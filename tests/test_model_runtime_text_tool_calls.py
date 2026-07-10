@@ -162,6 +162,30 @@ def test_extract_response_text_empty_for_tool_calls_without_content_or_reasoning
     assert text == ""
 
 
+def test_extract_response_text_returns_empty_for_null_message_without_tool_calls():
+    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
+    runtime = engine._model_runtime
+    object_raw = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=None, tool_calls=None),
+                finish_reason="stop",
+            )
+        ]
+    )
+    dict_raw = {
+        "choices": [
+            {
+                "message": {"content": None, "tool_calls": None},
+                "finish_reason": "stop",
+            }
+        ]
+    }
+
+    assert runtime._extract_response_text(object_raw) == ""
+    assert runtime._extract_response_text(dict_raw) == ""
+
+
 def test_native_tool_call_history_keeps_assistant_text_and_tool_calls():
     class _ObjectResponseModel:
         model = "demo-model"
