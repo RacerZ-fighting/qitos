@@ -12,6 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, cast
 
+from ..core.model_response import ModelResponse
 from ..core.multimodal import (
     content_to_text,
     ensure_data_url,
@@ -19,6 +20,13 @@ from ..core.multimodal import (
     has_nontext_content,
     normalize_content_block,
     normalize_messages,
+)
+from ._openai_responses import (
+    _async_responses_completion,
+    _async_responses_stream,
+    _normalize_api_mode,
+    _responses_completion,
+    _responses_stream,
 )
 from .base import Model, ModelStreamChunk
 
@@ -117,7 +125,7 @@ def _to_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         content = message.get("content")
         payload: Dict[str, Any] = {"role": role}
         for key, value in message.items():
-            if key in {"role", "content"}:
+            if key in {"role", "content", "native_items"}:
                 continue
             payload[key] = value
         if isinstance(content, list):
@@ -264,6 +272,7 @@ class OpenAIModel(Model):
         timeout: int = 120,
         context_window: Optional[int] = None,
         default_request_kwargs: Optional[Dict[str, Any]] = None,
+        api_mode: str = "chat_completions",
     ):
         """
         Initialize OpenAI model
@@ -278,6 +287,7 @@ class OpenAIModel(Model):
             timeout: Request timeout (seconds)
             context_window: Total model context window
             default_request_kwargs: Extra kwargs merged into every API call
+            api_mode: OpenAI transport, ``chat_completions`` or ``responses``
         """
         super().__init__(
             model=model,
@@ -293,6 +303,7 @@ class OpenAIModel(Model):
         )
         self.timeout = timeout
         self.default_request_kwargs = default_request_kwargs or {}
+        self.api_mode = _normalize_api_mode(api_mode)
 
         if not self.api_key:
             raise ValueError(
@@ -316,7 +327,14 @@ class OpenAIModel(Model):
                 api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
             )
 
-            response = self._chat_completion(client, messages, **kwargs)
+            if self.api_mode == "responses":
+                response = _responses_completion(
+                    self, client, messages, provider="openai", **kwargs
+                )
+            else:
+                response = self._chat_completion(client, messages, **kwargs)
+            if isinstance(response, ModelResponse):
+                return response.text
             return self._parse_response(response)
 
         except openai.APIError as e:
@@ -381,6 +399,10 @@ class OpenAIModel(Model):
         client = openai.OpenAI(
             api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
         )
+        if self.api_mode == "responses":
+            return _responses_completion(
+                self, client, messages, provider="openai", **kwargs
+            )
         return self._chat_completion(client, messages, **kwargs)
 
     def stream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> Iterator[ModelStreamChunk]:
@@ -392,6 +414,11 @@ class OpenAIModel(Model):
             client = openai.OpenAI(
                 api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
             )
+            if self.api_mode == "responses":
+                yield from _responses_stream(
+                    self, client, messages, provider="openai", **kwargs
+                )
+                return
             response = client.chat.completions.create(
                 model=self.model,
                 messages=cast(Any, _to_openai_messages(messages)),
@@ -549,6 +576,7 @@ class OpenAICompatibleModel(Model):
         timeout: int = 120,
         context_window: Optional[int] = None,
         default_request_kwargs: Optional[Dict[str, Any]] = None,
+        api_mode: str = "chat_completions",
     ):
         """
         Initialize compatible model
@@ -564,6 +592,7 @@ class OpenAICompatibleModel(Model):
             context_window: Total model context window
             default_request_kwargs: Extra kwargs merged into every API call
                 (e.g. {"chat_template_kwargs": {"thinking": True}})
+            api_mode: OpenAI transport, ``chat_completions`` or ``responses``
         """
         super().__init__(
             model=model,
@@ -577,6 +606,7 @@ class OpenAICompatibleModel(Model):
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL", "")
         self.timeout = timeout
         self.default_request_kwargs = default_request_kwargs or {}
+        self.api_mode = _normalize_api_mode(api_mode)
 
         if not self.base_url:
             raise ValueError(
@@ -637,7 +667,14 @@ class OpenAICompatibleModel(Model):
                 api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
             )
 
-            response = self._chat_completion(client, messages, **kwargs)
+            if self.api_mode == "responses":
+                response = _responses_completion(
+                    self, client, messages, provider="openai-compatible", **kwargs
+                )
+            else:
+                response = self._chat_completion(client, messages, **kwargs)
+            if isinstance(response, ModelResponse):
+                return response.text
             return self._parse_response(response)
 
         except openai.APIError as e:
@@ -760,6 +797,10 @@ class OpenAICompatibleModel(Model):
         client = openai.OpenAI(
             api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
         )
+        if self.api_mode == "responses":
+            return _responses_completion(
+                self, client, messages, provider="openai-compatible", **kwargs
+            )
         return self._chat_completion(client, messages, **kwargs)
 
     def _usage_from_response(self, response: Any) -> Optional[Dict[str, Any]]:
@@ -774,6 +815,11 @@ class OpenAICompatibleModel(Model):
             client = openai.OpenAI(
                 api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
             )
+            if self.api_mode == "responses":
+                yield from _responses_stream(
+                    self, client, messages, provider="openai-compatible", **kwargs
+                )
+                return
             # Build stream options — request usage in final chunk
             # Not all OpenAI-compatible APIs support this, so we wrap it
             create_kwargs: Dict[str, Any] = dict(kwargs)
@@ -992,7 +1038,14 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
             client = openai.AsyncOpenAI(
                 api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
             )
-            response = await self._achat_completion(client, messages, **kwargs)
+            if self.api_mode == "responses":
+                response = await _async_responses_completion(
+                    self, client, messages, provider="openai-compatible", **kwargs
+                )
+            else:
+                response = await self._achat_completion(client, messages, **kwargs)
+            if isinstance(response, ModelResponse):
+                return response.text
             return self._parse_response(response)
         except openai.APIError as e:
             return f"API Error: {str(e)}"
@@ -1023,6 +1076,10 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
         client = openai.AsyncOpenAI(
             api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
         )
+        if self.api_mode == "responses":
+            return await _async_responses_completion(
+                self, client, messages, provider="openai-compatible", **kwargs
+            )
         return await self._achat_completion(client, messages, **kwargs)
 
     async def astream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> AsyncIterator[ModelStreamChunk]:
@@ -1034,6 +1091,12 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
             client = openai.AsyncOpenAI(
                 api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
             )
+            if self.api_mode == "responses":
+                async for chunk in _async_responses_stream(
+                    self, client, messages, provider="openai-compatible", **kwargs
+                ):
+                    yield chunk
+                return
             response = await client.chat.completions.create(
                 model=self.model,
                 messages=cast(Any, _to_openai_messages(messages)),
@@ -1083,7 +1146,14 @@ class AsyncOpenAIModel(OpenAIModel):
             client = openai.AsyncOpenAI(
                 api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
             )
-            response = await self._achat_completion(client, messages, **kwargs)
+            if self.api_mode == "responses":
+                response = await _async_responses_completion(
+                    self, client, messages, provider="openai", **kwargs
+                )
+            else:
+                response = await self._achat_completion(client, messages, **kwargs)
+            if isinstance(response, ModelResponse):
+                return response.text
             return self._parse_response(response)
         except openai.APIError as e:
             return f"API Error: {str(e)}"
@@ -1111,6 +1181,10 @@ class AsyncOpenAIModel(OpenAIModel):
         client = openai.AsyncOpenAI(
             api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
         )
+        if self.api_mode == "responses":
+            return await _async_responses_completion(
+                self, client, messages, provider="openai", **kwargs
+            )
         return await self._achat_completion(client, messages, **kwargs)
 
     async def astream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> AsyncIterator[ModelStreamChunk]:
@@ -1122,6 +1196,12 @@ class AsyncOpenAIModel(OpenAIModel):
             client = openai.AsyncOpenAI(
                 api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
             )
+            if self.api_mode == "responses":
+                async for chunk in _async_responses_stream(
+                    self, client, messages, provider="openai", **kwargs
+                ):
+                    yield chunk
+                return
             response = await client.chat.completions.create(
                 model=self.model,
                 messages=cast(Any, _to_openai_messages(messages)),
