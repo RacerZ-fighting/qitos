@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import traceback
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
@@ -474,6 +475,21 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 self._resolved_protocol_source = "parser_inferred"
                 return self._resolved_protocol
         llm = getattr(self.agent, "llm", None)
+        model_protocol = get_protocol(getattr(llm, "qitos_protocol", None))
+        if model_protocol is not None:
+            self._resolved_protocol = model_protocol
+            self._resolved_protocol_source = "model_qitos_protocol"
+            return self._resolved_protocol
+        harness_metadata = getattr(llm, "qitos_harness_metadata", {}) or {}
+        metadata_protocol = get_protocol(
+            harness_metadata.get("protocol")
+            if isinstance(harness_metadata, Mapping)
+            else None
+        )
+        if metadata_protocol is not None:
+            self._resolved_protocol = metadata_protocol
+            self._resolved_protocol_source = "model_harness_metadata"
+            return self._resolved_protocol
         model_name = getattr(llm, "model", None) or getattr(llm, "model_name", None)
         default_protocol = infer_default_protocol(model_name, fallback="react_text_v1")
         self._resolved_protocol = get_protocol(default_protocol)
