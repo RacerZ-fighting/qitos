@@ -33,6 +33,7 @@ class StopReason(str, Enum):
     ENV_CAPABILITY_MISMATCH = "env_capability_mismatch"
     INFRASTRUCTURE_INVALID = "infrastructure_invalid"
     UNRECOVERABLE_ERROR = "unrecoverable_error"
+    CANCELLED_IMMEDIATE = "cancelled_immediate"
     INTERRUPT = "interrupt"
 
 
