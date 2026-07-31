@@ -2841,12 +2841,13 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
     def _ensure_chain_consistency(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Ensure every assistant tool_call has a corresponding tool response.
+        """Ensure assistant tool calls and tool responses form a valid chain.
 
-        After errors or crashes, the message chain can have dangling tool
-        calls (assistant messages with tool_calls that never got a response).
-        The LLM API rejects such chains. This method adds placeholder tool
-        responses for any missing ones.
+        Window trimming can retain a tool response after its declaring
+        assistant message has been evicted. Errors or crashes can leave the
+        opposite shape: an assistant tool call without a response. LLM APIs
+        reject both forms. Remove orphan responses, then preserve the existing
+        recovery behavior by adding placeholder responses for missing ones.
         """
         if not messages:
             return messages
@@ -2864,12 +2865,20 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 if tc_id:
                     expected_tool_ids.append(tc_id)
 
+        expected_tool_id_set = set(expected_tool_ids)
+        result = [
+            msg
+            for msg in messages
+            if msg.get("role") != "tool"
+            or msg.get("tool_call_id") in expected_tool_id_set
+        ]
+
         if not expected_tool_ids:
-            return messages
+            return result
 
         # Collect all tool_call_ids that already have responses
         responded_ids: set = set()
-        for msg in messages:
+        for msg in result:
             if msg.get("role") == "tool":
                 tc_id = msg.get("tool_call_id")
                 if tc_id:
@@ -2878,12 +2887,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         # Find dangling tool calls and add placeholder responses
         missing_ids = [tid for tid in expected_tool_ids if tid not in responded_ids]
         if not missing_ids:
-            return messages
+            return result
 
         # This is a last-resort provider parity guard for a genuinely current
         # interrupted batch. Historical incomplete transactions are removed by
-        # _trim_native_tool_history and never receive synthetic prose.
-        result = list(messages)
+        # _trim_native_tool_history or the orphan filter above and never
+        # receive synthetic prose.
         for tid in missing_ids:
             result.append({
                 "role": "tool",
