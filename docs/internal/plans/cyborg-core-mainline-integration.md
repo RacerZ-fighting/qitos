@@ -31,7 +31,13 @@ to `main`.
 - [x] Run focused message-history and provider tests.
 - [x] Run QitOS full validation.
 - [x] Update and validate PentestAgent integration.
-- [ ] Push the validated QitOS branch and PentestAgent update.
+- [x] Push the validated QitOS branch to the PentestAgent-owned fork.
+- [ ] Push the PentestAgent update.
+
+## Publication
+
+- Fork: `https://github.com/RacerZ-fighting/qitos`
+- Branch: `feat/cyborg-core-mainline`
 
 ## Conflict policy
 
