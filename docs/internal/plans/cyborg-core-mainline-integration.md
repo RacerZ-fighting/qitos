@@ -30,7 +30,7 @@ to `main`.
 - [x] Rebase `main` commits onto `core` and resolve conflicts surgically.
 - [x] Run focused message-history and provider tests.
 - [x] Run QitOS full validation.
-- [ ] Update and validate PentestAgent integration.
+- [x] Update and validate PentestAgent integration.
 - [ ] Push the validated QitOS branch and PentestAgent update.
 
 ## Conflict policy
@@ -52,3 +52,5 @@ benchmark-specific runtime coupling removed by `core`.
 - `flake8` is unavailable in the integration environment. Stable-surface
   `mypy` was run and reports the existing core baseline debt (`161 errors`),
   including the known incomplete `_EngineProtocol` typing surface.
+- PentestAgent integration gate: Ruff lint/format, ty, and mypy passed; pytest
+  completed with `579 passed, 27 skipped`.
