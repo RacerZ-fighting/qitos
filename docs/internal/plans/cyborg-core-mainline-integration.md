@@ -32,7 +32,7 @@ to `main`.
 - [x] Run QitOS full validation.
 - [x] Update and validate PentestAgent integration.
 - [x] Push the validated QitOS branch to the PentestAgent-owned fork.
-- [ ] Push the PentestAgent update.
+- [x] Publish the PentestAgent update with the fork URL and final gitlink.
 
 ## Publication
 
