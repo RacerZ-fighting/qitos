@@ -27,7 +27,7 @@ def test_resolve_family_preset_for_gold_families() -> None:
 
 
 def test_profile_registry_is_derived_from_presets() -> None:
-    assert infer_model_profile("GLM-5.1-sii").default_protocol == "json_decision_v1"
+    assert infer_model_profile("GLM-5.1-sii").default_protocol == "json_decision_multi_v1"
     assert infer_model_profile("moonshot-v1-128k").default_protocol == "json_decision_v1"
     assert infer_model_profile("gpt-oss-120b").default_protocol == "json_decision_v1"
     assert infer_model_profile("gemma-4-31b-it").default_protocol == "json_decision_v1"
@@ -37,8 +37,9 @@ def test_profile_registry_is_derived_from_presets() -> None:
 def test_build_harness_policy_keeps_glm_native_chain() -> None:
     harness = build_harness_policy(model_name="GLM-5.1-sii")
     assert harness.family_preset.id == "glm"
-    assert harness.protocol.id == "json_decision_v1"
+    assert harness.protocol.id == "json_decision_multi_v1"
     assert harness.protocol.fallback_protocols == (
+        "json_decision_v1",
         "xml_decision_v1",
         "react_text_v1",
     )
@@ -87,7 +88,7 @@ def test_build_model_for_glm_preset_attaches_native_tool_call_metadata() -> None
     )
     metadata = dict(getattr(llm, "qitos_harness_metadata", {}) or {})
     assert metadata["family_preset"] == "glm"
-    assert metadata["protocol"] == "json_decision_v1"
+    assert metadata["protocol"] == "json_decision_multi_v1"
     assert metadata["native_tool_call_preferred"] is True
     assert metadata["decision_lane_preference"] == "native_tool_calls"
     assert metadata["effective_tool_delivery"] == "api_parameter"

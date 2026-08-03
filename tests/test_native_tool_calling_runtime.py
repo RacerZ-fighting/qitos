@@ -240,26 +240,16 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
     assert result.state.final_result == "done"
     assert llm.calls == 9
     assert llm.orphan_ids_by_call == [[] for _ in range(9)]
-    model_input_messages = [
-        event.payload["messages"]
+    model_input_events = [
+        event.payload
         for event in result.events
         if event.payload.get("stage") == "model_input"
     ]
-    assert len(model_input_messages) == 9
-    for messages in model_input_messages:
-        assistant_ids = {
-            str(tool_call["id"])
-            for message in messages
-            if message.get("role") == "assistant"
-            for tool_call in message.get("tool_calls", [])
-            if isinstance(tool_call, dict) and tool_call.get("id")
-        }
-        tool_result_ids = {
-            str(message["tool_call_id"])
-            for message in messages
-            if message.get("role") == "tool" and message.get("tool_call_id")
-        }
-        assert tool_result_ids <= assistant_ids
+    assert len(model_input_events) == 9
+    for payload in model_input_events:
+        parity = payload["tool_transaction_parity"]
+        assert parity["valid"] is True
+        assert parity["orphan_result_ids"] == []
 
 
 def test_responses_native_items_survive_engine_tool_round() -> None:
