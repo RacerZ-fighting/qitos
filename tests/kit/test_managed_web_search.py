@@ -1,0 +1,222 @@
+"""Managed provider web-search capability tests."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from qitos.kit.search import (
+    KimiBuiltinWebSearchCapability,
+    KimiWebSearchCapability,
+    ManagedWebSearchTool,
+    WebSearchError,
+    build_web_search_capability,
+)
+
+
+@dataclass
+class _Response:
+    status_code: int
+    payload: Any
+
+    def json(self) -> Any:
+        if isinstance(self.payload, ValueError):
+            raise self.payload
+        return self.payload
+
+
+@dataclass
+class _Session:
+    response: _Response
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def post(self, url: str, **kwargs: Any) -> _Response:
+        self.calls.append({"url": url, **kwargs})
+        return self.response
+
+
+def test_kimi_search_uses_managed_contract_and_bounds_results() -> None:
+    session = _Session(
+        _Response(
+            200,
+            {
+                "search_results": [
+                    {
+                        "title": "Vendor advisory",
+                        "url": "https://vendor.example/advisory",
+                        "snippet": "Affected versions and remediation.",
+                        "site_name": "Vendor",
+                        "date": "2026-08-04",
+                    },
+                    {
+                        "title": "Research",
+                        "url": "https://research.example/post",
+                        "snippet": "Technical details.",
+                    },
+                ]
+            },
+        )
+    )
+    capability = KimiWebSearchCapability(
+        api_key="secret",
+        search_url="https://api.example/search",
+        session=session,  # type: ignore[arg-type]
+    )
+
+    result = capability.search("product 1.2 CVE", max_results=1)
+
+    assert [source.title for source in result.sources] == ["Vendor advisory"]
+    assert session.calls[0]["url"] == "https://api.example/search"
+    assert session.calls[0]["json"] == {"text_query": "product 1.2 CVE"}
+    assert session.calls[0]["headers"]["Authorization"] == "Bearer secret"
+
+
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    [
+        (401, "authentication"),
+        (403, "authentication"),
+        (429, "rate_limited"),
+        (503, "provider"),
+    ],
+)
+def test_kimi_search_preserves_failure_kind(status: int, kind: str) -> None:
+    capability = KimiWebSearchCapability(
+        api_key="secret",
+        session=_Session(_Response(status, {})),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(WebSearchError) as error:
+        capability.search("query")
+
+    assert error.value.kind == kind
+
+
+def test_kimi_search_rejects_invalid_protocol_response() -> None:
+    capability = KimiWebSearchCapability(
+        api_key="secret",
+        session=_Session(_Response(200, {"search_results": "wrong"})),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(WebSearchError) as error:
+        capability.search("query")
+
+    assert error.value.kind == "protocol"
+
+
+def test_factory_is_extensible_without_faking_unsupported_search() -> None:
+    assert build_web_search_capability(provider="unknown", api_key="secret") is None
+    assert isinstance(
+        build_web_search_capability(
+            provider="kimi",
+            api_key="secret",
+            base_url="https://api.kimi.com/coding/v1",
+        ),
+        KimiWebSearchCapability,
+    )
+    assert isinstance(
+        build_web_search_capability(
+            provider="kimi",
+            api_key="secret",
+            base_url="https://api.moonshot.cn/v1",
+            model="kimi-k3",
+        ),
+        KimiBuiltinWebSearchCapability,
+    )
+
+
+@dataclass
+class _Completions:
+    responses: list[Any]
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+def test_kimi_builtin_search_round_trips_server_arguments() -> None:
+    arguments = (
+        '{"results":[{"title":"Advisory","url":"https://vendor.example/a",'
+        '"snippet":"Affected versions"}],"usage":{"total_tokens":42}}'
+    )
+    tool_call = SimpleNamespace(
+        id="call-1",
+        function=SimpleNamespace(name="$web_search", arguments=arguments),
+    )
+    first_message = SimpleNamespace(
+        content=None,
+        reasoning_content="The query needs current sources.",
+        tool_calls=[tool_call],
+    )
+    second_message = SimpleNamespace(
+        content="Current details: https://vendor.example/a",
+        tool_calls=[],
+    )
+    completions = _Completions(
+        [
+            SimpleNamespace(choices=[SimpleNamespace(message=first_message)]),
+            SimpleNamespace(choices=[SimpleNamespace(message=second_message)]),
+        ]
+    )
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    capability = KimiBuiltinWebSearchCapability(
+        api_key="secret",
+        client=client,
+    )
+
+    result = capability.search("product advisory")
+
+    assert result.text == "Current details: https://vendor.example/a"
+    assert [source.url for source in result.sources] == ["https://vendor.example/a"]
+    assert completions.calls[0]["tools"] == [
+        {
+            "type": "builtin_function",
+            "function": {"name": "$web_search"},
+        }
+    ]
+    assert completions.calls[1]["messages"][-2]["tool_calls"][0]["type"] == "function"
+    assert completions.calls[1]["messages"][-2]["reasoning_content"] == (
+        "The query needs current sources."
+    )
+    assert completions.calls[1]["messages"][-1] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "name": "$web_search",
+        "content": arguments,
+    }
+
+
+def test_managed_tool_is_read_only_and_returns_structured_sources() -> None:
+    capability = KimiWebSearchCapability(
+        api_key="secret",
+        session=_Session(
+            _Response(
+                200,
+                {
+                    "search_results": [
+                        {
+                            "title": "Documentation",
+                            "url": "https://docs.example/",
+                            "snippet": "Reference.",
+                        }
+                    ]
+                },
+            )
+        ),  # type: ignore[arg-type]
+    )
+    tool = ManagedWebSearchTool(capability)
+
+    result = tool.execute({"query": "docs"})
+
+    assert tool.spec.read_only is True
+    assert tool.spec.concurrency_safe is True
+    assert result["sources"] == [
+        {
+            "title": "Documentation",
+            "url": "https://docs.example/",
+            "snippet": "Reference.",
+        }
+    ]
