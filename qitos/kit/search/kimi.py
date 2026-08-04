@@ -191,6 +191,15 @@ class KimiBuiltinWebSearchCapability:
 
             text = str(getattr(message, "content", "") or "").strip()
             if not text:
+                bounded_sources = _deduplicate_sources(sources, normalized_limit)
+                if bounded_sources:
+                    return WebSearchResponse(
+                        text=(
+                            "Kimi returned public web search sources without a "
+                            "synthesized answer."
+                        ),
+                        sources=bounded_sources,
+                    )
                 raise WebSearchError(
                     "protocol", "Kimi web search returned no final answer"
                 )
@@ -215,6 +224,7 @@ class KimiBuiltinWebSearchCapability:
                     }
                 ],
                 max_tokens=8_192,
+                extra_body={"thinking": {"type": "disabled"}},
             )
         except Exception as exc:
             raise _classify_client_error(exc) from exc

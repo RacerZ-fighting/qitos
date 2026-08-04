@@ -114,7 +114,7 @@ def test_factory_is_extensible_without_faking_unsupported_search() -> None:
             api_key="secret",
             base_url="https://api.kimi.com/coding/v1",
         ),
-        KimiWebSearchCapability,
+        KimiBuiltinWebSearchCapability,
     )
     assert isinstance(
         build_web_search_capability(
@@ -124,6 +124,15 @@ def test_factory_is_extensible_without_faking_unsupported_search() -> None:
             model="kimi-k3",
         ),
         KimiBuiltinWebSearchCapability,
+    )
+    assert isinstance(
+        build_web_search_capability(
+            provider="kimi",
+            api_key="search-secret",
+            search_url="https://search.example/v1/search",
+            base_url="https://api.kimi.com/coding/v1",
+        ),
+        KimiWebSearchCapability,
     )
 
 
@@ -177,6 +186,7 @@ def test_kimi_builtin_search_round_trips_server_arguments() -> None:
             "function": {"name": "$web_search"},
         }
     ]
+    assert completions.calls[0]["extra_body"] == {"thinking": {"type": "disabled"}}
     assert completions.calls[1]["messages"][-2]["tool_calls"][0]["type"] == "function"
     assert completions.calls[1]["messages"][-2]["reasoning_content"] == (
         "The query needs current sources."
@@ -187,6 +197,50 @@ def test_kimi_builtin_search_round_trips_server_arguments() -> None:
         "name": "$web_search",
         "content": arguments,
     }
+
+
+def test_kimi_builtin_search_keeps_sources_when_final_text_is_empty() -> None:
+    arguments = (
+        '{"results":[{"title":"Advisory","url":"https://vendor.example/a",'
+        '"snippet":"Affected versions"}]}'
+    )
+    tool_call = SimpleNamespace(
+        id="call-1",
+        function=SimpleNamespace(name="$web_search", arguments=arguments),
+    )
+    completions = _Completions(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=None,
+                            reasoning_content=None,
+                            tool_calls=[tool_call],
+                        )
+                    )
+                ]
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=None, tool_calls=[])
+                    )
+                ]
+            ),
+        ]
+    )
+    capability = KimiBuiltinWebSearchCapability(
+        api_key="secret",
+        client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
+    )
+
+    result = capability.search("product advisory")
+
+    assert result.text == (
+        "Kimi returned public web search sources without a synthesized answer."
+    )
+    assert [source.url for source in result.sources] == ["https://vendor.example/a"]
 
 
 def test_managed_tool_is_read_only_and_returns_structured_sources() -> None:

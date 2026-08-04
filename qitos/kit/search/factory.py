@@ -32,12 +32,6 @@ def _build_kimi(
             timeout_seconds=timeout_seconds,
         )
     normalized_base = (base_url or DEFAULT_KIMI_BASE_URL).rstrip("/")
-    if "api.kimi.com/coding" in normalized_base:
-        return KimiWebSearchCapability(
-            api_key=api_key,
-            search_url=f"{normalized_base}/search",
-            timeout_seconds=timeout_seconds,
-        )
     return KimiBuiltinWebSearchCapability(
         api_key=api_key,
         base_url=normalized_base,
