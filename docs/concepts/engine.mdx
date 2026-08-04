@@ -60,6 +60,47 @@ engine = Engine(
   Prefer calling `agent.run()` for single-run workflows. Use `Engine` directly when you need to reuse an Engine across multiple runs or configure hooks dynamically between runs.
 </Tip>
 
+## Runtime input and idle wait
+
+Long-running tools can return a handle before their work finishes. Use
+`RuntimeInput` to notify the same Engine run when that work reaches a terminal
+state:
+
+```python
+from qitos import RuntimeInput
+
+accepted = engine.post_runtime_event(
+    RuntimeInput(
+        event_id="command:42:terminal",
+        kind="command.terminal",
+        correlation_id="42",
+        source="shell",
+        payload={"status": "completed", "exit_code": 0},
+    ),
+    run_id=run_id,
+)
+```
+
+Capture `run_id` from `engine.active_run_id` after the run starts. A post returns
+`False` when the event id is a duplicate, the run id does not match, or the run
+has ended. Keep event payloads small. Store full command output behind the tool's
+normal result or read API.
+
+An agent can explicitly enter idle wait with
+`Decision.wait(meta={"runtime_wait": True})`. JSON decision agents can return:
+
+```json
+{"mode":"wait","runtime_wait":true}
+```
+
+While idle, the Engine does not call the model or advance the step. A runtime
+event, cancellation, or runtime deadline wakes it. Events are drained only before
+the next model request and are appended as runtime-sourced user context. QitOS
+does not forge a second tool result for a tool call that has already ended.
+
+Unmarked `Decision.wait()` retains its existing immediate-loop behavior for parser
+repair and search backtracking.
+
 ## Protocol resolution
 
 `Engine` resolves the model protocol once per run using the following precedence:

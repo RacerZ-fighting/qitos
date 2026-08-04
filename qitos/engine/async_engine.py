@@ -9,6 +9,7 @@ from typing import Any, AsyncIterator, Generic, List, Optional, TypeVar
 from ..core.agent_module import AgentModule
 from ..core.decision import Decision
 from ..core.errors import StopReason
+from ..core.runtime_input import RuntimeInput
 from ..core.state import StateSchema
 from .engine import Engine, EngineResult
 from .events import EngineEvent, EngineEventType, EventStream
@@ -73,6 +74,17 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
         Delegates to the underlying Engine's cancellation token.
         """
         self._engine.cancel(mode)
+
+    @property
+    def active_run_id(self) -> str:
+        """Return the underlying Engine's active run id."""
+
+        return self._engine.active_run_id
+
+    def post_runtime_event(self, event: RuntimeInput, *, run_id: str) -> bool:
+        """Post one event to the exact underlying Engine run."""
+
+        return self._engine.post_runtime_event(event, run_id=run_id)
 
     async def arun_stream(
         self,

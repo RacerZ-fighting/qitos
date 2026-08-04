@@ -18,6 +18,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Runtime input and idle wait**: background work can post a small event to an exact
+  Engine run. Explicit runtime waits sleep without model polling or step growth and
+  wake on input, cancellation, or the run deadline.
 - **Bounded OpenAI-compatible retries**: synchronous calls and async Responses streams
   now use one explicit QitOS transport retry budget with SDK retries disabled. Async
   streams enforce an event-idle timeout, close stalled streams before retrying, and

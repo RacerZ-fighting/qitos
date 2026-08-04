@@ -153,6 +153,8 @@ class JsonDecisionParser(BaseParser[dict[str, Any]]):
             or first_dict_value(payload, ("answer",))
         )
 
+        if mode == "wait" and payload.get("runtime_wait") is True:
+            meta["runtime_wait"] = True
         if mode == "wait":
             return Decision.wait(rationale=thought, meta=meta)
         if mode == "final":

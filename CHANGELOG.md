@@ -19,6 +19,9 @@ How to update:
 
 ### Added
 
+- Added run-scoped `RuntimeInput` delivery and explicit idle wait/wakeup. Background
+  work can wake an Engine at the next model-safe boundary without polling, advancing
+  steps while idle, or fabricating a second tool result.
 - Added a bounded transport policy for synchronous OpenAI-compatible calls and async
   Responses streams, with one visible retry owner, provider retry-hint handling, typed
   exhaustion errors, and stream event-idle timeouts.

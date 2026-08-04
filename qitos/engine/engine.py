@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -27,6 +28,7 @@ from ..core.env import Env, EnvObservation, EnvStepResult
 from ..core.history import History, HistoryMessage, HistoryPolicy
 from ..core.interceptor import InterceptorChain, ToolInterceptor
 from ..core.memory import Memory, MemoryRecord
+from ..core.runtime_input import RuntimeInput
 from ..core.state import StateSchema
 from ..core.task import Task, TaskResult, TaskValidationIssue
 from ..core.tool_result import ToolResult
@@ -44,6 +46,7 @@ from ._trace_runtime import _TraceRuntime
 from .action_executor import ActionExecutor
 from .cancellation import CancelMode, CancelToken
 from .branching import BranchSelector, FirstCandidateSelector
+from ._runtime_inbox import RuntimeWaitOutcome, _RuntimeInbox
 from .critic import Critic
 from .hooks import EngineHook, HookContext
 from .parser import Parser
@@ -444,6 +447,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         # Cancellation token — shared with EngineResult for external cancel
         self._cancel_token = CancelToken()
+        self._runtime_inbox = _RuntimeInbox()
 
     def _build_action_executor(self, tool_registry: Any) -> Optional[ActionExecutor]:
         """Construct an ActionExecutor carrying every engine-level dependency.
@@ -482,6 +486,22 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             ``"after_step"`` — wait for the current step to complete first.
         """
         self._cancel_token.request_cancel(mode)
+        self._runtime_inbox.wake()
+
+    @property
+    def active_run_id(self) -> str:
+        """Return the current run id, or an empty string outside a run."""
+
+        return self._active_run_id
+
+    def post_runtime_event(self, event: RuntimeInput, *, run_id: str) -> bool:
+        """Post one idempotent event to the exact active run."""
+
+        if not isinstance(event, RuntimeInput):
+            raise TypeError("event must be a RuntimeInput")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        return self._runtime_inbox.post(run_id, event)
 
     def resolve_protocol(self) -> Any:
         if self._resolved_protocol is not None:
@@ -930,6 +950,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         except Exception as exc:
             self._report_runtime_exception("SETUP_ENV", 0, exc, emit=False)
             raise
+        self._runtime_inbox.open(self._active_run_id)
         harness_diagnostics = self._harness_mismatch_diagnostics()
         self._emit(
             0,
@@ -950,9 +971,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 payload={"stage": "harness_mismatch", **harness_diagnostics},
             )
         self._notify_run_start(task_text, state)
-        preflight_issues = self._preflight_validate(
-            task_obj=task_obj, workspace=kwargs.get("workspace")
-        )
+        try:
+            preflight_issues = self._preflight_validate(
+                task_obj=task_obj, workspace=kwargs.get("workspace")
+            )
+        except BaseException:
+            self._runtime_inbox.close(self._active_run_id)
+            raise
         if preflight_issues:
             has_task_issue = any(
                 not issue.code.startswith("ENV_") for issue in preflight_issues
@@ -991,6 +1016,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 run_id=self._active_run_id,
                 _cancel_token=self._cancel_token,
             )
+            self._runtime_inbox.close(self._active_run_id)
             self._notify_run_end(result)
             self._clear_active_context()
             self._teardown_env()
@@ -1031,6 +1057,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         payload={"stop_reason": state.stop_reason},
                     )
                     break
+
+                self._drain_runtime_events(step_id)
 
                 self.validation_gate.before_phase(state, RuntimePhase.DECIDE.value)
 
@@ -1146,7 +1174,52 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     step_id += 1
                     continue
 
-                # Wait: agent requests a pause, skip act/reduce
+                # Runtime wait: block without spending model calls or steps until
+                # an external event, cancellation, or the run deadline wakes us.
+                if (
+                    decision.mode == "wait"
+                    and decision.meta.get("runtime_wait") is True
+                    and not bool(decision.meta.get("task_complete_requested"))
+                    and not bool(decision.meta.get("parser_error"))
+                ):
+                    self._emit(
+                        step_id,
+                        RuntimePhase.DECIDE,
+                        payload={"stage": "runtime_wait_start"},
+                    )
+                    wait_outcome = self._wait_for_runtime_event(started_at)
+                    self._emit(
+                        step_id,
+                        RuntimePhase.DECIDE,
+                        payload={
+                            "stage": "runtime_wait_end",
+                            "outcome": wait_outcome,
+                        },
+                    )
+                    self._finalize_step(record, state)
+                    self._dispatch_hook(
+                        "on_after_step",
+                        HookContext(
+                            task=task_text,
+                            step_id=step_id,
+                            phase=RuntimePhase.CHECK_STOP,
+                            state=state,
+                            record=record,
+                        ),
+                    )
+                    if wait_outcome == "event":
+                        current_observation = self._build_initial_observation(
+                            state, step_id + 1, started_at
+                        )
+                        state.advance_step()
+                        step_id += 1
+                        continue
+                    if wait_outcome in {"cancelled", "timeout"}:
+                        continue
+                    raise RuntimeError("runtime inbox closed while Engine was waiting")
+
+                # Ordinary parser/search wait: preserve the existing immediate
+                # repair-loop behavior instead of treating every wait as idle.
                 if (
                     decision.mode == "wait"
                     and not bool(decision.meta.get("task_complete_requested"))
@@ -1364,6 +1437,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     )
                     break
         finally:
+            self._runtime_inbox.close(self._active_run_id)
             self._teardown_env()
             self._teardown_toolsets(
                 {
@@ -1622,6 +1696,37 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
     def _budget_exhausted(self, step_id: int, started_at: float, state: StateT) -> bool:
         return self._control_runtime.budget_exhausted(step_id, started_at, state)
+
+    def _drain_runtime_events(self, step_id: int) -> None:
+        events = self._runtime_inbox.drain(self._active_run_id)
+        if not events:
+            return
+        payload = {"runtime_events": [event.to_dict() for event in events]}
+        self._history_append(
+            "user",
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            step_id,
+            metadata={"source": "runtime", "event_count": len(events)},
+        )
+        self._emit(
+            step_id,
+            RuntimePhase.DECIDE,
+            payload={"stage": "runtime_input", **payload},
+        )
+
+    def _wait_for_runtime_event(self, started_at: float) -> RuntimeWaitOutcome:
+        timeout_seconds: float | None = None
+        if self.budget.max_runtime_seconds is not None:
+            timeout_seconds = max(
+                0.0,
+                float(self.budget.max_runtime_seconds)
+                - (time.monotonic() - started_at),
+            )
+        return self._runtime_inbox.wait(
+            self._active_run_id,
+            timeout_seconds=timeout_seconds,
+            cancelled=lambda: self._cancel_token.is_cancel_requested,
+        )
 
     def _normalize_decision(self, raw_decision: Any, step: int) -> Decision[ActionT]:
         return self._model_runtime.normalize_decision(raw_decision, step)
@@ -1997,6 +2102,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     continue
                 message: Dict[str, Any] = {"role": role, "content": item.content}
                 message["_step_id"] = int(item.step_id)
+                if item.metadata:
+                    message["_metadata"] = dict(item.metadata)
                 if item.tool_calls:
                     message["tool_calls"] = [dict(x) for x in item.tool_calls]
                 if item.tool_call_id:
@@ -2034,6 +2141,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         payload_message["_step_id"] = int(step_value)
                     except Exception as exc:
                         _logger.debug("Failed to parse step_id: %s", exc)
+                item_metadata = item.get("metadata")
+                if isinstance(item_metadata, dict) and item_metadata:
+                    payload_message["_metadata"] = dict(item_metadata)
                 tool_calls = item.get("tool_calls")
                 if isinstance(tool_calls, list):
                     payload_message["tool_calls"] = [
@@ -2246,6 +2356,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._trace_runtime.inject_hook_payload(method_name, ctx)
 
     def _reset_run_state(self) -> None:
+        self._runtime_inbox.close()
         self._trace_runtime.reset_run_state()
         self._last_runtime_error: Optional[Dict[str, Any]] = None
         self._resolved_protocol = None

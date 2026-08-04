@@ -14,6 +14,7 @@ from .core.env import Env, EnvSpec
 from .core.errors import QitosRuntimeError, StopReason
 from .core.memory import Memory
 from .core.model_response import ModelResponse
+from .core.runtime_input import RuntimeInput
 from .core.history import History, HistoryPolicy
 from .core.observation import Observation
 from .core.tool_result import ToolResult
@@ -48,6 +49,7 @@ __all__ = [
     "EngineEventType",
     "EventStream",
     "EngineResult",
+    "RuntimeInput",
     "StepSummary",
     "ContextConfig",
     "Task",
