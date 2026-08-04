@@ -40,6 +40,23 @@ class RuntimeBudget:
 
 @dataclass
 class ContextConfig:
+    """Engine-side context-length policy.
+
+    Three thresholds act on one request, in this order:
+
+    * ``warning_ratio`` (0.80) — occupancy at which a ``warning`` context event
+      is emitted. Observability only; nothing is reduced.
+    * ``compact_ratio`` (0.85) — fraction of the provider-safe hard history
+      budget at which the history strategy is asked to compact. Lowering it
+      compacts earlier.
+    * overflow (1.0) — exceeding ``available_input_budget`` raises
+      ``ContextOverflowError`` when ``strict_overflow`` is set.
+
+    ``target_utilization`` is a different axis: it sets the soft target used by
+    preventive history sliding. It is not multiplied by ``compact_ratio``;
+    the hard provider capacity remains available to deterministic recovery.
+    """
+
     enabled: bool = True
     warning_ratio: float = 0.80
     compact_ratio: float = 0.85
@@ -136,6 +153,9 @@ class StepRecord:
     actions: List[Any] = field(default_factory=list)
     action_results: List[Any] = field(default_factory=list)
     tool_invocations: List[Any] = field(default_factory=list)
+    # Effective action-execution policy, concurrency peak and segment count
+    # for this step's action batch (issue #35).
+    action_execution: Dict[str, Any] = field(default_factory=dict)
     critic_outputs: List[Any] = field(default_factory=list)
     state_diff: Dict[str, Any] = field(default_factory=dict)
     context: Dict[str, Any] = field(default_factory=dict)
