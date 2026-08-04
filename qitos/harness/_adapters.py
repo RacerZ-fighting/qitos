@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..models.context_registry import infer_context_window
-from ..models.openai import OpenAICompatibleModel
+from ..models.openai import AsyncOpenAICompatibleModel, OpenAICompatibleModel
 from ._types import ContextPolicy, FamilyPreset, ModelAdapter
 
 
@@ -63,13 +63,20 @@ class OpenAICompatibleAdapter(ModelAdapter):
         context_window = kwargs.get("context_window")
         default_request_kwargs = kwargs.get("default_request_kwargs")
         api_mode = str(kwargs.get("api_mode") or "chat_completions")
+        max_attempts = _coerce_int(kwargs.get("max_attempts"), 2)
+        stream_idle_timeout = _coerce_float(kwargs.get("stream_idle_timeout"), 60.0)
+        model_class = (
+            AsyncOpenAICompatibleModel
+            if kwargs.get("async_model") is True
+            else OpenAICompatibleModel
+        )
         if not isinstance(preset, FamilyPreset):
             raise TypeError("preset must be a FamilyPreset")
         if not isinstance(model_name, str):
             raise TypeError("model_name must be a string")
         if not isinstance(context_policy, ContextPolicy):
             raise TypeError("context_policy must be a ContextPolicy")
-        llm = OpenAICompatibleModel(
+        llm = model_class(
             model=model_name,
             api_key=str(api_key) if api_key is not None else None,
             base_url=str(base_url) if base_url is not None else None,
@@ -88,6 +95,8 @@ class OpenAICompatibleAdapter(ModelAdapter):
             ),
             default_request_kwargs=dict(default_request_kwargs) if isinstance(default_request_kwargs, dict) else None,
             api_mode=api_mode,
+            max_attempts=max_attempts,
+            stream_idle_timeout=stream_idle_timeout,
         )
         setattr(
             llm,

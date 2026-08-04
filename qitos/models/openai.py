@@ -28,6 +28,7 @@ from ._openai_responses import (
     _responses_completion,
     _responses_stream,
 )
+from ._openai_retry import ModelRetryPolicy, run_with_retry
 from .base import Model, ModelStreamChunk
 
 
@@ -577,6 +578,8 @@ class OpenAICompatibleModel(Model):
         context_window: Optional[int] = None,
         default_request_kwargs: Optional[Dict[str, Any]] = None,
         api_mode: str = "chat_completions",
+        max_attempts: int = 2,
+        stream_idle_timeout: float = 60.0,
     ):
         """
         Initialize compatible model
@@ -593,6 +596,8 @@ class OpenAICompatibleModel(Model):
             default_request_kwargs: Extra kwargs merged into every API call
                 (e.g. {"chat_template_kwargs": {"thinking": True}})
             api_mode: OpenAI transport, ``chat_completions`` or ``responses``
+            max_attempts: Total transport attempts, including the initial request
+            stream_idle_timeout: Maximum seconds between Responses stream events
         """
         super().__init__(
             model=model,
@@ -607,6 +612,10 @@ class OpenAICompatibleModel(Model):
         self.timeout = timeout
         self.default_request_kwargs = default_request_kwargs or {}
         self.api_mode = _normalize_api_mode(api_mode)
+        if isinstance(stream_idle_timeout, bool) or stream_idle_timeout <= 0:
+            raise ValueError("stream_idle_timeout must be positive")
+        self.retry_policy = ModelRetryPolicy(max_attempts=max_attempts)
+        self.stream_idle_timeout = float(stream_idle_timeout)
 
         if not self.base_url:
             raise ValueError(
@@ -662,25 +671,24 @@ class OpenAICompatibleModel(Model):
         """
         import openai
 
-        try:
-            client = openai.OpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-            )
-
-            if self.api_mode == "responses":
-                response = _responses_completion(
+        client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout,
+            max_retries=0,
+        )
+        if self.api_mode == "responses":
+            response = run_with_retry(
+                lambda: _responses_completion(
                     self, client, messages, provider="openai-compatible", **kwargs
-                )
-            else:
-                response = self._chat_completion(client, messages, **kwargs)
-            if isinstance(response, ModelResponse):
-                return response.text
-            return self._parse_response(response)
-
-        except openai.APIError as e:
-            return f"API Error: {str(e)}"
-        except Exception as e:
-            return f"Error: {str(e)}"
+                ),
+                self.retry_policy,
+            )
+        else:
+            response = self._chat_completion(client, messages, **kwargs)
+        if isinstance(response, ModelResponse):
+            return response.text
+        return self._parse_response(response)
 
     def _parse_response(self, response) -> str:
         """
@@ -763,30 +771,18 @@ class OpenAICompatibleModel(Model):
         safe_kwargs = _disable_thinking_for_forced_tool_choice(
             _relocate_chat_template_kwargs(kwargs)
         )
-        response = None
-        last_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                request_kwargs: Dict[str, Any] = {
-                    "model": self.model,
-                    "messages": cast(Any, _to_openai_messages(messages)),
-                    "max_tokens": self.max_tokens,
-                    **safe_kwargs,
-                }
-                if self.temperature is not None:
-                    request_kwargs["temperature"] = self.temperature
-                response = client.chat.completions.create(
-                    **request_kwargs,
-                )
-                break
-            except Exception as exc:
-                last_error = exc
-                if attempt >= 2:
-                    raise
-                time.sleep(2 ** attempt)
-        if response is None:
-            assert last_error is not None
-            raise last_error
+        request_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": cast(Any, _to_openai_messages(messages)),
+            "max_tokens": self.max_tokens,
+            **safe_kwargs,
+        }
+        if self.temperature is not None:
+            request_kwargs["temperature"] = self.temperature
+        response = run_with_retry(
+            lambda: client.chat.completions.create(**request_kwargs),
+            self.retry_policy,
+        )
         self._set_last_usage(self._usage_from_response(response))
         return response
 
@@ -795,11 +791,17 @@ class OpenAICompatibleModel(Model):
 
         self._last_usage = None
         client = openai.OpenAI(
-            api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout,
+            max_retries=0,
         )
         if self.api_mode == "responses":
-            return _responses_completion(
-                self, client, messages, provider="openai-compatible", **kwargs
+            return run_with_retry(
+                lambda: _responses_completion(
+                    self, client, messages, provider="openai-compatible", **kwargs
+                ),
+                self.retry_policy,
             )
         return self._chat_completion(client, messages, **kwargs)
 
@@ -1087,16 +1089,22 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
         import openai
 
         self._last_usage = None
+        if self.api_mode == "responses":
+            client = openai.AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+                max_retries=0,
+            )
+            async for chunk in _async_responses_stream(
+                self, client, messages, provider="openai-compatible", **kwargs
+            ):
+                yield chunk
+            return
         try:
             client = openai.AsyncOpenAI(
                 api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
             )
-            if self.api_mode == "responses":
-                async for chunk in _async_responses_stream(
-                    self, client, messages, provider="openai-compatible", **kwargs
-                ):
-                    yield chunk
-                return
             response = await client.chat.completions.create(
                 model=self.model,
                 messages=cast(Any, _to_openai_messages(messages)),

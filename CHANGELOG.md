@@ -19,6 +19,9 @@ How to update:
 
 ### Added
 
+- Added a bounded transport policy for synchronous OpenAI-compatible calls and async
+  Responses streams, with one visible retry owner, provider retry-hint handling, typed
+  exhaustion errors, and stream event-idle timeouts.
 - Added generic `model_summary` projection for native tool-call history and
   model-visible observations. Tools can now retain full structured evidence
   for reducers and replay while supplying a bounded readable result to models.
@@ -33,6 +36,8 @@ How to update:
 
 ### Changed
 
+- OpenAI-compatible clients now disable OpenAI SDK retries on paths where QitOS owns the
+  retry budget, preventing multiplicative retry delays.
 - Raised the optional OpenAI SDK floor to `openai>=1.66.0` and taught compact history to preserve active Responses function-call rounds atomically.
 - Strengthened the CyberGym PoC agent's task bootstrap with lightweight structured task-spec extraction and more relevant repo evidence ranking.
 - Clarified candidate provenance and lightweight failure taxonomy handling in the CyberGym agent without changing its single-agent runtime architecture.

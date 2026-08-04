@@ -5,6 +5,8 @@ import sys
 from types import ModuleType
 from types import SimpleNamespace
 
+import pytest
+
 from qitos.models import (
     AnthropicModel,
     GeminiModel,
@@ -298,14 +300,11 @@ def test_openai_compatible_model_formats_multimodal_chat_messages(tmp_path, monk
 def test_openai_compatible_model_retries_and_uses_120s_timeout(monkeypatch) -> None:
     captured = {"attempts": 0, "client_kwargs": None}
 
-    class _TransientError(Exception):
-        pass
-
     class _FakeCompletions:
         def create(self, **kwargs):
             captured["attempts"] += 1
-            if captured["attempts"] < 3:
-                raise _TransientError("request time out")
+            if captured["attempts"] < 2:
+                raise TimeoutError("request timed out")
             return SimpleNamespace(
                 choices=[
                     SimpleNamespace(
@@ -326,9 +325,8 @@ def test_openai_compatible_model_retries_and_uses_120s_timeout(monkeypatch) -> N
 
     fake_openai = ModuleType("openai")
     fake_openai.OpenAI = lambda **kwargs: _FakeClient(**kwargs)
-    fake_openai.APIError = _TransientError
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
-    monkeypatch.setattr("qitos.models.openai.time.sleep", lambda _: None)
+    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
 
     llm = OpenAICompatibleModel(
         model="gpt-4.1-mini",
@@ -338,22 +336,23 @@ def test_openai_compatible_model_retries_and_uses_120s_timeout(monkeypatch) -> N
     out = llm([{"role": "user", "content": "Retry please"}])
 
     assert out == "Final Answer: retried ok"
-    assert captured["attempts"] == 3
+    assert captured["attempts"] == 2
     assert captured["client_kwargs"]["timeout"] == 120
+    assert captured["client_kwargs"]["max_retries"] == 0
     assert llm.timeout == 120
 
 
 def test_openai_compatible_model_call_raw_retries_on_transient_errors(monkeypatch) -> None:
     captured = {"attempts": 0}
 
-    class _TransientError(Exception):
+    class APIError(Exception):
         pass
 
     class _FakeCompletions:
         def create(self, **kwargs):
             captured["attempts"] += 1
-            if captured["attempts"] < 3:
-                raise _TransientError("request time out")
+            if captured["attempts"] < 2:
+                raise APIError("stream timeout")
             return SimpleNamespace(
                 choices=[
                     SimpleNamespace(
@@ -373,9 +372,8 @@ def test_openai_compatible_model_call_raw_retries_on_transient_errors(monkeypatc
 
     fake_openai = ModuleType("openai")
     fake_openai.OpenAI = lambda **kwargs: _FakeClient(**kwargs)
-    fake_openai.APIError = _TransientError
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
-    monkeypatch.setattr("qitos.models.openai.time.sleep", lambda _: None)
+    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
 
     llm = OpenAICompatibleModel(
         model="gpt-4.1-mini",
@@ -384,8 +382,43 @@ def test_openai_compatible_model_call_raw_retries_on_transient_errors(monkeypatc
     )
     response = llm.call_raw([{"role": "user", "content": "Retry raw please"}])
 
-    assert captured["attempts"] == 3
+    assert captured["attempts"] == 2
     assert response.choices[0].message.content == "Final Answer: raw retried ok"
+
+
+def test_openai_compatible_model_does_not_retry_bad_requests(monkeypatch) -> None:
+    from qitos.core import ModelTransportError
+
+    captured = {"attempts": 0}
+
+    class _BadRequest(Exception):
+        status_code = 400
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            captured["attempts"] += 1
+            raise _BadRequest("invalid request")
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: _FakeClient(**kwargs)
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    llm = OpenAICompatibleModel(
+        model="gpt-4.1-mini",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+    )
+    with pytest.raises(ModelTransportError) as exc_info:
+        llm.call_raw([{"role": "user", "content": "bad request"}])
+
+    assert captured["attempts"] == 1
+    assert exc_info.value.attempts == 1
+    assert exc_info.value.retryable is False
+    assert exc_info.value.status_code == 400
 
 
 def test_openai_compatible_model_disables_thinking_for_forced_tool_choice(

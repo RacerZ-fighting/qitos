@@ -58,6 +58,38 @@ Reasoning items are treated as opaque continuation state. Trace summaries keep
 safe item descriptors and provider-authorized summaries, but omit encrypted
 reasoning continuation payloads.
 
+### OpenAI-compatible retry and stream deadlines
+
+`OpenAICompatibleModel` accepts the following transport controls:
+
+| Argument | Default | Behavior |
+|---|---:|---|
+| `timeout` | `120` | Total request timeout for one transport attempt |
+| `max_attempts` | `2` | Total attempts including the first request |
+| `stream_idle_timeout` | `60` | Maximum seconds between async Responses stream events |
+
+Synchronous calls and async Responses streams activate this policy. QitOS creates the
+corresponding OpenAI-compatible SDK client with `max_retries=0` and becomes the only
+retry owner. It retries recognized connection failures, timeouts, 408, 409, 429, and
+5xx responses and honors bounded
+`Retry-After`, `retry-after-ms`, and `x-should-retry` hints. Local validation errors
+and ordinary 4xx responses fail immediately. Async Responses streams are retried only
+before the first event and are closed before a retry, avoiding duplicated partial
+output.
+
+```python
+from qitos.models import AsyncOpenAICompatibleModel
+
+llm = AsyncOpenAICompatibleModel(
+    model="compatible-model",
+    base_url="https://provider.example/v1",
+    api_mode="responses",
+    timeout=120,
+    max_attempts=2,
+    stream_idle_timeout=60,
+)
+```
+
 ---
 
 ## AgentModule.run() arguments

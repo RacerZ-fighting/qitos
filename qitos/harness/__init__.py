@@ -63,6 +63,9 @@ def build_model_for_preset(
     context_window: int | None = None,
     default_request_kwargs: dict[str, Any] | None = None,
     api_mode: str = "chat_completions",
+    max_attempts: int = 2,
+    stream_idle_timeout: float = 60.0,
+    async_model: bool = False,
 ) -> Any:
     harness = build_harness_policy(
         model_name=model_name,
@@ -95,6 +98,9 @@ def build_model_for_preset(
         context_window=context_window,
         default_request_kwargs=effective_kwargs,
         api_mode=api_mode,
+        max_attempts=max_attempts,
+        stream_idle_timeout=stream_idle_timeout,
+        async_model=async_model,
     )
     metadata = dict(getattr(llm, "qitos_harness_metadata", {}) or {})
     metadata.update(harness.to_dict())

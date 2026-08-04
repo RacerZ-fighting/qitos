@@ -3,6 +3,7 @@ from __future__ import annotations
 from qitos.core.errors import (
     ErrorCategory,
     ModelExecutionError,
+    ModelTransportError,
     RuntimeErrorInfo,
     classify_exception,
 )
@@ -23,6 +24,28 @@ def test_classify_exception_marks_timed_out_message_as_recoverable_model_error()
 
     assert info.category == ErrorCategory.MODEL
     assert info.recoverable is True
+
+
+def test_classify_exhausted_transport_retry_as_nonrecoverable() -> None:
+    info = classify_exception(
+        ModelTransportError(
+            "provider timed out",
+            attempts=2,
+            retryable=True,
+            status_code=429,
+        ),
+        "DECIDE",
+        4,
+    )
+
+    assert info.category == ErrorCategory.MODEL
+    assert info.recoverable is False
+    assert info.details == {
+        "code": "model_transport_exhausted",
+        "attempts": 2,
+        "retryable": True,
+        "status_code": 429,
+    }
 
 
 def test_recovery_policy_continues_on_stream_timeout() -> None:

@@ -5,7 +5,9 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, cast
 
+from ..core.errors import ModelTransportError
 from ..core.model_response import ModelResponse
+from ._openai_retry import ModelRetryPolicy, stream_with_retry
 from .base import Model, ModelStreamChunk
 
 OPENAI_API_MODES = {"chat_completions", "responses"}
@@ -138,6 +140,9 @@ def _to_responses_tool_choice(tool_choice: Any) -> Any:
 
 def _normalize_request_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     request_kwargs = dict(kwargs)
+    response_format = request_kwargs.pop("response_format", None)
+    if response_format is not None:
+        request_kwargs["text"] = {"format": _native_value(response_format)}
     tools = request_kwargs.pop("tools", None)
     if tools is not None:
         request_kwargs["tools"] = _to_responses_tools(tools)
@@ -363,15 +368,10 @@ def _event_chunk(
     if event_type == "response.completed":
         return None, None, _field(event, "response")
     if event_type in {"response.failed", "error"}:
-        return (
-            ModelStreamChunk(
-                text=f"API Error: {_field(event, 'error')}",
-                done=True,
-                event_type=event_type,
-                event_metadata=metadata,
-            ),
-            None,
-            None,
+        raise ModelTransportError(
+            f"model stream failed: {_field(event, 'error')}",
+            attempts=1,
+            retryable=False,
         )
     return None, None, None
 
@@ -445,9 +445,17 @@ async def _async_responses_stream(
     provider: str,
     **kwargs: Any,
 ) -> AsyncIterator[ModelStreamChunk]:
-    events = await _responses_create(client)(
-        **_request_payload(adapter, messages, kwargs, stream=True)
-    )
+    payload = _request_payload(adapter, messages, kwargs, stream=True)
+    policy = getattr(adapter, "retry_policy", None)
+    if isinstance(policy, ModelRetryPolicy):
+        events = stream_with_retry(
+            lambda: _responses_create(client)(**payload),
+            policy=policy,
+            idle_timeout_seconds=float(getattr(adapter, "stream_idle_timeout", 60.0)),
+            request_timeout_seconds=float(getattr(adapter, "timeout", 120.0)),
+        )
+    else:
+        events = await _responses_create(client)(**payload)
     completed_items: List[Dict[str, Any]] = []
     completed_response: Any = None
     async for event in events:

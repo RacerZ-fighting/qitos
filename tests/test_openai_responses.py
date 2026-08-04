@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 
 import pytest
 
+from qitos.core.errors import ModelTransportError
 from qitos.core.model_response import ModelResponse
 from qitos.models import _openai_responses as responses_module
 from qitos.models.openai import (
@@ -333,6 +334,7 @@ def test_sync_responses_transport_uses_responses_endpoint(
 
     result = model.call_raw(
         [{"role": "user", "content": "calculate"}],
+        response_format={"type": "json_object"},
         tools=[
             {
                 "type": "function",
@@ -352,6 +354,7 @@ def test_sync_responses_transport_uses_responses_endpoint(
             "input": [{"role": "user", "content": "calculate"}],
             "temperature": 0.7,
             "max_output_tokens": 321,
+            "text": {"format": {"type": "json_object"}},
             "tools": [
                 {
                     "type": "function",
@@ -612,3 +615,62 @@ def test_async_responses_stream_preserves_typed_events(
     assert chunks[0].event_type == "response.output_text.delta"
     assert chunks[-1].done is True
     assert chunks[-1].tool_calls and chunks[-1].tool_calls[0]["id"] == "call_1"
+
+
+def test_async_responses_stream_retries_idle_before_first_event_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    attempts = 0
+    closes = 0
+    client_kwargs: Dict[str, Any] = {}
+
+    class _IdleEvents:
+        def __aiter__(self) -> "_IdleEvents":
+            return self
+
+        async def __anext__(self) -> Any:
+            await asyncio.Event().wait()
+            raise StopAsyncIteration
+
+        async def close(self) -> None:
+            nonlocal closes
+            closes += 1
+
+    class _Responses:
+        async def create(self, **kwargs: Any) -> Any:
+            nonlocal attempts
+            attempts += 1
+            return _IdleEvents()
+
+    async def _no_sleep(_: float) -> None:
+        return None
+
+    def _client(**kwargs: Any) -> Any:
+        client_kwargs.update(kwargs)
+        return SimpleNamespace(responses=_Responses())
+
+    monkeypatch.setattr("openai.AsyncOpenAI", _client)
+    monkeypatch.setattr("qitos.models._openai_retry.asyncio.sleep", _no_sleep)
+    model = AsyncOpenAICompatibleModel(
+        model="gpt-5",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        api_mode="responses",
+        timeout=1,
+        stream_idle_timeout=0.001,
+        max_attempts=2,
+    )
+
+    async def _collect() -> None:
+        async for _ in model.astream([{"role": "user", "content": "go"}]):
+            pass
+
+    with pytest.raises(ModelTransportError) as exc_info:
+        asyncio.run(_collect())
+
+    assert exc_info.value.attempts == 2
+    assert attempts == 2
+    assert closes == 2
+    assert client_kwargs["max_retries"] == 0

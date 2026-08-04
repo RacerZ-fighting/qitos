@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Bounded OpenAI-compatible retries**: synchronous calls and async Responses streams
+  now use one explicit QitOS transport retry budget with SDK retries disabled. Async
+  streams enforce an event-idle timeout, close stalled streams before retrying, and
+  surface typed exhaustion errors.
 - **Readable tool evidence**: tools can now project a compact `model_summary`
   into native tool-call history without discarding their full structured result
   from reducers, traces, or replay.

@@ -11,6 +11,7 @@ from .action import (
 )
 from .errors import (
     ErrorCategory,
+    ModelTransportError,
     StopReason,
     RuntimeErrorInfo,
     QitosRuntimeError,
@@ -76,6 +77,7 @@ __all__ = [
     "ActionStatus",
     "ActionExecutionPolicy",
     "ErrorCategory",
+    "ModelTransportError",
     "StopReason",
     "RuntimeErrorInfo",
     "QitosRuntimeError",
