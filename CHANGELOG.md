@@ -19,6 +19,13 @@ How to update:
 
 ### Added
 
+- Added backend-neutral `CapabilityEnv` composition plus bounded filesystem and
+  fixed-argv process contracts for tools that run on host, container, or remote
+  application providers without per-tool backend adapters.
+- Added a compact environment-backed coding workspace profile with bounded reads,
+  exact edits, `rg` glob/grep, binary hex inspection, listings, and directory creation.
+- Added provider-neutral managed `web_fetch` capability/tool support with a Kimi
+  `/coding/v1/fetch` adapter, public-initial-URL validation, and bounded text results.
 - Added run-scoped `RuntimeInput` delivery and explicit idle wait/wakeup. Background
   work can wake an Engine at the next model-safe boundary without polling, advancing
   steps while idle, or fabricating a second tool result.
@@ -49,6 +56,11 @@ How to update:
 
 ### Fixed
 
+- Fixed structured tool failures being recorded as successful actions. Explicit QitOS
+  `status=error/failed/failure` results now preserve their payload and produce an
+  `ActionStatus.ERROR`.
+- Fixed bound function tools and fail-closed coding profiles mutating shared permission
+  metadata across toolset instances.
 - Fixed immediate cancellation finalization so the END event, canonical State, `TaskResult`/`EngineResult`, and trace manifest all report `cancelled_immediate`; cancelled manifests now use the existing terminal `stopped` status instead of `completed`.
 - Fixed native text fallback so malformed structured action output enters parser recovery instead of being misreported as a successful final answer, while ordinary natural-language conclusions still use `native_text_final`.
 - Fixed message-window trimming so native tool results whose declaring assistant call has been evicted are removed before provider dispatch, while complete tool chains and existing interrupted-call recovery remain unchanged.

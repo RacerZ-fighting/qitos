@@ -18,6 +18,13 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Environment-backed coding tools**: named Env capability groups now let the same
+  bounded workspace tools run against host, container, or remote providers. The compact
+  workspace profile includes reads/writes/exact edits, fixed-argv `rg` search, hex view,
+  and directory inspection without per-tool backend adapters.
+- **Managed public web fetch**: a provider-neutral `web_fetch` tool now includes a Kimi
+  managed-fetch adapter, public-initial-URL validation, bounded results, and explicit
+  provider failure categories.
 - **Runtime input and idle wait**: background work can post a small event to an exact
   Engine run. Explicit runtime waits sleep without model polling or step growth and
   wake on input, cancellation, or the run deadline.
