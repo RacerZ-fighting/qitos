@@ -182,6 +182,10 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
                 groups = getattr(spec, "required_ops", None)
                 if isinstance(groups, list):
                     required.update(str(x) for x in groups if str(x))
+                if engine.env is not None:
+                    groups = getattr(spec, "environment_ops", None)
+                    if isinstance(groups, list):
+                        required.update(str(x) for x in groups if str(x))
         except Exception as exc:
             _logger.debug("Failed to collect required ops: %s", exc)
             return required

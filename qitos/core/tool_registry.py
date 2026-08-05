@@ -210,6 +210,7 @@ class ToolRegistry:
             "description": tool.spec.description,
             "prompt": tool.spec.prompt,
             "required_ops": list(tool.spec.required_ops),
+            "environment_ops": list(tool.spec.environment_ops),
             "input_schema": dict(tool.spec.input_schema or {}),
             "output_schema": dict(tool.spec.output_schema or {}),
             "read_only": bool(tool.spec.read_only),
@@ -276,6 +277,10 @@ class ToolRegistry:
             lines.append(f"Source: {origin.source}")
             if tool.spec.required_ops:
                 lines.append(f"Required Ops: {', '.join(tool.spec.required_ops)}")
+            if tool.spec.environment_ops:
+                lines.append(
+                    f"Environment Ops: {', '.join(tool.spec.environment_ops)}"
+                )
             if origin.toolset_name:
                 lines.append(f"ToolSet: {origin.toolset_name}@{origin.toolset_version}")
             lines.append("Parameters:")
@@ -319,6 +324,7 @@ class ToolRegistry:
                         "command": tool.spec.permissions.command,
                     },
                     "required_ops": list(tool.spec.required_ops),
+                    "environment_ops": list(tool.spec.environment_ops),
                     "capabilities": {
                         "read_only": bool(tool.spec.read_only),
                         "concurrency_safe": bool(tool.spec.concurrency_safe),
@@ -354,6 +360,7 @@ class ToolRegistry:
                     read_only=tool.spec.read_only,
                     concurrency_safe=tool.spec.concurrency_safe,
                     required_ops=list(tool.spec.required_ops),
+                    environment_ops=list(tool.spec.environment_ops),
                 )
             )
         return specs

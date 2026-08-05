@@ -1,5 +1,6 @@
 """Concrete environment implementations for QitOS."""
 
+from .capability_env import CapabilityEnv
 from .desktop import ContainerDesktopProvider, DesktopEnv, MockDesktopProvider
 from .docker_env import DockerEnv, DockerEnvScheduler
 from .host_env import HostEnv
@@ -10,6 +11,7 @@ from .tmux_env import TmuxEnv, TmuxTerminalCapability
 from .web import MockBrowserProvider, PlaywrightBrowserProvider, WebBrowserEnv
 
 __all__ = [
+    "CapabilityEnv",
     "HostEnv",
     "DesktopEnv",
     "ContainerDesktopProvider",

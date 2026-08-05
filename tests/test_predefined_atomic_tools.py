@@ -251,7 +251,7 @@ def test_coding_toolset_uses_one_canonical_schema_surface():
     create_schema = registry.describe_tool("create")["input_schema"]["properties"]
     range_schema = registry.describe_tool("read_file_range")["input_schema"]["properties"]
 
-    assert set(read_schema) == {"path"}
+    assert set(read_schema) == {"path", "line_offset", "line_count"}
     assert set(write_schema) == {"path", "content"}
     assert set(append_schema) == {"path", "content"}
     assert set(create_schema) == {"path", "content"}

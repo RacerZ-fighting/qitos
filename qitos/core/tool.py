@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, cast, get_type_hints
 
@@ -27,6 +28,7 @@ class ToolPermissionSpec:
     read_only: bool = False
     concurrency_safe: Optional[bool] = None
     required_ops: List[str] = field(default_factory=list)
+    environment_ops: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -37,6 +39,7 @@ class ToolPermissionSpec:
             "read_only": self.read_only,
             "concurrency_safe": self.concurrency_safe,
             "required_ops": list(self.required_ops),
+            "environment_ops": list(self.environment_ops),
         }
 
 
@@ -240,6 +243,7 @@ class ToolSpec:
     on_failure: Optional[Callable] = None
     permissions: ToolPermission = field(default_factory=ToolPermission)
     required_ops: List[str] = field(default_factory=list)
+    environment_ops: List[str] = field(default_factory=list)
     input_schema: Optional[Dict[str, Any]] = None
     output_schema: Optional[Dict[str, Any]] = None
     read_only: bool = False
@@ -264,6 +268,7 @@ class ToolMeta:
     on_failure: Optional[Callable] = None
     permissions: ToolPermission = field(default_factory=ToolPermission)
     required_ops: List[str] = field(default_factory=list)
+    environment_ops: List[str] = field(default_factory=list)
     input_schema: Optional[Dict[str, Any]] = None
     output_schema: Optional[Dict[str, Any]] = None
     read_only: bool = False
@@ -407,8 +412,8 @@ class FunctionTool(BaseTool):
         # Create a bound copy that prepends obj (self) to the function call
         bound = FunctionTool.__new__(FunctionTool)
         bound.func = self.func.__get__(obj, objtype)
-        bound.meta = self.meta
-        bound.spec = self.spec
+        bound.meta = deepcopy(self.meta)
+        bound.spec = deepcopy(self.spec)
         return bound
 
     def run(self, **kwargs: Any) -> Any:
@@ -450,6 +455,7 @@ def tool(
     on_failure: Optional[Callable] = None,
     permissions: Optional[ToolPermission] = None,
     required_ops: Optional[List[str]] = None,
+    environment_ops: Optional[List[str]] = None,
     input_schema: Optional[Dict[str, Any]] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     read_only: bool = False,
@@ -474,6 +480,7 @@ def tool(
             on_failure=on_failure,
             permissions=permissions or ToolPermission(),
             required_ops=list(required_ops or []),
+            environment_ops=list(environment_ops or []),
             input_schema=input_schema,
             output_schema=output_schema,
             read_only=read_only,
@@ -623,6 +630,7 @@ def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
         on_failure=meta.on_failure,
         permissions=meta.permissions,
         required_ops=list(meta.required_ops),
+        environment_ops=list(meta.environment_ops),
         input_schema=meta.input_schema
         or {
             "type": "object",

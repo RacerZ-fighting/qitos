@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import base64
 import shlex
 import subprocess
 import threading
+import uuid
 from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, Iterator, Optional, Sequence
 
-from qitos.core.env import CommandCapability, FileSystemCapability
+from qitos.core.env import (
+    CommandCapability,
+    FileStat,
+    FileSystemCapability,
+    TextFileChunk,
+)
 from qitos.kit.env.host_env import HostEnv
 
 
@@ -53,6 +60,83 @@ class DockerCommandCapability(CommandCapability):
                 "container": self.container,
             }
 
+    def run_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: int = 30,
+        cwd: str | None = None,
+        stdin: bytes | None = None,
+    ) -> Dict[str, Any]:
+        args = [str(item) for item in argv]
+        if not args or not args[0].strip():
+            raise ValueError("argv must contain a non-empty executable")
+        workdir = self.workdir if cwd is None else _docker_scoped_path(self.workdir, cwd)
+        docker_argv = ["docker", "exec"]
+        if stdin is not None:
+            docker_argv.append("-i")
+        docker_argv.extend(["-w", workdir, self.container, *args])
+        result = subprocess.run(
+            docker_argv,
+            input=stdin,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "status": "success" if result.returncode == 0 else "partial",
+            "returncode": result.returncode,
+            "stdout": result.stdout.decode("utf-8", errors="replace"),
+            "stderr": result.stderr.decode("utf-8", errors="replace"),
+            "argv": args,
+            "container": self.container,
+            "cwd": workdir,
+        }
+
+    def start(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        stdout_path: str | None = None,
+    ) -> Dict[str, Any]:
+        if not command or not command.strip():
+            raise ValueError("command cannot be empty")
+        workdir = self.workdir if cwd is None else _docker_scoped_path(self.workdir, cwd)
+        relative_log = stdout_path or f".qitos/background/{uuid.uuid4().hex}.log"
+        log_path = _docker_scoped_path(self.workdir, relative_log)
+        shell_command = (
+            f"mkdir -p -- {shlex.quote(str(PurePosixPath(log_path).parent))} && "
+            f"({command}) > {shlex.quote(log_path)} 2>&1 & echo $!"
+        )
+        result = _run(
+            [
+                "docker",
+                "exec",
+                "-w",
+                workdir,
+                self.container,
+                "sh",
+                "-lc",
+                shell_command,
+            ]
+        )
+        if result.returncode != 0:
+            return {
+                "status": "error",
+                "error": result.stderr or "failed to start background command",
+                "command": command,
+                "container": self.container,
+            }
+        return {
+            "status": "success",
+            "command": command,
+            "pid": int(result.stdout.strip()),
+            "stdout_path": _relative_docker_path(self.workdir, log_path),
+            "container": self.container,
+            "cwd": workdir,
+        }
+
 
 class DockerFSCapability(FileSystemCapability):
     def __init__(self, container: str, workdir: str = "/workspace"):
@@ -60,54 +144,273 @@ class DockerFSCapability(FileSystemCapability):
         self.workdir = workdir.rstrip("/") or "/workspace"
         self.cmd = DockerCommandCapability(container=container, workdir=workdir)
 
-    def read_text(self, path: str) -> str:
+    def resolve_path(self, path: str, *, allow_missing: bool = False) -> str:
         inner = self._inner_path(path)
-        result = self.cmd.run(f"cat {shlex.quote(inner)}")
-        if result.get("returncode", 1) != 0:
+        argv = ["realpath", "-m" if allow_missing else "-e", "--", inner]
+        result = self.cmd.run_argv(argv)
+        if int(result.get("returncode", 1)) != 0:
+            raise FileNotFoundError(path)
+        resolved = str(result.get("stdout", "")).strip()
+        _relative_docker_path(self.workdir, resolved)
+        return resolved
+
+    def stat(self, path: str, *, follow_symlinks: bool = True) -> FileStat:
+        inner = self._inner_path(path)
+        flags = ["-L"] if follow_symlinks else []
+        result = self.cmd.run_argv(
+            ["stat", *flags, "-c", "%F\t%s\t%Y", "--", inner]
+        )
+        if int(result.get("returncode", 1)) != 0:
+            raise FileNotFoundError(path)
+        raw_kind, raw_size, raw_mtime = str(result.get("stdout", "")).strip().split(
+            "\t", maxsplit=2
+        )
+        kind = (
+            "file"
+            if raw_kind == "regular file"
+            else "directory"
+            if raw_kind == "directory"
+            else "symlink"
+            if raw_kind == "symbolic link"
+            else "other"
+        )
+        return FileStat(
+            path=_relative_docker_path(self.workdir, inner),
+            kind=kind,
+            size=int(raw_size),
+            modified_at=float(raw_mtime),
+        )
+
+    def read_bytes(
+        self,
+        path: str,
+        limit: int | None = None,
+        *,
+        offset: int = 0,
+    ) -> bytes:
+        if limit is not None and limit <= 0:
+            raise ValueError("limit must be positive")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+        inner = self.resolve_path(path)
+        read_command = f"base64 -w 0 -- {shlex.quote(inner)}"
+        if offset:
+            read_command = (
+                f"tail -c +{offset + 1} -- {shlex.quote(inner)} | base64 -w 0"
+            )
+        if limit is not None:
+            source = (
+                f"tail -c +{offset + 1} -- {shlex.quote(inner)}"
+                if offset
+                else f"cat -- {shlex.quote(inner)}"
+            )
+            read_command = f"{source} | head -c {int(limit)} | base64 -w 0"
+        result = self.cmd.run(read_command)
+        if int(result.get("returncode", 1)) != 0:
             raise RuntimeError(str(result.get("stderr", "failed to read file")))
-        return str(result.get("stdout", ""))
+        return base64.b64decode(str(result.get("stdout", "")), validate=True)
+
+    def read_text(self, path: str) -> str:
+        return self.read_bytes(path).decode("utf-8")
+
+    def read_text_chunk(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        limit: int = 1000,
+        max_bytes: int = 100 * 1024,
+        max_line_bytes: int = 2000,
+    ) -> TextFileChunk:
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
+        if limit <= 0 or max_bytes <= 0 or max_line_bytes <= 0:
+            raise ValueError("limit and byte bounds must be positive")
+
+        info = self.stat(path)
+        if not info.is_file:
+            raise IsADirectoryError(path)
+        inner = self.resolve_path(path)
+        if info.size > 0:
+            text_probe = self.cmd.run(
+                f"LC_ALL=C grep -Iq -- '' {shlex.quote(inner)}"
+            )
+            if int(text_probe.get("returncode", 1)) != 0:
+                raise UnicodeError(f"file is not UTF-8 text: {path}")
+
+        count_result = self.cmd.run_argv(
+            ["awk", "END { print NR }", inner]
+        )
+        if int(count_result.get("returncode", 1)) != 0:
+            raise RuntimeError(
+                str(count_result.get("stderr", "failed to count file lines"))
+            )
+        total_lines = int(str(count_result.get("stdout", "0")).strip() or "0")
+
+        start = offset + 1
+        end = offset + limit
+        read_command = (
+            f"sed -n {start},{end}p -- {shlex.quote(inner)} | "
+            f"head -c {max_bytes} | base64 -w 0"
+        )
+        result = self.cmd.run(read_command)
+        if int(result.get("returncode", 1)) != 0:
+            raise RuntimeError(str(result.get("stderr", "failed to read file chunk")))
+        raw = base64.b64decode(str(result.get("stdout", "")), validate=True)
+        content = raw.decode("utf-8", errors="strict")
+        if "\x00" in content:
+            raise UnicodeError(f"file contains NUL bytes: {path}")
+
+        line_truncated = False
+        lines: list[str] = []
+        for line in content.splitlines():
+            rendered, was_truncated = _truncate_utf8(line, max_line_bytes)
+            line_truncated = line_truncated or was_truncated
+            lines.append(rendered)
+        line_count = len(lines)
+        has_crlf = b"\r\n" in raw
+        has_lf = b"\n" in raw.replace(b"\r\n", b"")
+        has_lone_cr = b"\r" in raw.replace(b"\r\n", b"")
+        line_ending = (
+            "mixed"
+            if has_lone_cr or has_crlf and has_lf
+            else "crlf"
+            if has_crlf
+            else "lf"
+        )
+        has_more = total_lines > offset + line_count
+        byte_truncated = len(raw) >= max_bytes and has_more
+        return TextFileChunk(
+            content="\n".join(lines),
+            offset=offset,
+            line_count=line_count,
+            total_lines=total_lines,
+            size_bytes=info.size,
+            has_more=has_more,
+            truncated=line_truncated or byte_truncated,
+            line_ending=line_ending,
+        )
 
     def write_text(self, path: str, content: str) -> None:
-        inner = self._inner_path(path)
-        # ``printf '%s'`` does not interpret backslashes in its argument.  The
-        # old implementation doubled every backslash before shell quoting,
-        # silently changing source files and binary-builder helpers written in
-        # a Docker environment.  Only the surrounding single-quoted shell
-        # literal needs escaping.
-        encoded = content.replace("'", "'\"'\"'")
-        cmd = f"mkdir -p {shlex.quote(str(Path(inner).parent))} && printf '%s' '{encoded}' > {shlex.quote(inner)}"
-        result = self.cmd.run(cmd)
-        if result.get("returncode", 1) != 0:
+        self.write_bytes(path, content.encode("utf-8"))
+
+    def write_bytes(self, path: str, content: bytes) -> None:
+        inner = self.resolve_path(path, allow_missing=True)
+        parent_result = self.cmd.run_argv(
+            ["mkdir", "-p", "--", str(PurePosixPath(inner).parent)]
+        )
+        if int(parent_result.get("returncode", 1)) != 0:
+            raise RuntimeError(
+                str(parent_result.get("stderr", "failed to create parent directory"))
+            )
+        result = self.cmd.run_argv(
+            ["dd", f"of={inner}", "status=none"], stdin=content
+        )
+        if int(result.get("returncode", 1)) != 0:
             raise RuntimeError(str(result.get("stderr", "failed to write file")))
 
+    def append_text(self, path: str, content: str) -> None:
+        inner = self.resolve_path(path, allow_missing=True)
+        parent_result = self.cmd.run_argv(
+            ["mkdir", "-p", "--", str(PurePosixPath(inner).parent)]
+        )
+        if int(parent_result.get("returncode", 1)) != 0:
+            raise RuntimeError(
+                str(parent_result.get("stderr", "failed to create parent directory"))
+            )
+        result = self.cmd.run_argv(
+            [
+                "dd",
+                f"of={inner}",
+                "oflag=append",
+                "conv=notrunc",
+                "status=none",
+            ],
+            stdin=content.encode("utf-8"),
+        )
+        if int(result.get("returncode", 1)) != 0:
+            raise RuntimeError(str(result.get("stderr", "failed to append file")))
+
+    def make_directory(self, path: str, *, parents: bool = True) -> None:
+        inner = self.resolve_path(path, allow_missing=True)
+        argv = ["mkdir", "-p", "--", inner] if parents else ["mkdir", "--", inner]
+        result = self.cmd.run_argv(argv)
+        if int(result.get("returncode", 1)) != 0:
+            raise RuntimeError(str(result.get("stderr", "failed to create directory")))
+
+    def list_entries(self, path: str = ".") -> list[FileStat]:
+        inner = self.resolve_path(path)
+        result = self.cmd.run_argv(
+            ["find", inner, "-mindepth", "1", "-maxdepth", "1", "-print0"]
+        )
+        if int(result.get("returncode", 1)) != 0:
+            raise RuntimeError(str(result.get("stderr", "failed to list directory")))
+        paths = sorted(
+            item for item in str(result.get("stdout", "")).split("\0") if item
+        )
+        return [
+            self.stat(
+                _relative_docker_path(self.workdir, item), follow_symlinks=False
+            )
+            for item in paths
+        ]
+
     def list_files(self, path: str = ".", limit: int = 200) -> list[str]:
-        inner = self._inner_path(path)
-        cmd = f"find {shlex.quote(inner)} -type f | head -n {int(limit)}"
-        result = self.cmd.run(cmd)
-        if result.get("returncode", 1) != 0:
-            return []
-        prefix = self.workdir.rstrip("/") + "/"
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        inner = self.resolve_path(path)
+        result = self.cmd.run_argv(["find", inner, "-type", "f", "-print0"])
+        if int(result.get("returncode", 1)) != 0:
+            raise RuntimeError(str(result.get("stderr", "failed to list files")))
         out: list[str] = []
-        for line in str(result.get("stdout", "")).splitlines():
-            line = line.strip()
-            if not line:
+        for item in sorted(str(result.get("stdout", "")).split("\0")):
+            if not item:
                 continue
-            out.append(line[len(prefix) :] if line.startswith(prefix) else line)
+            out.append(_relative_docker_path(self.workdir, item))
+            if len(out) >= limit:
+                break
         return out
 
     def exists(self, path: str) -> bool:
-        inner = self._inner_path(path)
-        result = self.cmd.run(f"test -e {shlex.quote(inner)}")
-        return int(result.get("returncode", 1)) == 0
+        try:
+            self.resolve_path(path)
+        except (FileNotFoundError, PermissionError):
+            return False
+        return True
 
     def _inner_path(self, path: str) -> str:
-        p = str(path)
-        # Absolute paths are used verbatim (valid under a same-path bind mount
-        # or an explicit in-container absolute path). Only relative paths are
-        # resolved against the container workdir.
-        if p.startswith("/"):
-            return p
-        return f"{self.workdir}/{p}" if p else self.workdir
+        return _docker_scoped_path(self.workdir, path)
+
+
+def _docker_scoped_path(workdir: str, path: str) -> str:
+    root = PurePosixPath(workdir)
+    candidate = PurePosixPath(str(path or "."))
+    if candidate.is_absolute():
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise PermissionError(f"path outside container workspace: {path}") from exc
+        return candidate.as_posix()
+    if any(part == ".." for part in candidate.parts):
+        raise PermissionError(f"parent traversal is outside container workspace: {path}")
+    return (root / candidate).as_posix()
+
+
+def _relative_docker_path(workdir: str, path: str) -> str:
+    try:
+        return PurePosixPath(path).relative_to(PurePosixPath(workdir)).as_posix()
+    except ValueError as exc:
+        raise PermissionError(f"path outside container workspace: {path}") from exc
+
+
+def _truncate_utf8(text: str, max_bytes: int) -> tuple[str, bool]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    if max_bytes <= 3:
+        return "." * max_bytes, True
+    prefix = encoded[: max_bytes - 3].decode("utf-8", errors="ignore")
+    return prefix + "...", True
 
 
 class DockerEnv(HostEnv):

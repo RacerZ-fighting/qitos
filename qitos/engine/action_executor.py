@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 from ..core.action import Action, ActionExecutionPolicy, ActionResult, ActionStatus
 from ..core.env import Env
 from ..core.interceptor import InterceptorChain, InterceptorContext
+from ..core.tool_result import ToolResult
 from ..core.tool import (
     BaseTool,
     ToolPermissionContext,
@@ -860,9 +861,33 @@ class ActionExecutor:
                     "on_after_tool_use", action.name, effective_args,
                     tool_result=output, permission_decision=permission.decision,
                 )
-                # Track reads / invalidate writes for read-before-write
-                self._track_file_access(action.name, effective_args, output)
                 normalized_output = self._normalize_output(tool, output)
+                reported_error = self._reported_tool_error(normalized_output)
+                if reported_error is not None:
+                    result = self._finish_result(
+                        action=action,
+                        status=ActionStatus.ERROR,
+                        start=start,
+                        attempts=attempts,
+                        tool_meta=tool_meta,
+                        output=normalized_output,
+                        error=reported_error,
+                        extra_metadata={
+                            **ordering_meta,
+                            "error_category": "tool_reported_error",
+                            "permission": self._permission_payload(permission),
+                            "progress_count": len(runtime_context["progress_events"]),
+                            "artifacts": list(runtime_context["artifacts"]),
+                            "ended_at": time.time(),
+                        },
+                    )
+                    if self._interceptor_chain is not None:
+                        result = self._interceptor_chain.after_execute(
+                            action, result, interceptor_context
+                        )
+                    return result
+                # Track reads / invalidate writes only after a successful tool result.
+                self._track_file_access(action.name, effective_args, normalized_output)
                 latency = (time.monotonic() - start) * 1000
                 result_metadata = {
                     **tool_meta,
@@ -999,6 +1024,7 @@ class ActionExecutor:
         self, name: str, env: Optional[Env], state: Any
     ) -> Dict[str, Any]:
         required_ops = self._required_ops(name)
+        environment_ops = self._environment_ops(name)
         permission_context = self._resolve_permission_context(env=env, state=state)
         progress_events: List[Dict[str, Any]] = []
         artifacts: List[Dict[str, Any]] = []
@@ -1015,7 +1041,8 @@ class ActionExecutor:
                 getattr(env, "attestation", {}) or {}
             ) if env is not None else {},
             "state": state,
-            "ops": self._resolve_ops(required_ops, env),
+            "ops": self._resolve_ops(required_ops, env)
+            | self._resolve_environment_ops(environment_ops, env),
             "tool_registry": self.tool_registry,
             "permission_context": permission_context,
             "progress_events": progress_events,
@@ -1121,6 +1148,8 @@ class ActionExecutor:
         )
 
     def _normalize_output(self, tool: Optional[BaseTool], output: Any) -> Any:
+        if isinstance(output, ToolResult):
+            output = output.to_dict()
         if tool is None:
             return output
         max_chars = getattr(getattr(tool, "spec", None), "result_max_chars", None)
@@ -1136,6 +1165,18 @@ class ActionExecutor:
                     normalized[key] = self._truncate_text(value, max_chars)
             return normalized
         return output
+
+    @staticmethod
+    def _reported_tool_error(output: Any) -> str | None:
+        """Return the message from QitOS's explicit structured error contract."""
+
+        if not isinstance(output, dict):
+            return None
+        status = str(output.get("status") or "").strip().casefold()
+        if status not in {"error", "failed", "failure"}:
+            return None
+        message = output.get("error") or output.get("message") or status
+        return str(message)
 
     def _truncate_text(self, text: str, max_chars: int) -> str:
         if len(text) <= max_chars:
@@ -1190,6 +1231,18 @@ class ActionExecutor:
                 return []
         return []
 
+    def _environment_ops(self, name: str) -> List[str]:
+        if hasattr(self.tool_registry, "get"):
+            try:
+                tool = self.tool_registry.get(name)
+                if tool is not None and hasattr(tool, "spec"):
+                    value = getattr(getattr(tool, "spec"), "environment_ops", None)
+                    if isinstance(value, list):
+                        return [str(item) for item in value]
+            except Exception:
+                return []
+        return []
+
     def _resolve_ops(
         self, required_ops: List[str], env: Optional[Env]
     ) -> Dict[str, Any]:
@@ -1208,6 +1261,13 @@ class ActionExecutor:
                 )
             out[group] = ops
         return out
+
+    def _resolve_environment_ops(
+        self, environment_ops: List[str], env: Optional[Env]
+    ) -> Dict[str, Any]:
+        if env is None or not environment_ops:
+            return {}
+        return self._resolve_ops(environment_ops, env)
 
     def _tool_meta(self, name: str) -> dict[str, Any]:
         if hasattr(self.tool_registry, "describe_tool"):

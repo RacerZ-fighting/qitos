@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Sequence
 
 
 @dataclass
@@ -35,6 +35,48 @@ class EnvStepResult:
     reward: Optional[float] = None
     info: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class FileStat:
+    """Backend-neutral metadata for one capability-scoped path."""
+
+    path: str
+    kind: Literal["file", "directory", "symlink", "other"]
+    size: int
+    modified_at: float | None = None
+
+    @property
+    def is_file(self) -> bool:
+        """Whether the path is a regular file."""
+
+        return self.kind == "file"
+
+    @property
+    def is_directory(self) -> bool:
+        """Whether the path is a directory."""
+
+        return self.kind == "directory"
+
+    @property
+    def is_symlink(self) -> bool:
+        """Whether the path itself is a symbolic link."""
+
+        return self.kind == "symlink"
+
+
+@dataclass(frozen=True)
+class TextFileChunk:
+    """Bounded, line-oriented view of a UTF-8 text file."""
+
+    content: str
+    offset: int
+    line_count: int
+    total_lines: int
+    size_bytes: int
+    has_more: bool
+    truncated: bool
+    line_ending: Literal["lf", "crlf", "mixed"] = "lf"
 
 
 class Env(ABC):
@@ -93,15 +135,61 @@ class Env(ABC):
 
 
 class FileSystemCapability(ABC):
-    """Filesystem capability contract used by env implementations."""
+    """Root-scoped filesystem contract used by environment implementations."""
+
+    @abstractmethod
+    def resolve_path(self, path: str, *, allow_missing: bool = False) -> str:
+        """Resolve a capability-relative path without escaping its root."""
+
+    @abstractmethod
+    def stat(self, path: str, *, follow_symlinks: bool = True) -> FileStat:
+        """Return metadata for a capability-relative path."""
+
+    @abstractmethod
+    def read_bytes(
+        self,
+        path: str,
+        limit: int | None = None,
+        *,
+        offset: int = 0,
+    ) -> bytes:
+        """Read raw bytes from ``offset``, optionally capped at ``limit`` bytes."""
 
     @abstractmethod
     def read_text(self, path: str) -> str:
         """Read UTF-8 text from file path."""
 
     @abstractmethod
+    def read_text_chunk(
+        self,
+        path: str,
+        *,
+        offset: int = 0,
+        limit: int = 1000,
+        max_bytes: int = 100 * 1024,
+        max_line_bytes: int = 2000,
+    ) -> TextFileChunk:
+        """Read a bounded whole-line UTF-8 chunk with file-level metadata."""
+
+    @abstractmethod
     def write_text(self, path: str, content: str) -> None:
         """Write UTF-8 text to file path."""
+
+    @abstractmethod
+    def write_bytes(self, path: str, content: bytes) -> None:
+        """Write raw bytes to file path."""
+
+    @abstractmethod
+    def append_text(self, path: str, content: str) -> None:
+        """Append UTF-8 text to file path."""
+
+    @abstractmethod
+    def make_directory(self, path: str, *, parents: bool = True) -> None:
+        """Create a directory inside the capability root."""
+
+    @abstractmethod
+    def list_entries(self, path: str = ".") -> List[FileStat]:
+        """List immediate children of one directory in stable name order."""
 
     @abstractmethod
     def list_files(self, path: str = ".", limit: int = 200) -> List[str]:
@@ -118,6 +206,28 @@ class CommandCapability(ABC):
     @abstractmethod
     def run(self, command: str, timeout: int = 30) -> Dict[str, Any]:
         """Run one command and return standardized result payload."""
+
+    @abstractmethod
+    def run_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: int = 30,
+        cwd: str | None = None,
+        stdin: bytes | None = None,
+    ) -> Dict[str, Any]:
+        """Run one process without interpreting arguments through a shell."""
+
+    def start(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        stdout_path: str | None = None,
+    ) -> Dict[str, Any]:
+        """Start one background shell command when the provider supports it."""
+
+        raise NotImplementedError("background commands are not supported")
 
 
 class TerminalCapability(ABC):
@@ -191,6 +301,8 @@ __all__ = [
     "EnvObservation",
     "EnvStepResult",
     "Env",
+    "FileStat",
+    "TextFileChunk",
     "FileSystemCapability",
     "CommandCapability",
     "TerminalCapability",

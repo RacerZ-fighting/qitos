@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-import fnmatch
+import json
 import os
 import re
-import subprocess
-import tempfile
+from copy import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
 
+from qitos.core.env import CommandCapability, FileSystemCapability
 from qitos.core.function_tool_decorator import function_tool
 from qitos.core.tool import ToolPermission
+from qitos.kit.env.host_env import HostCommandCapability, HostFSCapability
 from qitos.kit.tool.internal.coding_utils import (
     build_diff,
     default_rule_scope,
@@ -23,6 +24,7 @@ from qitos.kit.tool.internal.coding_utils import (
     truncate_text,
     utc_now,
 )
+from qitos.kit.tool.internal.runtime_ops import select_runtime_ops
 from qitos.kit.tool.notebook import NotebookToolSet
 
 try:  # optional dependency
@@ -74,6 +76,25 @@ def _default_rule_scope(args: Dict[str, Any]) -> Optional[str]:
     return default_rule_scope(args)
 
 
+def _join_capability_path(base: str, child: str) -> str:
+    normalized_base = str(base or ".").replace("\\", "/").strip("/")
+    normalized_child = str(child or "").replace("\\", "/")
+    while normalized_child.startswith("./"):
+        normalized_child = normalized_child[2:]
+    if not normalized_child or normalized_child.startswith("/"):
+        raise ValueError(f"process returned invalid workspace path: {child}")
+    parts = normalized_child.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"process returned invalid workspace path: {child}")
+    if normalized_base in {"", "."}:
+        return normalized_child
+    return f"{normalized_base}/{normalized_child}"
+
+
+def _capability_basename(path: str) -> str:
+    return str(path or ".").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+
 class CodingToolSet:
     """Canonical coding toolset with one stable, traditional tool surface."""
 
@@ -94,6 +115,7 @@ class CodingToolSet:
         profile: str = "full",
         include_http_tools: bool = False,
         auto_approve: bool = False,
+        allow_local_fallback: bool = True,
     ):
         self.workspace_root = os.path.abspath(workspace_root)
         self.shell_timeout = int(shell_timeout)
@@ -106,6 +128,15 @@ class CodingToolSet:
         self.profile = str(profile or "full")
         self.include_http_tools = bool(include_http_tools)
         self.auto_approve = bool(auto_approve)
+        self.allow_local_fallback = bool(allow_local_fallback)
+        self._local_file_ops = (
+            HostFSCapability(self.workspace_root) if self.allow_local_fallback else None
+        )
+        self._local_process_ops = (
+            HostCommandCapability(self.workspace_root)
+            if self.allow_local_fallback
+            else None
+        )
         self._notebook = (
             NotebookToolSet(workspace_root=self.workspace_root)
             if self.include_notebook
@@ -122,8 +153,22 @@ class CodingToolSet:
 
     def tools(self) -> List[Any]:
         items: List[Any] = []
+        if self.profile == "workspace":
+            items.extend(
+                [
+                    self.read_file,
+                    self.write_file,
+                    self.edit_file,
+                    self.glob,
+                    self.grep,
+                    self.hex_view,
+                    self.list_files,
+                    self.list_tree,
+                    self.make_directory,
+                ]
+            )
         # Claude Code modern-name aliases (Read, Edit, Write, Glob, Grep, Bash, etc.)
-        if self.expose_modern_names:
+        elif self.expose_modern_names:
             items.extend(
                 [
                     self.Read,
@@ -200,6 +245,23 @@ class CodingToolSet:
                 )
             if self._notebook is not None:
                 items.extend(self._notebook.tools())
+        if not self.allow_local_fallback:
+            bound_items: List[Any] = []
+            for item in items:
+                isolated = copy(item)
+                isolated.spec = copy(item.spec)
+                if hasattr(item, "meta"):
+                    isolated.meta = copy(item.meta)
+                isolated.spec.required_ops = list(
+                    dict.fromkeys(
+                        [
+                            *list(isolated.spec.required_ops or []),
+                            *list(isolated.spec.environment_ops or []),
+                        ]
+                    )
+                )
+                bound_items.append(isolated)
+            items = bound_items
         if self.auto_approve:
             for item in items:
                 if hasattr(item, "meta") and getattr(item.meta, "needs_approval", False):
@@ -208,122 +270,168 @@ class CodingToolSet:
                     item.spec.needs_approval = False
         return items
 
-    def _read_text_file(self, path: Path) -> tuple[str, str, float]:
-        raw = path.read_bytes()
+    def _file_ops(
+        self, runtime_context: Optional[Dict[str, Any]]
+    ) -> FileSystemCapability:
+        return select_runtime_ops(runtime_context, "file", self._local_file_ops)
+
+    def _process_ops(
+        self, runtime_context: Optional[Dict[str, Any]]
+    ) -> CommandCapability:
+        return select_runtime_ops(runtime_context, "process", self._local_process_ops)
+
+    def _read_text_file(
+        self,
+        path: str,
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> tuple[str, str, float]:
+        file_ops = self._file_ops(runtime_context)
+        raw = file_ops.read_bytes(path)
+        modified_at = file_ops.stat(path).modified_at
         return (
-            raw.decode("utf-8", errors="ignore"),
+            raw.decode("utf-8", errors="strict"),
             _detect_line_ending(raw),
-            path.stat().st_mtime,
+            float(modified_at or 0.0),
         )
 
     def _write_text_file(
-        self, path: Path, content: str, line_ending: str = "\n"
+        self,
+        path: str,
+        content: str,
+        line_ending: str,
+        runtime_context: Optional[Dict[str, Any]],
     ) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
         normalized = (
             content.replace("\r\n", "\n").replace("\r", "\n").replace("\n", line_ending)
         )
-        path.write_text(normalized, encoding="utf-8", newline="")
-
-    def _iter_files(self, base_dir: Path, include_hidden: bool = False) -> List[Path]:
-        files: List[Path] = []
-        for root, dirs, names in os.walk(base_dir):
-            if not include_hidden:
-                dirs[:] = [
-                    d
-                    for d in dirs
-                    if not d.startswith(".")
-                    and d not in {"__pycache__", "node_modules", ".venv"}
-                ]
-                names = [n for n in names if not n.startswith(".")]
-            for name in names:
-                files.append(Path(root) / name)
-        return files
+        self._file_ops(runtime_context).write_text(path, normalized)
 
     def _run_rg_files(
-        self, target_dir: Path, pattern: str, include_hidden: bool
-    ) -> Optional[List[str]]:
-        cmd = ["rg", "--files", str(target_dir), "-g", pattern]
+        self,
+        target_dir: str,
+        pattern: str,
+        include_hidden: bool,
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        cmd = ["rg", "--files", "--sort=path", "--glob", pattern]
         if include_hidden:
-            cmd.insert(1, "--hidden")
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        except FileNotFoundError:
-            return None
-        if result.returncode not in {0, 1}:
-            return None
-        rows = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        files: List[str] = []
-        for line in rows:
-            rel = os.path.relpath(line, self.workspace_root)
-            files.append(rel)
-        return sorted(files)
+            cmd.append("--hidden")
+        cmd.append(".")
+        result = self._process_ops(runtime_context).run_argv(
+            cmd,
+            timeout=self.shell_timeout,
+            cwd=target_dir,
+        )
+        returncode = int(result.get("returncode", 1))
+        if returncode not in {0, 1}:
+            message = str(result.get("stderr") or result.get("error") or "rg failed")
+            raise RuntimeError(f"Glob failed: {message.strip()}")
+        rows = [line.strip() for line in str(result.get("stdout", "")).splitlines()]
+        return sorted(
+            _join_capability_path(target_dir, row)
+            for row in rows
+            if row.strip()
+        )
 
     def _run_rg_grep(
         self,
         pattern: str,
-        target_dir: Path,
+        target_dir: str,
         glob: Optional[str],
         case_sensitive: bool,
         regex: bool,
         files_with_matches: bool,
-    ) -> Optional[List[Dict[str, Any]]]:
+        context: int,
+        file_type: Optional[str],
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
         cmd = ["rg", "--color", "never"]
         if files_with_matches:
-            cmd.append("-l")
+            cmd.extend(["--files-with-matches", "--null"])
         else:
-            cmd.extend(["--line-number", "--with-filename"])
+            cmd.append("--json")
         if not regex:
             cmd.append("-F")
         if not case_sensitive:
             cmd.append("-i")
         if glob:
-            cmd.extend(["-g", glob])
-        cmd.extend([pattern, str(target_dir)])
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        except FileNotFoundError:
-            return None
-        if result.returncode not in {0, 1}:
-            return None
-        rows = [
-            line.rstrip("\n") for line in result.stdout.splitlines() if line.strip()
-        ]
+            cmd.extend(["--glob", glob])
+        if file_type:
+            cmd.extend(["--type", file_type])
+        if context > 0 and not files_with_matches:
+            cmd.extend(["--context", str(context)])
+        cmd.extend(["--", pattern, "."])
+        result = self._process_ops(runtime_context).run_argv(
+            cmd,
+            timeout=self.shell_timeout,
+            cwd=target_dir,
+        )
+        returncode = int(result.get("returncode", 1))
+        if returncode not in {0, 1}:
+            message = str(result.get("stderr") or result.get("error") or "rg failed")
+            raise RuntimeError(f"Grep failed: {message.strip()}")
+
+        stdout = str(result.get("stdout", ""))
         matches: List[Dict[str, Any]] = []
-        for row in rows:
-            if files_with_matches:
-                matches.append({"path": os.path.relpath(row, self.workspace_root)})
+        if files_with_matches:
+            return [
+                {"path": _join_capability_path(target_dir, row)}
+                for row in stdout.split("\0")
+                if row
+            ]
+
+        for row in stdout.splitlines():
+            if not row.strip():
                 continue
-            parts = row.split(":", 2)
-            if len(parts) != 3:
+            event = json.loads(row)
+            if event.get("type") != "match":
                 continue
-            file_path, line_no, text = parts
+            data = event.get("data") or {}
+            raw_path = str((data.get("path") or {}).get("text") or "")
+            line_number = int(data.get("line_number") or 0)
+            text = str((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
             matches.append(
                 {
-                    "path": os.path.relpath(file_path, self.workspace_root),
-                    "line": int(line_no),
+                    "path": _join_capability_path(target_dir, raw_path),
+                    "line": line_number,
                     "text": text,
                 }
             )
         return matches
 
-    def _tree_lines(self, path: Path, depth: int) -> List[str]:
-        lines: List[str] = [f"{path.name or path}/"]
+    def _tree_lines(
+        self,
+        path: str,
+        depth: int,
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        file_ops = self._file_ops(runtime_context)
+        display_name = path.rstrip("/").rsplit("/", maxsplit=1)[-1] or "."
+        lines: List[str] = [f"{display_name}/"]
 
-        def walk(current: Path, indent: str, current_depth: int) -> None:
+        def walk(current: str, indent: str, current_depth: int) -> None:
             if current_depth >= depth:
                 return
             items = sorted(
-                [p for p in current.iterdir() if not p.name.startswith(".")],
-                key=lambda p: (p.is_file(), p.name),
+                [
+                    entry
+                    for entry in file_ops.list_entries(current)
+                    if not _capability_basename(entry.path).startswith(".")
+                ],
+                key=lambda entry: (
+                    entry.is_file,
+                    _capability_basename(entry.path),
+                ),
             )
             for index, item in enumerate(items):
                 is_last = index == len(items) - 1
                 connector = "`-- " if is_last else "|-- "
-                lines.append(f"{indent}{connector}{item.name}")
-                if item.is_dir():
+                lines.append(
+                    f"{indent}{connector}{_capability_basename(item.path)}"
+                )
+                if item.is_directory:
                     walk(
-                        item,
+                        item.path,
                         indent + ("    " if is_last else "|   "),
                         current_depth + 1,
                     )
@@ -415,6 +523,7 @@ class CodingToolSet:
         name="bash_v2",
         needs_approval=True,
         supports_background=True,
+        environment_ops=["process"],
         rule_scope_builder=_default_rule_scope,
     )
     def bash_v2(
@@ -451,7 +560,6 @@ class CodingToolSet:
         allow_needs_review: bool = False,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        _ = runtime_context
         text = str(command or "").strip()
         if not text:
             return {"status": "error", "message": "Command cannot be empty"}
@@ -488,56 +596,18 @@ class CodingToolSet:
                 "message": f"Command needs review: {analysis.explanation}",
                 "detected_patterns": analysis.detected_patterns,
             }
-        if run_in_background:
-            fd, stdout_path = tempfile.mkstemp(
-                prefix="qitos_bash_", suffix=".log", dir=self.workspace_root
-            )
-            os.close(fd)
-            with open(stdout_path, "w", encoding="utf-8") as handle:
-                process = subprocess.Popen(
-                    text,
-                    cwd=self.workspace_root,
-                    shell=True,
-                    stdout=handle,
-                    stderr=subprocess.STDOUT,
-                )
-            return {
-                "status": "success",
-                "command": text,
-                "pid": process.pid,
-                "stdout_path": stdout_path,
-            }
         try:
-            result = subprocess.run(
-                text,
-                cwd=self.workspace_root,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.shell_timeout,
-            )
-            return {
-                "status": "success" if result.returncode == 0 else "partial",
-                "command": text,
-                "returncode": result.returncode,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "cwd": self.workspace_root,
-            }
-        except subprocess.TimeoutExpired as e:
-            return {
-                "status": "error",
-                "message": f"Command timed out after {self.shell_timeout}s",
-                "command": text,
-                "stdout": e.stdout or "",
-                "stderr": e.stderr or "",
-            }
+            process_ops = self._process_ops(runtime_context)
+            if run_in_background:
+                return process_ops.start(text)
+            return process_ops.run(text, timeout=self.shell_timeout)
         except Exception as e:
             return {"status": "error", "message": str(e), "command": text}
 
     @function_tool(
         name="run_command",
         needs_approval=True,
+        environment_ops=["process"],
         rule_scope_builder=_default_rule_scope,
     )
     def run_command(
@@ -554,6 +624,7 @@ class CodingToolSet:
     @function_tool(
         name="file_read_v2",
         read_only=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
     def file_read_v2(
@@ -574,73 +645,94 @@ class CodingToolSet:
             boundary just after reaching this value.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        _ = runtime_context
         try:
-            resolved = _resolve_workspace_path(self.workspace_root, path)
-            if not resolved.exists():
-                return {"status": "error", "message": f"File not found: {path}"}
-            if resolved.is_dir():
+            file_ops = self._file_ops(runtime_context)
+            info = file_ops.stat(path)
+            if info.is_directory:
                 return {"status": "error", "message": f"Path is a directory: {path}"}
-            content, line_ending, _mtime = self._read_text_file(resolved)
-            lines = content.splitlines()
             start = max(0, int(offset))
-            size = max(1, int(limit))
-            chunk, truncated = _select_line_chunk(lines, start, size, int(max_chars))
-            chunk_text = "\n".join(chunk)
+            size = min(1000, max(1, int(limit)))
+            byte_limit = 100 * 1024
+            if int(max_chars) > 0:
+                byte_limit = min(byte_limit, int(max_chars))
+            chunk = file_ops.read_text_chunk(
+                path,
+                offset=start,
+                limit=size,
+                max_bytes=byte_limit,
+                max_line_bytes=2000,
+            )
             return {
                 "status": "success",
                 "path": str(path),
-                "content": chunk_text,
-                "line_ending": line_ending,
-                "offset": start,
-                "limit": len(chunk),
-                "total_lines": len(lines),
-                "has_more": start + len(chunk) < len(lines),
-                "truncated": truncated,
+                "content": chunk.content,
+                "line_ending": chunk.line_ending,
+                "offset": chunk.offset,
+                "limit": chunk.line_count,
+                "total_lines": chunk.total_lines,
+                "size_bytes": chunk.size_bytes,
+                "has_more": chunk.has_more,
+                "truncated": chunk.truncated,
             }
+        except FileNotFoundError:
+            return {"status": "error", "message": f"File not found: {path}"}
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
 
     @function_tool(
         name="read_file",
         read_only=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
     def read_file(
-        self, path: str, runtime_context: Optional[Dict[str, Any]] = None
+        self,
+        path: str,
+        line_offset: int = 0,
+        line_count: int = 1000,
+        runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Read the full text content of a workspace file.
+        Read a bounded text chunk from a workspace file.
 
         :param path: Path relative to the workspace root.
+        :param line_offset: Zero-based first line to return.
+        :param line_count: Maximum whole lines to return, capped at 1000.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        _ = runtime_context
-        try:
-            resolved = _resolve_workspace_path(self.workspace_root, path)
-            if not resolved.exists():
-                return {"status": "error", "message": f"File not found: {path}"}
-            if resolved.is_dir():
-                return {"status": "error", "message": f"Path is a directory: {path}"}
-            content, line_ending, _mtime = self._read_text_file(resolved)
-            return {
-                "status": "success",
-                "path": path,
-                "content": content,
-                "size": len(content),
-                "truncated": False,
-                "total_lines": len(content.splitlines()),
-                "line_ending": line_ending,
-            }
-        except Exception as e:
-            return {"status": "error", "message": str(e), "path": path}
+        result = self.file_read_v2(
+            path=path,
+            offset=line_offset,
+            limit=line_count,
+            max_chars=100 * 1024,
+            runtime_context=runtime_context,
+        )
+        if result.get("status") != "success":
+            return result
+        offset = int(result.get("offset", line_offset))
+        content = str(result.get("content", ""))
+        result["numbered_content"] = "\n".join(
+            f"{number}\t{line}"
+            for number, line in enumerate(content.splitlines(), start=offset + 1)
+        )
+        result["line_offset"] = offset
+        result["line_count"] = int(result.get("limit", 0))
+        result.pop("limit", None)
+        result.pop("offset", None)
+        return result
 
     @function_tool(
         name="view",
         read_only=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
-    def view(self, path: str, view_range: Optional[List[int]] = None) -> Dict[str, Any]:
+    def view(
+        self,
+        path: str,
+        view_range: Optional[List[int]] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         View a file or directory under the workspace root.
 
@@ -651,18 +743,24 @@ class CodingToolSet:
         readable listing of immediate child entries.
         """
         try:
-            resolved = _resolve_workspace_path(self.workspace_root, path)
-            if resolved.is_dir():
+            file_ops = self._file_ops(runtime_context)
+            info = file_ops.stat(path)
+            if info.is_directory:
                 entries = []
                 for item in sorted(
-                    resolved.iterdir(), key=lambda p: (p.is_file(), p.name)
+                    file_ops.list_entries(path),
+                    key=lambda entry: (
+                        entry.is_file,
+                        _capability_basename(entry.path),
+                    ),
                 ):
-                    if item.name.startswith("."):
+                    name = _capability_basename(item.path)
+                    if name.startswith("."):
                         continue
                     entries.append(
                         {
-                            "name": item.name,
-                            "type": "directory" if item.is_dir() else "file",
+                            "name": name,
+                            "type": "directory" if item.is_directory else "file",
                         }
                     )
                 return {
@@ -672,8 +770,6 @@ class CodingToolSet:
                     "entries": entries,
                     "count": len(entries),
                 }
-            if not resolved.exists():
-                return {"status": "error", "message": f"File not found: {path}"}
             start = 0
             limit = 200
             if isinstance(view_range, list) and len(view_range) == 2:
@@ -681,13 +777,21 @@ class CodingToolSet:
                 view_end = int(view_range[1])
                 start = max(0, view_start - 1)
                 limit = 100_000 if view_end == -1 else max(1, view_end - view_start + 1)
-            return self.file_read_v2(path=path, offset=start, limit=limit)
+            return self.file_read_v2(
+                path=path,
+                offset=start,
+                limit=limit,
+                runtime_context=runtime_context,
+            )
+        except FileNotFoundError:
+            return {"status": "error", "message": f"File not found: {path}"}
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
 
     @function_tool(
         name="list_files",
         read_only=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
     def list_files(
@@ -699,23 +803,29 @@ class CodingToolSet:
         :param path: Directory path relative to the workspace root.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        _ = runtime_context
         try:
-            resolved = _resolve_workspace_path(self.workspace_root, path)
-            if not resolved.is_dir():
+            file_ops = self._file_ops(runtime_context)
+            if not file_ops.stat(path).is_directory:
                 return {
                     "status": "error",
                     "message": f"Path is not a directory: {path}",
                 }
             items = []
-            for item in sorted(resolved.iterdir(), key=lambda p: (p.is_file(), p.name)):
-                if item.name.startswith("."):
+            for item in sorted(
+                file_ops.list_entries(path),
+                key=lambda entry: (
+                    entry.is_file,
+                    _capability_basename(entry.path),
+                ),
+            ):
+                name = _capability_basename(item.path)
+                if name.startswith("."):
                     continue
                 items.append(
                     {
-                        "name": item.name,
-                        "type": "directory" if item.is_dir() else "file",
-                        "size": item.stat().st_size if item.is_file() else None,
+                        "name": name,
+                        "type": "directory" if item.is_directory else "file",
+                        "size": item.size if item.is_file else None,
                     }
                 )
             return {
@@ -730,6 +840,7 @@ class CodingToolSet:
     @function_tool(
         name="write_file",
         needs_approval=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
     def write_file(
@@ -745,10 +856,8 @@ class CodingToolSet:
         :param content: Full text content to write into the file.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        _ = runtime_context
         try:
-            resolved = _resolve_workspace_path(self.workspace_root, path)
-            self._write_text_file(resolved, str(content), "\n")
+            self._write_text_file(path, str(content), "\n", runtime_context)
             return {"status": "success", "path": path, "size": len(content)}
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
@@ -756,16 +865,26 @@ class CodingToolSet:
     @function_tool(
         name="create",
         needs_approval=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
-    def create(self, path: str, content: str = "") -> Dict[str, Any]:
+    def create(
+        self,
+        path: str,
+        content: str = "",
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Create a new file with the given content.
 
         :param path: Path relative to the workspace root (e.g., `new_file.py`).
         :param content: Content to write to the new file.
         """
-        result = self.write_file(path=path, content=content)
+        result = self.write_file(
+            path=path,
+            content=content,
+            runtime_context=runtime_context,
+        )
         if result.get("status") != "success":
             return result
         return {
@@ -778,6 +897,7 @@ class CodingToolSet:
     @function_tool(
         name="file_edit_v2",
         needs_approval=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
     def file_edit_v2(
@@ -790,6 +910,7 @@ class CodingToolSet:
         start_line: int = 0,
         end_line: int = 0,
         replacement: str = "",
+        replace_all: bool = False,
         expected_mtime: Optional[float] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -804,19 +925,18 @@ class CodingToolSet:
         :param start_line: Starting line number for `replace_lines`.
         :param end_line: Ending line number for `replace_lines`.
         :param replacement: Replacement content for `replace_lines`.
+        :param replace_all: Replace every occurrence for `str_replace`.
         :param expected_mtime: Optional optimistic concurrency check.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        _ = runtime_context
         try:
-            resolved = _resolve_workspace_path(self.workspace_root, path)
-            if not resolved.exists():
-                return {
-                    "status": "error",
-                    "message": f"File not found: {path}",
-                    "path": path,
-                }
-            old_content, line_ending, current_mtime = self._read_text_file(resolved)
+            file_ops = self._file_ops(runtime_context)
+            if not file_ops.stat(path).is_file:
+                return {"status": "error", "message": f"Not a file: {path}"}
+            old_content, line_ending, current_mtime = self._read_text_file(
+                path,
+                runtime_context,
+            )
             if (
                 expected_mtime is not None
                 and abs(float(expected_mtime) - float(current_mtime)) > 1e-6
@@ -834,6 +954,12 @@ class CodingToolSet:
                         "message": "old_text cannot be empty",
                         "path": path,
                     }
+                if old_text == new_text:
+                    return {
+                        "status": "error",
+                        "message": "old_text and new_text are identical",
+                        "path": path,
+                    }
                 count = old_content.count(old_text)
                 if count == 0:
                     return {
@@ -841,15 +967,24 @@ class CodingToolSet:
                         "message": f"Text not found in {path}",
                         "path": path,
                     }
-                if count > 1:
+                if count > 1 and not replace_all:
                     return {
                         "status": "error",
                         "message": "Text replacement must be unique",
                         "path": path,
                         "occurrences": count,
                     }
-                new_content = old_content.replace(old_text, new_text, 1)
-                message = f"Replaced one occurrence in {path}"
+                replacement_count = count if replace_all else 1
+                new_content = old_content.replace(
+                    old_text,
+                    new_text,
+                    -1 if replace_all else 1,
+                )
+                message = (
+                    f"Replaced {replacement_count} occurrences in {path}"
+                    if replace_all
+                    else f"Replaced one occurrence in {path}"
+                )
             elif normalized_action == "insert":
                 try:
                     insert_line = int(insert_line)
@@ -907,7 +1042,7 @@ class CodingToolSet:
                     "message": f"Unsupported action: {normalized_action}",
                     "path": path,
                 }
-            self._write_text_file(resolved, new_content, line_ending)
+            self._write_text_file(path, new_content, line_ending, runtime_context)
             return {
                 "status": "success",
                 "path": path,
@@ -915,17 +1050,61 @@ class CodingToolSet:
                 "diff": _build_diff(old_content, new_content, path),
                 "line_ending": line_ending,
                 "expected_mtime": expected_mtime,
-                "current_mtime": resolved.stat().st_mtime,
+                "current_mtime": file_ops.stat(path).modified_at,
+            }
+        except FileNotFoundError:
+            return {
+                "status": "error",
+                "message": f"File not found: {path}",
+                "path": path,
             }
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
 
     @function_tool(
-        name="str_replace",
+        name="edit_file",
         needs_approval=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
-    def str_replace(self, path: str, old_str: str, new_str: str = "") -> Dict[str, Any]:
+    def edit_file(
+        self,
+        path: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool = False,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Replace exact text in one workspace file.
+
+        :param path: Path relative to the workspace root.
+        :param old_text: Exact text to replace. It must be unique by default.
+        :param new_text: Replacement text.
+        :param replace_all: Replace every occurrence instead of requiring uniqueness.
+        :param runtime_context: Optional runtime context injected by the executor.
+        """
+        return self.file_edit_v2(
+            path=path,
+            action="str_replace",
+            old_text=old_text,
+            new_text=new_text,
+            replace_all=replace_all,
+            runtime_context=runtime_context,
+        )
+
+    @function_tool(
+        name="str_replace",
+        needs_approval=True,
+        environment_ops=["file"],
+        rule_scope_builder=_default_rule_scope,
+    )
+    def str_replace(
+        self,
+        path: str,
+        old_str: str,
+        new_str: str = "",
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Replace one unique string fragment in a file.
 
@@ -934,15 +1113,26 @@ class CodingToolSet:
         :param new_str: The new string to replace old_str with.
         """
         return self.file_edit_v2(
-            path=path, action="str_replace", old_text=old_str, new_text=new_str
+            path=path,
+            action="str_replace",
+            old_text=old_str,
+            new_text=new_str,
+            runtime_context=runtime_context,
         )
 
     @function_tool(
         name="insert",
         needs_approval=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
-    def insert(self, path: str, insert_line: int, new_str: str) -> Dict[str, Any]:
+    def insert(
+        self,
+        path: str,
+        insert_line: int,
+        new_str: str,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Insert new text after a given line number.
 
@@ -951,16 +1141,26 @@ class CodingToolSet:
         :param new_str: String to insert.
         """
         return self.file_edit_v2(
-            path=path, action="insert", insert_line=insert_line, new_text=new_str
+            path=path,
+            action="insert",
+            insert_line=insert_line,
+            new_text=new_str,
+            runtime_context=runtime_context,
         )
 
     @function_tool(
         name="replace_lines",
         needs_approval=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
     def replace_lines(
-        self, path: str, start_line: int, end_line: int, replacement: str = ""
+        self,
+        path: str,
+        start_line: int,
+        end_line: int,
+        replacement: str = "",
+        runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Replace an inclusive line range with new content.
@@ -976,11 +1176,13 @@ class CodingToolSet:
             start_line=start_line,
             end_line=end_line,
             replacement=replacement,
+            runtime_context=runtime_context,
         )
 
     @function_tool(
         name="append_file",
         needs_approval=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
     def append_file(
@@ -996,17 +1198,14 @@ class CodingToolSet:
         :param content: Text to append.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        _ = runtime_context
         try:
-            resolved = _resolve_workspace_path(self.workspace_root, path)
-            resolved.parent.mkdir(parents=True, exist_ok=True)
-            with resolved.open("a", encoding="utf-8") as handle:
-                handle.write(content)
+            file_ops = self._file_ops(runtime_context)
+            file_ops.append_text(path, content)
             return {
                 "status": "success",
                 "path": path,
                 "appended_size": len(content),
-                "size": resolved.stat().st_size,
+                "size": file_ops.stat(path).size,
             }
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
@@ -1014,6 +1213,7 @@ class CodingToolSet:
     @function_tool(
         name="make_directory",
         needs_approval=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
     def make_directory(
@@ -1025,10 +1225,8 @@ class CodingToolSet:
         :param path: Directory path relative to the workspace root.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        _ = runtime_context
         try:
-            resolved = _resolve_workspace_path(self.workspace_root, path)
-            resolved.mkdir(parents=True, exist_ok=True)
+            self._file_ops(runtime_context).make_directory(path, parents=True)
             return {"status": "success", "path": path}
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
@@ -1036,6 +1234,7 @@ class CodingToolSet:
     @function_tool(
         name="glob_v2",
         read_only=True,
+        environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
     )
     def glob_v2(
@@ -1055,21 +1254,20 @@ class CodingToolSet:
         :param limit: Maximum number of matching files to return.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        _ = runtime_context
         if not str(pattern or "").strip():
             return {"status": "error", "message": "Pattern cannot be empty"}
         try:
-            target = _resolve_workspace_path(self.workspace_root, path)
-            matches = self._run_rg_files(target, pattern, include_hidden)
-            if matches is None:
-                matches = []
-                for item in self._iter_files(target, include_hidden=include_hidden):
-                    rel = os.path.relpath(str(item), self.workspace_root)
-                    if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(
-                        item.name, pattern
-                    ):
-                        matches.append(rel)
-                matches = sorted(matches)
+            if not self._file_ops(runtime_context).stat(path).is_directory:
+                return {
+                    "status": "error",
+                    "message": f"Path is not a directory: {path}",
+                }
+            matches = self._run_rg_files(
+                path,
+                pattern,
+                include_hidden,
+                runtime_context,
+            )
             capped = matches[: max(1, int(limit))]
             return {
                 "status": "success",
@@ -1091,6 +1289,7 @@ class CodingToolSet:
     @function_tool(
         name="glob_files",
         read_only=True,
+        environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
     )
     def glob_files(
@@ -1099,6 +1298,7 @@ class CodingToolSet:
         path: str = ".",
         include_hidden: bool = False,
         limit: int = 100,
+        runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Find files under the workspace that match a glob pattern.
@@ -1109,15 +1309,50 @@ class CodingToolSet:
         :param limit: Maximum number of matching files to return.
         """
         result = self.glob_v2(
-            pattern=pattern, path=path, include_hidden=include_hidden, limit=limit
+            pattern=pattern,
+            path=path,
+            include_hidden=include_hidden,
+            limit=limit,
+            runtime_context=runtime_context,
         )
         if result.get("status") == "success":
             result["num_files"] = result.get("match_count", 0)
         return result
 
     @function_tool(
+        name="glob",
+        read_only=True,
+        environment_ops=["file", "process"],
+        rule_scope_builder=_default_rule_scope,
+    )
+    def glob(
+        self,
+        pattern: str,
+        path: str = ".",
+        include_hidden: bool = False,
+        limit: int = 200,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Find workspace files with ripgrep's file inventory.
+
+        :param pattern: Glob pattern relative to path.
+        :param path: Workspace-relative directory to search.
+        :param include_hidden: Include hidden paths when true.
+        :param limit: Maximum sorted paths to return.
+        :param runtime_context: Optional runtime context injected by the executor.
+        """
+        return self.glob_v2(
+            pattern=pattern,
+            path=path,
+            include_hidden=include_hidden,
+            limit=limit,
+            runtime_context=runtime_context,
+        )
+
+    @function_tool(
         name="grep_v2",
         read_only=True,
+        environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
     )
     def grep_v2(
@@ -1130,6 +1365,7 @@ class CodingToolSet:
         files_with_matches: bool = False,
         limit: int = 100,
         context: int = 0,
+        file_type: Optional[str] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -1143,41 +1379,28 @@ class CodingToolSet:
         :param files_with_matches: Whether to return only matching file paths.
         :param limit: Maximum number of returned matches.
         :param context: Reserved context-line count for future expansion.
+        :param file_type: Optional ripgrep file type filter.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        _ = context
-        _ = runtime_context
         if not str(pattern or "").strip():
             return {"status": "error", "message": "Pattern cannot be empty"}
         try:
-            target = _resolve_workspace_path(self.workspace_root, path)
+            if not self._file_ops(runtime_context).stat(path).is_directory:
+                return {
+                    "status": "error",
+                    "message": f"Path is not a directory: {path}",
+                }
             matches = self._run_rg_grep(
-                pattern, target, glob, case_sensitive, regex, files_with_matches
+                pattern,
+                path,
+                glob,
+                case_sensitive,
+                regex,
+                files_with_matches,
+                max(0, int(context)),
+                file_type,
+                runtime_context,
             )
-            if matches is None:
-                flags = 0 if case_sensitive else re.IGNORECASE
-                matcher = re.compile(pattern if regex else re.escape(pattern), flags)
-                matches = []
-                for file_path in self._iter_files(target):
-                    rel = os.path.relpath(str(file_path), self.workspace_root)
-                    if glob and not (
-                        fnmatch.fnmatch(rel, glob)
-                        or fnmatch.fnmatch(file_path.name, glob)
-                    ):
-                        continue
-                    try:
-                        lines = file_path.read_text(
-                            encoding="utf-8", errors="ignore"
-                        ).splitlines()
-                    except Exception:
-                        continue
-                    if files_with_matches:
-                        if any(matcher.search(line) for line in lines):
-                            matches.append({"path": rel})
-                        continue
-                    for line_no, text in enumerate(lines, 1):
-                        if matcher.search(text):
-                            matches.append({"path": rel, "line": line_no, "text": text})
             capped = matches[: max(1, int(limit))]
             return {
                 "status": "success",
@@ -1193,18 +1416,13 @@ class CodingToolSet:
                     "files_with_matches": files_with_matches,
                 },
             }
-        except re.error as e:
-            return {
-                "status": "error",
-                "message": f"Invalid regex: {e}",
-                "pattern": pattern,
-            }
         except Exception as e:
             return {"status": "error", "message": str(e), "pattern": pattern}
 
     @function_tool(
         name="grep_files",
         read_only=True,
+        environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
     )
     def grep_files(
@@ -1216,6 +1434,7 @@ class CodingToolSet:
         regex: bool = True,
         files_with_matches: bool = False,
         limit: int = 100,
+        runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Search workspace files for a regex or literal text pattern.
@@ -1236,14 +1455,131 @@ class CodingToolSet:
             regex=regex,
             files_with_matches=files_with_matches,
             limit=limit,
+            runtime_context=runtime_context,
         )
         if result.get("status") == "success":
             result["num_matches"] = result.get("match_count", 0)
         return result
 
     @function_tool(
+        name="grep",
+        read_only=True,
+        environment_ops=["file", "process"],
+        rule_scope_builder=_default_rule_scope,
+    )
+    def grep(
+        self,
+        pattern: str,
+        path: str = ".",
+        glob: Optional[str] = None,
+        case_sensitive: bool = False,
+        regex: bool = True,
+        files_with_matches: bool = False,
+        limit: int = 100,
+        context: int = 0,
+        file_type: Optional[str] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Search workspace text with fixed-argv ripgrep.
+
+        :param pattern: Regular expression or literal text to find.
+        :param path: Workspace-relative directory to search.
+        :param glob: Optional file glob filter.
+        :param case_sensitive: Preserve case when true.
+        :param regex: Interpret pattern as regex when true, literal text otherwise.
+        :param files_with_matches: Return only matching paths when true.
+        :param limit: Maximum returned matches.
+        :param context: Number of context lines requested from ripgrep.
+        :param file_type: Optional ripgrep file type such as py or rust.
+        :param runtime_context: Optional runtime context injected by the executor.
+        """
+        return self.grep_v2(
+            pattern=pattern,
+            path=path,
+            glob=glob,
+            case_sensitive=case_sensitive,
+            regex=regex,
+            files_with_matches=files_with_matches,
+            limit=limit,
+            context=context,
+            file_type=file_type,
+            runtime_context=runtime_context,
+        )
+
+    @function_tool(
+        name="hex_view",
+        read_only=True,
+        environment_ops=["file"],
+        rule_scope_builder=_default_rule_scope,
+    )
+    def hex_view(
+        self,
+        path: str,
+        offset: int = 0,
+        length: int = 256,
+        width: int = 16,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Inspect an exact bounded byte range from a workspace file.
+
+        :param path: Path relative to the workspace root.
+        :param offset: Zero-based byte offset.
+        :param length: Number of bytes to display, from 1 through 4096.
+        :param width: Bytes per row: 8, 16, or 32.
+        :param runtime_context: Optional runtime context injected by the executor.
+        """
+        try:
+            start = int(offset)
+            size = int(length)
+            row_width = int(width)
+            if start < 0:
+                raise ValueError("offset must be non-negative")
+            if not 1 <= size <= 4096:
+                raise ValueError("length must be between 1 and 4096")
+            if row_width not in {8, 16, 32}:
+                raise ValueError("width must be 8, 16, or 32")
+            file_ops = self._file_ops(runtime_context)
+            info = file_ops.stat(path)
+            if not info.is_file:
+                return {"status": "error", "message": f"Not a file: {path}"}
+            if start >= info.size:
+                return {
+                    "status": "success",
+                    "path": path,
+                    "offset": start,
+                    "length": 0,
+                    "file_size": info.size,
+                    "content": "",
+                    "has_more": False,
+                }
+            raw = file_ops.read_bytes(path, limit=size, offset=start)
+            rows: List[str] = []
+            for index in range(0, len(raw), row_width):
+                chunk = raw[index : index + row_width]
+                hexadecimal = " ".join(f"{byte:02x}" for byte in chunk)
+                hexadecimal = hexadecimal.ljust(row_width * 3 - 1)
+                printable = "".join(
+                    chr(byte) if 32 <= byte < 127 else "." for byte in chunk
+                )
+                rows.append(
+                    f"{start + index:08x}  {hexadecimal}  |{printable}|"
+                )
+            return {
+                "status": "success",
+                "path": path,
+                "offset": start,
+                "length": len(raw),
+                "file_size": info.size,
+                "content": "\n".join(rows),
+                "has_more": start + len(raw) < info.size,
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e), "path": path}
+
+    @function_tool(
         name="read_file_range",
         read_only=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
     def read_file_range(
@@ -1280,23 +1616,41 @@ class CodingToolSet:
     @function_tool(
         name="search",
         read_only=True,
+        environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
     )
-    def search(self, path: str, keyword: str) -> Dict[str, Any]:
+    def search(
+        self,
+        path: str,
+        keyword: str,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         Search for a keyword inside files within a directory tree.
 
         :param path: Directory path relative to the workspace root.
         :param keyword: Keyword to search for.
         """
-        return self.grep_v2(pattern=keyword, path=path, regex=False, limit=15)
+        return self.grep_v2(
+            pattern=keyword,
+            path=path,
+            regex=False,
+            limit=15,
+            runtime_context=runtime_context,
+        )
 
     @function_tool(
         name="list_tree",
         read_only=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
-    def list_tree(self, path: str = ".", depth: int = 3) -> Dict[str, Any]:
+    def list_tree(
+        self,
+        path: str = ".",
+        depth: int = 3,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """
         List directory structure in a tree format.
 
@@ -1304,14 +1658,13 @@ class CodingToolSet:
         :param depth: Maximum depth to traverse.
         """
         try:
-            resolved = _resolve_workspace_path(self.workspace_root, path)
-            if not resolved.is_dir():
+            if not self._file_ops(runtime_context).stat(path).is_directory:
                 return {
                     "status": "error",
                     "message": f"Path is not a directory: {path}",
                 }
             normalized_depth = min(max(int(depth), 1), 10)
-            lines = self._tree_lines(resolved, normalized_depth)
+            lines = self._tree_lines(path, normalized_depth, runtime_context)
             return {
                 "status": "success",
                 "path": path,
@@ -2086,6 +2439,7 @@ class CodingToolSet:
     @function_tool(
         name="Read",
         read_only=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
         prompt=(
             "Reads a file from the local filesystem. You can access any file directly by using this tool.\n"
@@ -2107,7 +2461,7 @@ class CodingToolSet:
         *,
         pages: Optional[str] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> str | Dict[str, Any]:
         """Read a file, image, PDF, or notebook. Returns content with line numbers.
 
         :param file_path: Absolute or relative path to the file.
@@ -2124,18 +2478,26 @@ class CodingToolSet:
             runtime_context=runtime_context,
         )
         if result.get("status") != "success":
-            return f"Error reading file: {result.get('error', 'unknown error')}"
-        content = result.get("content", "")
+            return result
+        content = str(result.get("content", ""))
         # Add line numbers like Claude Code
-        lines = content.split("\n")
+        lines = content.splitlines() if content else []
         numbered = []
-        for i, line in enumerate(lines[offset : offset + limit], start=offset + 1):
+        start = int(result.get("offset", offset))
+        for i, line in enumerate(lines, start=start + 1):
             numbered.append(f"{i}\t{line}")
+        if result.get("has_more"):
+            next_offset = start + len(lines)
+            numbered.append(
+                f"[truncated: use offset={next_offset} to continue; "
+                f"total_lines={result.get('total_lines', '?')}]"
+            )
         return "\n".join(numbered)
 
     @function_tool(
         name="Edit",
         needs_approval=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
         prompt=(
             "Performs exact string replacements in files.\n"
@@ -2154,7 +2516,7 @@ class CodingToolSet:
         new_string: str,
         replace_all: bool = False,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> str | Dict[str, Any]:
         """Replace old_string with new_string in a file. old_string must be unique unless replace_all=True.
 
         :param file_path: Absolute or relative path to the file.
@@ -2168,15 +2530,17 @@ class CodingToolSet:
             action="str_replace",
             old_text=old_string,
             new_text=new_string,
+            replace_all=replace_all,
             runtime_context=runtime_context,
         )
         if result.get("status") != "success":
-            return f"Error editing file: {result.get('error', 'unknown error')}"
-        return result.get("content", "Edit applied successfully")
+            return result
+        return str(result.get("message") or "Edit applied successfully")
 
     @function_tool(
         name="Write",
         needs_approval=True,
+        environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
         prompt=(
             "Writes a file to the local filesystem.\n"
@@ -2192,7 +2556,7 @@ class CodingToolSet:
         file_path: str,
         content: str,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> str | Dict[str, Any]:
         """Write content to a file, creating it if it doesn't exist.
 
         :param file_path: Absolute or relative path to the file.
@@ -2205,12 +2569,13 @@ class CodingToolSet:
             runtime_context=runtime_context,
         )
         if result.get("status") != "success":
-            return f"Error writing file: {result.get('error', 'unknown error')}"
+            return result
         return f"Successfully wrote to {file_path}"
 
     @function_tool(
         name="Glob",
         read_only=True,
+        environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
         prompt=(
             "Fast file pattern matching tool that works with any codebase size.\n"
@@ -2223,7 +2588,7 @@ class CodingToolSet:
         pattern: str,
         path: str = ".",
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> str | Dict[str, Any]:
         """Find files matching a glob pattern.
 
         :param pattern: Glob pattern (e.g., "**/*.py", "src/**/*.ts").
@@ -2236,13 +2601,14 @@ class CodingToolSet:
             runtime_context=runtime_context,
         )
         if result.get("status") != "success":
-            return f"Error: {result.get('error', 'unknown error')}"
+            return result
         files = result.get("files", [])
         return "\n".join(files)
 
     @function_tool(
         name="Grep",
         read_only=True,
+        environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
         prompt=(
             "A powerful search tool built on ripgrep.\n"
@@ -2264,7 +2630,7 @@ class CodingToolSet:
         context: int = 0,
         head_limit: int = 100,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> str | Dict[str, Any]:
         """Search file contents using regex patterns.
 
         :param pattern: Regular expression pattern to search for.
@@ -2287,19 +2653,33 @@ class CodingToolSet:
             files_with_matches=files_with_matches,
             limit=head_limit,
             context=context,
+            file_type=type,
             runtime_context=runtime_context,
         )
         if result.get("status") != "success":
-            return f"Error: {result.get('error', 'unknown error')}"
+            return result
         if files_with_matches:
             matches = result.get("matches", [])
-            return "\n".join(str(m) for m in matches)
+            return "\n".join(
+                str(match.get("path", ""))
+                for match in matches
+                if isinstance(match, dict)
+            )
         matches = result.get("matches", [])
+        if output_mode == "count":
+            counts: Dict[str, int] = {}
+            for match in matches:
+                if isinstance(match, dict):
+                    match_path = str(match.get("path", ""))
+                    counts[match_path] = counts.get(match_path, 0) + 1
+            return "\n".join(
+                f"{match_path}:{count}" for match_path, count in sorted(counts.items())
+            )
         lines = []
         for m in matches:
             if isinstance(m, dict):
                 lines.append(
-                    f"{m.get('file', '')}:{m.get('line', '')}:{m.get('text', '')}"
+                    f"{m.get('path', '')}:{m.get('line', '')}:{m.get('text', '')}"
                 )
             else:
                 lines.append(str(m))
@@ -2309,6 +2689,7 @@ class CodingToolSet:
         name="Bash",
         needs_approval=True,
         supports_background=True,
+        environment_ops=["process"],
         rule_scope_builder=_default_rule_scope,
         prompt=(
             "Executes a given bash command and returns its output.\n"
@@ -2331,7 +2712,7 @@ class CodingToolSet:
         timeout: Optional[int] = None,
         run_in_background: bool = False,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str:
+    ) -> str | Dict[str, Any]:
         """Execute a shell command.
 
         :param command: Shell command to execute.
@@ -2347,8 +2728,10 @@ class CodingToolSet:
             run_in_background=run_in_background,
             runtime_context=runtime_context,
         )
+        if result.get("status") in {"error", "failed", "needs_user_input"}:
+            return result
         if result.get("status") != "success":
-            error = result.get("error", "")
+            error = result.get("error") or result.get("message", "")
             returncode = result.get("returncode", 1)
             stdout = result.get("stdout", "")
             if stdout:
