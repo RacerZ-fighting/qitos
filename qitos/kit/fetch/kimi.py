@@ -9,7 +9,6 @@ import requests
 
 from .capability import WebFetchError, WebFetchResponse
 
-DEFAULT_KIMI_FETCH_URL = "https://api.kimi.com/coding/v1/fetch"
 _MAX_URL_CHARS = 2_048
 _MAX_CONTENT_BYTES = 512 * 1024
 _MAX_CONTENT_CHARS = 100_000
@@ -23,7 +22,7 @@ class KimiWebFetchCapability:
         self,
         *,
         api_key: str,
-        fetch_url: str = DEFAULT_KIMI_FETCH_URL,
+        fetch_url: str,
         timeout_seconds: float = 30.0,
         session: requests.Session | None = None,
     ) -> None:
@@ -144,4 +143,4 @@ def _bounded_response_bytes(response: requests.Response) -> tuple[bytes, bool]:
     return b"".join(chunks), truncated
 
 
-__all__ = ["DEFAULT_KIMI_FETCH_URL", "KimiWebFetchCapability"]
+__all__ = ["KimiWebFetchCapability"]

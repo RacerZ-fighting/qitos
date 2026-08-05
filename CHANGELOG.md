@@ -24,8 +24,9 @@ How to update:
   application providers without per-tool backend adapters.
 - Added a compact environment-backed coding workspace profile with bounded reads,
   exact edits, `rg` glob/grep, binary hex inspection, listings, and directory creation.
-- Added provider-neutral managed `web_fetch` capability/tool support with a Kimi
-  `/coding/v1/fetch` adapter, public-initial-URL validation, and bounded text results.
+- Added provider-neutral managed `web_fetch` capability/tool support with an optional,
+  explicitly configured Kimi adapter, public-initial-URL validation, and bounded text
+  results. The selected model never implies a fetch service endpoint.
 - Added run-scoped `RuntimeInput` delivery and explicit idle wait/wakeup. Background
   work can wake an Engine at the next model-safe boundary without polling, advancing
   steps while idle, or fabricating a second tool result.

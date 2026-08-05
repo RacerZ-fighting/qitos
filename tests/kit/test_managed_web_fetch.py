@@ -13,6 +13,8 @@ from qitos.kit.fetch import (
     build_web_fetch_capability,
 )
 
+_FETCH_URL = "https://fetch.example.test/v1/fetch"
+
 
 @dataclass
 class _Response:
@@ -49,7 +51,7 @@ def test_kimi_fetch_uses_managed_contract_and_returns_bounded_markdown() -> None
     session = _Session(response)
     capability = KimiWebFetchCapability(
         api_key="secret",
-        fetch_url="https://api.example/fetch",
+        fetch_url=_FETCH_URL,
         session=session,  # type: ignore[arg-type]
     )
 
@@ -61,7 +63,7 @@ def test_kimi_fetch_uses_managed_contract_and_returns_bounded_markdown() -> None
     assert response.closed is True
     assert session.calls == [
         {
-            "url": "https://api.example/fetch",
+            "url": _FETCH_URL,
             "headers": {
                 "Authorization": "Bearer secret",
                 "Accept": "text/markdown",
@@ -87,6 +89,7 @@ def test_kimi_fetch_uses_managed_contract_and_returns_bounded_markdown() -> None
 def test_kimi_fetch_preserves_failure_kind(status: int, kind: str) -> None:
     capability = KimiWebFetchCapability(
         api_key="secret",
+        fetch_url=_FETCH_URL,
         session=_Session(_Response(status)),  # type: ignore[arg-type]
     )
 
@@ -111,6 +114,7 @@ def test_kimi_fetch_rejects_non_public_urls_before_provider_call(url: str) -> No
     session = _Session(_Response(200, b"unused"))
     capability = KimiWebFetchCapability(
         api_key="secret",
+        fetch_url=_FETCH_URL,
         session=session,  # type: ignore[arg-type]
     )
 
@@ -122,8 +126,10 @@ def test_kimi_fetch_rejects_non_public_urls_before_provider_call(url: str) -> No
 
 def test_factory_and_managed_tool_keep_provider_contract_separate() -> None:
     assert build_web_fetch_capability(provider="unknown", api_key="secret") is None
+    assert build_web_fetch_capability(provider="kimi", api_key="secret") is None
     capability = KimiWebFetchCapability(
         api_key="secret",
+        fetch_url=_FETCH_URL,
         session=_Session(_Response(200, b"Extracted documentation.")),  # type: ignore[arg-type]
     )
     tool = ManagedWebFetchTool(capability)

@@ -5,19 +5,21 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from .capability import WebFetchCapability
-from .kimi import DEFAULT_KIMI_FETCH_URL, KimiWebFetchCapability
+from .kimi import KimiWebFetchCapability
 
-CapabilityBuilder = Callable[[str, str | None, float], WebFetchCapability]
+CapabilityBuilder = Callable[[str, str | None, float], WebFetchCapability | None]
 
 
 def _build_kimi(
     api_key: str,
     fetch_url: str | None,
     timeout_seconds: float,
-) -> WebFetchCapability:
+) -> WebFetchCapability | None:
+    if fetch_url is None:
+        return None
     return KimiWebFetchCapability(
         api_key=api_key,
-        fetch_url=fetch_url or DEFAULT_KIMI_FETCH_URL,
+        fetch_url=fetch_url,
         timeout_seconds=timeout_seconds,
     )
 
