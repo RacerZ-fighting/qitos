@@ -180,6 +180,24 @@ def run_with_retry(operation: Callable[[], _T], policy: ModelRetryPolicy) -> _T:
     raise AssertionError("unreachable retry loop")
 
 
+async def async_run_with_retry(
+    operation: Callable[[], Awaitable[_T]], policy: ModelRetryPolicy
+) -> _T:
+    """Run an asynchronous request with one explicit, bounded retry owner."""
+    for attempt in range(1, policy.max_attempts + 1):
+        try:
+            return await operation()
+        except Exception as exc:
+            delay = _retry_delay(exc, failed_attempt=attempt, policy=policy)
+            if delay is None:
+                if not _is_transport_failure(exc):
+                    raise
+                raise _terminal(exc, attempt) from exc
+            _announce_retry(exc, attempt=attempt, delay=delay, policy=policy)
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable retry loop")
+
+
 async def stream_with_retry(
     create_stream: Callable[[], Awaitable[AsyncIterator[_T]]],
     *,
@@ -226,4 +244,9 @@ async def stream_with_retry(
     raise AssertionError("unreachable retry loop")
 
 
-__all__ = ["ModelRetryPolicy", "run_with_retry", "stream_with_retry"]
+__all__ = [
+    "ModelRetryPolicy",
+    "async_run_with_retry",
+    "run_with_retry",
+    "stream_with_retry",
+]

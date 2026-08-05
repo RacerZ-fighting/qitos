@@ -237,7 +237,9 @@ def test_context_registry_infers_anthropic_and_gemini_windows() -> None:
     assert infer_context_window("gemini-2.5-flash") == 1_048_576
 
 
-def test_openai_compatible_model_formats_multimodal_chat_messages(tmp_path, monkeypatch) -> None:
+def test_openai_compatible_model_formats_multimodal_chat_messages(
+    tmp_path, monkeypatch
+) -> None:
     captured = {}
     png_path = tmp_path / "shot.png"
     png_path.write_bytes(
@@ -267,7 +269,9 @@ def test_openai_compatible_model_formats_multimodal_chat_messages(tmp_path, monk
             captured["client_kwargs"] = kwargs
             self.chat = SimpleNamespace(completions=_FakeCompletions())
 
-    fake_openai = SimpleNamespace(OpenAI=lambda **kwargs: _FakeClient(**kwargs), APIError=Exception)
+    fake_openai = SimpleNamespace(
+        OpenAI=lambda **kwargs: _FakeClient(**kwargs), APIError=Exception
+    )
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
     llm = OpenAICompatibleModel(
         model="gpt-4.1-mini",
@@ -342,7 +346,9 @@ def test_openai_compatible_model_retries_and_uses_120s_timeout(monkeypatch) -> N
     assert llm.timeout == 120
 
 
-def test_openai_compatible_model_call_raw_retries_on_transient_errors(monkeypatch) -> None:
+def test_openai_compatible_model_call_raw_retries_on_transient_errors(
+    monkeypatch,
+) -> None:
     captured = {"attempts": 0}
 
     class APIError(Exception):
@@ -419,6 +425,136 @@ def test_openai_compatible_model_does_not_retry_bad_requests(monkeypatch) -> Non
     assert exc_info.value.attempts == 1
     assert exc_info.value.retryable is False
     assert exc_info.value.status_code == 400
+
+
+def test_async_openai_compatible_stream_retries_and_preserves_errors(
+    monkeypatch,
+) -> None:
+    import asyncio
+
+    from qitos.core import ModelTransportError
+    from qitos.models.openai import AsyncOpenAICompatibleModel
+
+    attempts = 0
+    client_kwargs: dict[str, object] = {}
+
+    class _Stream:
+        def __init__(self) -> None:
+            self._chunks = iter(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content='{"ok":true}'),
+                                finish_reason=None,
+                            )
+                        ],
+                        usage=None,
+                    ),
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content=""),
+                                finish_reason="stop",
+                            )
+                        ],
+                        usage=SimpleNamespace(
+                            prompt_tokens=3,
+                            completion_tokens=2,
+                            total_tokens=5,
+                        ),
+                    ),
+                ]
+            )
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._chunks)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+    class _Completions:
+        async def create(self, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            assert kwargs["stream"] is True
+            if attempts == 1:
+                raise TimeoutError("request timed out")
+            return _Stream()
+
+    class _Client:
+        def __init__(self, **kwargs):
+            nonlocal client_kwargs
+            client_kwargs = kwargs
+            self.chat = SimpleNamespace(completions=_Completions())
+
+    fake_openai = ModuleType("openai")
+    fake_openai.AsyncOpenAI = lambda **kwargs: _Client(**kwargs)
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    async def _no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("qitos.models._openai_retry.asyncio.sleep", _no_sleep)
+    model = AsyncOpenAICompatibleModel(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        max_attempts=2,
+    )
+
+    async def _collect():
+        return [
+            chunk async for chunk in model.astream([{"role": "user", "content": "go"}])
+        ]
+
+    chunks = asyncio.run(_collect())
+
+    assert attempts == 2
+    assert client_kwargs["max_retries"] == 0
+    assert "".join(chunk.text for chunk in chunks) == '{"ok":true}'
+    assert chunks[-1].done is True
+    assert model.extract_usage() == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+        "cached_tokens": None,
+    }
+
+    class _BadRequest(Exception):
+        status_code = 400
+
+    class _FailingCompletions:
+        async def create(self, **kwargs):
+            _ = kwargs
+            raise _BadRequest("invalid request")
+
+    fake_openai.AsyncOpenAI = lambda **kwargs: SimpleNamespace(
+        chat=SimpleNamespace(completions=_FailingCompletions())
+    )
+    failing = AsyncOpenAICompatibleModel(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        max_attempts=2,
+    )
+
+    async def _drain_failing():
+        return [
+            chunk
+            async for chunk in failing.astream(
+                [{"role": "user", "content": "bad request"}]
+            )
+        ]
+
+    with pytest.raises(ModelTransportError) as exc_info:
+        asyncio.run(_drain_failing())
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.attempts == 1
 
 
 def test_openai_compatible_model_disables_thinking_for_forced_tool_choice(
