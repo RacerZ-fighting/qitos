@@ -32,6 +32,7 @@ from ._openai_retry import (
     ModelRetryPolicy,
     async_run_with_retry,
     run_with_retry,
+    sync_stream_with_retry,
     stream_with_retry,
 )
 from .base import Model, ModelStreamChunk
@@ -330,7 +331,10 @@ class OpenAIModel(Model):
 
         try:
             client = openai.OpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+                max_retries=0,
             )
 
             if self.api_mode == "responses":
@@ -818,104 +822,125 @@ class OpenAICompatibleModel(Model):
         import openai
 
         self._last_usage = None
-        try:
-            client = openai.OpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-            )
-            if self.api_mode == "responses":
-                yield from _responses_stream(
+        client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.timeout,
+            max_retries=0,
+        )
+        if self.api_mode == "responses":
+            yield from sync_stream_with_retry(
+                lambda: _responses_stream(
                     self, client, messages, provider="openai-compatible", **kwargs
-                )
-                return
-            # Build stream options — request usage in final chunk
-            # Not all OpenAI-compatible APIs support this, so we wrap it
-            create_kwargs: Dict[str, Any] = dict(kwargs)
-            if "stream_options" not in create_kwargs:
-                create_kwargs["stream_options"] = {"include_usage": True}
+                ),
+                policy=self.retry_policy,
+            )
+            return
+
+        # Build stream options — request usage in final chunk. Providers that do not
+        # support the optional field get one same-attempt fallback without it.
+        create_kwargs: Dict[str, Any] = dict(kwargs)
+        if "stream_options" not in create_kwargs:
+            create_kwargs["stream_options"] = {"include_usage": True}
+        request_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": cast(Any, _to_openai_messages(messages)),
+            "max_tokens": self.max_tokens,
+            "stream": True,
+            **create_kwargs,
+        }
+        if self.temperature is not None:
+            request_kwargs["temperature"] = self.temperature
+
+        fallback_types = tuple(
+            error_type
+            for name in ("BadRequestError", "APIError")
+            if (error_type := getattr(openai, name, None)) is not None
+        )
+
+        def create_stream() -> Any:
             try:
-                request_kwargs: Dict[str, Any] = {
-                    "model": self.model,
-                    "messages": cast(Any, _to_openai_messages(messages)),
-                    "max_tokens": self.max_tokens,
-                    "stream": True,
-                    **create_kwargs,
-                }
-                if self.temperature is not None:
-                    request_kwargs["temperature"] = self.temperature
-                response = client.chat.completions.create(**request_kwargs)
-            except (openai.BadRequestError, openai.APIError):
-                # Retry without stream_options if the API doesn't support it
-                create_kwargs.pop("stream_options", None)
-                request_kwargs = {
-                    "model": self.model,
-                    "messages": cast(Any, _to_openai_messages(messages)),
-                    "max_tokens": self.max_tokens,
-                    "stream": True,
-                    **create_kwargs,
-                }
-                if self.temperature is not None:
-                    request_kwargs["temperature"] = self.temperature
-                response = client.chat.completions.create(**request_kwargs)
-            accumulated_tool_calls: List[Dict[str, Any]] = []
-            for chunk in response:
-                if not chunk.choices:
-                    # Empty choices chunk may carry usage data (OpenAI sends it last)
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage_data = {
-                            "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
-                            "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
-                            "total_tokens": getattr(chunk.usage, "total_tokens", None),
-                            "cached_tokens": getattr(getattr(chunk.usage, "prompt_tokens_details", None), "cached_tokens", None),
-                        }
-                        self._set_last_usage(usage_data)
-                    continue
-                delta = chunk.choices[0].delta
-                text = delta.content or ""
-                if text:
-                    yield ModelStreamChunk(text=text, done=False)
-                # Accumulate streaming tool call deltas
-                delta_tool_calls = getattr(delta, "tool_calls", None)
-                if delta_tool_calls:
-                    for dtc in delta_tool_calls:
-                        idx = getattr(dtc, "index", len(accumulated_tool_calls))
-                        # Extend list if needed
-                        while len(accumulated_tool_calls) <= idx:
-                            accumulated_tool_calls.append(
-                                {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
-                            )
-                        tc = accumulated_tool_calls[idx]
-                        tc_id = getattr(dtc, "id", None)
-                        if tc_id:
-                            tc["id"] = tc_id
-                        tc_type = getattr(dtc, "type", None)
-                        if tc_type:
-                            tc["type"] = tc_type
-                        fn = getattr(dtc, "function", None)
-                        if fn:
-                            fn_name = getattr(fn, "name", None)
-                            if fn_name:
-                                tc["function"]["name"] = fn_name
-                            fn_args = getattr(fn, "arguments", None)
-                            if fn_args:
-                                tc["function"]["arguments"] = tc["function"].get("arguments", "") + fn_args
-                if chunk.choices[0].finish_reason is not None:
-                    usage_data = None
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage_data = {
-                            "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
-                            "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
-                            "total_tokens": getattr(chunk.usage, "total_tokens", None),
-                            "cached_tokens": getattr(getattr(chunk.usage, "prompt_tokens_details", None), "cached_tokens", None),
-                        }
-                        self._set_last_usage(usage_data)
-                    yield ModelStreamChunk(
-                        text="", done=True, usage=usage_data,
-                        tool_calls=accumulated_tool_calls if accumulated_tool_calls else None,
-                    )
-        except openai.APIError as e:
-            yield ModelStreamChunk(text=f"API Error: {str(e)}", done=True)
-        except Exception as e:
-            yield ModelStreamChunk(text=f"Error: {str(e)}", done=True)
+                return client.chat.completions.create(**request_kwargs)
+            except Exception as exc:
+                if not fallback_types or not isinstance(exc, fallback_types):
+                    raise
+                if "stream_options" not in request_kwargs:
+                    raise
+                fallback_kwargs = dict(request_kwargs)
+                fallback_kwargs.pop("stream_options", None)
+                return client.chat.completions.create(**fallback_kwargs)
+
+        accumulated_tool_calls: List[Dict[str, Any]] = []
+        for chunk in sync_stream_with_retry(create_stream, policy=self.retry_policy):
+            if not chunk.choices:
+                # Empty choices chunk may carry usage data (OpenAI sends it last)
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage_data = {
+                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
+                        "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
+                        "total_tokens": getattr(chunk.usage, "total_tokens", None),
+                        "cached_tokens": getattr(
+                            getattr(chunk.usage, "prompt_tokens_details", None),
+                            "cached_tokens",
+                            None,
+                        ),
+                    }
+                    self._set_last_usage(usage_data)
+                continue
+            delta = chunk.choices[0].delta
+            text = delta.content or ""
+            if text:
+                yield ModelStreamChunk(text=text, done=False)
+            # Accumulate streaming tool call deltas
+            delta_tool_calls = getattr(delta, "tool_calls", None)
+            if delta_tool_calls:
+                for dtc in delta_tool_calls:
+                    idx = getattr(dtc, "index", len(accumulated_tool_calls))
+                    while len(accumulated_tool_calls) <= idx:
+                        accumulated_tool_calls.append(
+                            {
+                                "id": None,
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            }
+                        )
+                    tc = accumulated_tool_calls[idx]
+                    tc_id = getattr(dtc, "id", None)
+                    if tc_id:
+                        tc["id"] = tc_id
+                    tc_type = getattr(dtc, "type", None)
+                    if tc_type:
+                        tc["type"] = tc_type
+                    fn = getattr(dtc, "function", None)
+                    if fn:
+                        fn_name = getattr(fn, "name", None)
+                        if fn_name:
+                            tc["function"]["name"] = fn_name
+                        fn_args = getattr(fn, "arguments", None)
+                        if fn_args:
+                            tc["function"]["arguments"] = tc["function"].get(
+                                "arguments", ""
+                            ) + fn_args
+            if chunk.choices[0].finish_reason is not None:
+                usage_data = None
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage_data = {
+                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
+                        "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
+                        "total_tokens": getattr(chunk.usage, "total_tokens", None),
+                        "cached_tokens": getattr(
+                            getattr(chunk.usage, "prompt_tokens_details", None),
+                            "cached_tokens",
+                            None,
+                        ),
+                    }
+                    self._set_last_usage(usage_data)
+                yield ModelStreamChunk(
+                    text="",
+                    done=True,
+                    usage=usage_data,
+                    tool_calls=accumulated_tool_calls if accumulated_tool_calls else None,
+                )
 
 
 class AzureOpenAIModel(OpenAICompatibleModel):

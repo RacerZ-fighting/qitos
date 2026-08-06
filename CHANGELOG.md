@@ -57,6 +57,9 @@ How to update:
 
 ### Fixed
 
+- Fixed lower-level OpenAI-compatible transport errors such as read-timeout and TLS
+  exceptions being treated as non-retryable; they now use the existing bounded model
+  retry policy instead of immediately terminating the agent loop.
 - Fixed structured tool failures being recorded as successful actions. Explicit QitOS
   `status=error/failed/failure` results now preserve their payload and produce an
   `ActionStatus.ERROR`.

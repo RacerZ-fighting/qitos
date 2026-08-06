@@ -87,6 +87,17 @@ def _is_retryable(exc: Exception) -> bool:
         return status in {408, 409, 429} or status >= 500
     if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
         return True
+    # OpenAI-compatible clients may surface transport failures from a lower-level
+    # HTTP stack (for example urllib3) instead of the SDK's exception classes. Keep
+    # those failures inside the bounded retry policy rather than turning a transient
+    # connection problem into a terminal model error.
+    try:
+        import httpx
+
+        if isinstance(exc, (httpx.TransportError, httpx.TimeoutException)):
+            return True
+    except ImportError:
+        pass
     if type(exc).__name__ == "APIError":
         message = str(exc).lower()
         return any(
@@ -105,7 +116,9 @@ def _is_retryable(exc: Exception) -> bool:
         "ConnectTimeout",
         "ReadError",
         "ReadTimeout",
+        "ReadTimeoutError",
         "RemoteProtocolError",
+        "SSLError",
         "TimeoutException",
     }
 
@@ -120,7 +133,7 @@ def _retry_delay(exc: Exception, *, failed_attempt: int, policy: ModelRetryPolic
         policy.base_delay_seconds * (2 ** (failed_attempt - 1)),
         policy.max_delay_seconds,
     )
-    return base * random.uniform(0.75, 1.25)
+    return base * float(random.uniform(0.75, 1.25))
 
 
 def _terminal(exc: Exception, attempts: int) -> ModelTransportError:
@@ -198,6 +211,45 @@ async def async_run_with_retry(
     raise AssertionError("unreachable retry loop")
 
 
+def _close_sync_stream(stream: Any) -> None:
+    close = getattr(stream, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            _logger.debug("model stream close failed", exc_info=True)
+
+
+def sync_stream_with_retry(
+    create_stream: Callable[[], Any], *, policy: ModelRetryPolicy
+) -> Any:
+    """Stream synchronously with bounded retries before the first event."""
+    for attempt in range(1, policy.max_attempts + 1):
+        stream: Any = None
+        received_event = False
+        try:
+            stream = create_stream()
+            for event in stream:
+                received_event = True
+                yield event
+            return
+        except Exception as exc:
+            delay = None if received_event else _retry_delay(
+                exc, failed_attempt=attempt, policy=policy
+            )
+            if delay is None:
+                if not _is_transport_failure(exc):
+                    raise
+                raise _terminal(exc, attempt) from exc
+            _close_sync_stream(stream)
+            stream = None
+            _announce_retry(exc, attempt=attempt, delay=delay, policy=policy)
+            time.sleep(delay)
+        finally:
+            _close_sync_stream(stream)
+    raise AssertionError("unreachable retry loop")
+
+
 async def stream_with_retry(
     create_stream: Callable[[], Awaitable[AsyncIterator[_T]]],
     *,
@@ -248,5 +300,6 @@ __all__ = [
     "ModelRetryPolicy",
     "async_run_with_retry",
     "run_with_retry",
+    "sync_stream_with_retry",
     "stream_with_retry",
 ]
