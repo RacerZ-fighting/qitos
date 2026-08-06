@@ -6,6 +6,9 @@ import asyncio
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
+from qitos.core.errors import ModelTransportError
 from qitos.models._openai_retry import ModelRetryPolicy, async_run_with_retry
 from qitos.models.openai import OpenAICompatibleModel
 
@@ -100,3 +103,176 @@ def test_sync_openai_stream_uses_one_bounded_retry_owner(monkeypatch) -> None:
     assert client_kwargs["max_retries"] == 0
     assert "".join(chunk.text for chunk in chunks) == "ok"
     assert chunks[-1].done is True
+
+
+def test_sync_openai_stream_does_not_retry_after_first_event(monkeypatch) -> None:
+    attempts = 0
+    closes = 0
+
+    class PartialStream:
+        def __iter__(self):
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="partial", tool_calls=None),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            )
+            raise TimeoutError("stream stalled")
+
+        def close(self) -> None:
+            nonlocal closes
+            closes += 1
+
+    class Completions:
+        def create(self, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            return PartialStream()
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: Client(**kwargs)
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    model = OpenAICompatibleModel(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        max_attempts=2,
+    )
+    chunks = model.stream([{"role": "user", "content": "go"}])
+
+    assert next(chunks).text == "partial"
+    with pytest.raises(ModelTransportError) as exc_info:
+        list(chunks)
+
+    assert attempts == 1
+    assert closes == 1
+    assert exc_info.value.attempts == 1
+
+
+def test_sync_openai_stream_does_not_retry_nonretryable_status(monkeypatch) -> None:
+    attempts = 0
+
+    class APIStatusError(Exception):
+        status_code = 403
+
+    class Completions:
+        def create(self, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise APIStatusError("forbidden")
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: Client(**kwargs)
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+
+    model = OpenAICompatibleModel(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        max_attempts=2,
+    )
+
+    with pytest.raises(ModelTransportError) as exc_info:
+        list(model.stream([{"role": "user", "content": "go"}]))
+
+    assert attempts == 1
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.retryable is False
+
+
+def test_rate_limit_uses_only_qitos_retry_budget(monkeypatch) -> None:
+    attempts = 0
+
+    class APIStatusError(Exception):
+        status_code = 429
+
+    class Completions:
+        def create(self, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            raise APIStatusError("rate limited")
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: Client(**kwargs)
+    fake_openai.APIError = APIStatusError
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
+
+    model = OpenAICompatibleModel(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        max_attempts=2,
+    )
+
+    with pytest.raises(ModelTransportError) as exc_info:
+        list(model.stream([{"role": "user", "content": "go"}]))
+
+    assert attempts == 2
+    assert exc_info.value.attempts == 2
+    assert exc_info.value.retryable is True
+
+
+def test_stream_options_fallback_is_reused_by_transport_retry(monkeypatch) -> None:
+    stream_options_by_attempt: list[bool] = []
+
+    class BadRequestError(Exception):
+        status_code = 400
+
+    class Completions:
+        def create(self, **kwargs):
+            stream_options_by_attempt.append("stream_options" in kwargs)
+            if len(stream_options_by_attempt) == 1:
+                raise BadRequestError("stream_options is unsupported")
+            if len(stream_options_by_attempt) == 2:
+                raise TimeoutError("temporary timeout")
+            return iter(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(content="ok", tool_calls=None),
+                                finish_reason="stop",
+                            )
+                        ],
+                        usage=None,
+                    )
+                ]
+            )
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: Client(**kwargs)
+    fake_openai.BadRequestError = BadRequestError
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
+
+    model = OpenAICompatibleModel(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        max_attempts=2,
+    )
+    chunks = list(model.stream([{"role": "user", "content": "go"}]))
+
+    assert stream_options_by_attempt == [True, False, False]
+    assert "".join(chunk.text for chunk in chunks) == "ok"

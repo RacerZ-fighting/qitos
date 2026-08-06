@@ -124,6 +124,29 @@ def _disable_thinking_for_forced_tool_choice(kwargs: Dict[str, Any]) -> Dict[str
     return result
 
 
+def _is_unsupported_stream_options_error(exc: Exception) -> bool:
+    """Return whether a provider explicitly rejected ``stream_options``."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code not in {400, 422}:
+        return False
+    detail = f"{exc} {getattr(exc, 'body', '')}".casefold()
+    return "stream_options" in detail and any(
+        marker in detail
+        for marker in (
+            "extra_forbidden",
+            "invalid",
+            "not support",
+            "not permitted",
+            "unknown",
+            "unrecognized",
+            "unsupported",
+            "unexpected",
+        )
+    )
+
+
 def _to_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     normalized = normalize_messages(messages)
     out: List[Dict[str, Any]] = []
@@ -852,23 +875,18 @@ class OpenAICompatibleModel(Model):
         if self.temperature is not None:
             request_kwargs["temperature"] = self.temperature
 
-        fallback_types = tuple(
-            error_type
-            for name in ("BadRequestError", "APIError")
-            if (error_type := getattr(openai, name, None)) is not None
-        )
-
         def create_stream() -> Any:
+            nonlocal request_kwargs
             try:
                 return client.chat.completions.create(**request_kwargs)
             except Exception as exc:
-                if not fallback_types or not isinstance(exc, fallback_types):
-                    raise
                 if "stream_options" not in request_kwargs:
                     raise
-                fallback_kwargs = dict(request_kwargs)
-                fallback_kwargs.pop("stream_options", None)
-                return client.chat.completions.create(**fallback_kwargs)
+                if not _is_unsupported_stream_options_error(exc):
+                    raise
+                request_kwargs = dict(request_kwargs)
+                request_kwargs.pop("stream_options", None)
+                return client.chat.completions.create(**request_kwargs)
 
         accumulated_tool_calls: List[Dict[str, Any]] = []
         for chunk in sync_stream_with_retry(create_stream, policy=self.retry_policy):
