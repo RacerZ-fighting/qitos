@@ -694,6 +694,34 @@ def test_native_text_structured_action_parse_error_stays_in_recovery(response_te
     )
 
 
+def test_native_text_structured_final_parse_error_stays_in_recovery():
+    engine = _native_text_engine(
+        parser=JsonDecisionParser(), protocol="json_decision_v1"
+    )
+    record = StepRecord(step_id=0)
+    response_text = (
+        '{"mode":"final","final_answer":{"outcome":"inconclusive",'
+        '"summary":"Ligolo "agent" upload failed","fact_ids":["fact-1"]}}'
+    )
+
+    decision = engine._model_runtime.normalize_decision(
+        ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
+        step=0,
+        record=record,
+    )
+
+    assert decision.mode == "wait"
+    assert decision.final_answer is None
+    assert decision.meta["parser_error"] is True
+    assert record.decision_source == "parser"
+    assert record.parser_diagnostics["severity"] == "error"
+    assert any(
+        event.payload.get("stage") == "native_text_final_rejected"
+        and event.payload.get("reason") == "structured_final_parse_error"
+        for event in engine.events
+    )
+
+
 def test_native_text_plain_natural_language_still_becomes_final():
     engine = _native_text_engine()
     record = StepRecord(step_id=0)

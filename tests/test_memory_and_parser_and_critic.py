@@ -1,3 +1,5 @@
+import json
+
 from qitos.core.memory import MemoryRecord
 from qitos.kit.critic import PassThroughCritic
 from qitos.kit.memory import SummaryMemory, VectorMemory, WindowMemory
@@ -118,6 +120,37 @@ def test_json_decision_parser_repairs_control_chars_inside_strings():
     diagnostics = decision.meta["parser_diagnostics"]
     assert diagnostics["extraction_mode"] == "control_char_repair"
     assert diagnostics["salvage_applied"] is True
+
+
+def test_json_decision_parser_serializes_structured_final_answer():
+    decision = JsonDecisionParser().parse(
+        {
+            "mode": "final",
+            "thought": "report the branch outcome",
+            "final_answer": {
+                "outcome": "inconclusive",
+                "summary": "Ligolo payload delivery failed.",
+                "fact_ids": ["fact-pivot"],
+            },
+        }
+    )
+
+    assert decision.mode == "final"
+    assert decision.rationale == "report the branch outcome"
+    assert json.loads(decision.final_answer or "") == {
+        "outcome": "inconclusive",
+        "summary": "Ligolo payload delivery failed.",
+        "fact_ids": ["fact-pivot"],
+    }
+
+
+def test_json_decision_parser_skips_empty_final_alias():
+    decision = JsonDecisionParser().parse(
+        {"mode": "final", "final_answer": "", "answer": "fallback"}
+    )
+
+    assert decision.mode == "final"
+    assert decision.final_answer == "fallback"
 
 
 def test_balanced_object_extraction_ignores_preface_apostrophes():

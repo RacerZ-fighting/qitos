@@ -1930,15 +1930,19 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     parser_input
                 ):
                     return parse_outcome
-                if parser_error and self._looks_like_structured_action_intent(
-                    parser_input
-                ):
+                rejection_reason: str | None = None
+                if parser_error:
+                    if self._looks_like_structured_action_intent(parser_input):
+                        rejection_reason = "structured_action_parse_error"
+                    elif self._looks_like_structured_final_intent(parser_input):
+                        rejection_reason = "structured_final_parse_error"
+                if rejection_reason is not None:
                     self.engine._emit(
                         step,
                         RuntimePhase.DECIDE,
                         payload={
                             "stage": "native_text_final_rejected",
-                            "reason": "structured_action_parse_error",
+                            "reason": rejection_reason,
                             "parser_diagnostics": parse_outcome.meta.get(
                                 "parser_diagnostics"
                             ),
@@ -2050,6 +2054,26 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         return bool(
             normalized_fields & ambiguous_carriers
             and normalized_fields & ({"name"} | argument_fields)
+        )
+
+    @staticmethod
+    def _looks_like_structured_final_intent(text: Any) -> bool:
+        source = str(text or "").strip()
+        if not source:
+            return False
+        return bool(
+            re.search(
+                r"(?i)(?:[\"']mode[\"']|(?:^|[\{,])\s*mode)"
+                r"\s*[:=]\s*[\"']?final\b",
+                source,
+            )
+            or re.search(
+                r"(?i)(?:[\"']final[_-]?answer[\"']\s*:|"
+                r"(?:^|[\{,])\s*final[_-]?answer\s*:)",
+                source,
+            )
+            or re.search(r"(?i)<\s*(?:final_answer|final)\b", source)
+            or re.search(r"(?im)^\s*final\s+answer\s*:", source)
         )
 
     def _parse_with_protocol_chain(
