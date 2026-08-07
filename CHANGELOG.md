@@ -47,6 +47,10 @@ How to update:
 
 ### Changed
 
+- Clarified the generic `AgentTool` model contract: independent multi-step tasks can be
+  delegated in one response for concurrent execution, while dependent steps and cheap
+  mechanical variants remain in the parent. Explicit tool guidance is no longer replaced
+  by the `execute()` implementation docstring during initialization.
 - OpenAI-compatible clients now disable OpenAI SDK retries on paths where QitOS owns the
   retry budget, preventing multiplicative retry delays.
 - Raised the optional OpenAI SDK floor to `openai>=1.66.0` and taught compact history to preserve active Responses function-call rounds atomically.

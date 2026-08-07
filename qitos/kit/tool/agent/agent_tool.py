@@ -125,12 +125,18 @@ class AgentTool(BaseTool):
                 "type": "boolean",
                 "description": "Run asynchronously and return a task id.",
             }
+        description = (
+            "Launch an independent child agent for one clearly scoped multi-step task. "
+            "For two or more independent multi-step tasks, make one Agent call per task "
+            "in the same response; same-response calls run concurrently under the "
+            "concurrent action policy. Do not repeat delegated work in the parent. Keep "
+            "dependent steps in the parent until their prerequisites are available. Use "
+            "ordinary tools, preferably one bounded batch, for cheap mechanical variants "
+            "instead of delegating them."
+        )
         tool_spec = ToolSpec(
             name="Agent",
-            description=(
-                "Launch an independent child agent for a clearly scoped task. Multiple "
-                "Agent calls in one response may run concurrently."
-            ),
+            description=description,
             parameters=parameters,
             required=["description", "prompt"],
             max_retries=0,
@@ -139,7 +145,7 @@ class AgentTool(BaseTool):
             supports_background=allow_background,
         )
         super().__init__(spec=tool_spec)
-        self.spec.description = tool_spec.description
+        self.spec.description = description
 
     @classmethod
     def register_agent_type(cls, name: str, agent_class: type[AgentModule]) -> None:

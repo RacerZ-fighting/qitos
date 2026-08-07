@@ -18,6 +18,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Clearer child-agent fan-out**: `AgentTool` now tells models to issue one same-response
+  call per independent multi-step task, avoid duplicating delegated work in the parent,
+  and keep dependent or cheap mechanical work local.
 - **Environment-backed coding tools**: named Env capability groups now let the same
   bounded workspace tools run against host, container, or remote providers. The compact
   workspace profile includes reads/writes/exact edits, fixed-argv `rg` search, hex view,

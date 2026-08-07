@@ -672,7 +672,10 @@ The result reports output, steps, total tokens, elapsed time, stop reason, and r
 When `allow_background=False`, the background argument is omitted from the schema.
 Delegation depth is checked before the factory runs. Multiple Agent calls execute in
 parallel only when the parent Engine's `ActionExecutionPolicy` allows `Agent` and the
-tool remains marked concurrency-safe.
+tool remains marked concurrency-safe. The model-facing tool description recommends one
+same-response call per independent multi-step task, while dependent steps stay in the
+parent and cheap mechanical variants use ordinary tools in a bounded batch. The parent
+should not repeat work it has already delegated.
 
 </Accordion>
 
