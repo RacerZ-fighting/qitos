@@ -1035,6 +1035,17 @@ class ActionExecutor:
         def _record_artifact(payload: Dict[str, Any]) -> None:
             artifacts.append(dict(payload))
 
+        active_run_id = (
+            str(getattr(self._engine, "active_run_id", "") or "")
+            if self._engine is not None
+            else ""
+        )
+
+        def _post_runtime_event(event: Any) -> bool:
+            if self._engine is None or not active_run_id:
+                return False
+            return bool(self._engine.post_runtime_event(event, run_id=active_run_id))
+
         return {
             "env": env,
             "environment_attestation": dict(
@@ -1051,6 +1062,7 @@ class ActionExecutor:
             "record_artifact": _record_artifact,
             "delegate_depth": self.delegate_depth,
             "parent_run_id": "",
+            "post_runtime_event": _post_runtime_event,
             "trace_writer": self.trace_writer,
             "shared_memory": self.shared_memory,
             "agent": getattr(self._engine, "agent", None) if self._engine is not None else None,

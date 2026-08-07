@@ -2,6 +2,7 @@
 
 from .agent_tool import (
     DEFAULT_SUBAGENT_MAX_TURNS,
+    AgentExecutionMode,
     AgentInvocation,
     AgentRequest,
     AgentResult,
@@ -10,6 +11,7 @@ from .agent_tool import (
 
 __all__ = [
     "DEFAULT_SUBAGENT_MAX_TURNS",
+    "AgentExecutionMode",
     "AgentInvocation",
     "AgentRequest",
     "AgentResult",

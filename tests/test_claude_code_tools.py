@@ -2,6 +2,9 @@
 
 import os
 import tempfile
+import threading
+import time
+from types import SimpleNamespace
 import pytest
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
@@ -449,6 +452,357 @@ class TestAgentTool:
 
         assert result["status"] == "error"
         assert "cannot launch another Agent" in result["error"]
+
+    def test_forced_background_children_launch_concurrently_and_notify_parent(self):
+        from qitos.core.runtime_input import RuntimeInput
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        lock = threading.Lock()
+        both_started = threading.Event()
+        release = threading.Event()
+        active = 0
+        peak = 0
+        events = []
+
+        class FakeEngine:
+            active_run_id = "child-run"
+
+            def run(self, task, **kwargs):
+                nonlocal active, peak
+                assert kwargs == {}
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                    if active == 2:
+                        both_started.set()
+                assert release.wait(timeout=1)
+                with lock:
+                    active -= 1
+                return SimpleNamespace(
+                    state=SimpleNamespace(
+                        final_result=f"validated:{task}",
+                        stop_reason="final",
+                    ),
+                    records=[],
+                    step_count=2,
+                    total_tokens=5,
+                )
+
+            def cancel(self, mode):
+                assert mode == "immediate"
+                release.set()
+
+        tool = AgentTool(
+            invocation_factory=lambda request, _context: AgentInvocation(
+                engine=FakeEngine(),
+                task=request.prompt,
+            ),
+            execution_mode="background",
+            max_background_workers=2,
+        )
+        runtime_context = {
+            "delegate_depth": 0,
+            "post_runtime_event": lambda event: events.append(event) or True,
+        }
+
+        first = tool.call(
+            {"description": "route one", "prompt": "one"},
+            runtime_context=runtime_context,
+        )
+        second = tool.call(
+            {"description": "route two", "prompt": "two"},
+            runtime_context=runtime_context,
+        )
+
+        assert first["status"] == "running"
+        assert second["status"] == "running"
+        assert "run_in_background" not in tool.spec.parameters
+        assert tool.spec.supports_background is True
+        assert both_started.wait(timeout=1)
+        assert peak == 2
+        assert tool.active_background_count == 2
+
+        release.set()
+        deadline = time.monotonic() + 1
+        while len(events) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert len(events) == 2
+        assert all(isinstance(event, RuntimeInput) for event in events)
+        assert {event.kind for event in events} == {"agent.child.completed"}
+        assert {event.payload["output"] for event in events} == {
+            "validated:one",
+            "validated:two",
+        }
+        assert tool.active_background_count == 0
+        assert tool.close(wait_seconds=0) == 0
+
+    def test_background_budget_stop_returns_partial_tool_evidence(self):
+        from qitos.engine.states import StepRecord
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        events = []
+
+        class FakeEngine:
+            active_run_id = "child-run"
+
+            def run(self, task, **kwargs):
+                assert task == "validate"
+                assert kwargs == {}
+                return SimpleNamespace(
+                    state=SimpleNamespace(final_result="", stop_reason="budget_time"),
+                    records=[
+                        StepRecord(
+                            step_id=4,
+                            action_results=[
+                                {"status": "success", "output": "uid=33(www-data)"}
+                            ],
+                            tool_invocations=[{"tool_name": "shell"}],
+                        )
+                    ],
+                    step_count=5,
+                    total_tokens=10,
+                )
+
+            def cancel(self, mode):
+                _ = mode
+
+        tool = AgentTool(
+            invocation_factory=lambda request, _context: AgentInvocation(
+                engine=FakeEngine(),
+                task=request.prompt,
+            ),
+            execution_mode="background",
+        )
+        launched = tool.call(
+            {"description": "validate route", "prompt": "validate"},
+            runtime_context={
+                "delegate_depth": 0,
+                "post_runtime_event": lambda event: events.append(event) or True,
+            },
+        )
+
+        deadline = time.monotonic() + 1
+        while not events and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert launched["status"] == "running"
+        assert len(events) == 1
+        assert events[0].payload["status"] == "partial"
+        assert events[0].payload["stop_reason"] == "budget_time"
+        assert "uid=33(www-data)" in events[0].payload["output"]
+        assert tool.close(wait_seconds=0) == 0
+
+    def test_running_background_child_exposes_bounded_tool_evidence_snapshot(self):
+        from qitos.engine.states import StepRecord
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        class FakeEngine:
+            active_run_id = "child-run"
+            records = [
+                StepRecord(
+                    step_id=index,
+                    model_response={"reasoning": "private child reasoning"},
+                    action_results=[
+                        {
+                            "status": "success",
+                            "output": f"evidence-{index}-" + ("x" * 2_000),
+                        }
+                    ],
+                    tool_invocations=[{"tool_name": "shell"}],
+                )
+                for index in range(20)
+            ]
+
+            def run(self, task, **kwargs):
+                _ = task, kwargs
+                started.set()
+                assert cancelled.wait(timeout=1)
+                return SimpleNamespace(
+                    state=SimpleNamespace(
+                        final_result="",
+                        stop_reason="cancelled_immediate",
+                    ),
+                    records=self.records,
+                    step_count=len(self.records),
+                    total_tokens=321,
+                    run_id=self.active_run_id,
+                )
+
+            def cancel(self, mode):
+                assert mode == "immediate"
+                cancelled.set()
+
+        tool = AgentTool(
+            invocation_factory=lambda request, _context: AgentInvocation(
+                engine=FakeEngine(),
+                task=request.prompt,
+            ),
+            execution_mode="background",
+        )
+        launched = tool.call(
+            {
+                "description": "validate extension bypass",
+                "name": "extension-bypass",
+                "prompt": "validate",
+            },
+            runtime_context={"delegate_depth": 0},
+        )
+
+        assert launched["status"] == "running"
+        assert started.wait(timeout=1)
+
+        snapshots = tool.snapshot_background_events()
+
+        assert len(snapshots) == 1
+        snapshot = snapshots[0]
+        assert snapshot.kind == "agent.child.snapshot"
+        assert snapshot.event_id == f"{launched['task_id']}:conclude-snapshot"
+        assert snapshot.payload["task_id"] == launched["task_id"]
+        assert snapshot.payload["status"] == "running"
+        assert snapshot.payload["name"] == "extension-bypass"
+        assert snapshot.payload["description"] == "validate extension bypass"
+        assert snapshot.payload["steps"] == 20
+        assert snapshot.payload["run_id"] == "child-run"
+        assert "evidence-19" in snapshot.payload["output"]
+        assert "evidence-0" not in snapshot.payload["output"]
+        assert "private child reasoning" not in snapshot.payload["output"]
+        assert len(snapshot.payload["output"]) <= 16_000
+        assert tool.close(wait_seconds=1) == 0
+
+    def test_completed_background_child_is_not_repeated_in_snapshot(self):
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        class FakeEngine:
+            active_run_id = "child-run"
+
+            def run(self, task, **kwargs):
+                _ = task, kwargs
+                return SimpleNamespace(
+                    state=SimpleNamespace(final_result="done", stop_reason="final"),
+                    records=[],
+                    step_count=1,
+                    total_tokens=2,
+                    run_id=self.active_run_id,
+                )
+
+            def cancel(self, mode):
+                _ = mode
+
+        tool = AgentTool(
+            invocation_factory=lambda request, _context: AgentInvocation(
+                engine=FakeEngine(),
+                task=request.prompt,
+            ),
+            execution_mode="background",
+        )
+        launched = tool.call(
+            {"description": "done", "prompt": "done"},
+            runtime_context={"delegate_depth": 0},
+        )
+
+        deadline = time.monotonic() + 1
+        while (
+            tool.get_background_result(launched["task_id"])["status"] == "running"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+        assert tool.snapshot_background_events() == []
+        assert tool.close(wait_seconds=0) == 0
+
+    def test_close_cancels_a_running_background_child(self):
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        class FakeEngine:
+            active_run_id = "child-run"
+
+            def run(self, task, **kwargs):
+                _ = task, kwargs
+                started.set()
+                assert cancelled.wait(timeout=1)
+                return SimpleNamespace(
+                    state=SimpleNamespace(
+                        final_result="",
+                        stop_reason="cancelled_immediate",
+                    ),
+                    records=[],
+                    step_count=0,
+                    total_tokens=0,
+                )
+
+            def cancel(self, mode):
+                assert mode == "immediate"
+                cancelled.set()
+
+        tool = AgentTool(
+            invocation_factory=lambda request, _context: AgentInvocation(
+                engine=FakeEngine(),
+                task=request.prompt,
+            ),
+            execution_mode="background",
+        )
+        result = tool.call(
+            {"description": "long route", "prompt": "wait"},
+            runtime_context={"delegate_depth": 0},
+        )
+
+        assert result["status"] == "running"
+        assert started.wait(timeout=1)
+        assert tool.close(wait_seconds=1) == 0
+        assert cancelled.is_set()
+
+    def test_close_wakes_a_child_waiting_for_an_execution_slot(self):
+        from contextlib import contextmanager
+
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        waiting = threading.Event()
+        child_started = threading.Event()
+
+        @contextmanager
+        def blocked_scope(runtime_context):
+            waiting.set()
+            cancelled = runtime_context["agent_cancelled"]
+            while not cancelled():
+                time.sleep(0.01)
+            raise RuntimeError("cancelled before child slot opened")
+            yield  # pragma: no cover
+
+        class FakeEngine:
+            active_run_id = "child-run"
+
+            def run(self, task, **kwargs):
+                _ = task, kwargs
+                child_started.set()
+                raise AssertionError("cancelled child unexpectedly started")
+
+            def cancel(self, mode):
+                _ = mode
+
+        tool = AgentTool(
+            invocation_factory=lambda request, _context: AgentInvocation(
+                engine=FakeEngine(),
+                task=request.prompt,
+            ),
+            execution_scope=blocked_scope,
+            execution_mode="background",
+        )
+        result = tool.call(
+            {"description": "queued route", "prompt": "wait"},
+            runtime_context={"delegate_depth": 0},
+        )
+
+        assert result["status"] == "running"
+        assert waiting.wait(timeout=1)
+        assert tool.close(wait_seconds=1) == 0
+        assert not child_started.is_set()
 
 
 # ── Sub-agents import ─────────────────────────────────────────────────────────

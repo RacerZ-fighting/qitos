@@ -6,14 +6,24 @@ import json
 import threading
 import time
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from qitos import AgentModule, Decision, Engine, RuntimeInput, StateSchema, ToolRegistry
+from qitos import (
+    Action,
+    AgentModule,
+    Decision,
+    Engine,
+    RuntimeInput,
+    StateSchema,
+    ToolRegistry,
+)
 from qitos.engine import RuntimeBudget
 from qitos.kit.history import WindowHistory
 from qitos.kit.parser import JsonDecisionParser
+from qitos.kit.tool.agent import AgentInvocation, AgentTool
 
 
 @dataclass
@@ -124,6 +134,114 @@ def test_runtime_wait_sleeps_until_event_and_delivers_it_at_safe_point() -> None
     assert stages.count("runtime_wait_start") == 1
     assert stages.count("runtime_wait_end") == 1
     assert stages.count("runtime_input") == 1
+
+
+def test_background_agent_completion_wakes_parent_runtime_wait() -> None:
+    child_started = threading.Event()
+    release_child = threading.Event()
+
+    class ChildEngine:
+        active_run_id = "child-run"
+
+        def run(self, task: str, **kwargs: Any) -> Any:
+            _ = kwargs
+            child_started.set()
+            assert release_child.wait(timeout=1)
+            return SimpleNamespace(
+                state=SimpleNamespace(
+                    final_result=f"validated:{task}",
+                    stop_reason="final",
+                ),
+                records=[],
+                step_count=1,
+                total_tokens=2,
+                run_id="child-run",
+            )
+
+        def cancel(self, mode: str) -> None:
+            _ = mode
+            release_child.set()
+
+    agent_tool = AgentTool(
+        invocation_factory=lambda request, _context: AgentInvocation(
+            engine=ChildEngine(),
+            task=request.prompt,
+        ),
+        execution_mode="background",
+    )
+
+    class ParentAgent(AgentModule[_State, dict[str, Any], Action]):
+        name = "background-parent"
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.waiting = threading.Event()
+            self.history = WindowHistory(window_size=20)
+            super().__init__(
+                tool_registry=ToolRegistry().register(agent_tool),
+                history=self.history,
+            )
+
+        def init_state(self, task: str, **kwargs: Any) -> _State:
+            _ = kwargs
+            return _State(task=task, max_steps=5)
+
+        def decide(
+            self,
+            state: _State,
+            observation: dict[str, Any],
+        ) -> Decision[Action]:
+            _ = state, observation
+            self.calls += 1
+            if self.calls == 1:
+                return Decision.act(
+                    [
+                        Action(
+                            name="Agent",
+                            args={"description": "route", "prompt": "one"},
+                        )
+                    ]
+                )
+            if self.calls == 2:
+                self.waiting.set()
+                return Decision.wait(meta={"runtime_wait": True})
+            return Decision.final("parent-done")
+
+        def reduce(
+            self,
+            state: _State,
+            observation: dict[str, Any],
+            decision: Decision[Action],
+        ) -> _State:
+            _ = observation, decision
+            return state
+
+    parent = ParentAgent()
+    engine = Engine(parent, budget=RuntimeBudget(max_steps=5))
+    result_holder: list[Any] = []
+    thread = threading.Thread(target=lambda: result_holder.append(engine.run("test")))
+
+    thread.start()
+    assert child_started.wait(timeout=1)
+    assert parent.waiting.wait(timeout=1)
+    assert thread.is_alive()
+
+    release_child.set()
+    thread.join(timeout=1)
+    agent_tool.close(wait_seconds=1)
+
+    assert not thread.is_alive()
+    assert parent.calls == 3
+    assert result_holder[0].state.final_result == "parent-done"
+    runtime_messages = [
+        json.loads(message.content)
+        for message in parent.history.messages
+        if message.role == "user" and message.metadata.get("source") == "runtime"
+    ]
+    assert len(runtime_messages) == 1
+    event = runtime_messages[0]["runtime_events"][0]
+    assert event["kind"] == "agent.child.completed"
+    assert event["payload"]["output"] == "validated:one"
 
 
 def test_cancel_wakes_runtime_wait_without_another_decide() -> None:

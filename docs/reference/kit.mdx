@@ -653,7 +653,7 @@ def build_child(request, runtime_context):
 tool = AgentTool(
     invocation_factory=build_child,
     execution_scope=acquire_run_scoped_slot,
-    allow_background=False,
+    execution_mode="background",
     max_delegate_depth=1,
     max_turns=200,
 )
@@ -669,7 +669,27 @@ The result reports output, steps, total tokens, elapsed time, stop reason, and r
 `AgentRequest.max_turns`; legacy class-registry children receive it through
 `AgentModule.run(max_steps=...)`.
 
-When `allow_background=False`, the background argument is omitted from the schema.
+`execution_mode` accepts `"foreground"`, `"optional_background"`, or `"background"`.
+The optional mode exposes `run_in_background` to the model. The background mode omits
+that argument, always returns a running receipt with a task id, and posts an
+`agent.child.completed` `RuntimeInput` to the exact parent Engine run when the child
+terminates. Invocation factories run before the background submission so parent context
+is frozen at launch. If a child has no final answer, the completion payload contains a
+bounded projection of its recent tool evidence instead of silently dropping useful work.
+
+`active_background_count`, `get_background_result(task_id)`, `cancel_background(task_id)`,
+`snapshot_background_events()`, and `close()` expose lifecycle control to the owning
+application. A snapshot projects only the active children's bounded, completed tool
+results into `agent.child.snapshot` runtime events; it does not expose model responses or
+reasoning. This lets an owner preserve evidence immediately before a forced conclusion.
+`close()` cooperatively cancels outstanding child Engines; applications with run-scoped
+resources should call it before those resources leave scope. An `execution_scope` that
+waits for an application slot should also observe the
+`runtime_context["agent_cancelled"]` callback so teardown can wake a child that has not
+entered its Engine yet.
+
+When `allow_background=False` (the compatibility spelling for foreground mode), the
+background argument is omitted from the schema.
 Delegation depth is checked before the factory runs. Multiple Agent calls execute in
 parallel only when the parent Engine's `ActionExecutionPolicy` allows `Agent` and the
 tool remains marked concurrency-safe. The model-facing tool description recommends one
