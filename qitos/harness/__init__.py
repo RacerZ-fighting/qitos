@@ -6,6 +6,13 @@ from typing import Any
 
 from ._adapters import OpenAICompatibleAdapter, adapter_for_kind
 from ._presets import known_family_presets, resolve_builtin_preset
+from ._reasoning import (
+    ReasoningEffort,
+    ReasoningPolicy,
+    ReasoningResolution,
+    parse_reasoning_effort,
+    resolve_reasoning,
+)
 from ._types import (
     ContextPolicy,
     FamilyPreset,
@@ -67,6 +74,7 @@ def build_model_for_preset(
     stream_idle_timeout: float = 60.0,
     retry_window_seconds: float = 300.0,
     async_model: bool = False,
+    reasoning_effort: ReasoningEffort | str | None = ReasoningEffort.HIGH,
 ) -> Any:
     harness = build_harness_policy(
         model_name=model_name,
@@ -74,17 +82,20 @@ def build_model_for_preset(
         protocol=protocol,
         tool_delivery=tool_delivery,
     )
-    # Merge preset-level recommended_request_kwargs with caller-provided kwargs.
-    # Caller kwargs take precedence over preset recommendations.
+    reasoning = resolve_reasoning(
+        family_id=harness.family_preset.id,
+        model_name=model_name,
+        api_mode=api_mode,
+        requested=reasoning_effort,
+    )
+    # Merge preset recommendations, caller options, then the resolved reasoning
+    # contract. Explicit reasoning intent is authoritative for its wire fields.
     preset_kwargs = harness.family_preset.recommended_request_kwargs
-    effective_kwargs = default_request_kwargs
-    if preset_kwargs:
-        if effective_kwargs is None:
-            effective_kwargs = dict(preset_kwargs)
-        else:
-            merged = dict(preset_kwargs)
-            merged.update(effective_kwargs)
-            effective_kwargs = merged
+    effective_kwargs = _merge_request_options(
+        preset_kwargs,
+        default_request_kwargs,
+        reasoning.request_options,
+    )
 
     llm = harness.adapter.build_model(
         preset=harness.family_preset,
@@ -116,10 +127,28 @@ def build_model_for_preset(
         "native_tool_call_preferred", harness.tool_policy.native_tool_call_preferred
     )
     metadata.setdefault("effective_tool_delivery", harness.protocol.tool_schema_delivery)
+    metadata["reasoning"] = reasoning.to_dict()
     setattr(llm, "qitos_harness_metadata", metadata)
     setattr(llm, "qitos_family_preset", harness.family_preset.id)
     setattr(llm, "qitos_protocol", harness.protocol.id)
     return llm
+
+
+def _merge_request_options(
+    *options: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    merged: dict[str, Any] = {}
+    for option in options:
+        if not option:
+            continue
+        for key, value in option.items():
+            if key in {"extra_body", "reasoning"} and isinstance(value, dict):
+                nested = dict(merged.get(key) or {})
+                nested.update(value)
+                merged[key] = nested
+            else:
+                merged[key] = value
+    return merged or None
 
 
 __all__ = [
@@ -129,6 +158,11 @@ __all__ = [
     "ContextPolicy",
     "HarnessPolicy",
     "FamilyPreset",
+    "ReasoningEffort",
+    "ReasoningPolicy",
+    "ReasoningResolution",
+    "parse_reasoning_effort",
+    "resolve_reasoning",
     "resolve_family_preset",
     "build_model_for_preset",
     "build_harness_policy",

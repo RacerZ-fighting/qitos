@@ -1396,6 +1396,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         """
         handler = to_stream_handler(self.stream_callback)
         accumulated_text: List[str] = []
+        accumulated_reasoning: List[str] = []
         final_usage: Optional[Dict[str, Any]] = None
         final_tool_calls: Optional[List[Dict[str, Any]]] = None
         final_native_items: Optional[List[Dict[str, Any]]] = None
@@ -1413,6 +1414,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             for chunk in stream_iter:
                 # Handle ModelStreamChunk objects
                 text = getattr(chunk, "text", None)
+                reasoning = getattr(chunk, "reasoning_content", None)
                 done = getattr(chunk, "done", False)
                 usage = getattr(chunk, "usage", None)
                 tool_calls = getattr(chunk, "tool_calls", None)
@@ -1432,6 +1434,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                             handler.on_delta(text)
                         except Exception:
                             pass
+
+                if reasoning:
+                    accumulated_reasoning.append(str(reasoning))
 
                 if done:
                     if usage is not None and isinstance(usage, dict):
@@ -1462,6 +1467,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             result["tool_calls"] = final_tool_calls
         if final_native_items:
             result["native_items"] = final_native_items
+        if accumulated_reasoning:
+            result["reasoning_content"] = "".join(accumulated_reasoning)
         return result
 
     def _build_current_user_message(

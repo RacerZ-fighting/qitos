@@ -92,8 +92,13 @@ class _ChatStreamAccumulator:
         choice = chunk.choices[0]
         delta = choice.delta
         text = delta.content or ""
-        if text:
-            yield ModelStreamChunk(text=text, done=False)
+        reasoning = getattr(delta, "reasoning_content", None)
+        if text or reasoning:
+            yield ModelStreamChunk(
+                text=text,
+                reasoning_content=str(reasoning) if reasoning else None,
+                done=False,
+            )
         self._accumulate_tool_calls(getattr(delta, "tool_calls", None))
         if choice.finish_reason is None:
             return
@@ -179,6 +184,21 @@ def _relocate_chat_template_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
         extra_body["chat_template_kwargs"] = ctk
         result["extra_body"] = extra_body
     return result
+
+
+def _merge_request_kwargs(
+    defaults: Dict[str, Any], overrides: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge model defaults with per-call overrides without losing nested options."""
+    merged = dict(defaults)
+    for key, value in overrides.items():
+        if key in {"extra_body", "reasoning"} and isinstance(value, dict):
+            nested = dict(merged.get(key) or {})
+            nested.update(value)
+            merged[key] = nested
+        else:
+            merged[key] = value
+    return merged
 
 
 def _is_forced_tool_choice(tool_choice: Any) -> bool:
@@ -742,6 +762,10 @@ class OpenAICompatibleModel(Model):
                 "OPENAI_BASE_URL not set. Please set environment variable or pass base_url parameter."
             )
 
+    def _request_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply model-level request defaults to every invocation path."""
+        return _merge_request_kwargs(self.default_request_kwargs, kwargs)
+
     def count_tokens(self, messages_or_text: Any) -> Optional[int]:
         if self._should_use_glm_tokenizer():
             value = self._count_tokens_with_glm_tokenizer(messages_or_text)
@@ -791,6 +815,7 @@ class OpenAICompatibleModel(Model):
         """
         import openai
 
+        kwargs = self._request_kwargs(kwargs)
         client = openai.OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
@@ -910,6 +935,7 @@ class OpenAICompatibleModel(Model):
         import openai
 
         self._last_usage = None
+        kwargs = self._request_kwargs(kwargs)
         client = openai.OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
@@ -1007,6 +1033,7 @@ class OpenAICompatibleModel(Model):
     ) -> Iterator[ModelStreamChunk]:
         """Stream live chunks, retrying only before output becomes observable."""
         self._last_usage = None
+        kwargs = self._request_kwargs(kwargs)
         if self.api_mode == "responses":
             yield from sync_stream_with_retry(
                 lambda: self._responses_stream_once(
@@ -1027,6 +1054,7 @@ class OpenAICompatibleModel(Model):
     ) -> Iterator[ModelStreamChunk]:
         """Publish one complete attempt and retry discarded partial attempts."""
         self._last_usage = None
+        kwargs = self._request_kwargs(kwargs)
         if self.api_mode == "responses":
             yield from sync_transactional_stream_with_retry(
                 lambda: self._responses_stream_once(
@@ -1168,6 +1196,7 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
         """Async call to OpenAI-compatible API."""
         import openai
 
+        kwargs = self._request_kwargs(kwargs)
         client = openai.AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
@@ -1210,6 +1239,7 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
         import openai
 
         self._last_usage = None
+        kwargs = self._request_kwargs(kwargs)
         client = openai.AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
@@ -1229,6 +1259,7 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
         import openai
 
         self._last_usage = None
+        kwargs = self._request_kwargs(kwargs)
         if self.api_mode == "responses":
             client = openai.AsyncOpenAI(
                 api_key=self.api_key,
@@ -1275,8 +1306,13 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
                 continue
             delta = chunk.choices[0].delta
             text = delta.content or ""
-            if text:
-                yield ModelStreamChunk(text=text, done=False)
+            reasoning = getattr(delta, "reasoning_content", None)
+            if text or reasoning:
+                yield ModelStreamChunk(
+                    text=text,
+                    reasoning_content=str(reasoning) if reasoning else None,
+                    done=False,
+                )
             if chunk.choices[0].finish_reason is not None:
                 usage_data = _usage_payload(getattr(chunk, "usage", None))
                 self._set_last_usage(usage_data)
@@ -1336,6 +1372,7 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
     ) -> AsyncIterator[ModelStreamChunk]:
         """Publish one complete attempt and retry discarded partial attempts."""
         self._last_usage = None
+        kwargs = self._request_kwargs(kwargs)
         request_kwargs = (
             dict(kwargs)
             if self.api_mode == "responses"
