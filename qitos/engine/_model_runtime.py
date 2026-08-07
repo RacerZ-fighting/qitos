@@ -1334,11 +1334,27 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
     def _call_llm(
         self, llm: Any, messages: List[Dict[str, Any]], request_options: Dict[str, Any]
     ) -> Any:
-        # If streaming is requested and the model supports it, use streaming path
+        transactional_stream = getattr(llm, "transactional_stream", None)
+        supports_transactional_stream = getattr(
+            llm, "supports_transactional_stream", None
+        )
+        if (
+            callable(transactional_stream)
+            and supports_transactional_stream is not False
+        ):
+            return self._call_llm_streaming(
+                llm,
+                messages,
+                request_options,
+                stream_fn=transactional_stream,
+            )
+
         if self.stream_callback is not None:
             stream_fn = getattr(llm, "stream", None)
             if callable(stream_fn):
-                return self._call_llm_streaming(llm, messages, request_options)
+                return self._call_llm_streaming(
+                    llm, messages, request_options, stream_fn=stream_fn
+                )
 
         call_raw = getattr(llm, "call_raw", None)
         if callable(call_raw):
@@ -1366,17 +1382,18 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             return llm(messages)
 
     def _call_llm_streaming(
-        self, llm: Any, messages: List[Dict[str, Any]], request_options: Dict[str, Any]
+        self,
+        llm: Any,
+        messages: List[Dict[str, Any]],
+        request_options: Dict[str, Any],
+        *,
+        stream_fn: Any,
     ) -> Any:
         """Stream LLM response, forwarding text deltas via callback.
 
         Returns a synthetic dict that mimics the structure _normalize_model_response
         expects: {"text": ..., "usage": ..., "finish_reason": ..., "tool_calls": ...}.
         """
-        stream_fn = getattr(llm, "stream", None)
-        if not callable(stream_fn):
-            return self._call_llm(llm, messages, request_options)
-
         handler = to_stream_handler(self.stream_callback)
         accumulated_text: List[str] = []
         final_usage: Optional[Dict[str, Any]] = None

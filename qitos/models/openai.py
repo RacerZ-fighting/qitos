@@ -33,7 +33,9 @@ from ._openai_retry import (
     async_run_with_retry,
     run_with_retry,
     sync_stream_with_retry,
+    sync_transactional_stream_with_retry,
     stream_with_retry,
+    transactional_stream_with_retry,
 )
 from .base import Model, ModelStreamChunk
 
@@ -45,8 +47,10 @@ def _usage_payload(usage: Any) -> Optional[Dict[str, Any]]:
     """Normalize OpenAI/SGLang usage, including optional cache reporting."""
     if usage is None:
         return None
+
     def field(name: str) -> Any:
         return usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+
     prompt_tokens = field("prompt_tokens")
     completion_tokens = field("completion_tokens")
     total_tokens = field("total_tokens")
@@ -60,6 +64,84 @@ def _usage_payload(usage: Any) -> Optional[Dict[str, Any]]:
         "total_tokens": total_tokens,
         "cached_tokens": cached,
     }
+
+
+def _stream_timeout(idle_timeout: float) -> Any:
+    """Use the provider read timeout as the synchronous stream-idle watchdog."""
+    import httpx
+
+    return httpx.Timeout(float(idle_timeout))
+
+
+class _ChatStreamAccumulator:
+    """Normalize one Chat Completions stream attempt."""
+
+    def __init__(self, adapter: Model) -> None:
+        self._adapter = adapter
+        self._tool_calls: List[Dict[str, Any]] = []
+        self._usage: Optional[Dict[str, Any]] = None
+        self.finished = False
+
+    def consume(self, chunk: Any) -> Iterator[ModelStreamChunk]:
+        if not chunk.choices:
+            usage = _usage_payload(getattr(chunk, "usage", None))
+            if usage:
+                self._usage = usage
+            return
+
+        choice = chunk.choices[0]
+        delta = choice.delta
+        text = delta.content or ""
+        if text:
+            yield ModelStreamChunk(text=text, done=False)
+        self._accumulate_tool_calls(getattr(delta, "tool_calls", None))
+        if choice.finish_reason is None:
+            return
+
+        usage = _usage_payload(getattr(chunk, "usage", None))
+        if usage:
+            self._usage = usage
+        self.finished = True
+
+    def complete(self) -> ModelStreamChunk | None:
+        if not self.finished:
+            return None
+        self._adapter._set_last_usage(self._usage)
+        return ModelStreamChunk(
+            text="",
+            done=True,
+            usage=self._usage,
+            tool_calls=self._tool_calls or None,
+        )
+
+    def _accumulate_tool_calls(self, deltas: Any) -> None:
+        for item in list(deltas or []):
+            index = getattr(item, "index", len(self._tool_calls))
+            while len(self._tool_calls) <= index:
+                self._tool_calls.append(
+                    {
+                        "id": None,
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                )
+            tool_call = self._tool_calls[index]
+            tool_call_id = getattr(item, "id", None)
+            if tool_call_id:
+                tool_call["id"] = tool_call_id
+            tool_call_type = getattr(item, "type", None)
+            if tool_call_type:
+                tool_call["type"] = tool_call_type
+            function = getattr(item, "function", None)
+            if not function:
+                continue
+            name = getattr(function, "name", None)
+            if name:
+                tool_call["function"]["name"] = name
+            arguments = getattr(function, "arguments", None)
+            if arguments:
+                previous = tool_call["function"].get("arguments", "")
+                tool_call["function"]["arguments"] = previous + arguments
 
 
 def _wire_tool_schema(
@@ -612,6 +694,7 @@ class OpenAICompatibleModel(Model):
         api_mode: str = "chat_completions",
         max_attempts: int = 2,
         stream_idle_timeout: float = 60.0,
+        retry_window_seconds: float = 300.0,
     ):
         """
         Initialize compatible model
@@ -630,6 +713,8 @@ class OpenAICompatibleModel(Model):
             api_mode: OpenAI transport, ``chat_completions`` or ``responses``
             max_attempts: Total transport attempts, including the initial request
             stream_idle_timeout: Maximum seconds between Responses stream events
+            retry_window_seconds: Maximum recovery window after the first
+                retryable failure
         """
         super().__init__(
             model=model,
@@ -646,7 +731,10 @@ class OpenAICompatibleModel(Model):
         self.api_mode = _normalize_api_mode(api_mode)
         if isinstance(stream_idle_timeout, bool) or stream_idle_timeout <= 0:
             raise ValueError("stream_idle_timeout must be positive")
-        self.retry_policy = ModelRetryPolicy(max_attempts=max_attempts)
+        self.retry_policy = ModelRetryPolicy(
+            max_attempts=max_attempts,
+            retry_window_seconds=retry_window_seconds,
+        )
         self.stream_idle_timeout = float(stream_idle_timeout)
 
         if not self.base_url:
@@ -840,32 +928,25 @@ class OpenAICompatibleModel(Model):
     def _usage_from_response(self, response: Any) -> Optional[Dict[str, Any]]:
         return _usage_payload(getattr(response, "usage", None))
 
-    def stream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> Iterator[ModelStreamChunk]:
-        """Stream OpenAI-compatible response as chunks, yielding token-level text."""
+    def _stream_client(self) -> Any:
         import openai
 
-        self._last_usage = None
-        client = openai.OpenAI(
+        return openai.OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
-            timeout=self.timeout,
+            timeout=_stream_timeout(self.stream_idle_timeout),
             max_retries=0,
         )
-        if self.api_mode == "responses":
-            yield from sync_stream_with_retry(
-                lambda: _responses_stream(
-                    self, client, messages, provider="openai-compatible", **kwargs
-                ),
-                policy=self.retry_policy,
-            )
-            return
 
-        # Build stream options — request usage in final chunk. Providers that do not
-        # support the optional field get one same-attempt fallback without it.
-        create_kwargs: Dict[str, Any] = dict(kwargs)
+    def _chat_stream_request(
+        self, messages: List[Dict[str, Any]], kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        create_kwargs = _disable_thinking_for_forced_tool_choice(
+            _relocate_chat_template_kwargs(kwargs)
+        )
         if "stream_options" not in create_kwargs:
             create_kwargs["stream_options"] = {"include_usage": True}
-        request_kwargs: Dict[str, Any] = {
+        request: Dict[str, Any] = {
             "model": self.model,
             "messages": cast(Any, _to_openai_messages(messages)),
             "max_tokens": self.max_tokens,
@@ -873,92 +954,95 @@ class OpenAICompatibleModel(Model):
             **create_kwargs,
         }
         if self.temperature is not None:
-            request_kwargs["temperature"] = self.temperature
+            request["temperature"] = self.temperature
+        return request
 
-        def create_stream() -> Any:
-            nonlocal request_kwargs
-            try:
-                return client.chat.completions.create(**request_kwargs)
-            except Exception as exc:
-                if "stream_options" not in request_kwargs:
-                    raise
-                if not _is_unsupported_stream_options_error(exc):
-                    raise
-                request_kwargs = dict(request_kwargs)
-                request_kwargs.pop("stream_options", None)
-                return client.chat.completions.create(**request_kwargs)
+    def _chat_stream_once(
+        self, request_kwargs: Dict[str, Any]
+    ) -> Iterator[ModelStreamChunk]:
+        client = self._stream_client()
+        try:
+            response = client.chat.completions.create(**request_kwargs)
+        except Exception as exc:
+            if "stream_options" not in request_kwargs:
+                raise
+            if not _is_unsupported_stream_options_error(exc):
+                raise
+            request_kwargs.pop("stream_options", None)
+            response = client.chat.completions.create(**request_kwargs)
 
-        accumulated_tool_calls: List[Dict[str, Any]] = []
-        for chunk in sync_stream_with_retry(create_stream, policy=self.retry_policy):
-            if not chunk.choices:
-                # Empty choices chunk may carry usage data (OpenAI sends it last)
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_data = {
-                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
-                        "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
-                        "total_tokens": getattr(chunk.usage, "total_tokens", None),
-                        "cached_tokens": getattr(
-                            getattr(chunk.usage, "prompt_tokens_details", None),
-                            "cached_tokens",
-                            None,
-                        ),
-                    }
-                    self._set_last_usage(usage_data)
-                continue
-            delta = chunk.choices[0].delta
-            text = delta.content or ""
-            if text:
-                yield ModelStreamChunk(text=text, done=False)
-            # Accumulate streaming tool call deltas
-            delta_tool_calls = getattr(delta, "tool_calls", None)
-            if delta_tool_calls:
-                for dtc in delta_tool_calls:
-                    idx = getattr(dtc, "index", len(accumulated_tool_calls))
-                    while len(accumulated_tool_calls) <= idx:
-                        accumulated_tool_calls.append(
-                            {
-                                "id": None,
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        )
-                    tc = accumulated_tool_calls[idx]
-                    tc_id = getattr(dtc, "id", None)
-                    if tc_id:
-                        tc["id"] = tc_id
-                    tc_type = getattr(dtc, "type", None)
-                    if tc_type:
-                        tc["type"] = tc_type
-                    fn = getattr(dtc, "function", None)
-                    if fn:
-                        fn_name = getattr(fn, "name", None)
-                        if fn_name:
-                            tc["function"]["name"] = fn_name
-                        fn_args = getattr(fn, "arguments", None)
-                        if fn_args:
-                            tc["function"]["arguments"] = tc["function"].get(
-                                "arguments", ""
-                            ) + fn_args
-            if chunk.choices[0].finish_reason is not None:
-                usage_data = None
-                if hasattr(chunk, "usage") and chunk.usage:
-                    usage_data = {
-                        "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
-                        "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
-                        "total_tokens": getattr(chunk.usage, "total_tokens", None),
-                        "cached_tokens": getattr(
-                            getattr(chunk.usage, "prompt_tokens_details", None),
-                            "cached_tokens",
-                            None,
-                        ),
-                    }
-                    self._set_last_usage(usage_data)
-                yield ModelStreamChunk(
-                    text="",
-                    done=True,
-                    usage=usage_data,
-                    tool_calls=accumulated_tool_calls if accumulated_tool_calls else None,
-                )
+        try:
+            yield from self._chat_stream_chunks(response)
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+
+    def _chat_stream_chunks(self, response: Any) -> Iterator[ModelStreamChunk]:
+        accumulator = _ChatStreamAccumulator(self)
+        for chunk in response:
+            yield from accumulator.consume(chunk)
+        completed = accumulator.complete()
+        if completed is not None:
+            yield completed
+
+    def _responses_stream_once(
+        self,
+        messages: List[Dict[str, Any]],
+        kwargs: Dict[str, Any],
+        *,
+        require_completed: bool,
+    ) -> Iterator[ModelStreamChunk]:
+        yield from _responses_stream(
+            self,
+            self._stream_client(),
+            messages,
+            provider="openai-compatible",
+            require_completed=require_completed,
+            **kwargs,
+        )
+
+    def stream(
+        self, messages: List[Dict[str, Any]], **kwargs: Any
+    ) -> Iterator[ModelStreamChunk]:
+        """Stream live chunks, retrying only before output becomes observable."""
+        self._last_usage = None
+        if self.api_mode == "responses":
+            yield from sync_stream_with_retry(
+                lambda: self._responses_stream_once(
+                    messages, dict(kwargs), require_completed=False
+                ),
+                policy=self.retry_policy,
+            )
+            return
+
+        request_kwargs = self._chat_stream_request(messages, dict(kwargs))
+        yield from sync_stream_with_retry(
+            lambda: self._chat_stream_once(request_kwargs),
+            policy=self.retry_policy,
+        )
+
+    def transactional_stream(
+        self, messages: List[Dict[str, Any]], **kwargs: Any
+    ) -> Iterator[ModelStreamChunk]:
+        """Publish one complete attempt and retry discarded partial attempts."""
+        self._last_usage = None
+        if self.api_mode == "responses":
+            yield from sync_transactional_stream_with_retry(
+                lambda: self._responses_stream_once(
+                    messages, dict(kwargs), require_completed=True
+                ),
+                policy=self.retry_policy,
+                is_complete=lambda chunk: chunk.done,
+            )
+            return
+
+        request_kwargs = self._chat_stream_request(messages, dict(kwargs))
+        yield from sync_transactional_stream_with_retry(
+            lambda: self._chat_stream_once(request_kwargs),
+            policy=self.retry_policy,
+            is_complete=lambda chunk: chunk.done,
+        )
 
 
 class AzureOpenAIModel(OpenAICompatibleModel):
@@ -1197,6 +1281,78 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
                 usage_data = _usage_payload(getattr(chunk, "usage", None))
                 self._set_last_usage(usage_data)
                 yield ModelStreamChunk(text="", done=True, usage=usage_data)
+
+    async def _atransactional_stream_once(
+        self,
+        messages: List[Dict[str, Any]],
+        request_kwargs: Dict[str, Any],
+    ) -> AsyncIterator[ModelStreamChunk]:
+        import openai
+
+        client = openai.AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=_stream_timeout(self.stream_idle_timeout),
+            max_retries=0,
+        )
+        if self.api_mode == "responses":
+            async for chunk in _async_responses_stream(
+                self,
+                client,
+                messages,
+                provider="openai-compatible",
+                retry_events=False,
+                require_completed=True,
+                **request_kwargs,
+            ):
+                yield chunk
+            return
+
+        try:
+            response = await client.chat.completions.create(**request_kwargs)
+        except Exception as exc:
+            if "stream_options" not in request_kwargs:
+                raise
+            if not _is_unsupported_stream_options_error(exc):
+                raise
+            request_kwargs.pop("stream_options", None)
+            response = await client.chat.completions.create(**request_kwargs)
+
+        accumulator = _ChatStreamAccumulator(self)
+        try:
+            async for item in response:
+                for chunk in accumulator.consume(item):
+                    yield chunk
+            completed = accumulator.complete()
+            if completed is not None:
+                yield completed
+        finally:
+            close = getattr(response, "aclose", None)
+            if callable(close):
+                await close()
+
+    async def atransactional_stream(
+        self, messages: List[Dict[str, Any]], **kwargs: Any
+    ) -> AsyncIterator[ModelStreamChunk]:
+        """Publish one complete attempt and retry discarded partial attempts."""
+        self._last_usage = None
+        request_kwargs = (
+            dict(kwargs)
+            if self.api_mode == "responses"
+            else self._chat_stream_request(messages, dict(kwargs))
+        )
+
+        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+            return self._atransactional_stream_once(messages, request_kwargs)
+
+        async for chunk in transactional_stream_with_retry(
+            create_stream,
+            policy=self.retry_policy,
+            idle_timeout_seconds=self.stream_idle_timeout,
+            request_timeout_seconds=float(self.timeout),
+            is_complete=lambda item: item.done,
+        ):
+            yield chunk
 
 
 class AsyncOpenAIModel(OpenAIModel):

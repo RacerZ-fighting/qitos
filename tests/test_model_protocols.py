@@ -9,6 +9,7 @@ from qitos.engine import Engine
 from qitos.harness import build_model_for_preset
 from qitos.kit import MiniMaxToolCallParser
 from qitos.kit.parser import ReActTextParser
+from qitos.models import ModelStreamChunk
 from qitos.models.profile_registry import infer_default_protocol, infer_model_profile
 from qitos.protocols import ModelProtocol, get_protocol
 
@@ -228,22 +229,16 @@ def test_preset_model_protocol_delivers_tools_to_direct_engine_model_call() -> N
     llm = _build_kimi_k3_model()
     calls: list[dict[str, Any]] = []
 
-    def call_raw(messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+    def transactional_stream(messages: list[dict[str, Any]], **kwargs: Any):
         _ = messages
         calls.append(dict(kwargs))
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": '{"thought":"done","final_answer":"ok"}',
-                        "tool_calls": None,
-                    },
-                    "finish_reason": "stop",
-                }
-            ]
-        }
+        yield ModelStreamChunk(
+            text='{"thought":"done","final_answer":"ok"}',
+            done=False,
+        )
+        yield ModelStreamChunk(text="", done=True)
 
-    llm.call_raw = call_raw
+    llm.transactional_stream = transactional_stream
     agent = _ProtocolAgent(llm=llm)
 
     @tool(name="lookup")

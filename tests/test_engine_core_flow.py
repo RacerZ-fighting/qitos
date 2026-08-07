@@ -20,6 +20,7 @@ from qitos.kit.parser import ReActTextParser
 from qitos.core.memory import Memory, MemoryRecord
 from qitos.engine import RuntimeBudget
 from qitos.engine.states import ContextConfig
+from qitos.models import ModelStreamChunk
 from qitos.trace import runtime_step_to_trace
 
 
@@ -838,7 +839,7 @@ def test_engine_prefers_provider_usage_for_context_totals():
     assert ctx["tokens_total"] == 140
 
 
-def test_engine_uses_native_tool_call_lane_before_parser():
+def test_engine_uses_transactional_stream_native_tool_calls_before_parser():
     class _RawResponseModel:
         model = "qwen-plus"
         provider = "openai-compatible"
@@ -853,34 +854,31 @@ def test_engine_uses_native_tool_call_lane_before_parser():
                 },
             }
 
-        def call_raw(self, messages):
+        def transactional_stream(self, messages):
             _ = messages
-            return {
-                "choices": [
+            yield ModelStreamChunk(
+                text="",
+                done=True,
+                tool_calls=[
                     {
-                        "message": {
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "add",
-                                        "arguments": '{"a": 20, "b": 22}',
-                                    },
-                                }
-                            ],
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "add",
+                            "arguments": '{"a": 20, "b": 22}',
                         },
-                        "finish_reason": "tool_calls",
                     }
                 ],
-                "usage": {
+                usage={
                     "prompt_tokens": 10,
                     "completion_tokens": 4,
                     "total_tokens": 14,
                 },
-                "model": "qwen-plus",
-            }
+            )
+
+        def call_raw(self, messages):
+            _ = messages
+            raise AssertionError("Engine should prefer the complete stream path")
 
     class _NeverParser:
         def parse(self, raw_output, context=None):

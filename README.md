@@ -32,10 +32,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Runtime input and idle wait**: background work can post a small event to an exact
   Engine run. Explicit runtime waits sleep without model polling or step growth and
   wake on input, cancellation, or the run deadline.
-- **Bounded OpenAI-compatible retries**: synchronous calls and async Responses streams
-  now use one explicit QitOS transport retry budget with SDK retries disabled. Async
-  streams enforce an event-idle timeout, close stalled streams before retrying, and
-  surface typed exhaustion errors.
+- **Transactional OpenAI-compatible streams**: Engine calls use one explicit QitOS
+  retry budget with SDK retries disabled. Retryable mid-stream failures discard partial
+  text and tool calls before retrying within a 300-second recovery window by default,
+  and an event-idle timeout detects stalled streams
+  without cutting off healthy long responses.
 - **Readable tool evidence**: tools can now project a compact `model_summary`
   into native tool-call history without discarding their full structured result
   from reducers, traces, or replay.

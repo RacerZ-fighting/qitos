@@ -64,18 +64,26 @@ reasoning continuation payloads.
 
 | Argument | Default | Behavior |
 |---|---:|---|
-| `timeout` | `120` | Total request timeout for one transport attempt |
+| `timeout` | `120` | Non-stream request timeout |
 | `max_attempts` | `2` | Total attempts including the first request |
-| `stream_idle_timeout` | `60` | Maximum seconds between async Responses stream events |
+| `stream_idle_timeout` | `60` | Maximum seconds without progress on a model stream |
+| `retry_window_seconds` | `300` | Total recovery window after the first retryable failure |
 
-Synchronous calls and async Responses streams activate this policy. QitOS creates the
-corresponding OpenAI-compatible SDK client with `max_retries=0` and becomes the only
+Synchronous calls and model streams activate this policy. QitOS creates the
+corresponding OpenAI-compatible SDK client with `max_retries=0` and remains the only
 retry owner. It retries recognized connection failures, timeouts, 408, 409, 429, and
 5xx responses and honors bounded
 `Retry-After`, `retry-after-ms`, and `x-should-retry` hints. Local validation errors
-and ordinary 4xx responses fail immediately. Async Responses streams are retried only
-before the first event and are closed before a retry, avoiding duplicated partial
-output.
+and ordinary 4xx responses fail immediately.
+
+The Engine uses a transactional stream for OpenAI-compatible models: text and tool-call
+deltas stay private until a terminal event completes the attempt. A retryable failure
+after partial output closes that stream, discards its buffered deltas, and retries within
+both the `max_attempts` budget and `retry_window_seconds`, measured from the first
+retryable failure. A healthy long response may run beyond `timeout` while events
+continue; `stream_idle_timeout` detects a stalled response. Direct callers of the public
+live `stream()` / `astream()` APIs still receive deltas immediately, so those APIs retry
+only before output becomes observable.
 
 ```python
 from qitos.models import AsyncOpenAICompatibleModel
@@ -87,6 +95,7 @@ llm = AsyncOpenAICompatibleModel(
     timeout=120,
     max_attempts=2,
     stream_idle_timeout=60,
+    retry_window_seconds=300,
 )
 ```
 

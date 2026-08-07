@@ -9,8 +9,13 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from qitos.core.errors import ModelTransportError
-from qitos.models._openai_retry import ModelRetryPolicy, async_run_with_retry
-from qitos.models.openai import OpenAICompatibleModel
+from qitos.models._openai_retry import (
+    ModelRetryPolicy,
+    async_run_with_retry,
+    sync_transactional_stream_with_retry,
+)
+from qitos.models.base import ModelStreamChunk
+from qitos.models.openai import AsyncOpenAICompatibleModel, OpenAICompatibleModel
 
 
 def test_lower_level_transport_errors_are_retried(monkeypatch) -> None:
@@ -155,6 +160,188 @@ def test_sync_openai_stream_does_not_retry_after_first_event(monkeypatch) -> Non
     assert attempts == 1
     assert closes == 1
     assert exc_info.value.attempts == 1
+
+
+def test_transactional_stream_retries_midstream_without_publishing_partial_output(
+    monkeypatch,
+) -> None:
+    attempts = 0
+    closes = 0
+
+    class AttemptStream:
+        def __init__(self, *, fail: bool) -> None:
+            self._fail = fail
+
+        def __iter__(self):
+            text = "discarded" if self._fail else "committed"
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=text, tool_calls=None),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            )
+            if self._fail:
+                raise TimeoutError("stream stalled after output")
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="", tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+
+        def close(self) -> None:
+            nonlocal closes
+            closes += 1
+
+    class Completions:
+        def create(self, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            return AttemptStream(fail=attempts == 1)
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: Client(**kwargs)
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
+
+    model = OpenAICompatibleModel(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        max_attempts=2,
+    )
+
+    chunks = list(model.transactional_stream([{"role": "user", "content": "go"}]))
+
+    assert attempts == 2
+    assert closes == 2
+    assert "".join(chunk.text for chunk in chunks) == "committed"
+    assert chunks[-1].done is True
+
+
+def test_async_transactional_stream_retries_midstream_without_partial_output(
+    monkeypatch,
+) -> None:
+    attempts = 0
+
+    class AttemptStream:
+        def __init__(self, *, fail: bool) -> None:
+            self._fail = fail
+            self._index = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            self._index += 1
+            if self._index == 1:
+                text = "discarded" if self._fail else "committed"
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content=text, tool_calls=None),
+                            finish_reason=None,
+                        )
+                    ],
+                    usage=None,
+                )
+            if self._fail:
+                raise TimeoutError("stream stalled after output")
+            if self._index == 2:
+                return SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            delta=SimpleNamespace(content="", tool_calls=None),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage=None,
+                )
+            raise StopAsyncIteration
+
+    class Completions:
+        async def create(self, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            return AttemptStream(fail=attempts == 1)
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    fake_openai = ModuleType("openai")
+    fake_openai.AsyncOpenAI = lambda **kwargs: Client(**kwargs)
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    monkeypatch.setattr("qitos.models._openai_retry.asyncio.sleep", no_sleep)
+
+    model = AsyncOpenAICompatibleModel(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        max_attempts=2,
+    )
+
+    async def collect() -> list[ModelStreamChunk]:
+        return [
+            chunk
+            async for chunk in model.atransactional_stream(
+                [{"role": "user", "content": "go"}]
+            )
+        ]
+
+    chunks = asyncio.run(collect())
+
+    assert attempts == 2
+    assert "".join(chunk.text for chunk in chunks) == "committed"
+    assert chunks[-1].done is True
+
+
+def test_transactional_retry_window_stops_repeated_fast_failures(
+    monkeypatch,
+) -> None:
+    attempts = 0
+    clock = 0.0
+
+    def create_stream():
+        nonlocal attempts
+        attempts += 1
+        raise TimeoutError("provider unavailable")
+
+    def sleep(delay: float) -> None:
+        nonlocal clock
+        clock += delay
+
+    monkeypatch.setattr("qitos.models._openai_retry.random.uniform", lambda *_: 1.0)
+    monkeypatch.setattr("qitos.models._openai_retry.time.monotonic", lambda: clock)
+    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", sleep)
+
+    with pytest.raises(ModelTransportError):
+        list(
+            sync_transactional_stream_with_retry(
+                create_stream,
+                policy=ModelRetryPolicy(
+                    max_attempts=10,
+                    retry_window_seconds=60.0,
+                ),
+                is_complete=lambda _: True,
+            )
+        )
+
+    assert attempts < 10
+    assert clock < 60.0
 
 
 def test_sync_openai_stream_does_not_retry_nonretryable_status(monkeypatch) -> None:

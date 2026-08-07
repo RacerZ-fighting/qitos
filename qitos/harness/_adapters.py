@@ -65,6 +65,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
         api_mode = str(kwargs.get("api_mode") or "chat_completions")
         max_attempts = _coerce_int(kwargs.get("max_attempts"), 2)
         stream_idle_timeout = _coerce_float(kwargs.get("stream_idle_timeout"), 60.0)
+        retry_window_seconds = _coerce_float(kwargs.get("retry_window_seconds"), 300.0)
         model_class = (
             AsyncOpenAICompatibleModel
             if kwargs.get("async_model") is True
@@ -97,6 +98,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
             api_mode=api_mode,
             max_attempts=max_attempts,
             stream_idle_timeout=stream_idle_timeout,
+            retry_window_seconds=retry_window_seconds,
         )
         setattr(
             llm,

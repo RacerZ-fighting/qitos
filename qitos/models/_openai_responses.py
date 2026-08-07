@@ -415,6 +415,7 @@ def _responses_stream(
     messages: List[Dict[str, Any]],
     *,
     provider: str,
+    require_completed: bool = False,
     **kwargs: Any,
 ) -> Iterator[ModelStreamChunk]:
     events = _responses_create(client)(
@@ -432,6 +433,12 @@ def _responses_stream(
             yield chunk
             if chunk.done:
                 return
+    if require_completed and completed_response is None:
+        raise ModelTransportError(
+            "model stream ended before response.completed",
+            attempts=1,
+            retryable=True,
+        )
     yield _final_stream_chunk(
         adapter, completed_response, completed_items, provider=provider
     )
@@ -443,11 +450,13 @@ async def _async_responses_stream(
     messages: List[Dict[str, Any]],
     *,
     provider: str,
+    retry_events: bool = True,
+    require_completed: bool = False,
     **kwargs: Any,
 ) -> AsyncIterator[ModelStreamChunk]:
     payload = _request_payload(adapter, messages, kwargs, stream=True)
     policy = getattr(adapter, "retry_policy", None)
-    if isinstance(policy, ModelRetryPolicy):
+    if retry_events and isinstance(policy, ModelRetryPolicy):
         events = stream_with_retry(
             lambda: _responses_create(client)(**payload),
             policy=policy,
@@ -468,6 +477,12 @@ async def _async_responses_stream(
             yield chunk
             if chunk.done:
                 return
+    if require_completed and completed_response is None:
+        raise ModelTransportError(
+            "model stream ended before response.completed",
+            attempts=1,
+            retryable=True,
+        )
     yield _final_stream_chunk(
         adapter, completed_response, completed_items, provider=provider
     )
