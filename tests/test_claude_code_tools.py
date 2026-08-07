@@ -341,9 +341,7 @@ class TestAgentTool:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool = AgentTool(workspace_root=tmpdir)
-            result = tool.call(
-                {"prompt": "test", "subagent_type": "nonexistent_type"}
-            )
+            result = tool.call({"prompt": "test", "subagent_type": "nonexistent_type"})
             # Should return error about unknown type
             assert result.get("error") is not None or result.get("status") == "error"
 
@@ -372,6 +370,85 @@ class TestAgentTool:
             )
             assert result["status"] == "running"
             assert "task_id" in result
+
+    def test_run_scoped_factory_creates_fresh_invocation_per_call(self):
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        engines = []
+        scopes = []
+
+        class FakeEngine:
+            active_run_id = "child-run"
+
+            def run(self, task, **kwargs):
+                assert task.startswith("seeded:")
+                assert kwargs == {}
+                return SimpleNamespace(
+                    state=SimpleNamespace(
+                        final_result="child result",
+                        stop_reason="final",
+                    ),
+                    step_count=3,
+                    total_tokens=42,
+                )
+
+        def build_invocation(request, runtime_context):
+            assert runtime_context["delegate_depth"] == 0
+            assert request.max_turns == 200
+            engine = FakeEngine()
+            engines.append(engine)
+            return AgentInvocation(engine=engine, task=f"seeded:{request.prompt}")
+
+        @contextmanager
+        def execution_scope(runtime_context):
+            assert runtime_context["delegate_depth"] == 0
+            scopes.append("enter")
+            try:
+                yield
+            finally:
+                scopes.append("exit")
+
+        tool = AgentTool(
+            invocation_factory=build_invocation,
+            execution_scope=execution_scope,
+            allow_background=False,
+        )
+        first = tool.call(
+            {"description": "first task", "prompt": "one"},
+            runtime_context={"delegate_depth": 0},
+        )
+        second = tool.call(
+            {"description": "second task", "prompt": "two"},
+            runtime_context={"delegate_depth": 0},
+        )
+
+        assert first["status"] == "success"
+        assert first["steps"] == 3
+        assert first["total_tokens"] == 42
+        assert second["status"] == "success"
+        assert len(engines) == 2
+        assert engines[0] is not engines[1]
+        assert scopes == ["enter", "exit", "enter", "exit"]
+        assert tool.spec.concurrency_safe is True
+        assert "run_in_background" not in tool.spec.parameters
+
+    def test_run_scoped_factory_rejects_recursive_agent(self):
+        from qitos.kit.tool.agent import AgentTool
+
+        tool = AgentTool(
+            invocation_factory=lambda request, context: None,
+            allow_background=False,
+        )
+        result = tool.call(
+            {"description": "nested task", "prompt": "recurse"},
+            runtime_context={"delegate_depth": 1},
+        )
+
+        assert result["status"] == "error"
+        assert "cannot launch another Agent" in result["error"]
 
 
 # ── Sub-agents import ─────────────────────────────────────────────────────────

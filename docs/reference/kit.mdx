@@ -635,6 +635,47 @@ Stand-alone tool objects you can register directly.
 
 <AccordionGroup>
 
+<Accordion title="AgentTool">
+
+Launch a fresh child-agent run from a normal tool call. Applications that own
+run-scoped resources should inject an invocation factory rather than relying on the
+legacy class registry.
+
+```python
+from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+def build_child(request, runtime_context):
+    child_engine = make_fresh_engine(
+        delegate_depth=runtime_context["delegate_depth"] + 1,
+    )
+    return AgentInvocation(engine=child_engine, task=request.prompt)
+
+tool = AgentTool(
+    invocation_factory=build_child,
+    execution_scope=acquire_run_scoped_slot,
+    allow_background=False,
+    max_delegate_depth=1,
+    max_turns=200,
+)
+```
+
+The model-facing arguments are `description`, `prompt`, optional `name`, and optional
+`subagent_type`. Each factory call must return an independent Engine; sharing a mutable
+AgentModule, history, or model client between concurrent children is unsupported.
+`execution_scope` can enforce an application-owned concurrency or lifecycle boundary.
+The result reports output, steps, total tokens, elapsed time, stop reason, and run id.
+`max_turns` is a tool-level safety ceiling and defaults to the exported
+`DEFAULT_SUBAGENT_MAX_TURNS` value of 200. Invocation factories receive that value on
+`AgentRequest.max_turns`; legacy class-registry children receive it through
+`AgentModule.run(max_steps=...)`.
+
+When `allow_background=False`, the background argument is omitted from the schema.
+Delegation depth is checked before the factory runs. Multiple Agent calls execute in
+parallel only when the parent Engine's `ActionExecutionPolicy` allows `Agent` and the
+tool remains marked concurrency-safe.
+
+</Accordion>
+
 <Accordion title="HTTPGet / HTTPPost / HTTPRequest">
 
 HTTP request tools with automatic retries and structured response payloads.
