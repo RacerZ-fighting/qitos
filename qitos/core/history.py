@@ -12,6 +12,7 @@ class HistoryMessage:
     role: str
     step_id: int
     content: Any = ""
+    reasoning_content: Optional[str] = None
     tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     tool_call_id: Optional[str] = None
     name: Optional[str] = None

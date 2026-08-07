@@ -119,6 +119,7 @@ class MicroCompactor:
             role=message.role,
             content=compacted,
             step_id=message.step_id,
+            reasoning_content=message.reasoning_content,
             tool_calls=[dict(x) for x in list(message.tool_calls or [])],
             tool_call_id=message.tool_call_id,
             name=message.name,
@@ -630,6 +631,7 @@ class CompactionController:
     def _estimate_tokens(self, messages: Iterable[HistoryMessage]) -> int:
         return sum(
             self._estimate_text_tokens(m.content)
+            + self._estimate_text_tokens(m.reasoning_content)
             + self._estimate_text_tokens(m.native_items)
             for m in messages
         )

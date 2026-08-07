@@ -919,6 +919,80 @@ def test_engine_uses_transactional_stream_native_tool_calls_before_parser():
     assert traced["native_tool_call_used"] is True
 
 
+def test_engine_preserves_streamed_reasoning_for_trace_and_tool_follow_up():
+    reasoning = "Inspect the arguments before invoking the tool."
+
+    class _ReasoningToolModel:
+        model = "kimi-k3"
+        provider = "openai-compatible"
+
+        def __init__(self) -> None:
+            self.calls: list[list[dict[str, Any]]] = []
+            self.qitos_harness_metadata = {
+                "family_preset": "kimi",
+                "tool_policy": {
+                    "primary_delivery": "api_parameter",
+                    "fallback_delivery": "prompt_injection",
+                    "native_tool_call_preferred": True,
+                },
+            }
+
+        def transactional_stream(self, messages, **kwargs):
+            _ = kwargs
+            self.calls.append([dict(message) for message in messages])
+            if len(self.calls) == 1:
+                yield ModelStreamChunk(text="", reasoning_content=reasoning)
+                yield ModelStreamChunk(
+                    text="",
+                    done=True,
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": '{"a": 20, "b": 22}',
+                            },
+                        }
+                    ],
+                )
+                return
+            yield ModelStreamChunk(text="Final Answer: done")
+            yield ModelStreamChunk(text="", done=True)
+
+    class _Agent(DemoAgent):
+        def __init__(self, llm: _ReasoningToolModel) -> None:
+            super().__init__()
+            self.llm = llm
+            self.model_parser = ReActTextParser()
+
+        def decide(self, state: DemoState, observation: dict[str, Any]):
+            _ = state, observation
+            return None
+
+    model = _ReasoningToolModel()
+    result = Engine(agent=_Agent(model), budget=RuntimeBudget(max_steps=3)).run(
+        "compute"
+    )
+
+    assert result.state.final_result == "done"
+    assert result.records[0].model_response["reasoning_content"] == reasoning
+    output_event = next(
+        event
+        for event in result.events
+        if getattr(event.phase, "value", event.phase) == "DECIDE"
+        and (event.payload or {}).get("stage") == "model_output"
+    )
+    assert output_event.payload["reasoning_content"] == reasoning
+    assistant = next(
+        message
+        for message in model.calls[1]
+        if message.get("role") == "assistant"
+    )
+    assert assistant["reasoning_content"] == reasoning
+    assert assistant["tool_calls"][0]["id"] == "call_1"
+
+
 def test_engine_sanitizes_submit_poc_native_tool_history_without_mutating_result():
     seen_messages: list[list[dict[str, Any]]] = []
 

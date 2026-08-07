@@ -248,7 +248,11 @@ class TokenBudgetSummaryHistory(History):
         return "Summary of earlier interaction:\n" + "\n".join(lines)
 
     def _estimate_tokens(self, messages: List[HistoryMessage]) -> int:
-        return sum(self._estimate_text_tokens(m.content) for m in messages)
+        return sum(
+            self._estimate_text_tokens(m.content)
+            + self._estimate_text_tokens(m.reasoning_content)
+            for m in messages
+        )
 
     def _estimate_text_tokens(self, text: Any) -> int:
         s = str(text or "")

@@ -1006,6 +1006,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 assistant_content,
                 record.step_id,
                 metadata={"source": "engine"},
+                reasoning_content=response.reasoning_content,
                 tool_calls=assistant_tool_calls,
                 native_items=response.native_items,
             )
@@ -1051,6 +1052,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             content,
             record.step_id,
             metadata={"source": "engine", "decision_source": "parser"},
+            reasoning_content=response.reasoning_content,
             tool_calls=calls,
         )
         record.history_tool_calls_pending = True
@@ -2391,6 +2393,14 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         This field carries the model's chain-of-thought and should be
         displayed in the TUI as the agent's "thought".
         """
+        direct = (
+            raw_output.get("reasoning_content")
+            if isinstance(raw_output, dict)
+            else getattr(raw_output, "reasoning_content", None)
+        )
+        if isinstance(direct, str) and direct.strip():
+            return direct
+
         # Navigate to the message object
         message = None
         if isinstance(raw_output, dict):

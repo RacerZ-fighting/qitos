@@ -2070,6 +2070,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         step_id: int,
         metadata: Optional[Dict[str, Any]] = None,
         *,
+        reasoning_content: Optional[str] = None,
         tool_calls: Optional[List[Dict[str, Any]]] = None,
         tool_call_id: Optional[str] = None,
         name: Optional[str] = None,
@@ -2081,6 +2082,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 role=role,
                 content=content,
                 step_id=step_id,
+                reasoning_content=reasoning_content,
                 metadata=metadata or {},
                 tool_calls=[dict(x) for x in list(tool_calls or []) if isinstance(x, dict)],
                 tool_call_id=tool_call_id,
@@ -2102,6 +2104,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     continue
                 message: Dict[str, Any] = {"role": role, "content": item.content}
                 message["_step_id"] = int(item.step_id)
+                if item.reasoning_content:
+                    message["reasoning_content"] = item.reasoning_content
                 if item.metadata:
                     message["_metadata"] = dict(item.metadata)
                 if item.tool_calls:
@@ -2135,6 +2139,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     "role": role,
                     "content": item.get("content"),
                 }
+                reasoning_content = item.get("reasoning_content")
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    payload_message["reasoning_content"] = reasoning_content
                 step_value = item.get("step_id")
                 if step_value is not None:
                     try:
