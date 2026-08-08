@@ -893,6 +893,11 @@ def test_build_run_diff_rejects_missing_provenance(tmp_path: Path):
     manifest_path = right / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["prompt_hash"] = "unknown"
+    manifest["run_spec"]["metadata"]["application"] = {
+        "name": "pentestagent",
+        "version": "0.0.0",
+        "git_sha": "unknown",
+    }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
     diff = _build_run_diff(_load_run_payload(left), _load_run_payload(right))
@@ -900,6 +905,10 @@ def test_build_run_diff_rejects_missing_provenance(tmp_path: Path):
     assert diff["comparison"]["compatible"] is False
     assert diff["comparison"]["status"] == "incomplete_provenance"
     assert "right.prompt_hash" in diff["comparison"]["missing_fields"]
+    assert (
+        "right.run_spec.metadata.application.git_sha"
+        in diff["comparison"]["missing_fields"]
+    )
 
 
 def test_main_export(tmp_path: Path):

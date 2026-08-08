@@ -1997,6 +1997,19 @@ def _missing_comparison_provenance(
         missing.append(f"{side}.budget")
     if not isinstance(contract.get("run_spec"), dict) or not contract.get("run_spec"):
         missing.append(f"{side}.run_spec")
+    else:
+        application = (
+            ((contract.get("run_spec") or {}).get("metadata") or {}).get(
+                "application"
+            )
+        )
+        if isinstance(application, dict):
+            for field in ("version", "git_sha"):
+                value = application.get(field)
+                if value is None or str(value).strip().lower() in {"", "unknown"}:
+                    missing.append(
+                        f"{side}.run_spec.metadata.application.{field}"
+                    )
     return missing
 
 
