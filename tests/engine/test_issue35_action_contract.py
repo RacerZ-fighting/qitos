@@ -21,6 +21,7 @@ import pytest
 
 from qitos.core.action import Action, ActionExecutionPolicy, ActionStatus
 from qitos.core.tool import BaseTool, ToolSpec
+from qitos.core.tool_registry import ToolRegistry
 from qitos.engine.action_executor import ActionExecutor
 
 
@@ -79,17 +80,12 @@ class TimelineTool(BaseTool):
             self._recorder.end(self.spec.name)
 
 
-class FakeRegistry:
-    def __init__(self, tools: Dict[str, BaseTool]) -> None:
-        self._tools = tools
-
-    def get(self, name: str) -> BaseTool | None:
-        return self._tools.get(name)
-
-
 def _executor(tools: Dict[str, BaseTool], **policy_kwargs: Any) -> ActionExecutor:
     policy = ActionExecutionPolicy(**policy_kwargs) if policy_kwargs else None
-    return ActionExecutor(tool_registry=FakeRegistry(tools), policy=policy)
+    registry = ToolRegistry()
+    for tool in tools.values():
+        registry.register(tool)
+    return ActionExecutor(tool_registry=registry, policy=policy)
 
 
 # ---------------------------------------------------------------------------
@@ -292,8 +288,11 @@ def test_cancel_token_prevents_unstarted_actions():
         "safe_a": TimelineTool("safe_a", rec, concurrency_safe=True, delay=0.01),
         "exclusive": TimelineTool("exclusive", rec, delay=0.01),
     }
+    registry = ToolRegistry()
+    for tool in tools.values():
+        registry.register(tool)
     executor = ActionExecutor(
-        tool_registry=FakeRegistry(tools),
+        tool_registry=registry,
         policy=ActionExecutionPolicy(mode="parallel"),
         cancel_token=token,
     )

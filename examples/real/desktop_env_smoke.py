@@ -32,14 +32,15 @@ def main(smoke: bool = False) -> None:
     first = env.reset()
 
     registry = computer_use_tools()
-    click_result = registry.call(
-        "click",
+    click = registry.get("click")
+    if click is None:
+        raise RuntimeError("computer-use registry did not expose click")
+    click_result = click.execute(
+        {"x": 640, "y": 420},
         runtime_context={
             "env": env,
             "ops": {"gui_controller": env.get_ops("gui_controller")},
         },
-        x=640,
-        y=420,
     )
     step = env.step(
         action={

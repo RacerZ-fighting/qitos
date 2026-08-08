@@ -237,15 +237,17 @@ class HTTPGet(BaseTool):
         :param verify_tls: Whether TLS certificates should be verified.
         :param allow_redirects: Whether redirects should be followed automatically.
         """
-        _ = runtime_context
-        return self._request.run(
-            method="GET",
-            url=str(args.get("url", "")),
-            params=args.get("params"),
-            headers=args.get("headers"),
-            timeout=args.get("timeout"),
-            verify_tls=bool(args.get("verify_tls", True)),
-            allow_redirects=bool(args.get("allow_redirects", True)),
+        return self._request.execute(
+            {
+                "method": "GET",
+                "url": str(args.get("url", "")),
+                "params": args.get("params"),
+                "headers": args.get("headers"),
+                "timeout": args.get("timeout"),
+                "verify_tls": bool(args.get("verify_tls", True)),
+                "allow_redirects": bool(args.get("allow_redirects", True)),
+            },
+            runtime_context=runtime_context,
         )
 
 
@@ -297,16 +299,18 @@ class HTTPPost(BaseTool):
         :param verify_tls: Whether TLS certificates should be verified.
         :param allow_redirects: Whether redirects should be followed automatically.
         """
-        _ = runtime_context
-        return self._request.run(
-            method="POST",
-            url=str(args.get("url", "")),
-            data=args.get("data"),
-            json_data=args.get("json_data"),
-            headers=args.get("headers"),
-            timeout=args.get("timeout"),
-            verify_tls=bool(args.get("verify_tls", True)),
-            allow_redirects=bool(args.get("allow_redirects", True)),
+        return self._request.execute(
+            {
+                "method": "POST",
+                "url": str(args.get("url", "")),
+                "data": args.get("data"),
+                "json_data": args.get("json_data"),
+                "headers": args.get("headers"),
+                "timeout": args.get("timeout"),
+                "verify_tls": bool(args.get("verify_tls", True)),
+                "allow_redirects": bool(args.get("allow_redirects", True)),
+            },
+            runtime_context=runtime_context,
         )
 
 

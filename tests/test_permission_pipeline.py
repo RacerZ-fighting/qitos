@@ -8,36 +8,27 @@ and ActionExecutor integration.
 import os
 import tempfile
 import time
-import pytest
-from typing import Any, Dict, Optional
 from unittest.mock import MagicMock
 
 from qitos.core.tool import (
     ToolPermission,
     ToolPermissionContext,
-    ToolPermissionDecision,
     ToolPermissionRule,
     ToolSpec,
+    tool,
 )
+from qitos.core.tool_registry import ToolRegistry
 from qitos.kit.permission.pipeline import (
     PermissionMode,
     PermissionPipeline,
-    WRITE_TOOL_NAMES,
-    READ_TOOL_NAMES,
-    BASH_TOOL_NAMES,
 )
 from qitos.kit.permission.bash_analyzer import (
     BashCommandAnalyzer,
     CommandSafety,
-    BashAnalysisResult,
 )
-from qitos.kit.permission.read_before_write import (
-    ReadBeforeWriteEnforcer,
-    FileReadState,
-)
+from qitos.kit.permission.read_before_write import ReadBeforeWriteEnforcer
 from qitos.kit.permission.auto_classifier import AutoPermissionClassifier
 from qitos.kit.permission.rules import (
-    PROTECTED_PATHS,
     build_default_deny_rules,
     build_default_ask_rules,
     is_protected_path,
@@ -516,7 +507,7 @@ class TestActionExecutorIntegration:
         engine_mock.hooks = [MagicMock()]
 
         executor = ActionExecutor(
-            tool_registry=MagicMock(), engine=engine_mock
+            tool_registry=ToolRegistry(), engine=engine_mock
         )
 
         # This should find hooks via engine.hooks, not engine._hooks
@@ -536,20 +527,14 @@ class TestActionExecutorIntegration:
         # Create a pipeline in PLAN mode that denies writes
         pipeline = PermissionPipeline(mode=PermissionMode.PLAN)
 
-        # Create a mock tool registry with a write tool
-        mock_tool = MagicMock()
-        mock_tool.name = "file_edit_v2"
-        mock_tool.spec = ToolSpec(
+        @tool(
             name="file_edit_v2",
-            description="edit file",
             permissions=ToolPermission(filesystem_write=True),
         )
-        mock_tool.validate_input.return_value = MagicMock(valid=True)
-        mock_tool.check_permissions.return_value = ToolPermissionDecision.allow()
+        def file_edit_v2(path: str) -> str:
+            return path
 
-        registry = MagicMock()
-        registry.get.return_value = mock_tool
-        registry.describe_tool.return_value = {"name": "file_edit_v2", "origin": {}}
+        registry = ToolRegistry().register(file_edit_v2)
 
         executor = ActionExecutor(
             tool_registry=registry,
@@ -567,17 +552,11 @@ class TestActionExecutorIntegration:
 
         rbw = ReadBeforeWriteEnforcer()
 
-        mock_tool = MagicMock()
-        mock_tool.name = "file_edit_v2"
-        mock_tool.spec = ToolSpec(
-            name="file_edit_v2",
-            description="edit file",
-        )
-        mock_tool.validate_input.return_value = MagicMock(valid=True)
+        @tool(name="file_edit_v2")
+        def file_edit_v2(path: str) -> str:
+            return path
 
-        registry = MagicMock()
-        registry.get.return_value = mock_tool
-        registry.describe_tool.return_value = {"name": "file_edit_v2", "origin": {}}
+        registry = ToolRegistry().register(file_edit_v2)
 
         executor = ActionExecutor(
             tool_registry=registry,

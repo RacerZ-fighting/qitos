@@ -81,7 +81,7 @@ Tool 模式的执行路径：
 Engine.run()
   → step N: Decision.act(actions=[Action(name="delegate", args={"agent": "researcher", "task": "..."})])
   → ActionExecutor.execute("delegate")
-    → DelegateTool.call()
+    → DelegateTool.execute()
       → 创建子 AgentModule 实例
       → Engine(sub_agent, ...).run(subtask)
       → 返回子智能体 final_result 作为 tool output

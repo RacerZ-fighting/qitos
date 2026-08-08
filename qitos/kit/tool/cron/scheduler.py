@@ -12,9 +12,8 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from ....core.tool import BaseTool, ToolPermission, ToolSpec
@@ -234,9 +233,10 @@ class CronCreateTool(BaseTool):
         )
         super().__init__(spec=spec)
 
-    def call(
+    def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
+        _ = runtime_context
         cron = args.get("cron", "")
         prompt = args.get("prompt", "")
         recurring = args.get("recurring", True)
@@ -266,15 +266,17 @@ class CronDeleteTool(BaseTool):
         )
         super().__init__(spec=spec)
 
-    def call(
+    def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
+        _ = runtime_context
         job_id = args.get("job_id", "")
         if not job_id:
             return {"status": "error", "error": "job_id is required"}
         deleted = self._scheduler.delete_job(job_id)
         return {
-            "status": "success" if deleted else "not_found",
+            "status": "success",
+            "domain_outcome": "deleted" if deleted else "not_found",
             "deleted": deleted,
             "job_id": job_id,
         }
@@ -292,9 +294,10 @@ class CronListTool(BaseTool):
         )
         super().__init__(spec=spec)
 
-    def call(
+    def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
+        _ = args, runtime_context
         jobs = self._scheduler.list_jobs()
         return {
             "status": "success",

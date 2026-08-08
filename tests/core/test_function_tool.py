@@ -2,8 +2,6 @@
 
 from typing import Optional
 
-import pytest
-
 from qitos.core.function_tool_decorator import function_tool
 from qitos.core.tool import FunctionTool, tool
 from qitos.core.tool_registry import ToolRegistry
@@ -77,7 +75,7 @@ class TestFunctionToolDecorator:
             return a + b
 
         assert isinstance(add, FunctionTool)
-        result = add.run(a=2, b=3)
+        result = add(a=2, b=3)
         assert result == 5
 
     def test_function_tool_works_with_registry(self) -> None:

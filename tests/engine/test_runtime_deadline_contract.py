@@ -16,17 +16,6 @@ from qitos.engine.cancellation import CancelToken
 from qitos.engine.states import RuntimeBudget
 
 
-class _Registry:
-    def __init__(self, tool: BaseTool) -> None:
-        self._tool = tool
-
-    def get(self, name: str) -> BaseTool | None:
-        return self._tool if name == self._tool.spec.name else None
-
-    def list_tools(self) -> list[str]:
-        return [self._tool.spec.name]
-
-
 class _RuntimeEngine:
     def __init__(self, deadline_monotonic: float | None) -> None:
         self._deadline_monotonic = deadline_monotonic
@@ -50,7 +39,7 @@ class _RuntimeEngine:
 
 def _execute(tool: BaseTool, engine: _RuntimeEngine) -> ActionResult:
     return ActionExecutor(
-        tool_registry=_Registry(tool),
+        tool_registry=ToolRegistry().register(tool),
         engine=engine,
     ).execute([Action(name=tool.spec.name)])[0]
 

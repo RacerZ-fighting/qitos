@@ -749,7 +749,9 @@ def __init__(
 )
 ```
 
-`HTTPRequest.run()` accepts `method`, `url`, `params`, `data`, `json_data`, `headers`, `timeout`, `verify_tls`, `allow_redirects`, `max_content_chars`.
+`HTTPRequest.execute(args, runtime_context)` accepts an `args` dictionary containing
+`method`, `url`, `params`, `data`, `json_data`, `headers`, `timeout`, `verify_tls`,
+`allow_redirects`, and `max_content_chars`.
 
 </Accordion>
 
@@ -763,7 +765,8 @@ from qitos.kit import HTMLExtractText
 
 **Constructor** — `HTMLExtractText()` (no parameters)
 
-**`run(html, max_chars=6000, keep_links=False)`** — Returns `{"status", "content", "length", "title"}`.
+**`execute(args, runtime_context)`** — accepts `html`, `max_chars`, and `keep_links`
+inside `args`, and returns `{"status", "content", "length", "title"}`.
 
 </Accordion>
 

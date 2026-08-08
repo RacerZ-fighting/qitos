@@ -18,6 +18,13 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One class-tool execution contract**: class tools now expose only
+  `execute(args, runtime_context)`. `ToolRegistry` performs exact canonical-name lookup,
+  while `ActionExecutor` alone owns validation, permissions, timeout/retry handling,
+  invocation, and result normalization. Old `run`/`call` adapters, registry execution,
+  automatic registry name aliases, duck-typed fallbacks, and implicit concurrency
+  whitelists are gone; parallelism requires an explicit `concurrency_safe=True`
+  declaration.
 - **Truthful tool lifecycle results**: one canonical `ToolResult` projection now
   preserves success, partial, running, error, skipped/denied, input/approval, timeout,
   and cancellation across execution records, observations, history, traces, summaries,

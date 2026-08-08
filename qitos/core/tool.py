@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, cast, get_type_hints
@@ -256,6 +257,14 @@ class ToolSpec:
     rule_scope_builder: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None
     prompt: str = ""
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.needs_approval, bool):
+            raise TypeError("needs_approval must be a boolean")
+        if self.concurrency_safe is not None and not isinstance(
+            self.concurrency_safe, bool
+        ):
+            raise TypeError("concurrency_safe must be a boolean or None")
+
 
 @dataclass
 class ToolMeta:
@@ -281,15 +290,11 @@ class ToolMeta:
     rule_scope_builder: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None
 
 
-class BaseTool:
-    """Base abstraction for callable tools."""
+class BaseTool(ABC):
+    """Canonical class-based tool contract."""
 
     def __init__(self, spec: ToolSpec):
-        description = (
-            inspect.getdoc(self.execute)
-            or inspect.getdoc(self.run)
-            or inspect.getdoc(self.__class__)
-        )
+        description = inspect.getdoc(self.execute) or inspect.getdoc(self.__class__)
         if description:
             spec.description = inspect.cleandoc(description)
         if spec.input_schema is None:
@@ -303,37 +308,6 @@ class BaseTool:
     @property
     def name(self) -> str:
         return self.spec.name
-
-    def _coerce_run_kwargs(
-        self, args: tuple[Any, ...], kwargs: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        if not args:
-            return dict(kwargs)
-        param_names = list(self.spec.parameters.keys())
-        if len(args) > len(param_names):
-            raise TypeError(
-                f"{self.__class__.__name__}.run() received too many positional arguments"
-            )
-        merged = dict(kwargs)
-        for name, value in zip(param_names, args):
-            if name in merged:
-                raise TypeError(
-                    f"{self.__class__.__name__}.run() got multiple values for argument '{name}'"
-                )
-            merged[name] = value
-        return merged
-
-    def run(self, *args: Any, **kwargs: Any) -> Any:
-        """Compatibility wrapper that routes legacy run calls through `execute(...)`."""
-        runtime_context = kwargs.pop("runtime_context", None)
-        coerced = self._coerce_run_kwargs(args, kwargs)
-        return self.execute(coerced, runtime_context=runtime_context)
-
-    def call(
-        self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Any:
-        """Normalized call path for tool execution."""
-        return self.execute(args, runtime_context=runtime_context)
 
     def validate_input(
         self,
@@ -364,25 +338,18 @@ class BaseTool:
             return str(value or "")
         return ""
 
+    @abstractmethod
     def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Any:
-        """Execute tool with optional runtime context."""
-        legacy_run = type(self).run
-        if legacy_run is not BaseTool.run:
-            call_kwargs = dict(args)
-            run_sig = inspect.signature(legacy_run)
-            if "runtime_context" in run_sig.parameters:
-                call_kwargs["runtime_context"] = runtime_context
-            return legacy_run(self, **call_kwargs)
-        raise NotImplementedError
-
-    def __call__(self, **kwargs: Any) -> Any:
-        return self.run(**kwargs)
+        """Execute one validated tool call with its runtime context."""
 
 
 class FunctionTool(BaseTool):
     """Tool wrapper around callable functions or bound methods."""
+
+    func: Callable[..., Any]
+    meta: ToolMeta
 
     def __init__(self, func: Callable[..., Any], meta: Optional[ToolMeta] = None):
         # If func is already a FunctionTool (e.g. from __get__ binding),
@@ -416,13 +383,10 @@ class FunctionTool(BaseTool):
         bound.spec = deepcopy(self.spec)
         return bound
 
-    def run(self, **kwargs: Any) -> Any:
-        return self.func(**kwargs)
+    def __call__(self, **kwargs: Any) -> Any:
+        """Preserve ordinary function-call semantics for the function decorator."""
 
-    def call(
-        self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Any:
-        return self.execute(args, runtime_context=runtime_context)
+        return self.func(**kwargs)
 
     def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None

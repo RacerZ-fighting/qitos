@@ -74,7 +74,7 @@ class ActionExecutionPolicy:
     mode: str = "serial"  # serial | parallel
     fail_fast: bool = False
     max_concurrency: int = 4
-    # ``None`` preserves the executor's ordinary read-only/concurrency-safe
-    # classification.  A caller may restrict parallel execution to a smaller
-    # set without changing the global QitOS policy.
+    # ``None`` preserves explicit ``ToolSpec.concurrency_safe`` declarations.
+    # A caller may restrict parallel execution to a smaller set without
+    # changing the registered tool metadata.
     parallel_tool_names: FrozenSet[str] | None = None

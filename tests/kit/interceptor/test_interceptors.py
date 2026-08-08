@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from qitos.core.action import Action, ActionResult, ActionKind, ActionStatus
 from qitos.core.interceptor import InterceptorChain, InterceptorContext, ToolInterceptor
-from qitos.core.tool import BaseTool, FunctionTool, ToolSpec
+from qitos.core.tool import BaseTool, ToolSpec
+from qitos.core.tool_registry import ToolRegistry
 from qitos.engine.action_executor import ActionExecutor
 from qitos.kit.interceptor.cache import CacheInterceptor
 from qitos.kit.interceptor.logging import LoggingInterceptor
@@ -116,8 +116,13 @@ def _make_tool(
 
         tool = _FuncTool(spec)
         return tool
-    else:
-        return BaseTool(spec)
+
+    class _NoopTool(BaseTool):
+        def execute(self, args, runtime_context=None):
+            _ = args, runtime_context
+            return None
+
+    return _NoopTool(spec)
 
 
 # ── ToolInterceptor Protocol Tests ──────────────────────────────────────────
@@ -201,7 +206,6 @@ class TestInterceptorChain:
         assert b.calls == ["after:B"]
         # But B should be called before A in time
         # We can verify by checking both calls in one list
-        all_calls = []
         a2 = _TracingInterceptor("A")
         b2 = _TracingInterceptor("B")
         shared_calls: List[str] = []
@@ -515,25 +519,6 @@ class TestLoggingInterceptor:
 # ── ActionExecutor Integration Tests ───────────────────────────────────────
 
 
-class _FakeToolRegistry:
-    """A minimal tool registry for testing that mirrors the real one."""
-
-    def __init__(self, tools: Optional[Dict[str, BaseTool]] = None):
-        self._tools = tools or {}
-
-    def get(self, name: str) -> Optional[BaseTool]:
-        return self._tools.get(name)
-
-    def describe_tool(self, name: str) -> Dict[str, Any]:
-        tool = self._tools.get(name)
-        if tool is not None:
-            return {
-                "name": name,
-                "origin": {},
-            }
-        return {"name": name, "origin": {}}
-
-
 class _FakeTool(BaseTool):
     """A simple test tool that returns a fixed result."""
 
@@ -555,7 +540,9 @@ def _make_executor(
     tools: Optional[Dict[str, BaseTool]] = None,
     interceptor_chain: Optional[InterceptorChain] = None,
 ) -> ActionExecutor:
-    registry = _FakeToolRegistry(tools)
+    registry = ToolRegistry()
+    for tool in (tools or {}).values():
+        registry.register(tool)
     return ActionExecutor(
         tool_registry=registry,
         interceptor_chain=interceptor_chain,

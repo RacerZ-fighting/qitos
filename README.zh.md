@@ -18,6 +18,11 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **类式工具只保留一个执行契约**：类式工具现在只暴露
+  `execute(args, runtime_context)`。`ToolRegistry` 只做精确 canonical 名称查找，
+  校验、权限、超时/重试、调用和结果归一化统一由 `ActionExecutor` 负责。旧的
+  `run`/`call` 适配、注册表直接执行、注册表自动名称别名、duck-typed 回退与隐式
+  并发白名单已删除；只有显式 `concurrency_safe=True` 才允许并行。
 - **工具生命周期结果不再失真**：统一的 `ToolResult` 投影会在执行记录、Observation、
   history、trace、摘要与成功率中保留 success、partial、running、error、拒绝/跳过、
   输入/审批、超时和取消。未知状态与旧别名都会 fail-closed；业务结果使用独立字段，

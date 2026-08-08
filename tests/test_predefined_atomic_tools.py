@@ -85,17 +85,22 @@ def test_notebook_toolset_read_replace_insert(tmp_path):
     path.write_text(json.dumps(nb), encoding="utf-8")
 
     toolset = NotebookToolSet(workspace_root=str(tmp_path))
-    read_out = toolset.read_notebook.run(path="demo.ipynb")
+    read_out = toolset.read_notebook.execute({"path": "demo.ipynb"})
     assert read_out["status"] == "success"
     assert read_out["cells"][0]["cell_type"] == "markdown"
 
-    replace_out = toolset.replace_notebook_cell.run(
-        path="demo.ipynb", cell_index=1, source="print('bye')\n"
+    replace_out = toolset.replace_notebook_cell.execute(
+        {"path": "demo.ipynb", "cell_index": 1, "source": "print('bye')\n"}
     )
     assert replace_out["status"] == "success"
 
-    insert_out = toolset.insert_notebook_cell.run(
-        path="demo.ipynb", cell_type="markdown", source="## Next\n", index=1
+    insert_out = toolset.insert_notebook_cell.execute(
+        {
+            "path": "demo.ipynb",
+            "cell_type": "markdown",
+            "source": "## Next\n",
+            "index": 1,
+        }
     )
     assert insert_out["status"] == "success"
 
@@ -270,33 +275,42 @@ def test_tool_package_only_exposes_canonical_toolsets():
 def test_task_toolset_persists_board_updates(tmp_path):
     toolset = TaskToolSet(workspace_root=str(tmp_path))
 
-    create = toolset.task_create.run(
-        subject="Implement planner", description="Break the work into phases"
+    create = toolset.task_create.execute(
+        {
+            "subject": "Implement planner",
+            "description": "Break the work into phases",
+        }
     )
     assert create["status"] == "success"
     task_id = create["task"]["id"]
 
-    update = toolset.task_update.run(
-        task_id=task_id,
-        status="in_progress",
-        add_blocks=["child-a"],
-        metadata={"priority": "high"},
+    update = toolset.task_update.execute(
+        {
+            "task_id": task_id,
+            "status": "in_progress",
+            "add_blocks": ["child-a"],
+            "metadata": {"priority": "high"},
+        }
     )
     assert update["status"] == "success"
     assert update["task"]["status"] == "in_progress"
     assert update["task"]["blocks"] == ["child-a"]
     assert update["task"]["metadata"]["priority"] == "high"
 
-    note = toolset.task_append_note.run(
-        task_id=task_id, text="Initial decomposition finished", kind="progress"
+    note = toolset.task_append_note.execute(
+        {
+            "task_id": task_id,
+            "text": "Initial decomposition finished",
+            "kind": "progress",
+        }
     )
     assert note["status"] == "success"
 
-    fetched = toolset.task_get.run(task_id=task_id)
+    fetched = toolset.task_get.execute({"task_id": task_id})
     assert fetched["status"] == "success"
     assert fetched["task"]["notes"][0]["kind"] == "progress"
 
-    listing = toolset.task_list.run(include_completed=False)
+    listing = toolset.task_list.execute({"include_completed": False})
     assert listing["status"] == "success"
     assert listing["count"] == 1
 

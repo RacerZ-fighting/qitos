@@ -107,8 +107,9 @@ class DummyModel:
 def test_send_terminal_keys_tool_uses_terminal_ops() -> None:
     terminal = FakeTerminal()
     tool = SendTerminalKeys()
-    result = tool.run(
-        "ls\n", duration_sec=0.25, runtime_context={"ops": {"terminal": terminal}}
+    result = tool.execute(
+        {"keystrokes": "ls\n", "duration_sec": 0.25},
+        runtime_context={"ops": {"terminal": terminal}},
     )
     assert result["status"] == "success"
     assert terminal.sent == ["ls\n"]

@@ -16,8 +16,12 @@ class _ResultTool(BaseTool):
         super().__init__(ToolSpec(name="result", description="return a fixed result"))
         self._payload = payload
 
-    def run(self, runtime_context: dict[str, Any] | None = None) -> dict[str, Any]:
-        _ = runtime_context
+    def execute(
+        self,
+        args: dict[str, Any],
+        runtime_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _ = args, runtime_context
         return dict(self._payload)
 
 

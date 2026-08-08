@@ -52,8 +52,10 @@ registry.register(slow_computation)
 # List all registered tools
 print("Registered tools:", registry.list_tools())
 
-# Call a tool through the registry
-result = registry.call("greet", name="QitOS")
+# Resolve the canonical name, then execute through the tool contract
+greet_tool = registry.get("greet")
+assert greet_tool is not None
+result = greet_tool.execute({"name": "QitOS"})
 print(f"greet result: {result}")
 
 # Check tool metadata

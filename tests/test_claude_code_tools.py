@@ -5,18 +5,13 @@ import tempfile
 import threading
 import time
 from types import SimpleNamespace
-import pytest
-from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, patch
 
 from qitos.kit import CodingToolSet
 from qitos.kit.tool.internal.coding_utils import (
     is_image_file,
-    is_pdf_file,
     is_notebook_file,
+    is_pdf_file,
     read_image_as_base64,
-    read_pdf_text,
-    read_notebook_cells,
 )
 
 
@@ -242,7 +237,7 @@ class TestCronTools:
         with tempfile.TemporaryDirectory() as tmpdir:
             scheduler = CronScheduler(workspace_root=tmpdir)
             tool = CronCreateTool(scheduler)
-            result = tool.call({"cron": "0 9 * * *", "prompt": "test"})
+            result = tool.execute({"cron": "0 9 * * *", "prompt": "test"})
             assert result["status"] == "success"
             assert result["created"] is True
 
@@ -252,7 +247,7 @@ class TestCronTools:
         with tempfile.TemporaryDirectory() as tmpdir:
             scheduler = CronScheduler(workspace_root=tmpdir)
             tool = CronCreateTool(scheduler)
-            result = tool.call({})
+            result = tool.execute({})
             assert result["status"] == "error"
 
     def test_delete_tool(self):
@@ -263,10 +258,10 @@ class TestCronTools:
             create_tool = CronCreateTool(scheduler)
             delete_tool = CronDeleteTool(scheduler)
 
-            result = create_tool.call({"cron": "0 9 * * *", "prompt": "test"})
+            result = create_tool.execute({"cron": "0 9 * * *", "prompt": "test"})
             job_id = result["job"]["id"]
 
-            del_result = delete_tool.call({"job_id": job_id})
+            del_result = delete_tool.execute({"job_id": job_id})
             assert del_result["deleted"] is True
 
     def test_list_tool(self):
@@ -277,10 +272,10 @@ class TestCronTools:
             create_tool = CronCreateTool(scheduler)
             list_tool = CronListTool(scheduler)
 
-            create_tool.call({"cron": "0 9 * * *", "prompt": "task1"})
-            create_tool.call({"cron": "0 17 * * *", "prompt": "task2"})
+            create_tool.execute({"cron": "0 9 * * *", "prompt": "task1"})
+            create_tool.execute({"cron": "0 17 * * *", "prompt": "task2"})
 
-            result = list_tool.call({})
+            result = list_tool.execute({})
             assert result["status"] == "success"
             assert result["count"] == 2
 
@@ -336,7 +331,7 @@ class TestAgentTool:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool = AgentTool(workspace_root=tmpdir)
-            result = tool.call({"subagent_type": "explore"})
+            result = tool.execute({"subagent_type": "explore"})
             assert result["status"] == "error"
 
     def test_call_unknown_agent_type(self):
@@ -344,7 +339,7 @@ class TestAgentTool:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool = AgentTool(workspace_root=tmpdir)
-            result = tool.call({"prompt": "test", "subagent_type": "nonexistent_type"})
+            result = tool.execute({"prompt": "test", "subagent_type": "nonexistent_type"})
             # Should return error about unknown type
             assert result.get("error") is not None or result.get("status") == "error"
 
@@ -364,7 +359,7 @@ class TestAgentTool:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool = AgentTool(workspace_root=tmpdir)
-            result = tool.call(
+            result = tool.execute(
                 {
                     "prompt": "test",
                     "subagent_type": "explore",
@@ -419,11 +414,11 @@ class TestAgentTool:
             execution_scope=execution_scope,
             allow_background=False,
         )
-        first = tool.call(
+        first = tool.execute(
             {"description": "first task", "prompt": "one"},
             runtime_context={"delegate_depth": 0},
         )
-        second = tool.call(
+        second = tool.execute(
             {"description": "second task", "prompt": "two"},
             runtime_context={"delegate_depth": 0},
         )
@@ -445,7 +440,7 @@ class TestAgentTool:
             invocation_factory=lambda request, context: None,
             allow_background=False,
         )
-        result = tool.call(
+        result = tool.execute(
             {"description": "nested task", "prompt": "recurse"},
             runtime_context={"delegate_depth": 1},
         )
@@ -505,11 +500,11 @@ class TestAgentTool:
             "post_runtime_event": lambda event: events.append(event) or True,
         }
 
-        first = tool.call(
+        first = tool.execute(
             {"description": "route one", "prompt": "one"},
             runtime_context=runtime_context,
         )
-        second = tool.call(
+        second = tool.execute(
             {"description": "route two", "prompt": "two"},
             runtime_context=runtime_context,
         )
@@ -580,7 +575,7 @@ class TestAgentTool:
             execution_scope=execution_scope,
             execution_mode="background",
         )
-        launched = tool.call(
+        launched = tool.execute(
             {"description": "queued route", "prompt": "inspect"},
             runtime_context={
                 "delegate_depth": 0,
@@ -638,7 +633,7 @@ class TestAgentTool:
             ),
             execution_mode="background",
         )
-        launched = tool.call(
+        launched = tool.execute(
             {"description": "fast route", "prompt": "inspect"},
             runtime_context={
                 "delegate_depth": 0,
@@ -689,7 +684,7 @@ class TestAgentTool:
             ),
             execution_mode="background",
         )
-        launched = tool.call(
+        launched = tool.execute(
             {"description": "validate route", "prompt": "validate"},
             runtime_context={
                 "delegate_depth": 0,
@@ -758,7 +753,7 @@ class TestAgentTool:
             ),
             execution_mode="background",
         )
-        launched = tool.call(
+        launched = tool.execute(
             {
                 "description": "validate extension bypass",
                 "name": "extension-bypass",
@@ -814,7 +809,7 @@ class TestAgentTool:
             ),
             execution_mode="background",
         )
-        launched = tool.call(
+        launched = tool.execute(
             {"description": "done", "prompt": "done"},
             runtime_context={"delegate_depth": 0},
         )
@@ -863,7 +858,7 @@ class TestAgentTool:
             ),
             execution_mode="background",
         )
-        result = tool.call(
+        result = tool.execute(
             {"description": "long route", "prompt": "wait"},
             runtime_context={"delegate_depth": 0},
         )
@@ -909,7 +904,7 @@ class TestAgentTool:
             ),
             execution_mode="background",
         )
-        result = tool.call(
+        result = tool.execute(
             {"description": "long route", "prompt": "wait"},
             runtime_context={"delegate_depth": 0},
         )
@@ -958,7 +953,7 @@ class TestAgentTool:
             execution_scope=blocked_scope,
             execution_mode="background",
         )
-        result = tool.call(
+        result = tool.execute(
             {"description": "queued route", "prompt": "wait"},
             runtime_context={"delegate_depth": 0},
         )

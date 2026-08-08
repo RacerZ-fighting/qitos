@@ -168,9 +168,13 @@ If you cannot run a check, explicitly say so and explain why.
 ## Tooling and contract rules
 
 - Class-based tools should implement `execute(args, runtime_context)`.
-- `run(...)` exists as a compatibility path, not as the preferred new contract.
+- `execute(args, runtime_context)` is the only class-based execution entry; do not add
+  `run`, `call`, callable fallbacks, name aliases, or normalized-name dispatch.
 - Function-style tools should continue to use the canonical decorator path.
-- Tool behavior should remain composable through `ToolRegistry`.
+- `ToolRegistry` owns registration and exact-name lookup; `ActionExecutor` owns
+  validation, permission checks, timeout handling, execution, and result normalization.
+- Parallel execution requires an explicit `ToolSpec.concurrency_safe=True`; read-only
+  metadata and historical tool names never imply concurrency safety.
 - Env-backed operations should consume env ops rather than assuming host filesystem/process access directly.
 
 ---

@@ -151,12 +151,12 @@ class TestReadOnly:
         result = executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 
-    def test_read_only_tool_is_concurrency_safe(self):
-        """A tool with read_only=True is classified as concurrency-safe."""
+    def test_read_only_tool_requires_an_explicit_concurrency_declaration(self):
+        """Read-only metadata alone does not prove shared-state safety."""
         ts = _TestToolSet()
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry)
-        assert executor._is_concurrency_safe("read_only_query") is True
+        assert executor._is_concurrency_safe("read_only_query") is False
 
     def test_needs_approval_tool_is_not_concurrency_safe(self):
         """A tool with needs_approval=True is NOT concurrency-safe."""

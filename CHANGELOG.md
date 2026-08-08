@@ -127,6 +127,23 @@ How to update:
 - Fixed CyberGym PoC generation runs so benchmark-local Bash commands can run without interactive command review while the default coding toolset review guard remains intact.
 - Fixed tool registration with name overrides so CyberGym uppercase aliases do not mutate source tool specs shared with ordinary coding toolsets.
 
+### Removed
+
+- Removed class-tool `run`/`call`/callable adapters, `ToolRegistry.call()`, automatic
+  short and separator aliases, normalized-name dispatch, duck-typed executor fallbacks,
+  callable approval flags, read-only concurrency inference, and the historical
+  concurrency-safe name list. Class tools now implement only
+  `execute(args, runtime_context)`; the registry performs exact-name lookup and the
+  executor owns the complete invocation lifecycle.
+
+### Breaking
+
+- Direct class-tool callers must pass an argument dictionary to `execute(...)`.
+  Registry callers must resolve an exact canonical name with `get()` or execute through
+  `Engine`/`ActionExecutor`. Tools run in parallel only when their spec explicitly sets
+  `concurrency_safe=True`. A `FunctionTool` remains directly callable as the ordinary
+  host-side behavior of `@function_tool`; agent execution never uses that shortcut.
+
 ## v0.6.0 (2026-05-28)
 
 ### Added

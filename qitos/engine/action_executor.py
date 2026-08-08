@@ -19,6 +19,7 @@ from ..core.action import Action, ActionExecutionPolicy, ActionResult, ActionSta
 from ..core.env import Env
 from ..core.interceptor import InterceptorChain, InterceptorContext
 from ..core.tool_result import ToolResult
+from ..core.tool_registry import ToolRegistry
 from ..core.tool import (
     BaseTool,
     ToolPermissionContext,
@@ -30,18 +31,6 @@ from .states import RuntimePhase
 if TYPE_CHECKING:
     from ._protocol import _EngineProtocol
     from .cancellation import CancelToken
-
-
-# Tools that are safe to run concurrently (read-only, no side effects)
-_CONCURRENCY_SAFE_TOOLS = frozenset({
-    "file_read_v2", "read_file", "Read", "view",
-    "Glob", "Grep", "glob_v2", "grep_v2",
-    "WebFetch", "web_fetch_v2",
-    "task_list", "task_get",
-    # CyberGym read-only tools
-    "READ", "GREP", "FindSymbols", "CallsiteSearch", "RepoMap",
-    "FileInfo", "HexView", "StructProbe", "CorpusInspect",
-})
 
 
 # Terminal states that count as a failure for fail_fast purposes.
@@ -75,7 +64,7 @@ class ActionExecutor:
 
     def __init__(
         self,
-        tool_registry: Any,
+        tool_registry: ToolRegistry,
         policy: Optional[ActionExecutionPolicy] = None,
         trace_writer: Any = None,
         delegate_depth: int = 0,
@@ -213,48 +202,15 @@ class ActionExecutor:
         self.last_execution_stats["segments"] = len(actions)
         return results
 
-    def _classify_actions(
-        self, actions: Sequence[Action]
-    ) -> Tuple[List[int], List[int]]:
-        """Classify actions into concurrency-safe and exclusive."""
-        safe_indices: List[int] = []
-        exclusive_indices: List[int] = []
-        for i, action in enumerate(actions):
-            if self._is_concurrency_safe(action.name):
-                safe_indices.append(i)
-            else:
-                exclusive_indices.append(i)
-        return safe_indices, exclusive_indices
-
     def _is_concurrency_safe(self, tool_name: str) -> bool:
-        """Check if a tool is safe to run concurrently.
-
-        Priority:
-        1. Tools with needs_approval=True are NEVER concurrency safe
-        2. ToolSpec.concurrency_safe=True → safe
-        3. ToolSpec.read_only=True → safe
-        4. Fallback to legacy _CONCURRENCY_SAFE_TOOLS set
-        """
+        """Return whether the registered tool explicitly permits concurrency."""
         allowed = self.policy.parallel_tool_names
         if allowed is not None and tool_name not in allowed:
             return False
         tool = self._resolve_tool(tool_name)
-        if tool is not None and hasattr(tool, "spec"):
-            spec = tool.spec
-            # Tools needing approval are NEVER concurrency safe
-            if getattr(spec, "needs_approval", False):
-                return False
-            concurrency_safe = getattr(spec, "concurrency_safe", None)
-            if concurrency_safe is True:
-                return True
-            if concurrency_safe is False:
-                return False
-            # A read-only tool without an explicit concurrency declaration is
-            # safe by default; an explicit False remains authoritative.
-            if getattr(spec, "read_only", False) is True:
-                return True
-        # Fallback: check legacy hardcoded set
-        return tool_name in _CONCURRENCY_SAFE_TOOLS
+        if tool is None or tool.spec.needs_approval:
+            return False
+        return tool.spec.concurrency_safe is True
 
     def _segment_actions(self, actions: Sequence[Action]) -> List[List[int]]:
         """Split actions into ordered runs separated by exclusive barriers.
@@ -476,7 +432,7 @@ class ActionExecutor:
     # ── Timeout resolution ─────────────────────────────────────────────────────
 
     def _resolve_timeout(
-        self, action: Action, tool: Optional[BaseTool]
+        self, action: Action, tool: BaseTool
     ) -> Tuple[Optional[float], str]:
         """Resolve the effective timeout for an action.
 
@@ -485,15 +441,13 @@ class ActionExecutor:
         """
         timeout: Optional[float] = None
         source = "none"
-        action_timeout = getattr(action, "timeout_s", None)
+        action_timeout = action.timeout_s
         if action_timeout is not None and action_timeout > 0:
             timeout = float(action_timeout)
             source = "action"
-        elif tool is not None:
-            spec_timeout = getattr(getattr(tool, "spec", None), "timeout_s", None)
-            if spec_timeout is not None and spec_timeout > 0:
-                timeout = float(spec_timeout)
-                source = "tool_spec"
+        elif tool.spec.timeout_s is not None and tool.spec.timeout_s > 0:
+            timeout = float(tool.spec.timeout_s)
+            source = "tool_spec"
         remaining = self._remaining_runtime_seconds()
         if remaining is not None and (timeout is None or remaining < timeout):
             return remaining, "runtime_deadline"
@@ -537,7 +491,7 @@ class ActionExecutor:
 
     def _call_tool_with_timeout(
         self,
-        tool: Optional[BaseTool],
+        tool: BaseTool,
         name: str,
         args: Dict[str, Any],
         runtime_context: Optional[Dict[str, Any]],
@@ -550,7 +504,7 @@ class ActionExecutor:
         reported as such without claiming the worker was terminated.
         """
         def _invoke() -> Any:
-            output = self._call_tool(tool, name, args, runtime_context=runtime_context)
+            output = self._call_tool(tool, args, runtime_context=runtime_context)
             if inspect.isawaitable(output):
                 output = self._resolve_awaitable(output, timeout_s)
             return output
@@ -653,30 +607,9 @@ class ActionExecutor:
                     "started": False,
                 },
             )
-        runtime_context = self._build_runtime_context(action.name, env=env, state=state)
-        ordering_meta: Dict[str, Any] = {
-            "segment_index": segment_index,
-            "started_at": started_at,
-            "started": True,
-        }
-
-        # Resolve per-tool retry_policy and on_failure from tool spec
-        _retry_policy = None
-        _on_failure = None
-        available = (
-            [
-                str(item)
-                for item in list(self.tool_registry.list_tools() or [])
-                if str(item)
-            ]
-            if hasattr(self.tool_registry, "list_tools")
-            else []
-        )
-        # Model-originated tool names are an exact protocol contract.  The
-        # registry may support aliases for host integrations, but execution
-        # must not silently repair casing or parse argument fragments embedded
-        # in a malformed name.
-        if available and action.name not in available:
+        available = self.tool_registry.list_tools()
+        tool = self._resolve_tool(action.name)
+        if tool is None:
             card = "\n".join(
                 [
                     "[TOOL:unknown]",
@@ -708,13 +641,18 @@ class ActionExecutor:
                     "executed": False,
                 },
             )
-        tool_preview = self._resolve_tool(action.name)
-        if tool_preview is not None and hasattr(tool_preview, 'spec'):
-            _retry_policy = getattr(tool_preview.spec, 'retry_policy', None)
-            _on_failure = getattr(tool_preview.spec, 'on_failure', None)
+        runtime_context = self._build_runtime_context(tool, env=env, state=state)
+        ordering_meta: Dict[str, Any] = {
+            "segment_index": segment_index,
+            "started_at": started_at,
+            "started": True,
+        }
+
+        _retry_policy = tool.spec.retry_policy
+        _on_failure = tool.spec.on_failure
 
         # Unified timeout: Action.timeout_s override > ToolSpec.timeout_s default
-        _timeout_s, _timeout_source = self._resolve_timeout(action, tool_preview)
+        _timeout_s, _timeout_source = self._resolve_timeout(action, tool)
         if _timeout_s is not None:
             ordering_meta["timeout_s"] = _timeout_s
             ordering_meta["timeout_source"] = _timeout_source
@@ -732,35 +670,30 @@ class ActionExecutor:
 
         # 2. Check needs_approval — triggers interrupt() for human approval
         _auto_approved = False
-        if tool_preview is not None and hasattr(tool_preview, 'spec'):
-            _needs_approval_val = getattr(tool_preview.spec, 'needs_approval', False)
-            if _needs_approval_val:
-                if callable(_needs_approval_val) and not isinstance(_needs_approval_val, bool):
-                    _needs_approval_val = _needs_approval_val(runtime_context, action.args)
-            if _needs_approval_val:
-                if self.auto_approve:
-                    _auto_approved = True
-                else:
-                    from ..engine.interrupt import interrupt
-                    from ..engine.approval import ToolApprovalItem
+        if tool.spec.needs_approval:
+            if self.auto_approve:
+                _auto_approved = True
+            else:
+                from ..engine.interrupt import interrupt
+                from ..engine.approval import ToolApprovalItem
 
-                    approval_item = ToolApprovalItem(
-                        tool_name=action.name,
-                        tool_args=action.args,
-                        message=f"Tool '{action.name}' requires approval before execution.",
+                approval_item = ToolApprovalItem(
+                    tool_name=action.name,
+                    tool_args=action.args,
+                    message=f"Tool '{action.name}' requires approval before execution.",
+                )
+                approval = interrupt(approval_item)
+                if approval == "deny":
+                    return self._finish_result(
+                        action=action,
+                        status=ActionStatus.DENIED,
+                        start=start,
+                        attempts=1,
+                        tool_meta=tool_meta,
+                        output={"message": "User denied approval"},
+                        error="User denied approval",
+                        extra_metadata={"error_category": "approval_denied"},
                     )
-                    approval = interrupt(approval_item)
-                    if approval == "deny":
-                        return self._finish_result(
-                            action=action,
-                            status=ActionStatus.DENIED,
-                            start=start,
-                            attempts=1,
-                            tool_meta=tool_meta,
-                            output={"message": "User denied approval"},
-                            error="User denied approval",
-                            extra_metadata={"error_category": "approval_denied"},
-                        )
 
         # Compute effective max attempts from retry_policy or fallback to max_retries
         if _retry_policy is not None:
@@ -789,7 +722,6 @@ class ActionExecutor:
                 )
             attempts += 1
             try:
-                tool = self._resolve_tool(action.name)
                 validation = self._validate(tool, action.args, runtime_context)
                 if not validation.valid:
                     return self._finish_result(
@@ -1141,10 +1073,10 @@ class ActionExecutor:
         )
 
     def _build_runtime_context(
-        self, name: str, env: Optional[Env], state: Any
+        self, tool: BaseTool, env: Optional[Env], state: Any
     ) -> Dict[str, Any]:
-        required_ops = self._required_ops(name)
-        environment_ops = self._environment_ops(name)
+        required_ops = list(tool.spec.required_ops)
+        environment_ops = list(tool.spec.environment_ops)
         permission_context = self._resolve_permission_context(env=env, state=state)
         progress_events: List[Dict[str, Any]] = []
         artifacts: List[Dict[str, Any]] = []
@@ -1198,102 +1130,44 @@ class ActionExecutor:
         }
 
     def _resolve_tool(self, name: str) -> Optional[BaseTool]:
-        if hasattr(self.tool_registry, "get"):
-            tool = self.tool_registry.get(name)
-            if tool is not None:
-                return tool
-        return None
+        return self.tool_registry.get(name)
 
     def _validate(
         self,
-        tool: Optional[BaseTool],
+        tool: BaseTool,
         args: Dict[str, Any],
         runtime_context: Dict[str, Any],
     ) -> ToolValidationResult:
-        if tool is None or not hasattr(tool, "validate_input"):
-            return ToolValidationResult.ok()
-        result = tool.validate_input(dict(args), runtime_context=runtime_context)
-        if isinstance(result, ToolValidationResult):
-            return result
-        if isinstance(result, dict):
-            return ToolValidationResult(
-                valid=bool(result.get("valid", result.get("result", True))),
-                message=str(result.get("message", "")),
-                code=str(result.get("code", result.get("error_code", ""))),
-                suggested_args=result.get("suggested_args"),
-            )
-        if result is False:
-            return ToolValidationResult.fail("tool input validation failed")
-        return ToolValidationResult.ok()
+        return tool.validate_input(dict(args), runtime_context=runtime_context)
 
     def _check_permissions(
         self,
-        tool: Optional[BaseTool],
+        tool: BaseTool,
         args: Dict[str, Any],
         runtime_context: Dict[str, Any],
     ) -> ToolPermissionDecision:
         # Use permission pipeline if available
         if self._pipeline is not None:
-            tool_spec = getattr(tool, "spec", None) if tool is not None else None
             return self._pipeline.evaluate(
-                tool_name=getattr(tool, "name", "") if tool else "",
+                tool_name=tool.name,
                 args=dict(args),
-                tool_spec=tool_spec,
+                tool_spec=tool.spec,
                 runtime_context=runtime_context,
             )
-        # Fallback: use tool's own permission check
-        if tool is None or not hasattr(tool, "check_permissions"):
-            return ToolPermissionDecision.allow()
-        result = tool.check_permissions(dict(args), runtime_context=runtime_context)
-        if isinstance(result, ToolPermissionDecision):
-            return result
-        if isinstance(result, dict):
-            return ToolPermissionDecision(
-                decision=str(result.get("decision", "allow")),
-                message=str(result.get("message", "")),
-                scope=str(result.get("scope", "")),
-                updated_args=result.get("updated_args"),
-            )
-        if result in {"allow", "deny", "ask"}:
-            return ToolPermissionDecision(decision=str(result))
-        return ToolPermissionDecision.allow()
+        return tool.check_permissions(dict(args), runtime_context=runtime_context)
 
     def _call_tool(
         self,
-        tool: Optional[BaseTool],
-        name: str,
+        tool: BaseTool,
         args: Dict[str, Any],
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        if tool is not None:
-            return tool.call(args, runtime_context=runtime_context)
-        if hasattr(self.tool_registry, "call"):
-            return self.tool_registry.call(
-                name, runtime_context=runtime_context, **args
-            )
+        return tool.execute(args, runtime_context=runtime_context)
 
-        if hasattr(self.tool_registry, "get"):
-            fallback = self.tool_registry.get(name)
-            if fallback is None:
-                raise ValueError(f"Unknown tool: {name}")
-            if hasattr(fallback, "call"):
-                return fallback.call(args, runtime_context=runtime_context)
-            if hasattr(fallback, "execute"):
-                return fallback.execute(args, runtime_context=runtime_context)
-            if hasattr(fallback, "run"):
-                return fallback.run(**args)
-            return fallback(**args)
-
-        raise TypeError(
-            "Unsupported tool registry. Expected object with call() or get()."
-        )
-
-    def _normalize_output(self, tool: Optional[BaseTool], output: Any) -> Any:
+    def _normalize_output(self, tool: BaseTool, output: Any) -> Any:
         if isinstance(output, ToolResult):
             output = output.to_dict()
-        if tool is None:
-            return output
-        max_chars = getattr(getattr(tool, "spec", None), "result_max_chars", None)
+        max_chars = tool.spec.result_max_chars
         if not max_chars or max_chars <= 0:
             return output
         if isinstance(output, str):
@@ -1346,32 +1220,6 @@ class ActionExecutor:
             ),
         }
 
-    def _required_ops(self, name: str) -> List[str]:
-        if hasattr(self.tool_registry, "get"):
-            try:
-                tool = self.tool_registry.get(name)
-                if tool is not None and hasattr(tool, "spec"):
-                    spec = getattr(tool, "spec")
-                    if hasattr(spec, "required_ops"):
-                        value = getattr(spec, "required_ops")
-                        if isinstance(value, list):
-                            return [str(x) for x in value]
-            except Exception:
-                return []
-        return []
-
-    def _environment_ops(self, name: str) -> List[str]:
-        if hasattr(self.tool_registry, "get"):
-            try:
-                tool = self.tool_registry.get(name)
-                if tool is not None and hasattr(tool, "spec"):
-                    value = getattr(getattr(tool, "spec"), "environment_ops", None)
-                    if isinstance(value, list):
-                        return [str(item) for item in value]
-            except Exception:
-                return []
-        return []
-
     def _resolve_ops(
         self, required_ops: List[str], env: Optional[Env]
     ) -> Dict[str, Any]:
@@ -1399,18 +1247,15 @@ class ActionExecutor:
         return self._resolve_ops(environment_ops, env)
 
     def _tool_meta(self, name: str) -> dict[str, Any]:
-        if hasattr(self.tool_registry, "describe_tool"):
-            try:
-                desc = self.tool_registry.describe_tool(name)
-                origin = desc.get("origin", {})
-                return {
-                    "tool_name": desc.get("name", name),
-                    "toolset_name": origin.get("toolset_name"),
-                    "toolset_version": origin.get("toolset_version"),
-                    "source": origin.get("source", "function"),
-                }
-            except Exception:
-                pass
+        if self.tool_registry.get(name) is not None:
+            desc = self.tool_registry.describe_tool(name)
+            origin = desc.get("origin", {})
+            return {
+                "tool_name": desc.get("name", name),
+                "toolset_name": origin.get("toolset_name"),
+                "toolset_version": origin.get("toolset_version"),
+                "source": origin.get("source", "function"),
+            }
         return {
             "tool_name": name,
             "toolset_name": None,

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from qitos.core.action import Action, ActionResult, ActionStatus
+from qitos.core.action import Action, ActionStatus
 from qitos.core.tool import ToolMeta, ToolSpec, FunctionTool, tool
+from qitos.core.tool_registry import ToolRegistry
 from qitos.engine.approval import ToolApprovalItem
 from qitos.engine.action_executor import ActionExecutor
 
@@ -124,13 +125,10 @@ class TestToolApprovalItem:
 
 
 def _make_registry(tools_dict):
-    """Create a mock tool registry that supports .get()."""
-    registry = MagicMock()
-    registry.get = lambda name: tools_dict.get(name)
-    registry.describe_tool = MagicMock(return_value={
-        "name": "unknown",
-        "origin": {"toolset_name": None, "toolset_version": None, "source": "function"},
-    })
+    """Create a real registry so executor tests exercise the canonical boundary."""
+    registry = ToolRegistry()
+    for item in tools_dict.values():
+        registry.register(item)
     return registry
 
 
@@ -240,8 +238,8 @@ class TestActionExecutorNeedsApproval:
         assert approval_item.tool_args == {"x": 5}
         assert "requires approval" in approval_item.message
 
-    def test_callable_needs_approval_evaluated(self):
-        """Callable needs_approval should be evaluated with runtime_context and args."""
+    def test_callable_needs_approval_is_rejected(self):
+        """Approval policy is a runtime concern, not an overloaded spec field."""
 
         def conditional_approval(runtime_context, args):
             # Only require approval for production environment
@@ -252,35 +250,17 @@ class TestActionExecutorNeedsApproval:
             """Deploy."""
             return f"deployed to {target_env}"
 
-        ft = FunctionTool(deploy)
-        registry = _make_registry({"deploy": ft})
-        executor = ActionExecutor(tool_registry=registry)
-
-        # Non-production should execute without approval
-        action_dev = Action(name="deploy", args={"target_env": "dev"})
-        with patch("qitos.engine.interrupt.interrupt") as mock_interrupt:
-            result = executor._execute_one(action_dev)
-            mock_interrupt.assert_not_called()
-            assert result.status == ActionStatus.SUCCESS
-
-        # Production should trigger approval
-        action_prod = Action(name="deploy", args={"target_env": "production"})
-        with patch("qitos.engine.interrupt.interrupt") as mock_interrupt:
-            mock_interrupt.return_value = "allow"
-            result = executor._execute_one(action_prod)
-            assert mock_interrupt.called
-            assert result.status == ActionStatus.SUCCESS
+        with pytest.raises(TypeError, match="needs_approval must be a boolean"):
+            FunctionTool(deploy)
 
     def test_unknown_tool_no_approval_check(self):
         """If tool is not in registry, no approval check should be attempted."""
         registry = _make_registry({})
-        # The mock registry.call() succeeds by default, so the result
-        # status depends on the registry implementation. The key assertion
-        # is that no interrupt is triggered for a missing tool.
         executor = ActionExecutor(tool_registry=registry)
 
         action = Action(name="nonexistent", args={})
         with patch("qitos.engine.interrupt.interrupt") as mock_interrupt:
             result = executor._execute_one(action)
-            # No interrupt should be called for unknown tools
             mock_interrupt.assert_not_called()
+            assert result.status is ActionStatus.ERROR
+            assert result.metadata["error_category"] == "tool_not_found"

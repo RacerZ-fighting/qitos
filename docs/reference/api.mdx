@@ -722,12 +722,15 @@ def get(self, name: str) -> Optional[BaseTool]
 def list_tools(self) -> List[str]
 def list_toolsets(self) -> List[str]
 def describe_tool(self, name: str) -> Dict[str, Any]
-def call(self, name: str, runtime_context: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Any
 def get_tool_descriptions(self) -> str
 def get_all_specs(self) -> List[Dict[str, Any]]
 def setup(self, context: Optional[Dict[str, Any]] = None) -> None
 def teardown(self, context: Optional[Dict[str, Any]] = None) -> None
 ```
+
+Lookup is exact. Execution belongs to `ActionExecutor`, which applies validation,
+permissions, timeouts, retries, and canonical result handling before calling
+`BaseTool.execute(args, runtime_context)`.
 
 **Example**
 

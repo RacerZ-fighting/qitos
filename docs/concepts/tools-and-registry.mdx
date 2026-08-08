@@ -3,7 +3,9 @@ title: "Tools and Registry"
 description: "QitOS tools are plain Python callables marked with the @tool decorator. ToolRegistry collects them and makes them available to the Engine for execution."
 ---
 
-Tools are the actions your agent can take. At runtime, the Engine dispatches tool calls from a `Decision` to the `ToolRegistry`, which looks up and executes the matching callable.
+Tools are the actions your agent can take. At runtime, the Engine uses `ToolRegistry`
+for exact-name lookup, then `ActionExecutor` validates, authorizes, and executes the
+resolved tool.
 
 ## The `@tool` decorator
 
@@ -162,7 +164,9 @@ class DatabaseTool(BaseTool):
             )
         )
 
-    def run(self, sql: str) -> list:
+    def execute(self, args: dict, runtime_context: dict | None = None) -> list:
+        _ = runtime_context
+        sql = str(args["sql"])
         import sqlite3
         with sqlite3.connect(self.db_path) as conn:
             return conn.execute(sql).fetchall()
@@ -172,6 +176,13 @@ registry.register(DatabaseTool(db_path="data.db"))
 ```
 
 `FunctionTool` is the wrapper that `register()` creates automatically when you pass a plain callable. You rarely need to instantiate it directly.
+
+Class-based tools have one execution entry: `execute(args, runtime_context)`. The
+registry resolves only the exact registered name and does not execute tools itself.
+There are no `run`/`call` adapters, short aliases, separator aliases, or case repair.
+Use `ActionExecutor` (normally through `Engine`) when permission, timeout, retry, and
+result handling must apply. `read_only=True` describes effects; only an explicit
+`concurrency_safe=True` permits parallel execution.
 
 <Note>
 For most practical coding agents, prefer preset toolsets such as `CodingToolSet` or the registry builders in `qitos.kit.toolset` rather than hand-registering every file and shell tool yourself.

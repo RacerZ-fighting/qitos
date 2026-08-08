@@ -22,17 +22,17 @@ def test_text_web_atomic_tools_use_ops_context():
     ops.state.title = "Example"  # type: ignore[attr-defined]
 
     ctx = {"ops": {"web_browser": ops}, "env": env}
-    down = PageDown().run(lines=20, runtime_context=ctx)
+    down = PageDown().execute({"lines": 20}, runtime_context=ctx)
     assert down["status"] == "success"
     assert down["line_start"] == 20
 
-    up = PageUp().run(lines=10, runtime_context=ctx)
+    up = PageUp().execute({"lines": 10}, runtime_context=ctx)
     assert up["status"] == "success"
     assert up["line_start"] == 10
 
-    find = FindInPage().run(keyword="line 42", runtime_context=ctx)
+    find = FindInPage().execute({"keyword": "line 42"}, runtime_context=ctx)
     assert find["status"] == "success"
     assert find["matched_line"] == 42
 
-    next_match = FindNext().run(runtime_context=ctx)
+    next_match = FindNext().execute({}, runtime_context=ctx)
     assert next_match["status"] == "error"

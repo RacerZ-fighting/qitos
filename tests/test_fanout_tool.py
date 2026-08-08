@@ -6,15 +6,12 @@ from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from qitos import (
     Action,
     AgentModule,
     AgentRegistry,
     AgentSpec,
     ContextStrategy,
-    Decision,
     StateSchema,
     ToolRegistry,
 )
@@ -72,7 +69,7 @@ class TestFanOutToolCreation:
         tool = registry.get_fanout_tool()
         tool_reg = ToolRegistry()
         tool_reg.register(tool)
-        assert tool_reg.resolve_name("fanout") == "fanout"
+        assert tool_reg.get("fanout") is tool
 
     def test_fanout_tool_spec_flags(self):
         registry = _make_registry()

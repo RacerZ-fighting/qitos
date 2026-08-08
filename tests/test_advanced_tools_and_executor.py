@@ -41,9 +41,9 @@ class _EchoTool(BaseTool):
             return ToolValidationResult.fail("bad input", code="bad_input")
         return ToolValidationResult.ok()
 
-    def run(self, value: str, runtime_context=None):
+    def execute(self, args, runtime_context=None):
         _ = runtime_context
-        return {"result": value}
+        return {"result": args["value"]}
 
 
 class _SleepReadTool(BaseTool):
@@ -63,12 +63,12 @@ class _SleepReadTool(BaseTool):
             )
         )
 
-    def run(self, value: str, runtime_context=None):
+    def execute(self, args, runtime_context=None):
         _ = runtime_context
         with self._lock:
             self.starts.append(time.perf_counter())
         time.sleep(self.delay)
-        return {"value": value}
+        return {"value": args["value"]}
 
 
 class _UnsafeSleepTool(BaseTool):
@@ -88,20 +88,20 @@ class _UnsafeSleepTool(BaseTool):
             )
         )
 
-    def run(self, value: str, runtime_context=None):
+    def execute(self, args, runtime_context=None):
         _ = runtime_context
         with self._lock:
             self.starts.append(time.perf_counter())
         time.sleep(self.delay)
-        return {"value": value}
+        return {"value": args["value"]}
 
 
 class _MissingResultTool(BaseTool):
     def __init__(self) -> None:
         super().__init__(ToolSpec(name="MISSING", description="returns nothing"))
 
-    def run(self, runtime_context=None):
-        _ = runtime_context
+    def execute(self, args, runtime_context=None):
+        _ = args, runtime_context
         return None
 
 
@@ -170,6 +170,25 @@ def test_action_executor_reports_unknown_tool_without_name_repair():
     assert result.metadata["executed"] is False
     assert "Unknown tool: `Grep`" in result.output
     assert "`GREP`" in result.output
+
+
+def test_action_executor_invokes_only_execute():
+    tool = _EchoTool()
+
+    def forbidden_entry(*args, **kwargs):
+        _ = args, kwargs
+        raise AssertionError("legacy tool entry was invoked")
+
+    setattr(tool, "call", forbidden_entry)
+    setattr(tool, "run", forbidden_entry)
+    registry = ToolRegistry().register(tool)
+
+    result = ActionExecutor(registry).execute(
+        [Action(name="echo_tool", args={"value": "ok"})]
+    )[0]
+
+    assert result.status == ActionStatus.SUCCESS
+    assert result.output == {"result": "ok"}
 
 
 def test_action_executor_reports_missing_result_instead_of_none():
@@ -275,7 +294,7 @@ def test_action_executor_keeps_non_concurrency_safe_tools_serial_even_in_paralle
 
 def test_run_command_executes_in_workspace(tmp_path):
     tool = RunCommand(workspace_root=str(tmp_path))
-    result = tool.run(command="pwd")
+    result = tool.execute({"command": "pwd"})
     assert result["status"] == "success"
     assert str(tmp_path) in result["stdout"]
 
@@ -285,22 +304,20 @@ def test_read_file_and_str_replace_preserve_line_endings(tmp_path):
     path.write_bytes(b"hello\r\nworld\r\n")
 
     reader = ReadFile(workspace_root=str(tmp_path))
-    read_out = reader.run(path="demo.txt")
+    read_out = reader.execute({"path": "demo.txt"})
     assert read_out["status"] == "success"
     assert "hello" in read_out["content"]
 
     editor = StrReplace(workspace_root=str(tmp_path))
-    edit_out = editor.run(
-        path="demo.txt",
-        old_str="world",
-        new_str="qitos",
+    edit_out = editor.execute(
+        {"path": "demo.txt", "old_str": "world", "new_str": "qitos"}
     )
     assert edit_out["status"] == "success"
     assert b"\r\n" in path.read_bytes()
 
     lines = ReplaceLines(workspace_root=str(tmp_path))
-    replaced = lines.run(
-        path="demo.txt", start_line=2, end_line=2, replacement="done"
+    replaced = lines.execute(
+        {"path": "demo.txt", "start_line": 2, "end_line": 2, "replacement": "done"}
     )
     assert replaced["status"] == "success"
     assert "done" in path.read_text(encoding="utf-8")
@@ -368,24 +385,25 @@ def test_session_tools_and_tool_search(tmp_path):
     state = _ExecutorState(task="advanced")
     ctx = {"state": state, "tool_registry": registry}
 
-    todo = TodoWriteTool().run(
-        todos=[{"content": "ship", "status": "pending"}], runtime_context=ctx
+    todo = TodoWriteTool().execute(
+        {"todos": [{"content": "ship", "status": "pending"}]},
+        runtime_context=ctx,
     )
     assert todo["count"] == 1
 
-    plan_enter = registry.get("enter_plan_mode").run(
-        reason="decompose", runtime_context=ctx
+    plan_enter = registry.get("enter_plan_mode").execute(
+        {"reason": "decompose"}, runtime_context=ctx
     )
     assert plan_enter["current_mode"] == "plan"
 
-    create = registry.get("task_create").run(
-        subject="Implement", description="Do the work", runtime_context=ctx
+    create = registry.get("task_create").execute(
+        {"subject": "Implement", "description": "Do the work"}, runtime_context=ctx
     )
-    listed = registry.get("task_list").run(runtime_context=ctx)
+    listed = registry.get("task_list").execute({}, runtime_context=ctx)
     assert create["status"] == "success"
     assert listed["count"] == 1
 
-    search = ToolSearchTool().run(query="plan", runtime_context=ctx)
+    search = ToolSearchTool().execute({"query": "plan"}, runtime_context=ctx)
     assert search["count"] >= 1
 
 
@@ -395,9 +413,8 @@ def test_lsp_query_and_mcp_resource_tools():
             return {"status": "success", "kwargs": kwargs}
 
     lsp = LSPQueryTool()
-    out = lsp.run(
-        operation="definition",
-        symbol="demo",
+    out = lsp.execute(
+        {"operation": "definition", "symbol": "demo"},
         runtime_context={"ops": {"lsp": _FakeLSP()}},
     )
     assert out["status"] == "success"
@@ -409,24 +426,29 @@ def test_lsp_query_and_mcp_resource_tools():
             {"uri": "memo://two", "text": "beta"},
         ]
     }
-    listed = MCPListResourcesTool().run(runtime_context={"mcp_resources": resources})
+    listed = MCPListResourcesTool().execute(
+        {}, runtime_context={"mcp_resources": resources}
+    )
     assert "docs" in listed["resources"]
 
-    read = MCPReadResourceTool().run(
-        server="docs", uri="memo://two", runtime_context={"mcp_resources": resources}
+    read = MCPReadResourceTool().execute(
+        {"server": "docs", "uri": "memo://two"},
+        runtime_context={"mcp_resources": resources},
     )
     assert read["resource"]["text"] == "beta"
 
 
 def test_ask_user_choice_returns_needs_input_without_answers():
     tool = AskUserChoiceTool()
-    out = tool.run(
-        questions=[
-            {
-                "header": "Mode",
-                "question": "Which mode?",
-                "options": [{"label": "A"}, {"label": "B"}],
-            }
-        ]
+    out = tool.execute(
+        {
+            "questions": [
+                {
+                    "header": "Mode",
+                    "question": "Which mode?",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                }
+            ]
+        }
     )
     assert out["status"] == "needs_input"

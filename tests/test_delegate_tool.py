@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -24,6 +21,7 @@ from qitos import (
 )
 from qitos.engine.action_executor import ActionExecutor
 from qitos.engine.states import RuntimePhase
+from qitos.core.tool import BaseTool, ToolSpec
 from qitos.kit.tool.delegate import DelegateTool, MAX_DELEGATE_DEPTH
 
 
@@ -209,8 +207,7 @@ class TestDelegateTool:
             tool_reg.register(t)
 
         # The tool should be findable
-        resolved = tool_reg.resolve_name("delegate_to_worker")
-        assert resolved == "delegate_to_worker"
+        assert tool_reg.get("delegate_to_worker") is not None
 
     def test_execute_no_task_returns_error(self):
         spec = _make_spec()
@@ -310,10 +307,19 @@ class TestRuntimePhase:
 # ── ActionExecutor runtime_context tests ─────────────────────────────────
 
 
+class _ContextTool(BaseTool):
+    def __init__(self) -> None:
+        super().__init__(ToolSpec(name="some_tool", description="context fixture"))
+
+    def execute(self, args: dict[str, Any], runtime_context=None) -> None:
+        _ = args, runtime_context
+
+
 class TestActionExecutorContext:
     def test_runtime_context_has_delegation_keys(self):
-        executor = ActionExecutor(tool_registry=ToolRegistry())
-        ctx = executor._build_runtime_context("some_tool", env=None, state=None)
+        tool = _ContextTool()
+        executor = ActionExecutor(tool_registry=ToolRegistry().register(tool))
+        ctx = executor._build_runtime_context(tool, env=None, state=None)
         assert "delegate_depth" in ctx
         assert "parent_run_id" in ctx
         assert "trace_writer" in ctx
@@ -322,13 +328,15 @@ class TestActionExecutorContext:
         assert ctx["trace_writer"] is None
 
     def test_runtime_context_delegate_depth_propagated(self):
-        executor = ActionExecutor(tool_registry=ToolRegistry(), delegate_depth=2)
-        ctx = executor._build_runtime_context("some_tool", env=None, state=None)
+        tool = _ContextTool()
+        executor = ActionExecutor(
+            tool_registry=ToolRegistry().register(tool), delegate_depth=2
+        )
+        ctx = executor._build_runtime_context(tool, env=None, state=None)
         assert ctx["delegate_depth"] == 2
 
     def test_sub_engine_receives_incremented_depth(self):
         """DelegateTool._build_sub_engine should pass current_depth + 1 to Engine."""
-        from qitos.engine.engine import Engine
         registry = AgentRegistry()
         registry.register(_make_spec("worker"))
         tool = registry.get_delegate_tools()[0]
@@ -338,6 +346,9 @@ class TestActionExecutorContext:
 
     def test_runtime_context_trace_writer_passed_through(self):
         mock_tw = MagicMock()
-        executor = ActionExecutor(tool_registry=ToolRegistry(), trace_writer=mock_tw)
-        ctx = executor._build_runtime_context("some_tool", env=None, state=None)
+        tool = _ContextTool()
+        executor = ActionExecutor(
+            tool_registry=ToolRegistry().register(tool), trace_writer=mock_tw
+        )
+        ctx = executor._build_runtime_context(tool, env=None, state=None)
         assert ctx["trace_writer"] is mock_tw

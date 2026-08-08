@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List
-from unittest.mock import MagicMock
+from typing import Any, Dict
 
-from qitos.core.action import Action, ActionExecutionPolicy, ActionResult, ActionStatus
+from qitos.core.action import Action, ActionExecutionPolicy
 from qitos.core.tool import BaseTool, ToolSpec
+from qitos.core.tool_registry import ToolRegistry
 from qitos.engine.action_executor import ActionExecutor
 
 
@@ -24,24 +23,13 @@ class FakeTool(BaseTool):
         return self._result
 
 
-class FakeToolRegistry:
-    """A minimal tool registry for testing."""
-
-    def __init__(self, tools: Dict[str, BaseTool] | None = None):
-        self._tools = tools or {}
-
-    def get(self, name: str) -> BaseTool | None:
-        return self._tools.get(name)
-
-    def resolve(self, name: str) -> BaseTool | None:
-        return self._tools.get(name)
-
-
 def _make_executor(
     tools: Dict[str, BaseTool] | None = None,
     policy: ActionExecutionPolicy | None = None,
 ) -> ActionExecutor:
-    registry = FakeToolRegistry(tools)
+    registry = ToolRegistry()
+    for tool in (tools or {}).values():
+        registry.register(tool)
     return ActionExecutor(
         tool_registry=registry,
         policy=policy,
@@ -72,11 +60,11 @@ class TestSpecDrivenClassification:
         executor = _make_executor({"safe_read": tool})
         assert executor._is_concurrency_safe("safe_read")
 
-    def test_read_only_spec(self):
+    def test_read_only_without_concurrency_declaration_is_serial(self):
         spec = ToolSpec(name="read_only", description="Read", read_only=True)
         tool = FakeTool("read_only", spec=spec)
         executor = _make_executor({"read_only": tool})
-        assert executor._is_concurrency_safe("read_only")
+        assert not executor._is_concurrency_safe("read_only")
 
     def test_needs_approval_never_safe(self):
         spec = ToolSpec(name="danger", description="Danger", needs_approval=True, concurrency_safe=True)
@@ -84,11 +72,10 @@ class TestSpecDrivenClassification:
         executor = _make_executor({"danger": tool})
         assert not executor._is_concurrency_safe("danger")
 
-    def test_fallback_to_legacy_set(self):
-        """Unknown tool in legacy set is still considered safe."""
+    def test_historical_tool_names_have_no_concurrency_bypass(self):
         executor = _make_executor()
-        assert executor._is_concurrency_safe("Read")  # In _CONCURRENCY_SAFE_TOOLS
-        assert executor._is_concurrency_safe("Glob")
+        assert not executor._is_concurrency_safe("Read")
+        assert not executor._is_concurrency_safe("Glob")
 
     def test_unknown_tool_not_safe(self):
         executor = _make_executor()
@@ -99,7 +86,10 @@ class TestSerialMode:
     def test_serial_mode_forces_sequential(self):
         safe_spec = ToolSpec(name="read", description="Read", concurrency_safe=True)
         tool1 = FakeTool("read", spec=safe_spec)
-        tool2 = FakeTool("read2", spec=safe_spec)
+        tool2 = FakeTool(
+            "read2",
+            spec=ToolSpec(name="read2", description="Read", concurrency_safe=True),
+        )
         policy = ActionExecutionPolicy(mode="serial")
         executor = _make_executor({"read": tool1, "read2": tool2}, policy=policy)
         actions = [

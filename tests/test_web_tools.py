@@ -49,7 +49,7 @@ def test_http_request_parses_json(monkeypatch):
         )
 
     monkeypatch.setattr(tool._session, "request", _fake_request)
-    out = tool.run(method="GET", url="https://example.com")
+    out = tool.execute({"method": "GET", "url": "https://example.com"})
     assert out["status"] == "success"
     assert out["json"] == {"ok": True}
     assert out["content_type"].startswith("application/json")
@@ -61,20 +61,21 @@ def test_http_get_and_post_delegate(monkeypatch):
 
     calls = []
 
-    def _fake_get_run(**kwargs):
-        calls.append(kwargs)
+    def _fake_execute(args, runtime_context=None):
+        _ = runtime_context
+        calls.append(args)
         return {
             "status": "success",
-            "method": kwargs["method"],
-            "url": kwargs["url"],
+            "method": args["method"],
+            "url": args["url"],
             "content": "ok",
         }
 
-    monkeypatch.setattr(get_tool._request, "run", _fake_get_run)
-    monkeypatch.setattr(post_tool._request, "run", _fake_get_run)
+    monkeypatch.setattr(get_tool._request, "execute", _fake_execute)
+    monkeypatch.setattr(post_tool._request, "execute", _fake_execute)
 
-    g = get_tool.run(url="https://a.com", params={"q": "x"})
-    p = post_tool.run(url="https://b.com", json_data={"x": 1})
+    g = get_tool.execute({"url": "https://a.com", "params": {"q": "x"}})
+    p = post_tool.execute({"url": "https://b.com", "json_data": {"x": 1}})
     assert g["method"] == "GET"
     assert p["method"] == "POST"
     assert len(calls) == 2
@@ -91,7 +92,7 @@ def test_html_extract_text_title_and_content():
       <a href="https://x.com">Link</a>
     </body></html>
     """
-    out = tool.run(html=html, max_chars=1000, keep_links=True)
+    out = tool.execute({"html": html, "max_chars": 1000, "keep_links": True})
     assert out["status"] == "success"
     assert out["title"] == "Demo Page"
     assert "Hello" in out["content"]
@@ -104,7 +105,7 @@ def test_html_extract_text_emits_no_deprecation_warning():
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        out = tool.run(html=html, max_chars=1000)
+        out = tool.execute({"html": html, "max_chars": 1000})
 
     assert out["status"] == "success"
     assert not [w for w in caught if issubclass(w.category, DeprecationWarning)]

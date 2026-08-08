@@ -3,7 +3,8 @@ title: "Tools 与 Registry"
 description: "理解 QitOS 中的工具、工具集以及 ToolRegistry 如何组合成智能体能力表面。"
 ---
 
-工具就是智能体可以执行的动作。运行时，Engine 会把 `Decision` 里的动作（标准化工具调用）分发给 `ToolRegistry`，由它查找并执行对应的可调用对象。
+工具就是智能体可以执行的动作。运行时，Engine 使用 `ToolRegistry` 做精确名称
+查找，再由 `ActionExecutor` 完成校验、授权和执行。
 
 ## `@tool` 装饰器
 
@@ -160,7 +161,9 @@ class DatabaseTool(BaseTool):
             )
         )
 
-    def run(self, sql: str) -> list:
+    def execute(self, args: dict, runtime_context: dict | None = None) -> list:
+        _ = runtime_context
+        sql = str(args["sql"])
         import sqlite3
         with sqlite3.connect(self.db_path) as conn:
             return conn.execute(sql).fetchall()
@@ -170,6 +173,12 @@ registry.register(DatabaseTool(db_path="data.db"))
 ```
 
 当你向 `register()` 传入普通可调用对象时，QitOS 内部会自动把它包装成 `FunctionTool`。大多数情况下你无需显式实例化它。
+
+类式工具只有一个执行入口：`execute(args, runtime_context)`。注册表只接受精确的
+已注册名称，本身不负责执行；不存在 `run`/`call` 适配、短名称别名、分隔符别名或
+大小写修复。需要权限、超时、重试和结果归一化时，应通过 `Engine` 使用
+`ActionExecutor`。`read_only=True` 只描述副作用；只有显式
+`concurrency_safe=True` 才允许并行。
 
 <Note>
   对于实际编码智能体，通常优先使用 `CodingToolSet` 或 `qitos.kit.toolset` 中的预设构建器，而不是手工把文件、Shell、Web 工具逐个注册。
