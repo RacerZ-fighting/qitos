@@ -13,6 +13,7 @@ from urllib.parse import quote
 import requests
 
 from .base import Model, ModelFactory
+from ._request_runtime import effective_request_timeout
 
 
 class GeminiModel(Model):
@@ -68,24 +69,16 @@ class GeminiModel(Model):
         if system_text:
             payload["systemInstruction"] = {"parts": [{"text": system_text}]}
 
-        try:
-            response = requests.post(
-                f"{self.base_url}/models/{quote(self.model, safe='')}:generateContent",
-                params={"key": self.api_key},
-                json=payload,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            result = response.json()
-            self._set_last_usage(self._usage_from_response(result))
-            return self._parse_response(result)
-        except requests.HTTPError as exc:
-            body = exc.response.text if exc.response is not None else ""
-            return f"HTTP Error: {body or str(exc)}"
-        except requests.RequestException as exc:
-            return f"Connection Error: {str(exc)}"
-        except Exception as exc:
-            return f"Error: {str(exc)}"
+        response = requests.post(
+            f"{self.base_url}/models/{quote(self.model, safe='')}:generateContent",
+            params={"key": self.api_key},
+            json=payload,
+            timeout=effective_request_timeout(self.timeout),
+        )
+        response.raise_for_status()
+        result = response.json()
+        self._set_last_usage(self._usage_from_response(result))
+        return self._parse_response(result)
 
     def _system_text(self, messages: List[Dict[str, Any]]) -> str:
         parts: List[str] = []
@@ -114,7 +107,7 @@ class GeminiModel(Model):
         if not candidates:
             prompt_feedback = response.get("promptFeedback")
             if isinstance(prompt_feedback, dict) and prompt_feedback:
-                return f"Error: {prompt_feedback}"
+                raise RuntimeError(f"Gemini rejected the prompt: {prompt_feedback}")
             return ""
 
         content = candidates[0].get("content") or {}

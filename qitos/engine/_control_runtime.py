@@ -6,7 +6,11 @@ import time
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 
 from ..core.decision import Decision
-from ..core.errors import StopReason
+from ..core.errors import (
+    ModelRequestCancelled,
+    ModelRequestDeadlineExceeded,
+    StopReason,
+)
 from ..core.state import StateSchema
 from ._context_runtime import (
     ContextCompactionRequired,
@@ -355,6 +359,14 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
 
         if isinstance(exc, DecisionContextConfigurationError):
             state.set_stop(StopReason.INFRASTRUCTURE_INVALID)
+            return False
+
+        if isinstance(exc, ModelRequestCancelled):
+            state.set_stop(StopReason.CANCELLED_IMMEDIATE)
+            return False
+
+        if isinstance(exc, ModelRequestDeadlineExceeded):
+            state.set_stop(StopReason.BUDGET_TIME)
             return False
 
         if isinstance(exc, ContextOverflowError) or self._is_api_context_overflow(exc):

@@ -20,6 +20,7 @@ from qitos.core.tool import (
 from qitos.engine.action_executor import ActionExecutor
 from qitos.engine.cancellation import CancelToken
 from qitos.engine.states import RuntimeBudget
+from qitos.models.base import ModelStreamChunk
 
 
 class _RuntimeEngine:
@@ -285,7 +286,9 @@ def test_tool_retries_share_one_tool_deadline() -> None:
 
 class _CancellationAwareTool(BaseTool):
     def __init__(self) -> None:
-        super().__init__(ToolSpec(name="cancel_aware", description="cooperative cancel"))
+        super().__init__(
+            ToolSpec(name="cancel_aware", description="cooperative cancel")
+        )
         self.entered = threading.Event()
         self.observed_cancel = False
         self.deadline_monotonic: float | None = None
@@ -399,3 +402,138 @@ def test_absolute_deadline_clamps_relative_runtime_budget() -> None:
     assert time.monotonic() - started < 0.2
     assert agent.calls == 1
     assert result.state.stop_reason == "budget_time"
+
+
+class _BlockingModel:
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.worker_daemon: bool | None = None
+
+    def __call__(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+        _ = messages, kwargs
+        self.worker_daemon = threading.current_thread().daemon
+        self.entered.set()
+        self.release.wait(timeout=1.0)
+        return "Final Answer: late result"
+
+
+@dataclass
+class _ModelDeadlineState(StateSchema):
+    pass
+
+
+class _ModelDeadlineAgent(AgentModule[_ModelDeadlineState, dict[str, Any], Any]):
+    def __init__(self, model: _BlockingModel) -> None:
+        super().__init__(tool_registry=ToolRegistry(), llm=model)
+
+    def init_state(self, task: str, **kwargs: Any) -> _ModelDeadlineState:
+        _ = kwargs
+        return _ModelDeadlineState(task=task, max_steps=3)
+
+    def reduce(
+        self,
+        state: _ModelDeadlineState,
+        observation: dict[str, Any],
+        decision: Decision[Any],
+    ) -> _ModelDeadlineState:
+        _ = observation, decision
+        return state
+
+
+def test_model_request_deadline_detaches_blocking_provider_and_discards_late_result() -> (
+    None
+):
+    model = _BlockingModel()
+    engine = Engine(
+        _ModelDeadlineAgent(model),
+        budget=RuntimeBudget(
+            max_steps=3,
+            deadline_monotonic=time.monotonic() + 0.03,
+        ),
+    )
+    started = time.monotonic()
+
+    result = engine.run("block")
+    model.release.set()
+
+    assert time.monotonic() - started < 0.2
+    assert model.entered.is_set()
+    assert model.worker_daemon is True
+    assert result.state.stop_reason == "budget_time"
+    assert result.state.final_result is None
+
+
+def test_immediate_cancel_stops_waiting_for_blocking_model() -> None:
+    model = _BlockingModel()
+    engine = Engine(_ModelDeadlineAgent(model), budget=RuntimeBudget(max_steps=3))
+    results: list[Any] = []
+    thread = threading.Thread(target=lambda: results.append(engine.run("block")))
+
+    thread.start()
+    assert model.entered.wait(timeout=0.2)
+    engine.cancel("immediate")
+    thread.join(timeout=0.2)
+    model.release.set()
+
+    assert not thread.is_alive()
+    assert results[0].state.stop_reason == "cancelled_immediate"
+    assert results[0].state.final_result is None
+
+
+class _BlockingStreamModel:
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+        _ = messages, kwargs
+        try:
+            yield ModelStreamChunk(text="before deadline")
+            self.entered.set()
+            self.release.wait(timeout=1.0)
+            yield ModelStreamChunk(text="late", done=True)
+        finally:
+            self.finished.set()
+
+    def __call__(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
+        _ = messages, kwargs
+        return "Final Answer: fallback"
+
+
+class _RecordingStreamHandler:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str | None]] = []
+
+    def on_start(self) -> None:
+        self.events.append(("start", None))
+
+    def on_delta(self, text: str) -> None:
+        self.events.append(("delta", text))
+
+    def on_end(self) -> None:
+        self.events.append(("end", None))
+
+
+def test_model_stream_discards_callbacks_after_deadline() -> None:
+    model = _BlockingStreamModel()
+    handler = _RecordingStreamHandler()
+    engine = Engine(
+        _ModelDeadlineAgent(model),
+        budget=RuntimeBudget(
+            max_steps=3,
+            deadline_monotonic=time.monotonic() + 0.05,
+        ),
+    )
+    engine.stream_callback = handler
+
+    result = engine.run("stream")
+    model.release.set()
+    assert model.finished.wait(timeout=0.2)
+
+    assert result.state.stop_reason == "budget_time"
+    assert handler.events == [
+        ("start", None),
+        ("delta", "before deadline"),
+    ]

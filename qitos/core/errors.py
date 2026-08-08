@@ -90,6 +90,14 @@ class ModelTransportError(Exception):
         self.status_code = status_code
 
 
+class ModelRequestDeadlineExceeded(TimeoutError):
+    """The Engine deadline expired while a model request was in flight."""
+
+
+class ModelRequestCancelled(Exception):
+    """Immediate Engine cancellation stopped waiting for a model request."""
+
+
 def _is_network_error(exc: Exception) -> bool:
     """Check if an exception is a transient network/SSL error."""
     # Standard Python errors

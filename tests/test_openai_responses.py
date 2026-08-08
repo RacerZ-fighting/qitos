@@ -202,7 +202,9 @@ def test_responses_input_deduplicates_generic_native_mirrors() -> None:
     assert sum(item.get("type") == "function_call" for item in payload) == 1
 
 
-def test_responses_request_count_uses_normalized_wire_options_without_duplicate_calls() -> None:
+def test_responses_request_count_uses_normalized_wire_options_without_duplicate_calls() -> (
+    None
+):
     class _RecordingAdapter:
         api_mode = "responses"
 
@@ -490,6 +492,7 @@ def test_sync_responses_transport_uses_responses_endpoint(
             "input": [{"role": "user", "content": "calculate"}],
             "temperature": 0.7,
             "max_output_tokens": 321,
+            "timeout": 120.0,
             "text": {"format": {"type": "json_object"}},
             "tools": [
                 {
@@ -653,9 +656,17 @@ def test_responses_stream_emits_typed_text_and_completed_tool_call(
     )
     assert final_reasoning["encrypted_content"] == "opaque-private-state"
     replay = responses_module._to_responses_input(
-        [{"role": "assistant", "content": None, "native_items": chunks[-1].native_items}]
+        [
+            {
+                "role": "assistant",
+                "content": None,
+                "native_items": chunks[-1].native_items,
+            }
+        ]
     )
-    assert next(item for item in replay if item["type"] == "reasoning") == final_reasoning
+    assert (
+        next(item for item in replay if item["type"] == "reasoning") == final_reasoning
+    )
     assert chunks[-1].usage["prompt_tokens"] == 11
 
 
@@ -821,7 +832,7 @@ def test_async_responses_stream_retries_idle_before_first_event_and_closes(
         return SimpleNamespace(responses=_Responses())
 
     monkeypatch.setattr("openai.AsyncOpenAI", _client)
-    monkeypatch.setattr("qitos.models._openai_retry.asyncio.sleep", _no_sleep)
+    monkeypatch.setattr("qitos.models._request_runtime.asyncio.sleep", _no_sleep)
     model = AsyncOpenAICompatibleModel(
         model="gpt-5",
         api_key="test-key",

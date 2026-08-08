@@ -18,6 +18,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from .base import Model
+from ._request_runtime import effective_request_timeout
 
 
 class OllamaModel(Model):
@@ -92,7 +93,6 @@ class OllamaModel(Model):
             可被 parse_tool_calls() 解析的文本
         """
         import urllib.request
-        import urllib.error
 
         _ = kwargs
         url = f"{self.host}/api/chat"
@@ -110,27 +110,21 @@ class OllamaModel(Model):
         if self.format:
             payload["format"] = self.format
 
-        try:
-            data = json.dumps(payload).encode("utf-8")
-            request = urllib.request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
 
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-                self._set_last_usage(self._usage_from_response(result))
-                return self._parse_response(result)
-
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode("utf-8") if e.fp else ""
-            return f"HTTP Error {e.code}: {error_body}"
-        except urllib.error.URLError as e:
-            return f"Connection Error: {str(e.reason)}"
-        except Exception as e:
-            return f"Error: {str(e)}"
+        with urllib.request.urlopen(
+            request,
+            timeout=effective_request_timeout(self.timeout),
+        ) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            self._set_last_usage(self._usage_from_response(result))
+            return self._parse_response(result)
 
     def _parse_response(self, response: Dict[str, Any]) -> str:
         """
@@ -258,7 +252,6 @@ class OllamaGenerateModel(Model):
             可被 parse_tool_calls() 解析的文本
         """
         import urllib.request
-        import urllib.error
 
         _ = kwargs
         url = f"{self.host}/api/generate"
@@ -275,21 +268,20 @@ class OllamaGenerateModel(Model):
             },
         }
 
-        try:
-            data = json.dumps(payload).encode("utf-8")
-            request = urllib.request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
 
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-                return self._parse_response(result)
-
-        except Exception as e:
-            return f"Error: {str(e)}"
+        with urllib.request.urlopen(
+            request,
+            timeout=effective_request_timeout(self.timeout),
+        ) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            return self._parse_response(result)
 
     def _build_prompt(self, messages: List[Dict[str, Any]]) -> str:
         """
@@ -380,7 +372,6 @@ class LMStudioModel(Model):
         调用 LM Studio API (OpenAI 兼容格式)
         """
         import urllib.request
-        import urllib.error
 
         _ = kwargs
         url = f"{self.base_url}/chat/completions"
@@ -392,24 +383,21 @@ class LMStudioModel(Model):
             "max_tokens": self.max_tokens,
         }
 
-        try:
-            data = json.dumps(payload).encode("utf-8")
-            request = urllib.request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
 
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-                self._set_last_usage(self._usage_from_response(result))
-                return self._parse_response(result)
-
-        except urllib.error.HTTPError as e:
-            return f"HTTP Error: {str(e)}"
-        except Exception as e:
-            return f"Error: {str(e)}"
+        with urllib.request.urlopen(
+            request,
+            timeout=effective_request_timeout(self.timeout),
+        ) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            self._set_last_usage(self._usage_from_response(result))
+            return self._parse_response(result)
 
     def _parse_response(self, response: Dict[str, Any]) -> str:
         """
@@ -523,7 +511,6 @@ class VLLMModel(Model):
         调用 vLLM API (OpenAI 兼容格式)
         """
         import urllib.request
-        import urllib.error
 
         _ = kwargs
         url = f"{self.base_url}/chat/completions"
@@ -535,21 +522,20 @@ class VLLMModel(Model):
             "max_tokens": self.max_tokens,
         }
 
-        try:
-            data = json.dumps(payload).encode("utf-8")
-            request = urllib.request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
 
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                result = json.loads(response.read().decode("utf-8"))
-                return self._parse_response(result)
-
-        except Exception as e:
-            return f"Error: {str(e)}"
+        with urllib.request.urlopen(
+            request,
+            timeout=effective_request_timeout(self.timeout),
+        ) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            return self._parse_response(result)
 
     def _parse_response(self, response: Dict[str, Any]) -> str:
         """

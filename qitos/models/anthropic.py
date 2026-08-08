@@ -13,6 +13,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import requests
 
 from .base import Model, ModelFactory, ModelStreamChunk
+from ._request_runtime import effective_request_timeout
 
 
 class AnthropicModel(Model):
@@ -75,24 +76,16 @@ class AnthropicModel(Model):
         if system_text:
             payload["system"] = system_text
 
-        try:
-            response = requests.post(
-                f"{self.base_url}/v1/messages",
-                headers=headers,
-                json=payload,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            result = response.json()
-            self._set_last_usage(self._usage_from_response(result))
-            return self._parse_response(result)
-        except requests.HTTPError as exc:
-            body = exc.response.text if exc.response is not None else ""
-            return f"HTTP Error: {body or str(exc)}"
-        except requests.RequestException as exc:
-            return f"Connection Error: {str(exc)}"
-        except Exception as exc:
-            return f"Error: {str(exc)}"
+        response = requests.post(
+            f"{self.base_url}/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=effective_request_timeout(self.timeout),
+        )
+        response.raise_for_status()
+        result = response.json()
+        self._set_last_usage(self._usage_from_response(result))
+        return self._parse_response(result)
 
     def _system_text(self, messages: List[Dict[str, Any]]) -> str:
         parts: List[str] = []
@@ -190,70 +183,61 @@ class AnthropicModel(Model):
         payload.update(kwargs)
 
         self._last_usage = None
-        try:
-            response = requests.post(
-                f"{self.base_url}/v1/messages",
-                headers=headers,
-                json=payload,
-                timeout=self.timeout,
-                stream=True,
-            )
-            response.raise_for_status()
+        response = requests.post(
+            f"{self.base_url}/v1/messages",
+            headers=headers,
+            json=payload,
+            timeout=effective_request_timeout(self.timeout),
+            stream=True,
+        )
+        response.raise_for_status()
 
-            usage_data = None
-            for line in response.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    break
-                import json as _json
+        usage_data = None
+        for line in response.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data: "):
+                continue
+            data_str = line[6:]
+            if data_str.strip() == "[DONE]":
+                break
+            import json as _json
 
-                try:
-                    event = _json.loads(data_str)
-                except _json.JSONDecodeError:
-                    continue
+            try:
+                event = _json.loads(data_str)
+            except _json.JSONDecodeError:
+                continue
 
-                event_type = event.get("type", "")
+            event_type = event.get("type", "")
 
-                if event_type == "content_block_delta":
-                    delta = event.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        text = delta.get("text", "")
-                        if text:
-                            yield ModelStreamChunk(text=text, done=False)
+            if event_type == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    text = delta.get("text", "")
+                    if text:
+                        yield ModelStreamChunk(text=text, done=False)
 
-                elif event_type == "message_delta":
-                    delta = event.get("delta", {})
-                    if delta.get("stop_reason"):
-                        msg_usage = event.get("usage", {})
-                        if msg_usage:
-                            output_tokens = msg_usage.get("output_tokens")
-                            usage_data = {"completion_tokens": output_tokens}
-                        yield ModelStreamChunk(text="", done=True, usage=usage_data)
-                        break
-
-                elif event_type == "message_start":
-                    msg_data = event.get("message", {})
-                    msg_usage = msg_data.get("usage", {})
+            elif event_type == "message_delta":
+                delta = event.get("delta", {})
+                if delta.get("stop_reason"):
+                    msg_usage = event.get("usage", {})
                     if msg_usage:
-                        input_tokens = msg_usage.get("input_tokens")
-                        usage_data = {"prompt_tokens": input_tokens}
-
-                elif event_type == "message_stop":
+                        output_tokens = msg_usage.get("output_tokens")
+                        usage_data = {"completion_tokens": output_tokens}
                     yield ModelStreamChunk(text="", done=True, usage=usage_data)
                     break
 
-            if usage_data:
-                self._set_last_usage(usage_data)
+            elif event_type == "message_start":
+                msg_data = event.get("message", {})
+                msg_usage = msg_data.get("usage", {})
+                if msg_usage:
+                    input_tokens = msg_usage.get("input_tokens")
+                    usage_data = {"prompt_tokens": input_tokens}
 
-        except requests.HTTPError as exc:
-            body = exc.response.text if exc.response is not None else ""
-            yield ModelStreamChunk(text=f"HTTP Error: {body or str(exc)}", done=True)
-        except requests.RequestException as exc:
-            yield ModelStreamChunk(text=f"Connection Error: {str(exc)}", done=True)
-        except Exception as exc:
-            yield ModelStreamChunk(text=f"Error: {str(exc)}", done=True)
+            elif event_type == "message_stop":
+                yield ModelStreamChunk(text="", done=True, usage=usage_data)
+                break
+
+        if usage_data:
+            self._set_last_usage(usage_data)
 
 
 ModelFactory.register("anthropic")(AnthropicModel)

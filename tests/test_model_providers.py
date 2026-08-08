@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import sys
+import urllib.error
 from types import ModuleType
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from qitos.models import (
     AnthropicModel,
@@ -14,7 +16,9 @@ from qitos.models import (
     LMStudioModel,
     ModelFactory,
     OpenAICompatibleModel,
+    OllamaGenerateModel,
     OllamaModel,
+    VLLMModel,
     infer_context_window,
 )
 
@@ -157,6 +161,65 @@ def test_litellm_adapter_and_usage(monkeypatch) -> None:
         "completion_tokens": 5,
         "total_tokens": 18,
     }
+
+
+@pytest.mark.parametrize(
+    ("post_target", "model"),
+    [
+        (
+            "qitos.models.anthropic.requests.post",
+            AnthropicModel(api_key="anthropic-test"),
+        ),
+        (
+            "qitos.models.gemini.requests.post",
+            GeminiModel(api_key="gemini-test"),
+        ),
+    ],
+)
+def test_native_provider_transport_errors_are_not_model_text(
+    monkeypatch, post_target, model
+) -> None:
+    def fail_request(*args, **kwargs):
+        _ = args, kwargs
+        raise requests.ConnectionError("provider unavailable")
+
+    monkeypatch.setattr(post_target, fail_request)
+
+    with pytest.raises(requests.ConnectionError, match="provider unavailable"):
+        model([{"role": "user", "content": "hello"}])
+
+
+def test_litellm_transport_errors_are_not_model_text(monkeypatch) -> None:
+    def fail_completion(**kwargs):
+        _ = kwargs
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setitem(
+        sys.modules, "litellm", SimpleNamespace(completion=fail_completion)
+    )
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        LiteLLMModel(model="test")([{"role": "user", "content": "hello"}])
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        OllamaModel(model="test"),
+        OllamaGenerateModel(model="test"),
+        LMStudioModel(model="test"),
+        VLLMModel(model="test"),
+    ],
+)
+def test_local_provider_transport_errors_are_not_model_text(monkeypatch, model) -> None:
+    def fail_request(*args, **kwargs):
+        _ = args, kwargs
+        raise urllib.error.URLError("provider unavailable")
+
+    monkeypatch.setattr("urllib.request.urlopen", fail_request)
+
+    with pytest.raises(urllib.error.URLError, match="provider unavailable"):
+        model([{"role": "user", "content": "hello"}])
 
 
 def test_model_factory_from_env_supports_new_providers(monkeypatch) -> None:
@@ -330,7 +393,7 @@ def test_openai_compatible_model_retries_and_uses_120s_timeout(monkeypatch) -> N
     fake_openai = ModuleType("openai")
     fake_openai.OpenAI = lambda **kwargs: _FakeClient(**kwargs)
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
-    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
+    monkeypatch.setattr("qitos.models._request_runtime.time.sleep", lambda _: None)
 
     llm = OpenAICompatibleModel(
         model="gpt-4.1-mini",
@@ -379,7 +442,7 @@ def test_openai_compatible_model_call_raw_retries_on_transient_errors(
     fake_openai = ModuleType("openai")
     fake_openai.OpenAI = lambda **kwargs: _FakeClient(**kwargs)
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
-    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
+    monkeypatch.setattr("qitos.models._request_runtime.time.sleep", lambda _: None)
 
     llm = OpenAICompatibleModel(
         model="gpt-4.1-mini",
@@ -498,7 +561,7 @@ def test_async_openai_compatible_stream_retries_and_preserves_errors(
     async def _no_sleep(_: float) -> None:
         return None
 
-    monkeypatch.setattr("qitos.models._openai_retry.asyncio.sleep", _no_sleep)
+    monkeypatch.setattr("qitos.models._request_runtime.asyncio.sleep", _no_sleep)
     model = AsyncOpenAICompatibleModel(
         model="test-model",
         api_key="test-key",

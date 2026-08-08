@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import re
+import time
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any, Dict, Generic, List, Optional, TypeVar, cast
 
@@ -18,6 +20,8 @@ from ..core.decision import Decision
 from ..core.errors import (
     ErrorCategory,
     ModelExecutionError,
+    ModelRequestCancelled,
+    ModelRequestDeadlineExceeded,
     ParseExecutionError,
     RuntimeErrorInfo,
 )
@@ -42,6 +46,7 @@ from ..core.multimodal import (
 )
 from ..core.observation import Observation
 from ..harness._types import native_tool_calls_preferred
+from ..models._request_runtime import ensure_request_active, model_request_runtime
 from ..protocols import get_protocol, resolve_protocol_chain
 from ..core.state import StateSchema
 from ._context_runtime import (
@@ -49,6 +54,7 @@ from ._context_runtime import (
     ContextOverflowError,
     DecisionContextConfigurationError,
 )
+from ._daemon_pool import DaemonTaskPool
 from ._protocol import _EngineProtocol
 from .streaming import to_stream_handler
 from .parser import (
@@ -1255,6 +1261,52 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
     def _call_llm(
         self, llm: Any, messages: List[Dict[str, Any]], request_options: Dict[str, Any]
     ) -> Any:
+        engine = self.engine
+        deadline = getattr(engine, "runtime_deadline_monotonic", None)
+
+        def cancelled() -> bool:
+            token = getattr(engine, "_cancel_token", None)
+            if token is None or not bool(getattr(token, "is_cancel_requested", False)):
+                return False
+            mode = getattr(token, "mode", None)
+            return getattr(mode, "value", mode) == "immediate"
+
+        def invoke() -> Any:
+            with model_request_runtime(
+                deadline_monotonic=deadline,
+                cancelled=cancelled,
+            ):
+                return self._call_llm_unbounded(llm, messages, request_options)
+
+        pool = DaemonTaskPool(
+            1,
+            thread_name_prefix="qitos-model",
+            propagate_context=True,
+        )
+        future = pool.submit(invoke)
+        try:
+            while True:
+                if cancelled():
+                    raise ModelRequestCancelled("model request cancelled")
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise ModelRequestDeadlineExceeded("model request deadline expired")
+                wait_seconds = 0.05 if remaining is None else min(0.05, remaining)
+                try:
+                    result = future.result(timeout=wait_seconds)
+                except FuturesTimeoutError:
+                    continue
+                if cancelled():
+                    raise ModelRequestCancelled("model request cancelled")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise ModelRequestDeadlineExceeded("model request deadline expired")
+                return result
+        finally:
+            pool.shutdown(wait_for_workers=False, cancel_futures=True)
+
+    def _call_llm_unbounded(
+        self, llm: Any, messages: List[Dict[str, Any]], request_options: Dict[str, Any]
+    ) -> Any:
         transactional_stream = getattr(llm, "transactional_stream", None)
         supports_transactional_stream = getattr(
             llm, "supports_transactional_stream", None
@@ -1314,6 +1366,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
 
         try:
             for chunk in stream_iter:
+                ensure_request_active()
                 # Handle ModelStreamChunk objects
                 text = getattr(chunk, "text", None)
                 reasoning = getattr(chunk, "reasoning_content", None)
@@ -1348,9 +1401,18 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     if native_items is not None and isinstance(native_items, list):
                         final_native_items = native_items
         finally:
+            close = getattr(stream_iter, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    _logger.debug("model stream close failed", exc_info=True)
             if handler is not None and started:
                 try:
+                    ensure_request_active()
                     handler.on_end()
+                except (ModelRequestCancelled, ModelRequestDeadlineExceeded):
+                    pass
                 except Exception:
                     pass
         if final_usage is None:
@@ -1371,6 +1433,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             result["native_items"] = final_native_items
         if accumulated_reasoning:
             result["reasoning_content"] = "".join(accumulated_reasoning)
+        ensure_request_active()
         return result
 
     def _build_current_user_message(

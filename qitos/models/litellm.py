@@ -7,6 +7,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from .base import Model, ModelFactory
+from ._request_runtime import effective_request_timeout
 
 
 class LiteLLMModel(Model):
@@ -50,18 +51,17 @@ class LiteLLMModel(Model):
     def _call_api(self, messages: List[Dict[str, Any]], **call_kwargs: Any) -> str:
         try:
             import litellm
-        except ImportError:
-            return (
-                "Error: LiteLLM is not installed. "
-                'Install optional model dependencies with `pip install "qitos[models]"`.'
-            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "LiteLLM is not installed; install the qitos models extra"
+            ) from exc
 
         request_kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-            "timeout": self.timeout,
+            "timeout": effective_request_timeout(self.timeout),
         }
         if self.api_key:
             request_kwargs["api_key"] = self.api_key
@@ -73,12 +73,9 @@ class LiteLLMModel(Model):
             request_kwargs["custom_llm_provider"] = self.custom_llm_provider
         request_kwargs.update(call_kwargs)
 
-        try:
-            response = litellm.completion(**request_kwargs)
-            self._set_last_usage(self._usage_from_response(response))
-            return self._parse_response(response)
-        except Exception as exc:
-            return f"Error: {str(exc)}"
+        response = litellm.completion(**request_kwargs)
+        self._set_last_usage(self._usage_from_response(response))
+        return self._parse_response(response)
 
     def _parse_response(self, response: Any) -> str:
         choice = self._get_choice(response)

@@ -49,6 +49,11 @@ How to update:
 
 ### Changed
 
+- Model calls now run under one Engine-scoped absolute request deadline. Provider
+  timeouts and retry backoff are clamped to live remaining time, immediate cancellation
+  stops waiting, and uncooperative synchronous calls remain on bounded daemon workers.
+  Official sync/async OpenAI models are thin specializations of the canonical
+  OpenAI-compatible adapter instead of maintaining separate transports.
 - Tool actions now have one absolute budget covering admission, invocation retries, and
   backoff. `ToolSpec.retry_policy` is the only tool retry owner, validation and
   permission checks run once, HTTP transport retries are disabled, and bounded daemon
@@ -92,6 +97,9 @@ How to update:
 
 ### Fixed
 
+- Fixed model requests and streams outliving the Engine deadline, late responses being
+  accepted as successful decisions, async Responses completion bypassing QitOS retry,
+  Azure retaining SDK retries, and provider attempts reusing stale timeout values.
 - Fixed action-level timeouts being resolved before approval and permission work, retry
   attempts each receiving a fresh timeout, and parallel execution waiting indefinitely
   for a non-daemon executor to drain.
@@ -137,6 +145,10 @@ How to update:
 
 ### Removed
 
+- Removed the legacy official OpenAI sync/async request implementations, including their
+  hard-coded three-attempt loop, implicit SDK retries, and error-as-success strings.
+- Removed provider-failure-as-model-text paths from the Anthropic, Gemini, LiteLLM,
+  Ollama, LM Studio, and vLLM adapters; transport failures now enter Engine recovery.
 - Removed unused `ActionKind`, action-level timeout/retry/idempotency/classification
   fields, integer `max_retries` tool metadata, nonfunctional functional-task retry and
   timeout options, and the duplicate ToolInterceptor middleware (including broken cache

@@ -4,18 +4,90 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 
-from qitos.core.errors import ModelTransportError
+from qitos.core.errors import ModelRequestDeadlineExceeded, ModelTransportError
 from qitos.models._openai_retry import (
     ModelRetryPolicy,
     async_run_with_retry,
+    run_with_retry,
     sync_transactional_stream_with_retry,
 )
+from qitos.models._request_runtime import model_request_runtime
 from qitos.models.base import ModelStreamChunk
 from qitos.models.openai import AsyncOpenAICompatibleModel, OpenAICompatibleModel
+
+
+def test_model_retry_backoff_cannot_cross_engine_deadline() -> None:
+    attempts = 0
+
+    def operation() -> str:
+        nonlocal attempts
+        attempts += 1
+        raise TimeoutError("provider unavailable")
+
+    with model_request_runtime(
+        deadline_monotonic=time.monotonic() + 0.01,
+        cancelled=lambda: False,
+    ):
+        with pytest.raises(ModelRequestDeadlineExceeded):
+            run_with_retry(
+                operation,
+                ModelRetryPolicy(
+                    max_attempts=3,
+                    base_delay_seconds=0.5,
+                ),
+            )
+
+    assert attempts == 1
+
+
+def test_openai_provider_timeout_is_clamped_to_engine_deadline(monkeypatch) -> None:
+    client_kwargs: dict[str, Any] = {}
+    request_kwargs: dict[str, Any] = {}
+
+    class Completions:
+        def create(self, **kwargs: Any) -> Any:
+            request_kwargs.update(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content="ok", tool_calls=None)
+                    )
+                ],
+                usage=None,
+            )
+
+    class Client:
+        def __init__(self, **kwargs: Any) -> None:
+            client_kwargs.update(kwargs)
+            self.chat = SimpleNamespace(completions=Completions())
+
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = lambda **kwargs: Client(**kwargs)
+    monkeypatch.setitem(sys.modules, "openai", fake_openai)
+    model = OpenAICompatibleModel(
+        model="test-model",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        timeout=120,
+        max_attempts=1,
+    )
+
+    with model_request_runtime(
+        deadline_monotonic=time.monotonic() + 1.0,
+        cancelled=lambda: False,
+    ):
+        response = model.call_raw([{"role": "user", "content": "go"}])
+
+    assert response.choices[0].message.content == "ok"
+    assert client_kwargs["max_retries"] == 0
+    assert 0 < float(client_kwargs["timeout"]) <= 1.0
+    assert 0 < float(request_kwargs["timeout"]) <= 1.0
 
 
 def test_lower_level_transport_errors_are_retried(monkeypatch) -> None:
@@ -28,7 +100,7 @@ def test_lower_level_transport_errors_are_retried(monkeypatch) -> None:
     async def no_sleep(_: float) -> None:
         return None
 
-    monkeypatch.setattr("qitos.models._openai_retry.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("qitos.models._request_runtime.asyncio.sleep", no_sleep)
 
     async def retry_once(error: Exception) -> tuple[str, int]:
         attempts = 0
@@ -94,7 +166,7 @@ def test_sync_openai_stream_uses_one_bounded_retry_owner(monkeypatch) -> None:
     fake_openai = ModuleType("openai")
     fake_openai.OpenAI = lambda **kwargs: Client(**kwargs)
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
-    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
+    monkeypatch.setattr("qitos.models._request_runtime.time.sleep", lambda _: None)
 
     model = OpenAICompatibleModel(
         model="test-model",
@@ -212,7 +284,7 @@ def test_transactional_stream_retries_midstream_without_publishing_partial_outpu
     fake_openai = ModuleType("openai")
     fake_openai.OpenAI = lambda **kwargs: Client(**kwargs)
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
-    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
+    monkeypatch.setattr("qitos.models._request_runtime.time.sleep", lambda _: None)
 
     model = OpenAICompatibleModel(
         model="test-model",
@@ -285,7 +357,7 @@ def test_async_transactional_stream_retries_midstream_without_partial_output(
     fake_openai = ModuleType("openai")
     fake_openai.AsyncOpenAI = lambda **kwargs: Client(**kwargs)
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
-    monkeypatch.setattr("qitos.models._openai_retry.asyncio.sleep", no_sleep)
+    monkeypatch.setattr("qitos.models._request_runtime.asyncio.sleep", no_sleep)
 
     model = AsyncOpenAICompatibleModel(
         model="test-model",
@@ -326,7 +398,7 @@ def test_transactional_retry_window_stops_repeated_fast_failures(
 
     monkeypatch.setattr("qitos.models._openai_retry.random.uniform", lambda *_: 1.0)
     monkeypatch.setattr("qitos.models._openai_retry.time.monotonic", lambda: clock)
-    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", sleep)
+    monkeypatch.setattr("qitos.models._request_runtime.time.sleep", sleep)
 
     with pytest.raises(ModelTransportError):
         list(
@@ -399,7 +471,7 @@ def test_rate_limit_uses_only_qitos_retry_budget(monkeypatch) -> None:
     fake_openai.OpenAI = lambda **kwargs: Client(**kwargs)
     fake_openai.APIError = APIStatusError
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
-    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
+    monkeypatch.setattr("qitos.models._request_runtime.time.sleep", lambda _: None)
 
     model = OpenAICompatibleModel(
         model="test-model",
@@ -451,7 +523,7 @@ def test_stream_options_fallback_is_reused_by_transport_retry(monkeypatch) -> No
     fake_openai.OpenAI = lambda **kwargs: Client(**kwargs)
     fake_openai.BadRequestError = BadRequestError
     monkeypatch.setitem(sys.modules, "openai", fake_openai)
-    monkeypatch.setattr("qitos.models._openai_retry.time.sleep", lambda _: None)
+    monkeypatch.setattr("qitos.models._request_runtime.time.sleep", lambda _: None)
 
     model = OpenAICompatibleModel(
         model="test-model",

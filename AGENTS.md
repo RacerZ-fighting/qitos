@@ -176,6 +176,9 @@ If you cannot run a check, explicitly say so and explain why.
 - `ToolSpec.retry_policy` is the only tool retry control. Admission runs once; retry
   attempts and backoff share one absolute action deadline. Do not add integer retry
   fields, transport retry loops, retry interceptors, or action-level timeout overrides.
+- `ModelRetryPolicy` is the only OpenAI transport retry owner and every OpenAI SDK
+  client must use `max_retries=0`. Model attempts, streams, provider timeouts, and
+  backoff share the Engine's absolute request deadline; late results are discarded.
 - Parallel execution requires an explicit `ToolSpec.concurrency_safe=True`; read-only
   metadata and historical tool names never imply concurrency safety.
 - Env-backed operations should consume env ops rather than assuming host filesystem/process access directly.

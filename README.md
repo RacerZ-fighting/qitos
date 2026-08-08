@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One bounded model-request lifecycle**: every Engine model call now receives the
+  run's absolute deadline and immediate cancellation signal. Provider timeouts and
+  QitOS-owned retry backoff use live remaining time, SDK retries stay disabled, late
+  responses are discarded, and blocked synchronous providers cannot retain process exit.
 - **One bounded tool-action lifecycle**: one absolute deadline now covers interceptor-
   free admission, approval, permission checks, invocation retries, and backoff.
   `ToolSpec.retry_policy` is the sole retry owner; validation and authorization run once,

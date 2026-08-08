@@ -74,9 +74,10 @@ OpenAI-only `include` value to compatible providers such as Kimi. Compatible Cha
 `reasoning_content` remains continuation metadata and is never substituted for an
 empty visible answer.
 
-### OpenAI-compatible retry and stream deadlines
+### Model retry and Engine deadlines
 
-`OpenAICompatibleModel` accepts the following transport controls:
+`OpenAIModel`, `OpenAICompatibleModel`, and their async variants share the same
+transport implementation and accept the following controls:
 
 | Argument | Default | Behavior |
 |---|---:|---|
@@ -92,12 +93,20 @@ retry owner. It retries recognized connection failures, timeouts, 408, 409, 429,
 `Retry-After`, `retry-after-ms`, and `x-should-retry` hints. Local validation errors
 and ordinary 4xx responses fail immediately.
 
+When an Engine run has a relative or absolute runtime limit, it binds one logical
+model-request deadline. Every attempt recalculates its provider timeout from live
+remaining time, retry backoff observes both deadline and cancellation, and no new
+attempt starts after either becomes terminal. A synchronous provider that cannot be
+interrupted is detached on a daemon worker; its late response is discarded and cannot
+update history, actions, or final state.
+
 The Engine uses a transactional stream for OpenAI-compatible models: text and tool-call
 deltas stay private until a terminal event completes the attempt. A retryable failure
 after partial output closes that stream, discards its buffered deltas, and retries within
 both the `max_attempts` budget and `retry_window_seconds`, measured from the first
 retryable failure. A healthy long response may run beyond `timeout` while events
-continue; `stream_idle_timeout` detects a stalled response. Direct callers of the public
+continue only when no earlier Engine deadline applies; `stream_idle_timeout` detects a
+stalled response. Direct callers of the public
 live `stream()` / `astream()` APIs still receive deltas immediately, so those APIs retry
 only before output becomes observable.
 

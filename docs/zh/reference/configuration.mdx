@@ -58,6 +58,15 @@ Reasoning item 被视为不透明的续接状态。追踪摘要只保留安全�
 Kimi 等兼容供应商不会收到这个 OpenAI 专属的 `include` 值。兼容 Chat 返回的
 `reasoning_content` 只作为续接元数据保存，不会在可见答案为空时被冒充为最终回答。
 
+### 模型重试与 Engine deadline
+
+`OpenAIModel`、`OpenAICompatibleModel` 及其异步版本共用同一传输实现。
+OpenAI SDK 的内置重试固定关闭，`ModelRetryPolicy` 是唯一重试 owner。Engine 会把
+相对或绝对运行时限制绑定成一次逻辑模型请求的 deadline；每次 attempt 都按实时剩余
+时间收紧 provider timeout，backoff 同时响应 deadline 与立即取消。无法中断的同步
+provider 会留在 daemon worker 中，其迟到结果会被丢弃，不能写入 history、action 或
+final state。
+
 ## AgentModule.run() 参数
 
 这些参数都可以直接传给 `agent.run(task, ...)`：

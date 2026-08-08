@@ -47,11 +47,11 @@ execution. Parser-only final-text compatibility remains for a later explicit-lan
   time.
 - [x] Make `ToolSpec.retry_policy` the sole tool retry owner and share one absolute
   action deadline across admission, attempts, backoff, and concurrent drain.
-- [ ] Clamp model attempts and provider transport timeouts to remaining time.
+- [x] Clamp model attempts and provider transport timeouts to remaining time.
 - [x] Preserve action status and attempts through ToolResult, history, hooks, and trace.
 - [x] Make async stream shutdown request Engine cancellation and guarantee a terminal
   stream event even when the bounded event queue is full.
-- [ ] Audit legacy model adapters so the provider transport has one retry owner.
+- [x] Audit OpenAI model adapters so the provider transport has one retry owner.
 
 Done when deterministic tests cover cancellation before admission, queued actions,
 running actions, partial streams, provider retry, tool retry, and queue saturation.
@@ -61,8 +61,8 @@ effective monotonic deadline. Tools receive live deadline/cancellation accessors
 admission, timeout, retry backoff, and runtime wait all use the same remaining-time
 calculation. Async Engine execution no longer relies on asyncio's non-daemon default
 executor, duplicated stream cleanup is removed, early stream close requests cooperative
-cancellation, and full event queues retain a terminal marker. Provider-call clamping and
-end-to-end child cleanup remain open.
+cancellation, and full event queues retain a terminal marker. End-to-end child/process
+cleanup remains a separate follow-up.
 
 Progress (2026-08-08): one fail-closed `ToolResult` classifier now preserves executor
 timeout, cancellation, denial, input/approval, partial, and background states through
@@ -74,6 +74,12 @@ Progress (2026-08-08): action-level retry/timeout knobs and the duplicate interc
 middleware were removed. Admission runs once, explicit invocation retries share the
 tool/runtime deadline, HTTP transport retries stay disabled, and bounded daemon action
 workers detach blocked admission or concurrent work instead of waiting indefinitely.
+
+Progress (2026-08-08): one Engine-scoped model-request deadline now governs provider
+timeouts, QitOS-owned retry backoff, synchronous and asynchronous streams, and immediate
+cancellation. Official OpenAI adapters share the compatible transport with SDK retries
+disabled; blocked synchronous calls detach on daemon workers, streams close on every
+exit path, and late output cannot update callbacks, history, actions, or final state.
 
 ### 3. Context, compression, and reasoning
 

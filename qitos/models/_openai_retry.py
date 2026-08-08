@@ -11,7 +11,18 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-from ..core.errors import ModelTransportError
+from ..core.errors import (
+    ModelRequestCancelled,
+    ModelRequestDeadlineExceeded,
+    ModelTransportError,
+)
+from ._request_runtime import (
+    asleep_before_retry,
+    effective_request_timeout,
+    ensure_request_active,
+    remaining_request_seconds,
+    sleep_before_retry,
+)
 
 _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -87,6 +98,8 @@ def _retry_after(exc: Exception) -> float | None:
 
 
 def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, (ModelRequestCancelled, ModelRequestDeadlineExceeded)):
+        return False
     if isinstance(exc, ModelTransportError):
         return exc.retryable
     should_retry = _header(exc, "x-should-retry")
@@ -217,9 +230,15 @@ def run_with_retry(operation: Callable[[], _T], policy: ModelRetryPolicy) -> _T:
     """Run a synchronous request with one explicit, bounded retry owner."""
     retry_deadline: float | None = None
     for attempt in range(1, policy.max_attempts + 1):
+        ensure_request_active()
         try:
-            return operation()
+            result = operation()
+            ensure_request_active()
+            return result
+        except (ModelRequestCancelled, ModelRequestDeadlineExceeded):
+            raise
         except Exception as exc:
+            ensure_request_active()
             delay, retry_deadline = _retry_delay_with_window(
                 exc,
                 failed_attempt=attempt,
@@ -231,7 +250,7 @@ def run_with_retry(operation: Callable[[], _T], policy: ModelRetryPolicy) -> _T:
                     raise
                 raise _terminal(exc, attempt) from exc
             _announce_retry(exc, attempt=attempt, delay=delay, policy=policy)
-            time.sleep(delay)
+            sleep_before_retry(delay)
     raise AssertionError("unreachable retry loop")
 
 
@@ -241,9 +260,15 @@ async def async_run_with_retry(
     """Run an asynchronous request with one explicit, bounded retry owner."""
     retry_deadline: float | None = None
     for attempt in range(1, policy.max_attempts + 1):
+        ensure_request_active()
         try:
-            return await operation()
+            result = await operation()
+            ensure_request_active()
+            return result
+        except (ModelRequestCancelled, ModelRequestDeadlineExceeded):
+            raise
         except Exception as exc:
+            ensure_request_active()
             delay, retry_deadline = _retry_delay_with_window(
                 exc,
                 failed_attempt=attempt,
@@ -255,7 +280,7 @@ async def async_run_with_retry(
                     raise
                 raise _terminal(exc, attempt) from exc
             _announce_retry(exc, attempt=attempt, delay=delay, policy=policy)
-            await asyncio.sleep(delay)
+            await asleep_before_retry(delay)
     raise AssertionError("unreachable retry loop")
 
 
@@ -274,15 +299,21 @@ def sync_stream_with_retry(
     """Stream synchronously with bounded retries before the first event."""
     retry_deadline: float | None = None
     for attempt in range(1, policy.max_attempts + 1):
+        ensure_request_active()
         stream: Any = None
         received_event = False
         try:
             stream = create_stream()
             for event in stream:
+                ensure_request_active()
                 received_event = True
                 yield event
+            ensure_request_active()
             return
+        except (ModelRequestCancelled, ModelRequestDeadlineExceeded):
+            raise
         except Exception as exc:
+            ensure_request_active()
             if received_event:
                 delay = None
             else:
@@ -299,7 +330,7 @@ def sync_stream_with_retry(
             _close_sync_stream(stream)
             stream = None
             _announce_retry(exc, attempt=attempt, delay=delay, policy=policy)
-            time.sleep(delay)
+            sleep_before_retry(delay)
         finally:
             _close_sync_stream(stream)
     raise AssertionError("unreachable retry loop")
@@ -319,17 +350,22 @@ def sync_transactional_stream_with_retry(
     """
     retry_deadline: float | None = None
     for attempt in range(1, policy.max_attempts + 1):
+        ensure_request_active()
         stream: Any = None
         buffered: list[_T] = []
         try:
             stream = create_stream()
             for event in stream:
+                ensure_request_active()
                 buffered.append(event)
             if not any(is_complete(event) for event in buffered):
                 raise _IncompleteStreamError(
                     "model stream ended before its terminal event"
                 )
+        except (ModelRequestCancelled, ModelRequestDeadlineExceeded):
+            raise
         except Exception as exc:
+            ensure_request_active()
             delay, retry_deadline = _retry_delay_with_window(
                 exc,
                 failed_attempt=attempt,
@@ -343,11 +379,12 @@ def sync_transactional_stream_with_retry(
             _close_sync_stream(stream)
             stream = None
             _announce_retry(exc, attempt=attempt, delay=delay, policy=policy)
-            time.sleep(delay)
+            sleep_before_retry(delay)
             continue
         finally:
             _close_sync_stream(stream)
 
+        ensure_request_active()
         yield from buffered
         return
     raise AssertionError("unreachable retry loop")
@@ -364,32 +401,50 @@ async def stream_with_retry(
     loop = asyncio.get_running_loop()
     retry_deadline: float | None = None
     for attempt in range(1, policy.max_attempts + 1):
+        ensure_request_active()
         stream: Any = None
         received_event = False
-        deadline = loop.time() + request_timeout_seconds
+        request_timeout = effective_request_timeout(request_timeout_seconds)
+        request_remaining = remaining_request_seconds()
+        request_deadline = loop.time() + (
+            request_timeout
+            if request_remaining is None
+            else min(request_timeout, request_remaining)
+        )
         try:
             stream = await asyncio.wait_for(
-                create_stream(), timeout=request_timeout_seconds
+                create_stream(), timeout=request_timeout
             )
             iterator = stream.__aiter__()
             while True:
-                remaining = deadline - loop.time()
+                ensure_request_active()
+                remaining = request_deadline - loop.time()
+                engine_remaining = remaining_request_seconds()
+                if engine_remaining is not None:
+                    remaining = min(remaining, engine_remaining)
                 if remaining <= 0:
-                    raise TimeoutError("model stream exceeded request timeout")
+                    ensure_request_active()
+                    raise TimeoutError("model stream exceeded provider timeout")
                 try:
                     event = await asyncio.wait_for(
                         iterator.__anext__(),
                         timeout=min(idle_timeout_seconds, remaining),
                     )
                 except StopAsyncIteration:
+                    ensure_request_active()
                     return
                 except asyncio.TimeoutError as exc:
+                    ensure_request_active()
                     raise TimeoutError(
                         "model stream idle timeout waiting for provider event"
                     ) from exc
                 received_event = True
+                ensure_request_active()
                 yield event
+        except (ModelRequestCancelled, ModelRequestDeadlineExceeded):
+            raise
         except Exception as exc:
+            ensure_request_active()
             if received_event:
                 delay = None
             else:
@@ -406,7 +461,7 @@ async def stream_with_retry(
             await _close_stream(stream)
             stream = None
             _announce_retry(exc, attempt=attempt, delay=delay, policy=policy)
-            await asyncio.sleep(delay)
+            await asleep_before_retry(delay)
         finally:
             await _close_stream(stream)
     raise AssertionError("unreachable retry loop")
@@ -428,30 +483,42 @@ async def transactional_stream_with_retry(
     """
     retry_deadline: float | None = None
     for attempt in range(1, policy.max_attempts + 1):
+        ensure_request_active()
         stream: Any = None
         buffered: list[_T] = []
+        request_timeout = effective_request_timeout(request_timeout_seconds)
         try:
             stream = await asyncio.wait_for(
-                create_stream(), timeout=request_timeout_seconds
+                create_stream(), timeout=request_timeout
             )
             iterator = stream.__aiter__()
             while True:
+                ensure_request_active()
+                event_timeout = idle_timeout_seconds
+                engine_remaining = remaining_request_seconds()
+                if engine_remaining is not None:
+                    event_timeout = min(event_timeout, engine_remaining)
                 try:
                     event = await asyncio.wait_for(
-                        iterator.__anext__(), timeout=idle_timeout_seconds
+                        iterator.__anext__(), timeout=event_timeout
                     )
                 except StopAsyncIteration:
                     break
                 except asyncio.TimeoutError as exc:
+                    ensure_request_active()
                     raise TimeoutError(
                         "model stream idle timeout waiting for provider event"
                     ) from exc
+                ensure_request_active()
                 buffered.append(event)
             if not any(is_complete(event) for event in buffered):
                 raise _IncompleteStreamError(
                     "model stream ended before its terminal event"
                 )
+        except (ModelRequestCancelled, ModelRequestDeadlineExceeded):
+            raise
         except Exception as exc:
+            ensure_request_active()
             delay, retry_deadline = _retry_delay_with_window(
                 exc,
                 failed_attempt=attempt,
@@ -465,11 +532,12 @@ async def transactional_stream_with_retry(
             await _close_stream(stream)
             stream = None
             _announce_retry(exc, attempt=attempt, delay=delay, policy=policy)
-            await asyncio.sleep(delay)
+            await asleep_before_retry(delay)
             continue
         finally:
             await _close_stream(stream)
 
+        ensure_request_active()
         for event in buffered:
             yield event
         return
