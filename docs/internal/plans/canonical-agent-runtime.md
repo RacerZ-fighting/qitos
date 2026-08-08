@@ -23,12 +23,12 @@ contracts for context, reasoning, child Agents, and tools.
 
 ### 1. Conformance baseline and protocol normalization
 
-- [ ] Add deterministic tests for exact provider options, native call/result parity,
+- [x] Add deterministic tests for exact provider options, native call/result parity,
   final text, parser-only agents, cancellation placeholders, and parallel ordering.
 - [x] Stop injecting a text output contract when API-native tool delivery is selected.
-- [ ] Skip parser interpretation for completed native-mode text responses; keep parser
+- [x] Skip parser interpretation for completed native-mode text responses; keep parser
   fallback only when explicitly configured as the action protocol.
-- [ ] Remove PentestAgent-specific/benchmark-specific salvage from the generic native
+- [x] Remove PentestAgent-specific/benchmark-specific salvage from the generic native
   request path after compatibility tests demonstrate it is unnecessary.
 
 Done when a native request advertises tools once, accepts only provider-native calls as
@@ -91,10 +91,10 @@ callbacks without changing the required stream-handler protocol.
 
 ### 3. Context, compression, and reasoning
 
-- [ ] Define complete transcript transactions and make all history policies compact or
+- [x] Define complete transcript transactions and make all history policies compact or
   trim only at their boundaries.
 - [x] Preserve opaque provider continuation/reasoning items needed by the next request.
-- [ ] Bound tool projections and record truncation/compaction metadata without rewriting
+- [x] Bound tool projections and record truncation/compaction metadata without rewriting
   retained messages.
 - [x] Resolve reasoning effort through one provider capability path for sync, async, and
   streaming requests.
@@ -109,27 +109,28 @@ model fixture, and provider request tests cover every supported reasoning level.
 
 ### 4. Child Agent lifecycle
 
-- [ ] Specify parent/child identity, depth, budgets, permission inheritance, workspace
+- [x] Specify parent/child identity, depth, budgets, permission inheritance, workspace
   isolation, cancellation propagation, and terminal delivery.
-- [ ] Bound concurrent children and guarantee all children are reaped on parent stop.
-- [ ] Keep child model history and reasoning private while returning bounded tool-backed
+- [x] Bound concurrent children and guarantee all children are reaped on parent stop.
+- [x] Keep child model history and reasoning private while returning bounded tool-backed
   evidence and usage metadata.
-- [ ] Keep spawn/delegation attached to the existing Engine action lifecycle.
+- [x] Keep spawn/delegation attached to the existing Engine action lifecycle.
 
 Done when tests cover concurrent children, recursive-depth rejection, parent
 cancellation, forced conclusion, partial child evidence, and no stale writes.
 
 ### 5. Tool contract and built-ins
 
-- [ ] Validate model arguments before tool invocation and preserve structured validation
+- [x] Validate model arguments before tool invocation and preserve structured validation
   failures as non-retryable terminal results.
 - [x] Define truthful status projection for success, error, skipped/denied, timed out,
   cancelled, partial, and background/running results.
-- [ ] Separate registered tools from direct/deferred/hidden model exposure.
-- [ ] Replace blanket parallel booleans with safe defaults and explicit keyed/exclusive
-  policy where shared resources require it.
-- [ ] Bound nested outputs and retain truncation/artifact metadata.
-- [ ] Audit built-in coding, shell, web, MCP, and Agent tools against the contract.
+- [x] Keep one exact active registry selected by application role policy; do not add a
+  second hidden/deferred exposure state to the generic registry.
+- [x] Replace blanket parallel booleans with explicit `concurrency_safe` declarations
+  and exclusive barriers for tools that share mutable resources.
+- [x] Bound nested outputs and retain truncation/artifact metadata.
+- [x] Audit built-in coding, shell, web, MCP, and Agent tools against the contract.
 
 Progress (2026-08-08): the truthful lifecycle projection is complete, including
 unknown-status rejection and removal of the older executor/runtime status guesses.
@@ -141,10 +142,10 @@ for every maintained built-in tool family.
 
 ### 6. PentestAgent migration and evaluation
 
-- [ ] Centralize parent and child Engine construction in the PentestAgent adapter.
-- [ ] Pass Worker deadlines and canonical runtime metadata into QitOS.
-- [ ] Make role profiles select the exact advertised tool surface.
-- [ ] Remove redundant protocol wiring and text-tool salvage after QitOS conformance is
+- [x] Centralize parent and child Engine construction in the PentestAgent adapter.
+- [x] Pass Worker deadlines and canonical runtime metadata into QitOS.
+- [x] Make role profiles select the exact advertised tool surface.
+- [x] Remove redundant protocol wiring and text-tool salvage after QitOS conformance is
   proven, while retaining branch-result compatibility.
 - [x] Add a deterministic same-spec A/B harness and semantic trace-closure checks before
   running optional live benchmark slices.
@@ -158,6 +159,12 @@ effective step/runtime/token budget without persisting process-local deadline va
 and rejects mismatched or incomplete provenance before outcome deltas can be read as a
 same-spec repeat. A scripted model test executes the same traced run twice and verifies
 the comparison contract; separate tests reject parser drift and missing prompt identity.
+
+Progress (2026-08-09): PentestAgent removed its final-answer text-tool salvage path and
+its legacy-only tests. Worker and child traces now attach the application version,
+parent repository revision, clean-source state, capability, and scope; qita rejects
+dirty or incomplete application provenance. Role policy constructs one exact active
+registry instead of adding a second hidden/deferred exposure mechanism.
 
 Done when PentestAgent keeps its Planner/Facts/AuthSession/Artifact/Shell boundaries,
 passes `make check`, and produces a closed QitOS transcript with no parser salvage on a
