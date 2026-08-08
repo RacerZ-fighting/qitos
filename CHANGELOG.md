@@ -106,9 +106,11 @@ How to update:
   retry policy instead of immediately terminating the agent loop. Unsupported stream
   options now fall back only after an explicit provider rejection and remain disabled
   for the rest of that logical request.
-- Fixed structured tool failures being recorded as successful actions. Explicit QitOS
-  `status=error/failed/failure` results now preserve their payload and produce an
-  `ActionStatus.ERROR`.
+- Fixed structured tool lifecycle results being flattened to success or generic error.
+  Canonical results now retain partial, running, skipped/denied, input/approval, timeout,
+  and cancellation through observations, history, traces, summaries, and metrics;
+  unknown and legacy alias statuses fail closed, flattened legacy fields are removed,
+  and domain outcomes no longer overload execution status.
 - Fixed bound function tools and fail-closed coding profiles mutating shared permission
   metadata across toolset instances.
 - Fixed immediate cancellation finalization so the END event, canonical State, `TaskResult`/`EngineResult`, and trace manifest all report `cancelled_immediate`; cancelled manifests now use the existing terminal `stopped` status instead of `completed`.

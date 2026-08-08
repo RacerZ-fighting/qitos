@@ -17,7 +17,7 @@ from .core.model_response import ModelResponse
 from .core.runtime_input import RuntimeInput
 from .core.history import History, HistoryPolicy
 from .core.observation import Observation
-from .core.tool_result import ToolResult
+from .core.tool_result import ToolResult, ToolResultStatus
 from .core.state import StateSchema
 from .core.spec import BenchmarkRunResult, ExperimentSpec, RunSpec
 from .core.task import (
@@ -65,6 +65,7 @@ __all__ = [
     "HistoryPolicy",
     "Observation",
     "ToolResult",
+    "ToolResultStatus",
     "RunSpec",
     "ExperimentSpec",
     "BenchmarkRunResult",

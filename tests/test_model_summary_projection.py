@@ -73,12 +73,17 @@ def test_failed_tool_history_keeps_recoverable_card_not_json_wrapper() -> None:
             "The cursor does not match this query or its snapshot is unavailable.\n\n"
             "Retry: GREP(pattern=\"parse_record\", path=\"repo-vul/src\")"
         ),
-        "status": "invalid_cursor",
+        "status": "error",
+        "error_category": "invalid_cursor",
     }
     error = "The cursor does not match this query or its snapshot is unavailable."
 
     model_output = runtime._model_visible_tool_output("GREP", payload)
-    history_content = runtime._serialize_for_tool_message(model_output, error)
+    history_content = runtime._serialize_for_tool_message(
+        model_output,
+        error,
+        "error",
+    )
 
     assert history_content == payload["model_summary"]
     assert not history_content.lstrip().startswith("{")

@@ -68,7 +68,7 @@ class MockGUIControllerOps(GUIControllerCapability):
         _ = state
         payload = dict(action or {})
         self.actions.append(payload)
-        return {"status": "ok", "action": payload}
+        return {"status": "success", "action": payload}
 
 
 class ScreenshotEnv(Env):

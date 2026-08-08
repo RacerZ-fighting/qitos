@@ -175,8 +175,8 @@ class TestActionExecutorNeedsApproval:
         assert result.status == ActionStatus.SUCCESS
 
     @patch("qitos.engine.interrupt.interrupt")
-    def test_approval_deny_returns_skipped(self, mock_interrupt):
-        """When interrupt returns 'deny', the action should be SKIPPED."""
+    def test_approval_deny_returns_denied(self, mock_interrupt):
+        """When interrupt returns 'deny', the action should be DENIED."""
         mock_interrupt.return_value = "deny"
 
         @tool(needs_approval=True)
@@ -191,8 +191,8 @@ class TestActionExecutorNeedsApproval:
         action = Action(name="dangerous_delete", args={"target": "db"})
         result = executor._execute_one(action)
 
-        assert result.status == ActionStatus.SKIPPED
-        assert result.output["status"] == "denied"
+        assert result.status == ActionStatus.DENIED
+        assert result.output["message"] == "User denied approval"
         assert result.metadata.get("error_category") == "approval_denied"
 
     @patch("qitos.engine.interrupt.interrupt")

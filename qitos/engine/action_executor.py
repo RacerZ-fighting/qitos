@@ -753,11 +753,12 @@ class ActionExecutor:
                     if approval == "deny":
                         return self._finish_result(
                             action=action,
-                            status=ActionStatus.SKIPPED,
+                            status=ActionStatus.DENIED,
                             start=start,
                             attempts=1,
                             tool_meta=tool_meta,
-                            output={"status": "denied", "message": "User denied approval"},
+                            output={"message": "User denied approval"},
+                            error="User denied approval",
                             extra_metadata={"error_category": "approval_denied"},
                         )
 
@@ -822,15 +823,15 @@ class ActionExecutor:
                     )
                     return self._finish_result(
                         action=action,
-                        status=ActionStatus.SKIPPED,
+                        status=ActionStatus.DENIED,
                         start=start,
                         attempts=attempts,
                         tool_meta=tool_meta,
                         output={
-                            "status": "denied",
                             "message": permission.message,
                             "scope": permission.scope,
                         },
+                        error=permission.message or "Tool permission denied",
                         extra_metadata={
                             "error_category": "permission_denied",
                             "permission": self._permission_payload(permission),
@@ -854,15 +855,15 @@ class ActionExecutor:
                                 )
                                 return self._finish_result(
                                     action=action,
-                                    status=ActionStatus.SKIPPED,
+                                    status=ActionStatus.DENIED,
                                     start=start,
                                     attempts=attempts,
                                     tool_meta=tool_meta,
                                     output={
-                                        "status": "denied",
                                         "message": "User denied permission",
                                         "scope": permission.scope,
                                     },
+                                    error="User denied permission",
                                     extra_metadata={
                                         "error_category": "permission_denied",
                                         "permission": self._permission_payload(permission),
@@ -878,12 +879,11 @@ class ActionExecutor:
                     )
                     return self._finish_result(
                         action=action,
-                        status=ActionStatus.SKIPPED,
+                        status=ActionStatus.NEEDS_APPROVAL,
                         start=start,
                         attempts=attempts,
                         tool_meta=tool_meta,
                         output={
-                            "status": "needs_user_input",
                             "message": permission.message,
                             "scope": permission.scope,
                         },
@@ -934,42 +934,28 @@ class ActionExecutor:
                             "executed": True,
                         },
                     )
-                self._dispatch_tool_hook(
-                    "on_after_tool_use", action.name, effective_args,
-                    tool_result=output, permission_decision=permission.decision,
-                )
                 normalized_output = self._normalize_output(tool, output)
-                reported_error = self._reported_tool_error(normalized_output)
-                if reported_error is not None:
-                    result = self._finish_result(
-                        action=action,
-                        status=ActionStatus.ERROR,
-                        start=start,
-                        attempts=attempts,
-                        tool_meta=tool_meta,
-                        output=normalized_output,
-                        error=reported_error,
-                        extra_metadata={
-                            **ordering_meta,
-                            "error_category": "tool_reported_error",
-                            "permission": self._permission_payload(permission),
-                            "progress_count": len(runtime_context["progress_events"]),
-                            "artifacts": list(runtime_context["artifacts"]),
-                            "ended_at": time.time(),
-                        },
+                reported_result = ToolResult.from_value(normalized_output)
+                self._dispatch_tool_hook(
+                    "on_after_tool_use",
+                    action.name,
+                    effective_args,
+                    tool_result=reported_result.to_dict(),
+                    permission_decision=permission.decision,
+                )
+                if reported_result.is_success:
+                    self._track_file_access(
+                        action.name, effective_args, reported_result.output
                     )
-                    if self._interceptor_chain is not None:
-                        result = self._interceptor_chain.after_execute(
-                            action, result, interceptor_context
-                        )
-                    return result
-                # Track reads / invalidate writes only after a successful tool result.
-                self._track_file_access(action.name, effective_args, normalized_output)
                 latency = (time.monotonic() - start) * 1000
                 result_metadata = {
                     **tool_meta,
                     **ordering_meta,
-                    "error_category": None,
+                    "error_category": (
+                        None
+                        if reported_result.is_success
+                        else f"tool_reported_{reported_result.status}"
+                    ),
                     "permission": self._permission_payload(permission),
                     "progress_count": len(runtime_context["progress_events"]),
                     "artifacts": list(runtime_context["artifacts"]),
@@ -980,8 +966,9 @@ class ActionExecutor:
                     result_metadata["approval_required"] = True
                 result = ActionResult(
                     name=action.name,
-                    status=ActionStatus.SUCCESS,
-                    output=normalized_output,
+                    status=ActionStatus(reported_result.status),
+                    output=reported_result.output,
+                    error=reported_result.error,
                     action_id=action.action_id,
                     attempts=attempts,
                     latency_ms=latency,
@@ -1320,18 +1307,6 @@ class ActionExecutor:
             return normalized
         return output
 
-    @staticmethod
-    def _reported_tool_error(output: Any) -> str | None:
-        """Return the message from QitOS's explicit structured error contract."""
-
-        if not isinstance(output, dict):
-            return None
-        status = str(output.get("status") or "").strip().casefold()
-        if status not in {"error", "failed", "failure"}:
-            return None
-        message = output.get("error") or output.get("message") or status
-        return str(message)
-
     def _truncate_text(self, text: str, max_chars: int) -> str:
         if len(text) <= max_chars:
             return text
@@ -1508,15 +1483,15 @@ class ActionExecutor:
         start = time.monotonic()
         return self._finish_result(
             action=action,
-            status=ActionStatus.SKIPPED,
+            status=ActionStatus.DENIED,
             start=start,
             attempts=1,
             tool_meta=self._tool_meta(action.name),
             output={
-                "status": "error",
                 "message": reason,
                 "error_category": "read_before_write",
             },
+            error=reason,
             extra_metadata={
                 "error_category": "read_before_write",
             },

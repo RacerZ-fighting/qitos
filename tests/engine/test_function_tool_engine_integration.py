@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from typing import Any, Dict
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -44,7 +43,7 @@ class _TestToolSet:
         read_only=True,
     )
     def read_only_tool(self, query: str) -> Dict[str, Any]:
-        return {"status": "ok", "query": query}
+        return {"status": "success", "query": query}
 
     @function_tool(
         name="approval_action",
@@ -52,7 +51,11 @@ class _TestToolSet:
         needs_approval=True,
     )
     def needs_approval_tool(self, command: str) -> Dict[str, Any]:
-        return {"status": "executed", "command": command}
+        return {
+            "status": "success",
+            "domain_outcome": "executed",
+            "command": command,
+        }
 
     @function_tool(
         name="read_and_approve",
@@ -61,14 +64,14 @@ class _TestToolSet:
         needs_approval=True,
     )
     def both_markers_tool(self, path: str) -> Dict[str, Any]:
-        return {"status": "ok", "path": path}
+        return {"status": "success", "path": path}
 
     @function_tool(
         name="basic_tool",
         description="A basic tool without markers",
     )
     def no_marker_tool(self, value: str) -> Dict[str, Any]:
-        return {"status": "ok", "value": value}
+        return {"status": "success", "value": value}
 
 
 # --- Test agent ---

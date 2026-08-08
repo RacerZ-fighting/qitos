@@ -46,7 +46,7 @@ execution. Parser-only final-text compatibility remains for a later explicit-lan
 - [x] Clamp tool admission, tool timeout, runtime wait, and retry backoff to remaining
   time.
 - [ ] Clamp model attempts and provider transport timeouts to remaining time.
-- [ ] Preserve action status and attempts through ToolResult, history, hooks, and trace.
+- [x] Preserve action status and attempts through ToolResult, history, hooks, and trace.
 - [x] Make async stream shutdown request Engine cancellation and guarantee a terminal
   stream event even when the bounded event queue is full.
 - [ ] Audit legacy model adapters so the provider transport has one retry owner.
@@ -61,6 +61,12 @@ calculation. Async Engine execution no longer relies on asyncio's non-daemon def
 executor, duplicated stream cleanup is removed, early stream close requests cooperative
 cancellation, and full event queues retain a terminal marker. Provider-call clamping and
 end-to-end child cleanup remain open.
+
+Progress (2026-08-08): one fail-closed `ToolResult` classifier now preserves executor
+timeout, cancellation, denial, input/approval, partial, and background states through
+Engine records, observations, history, events, summaries, and success metrics. Legacy
+status aliases and flattened result fields were removed; domain outcomes no longer
+occupy the execution-status field in maintained built-ins.
 
 ### 3. Context, compression, and reasoning
 
@@ -96,13 +102,18 @@ cancellation, forced conclusion, partial child evidence, and no stale writes.
 
 - [ ] Validate model arguments before tool invocation and preserve structured validation
   failures as non-retryable terminal results.
-- [ ] Define truthful status projection for success, error, skipped/denied, timed out,
+- [x] Define truthful status projection for success, error, skipped/denied, timed out,
   cancelled, partial, and background/running results.
 - [ ] Separate registered tools from direct/deferred/hidden model exposure.
 - [ ] Replace blanket parallel booleans with safe defaults and explicit keyed/exclusive
   policy where shared resources require it.
 - [ ] Bound nested outputs and retain truncation/artifact metadata.
 - [ ] Audit built-in coding, shell, web, MCP, and Agent tools against the contract.
+
+Progress (2026-08-08): the truthful lifecycle projection is complete, including
+unknown-status rejection and removal of the older executor/runtime status guesses.
+Schema validation, exposure, keyed concurrency, nested output bounds, and the remaining
+built-in audit stay as independent slices.
 
 Done when schema, status, environment, concurrency, output-bound, and exposure tests pass
 for every maintained built-in tool family.

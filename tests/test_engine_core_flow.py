@@ -90,7 +90,8 @@ def test_tool_loop_detection_can_be_disabled_for_long_running_agents():
             def glob() -> dict[str, str]:
                 self.calls += 1
                 return {
-                    "status": "no_match",
+                    "status": "success",
+                    "domain_outcome": "no_match",
                     "model_summary": "[GLOB:no_match]\n\nEnumeration complete: yes",
                 }
 
@@ -1176,7 +1177,7 @@ def test_engine_agent_can_block_disallowed_actions_before_execution():
 
     assert executed["value"] is False
     first_result = result.records[0].action_results[0]
-    assert first_result.status == "error"
+    assert first_result.status == "denied"
     assert first_result.error == "action_blocked"
     assert first_result.metadata["error_category"] == "action_blocked"
     assert "blocked for this state" in str(first_result.output)

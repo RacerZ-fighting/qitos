@@ -18,6 +18,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Truthful tool lifecycle results**: one canonical `ToolResult` projection now
+  preserves success, partial, running, error, skipped/denied, input/approval, timeout,
+  and cancellation across execution records, observations, history, traces, summaries,
+  and success metrics. Unknown and legacy alias statuses fail closed; domain outcomes
+  use a separate field instead of overloading execution status.
 - **Provider-consistent reasoning continuation**: model presets now resolve GPT-5.6
   `max` without changing older OpenAI capability limits, forced compatible-tool calls
   cannot send contradictory thinking controls, and official Responses streams preserve

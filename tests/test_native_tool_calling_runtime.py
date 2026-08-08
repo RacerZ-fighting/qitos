@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import time
 from typing import Any
 
 from qitos import Action, AgentModule, Decision, Engine, Observation, StateSchema, ToolRegistry, tool
@@ -124,6 +125,101 @@ def test_native_tool_chain_preserves_tool_call_history_and_non_json_result() -> 
     assert tool_msgs[-1].get("tool_call_id") == "call_native_1"
     tool_content = str(tool_msgs[-1].get("content", ""))
     assert "1" in tool_content and "2" in tool_content
+
+
+def test_native_tool_timeout_remains_timed_out_in_result_trace_and_history() -> None:
+    class _SlowToolModel(_NativeToolModel):
+        def call_raw(
+            self, messages: list[dict[str, Any]], **kwargs: Any
+        ) -> dict[str, Any]:
+            _ = kwargs
+            self.seen_messages.append(list(messages))
+            if self.calls == 0:
+                self.calls += 1
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_slow_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "slow_tool",
+                                            "arguments": "{}",
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            self.calls += 1
+            return {"choices": [{"message": {"content": "Final Answer: done"}}]}
+
+    class _SlowToolAgent(AgentModule[_State, Observation, Action]):
+        def __init__(self, llm: Any) -> None:
+            registry = ToolRegistry()
+
+            @tool(name="slow_tool", timeout_s=0.01)
+            def slow_tool() -> str:
+                time.sleep(0.05)
+                return "late"
+
+            registry.register(slow_tool)
+            super().__init__(
+                tool_registry=registry,
+                llm=llm,
+                model_parser=ReActTextParser(),
+            )
+
+        def init_state(self, task: str, **kwargs: Any) -> _State:
+            _ = kwargs
+            return _State(task=task, max_steps=3)
+
+        def decide(
+            self, state: _State, observation: Observation
+        ) -> Decision[Action] | None:
+            _ = state, observation
+            return None
+
+        def reduce(
+            self,
+            state: _State,
+            observation: Observation,
+            decision: Decision[Action],
+        ) -> _State:
+            _ = observation, decision
+            return state
+
+    llm = _SlowToolModel()
+    result = Engine(
+        agent=_SlowToolAgent(llm),
+        budget=RuntimeBudget(max_steps=3),
+    ).run("time out")
+
+    tool_result = result.records[0].action_results[0]
+    assert tool_result.status == "timed_out"
+    assert tool_result.is_success is False
+    assert result.success_rate == 0.0
+    assert result.step_summaries[0].status == "timed_out"
+    action_result_events = [
+        event
+        for event in result.events
+        if event.payload.get("stage") == "action_results"
+    ]
+    assert action_result_events[0].payload["action_results"][0]["status"] == (
+        "timed_out"
+    )
+
+    tool_messages = [
+        message
+        for message in llm.seen_messages[1]
+        if message.get("role") == "tool"
+    ]
+    assert len(tool_messages) == 1
+    assert "timed_out" in str(tool_messages[0].get("content", ""))
 
 
 def test_default_history_window_never_sends_orphan_parallel_tool_results() -> None:

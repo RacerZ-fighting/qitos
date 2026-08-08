@@ -142,8 +142,8 @@ def test_action_executor_applies_validation_permission_and_truncation():
     denied = executor.execute(
         [Action(name="echo_tool", args={"value": "ok"})], state=state
     )[0]
-    assert denied.status == ActionStatus.SKIPPED
-    assert denied.output["status"] == "denied"
+    assert denied.status == ActionStatus.DENIED
+    assert denied.output["message"] == "blocked"
 
     state.metadata["tool_permission_context"] = ToolPermissionContext(
         ask_rules=[
@@ -155,8 +155,8 @@ def test_action_executor_applies_validation_permission_and_truncation():
     ask = executor.execute(
         [Action(name="echo_tool", args={"value": "ok"})], state=state
     )[0]
-    assert ask.status == ActionStatus.SKIPPED
-    assert ask.output["status"] == "needs_user_input"
+    assert ask.status == ActionStatus.NEEDS_APPROVAL
+    assert ask.output["message"] == "need approval"
 
 
 def test_action_executor_reports_unknown_tool_without_name_repair():
@@ -429,4 +429,4 @@ def test_ask_user_choice_returns_needs_input_without_answers():
             }
         ]
     )
-    assert out["status"] == "needs_user_input"
+    assert out["status"] == "needs_input"

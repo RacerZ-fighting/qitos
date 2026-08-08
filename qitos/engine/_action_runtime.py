@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Generic, List, TypeVar, cast
 
-from ..core.action import Action
+from ..core.action import Action, ActionStatus
 from ..core.decision import Decision
 from ..core.tool_result import ToolResult
 from ._protocol import _EngineProtocol
@@ -82,9 +82,8 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             block_reason = self._action_block_reason(state, normalized_action)
             if block_reason:
                 blocked_result = ToolResult(
-                    status="error",
+                    status="denied",
                     output={
-                        "status": "blocked",
                         "message": block_reason,
                         "tool_name": normalized_action.name,
                     },
@@ -105,7 +104,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                     "source": "agent_action_gate",
                     "attempts": 0,
                     "latency_ms": 0,
-                    "status": "error",
+                    "status": "denied",
                     "error_category": "action_blocked",
                     "error": "action_blocked",
                 }))
@@ -149,9 +148,8 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 )
                 if loop_result.level == "block":
                     loop_tool_result = ToolResult(
-                        status="error",
+                        status="denied",
                         output={
-                            "status": "blocked",
                             "message": loop_result.message,
                             "tool_name": normalized_action.name,
                         },
@@ -172,7 +170,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                         "source": "loop_detector",
                         "attempts": 0,
                         "latency_ms": 0,
-                        "status": "error",
+                        "status": "denied",
                         "error_category": "tool_call_loop_detected",
                         "error": "tool_call_loop_detected",
                     }))
@@ -267,27 +265,17 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         per_message_max = int(getattr(engine.context_config, "tool_result_per_message_max_chars", 0) or 0)
         message_total_chars = 0
         for item in execution:
-            if item.status.value == "success":
+            result_metadata = {
+                "tool_name": item.name,
+                "latency_ms": item.latency_ms,
+                "attempts": item.attempts,
+            }
+            if item.status in {
+                ActionStatus.SUCCESS,
+                ActionStatus.PARTIAL,
+                ActionStatus.RUNNING,
+            }:
                 output = item.output
-                output_status = ""
-                output_error = None
-                if isinstance(output, dict):
-                    output_status = str(output.get("status") or "").strip().lower()
-                    output_error = output.get("error") or output.get("message")
-                if output_status in {"error", "failed", "denied", "needs_user_input"}:
-                    results.append(
-                        ToolResult(
-                            status="error",
-                            output=output,
-                            error=str(output_error or output_status),
-                            metadata={
-                                "tool_name": item.name,
-                                "latency_ms": item.latency_ms,
-                                "attempts": item.attempts,
-                            },
-                        )
-                    )
-                    continue
                 # Truncate large tool results to prevent context overflow
                 if max_chars > 0 and output is not None:
                     # Artifact-heavy tools may expose a bounded, human-readable
@@ -320,31 +308,24 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                         message_total_chars += len(output_str)
                 results.append(
                     ToolResult(
-                        status="success",
+                        status=item.status.value,
                         output=output,
-                        metadata={
-                            "tool_name": item.name,
-                            "latency_ms": item.latency_ms,
-                            "attempts": item.attempts,
-                        },
+                        error=item.error,
+                        metadata=result_metadata,
                     )
                 )
             else:
                 results.append(
                     ToolResult(
-                        status="error",
+                        status=item.status.value,
                         # Executors may intentionally return a recoverable,
                         # model-facing failure Card together with a non-success
                         # status (unknown tools and backend failures do this).
                         # Preserve it through provider history rather than
                         # replacing it with ``None`` and an opaque JSON error.
                         output=item.output,
-                        error=str(item.error or "tool execution failed"),
-                        metadata={
-                            "tool_name": item.name,
-                            "latency_ms": item.latency_ms,
-                            "attempts": item.attempts,
-                        },
+                        error=item.error,
+                        metadata=result_metadata,
                     )
                 )
 
@@ -480,6 +461,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             serialized = self._serialize_for_tool_message(
                 model_payload,
                 result.error,
+                result.status,
             )
             engine._history_append(
                 "tool",
@@ -490,7 +472,12 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 name=(tool_name or None),
             )
 
-    def _serialize_for_tool_message(self, output: Any, error: str | None) -> str:
+    def _serialize_for_tool_message(
+        self,
+        output: Any,
+        error: str | None,
+        status: str,
+    ) -> str:
         # ``output`` has already passed through ``_model_visible_tool_output``.
         # When a tool supplies a model_summary, it is therefore the exact Card
         # that provider history, TUI, and assembled messages must share.  Do
@@ -504,12 +491,18 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 # not append a generic engine error: it makes the provider
                 # payload differ from the TUI Card and can turn a useful
                 # failure into noise merely because wording differs.
+                if status not in {"success", "error"}:
+                    return f"[TOOL:{status}]\n\n{card}"
                 return card
             if error not in (None, ""):
                 return f"[TOOL:error]\n\nError: {error}"
             return ""
 
-        payload = output if error in (None, "") else {"error": str(error), "output": output}
+        payload = (
+            output
+            if status == "success" and error in (None, "")
+            else {"status": status, "error": error, "output": output}
+        )
         try:
             return json.dumps(payload, ensure_ascii=False, default=str)
         except Exception:

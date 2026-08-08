@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from typing import Any, Dict
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -40,14 +39,18 @@ class _AuditToolSet:
         needs_approval=True,
     )
     def approval_tool(self, command: str) -> Dict[str, Any]:
-        return {"status": "executed", "command": command}
+        return {
+            "status": "success",
+            "domain_outcome": "executed",
+            "command": command,
+        }
 
     @function_tool(
         name="safe_action",
         description="A safe tool without approval",
     )
     def normal_tool(self, value: str) -> Dict[str, Any]:
-        return {"status": "ok", "value": value}
+        return {"status": "success", "value": value}
 
 
 # --- Tests ---

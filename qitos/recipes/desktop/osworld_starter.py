@@ -304,9 +304,22 @@ class OpenAICUAAgent(AgentModule[OpenAICUAState, dict[str, Any], Action]):
             first = action_results[0]
             state.trajectory.append(f"Observation: {first}")
             for result in action_results:
-                status = _safe_str((result or {}).get("status"))
-                if status in {"validation_error", "approval_required"} and "execution_environment_failure" not in state.failure_tags:
+                tool_result = ToolResult.from_value(result)
+                status = str(tool_result.status or "")
+                category = str(
+                    (tool_result.metadata or {}).get("error_category") or ""
+                ).strip()
+                if (
+                    status in {"denied", "needs_approval"}
+                    or category
+                    in {"validation_error", "permission_ask", "permission_denied"}
+                ) and "execution_environment_failure" not in state.failure_tags:
                     state.failure_tags.append("execution_environment_failure")
+                if (
+                    status != "success"
+                    and "action_selection_failure" not in state.failure_tags
+                ):
+                    state.failure_tags.append("action_selection_failure")
         state.trajectory = state.trajectory[-50:]
         state.planner_notes = state.planner_notes[-12:]
         state.grounding_notes = state.grounding_notes[-12:]
@@ -606,7 +619,7 @@ def build_benchmark_result(
                 and "execution_environment_failure" not in failure_tags
             ):
                 failure_tags.append("execution_environment_failure")
-            if status == "error" and "action_selection_failure" not in failure_tags:
+            if status != "success" and "action_selection_failure" not in failure_tags:
                 failure_tags.append("action_selection_failure")
     return BenchmarkRunResult(
         task_id=str(execution.task.id),

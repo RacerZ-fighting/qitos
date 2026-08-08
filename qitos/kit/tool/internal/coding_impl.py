@@ -592,7 +592,7 @@ class CodingToolSet:
             and not python_inline_smoke
         ):
             return {
-                "status": "needs_user_input",
+                "status": "needs_approval",
                 "message": f"Command needs review: {analysis.explanation}",
                 "detected_patterns": analysis.detected_patterns,
             }
@@ -1896,7 +1896,7 @@ class CodingToolSet:
         :param runtime_context: Optional runtime context injected by the executor.
         """
         _ = runtime_context
-        return {"status": "needs_user_input", "questions": list(questions or [])}
+        return {"status": "needs_input", "questions": list(questions or [])}
 
     @function_tool(name="todo_write")
     def todo_write(
@@ -2728,7 +2728,7 @@ class CodingToolSet:
             run_in_background=run_in_background,
             runtime_context=runtime_context,
         )
-        if result.get("status") in {"error", "failed", "needs_user_input"}:
+        if result.get("status") in {"error", "needs_input", "needs_approval"}:
             return result
         if result.get("status") != "success":
             error = result.get("error") or result.get("message", "")

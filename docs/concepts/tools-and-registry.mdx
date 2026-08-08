@@ -179,6 +179,45 @@ For most practical coding agents, prefer preset toolsets such as `CodingToolSet`
 
 ---
 
+## Tool result contract
+
+A plain return value is a successful tool result. A structured tool should use the
+canonical lifecycle envelope when the operation is not simply complete:
+
+```python
+from qitos import ToolResult
+
+return ToolResult(
+    status="partial",
+    output={"preview": text, "omitted_chars": omitted},
+    metadata={"artifact_ref": artifact_ref},
+)
+```
+
+The canonical statuses are `success`, `partial`, `running`, `error`, `skipped`,
+`denied`, `needs_input`, `needs_approval`, `timed_out`, and `cancelled`. Only exact
+`success` counts as success. The boundary is strict: spellings such as `failed`,
+`needs_user_input`, `output_limit_exceeded`, `cancelling`, and `canceled` are rejected
+rather than normalized. Any unknown explicit status is an error, not inferred success.
+
+Execution lifecycle and domain outcome are separate. For example, an empty search ran
+successfully even though it found nothing:
+
+```python
+return {
+    "status": "success",
+    "domain_outcome": "no_match",
+    "matches": [],
+}
+```
+
+Do not put values such as `usable`, `pending`, or `no_match` in the top-level `status`
+field. Use `needs_input` for a user question and `needs_approval` for permission to
+execute. Background `running` and `partial` results remain non-successful operation
+states even when the executor successfully obtained the snapshot.
+
+---
+
 ## Passing the registry to AgentModule
 
 Pass your populated `ToolRegistry` to `AgentModule.__init__()`:

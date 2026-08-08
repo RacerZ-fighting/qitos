@@ -478,7 +478,6 @@ def test_mixed_native_tool_batch_commits_each_result_once_in_call_order():
     assert [item.output for item in result.records[0].action_results] == [
         42,
         {
-            "status": "blocked",
             "message": "blocked by test policy",
             "tool_name": "blocked_tool",
         },

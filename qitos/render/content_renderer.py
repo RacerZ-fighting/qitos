@@ -39,6 +39,28 @@ _NOISE_KEYS = {
     "hook",
 }
 
+_NONTERMINAL_TOOL_STATUSES = {
+    "partial",
+    "running",
+    "skipped",
+    "needs_input",
+    "needs_approval",
+}
+_FAILED_TOOL_STATUSES = {"error", "denied", "timed_out", "cancelled"}
+
+
+def _display_tool_status(status: Any, *, has_error: bool = False) -> str:
+    """Map an exact tool lifecycle status onto the renderer's three colors."""
+
+    normalized = str(status or "").strip().lower()
+    if has_error or normalized in _FAILED_TOOL_STATUSES:
+        return "error"
+    if normalized == "success":
+        return "success"
+    if not normalized or normalized in _NONTERMINAL_TOOL_STATUSES:
+        return "neutral"
+    return "error"
+
 
 class ContentFirstRenderer:
     """Extract concise thought/action/observation/memory blocks from events."""
@@ -146,33 +168,42 @@ class ContentFirstRenderer:
                     return {
                         "label": name.upper().replace("_", " "),
                         "detail": "",
-                        "status": "error" if status == "error" else "success",
+                        "status": _display_tool_status(status),
+                        "tool_result_status": status,
                         "action_id": str(first.get("action_id") or ""),
                         "args": first.get("args") if isinstance(first.get("args"), dict) else {},
                     }
                 names = []
-                has_error = False
+                summaries = []
                 for item in items:
                     d = item if isinstance(item, dict) else {}
                     name = str(d.get("tool_name") or d.get("name") or "tool")
                     names.append(name.upper().replace("_", " "))
-                    if str(d.get("status") or "").lower() == "error":
-                        has_error = True
+                    lifecycle_status = str(d.get("status") or "").lower()
+                    summaries.append(
+                        {
+                            "label": name.upper().replace("_", " "),
+                            "detail": "",
+                            "status": _display_tool_status(lifecycle_status),
+                            "tool_result_status": lifecycle_status,
+                            "action_id": str(d.get("action_id") or ""),
+                            "args": d.get("args") if isinstance(d.get("args"), dict) else {},
+                        }
+                    )
+                display_statuses = [str(item["status"]) for item in summaries]
+                batch_status = (
+                    "error"
+                    if "error" in display_statuses
+                    else "success"
+                    if display_statuses and all(value == "success" for value in display_statuses)
+                    else "neutral"
+                )
                 return {
                     "label": f"{len(items)} INVOCATIONS",
                     "detail": " | ".join(names),
-                    "status": "error" if has_error else "success",
+                    "status": batch_status,
                     "action_count": len(items),
-                    "actions": [
-                        {
-                            "label": str((item if isinstance(item, dict) else {}).get("tool_name") or (item if isinstance(item, dict) else {}).get("name") or "tool").upper().replace("_", " "),
-                            "detail": "",
-                            "status": "error" if str((item if isinstance(item, dict) else {}).get("status") or "").lower() == "error" else "neutral",
-                            "action_id": str((item if isinstance(item, dict) else {}).get("action_id") or ""),
-                            "args": (item if isinstance(item, dict) else {}).get("args") if isinstance((item if isinstance(item, dict) else {}).get("args"), dict) else {},
-                        }
-                        for item in items
-                    ],
+                    "actions": summaries,
                 }
             return None
         return None
@@ -640,7 +671,7 @@ class ContentFirstRenderer:
         tool_name = str(cleaned.get("tool_name") or cleaned.get("name") or "").strip()
         specific = self._summarize_known_tool(cleaned, tool_name=tool_name, secondary=secondary)
         if specific is not None:
-            return specific
+            return self._annotate_tool_summary(specific, cleaned)
 
         cleaned = self._strip_noise(cleaned)
         rows = self._extract_search_rows(cleaned)
@@ -652,23 +683,23 @@ class ContentFirstRenderer:
             table.add_column("URL")
             for title, short_url in rows[:6]:
                 table.add_row(self._truncate(title, 80), short_url)
-            return {
-                "status": "success",
+            return self._annotate_tool_summary({
+                "status": "neutral",
                 "title": "Search Results" if not secondary else "Tool Observation",
                 "table": table,
                 "primary_kind": "search_results",
                 "secondary_only": secondary,
-            }
+            }, cleaned)
 
         syntax = self._extract_syntax(cleaned)
         if syntax is not None:
-            return {
-                "status": "success",
+            return self._annotate_tool_summary({
+                "status": "neutral",
                 "title": "Tool Observation" if secondary else (f"{tool_name} Output" if tool_name else "Tool Output"),
                 "syntax": syntax,
                 "primary_kind": "tool_syntax",
                 "secondary_only": secondary,
-            }
+            }, cleaned)
 
         title = str(
             cleaned.get("title")
@@ -684,24 +715,36 @@ class ContentFirstRenderer:
         )
         err = cleaned.get("error")
         if err:
-            return {
+            return self._annotate_tool_summary({
                 "status": "error",
                 "title": self._truncate(str(err), 120),
                 "url": self._short_url(url) if url else "",
                 "body": self._truncate(self._to_text(cleaned.get("content", "")), 50000),
                 "primary_kind": "error",
                 "secondary_only": secondary,
-            }
+            }, cleaned)
 
         body = self._best_body(cleaned)
-        return {
-            "status": "success",
+        return self._annotate_tool_summary({
+            "status": "neutral",
             "title": self._truncate(title, 120),
             "url": self._short_url(url) if url else "",
             "body": self._truncate(body, 50000) if body else "",
             "primary_kind": "tool_result",
             "secondary_only": secondary,
-        }
+        }, cleaned)
+
+    def _annotate_tool_summary(
+        self, summary: Dict[str, Any], data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        lifecycle_status = str(data.get("tool_result_status") or "").strip().lower()
+        summary["status"] = _display_tool_status(
+            lifecycle_status,
+            has_error=bool(data.get("error")),
+        )
+        if lifecycle_status:
+            summary["tool_result_status"] = lifecycle_status
+        return summary
 
     def _unwrap_tool_result(self, item: Dict[str, Any]) -> Dict[str, Any]:
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
@@ -738,7 +781,10 @@ class ContentFirstRenderer:
         secondary: bool = False,
     ) -> Optional[Dict[str, Any]]:
         name = tool_name.upper()
-        status = "error" if data.get("error") else "success"
+        status = _display_tool_status(
+            data.get("tool_result_status"),
+            has_error=bool(data.get("error")),
+        )
         summary = data.get("summary")
         if isinstance(summary, str) and summary.strip():
             body = summary.strip()

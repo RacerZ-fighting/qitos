@@ -25,9 +25,7 @@ def _classify_failure(run: Any) -> list[str]:
     tags: list[str] = []
     if state is not None:
         tags.extend(
-            str(x)
-            for x in (getattr(state, "failure_tags", []) or [])
-            if str(x).strip()
+            str(x) for x in (getattr(state, "failure_tags", []) or []) if str(x).strip()
         )
     for record in records:
         diagnostics = getattr(record, "parser_diagnostics", {}) or {}
@@ -41,7 +39,7 @@ def _classify_failure(run: Any) -> list[str]:
             ).strip()
             if category in {"validation_error", "permission_ask", "permission_denied"}:
                 tags.append("execution_environment_failure")
-            if status == "error":
+            if status != "success":
                 tags.append("action_selection_failure")
     seen: list[str] = []
     for tag in tags:

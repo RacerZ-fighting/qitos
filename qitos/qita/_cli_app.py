@@ -856,40 +856,34 @@ def _model_visible_action_results(events: List[Dict[str, Any]]) -> List[Any]:
     return []
 
 
-def _interaction_status(tool_name: str, result: Any, raw_result: Any) -> str:
-    probes = [raw_result, result]
-    for probe in probes:
+def _interaction_status(result: Any, raw_result: Any) -> str:
+    for probe in (raw_result, result):
+        if isinstance(probe, dict) and probe.get("status"):
+            return str(probe.get("status")).strip().lower()
+    return "not_recorded"
+
+
+def _interaction_outcome(tool_name: str, result: Any, raw_result: Any) -> str:
+    for probe in (result, raw_result):
         if not isinstance(probe, dict):
             continue
-        explicit_status = str(probe.get("status") or "").lower()
-        if explicit_status in {
-            "blocked",
-            "submission_error",
-            "no_trigger",
-            "verified",
-        }:
-            return explicit_status
-        if _result_error(probe):
-            return "error"
         output = probe.get("output")
         if not isinstance(output, dict):
             continue
-        verification = str(
-            output.get("verification_status")
+        outcome = str(
+            output.get("domain_outcome")
+            or output.get("verification_status")
             or output.get("failure_type")
             or ""
         ).strip()
-        if verification:
-            return verification.lower()
+        if outcome:
+            return outcome.lower()
         if str(tool_name).rsplit(".", 1)[-1] == "submit_poc":
             if output.get("accepted") is True or output.get("verified") is True:
                 return "verified"
             if output.get("accepted") is False:
                 return "no_trigger"
-    for probe in probes:
-        if isinstance(probe, dict) and probe.get("status"):
-            return str(probe.get("status")).lower()
-    return "not_recorded"
+    return ""
 
 
 def _build_step_interactions(
@@ -978,16 +972,17 @@ def _build_step_interactions(
             args = action.get("args")
             if not isinstance(args, dict):
                 args = action.get("kwargs") if isinstance(action.get("kwargs"), dict) else {}
-            status = _interaction_status(tool_name, visible_result, raw_result)
+            status = _interaction_status(visible_result, raw_result)
             if status == "not_recorded" and invocation.get("status"):
                 status = str(invocation.get("status")).lower()
+            outcome = _interaction_outcome(tool_name, visible_result, raw_result)
             result_for_summary = visible_result if visible_result is not None else raw_result
             result_summary = _result_error(result_for_summary) or _result_success_summary(
                 result_for_summary
             )
-            if status in {"blocked", "no_trigger", "submission_error", "verified"}:
+            if outcome:
                 result_summary = " · ".join(
-                    part for part in (status, result_summary) if part
+                    part for part in (outcome, result_summary) if part
                 )
             calls.append(
                 {
@@ -1007,6 +1002,7 @@ def _build_step_interactions(
                         else "not_recorded"
                     ),
                     "status": status,
+                    "outcome": outcome,
                     "result_summary": result_summary or "not recorded",
                     "latency_ms": invocation.get("latency_ms"),
                     "attempts": invocation.get("attempts"),
@@ -1150,17 +1146,13 @@ def _step_action_summary(step: Dict[str, Any]) -> str:
 
 def _result_error(result: Any) -> str:
     if isinstance(result, dict):
-        status = str(result.get("status") or "").lower()
-        if status == "error" or result.get("error"):
+        status = str(result.get("status") or "").strip().lower()
+        if result.get("error"):
+            return _shorten_for_summary(result.get("error"))
+        if status and status != "success":
             return _shorten_for_summary(
-                result.get("error") or result.get("message") or result
+                result.get("message") or f"status={status}"
             )
-        for key in ("result", "data", "payload"):
-            nested = result.get(key)
-            if isinstance(nested, dict):
-                err = _result_error(nested)
-                if err:
-                    return err
     return ""
 
 
@@ -1179,23 +1171,18 @@ def _summary_value(value: Any, *, limit: int = 120) -> str:
 
 def _result_success_summary(result: Any) -> str:
     if not isinstance(result, dict):
-        return _summary_value(result)
+        return ""
     if _result_error(result):
         return ""
     status = str(result.get("status") or "").strip()
+    if status.lower() != "success":
+        return ""
     output = result.get("output")
-    if output is None:
-        output = result.get("result")
-    if output is None:
-        output = result.get("data")
 
     parts: List[str] = []
     if status:
         parts.append(status)
     if isinstance(output, dict):
-        nested_status = str(output.get("status") or "").strip()
-        if nested_status and nested_status not in parts:
-            parts.append(nested_status)
         for key in ("path", "file", "url", "command", "poc_path"):
             if output.get(key):
                 parts.append(f"{key}={_summary_value(output.get(key), limit=80)}")
@@ -1890,7 +1877,11 @@ def _first_failure_step(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             }
         action_results = step.get("action_results") or []
         for result in action_results:
-            if isinstance(result, dict) and str(result.get("status")) == "error":
+            if (
+                isinstance(result, dict)
+                and str(result.get("status") or "").strip().lower()
+                not in {"", "success"}
+            ):
                 return {
                     "step_id": step.get("step_id"),
                     "reason": "action_error",
@@ -2979,29 +2970,13 @@ function renderInputBlock(step, open){{
 function stepInteractionFor(sid){{
   const derived = stepInteractions.find(function(item){{ return String(item.step_id) === String(sid); }});
   if(derived) return derived;
-  const step = steps.find(function(item){{ return String(item.step_id) === String(sid); }}) || {{}};
-  const actions = Array.isArray(step.actions) ? step.actions : [];
-  const results = Array.isArray(step.action_results) ? step.action_results : [];
-  const invocations = Array.isArray(step.tool_invocations) ? step.tool_invocations : [];
-  const environmentResults = results.filter(function(result){{
-    const metadata = result && typeof result === 'object' && result.metadata && typeof result.metadata === 'object' ? result.metadata : {{}};
-    const output = result && typeof result === 'object' && result.output && typeof result.output === 'object' ? result.output : null;
-    return String(metadata.source || '').toLowerCase() === 'env' || (!!output && Object.keys(output).length === 1 && Object.prototype.hasOwnProperty.call(output, 'env'));
-  }});
-  const toolResults = results.filter(function(result){{ return !environmentResults.includes(result); }});
-  const calls = actions.map(function(action, index){{
-    const item = action && typeof action === 'object' ? action : {{}};
-    const result = index < toolResults.length ? toolResults[index] : null;
-    const status = result && typeof result === 'object' ? (result.status || (result.error ? 'error' : 'success')) : 'not recorded';
-    return {{index:index,tool_name:item.tool||item.name||item.action||item.type||'action',args:item.args||item.kwargs||{{}},action:item,invocation:invocations[index]||null,result:result,raw_result:result,result_source:result === null ? 'not_recorded' : 'raw_fallback',status:status,result_summary:result && typeof result === 'object' ? (result.error || result.message || result.status || 'recorded') : 'not recorded',latency_ms:(invocations[index]||{{}}).latency_ms,attempts:(invocations[index]||{{}}).attempts,pairing_method:'ordered_fallback'}};
-  }});
-  return {{step_id:sid,calls:calls,environment_results:environmentResults.map(function(result,index){{return {{index:index,result:result,raw_result:result}};}}),unmatched_actions:[],unmatched_results:toolResults.slice(actions.length)}};
+  return {{step_id:sid,calls:[],environment_results:[],unmatched_actions:[],unmatched_results:[]}};
 }}
 function statusClass(value){{
   const status = String(value || 'not_recorded').toLowerCase();
   if(status === 'verified' || status === 'success') return status;
-  if(status === 'no_trigger' || status === 'submission_error' || status === 'error' || status === 'blocked') return status;
-  return 'not_recorded';
+  if(status === 'not_recorded' || status === 'not recorded') return 'not_recorded';
+  return 'error';
 }}
 function isAbnormalCall(call){{
   const status = String((call && call.status) || '').toLowerCase();

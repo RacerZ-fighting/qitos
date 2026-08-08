@@ -177,6 +177,43 @@ registry.register(DatabaseTool(db_path="data.db"))
 
 ---
 
+## 工具结果契约
+
+普通返回值表示工具成功完成。结构化工具如果还在运行、只得到部分结果，或以非成功
+状态结束，应返回统一的生命周期 envelope：
+
+```python
+from qitos import ToolResult
+
+return ToolResult(
+    status="partial",
+    output={"preview": text, "omitted_chars": omitted},
+    metadata={"artifact_ref": artifact_ref},
+)
+```
+
+规范状态包括 `success`、`partial`、`running`、`error`、`skipped`、`denied`、
+`needs_input`、`needs_approval`、`timed_out` 与 `cancelled`。只有精确的 `success`
+才计入成功。该边界是严格的：`failed`、`needs_user_input`、
+`output_limit_exceeded`、`cancelling` 和 `canceled` 等旧写法会被拒绝，不会再做
+兼容归一化；任何未知的显式状态都会被视为错误，而不是猜成成功。
+
+执行生命周期和业务结果必须分开。例如搜索正常完成但没有匹配项：
+
+```python
+return {
+    "status": "success",
+    "domain_outcome": "no_match",
+    "matches": [],
+}
+```
+
+不要把 `usable`、`pending` 或 `no_match` 放进顶层 `status`。需要用户回答问题时用
+`needs_input`，需要执行审批时用 `needs_approval`。即使执行器成功取得了快照，后台
+`running` 和 `partial` 仍然不是操作成功终态。
+
+---
+
 ## 把注册表传给 AgentModule
 
 把准备好的 `ToolRegistry` 传入 `AgentModule.__init__()`：

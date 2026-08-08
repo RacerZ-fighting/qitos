@@ -84,10 +84,12 @@ def _build_remediation_hint(step: Dict[str, Any]) -> Optional[str]:
     for item in invocations:
         if not isinstance(item, dict):
             continue
-        if item.get("status") == "error":
+        status = str(item.get("status") or "").strip().lower()
+        if status and status != "success":
             category = item.get("error_category")
             if category == "tool_not_found":
                 return "Verify tool registration and action name."
             if category == "runtime_error":
                 return "Inspect tool arguments and environment configuration."
+            return f"Inspect the tool lifecycle result ({status})."
     return None

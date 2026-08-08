@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from qitos.qita._cli_app import _result_error, _result_success_summary
 from qitos.qita.cli import (
     _build_run_diff,
     _build_handler,
@@ -339,15 +340,17 @@ def test_step_interactions_use_ids_and_keep_unmatched_results(tmp_path: Path):
     interaction = _load_run_payload(run)["step_interactions"][0]
 
     assert interaction["calls"][0]["pairing_method"] == "action_id"
-    assert interaction["calls"][0]["status"] == "no_trigger"
+    assert interaction["calls"][0]["status"] == "success"
+    assert interaction["calls"][0]["outcome"] == "no_trigger"
     assert interaction["calls"][0]["result_summary"].startswith("no_trigger")
-    assert interaction["calls"][1]["status"] == "verified"
+    assert interaction["calls"][1]["status"] == "success"
+    assert interaction["calls"][1]["outcome"] == "verified"
     assert interaction["calls"][0]["args"]["poc_path"] == "pocs/a.bin"
     assert interaction["calls"][1]["args"]["poc_path"] == "pocs/b.bin"
     assert len(interaction["unmatched_results"]) == 1
 
 
-def test_step_interactions_mark_missing_and_blocked_evidence(tmp_path: Path):
+def test_step_interactions_mark_missing_and_denied_evidence(tmp_path: Path):
     run = _make_run(tmp_path, "paired-partial")
     step = json.loads((run / "steps.jsonl").read_text(encoding="utf-8").strip())
     step["actions"] = [
@@ -355,19 +358,32 @@ def test_step_interactions_mark_missing_and_blocked_evidence(tmp_path: Path):
         {"name": "submit_poc", "args": {"poc_path": "pocs/a.bin"}},
     ]
     step["tool_invocations"] = [
-        {"tool_name": "BASH", "status": "blocked", "error": "Policy blocked command"}
+        {"tool_name": "BASH", "status": "denied", "error": "Policy blocked command"}
     ]
     step["action_results"] = []
     (run / "steps.jsonl").write_text(json.dumps(step) + "\n", encoding="utf-8")
 
     interaction = _load_run_payload(run)["step_interactions"][0]
 
-    assert interaction["calls"][0]["status"] == "blocked"
-    assert interaction["calls"][0]["invocation"]["status"] == "blocked"
+    assert interaction["calls"][0]["status"] == "denied"
+    assert interaction["calls"][0]["invocation"]["status"] == "denied"
     assert interaction["calls"][1]["invocation"] == {}
     assert interaction["calls"][1]["pairing_method"] == "unmatched"
     assert interaction["calls"][1]["result"] is None
     assert [row["index"] for row in interaction["unmatched_actions"]] == [0, 1]
+
+
+def test_qita_uses_only_the_canonical_result_envelope_for_lifecycle() -> None:
+    assert _result_error({"status": "partial", "output": {"rows": [1]}}) == (
+        "status=partial"
+    )
+    assert _result_success_summary(
+        {"status": "partial", "output": {"rows": [1]}}
+    ) == ""
+    assert _result_error(
+        {"status": "success", "output": {"status": "domain-failed"}}
+    ) == ""
+    assert _result_error({"data": {"status": "error", "error": "legacy"}}) == ""
 
 
 def test_budgeted_cybergym_run_surfaces_verification_failure(tmp_path: Path):

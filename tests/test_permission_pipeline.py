@@ -558,7 +558,7 @@ class TestActionExecutorIntegration:
 
         action = Action(name="file_edit_v2", args={"path": "test.py"})
         results = executor.execute([action])
-        assert results[0].status == ActionStatus.SKIPPED
+        assert results[0].status == ActionStatus.DENIED
 
     def test_rbw_enforcer_in_executor(self):
         """Test that read-before-write enforcer blocks writes to unread files."""
@@ -592,7 +592,7 @@ class TestActionExecutorIntegration:
         try:
             action = Action(name="file_edit_v2", args={"path": path})
             results = executor.execute([action])
-            assert results[0].status == ActionStatus.SKIPPED
+            assert results[0].status == ActionStatus.DENIED
             assert results[0].output.get("error_category") == "read_before_write"
         finally:
             os.unlink(path)

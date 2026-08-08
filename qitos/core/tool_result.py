@@ -4,17 +4,48 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal
+from typing import Any, Dict, Literal, TypeAlias, cast
+
+from .action import ActionStatus
+
+
+ToolResultStatus: TypeAlias = Literal[
+    "success",
+    "partial",
+    "running",
+    "error",
+    "skipped",
+    "denied",
+    "needs_input",
+    "needs_approval",
+    "timed_out",
+    "cancelled",
+]
+
+_MESSAGE_ERROR_STATUSES = frozenset(
+    {"error", "denied", "timed_out", "cancelled"}
+)
 
 
 @dataclass
 class ToolResult:
     """Normalized tool execution result."""
 
-    status: Literal["success", "error"] = "success"
+    status: ToolResultStatus = "success"
     output: Any = None
     error: str | None = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        raw_status = str(self.status).strip()
+        try:
+            self.status = cast(ToolResultStatus, ActionStatus(raw_status).value)
+        except ValueError:
+            self.status = "error"
+            if self.error in (None, ""):
+                self.error = f"unknown tool result status: {raw_status}"
+        if self.status == "success" and self.error not in (None, ""):
+            self.status = "error"
 
     @property
     def is_success(self) -> bool:
@@ -30,41 +61,49 @@ class ToolResult:
             return str(self.output)
 
     def to_dict(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {
+        return {
             "status": str(self.status),
             "output": self.output,
             "error": self.error,
             "metadata": dict(self.metadata),
         }
-        # Backward-compatible flattening: legacy reducers expect direct tool fields.
-        if isinstance(self.output, dict):
-            for key, value in self.output.items():
-                if key in payload:
-                    continue
-                payload[str(key)] = value
-        elif isinstance(self.output, str):
-            # Promote string output as "content" so renderers (e.g. ContentFirstRenderer)
-            # that look for a "content" key can find it.  This ensures the TUI shows
-            # the same text the LLM sees.
-            payload["content"] = self.output
-        return payload
 
     @classmethod
     def from_value(cls, payload: Any) -> "ToolResult":
         if isinstance(payload, ToolResult):
-            return payload
-        if isinstance(payload, dict):
-            status = str(payload.get("status") or "success")
-            if status not in {"success", "error"}:
-                status = "success" if not payload.get("error") else "error"
             return cls(
-                status=status,  # type: ignore[arg-type]
-                output=payload.get("output", payload),
-                error=(
-                    str(payload.get("error"))
-                    if payload.get("error") not in (None, "")
-                    else None
-                ),
+                status=payload.status,
+                output=payload.output,
+                error=payload.error,
+                metadata=dict(payload.metadata),
+            )
+        if isinstance(payload, dict):
+            if "status" not in payload:
+                return cls(status="success", output=payload)
+            raw_status = str(payload.get("status")).strip()
+            raw_error = payload.get("error")
+            error: str | None = None
+            if raw_error not in (None, ""):
+                error = str(raw_error)
+            elif raw_status in _MESSAGE_ERROR_STATUSES:
+                message = payload.get("message")
+                if message not in (None, ""):
+                    error = str(message)
+
+            domain_payload = {
+                str(key): value
+                for key, value in payload.items()
+                if key not in {"status", "error", "metadata"}
+            }
+            output = (
+                domain_payload["output"]
+                if set(domain_payload) == {"output"}
+                else domain_payload
+            )
+            return cls(
+                status=cast(ToolResultStatus, raw_status),
+                output=output,
+                error=error,
                 metadata=(
                     dict(payload.get("metadata", {}))
                     if isinstance(payload.get("metadata"), dict)
@@ -76,4 +115,4 @@ class ToolResult:
         return cls(status="success", output=payload)
 
 
-__all__ = ["ToolResult"]
+__all__ = ["ToolResult", "ToolResultStatus"]

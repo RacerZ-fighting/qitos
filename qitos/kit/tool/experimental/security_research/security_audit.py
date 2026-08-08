@@ -10,7 +10,7 @@ import shutil
 import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from qitos.core.function_tool_decorator import function_tool
 from qitos.core.tool import ToolPermission
@@ -1110,7 +1110,8 @@ class SecurityAuditToolSet:
         commands = self._dependency_audit_commands()
         if not commands:
             return {
-                "status": "unavailable",
+                "status": "error",
+                "error_category": "unavailable",
                 "stdout": "No supported dependency audit command is available for this repository or environment.",
                 "data": {"findings": [], "scans": []},
             }
@@ -1195,7 +1196,8 @@ class SecurityAuditToolSet:
             }
         except FileNotFoundError:
             return {
-                "status": "unavailable",
+                "status": "error",
+                "error_category": "unavailable",
                 "stdout": "",
                 "stderr": f"{cmd[0]} not found",
                 "returncode": -1,

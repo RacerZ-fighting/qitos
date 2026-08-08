@@ -123,6 +123,45 @@ def test_tool_result_observations_use_tool_specific_summaries() -> None:
     assert "vul_only_triggered" in obs["body"]
 
 
+def test_tool_result_lifecycle_is_never_rendered_as_implicit_success() -> None:
+    renderer = ContentFirstRenderer(max_preview_chars=240)
+    expected = {
+        "success": "success",
+        "partial": "neutral",
+        "running": "neutral",
+        "error": "error",
+        "skipped": "neutral",
+        "denied": "error",
+        "needs_input": "neutral",
+        "needs_approval": "neutral",
+        "timed_out": "error",
+        "cancelled": "error",
+    }
+
+    for lifecycle_status, display_status in expected.items():
+        obs = renderer.observation_summary(
+            RenderEvent(
+                channel="observation",
+                node="action_results",
+                step_id=0,
+                payload={
+                    "action_results": [
+                        ToolResult.from_value(
+                            {
+                                "status": lifecycle_status,
+                                "message": "bounded result",
+                            }
+                        ).to_dict()
+                    ]
+                },
+            )
+        )
+
+        assert isinstance(obs, dict)
+        assert obs["tool_result_status"] == lifecycle_status
+        assert obs["status"] == display_status
+
+
 def test_recall_observation_has_memory_specific_summary() -> None:
     renderer = ContentFirstRenderer(max_preview_chars=240)
     obs = renderer.observation_summary(
@@ -135,7 +174,7 @@ def test_recall_observation_has_memory_specific_summary() -> None:
                     ToolResult(
                         status="success",
                         output={
-                            "status": "ok",
+                            "domain_outcome": "ready",
                             "revision": 7,
                             "slot": "construction_plan",
                             "section": "Mutation rationale",

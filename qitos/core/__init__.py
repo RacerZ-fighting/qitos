@@ -59,7 +59,7 @@ from .multimodal import (
     ActionSpace,
     EnvironmentAdapter,
 )
-from .tool_result import ToolResult
+from .tool_result import ToolResult, ToolResultStatus
 from .tool import BaseTool, FunctionTool, RetryPolicy, ToolPermission, ToolPermissionSpec, ToolSpec, tool
 from .tool_schema import function_schema, type_to_json_schema, parse_docstring
 from .function_tool_decorator import function_tool
@@ -123,6 +123,7 @@ __all__ = [
     "ActionSpace",
     "EnvironmentAdapter",
     "ToolResult",
+    "ToolResultStatus",
     "BaseTool",
     "FunctionTool",
     "RetryPolicy",

@@ -7,7 +7,7 @@ to hand off control to another agent.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from ...core.tool import BaseTool, ToolSpec
 
@@ -53,7 +53,8 @@ class HandoffTool(BaseTool):
         """
         return {
             "handoff_target": self.target_name,
-            "status": "pending",
+            "status": "success",
+            "handoff_status": "pending",
             "rationale": args.get("rationale", "") if isinstance(args, dict) else "",
         }
 

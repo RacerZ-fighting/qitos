@@ -13,8 +13,13 @@ class ActionKind(str, Enum):
 
 class ActionStatus(str, Enum):
     SUCCESS = "success"
+    PARTIAL = "partial"
+    RUNNING = "running"
     ERROR = "error"
     SKIPPED = "skipped"
+    DENIED = "denied"
+    NEEDS_INPUT = "needs_input"
+    NEEDS_APPROVAL = "needs_approval"
     TIMED_OUT = "timed_out"
     CANCELLED = "cancelled"
 

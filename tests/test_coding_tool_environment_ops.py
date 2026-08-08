@@ -208,8 +208,5 @@ def test_executor_promotes_structured_tool_failure_to_action_error(
     )[0]
 
     assert result.status is ActionStatus.ERROR
-    assert result.output == {
-        "status": "error",
-        "message": "File not found: missing.txt",
-    }
+    assert result.output == {"message": "File not found: missing.txt"}
     assert result.metadata["error_category"] == "tool_reported_error"
