@@ -149,6 +149,8 @@ How to update:
   hard-coded three-attempt loop, implicit SDK retries, and error-as-success strings.
 - Removed provider-failure-as-model-text paths from the Anthropic, Gemini, LiteLLM,
   Ollama, LM Studio, and vLLM adapters; transport failures now enter Engine recovery.
+- Removed legacy Cookiecutter mocks that depended on an undeclared optional package and
+  a Docker write test for the deleted shell-string transport.
 - Removed unused `ActionKind`, action-level timeout/retry/idempotency/classification
   fields, integer `max_retries` tool metadata, nonfunctional functional-task retry and
   timeout options, and the duplicate ToolInterceptor middleware (including broken cache
