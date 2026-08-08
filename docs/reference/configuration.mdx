@@ -200,9 +200,14 @@ class RuntimeBudget:
     max_steps: int = 10
     max_runtime_seconds: Optional[float] = None
     max_tokens: Optional[int] = None
+    deadline_monotonic: Optional[float] = None
 ```
 
-When a `Task` object is passed to `Engine.run()`, the `Task.budget` values override the Engine's `RuntimeBudget` for that run.
+`max_runtime_seconds` starts when the Engine run is admitted. `deadline_monotonic` is an
+absolute `time.monotonic()` deadline supplied by an outer scheduler, so time spent before
+Engine admission is not accidentally restored. When both are set, the earlier deadline
+wins. A `Task` object's relative budget values override the Engine defaults for that run;
+the outer absolute deadline is retained.
 
 ---
 

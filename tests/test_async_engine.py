@@ -1,6 +1,8 @@
 """Tests for AsyncEngine, EventStream, and async model adapters."""
 
 import asyncio
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -196,6 +198,73 @@ class TestAsyncEngine:
         engine = AsyncEngine(agent=agent, budget=RuntimeBudget(max_steps=5))
         assert isinstance(engine.engine, Engine)
         assert engine.agent is engine.engine.agent
+
+    def test_closing_stream_requests_underlying_engine_cancellation(self):
+        class _WaitingAgent(DemoAgent):
+            def decide(self, state, observation):
+                _ = state, observation
+                return Decision.wait(
+                    rationale="wait for runtime input",
+                    meta={"runtime_wait": True},
+                )
+
+        async def _close_after_first_event(engine):
+            iterator = engine.arun_stream("wait").__aiter__()
+            await iterator.__anext__()
+            await iterator.aclose()
+            await asyncio.sleep(0.01)
+
+        engine = AsyncEngine(
+            agent=_WaitingAgent(),
+            budget=RuntimeBudget(max_steps=5),
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_close_after_first_event(engine))
+            assert engine.engine._cancel_token.is_cancel_requested
+        finally:
+            engine.cancel("immediate")
+            loop.close()
+
+    def test_cancelled_arun_does_not_wait_for_blocked_engine_thread(self):
+        class _BlockingAgent(DemoAgent):
+            def __init__(self):
+                super().__init__()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.worker_daemon = None
+
+            def decide(self, state, observation):
+                _ = state, observation
+                self.worker_daemon = threading.current_thread().daemon
+                self.entered.set()
+                self.release.wait(timeout=1.0)
+                return Decision.final("released")
+
+        async def _cancel_blocked_run(engine, agent):
+            task = asyncio.create_task(engine.arun("blocked"))
+            for _ in range(100):
+                if agent.entered.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            assert agent.entered.is_set()
+            started = time.monotonic()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return time.monotonic() - started
+
+        agent = _BlockingAgent()
+        engine = AsyncEngine(agent=agent, budget=RuntimeBudget(max_steps=5))
+        loop = asyncio.new_event_loop()
+        try:
+            elapsed = loop.run_until_complete(_cancel_blocked_run(engine, agent))
+            assert elapsed < 0.1
+            assert agent.worker_daemon is True
+        finally:
+            agent.release.set()
+            loop.run_until_complete(asyncio.sleep(0.01))
+            loop.close()
 
 
 # --- Async model tests ---

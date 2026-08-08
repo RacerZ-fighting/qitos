@@ -311,16 +311,15 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
                 return True, reason, detail
         return False, None, None
 
-    def budget_exhausted(self, step_id: int, started_at: float, state: StateT) -> bool:
+    def budget_exhausted(self, step_id: int, state: StateT) -> bool:
         engine = self.engine
         if step_id >= engine.budget.max_steps:
             state.set_stop(StopReason.BUDGET_STEPS)
             return True
-        if engine.budget.max_runtime_seconds is not None:
-            elapsed = time.monotonic() - started_at
-            if elapsed > engine.budget.max_runtime_seconds:
-                state.set_stop(StopReason.BUDGET_TIME)
-                return True
+        remaining = engine.remaining_runtime_seconds()
+        if remaining is not None and remaining <= 0:
+            state.set_stop(StopReason.BUDGET_TIME)
+            return True
         if engine.budget.max_tokens is not None and engine._token_usage >= int(
             engine.budget.max_tokens
         ):

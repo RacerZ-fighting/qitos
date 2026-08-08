@@ -41,16 +41,26 @@ execution. Parser-only final-text compatibility remains for a later explicit-lan
 
 ### 2. Deadlines, cancellation, concurrency, and retries
 
-- [ ] Propagate absolute deadline and cancellation accessors through Engine and tool
+- [x] Propagate absolute deadline and cancellation accessors through Engine and tool
   runtime context.
-- [ ] Clamp model attempts, tool timeouts, and retry backoff to remaining time.
+- [x] Clamp tool admission, tool timeout, runtime wait, and retry backoff to remaining
+  time.
+- [ ] Clamp model attempts and provider transport timeouts to remaining time.
 - [ ] Preserve action status and attempts through ToolResult, history, hooks, and trace.
-- [ ] Make async stream shutdown request Engine cancellation and guarantee a terminal
+- [x] Make async stream shutdown request Engine cancellation and guarantee a terminal
   stream event even when the bounded event queue is full.
 - [ ] Audit legacy model adapters so the provider transport has one retry owner.
 
 Done when deterministic tests cover cancellation before admission, queued actions,
 running actions, partial streams, provider retry, tool retry, and queue saturation.
+
+Progress (2026-08-08): Engine runs now resolve relative and absolute limits into one
+effective monotonic deadline. Tools receive live deadline/cancellation accessors; tool
+admission, timeout, retry backoff, and runtime wait all use the same remaining-time
+calculation. Async Engine execution no longer relies on asyncio's non-daemon default
+executor, duplicated stream cleanup is removed, early stream close requests cooperative
+cancellation, and full event queues retain a terminal marker. Provider-call clamping and
+end-to-end child cleanup remain open.
 
 ### 3. Context, compression, and reasoning
 

@@ -311,6 +311,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             max_steps=self.budget.max_steps,
             max_runtime_seconds=self.budget.max_runtime_seconds,
             max_tokens=self.budget.max_tokens,
+            deadline_monotonic=self.budget.deadline_monotonic,
         )
         self.validation_gate = validation_gate or StateValidationGate()
         self.recovery_handler = recovery_handler
@@ -373,6 +374,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_env_result: Optional[EnvStepResult] = None
         self._token_usage: int = 0
         self._active_run_id: str = ""
+        self._runtime_deadline_monotonic: Optional[float] = None
         self._runtime_history: History = _EngineWindowHistory(window_size=24)
         self._tool_loop_detector = (
             loop_detector
@@ -489,6 +491,28 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._runtime_inbox.wake()
 
     @property
+    def runtime_deadline_monotonic(self) -> Optional[float]:
+        """Return the effective absolute deadline for the active run."""
+
+        return self._runtime_deadline_monotonic
+
+    def remaining_runtime_seconds(self) -> Optional[float]:
+        """Return live time remaining before the active run deadline."""
+
+        deadline = self._runtime_deadline_monotonic
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
+
+    def _activate_runtime_budget(self, started_at: float) -> None:
+        deadlines: List[float] = []
+        if self.budget.deadline_monotonic is not None:
+            deadlines.append(float(self.budget.deadline_monotonic))
+        if self.budget.max_runtime_seconds is not None:
+            deadlines.append(started_at + float(self.budget.max_runtime_seconds))
+        self._runtime_deadline_monotonic = min(deadlines) if deadlines else None
+
+    @property
     def active_run_id(self) -> str:
         """Return the current run id, or an empty string outside a run."""
 
@@ -597,6 +621,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         task_obj, task_text = self._normalize_task(task)
         self._apply_task_budget(task_obj)
+        started_at = time.monotonic()
+        self._activate_runtime_budget(started_at)
 
         state = self.agent.init_state(task_text, **kwargs)
         self._memory_append("task", {"objective": task_text}, 0)
@@ -608,7 +634,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             {"state": state, "trace_writer": self.trace_writer, "task": task_obj or task_text}
         )
 
-        started_at = time.monotonic()
         observation = self._build_initial_observation(state, step_id=0, started_at=started_at)
         return state, observation
 
@@ -840,7 +865,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
     def budget_exhausted(self, state: StateT) -> bool:
         """Check if the runtime budget has been exhausted."""
-        return self._budget_exhausted(state.current_step, time.monotonic(), state)
+        return self._budget_exhausted(state.current_step, state)
 
     @property
     def current_state(self) -> Optional[StateT]:
@@ -890,6 +915,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_prompt_metadata = {}
         task_obj, task_text = self._normalize_task(task)
         self._apply_task_budget(task_obj)
+        started_at = time.monotonic()
+        self._activate_runtime_budget(started_at)
         self._token_usage = 0
         self._last_context_telemetry = {}
         self._context_runtime.reset()
@@ -931,7 +958,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._active_task = task_text
         self._active_task_obj = task_obj
         self._active_state = state
-        started_at = time.monotonic()
         self._hydrate_trace_metadata(task_obj=task_obj, task_text=task_text)
 
         try:
@@ -1049,7 +1075,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     # after_step: break after this iteration's step completes
                     # (checked again at end of loop body below)
 
-                if self._budget_exhausted(step_id, started_at, state):
+                if self._budget_exhausted(step_id, state):
                     self._emit(
                         step_id,
                         RuntimePhase.END,
@@ -1187,7 +1213,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         RuntimePhase.DECIDE,
                         payload={"stage": "runtime_wait_start"},
                     )
-                    wait_outcome = self._wait_for_runtime_event(started_at)
+                    wait_outcome = self._wait_for_runtime_event()
                     self._emit(
                         step_id,
                         RuntimePhase.DECIDE,
@@ -1518,6 +1544,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self.budget.max_steps = self._base_budget.max_steps
         self.budget.max_runtime_seconds = self._base_budget.max_runtime_seconds
         self.budget.max_tokens = self._base_budget.max_tokens
+        self.budget.deadline_monotonic = self._base_budget.deadline_monotonic
         if task_obj is not None:
             budget = task_obj.budget
             if budget.max_steps is not None:
@@ -1694,8 +1721,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             state, step_id, elapsed_seconds
         )
 
-    def _budget_exhausted(self, step_id: int, started_at: float, state: StateT) -> bool:
-        return self._control_runtime.budget_exhausted(step_id, started_at, state)
+    def _budget_exhausted(self, step_id: int, state: StateT) -> bool:
+        return self._control_runtime.budget_exhausted(step_id, state)
 
     def _drain_runtime_events(self, step_id: int) -> None:
         events = self._runtime_inbox.drain(self._active_run_id)
@@ -1714,14 +1741,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             payload={"stage": "runtime_input", **payload},
         )
 
-    def _wait_for_runtime_event(self, started_at: float) -> RuntimeWaitOutcome:
-        timeout_seconds: float | None = None
-        if self.budget.max_runtime_seconds is not None:
-            timeout_seconds = max(
-                0.0,
-                float(self.budget.max_runtime_seconds)
-                - (time.monotonic() - started_at),
-            )
+    def _wait_for_runtime_event(self) -> RuntimeWaitOutcome:
+        timeout_seconds = self.remaining_runtime_seconds()
         return self._runtime_inbox.wait(
             self._active_run_id,
             timeout_seconds=timeout_seconds,
@@ -2369,6 +2390,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._resolved_protocol = None
         self._resolved_protocol_source = ""
         self._last_prompt_metadata = {}
+        self._runtime_deadline_monotonic = None
         if self._tool_loop_detector is not None:
             self._tool_loop_detector.reset()
         self._handoff_history = []

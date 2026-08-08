@@ -19,6 +19,8 @@ How to update:
 
 ### Added
 
+- Added absolute monotonic run deadlines and live `remaining_seconds`,
+  `deadline_monotonic`, and `agent_cancelled` accessors to tool runtime context.
 - Added backend-neutral `CapabilityEnv` composition plus bounded filesystem and
   fixed-argv process contracts for tools that run on host, container, or remote
   application providers without per-tool backend adapters.
@@ -47,6 +49,9 @@ How to update:
 
 ### Changed
 
+- Async Engine runs now use a daemon worker with cooperative cancellation, and the two
+  duplicated stream cleanup paths share one lifecycle implementation. Early consumer
+  close requests Engine cancellation; normal completion still propagates Engine errors.
 - Clarified the generic `AgentTool` model contract: independent multi-step tasks can be
   delegated in one response for concurrent execution, while dependent steps and cheap
   mechanical variants remain in the parent. Explicit tool guidance is no longer replaced
@@ -65,6 +70,10 @@ How to update:
 
 ### Fixed
 
+- Fixed runtime deadlines being checked only at Engine step boundaries. The effective
+  deadline now clamps tool admission, execution timeout, retry backoff, and runtime
+  waits. Timed-out synchronous tools use daemon workers so an orphan cannot block
+  interpreter shutdown, and a saturated event queue still retains its terminal marker.
 - Fixed native-capable agent turns so provider `tool_calls` are authoritative before
   custom text interpreters or parsers, API-delivered tools no longer receive a second
   framework text action contract, malformed native arguments produce a paired recoverable

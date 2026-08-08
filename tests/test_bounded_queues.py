@@ -1,11 +1,7 @@
 """Tests for bounded queue capacity in EventStream and DurabilityManager."""
 from __future__ import annotations
 
-import asyncio
 import logging
-import queue
-
-import pytest
 
 from qitos.engine.events import EventStream, EngineEvent, EngineEventType
 from qitos.checkpoint.durability import DurabilityManager, DurabilityMode
@@ -38,13 +34,17 @@ def test_eventstream_emit_does_not_raise_when_queue_full():
 
 
 def test_eventstream_close_does_not_raise_when_queue_full():
-    """Closing with a full queue drops the sentinel gracefully."""
+    """Closing a full queue keeps a terminal sentinel by dropping one event."""
     es = EventStream()
     event = EngineEvent(event_type=EngineEventType.RUN_START, payload={})
     for _ in range(4096):
         es._queue.put_nowait(event)
-    # This should not raise
+
     es.close()
+
+    queued = [es._queue.get_nowait() for _ in range(es._queue.qsize())]
+    assert len(queued) == 4096
+    assert queued[-1] is None
 
 
 def test_durability_manager_async_queue_is_bounded():

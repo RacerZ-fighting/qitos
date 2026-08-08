@@ -130,7 +130,12 @@ class RuntimeBudget:
     max_steps: int = 10
     max_runtime_seconds: Optional[float] = None
     max_tokens: Optional[int] = None
+    deadline_monotonic: Optional[float] = None
 ```
+
+`max_runtime_seconds` 从 Engine 接纳运行时开始计时；`deadline_monotonic` 是外层调度器
+按 `time.monotonic()` 传入的绝对截止时间，不会把排队消耗的时间重新补回来。两者同时
+存在时取更早者。`Task` 可以覆盖相对预算，但不会移除外层绝对截止时间。
 
 ## 环境变量
 

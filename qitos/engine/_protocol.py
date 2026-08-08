@@ -5,13 +5,7 @@ private runtime mixins that need access to Engine internals.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol, runtime_checkable
-
-if TYPE_CHECKING:
-    from ..core.action import Action
-    from ..core.decision import Decision
-    from ..core.tool_result import ToolResult
-    from .states import ContextConfig, RuntimeBudget, RuntimePhase, StepRecord
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -39,11 +33,49 @@ class _EngineProtocol(Protocol):
     _handoff_history: List[str]
 
     # -- methods used by runtime mixins --
-    def _dispatch_hook(self, method_name: str, ctx: Any) -> None: ...
-    def _hook_context(self, **kwargs: Any) -> Any: ...
-    def _emit(self, step_id: int, phase: Any, payload: Optional[Dict[str, Any]] = None) -> None: ...
-    def _memory_append(self, category: str, item: Any, step_id: int) -> None: ...
-    def _history_append(self, role: str, content: str, step_id: int, **kwargs: Any) -> None: ...
-    def _intercept_handoff_action(self, action: Any) -> Optional[Any]: ...
-    def _run_env_step(self, **kwargs: Any) -> Optional[Any]: ...
-    def _env_step_result_to_dict(self, result: Any) -> Dict[str, Any]: ...
+    def _dispatch_hook(self, method_name: str, ctx: Any) -> None:
+        ...
+
+    def _hook_context(self, **kwargs: Any) -> Any:
+        ...
+
+    def _emit(
+        self,
+        step_id: int,
+        phase: Any,
+        ok: bool = True,
+        payload: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        ...
+
+    def _memory_append(self, category: str, item: Any, step_id: int) -> None:
+        ...
+
+    def _history_append(
+        self,
+        role: str,
+        content: str,
+        step_id: int,
+        **kwargs: Any,
+    ) -> None:
+        ...
+
+    def _intercept_handoff_action(self, action: Any) -> Optional[Any]:
+        ...
+
+    def _run_env_step(self, **kwargs: Any) -> Optional[Any]:
+        ...
+
+    def _env_step_result_to_dict(self, result: Any) -> Optional[Dict[str, Any]]:
+        ...
+
+    def post_runtime_event(self, event: Any, *, run_id: str) -> bool:
+        ...
+
+    @property
+    def runtime_deadline_monotonic(self) -> Optional[float]:
+        ...
+
+    def remaining_runtime_seconds(self) -> Optional[float]:
+        ...

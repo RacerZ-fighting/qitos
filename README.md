@@ -18,6 +18,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Run-scoped deadlines and bounded async shutdown**: relative runtime budgets and
+  caller-supplied monotonic deadlines now resolve to one effective deadline shared by
+  the Engine, tool admission, tool timeouts, retry backoff, and runtime waits. Async
+  cancellation requests cooperative Engine shutdown without letting an unresponsive
+  synchronous call keep the hosting event loop or CLI process alive indefinitely.
 - **One native tool-call lane**: when a model preset prefers provider-native tools,
   typed calls now bypass text interpreters and parsers, API requests omit the duplicate
   framework action contract, and every accepted, rejected, or malformed call commits one

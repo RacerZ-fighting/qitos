@@ -181,7 +181,10 @@ result = engine.run(task)
 
 ## AsyncEngine
 
-`AsyncEngine` 提供非阻塞的智能体执行能力。它封装了同样的 `Engine` 循环，但把阻塞调用放到线程池中执行，因此在 `asyncio` 事件循环中使用是安全的。
+`AsyncEngine` 提供非阻塞的智能体执行能力。它把同一个 `Engine` 循环放到 daemon
+工作线程中，并协作式传递取消请求，因此无响应的同步调用不会无限占住事件循环或进程
+退出。截止时间到达并不声称 Python 已强杀正在执行的同步调用；调用可以在有界清理宽限期
+内结束。
 
 ```python
 from qitos import AsyncEngine
@@ -252,5 +255,6 @@ result = await llm.acall([{"role": "user", "content": "你好"}])
 ```
 
 <Tip>
-  `AsyncEngine.arun()` 与任何模型都兼容——同步模型会自动调度到线程池。当你需要真正的非阻塞 I/O（例如在高并发 Web 服务器中）时，才需要使用异步模型适配器。
+  `AsyncEngine.arun()` 与任何模型都兼容——同步 Engine 会运行在 daemon 工作线程中。
+  需要 provider 原生取消或高并发时，再使用异步模型适配器。
 </Tip>

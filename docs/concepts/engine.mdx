@@ -199,6 +199,8 @@ You can also pass hooks at construction time via the `hooks` parameter, or at ru
 When the step budget, wall-clock time limit, or token budget is exceeded, the Engine sets `state.stop_reason` to the appropriate value and emits an `END` event. The run terminates gracefully and `EngineResult` is still returned — inspect `state.stop_reason` to detect this case.
 
 ```python
+import time
+
 from qitos.engine.states import RuntimeBudget
 
 engine = Engine(
@@ -207,9 +209,15 @@ engine = Engine(
         max_steps=30,
         max_runtime_seconds=120.0,
         max_tokens=50_000,
+        # Optional outer scheduler deadline; the earlier limit wins.
+        deadline_monotonic=time.monotonic() + 120.0,
     ),
 )
 ```
+
+The effective run deadline is shared by Engine step admission, runtime waits, tool
+admission and timeout, and tool retry backoff. Expiry requests graceful termination; it
+does not claim that Python forcibly killed a synchronous call already in progress.
 
 ## Building an Engine from AgentModule
 
@@ -227,7 +235,11 @@ This is equivalent to `Engine(agent=agent, ...)` and is what `agent.run()` calls
 
 ## AsyncEngine
 
-`AsyncEngine` provides non-blocking execution for agent workflows. It wraps the same `Engine` loop but runs blocking calls in a thread pool, making it safe to use inside `asyncio` event loops.
+`AsyncEngine` provides non-blocking execution for agent workflows. It wraps the same
+`Engine` loop on a daemon worker thread, making it safe to use inside `asyncio` event
+loops without letting an unresponsive synchronous call own loop or process shutdown.
+Cancellation is cooperative: the Engine is asked to stop and may finish during the
+caller's bounded cleanup grace period.
 
 ```python
 from qitos import AsyncEngine
@@ -298,5 +310,7 @@ result = await llm.acall([{"role": "user", "content": "Hello"}])
 ```
 
 <Tip>
-  `AsyncEngine.arun()` works with any model — sync models are automatically dispatched to a thread pool. Use async model adapters when you need true non-blocking I/O, e.g. in high-concurrency web servers.
+  `AsyncEngine.arun()` works with any model — the synchronous Engine runs on a daemon
+  worker. Use async model adapters when you need provider-native cancellation or high
+  concurrency rather than only non-blocking host shutdown.
 </Tip>

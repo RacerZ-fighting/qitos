@@ -3,20 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import time
-from typing import Any, AsyncIterator, Generic, List, Optional, TypeVar
+import threading
+from typing import Any, AsyncIterator, Callable, Generic, List, Optional, TypeVar
 
 from ..core.agent_module import AgentModule
-from ..core.decision import Decision
-from ..core.errors import StopReason
 from ..core.runtime_input import RuntimeInput
 from ..core.state import StateSchema
 from .engine import Engine, EngineResult
 from .events import EngineEvent, EngineEventType, EventStream
 from .hooks import HookContext
-from .states import ContextConfig, RuntimeBudget, RuntimeEvent, RuntimePhase, StepRecord
+from .states import RuntimeEvent, RuntimePhase, StepRecord
 from .stream.transformer import StreamTransformer, TransformerChain, TransformerOutput
-from ..models.base import ModelStreamChunk
 
 StateT = TypeVar("StateT", bound=StateSchema)
 ObservationT = TypeVar("ObservationT")
@@ -30,8 +27,9 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
     - ``await async_engine.arun(task)`` returns EngineResult
     - ``async for event in async_engine.arun_stream(task)`` yields EngineEvents
 
-    Internally delegates to a sync Engine but runs blocking calls in a
-    thread pool, and optionally uses Model.acall() when available.
+    Internally delegates to a sync Engine running on a daemon worker thread.
+    Cancellation remains cooperative, while an uncooperative provider or tool
+    cannot keep the hosting asyncio loop alive during process shutdown.
     """
 
     def __init__(
@@ -39,7 +37,10 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
         agent: AgentModule[StateT, ObservationT, ActionT],
         **engine_kwargs: Any,
     ):
-        self._engine = Engine(agent=agent, **engine_kwargs)
+        self._engine: Engine[StateT, ObservationT, ActionT] = Engine(
+            agent=agent,
+            **engine_kwargs,
+        )
         self.agent = self._engine.agent
         self.event_stream: Optional[EventStream] = None
 
@@ -50,8 +51,8 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
     async def arun(self, task: str, **kwargs: Any) -> EngineResult[StateT]:
         """Run the agent loop asynchronously, returning the final result.
 
-        This executes the sync Engine.run() in a thread pool to avoid
-        blocking the event loop.
+        This executes the sync Engine.run() on a daemon thread to avoid
+        blocking the event loop or interpreter shutdown.
 
         If the awaiting task is cancelled, the same cancellation signal is
         propagated to the underlying Engine. Note that a sync tool already
@@ -59,12 +60,17 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
         Python; it is asked to stop and drains on its own.
         """
         run_task = asyncio.ensure_future(
-            asyncio.to_thread(self._engine.run, task, **kwargs)
+            self._run_in_daemon_thread(lambda: self._engine.run(task, **kwargs))
         )
         try:
             return await asyncio.shield(run_task)
         except asyncio.CancelledError:
             self.cancel("immediate")
+            run_task.cancel()
+            try:
+                await run_task
+            except asyncio.CancelledError:
+                pass
             raise
 
     def cancel(self, mode: str = "immediate") -> None:
@@ -86,6 +92,86 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
 
         return self._engine.post_runtime_event(event, run_id=run_id)
 
+    async def _run_in_daemon_thread(
+        self,
+        callback: Callable[[], EngineResult[StateT]],
+    ) -> EngineResult[StateT]:
+        """Run one blocking Engine call without owning loop shutdown."""
+
+        loop = asyncio.get_running_loop()
+        result_future: asyncio.Future[EngineResult[StateT]] = loop.create_future()
+
+        def _set_result(result: EngineResult[StateT]) -> None:
+            if not result_future.done():
+                result_future.set_result(result)
+
+        def _set_exception(exc: BaseException) -> None:
+            if not result_future.done():
+                result_future.set_exception(exc)
+
+        def _worker() -> None:
+            try:
+                result = callback()
+            except BaseException as exc:
+                try:
+                    loop.call_soon_threadsafe(_set_exception, exc)
+                except RuntimeError:
+                    pass
+            else:
+                try:
+                    loop.call_soon_threadsafe(_set_result, result)
+                except RuntimeError:
+                    pass
+
+        threading.Thread(
+            target=_worker,
+            name="qitos-engine-run",
+            daemon=True,
+        ).start()
+        return await result_future
+
+    async def _stream_events(
+        self,
+        task: str,
+        **kwargs: Any,
+    ) -> AsyncIterator[EngineEvent]:
+        """Bridge one Engine run into a cancellation-safe event iterator."""
+
+        stream = EventStream()
+        self.event_stream = stream
+        hook = _StreamBridgeHook(stream)
+        self._engine.hooks.append(hook)
+
+        def _run() -> EngineResult[StateT]:
+            try:
+                return self._engine.run(task, **kwargs)
+            finally:
+                stream.close()
+
+        run_task = asyncio.ensure_future(self._run_in_daemon_thread(_run))
+        stream_exhausted = False
+        try:
+            async for event in stream:
+                yield event
+            stream_exhausted = True
+        finally:
+            self._engine.hooks = [
+                existing for existing in self._engine.hooks if existing is not hook
+            ]
+            if self.event_stream is stream:
+                self.event_stream = None
+
+            if stream_exhausted:
+                await run_task
+            else:
+                if not run_task.done():
+                    self.cancel("immediate")
+                    run_task.cancel()
+                try:
+                    await run_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
     async def arun_stream(
         self,
         task: str,
@@ -95,7 +181,7 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
     ) -> AsyncIterator[EngineEvent | TransformerOutput]:
         """Run the agent loop and yield structured events as they occur.
 
-        A sync Engine runs in a thread pool. Engine hooks bridge events
+        A sync Engine runs on a daemon worker. Engine hooks bridge events
         into the EventStream for async consumption.
 
         Parameters
@@ -107,26 +193,13 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
             and TransformerOutput values are yielded instead of raw events.
             Events that produce no TransformerOutput are suppressed.
         """
-        stream = EventStream()
-        self.event_stream = stream
         chain = TransformerChain(transformers) if transformers else None
-
-        hook = _StreamBridgeHook(stream)
-        self._engine.hooks.append(hook)
 
         if chain:
             chain.on_run_start()
 
-        def _run() -> EngineResult[StateT]:
-            try:
-                return self._engine.run(task, **kwargs)
-            finally:
-                stream.close()
-
-        run_task = asyncio.ensure_future(asyncio.to_thread(_run))
-
         try:
-            async for event in stream:
+            async for event in self._stream_events(task, **kwargs):
                 if chain:
                     outputs = await chain.aprocess(event)
                     for output in outputs:
@@ -136,16 +209,6 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
         finally:
             if chain:
                 chain.on_run_end()
-            self._engine.hooks = [
-                h for h in self._engine.hooks if h is not hook
-            ]
-            self.event_stream = None
-            if not run_task.done():
-                run_task.cancel()
-                try:
-                    await run_task
-                except (asyncio.CancelledError, Exception):
-                    pass
 
     def run(self, task: str, **kwargs: Any) -> EngineResult[StateT]:
         """Synchronous run (delegates to underlying Engine)."""
@@ -159,48 +222,11 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
         Yields EngineEvents including STEP_STREAM events that carry
         ModelStreamChunk payloads for real-time token display.
 
-        Falls back to arun_stream() if the model does not support streaming.
+        Uses the same event lifecycle as ``arun_stream()`` so cancellation and
+        terminal delivery remain identical.
         """
-        stream = EventStream()
-        self.event_stream = stream
-
-        hook = _StreamBridgeHook(stream)
-        self._engine.hooks.append(hook)
-
-        # Check if model supports streaming
-        llm = getattr(self.agent, "llm", None)
-        supports_streaming = hasattr(llm, "astream") if llm else False
-
-        if supports_streaming:
-            # Use streaming model path
-            from .states import RuntimePhase
-
-            def _run_stream() -> EngineResult[StateT]:
-                try:
-                    return self._engine.run(task, **kwargs)
-                finally:
-                    stream.close()
-
-            run_task = asyncio.ensure_future(asyncio.to_thread(_run_stream))
-
-            try:
-                async for event in stream:
-                    yield event
-            finally:
-                self._engine.hooks = [
-                    h for h in self._engine.hooks if h is not hook
-                ]
-                self.event_stream = None
-                if not run_task.done():
-                    run_task.cancel()
-                    try:
-                        await run_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-        else:
-            # Fallback: no streaming, just use arun_stream
-            async for event in self.arun_stream(task, **kwargs):
-                yield event
+        async for event in self._stream_events(task, **kwargs):
+            yield event
 
 
 class _StreamBridgeHook:

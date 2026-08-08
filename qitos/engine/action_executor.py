@@ -8,6 +8,7 @@ import threading
 import time
 from concurrent.futures import (
     FIRST_COMPLETED,
+    Future,
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
     wait,
@@ -117,6 +118,18 @@ class ActionExecutor:
         if token is None:
             return False
         return bool(getattr(token, "is_cancel_requested", False))
+
+    def _remaining_runtime_seconds(self) -> Optional[float]:
+        if self._engine is None:
+            return None
+        remaining = getattr(self._engine, "remaining_runtime_seconds", None)
+        if callable(remaining):
+            value = remaining()
+            return None if value is None else max(0.0, float(value))
+        deadline = getattr(self._engine, "runtime_deadline_monotonic", None)
+        if deadline is None:
+            return None
+        return max(0.0, float(deadline) - time.monotonic())
 
     def execute(
         self, actions: Sequence[Action], env: Optional[Env] = None, state: Any = None
@@ -470,14 +483,21 @@ class ActionExecutor:
         Precedence: ``Action.timeout_s`` override > ``ToolSpec.timeout_s``
         default > no timeout. Returns ``(timeout_s, source)``.
         """
+        timeout: Optional[float] = None
+        source = "none"
         action_timeout = getattr(action, "timeout_s", None)
         if action_timeout is not None and action_timeout > 0:
-            return float(action_timeout), "action"
-        if tool is not None:
+            timeout = float(action_timeout)
+            source = "action"
+        elif tool is not None:
             spec_timeout = getattr(getattr(tool, "spec", None), "timeout_s", None)
             if spec_timeout is not None and spec_timeout > 0:
-                return float(spec_timeout), "tool_spec"
-        return None, "none"
+                timeout = float(spec_timeout)
+                source = "tool_spec"
+        remaining = self._remaining_runtime_seconds()
+        if remaining is not None and (timeout is None or remaining < timeout):
+            return remaining, "runtime_deadline"
+        return timeout, source
 
     def _resolve_awaitable(self, value: Any, timeout_s: Optional[float]) -> Any:
         """Drive a coroutine/awaitable returned by a tool to completion.
@@ -529,32 +549,38 @@ class ActionExecutor:
         observed. Python cannot forcibly kill that thread, so a timeout is
         reported as such without claiming the worker was terminated.
         """
-        if timeout_s is None:
+        def _invoke() -> Any:
             output = self._call_tool(tool, name, args, runtime_context=runtime_context)
-            if inspect.isawaitable(output):
-                output = self._resolve_awaitable(output, None)
-            return output
-
-        # NOTE: deliberately not a `with` block — the context manager joins the
-        # worker on exit, which would block for the tool's full duration and
-        # defeat the timeout. We shut down without waiting and let the orphaned
-        # worker finish on its own (reported via `worker_still_running`).
-        pool = ThreadPoolExecutor(max_workers=1)
-        try:
-            future = pool.submit(
-                self._call_tool, tool, name, args, runtime_context=runtime_context
-            )
-            try:
-                output = future.result(timeout=timeout_s)
-            except FuturesTimeoutError as exc:
-                raise TimeoutError(
-                    f"action exceeded timeout of {timeout_s}s"
-                ) from exc
             if inspect.isawaitable(output):
                 output = self._resolve_awaitable(output, timeout_s)
             return output
-        finally:
-            pool.shutdown(wait=False)
+
+        if timeout_s is None:
+            return _invoke()
+
+        # A ThreadPoolExecutor registers non-daemon workers for interpreter
+        # shutdown, so shutdown(wait=False) still lets timed-out tools block
+        # process exit. A dedicated daemon worker preserves honest timeout
+        # reporting without turning an uncooperative tool into a CLI hang.
+        future: Future[Any] = Future()
+
+        def _run() -> None:
+            if not future.set_running_or_notify_cancel():
+                return
+            try:
+                future.set_result(_invoke())
+            except BaseException as exc:
+                future.set_exception(exc)
+
+        threading.Thread(
+            target=_run,
+            name=f"qitos-tool-{name}",
+            daemon=True,
+        ).start()
+        try:
+            return future.result(timeout=timeout_s)
+        except FuturesTimeoutError as exc:
+            raise TimeoutError(f"action exceeded timeout of {timeout_s}s") from exc
 
     def _execute_one(
         self,
@@ -586,6 +612,16 @@ class ActionExecutor:
         attempts = 0
         last_error = None
         tool_meta = self._tool_meta(action.name)
+        remaining = self._remaining_runtime_seconds()
+        if remaining is not None and remaining <= 0:
+            return self._deadline_result(
+                action=action,
+                start=start,
+                attempts=0,
+                tool_meta=tool_meta,
+                segment_index=segment_index,
+                started=False,
+            )
         protocol_error = str(action.metadata.get("protocol_error") or "").strip()
         if protocol_error:
             error_code = protocol_error.upper()
@@ -740,6 +776,16 @@ class ActionExecutor:
             _retryable_exceptions = (Exception,)
 
         while attempts < _max_attempts:
+            remaining = self._remaining_runtime_seconds()
+            if remaining is not None and remaining <= 0:
+                return self._deadline_result(
+                    action=action,
+                    start=start,
+                    attempts=attempts,
+                    tool_meta=tool_meta,
+                    segment_index=segment_index,
+                    started=attempts > 0,
+                )
             attempts += 1
             try:
                 tool = self._resolve_tool(action.name)
@@ -979,7 +1025,35 @@ class ActionExecutor:
                     delay = min(_backoff_factor * (2 ** (attempts - 1)), _max_backoff)
                     if _jitter:
                         delay = delay * (0.5 + random.random())
-                    time.sleep(delay)
+                    remaining = self._remaining_runtime_seconds()
+                    if remaining is not None and delay >= remaining:
+                        return self._deadline_result(
+                            action=action,
+                            start=start,
+                            attempts=attempts,
+                            tool_meta=tool_meta,
+                            segment_index=segment_index,
+                            started=True,
+                        )
+                    token = self._resolve_cancel_token()
+                    wait_for_cancel = getattr(token, "wait", None)
+                    if callable(wait_for_cancel) and wait_for_cancel(timeout=delay):
+                        return self._finish_result(
+                            action=action,
+                            status=ActionStatus.CANCELLED,
+                            start=start,
+                            attempts=attempts,
+                            tool_meta=tool_meta,
+                            error="action cancelled during retry backoff",
+                            extra_metadata={
+                                **ordering_meta,
+                                "error_category": "cancelled",
+                                "cancel_source": "cancel_token",
+                                "ended_at": time.time(),
+                            },
+                        )
+                    if not callable(wait_for_cancel):
+                        time.sleep(delay)
 
         error_category = "runtime_error"
         if last_error and "not found" in last_error.lower():
@@ -1011,6 +1085,34 @@ class ActionExecutor:
         if self._interceptor_chain is not None:
             error_result = self._interceptor_chain.after_execute(action, error_result, interceptor_context)
         return error_result
+
+    def _deadline_result(
+        self,
+        *,
+        action: Action,
+        start: float,
+        attempts: int,
+        tool_meta: Dict[str, Any],
+        segment_index: int,
+        started: bool,
+    ) -> ActionResult:
+        return self._finish_result(
+            action=action,
+            status=ActionStatus.TIMED_OUT,
+            start=start,
+            attempts=attempts,
+            tool_meta=tool_meta,
+            error="runtime deadline expired before tool completion",
+            extra_metadata={
+                "error_category": "timeout",
+                "timeout_source": "runtime_deadline",
+                "timeout_s": 0.0,
+                "segment_index": segment_index,
+                "started": started,
+                "worker_still_running": False,
+                "ended_at": time.time(),
+            },
+        )
 
     def _finish_result(
         self,
@@ -1077,6 +1179,12 @@ class ActionExecutor:
                 return False
             return bool(self._engine.post_runtime_event(event, run_id=active_run_id))
 
+        runtime_deadline = (
+            getattr(self._engine, "runtime_deadline_monotonic", None)
+            if self._engine is not None
+            else None
+        )
+
         return {
             "env": env,
             "environment_attestation": dict(
@@ -1094,6 +1202,9 @@ class ActionExecutor:
             "delegate_depth": self.delegate_depth,
             "parent_run_id": "",
             "post_runtime_event": _post_runtime_event,
+            "deadline_monotonic": runtime_deadline,
+            "remaining_seconds": self._remaining_runtime_seconds,
+            "agent_cancelled": self._is_cancelled,
             "trace_writer": self.trace_writer,
             "shared_memory": self.shared_memory,
             "agent": getattr(self._engine, "agent", None) if self._engine is not None else None,

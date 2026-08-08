@@ -202,7 +202,9 @@ class EngineResult(Generic[StateT]):
 
 <Accordion title="AsyncEngine">
 
-`AsyncEngine` 提供非阻塞的智能体执行能力。它封装了同样的 `Engine` 循环，但把阻塞调用放到线程池中执行，适用于 `asyncio` 事件循环。
+`AsyncEngine` 提供非阻塞的智能体执行能力。它把同一个 `Engine` 循环放到 daemon
+工作线程中，并协作式传递取消请求，因此无响应的同步调用不会无限占住事件循环或解释器
+退出。
 
 ```python
 class AsyncEngine(Generic[StateT, ObservationT, ActionT])

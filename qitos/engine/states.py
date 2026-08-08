@@ -36,6 +36,7 @@ class RuntimeBudget:
     max_steps: int = 10  # Default matches Engine's safe step limit
     max_runtime_seconds: Optional[float] = None
     max_tokens: Optional[int] = None
+    deadline_monotonic: Optional[float] = None
 
 
 @dataclass
