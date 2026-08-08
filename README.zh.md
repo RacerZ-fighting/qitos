@@ -22,6 +22,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   `ModelStreamChunk` 契约保留供应商终止原因、reasoning 与工具调用分片、完整工具调用
   及 usage。不完整的流会明确失败，不再伪造完成；发生错误后 Engine handler 也不会
   再收到正常 `on_end`。
+- **按调用准确统计 qita 工具状态**：工具次数与失败数现在来自 canonical action/result
+  配对，不会再把同一步中的一个失败错误归到所有调用上。精确生命周期计数以及无法配对
+  的 trace 证据都会保留供审计。
 - **类式工具只保留一个执行契约**：类式工具现在只暴露
   `execute(args, runtime_context)`。`ToolRegistry` 只做精确 canonical 名称查找，
   校验、权限、超时/重试、调用和结果归一化统一由 `ActionExecutor` 负责。旧的

@@ -88,6 +88,10 @@ qita board --logdir ./runs --host 0.0.0.0 --port 9000
 - **评估器**：评估器输出
 - **追踪事件**：该步骤的原始 `RuntimeEvent`
 
+qita 会优先按 `action_id`，否则按 Engine 原始顺序把每个动作与结果配对。工具统计复用
+同一配对，因此一个失败结果只会归到对应调用；每个精确生命周期状态都会单独计数，
+`unmatched_actions` 与 `unmatched_results` 则直接暴露不完整的 trace 闭包，不会猜测归属。
+
 左侧**步骤导航器**支持：
 
 - 全文过滤

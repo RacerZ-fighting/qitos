@@ -22,6 +22,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   provider finish reasons, reasoning and tool-call deltas, completed tool calls, and
   usage through one `ModelStreamChunk` contract. Incomplete streams fail instead of
   fabricating completion, and Engine handlers no longer receive `on_end` after an error.
+- **Call-accurate qita tool statistics**: tool counts and failures now come from the
+  canonical action/result pairing instead of applying one step-level error to every
+  call. Exact lifecycle counts and unmatched trace evidence remain visible for audits.
 - **One bounded model-request lifecycle**: every Engine model call now receives the
   run's absolute deadline and immediate cancellation signal. Provider timeouts and
   QitOS-owned retry backoff use live remaining time, SDK retries stay disabled, late

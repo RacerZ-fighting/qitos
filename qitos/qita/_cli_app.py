@@ -690,8 +690,9 @@ def _discover_runs(logdir: Path) -> List[Dict[str, Any]]:
         events = _load_jsonl(p / "events.jsonl")
         steps = _load_jsonl(p / "steps.jsonl")
         grouped_events = _group_events_by_step(events)
+        step_interactions = _build_step_interactions(steps, grouped_events)
         step_summaries = _build_step_summaries(steps, grouped_events)
-        tool_stats = _build_tool_stats(steps)
+        tool_stats = _build_tool_stats(step_interactions)
         phase_stats = _build_phase_stats(events)
         insights = _build_insights(manifest, step_summaries, tool_stats)
         step_focus = _build_step_focus(steps, step_summaries, grouped_events)
@@ -770,7 +771,7 @@ def _load_run_payload(run_dir: Path) -> Dict[str, Any]:
     grouped_events = _group_events_by_step(events)
     step_interactions = _build_step_interactions(steps, grouped_events)
     step_summaries = _build_step_summaries(steps, grouped_events)
-    tool_stats = _build_tool_stats(steps)
+    tool_stats = _build_tool_stats(step_interactions)
     phase_stats = _build_phase_stats(events)
     insights = _build_insights(manifest, step_summaries, tool_stats)
     step_focus = _build_step_focus(steps, step_summaries, grouped_events)
@@ -1455,29 +1456,45 @@ def _build_step_summaries(
     return summaries
 
 
-def _build_tool_stats(steps: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _build_tool_stats(step_interactions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate tools from the canonical action/result pairing."""
+
     by_tool: Dict[str, Dict[str, Any]] = {}
+    status_counts: Dict[str, int] = {}
     total = 0
     errors = 0
-    for step in steps:
-        actions = step.get("actions")
-        if not isinstance(actions, list):
-            actions = []
-        step_error = False
-        action_results = step.get("action_results")
-        if isinstance(action_results, list):
-            step_error = any(bool(_result_error(result)) for result in action_results)
-        for action in actions:
-            if not isinstance(action, dict):
+    unmatched_actions = 0
+    unmatched_results = 0
+    for interaction in step_interactions:
+        unmatched_actions += len(interaction.get("unmatched_actions") or [])
+        unmatched_results += len(interaction.get("unmatched_results") or [])
+        calls = interaction.get("calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, dict):
                 continue
-            name = _action_name(action)
-            item = by_tool.setdefault(name, {"count": 0, "errors": 0})
+            name = str(call.get("tool_name") or "action")
+            status = str(call.get("status") or "not_recorded").strip().lower()
+            item = by_tool.setdefault(
+                name,
+                {"count": 0, "errors": 0, "status_counts": {}},
+            )
             item["count"] += 1
+            item["status_counts"][status] = item["status_counts"].get(status, 0) + 1
+            status_counts[status] = status_counts.get(status, 0) + 1
             total += 1
-            if step_error:
+            if status != "success":
                 item["errors"] += 1
                 errors += 1
-    return {"total": total, "errors": errors, "by_tool": by_tool}
+    return {
+        "total": total,
+        "errors": errors,
+        "status_counts": status_counts,
+        "unmatched_actions": unmatched_actions,
+        "unmatched_results": unmatched_results,
+        "by_tool": by_tool,
+    }
 
 
 def _build_phase_stats(events: List[Dict[str, Any]]) -> Dict[str, Any]:

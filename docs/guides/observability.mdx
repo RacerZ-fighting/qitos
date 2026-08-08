@@ -103,6 +103,11 @@ For each action call, qita prefers an explicit `action_id` when pairing results.
 
 The run API exposes this derived view as optional `step_interactions`. It is a qita presentation model, not a new stable core trace schema; `manifest.json`, `events.jsonl`, and `steps.jsonl` remain unchanged.
 
+The `tool_stats` projection is computed from those same pairs. One failed result is
+attributed only to its matching call, every exact lifecycle status has a count, and
+`unmatched_actions` / `unmatched_results` expose incomplete trace closure rather than
+guessing a pairing.
+
 Numbered call badges select and locate calls without hiding repeated tool names. Failed, blocked, `NO_TRIGGER`, and submission-error calls expand automatically; successful and verified calls stay folded until needed. On narrow screens, the causal chain and Inspector stack vertically without horizontal page overflow.
 
 Long evidence is not truncated as the only available view. qita uses short status labels for scanning, then keeps the full input, thought, raw model output, action parameters, tool results, environment observations, terminal output, parser diagnostics, critic output, and raw JSON in expandable scrollable detail blocks.

@@ -102,6 +102,9 @@ How to update:
   retains incremental and completed tool calls, incomplete streams fail explicitly,
   and rich Engine handlers can observe normalized chunks or failures without receiving
   a false normal-end callback.
+- Fixed qita tool statistics attributing one failed result to every action in the same
+  step. Statistics now use the canonical action/result pairing, retain exact lifecycle
+  counts, and expose unmatched actions or results as trace-closure gaps.
 - Fixed model requests and streams outliving the Engine deadline, late responses being
   accepted as successful decisions, async Responses completion bypassing QitOS retry,
   Azure retaining SDK retries, and provider attempts reusing stale timeout values.

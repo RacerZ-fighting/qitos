@@ -743,6 +743,25 @@ def test_run_page_preserves_long_content_in_expandable_details(tmp_path: Path):
     assert len(interaction["calls"]) == 2
     assert interaction["calls"][0]["status"] == "error"
     assert interaction["calls"][1]["status"] == "success"
+    assert payload["tool_stats"] == {
+        "total": 2,
+        "errors": 1,
+        "status_counts": {"error": 1, "success": 1},
+        "unmatched_actions": 0,
+        "unmatched_results": 0,
+        "by_tool": {
+            "inspect": {
+                "count": 1,
+                "errors": 1,
+                "status_counts": {"error": 1},
+            },
+            "submit_candidate": {
+                "count": 1,
+                "errors": 0,
+                "status_counts": {"success": 1},
+            },
+        },
+    }
     assert "LONG_TERMINAL_END" in json.dumps(interaction, ensure_ascii=False)
     assert "LONG_OBSERVATION_END" in json.dumps(interaction, ensure_ascii=False)
     assert "Action Calls" in view

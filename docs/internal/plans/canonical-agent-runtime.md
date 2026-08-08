@@ -149,6 +149,10 @@ for every maintained built-in tool family.
 - [ ] Add a deterministic same-spec A/B harness and semantic trace-closure checks before
   running optional live benchmark slices.
 
+Progress (2026-08-08): qita now derives tool statistics from its canonical per-call
+action/result pairing. Exact lifecycle counts and unmatched action/result evidence make
+trace-closure gaps visible without assigning a step-level failure to unrelated calls.
+
 Done when PentestAgent keeps its Planner/Facts/AuthSession/Artifact/Shell boundaries,
 passes `make check`, and produces a closed QitOS transcript with no parser salvage on a
 native-capable Worker.
