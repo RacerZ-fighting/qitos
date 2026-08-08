@@ -46,6 +46,18 @@ Responses 模式支持同步、异步和类型化流式调用。工具循环期�
 
 Reasoning item 被视为不透明的续接状态。追踪摘要只保留安全的 item 描述与供应商允许的摘要，并排除加密 reasoning 续接内容。
 
+### Reasoning 强度与续接
+
+`build_model_for_preset(...)` 接受统一的 `reasoning_effort`：`low`、`medium`、
+`high`、`xhigh` 或 `max`。QitOS 会根据所选模型族只解析一次，并让同步、异步和
+流式请求共用解析后的请求默认值。不受支持的级别会映射到最接近的已声明级别；
+例如 GPT-5.6 会保留 `max`，较旧的 OpenAI policy 则上限为 `xhigh`。
+
+对于官方 OpenAI Responses 请求，QitOS 会请求 `reasoning.encrypted_content`，
+保留 output-item 事件先于最终响应送达的字段，并在下一轮工具调用中按顺序原样重放。
+Kimi 等兼容供应商不会收到这个 OpenAI 专属的 `include` 值。兼容 Chat 返回的
+`reasoning_content` 只作为续接元数据保存，不会在可见答案为空时被冒充为最终回答。
+
 ## AgentModule.run() 参数
 
 这些参数都可以直接传给 `agent.run(task, ...)`：

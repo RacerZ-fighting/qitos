@@ -15,6 +15,7 @@ _RESPONSES_REQUIREMENT = (
     "api_mode='responses' requires openai>=1.66.0 and an endpoint "
     "that implements POST /v1/responses"
 )
+_OPAQUE_REASONING_INCLUDE = "reasoning.encrypted_content"
 
 
 def _normalize_api_mode(value: Any) -> str:
@@ -290,6 +291,7 @@ def _request_payload(
     messages: List[Dict[str, Any]],
     kwargs: Dict[str, Any],
     *,
+    provider: str,
     stream: bool = False,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
@@ -301,6 +303,18 @@ def _request_payload(
     if stream:
         payload["stream"] = True
     payload.update(_normalize_request_kwargs(kwargs))
+    family = str(getattr(adapter, "qitos_family_preset", "") or "").casefold()
+    if provider.casefold() == "openai" or family == "openai":
+        configured = payload.get("include")
+        if isinstance(configured, (list, tuple)):
+            include = list(configured)
+        elif configured is None:
+            include = []
+        else:
+            include = [configured]
+        if _OPAQUE_REASONING_INCLUDE not in include:
+            include.append(_OPAQUE_REASONING_INCLUDE)
+        payload["include"] = include
     return payload
 
 
@@ -312,7 +326,9 @@ def _responses_completion(
     provider: str,
     **kwargs: Any,
 ) -> ModelResponse:
-    response = _responses_create(client)(**_request_payload(adapter, messages, kwargs))
+    response = _responses_create(client)(
+        **_request_payload(adapter, messages, kwargs, provider=provider)
+    )
     normalized = _model_response_from_responses(response, provider=provider)
     adapter._set_last_usage(normalized.usage)
     return normalized
@@ -327,7 +343,7 @@ async def _async_responses_completion(
     **kwargs: Any,
 ) -> ModelResponse:
     response = await _responses_create(client)(
-        **_request_payload(adapter, messages, kwargs)
+        **_request_payload(adapter, messages, kwargs, provider=provider)
     )
     normalized = _model_response_from_responses(response, provider=provider)
     adapter._set_last_usage(normalized.usage)
@@ -404,6 +420,57 @@ def _event_chunk(
     return None, None, None
 
 
+def _native_item_identity(item: Dict[str, Any]) -> tuple[str, str] | None:
+    item_id = str(item.get("id") or "").strip()
+    if item_id:
+        return "id", item_id
+    call_id = str(item.get("call_id") or "").strip()
+    item_type = str(item.get("type") or "").strip()
+    if call_id and item_type:
+        return item_type, call_id
+    return None
+
+
+def _merge_completed_output(
+    response: Any,
+    completed_items: List[Dict[str, Any]],
+) -> Any:
+    """Overlay final output onto event items without dropping opaque fields."""
+    if not completed_items:
+        return response
+    payload = _native_value(response)
+    if not isinstance(payload, dict):
+        return response
+    raw_output = payload.get("output")
+    output = (
+        [dict(item) for item in raw_output if isinstance(item, dict)]
+        if isinstance(raw_output, list)
+        else []
+    )
+    completed_by_id = {
+        identity: dict(item)
+        for item in completed_items
+        if (identity := _native_item_identity(item)) is not None
+    }
+    merged: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in output:
+        identity = _native_item_identity(item)
+        event_item = completed_by_id.get(identity) if identity is not None else None
+        merged.append({**event_item, **item} if event_item is not None else item)
+        if identity is not None:
+            seen.add(identity)
+    for item in completed_items:
+        identity = _native_item_identity(item)
+        if identity is not None and identity in seen:
+            continue
+        if identity is None and item in merged:
+            continue
+        merged.append(dict(item))
+    payload["output"] = merged
+    return payload
+
+
 def _final_stream_chunk(
     adapter: Model,
     response: Any,
@@ -424,7 +491,10 @@ def _final_stream_chunk(
             event_type="response.completed",
             event_metadata=dict(normalized.metadata),
         )
-    normalized = _model_response_from_responses(response, provider=provider)
+    normalized = _model_response_from_responses(
+        _merge_completed_output(response, completed_items),
+        provider=provider,
+    )
     adapter._set_last_usage(normalized.usage)
     return ModelStreamChunk(
         text="",
@@ -447,7 +517,13 @@ def _responses_stream(
     **kwargs: Any,
 ) -> Iterator[ModelStreamChunk]:
     events = _responses_create(client)(
-        **_request_payload(adapter, messages, kwargs, stream=True)
+        **_request_payload(
+            adapter,
+            messages,
+            kwargs,
+            provider=provider,
+            stream=True,
+        )
     )
     completed_items: List[Dict[str, Any]] = []
     completed_response: Any = None
@@ -482,7 +558,13 @@ async def _async_responses_stream(
     require_completed: bool = False,
     **kwargs: Any,
 ) -> AsyncIterator[ModelStreamChunk]:
-    payload = _request_payload(adapter, messages, kwargs, stream=True)
+    payload = _request_payload(
+        adapter,
+        messages,
+        kwargs,
+        provider=provider,
+        stream=True,
+    )
     policy = getattr(adapter, "retry_policy", None)
     if retry_events and isinstance(policy, ModelRetryPolicy):
         events = stream_with_retry(

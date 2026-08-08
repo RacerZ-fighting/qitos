@@ -23,6 +23,7 @@ def test_resolve_family_preset_for_gold_families() -> None:
     assert resolve_family_preset("moonshot-v1-128k").id == "kimi"
     assert resolve_family_preset("MiniMax-M2.5").id == "minimax"
     assert resolve_family_preset("gpt-oss-120b").id == "gpt-oss"
+    assert resolve_family_preset("gpt-5.6-luna").id == "openai"
     assert resolve_family_preset("gemma-4-31b-it").id == "gemma-4"
 
 

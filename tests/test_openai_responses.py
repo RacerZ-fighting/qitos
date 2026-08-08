@@ -521,11 +521,18 @@ def test_official_openai_model_uses_responses_endpoint(
         api_mode="responses",
     )
 
-    result = model.call_raw([{"role": "user", "content": "calculate"}])
+    result = model.call_raw(
+        [{"role": "user", "content": "calculate"}],
+        include=["file_search_call.results"],
+    )
 
     assert isinstance(result, ModelResponse)
     assert result.provider == "openai"
     assert calls[0]["input"] == [{"role": "user", "content": "calculate"}]
+    assert calls[0]["include"] == [
+        "file_search_call.results",
+        "reasoning.encrypted_content",
+    ]
 
 
 def test_responses_mode_never_falls_back_to_chat(
@@ -554,6 +561,13 @@ def test_responses_stream_emits_typed_text_and_completed_tool_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     completed_response = _response_with_function_calls()
+    reasoning_event_item = completed_response.output[0]
+    completed_response.output[0] = SimpleNamespace(
+        type="reasoning",
+        id="rs_1",
+        status="completed",
+        summary=[{"type": "summary_text", "text": "Need a tool."}],
+    )
     events = iter(
         [
             SimpleNamespace(
@@ -579,14 +593,20 @@ def test_responses_stream_emits_typed_text_and_completed_tool_call(
             ),
             SimpleNamespace(
                 type="response.output_item.done",
-                item=completed_response.output[1],
+                item=reasoning_event_item,
                 sequence_number=4,
+                output_index=0,
+            ),
+            SimpleNamespace(
+                type="response.output_item.done",
+                item=completed_response.output[1],
+                sequence_number=5,
                 output_index=1,
             ),
             SimpleNamespace(
                 type="response.completed",
                 response=completed_response,
-                sequence_number=5,
+                sequence_number=6,
             ),
         ]
     )
@@ -618,11 +638,24 @@ def test_responses_stream_emits_typed_text_and_completed_tool_call(
     completed_item = [
         chunk for chunk in chunks if chunk.event_type == "response.output_item.done"
     ]
-    assert completed_item[0].native_items[0]["call_id"] == "call_1"
+    completed_function = next(
+        chunk
+        for chunk in completed_item
+        if chunk.native_items[0].get("type") == "function_call"
+    )
+    assert completed_function.native_items[0]["call_id"] == "call_1"
     assert chunks[-1].done is True
     assert chunks[-1].tool_calls
     assert chunks[-1].tool_calls[0]["id"] == "call_1"
     assert chunks[-1].native_items
+    final_reasoning = next(
+        item for item in chunks[-1].native_items if item["type"] == "reasoning"
+    )
+    assert final_reasoning["encrypted_content"] == "opaque-private-state"
+    replay = responses_module._to_responses_input(
+        [{"role": "assistant", "content": None, "native_items": chunks[-1].native_items}]
+    )
+    assert next(item for item in replay if item["type"] == "reasoning") == final_reasoning
     assert chunks[-1].usage["prompt_tokens"] == 11
 
 

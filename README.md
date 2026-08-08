@@ -18,6 +18,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Provider-consistent reasoning continuation**: model presets now resolve GPT-5.6
+  `max` without changing older OpenAI capability limits, forced compatible-tool calls
+  cannot send contradictory thinking controls, and official Responses streams preserve
+  encrypted reasoning items for stateless replay without exposing them in trace
+  summaries or visible answers.
 - **Run-scoped deadlines and bounded async shutdown**: relative runtime budgets and
   caller-supplied monotonic deadlines now resolve to one effective deadline shared by
   the Engine, tool admission, tool timeouts, retry backoff, and runtime waits. Async

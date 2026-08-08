@@ -49,6 +49,9 @@ How to update:
 
 ### Changed
 
+- Reasoning effort now resolves through model-specific preset capabilities across sync,
+  async, and streaming request defaults. GPT-5.6 accepts `max`; older OpenAI models keep
+  their existing `xhigh` ceiling.
 - Context control now measures the complete provider input, including native tool
   schemas and response schemas, and forces transaction-safe compaction at 80% of
   the provider-safe input budget. `CompactHistory` uses three bounded levels
@@ -85,6 +88,10 @@ How to update:
 
 ### Fixed
 
+- Fixed forced compatible-Chat tool calls sending contradictory reasoning controls,
+  official Responses requests omitting encrypted continuation fields, streamed output
+  item data being overwritten by `response.completed`, and reasoning-only content being
+  promoted to a visible final answer.
 - Fixed runtime deadlines being checked only at Engine step boundaries. The effective
   deadline now clamps tool admission, execution timeout, retry backoff, and runtime
   waits. Timed-out synchronous tools use daemon workers so an orphan cannot block

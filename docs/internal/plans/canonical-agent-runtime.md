@@ -66,11 +66,16 @@ end-to-end child cleanup remain open.
 
 - [ ] Define complete transcript transactions and make all history policies compact or
   trim only at their boundaries.
-- [ ] Preserve opaque provider continuation/reasoning items needed by the next request.
+- [x] Preserve opaque provider continuation/reasoning items needed by the next request.
 - [ ] Bound tool projections and record truncation/compaction metadata without rewriting
   retained messages.
-- [ ] Resolve reasoning effort through one provider capability path for sync, async, and
+- [x] Resolve reasoning effort through one provider capability path for sync, async, and
   streaming requests.
+
+Progress (2026-08-08): provider presets resolve one reasoning request default for all
+OpenAI-compatible invocation paths. GPT-5.6 keeps `max`; forced Chat tool calls remove
+conflicting controls. Official Responses requests retain encrypted item fields across
+stream completion and stateless replay while summaries omit the opaque payload.
 
 Done when full and compacted runs produce equivalent tool/final behavior in a scripted
 model fixture, and provider request tests cover every supported reasoning level.

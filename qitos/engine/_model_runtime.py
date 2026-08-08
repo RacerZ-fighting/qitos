@@ -2491,9 +2491,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         parts.append(str(getattr(item, "text")))
                 if parts:
                     return "\n".join(parts)
-            reasoning = raw_output.get("reasoning_content")
-            if isinstance(reasoning, str):
-                return reasoning
             tool_calls = raw_output.get("tool_calls")
             if isinstance(tool_calls, list) and tool_calls:
                 return ""
@@ -2530,9 +2527,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         parts.append(str(getattr(item, "text")))
                 if parts:
                     return "\n".join(parts)
-            reasoning = getattr(message, "reasoning_content", None)
-            if isinstance(reasoning, str):
-                return reasoning
             text = getattr(message, "text", None)
             if isinstance(text, str):
                 return text

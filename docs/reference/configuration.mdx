@@ -58,6 +58,22 @@ Reasoning items are treated as opaque continuation state. Trace summaries keep
 safe item descriptors and provider-authorized summaries, but omit encrypted
 reasoning continuation payloads.
 
+### Reasoning effort and continuation
+
+`build_model_for_preset(...)` accepts one provider-neutral `reasoning_effort` value:
+`low`, `medium`, `high`, `xhigh`, or `max`. QitOS resolves it once against the
+selected model-family policy and shares the resulting request defaults across sync,
+async, and streaming calls. Unsupported values map to the nearest advertised level;
+for example, GPT-5.6 preserves `max`, while the older OpenAI policy caps it at
+`xhigh`.
+
+For official OpenAI Responses requests, QitOS asks for
+`reasoning.encrypted_content`, preserves fields delivered by output-item events, and
+replays the ordered native items on the next tool round. It does not add that
+OpenAI-only `include` value to compatible providers such as Kimi. Compatible Chat
+`reasoning_content` remains continuation metadata and is never substituted for an
+empty visible answer.
+
 ### OpenAI-compatible retry and stream deadlines
 
 `OpenAICompatibleModel` accepts the following transport controls:

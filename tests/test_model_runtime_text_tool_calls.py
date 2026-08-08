@@ -127,7 +127,7 @@ def test_extract_response_text_preserves_object_message_content_when_tool_calls_
     assert text == "Conclusion: likely 1-byte trigger. Next: write and submit."
 
 
-def test_extract_response_text_uses_reasoning_content_when_content_is_empty():
+def test_extract_response_text_keeps_reasoning_separate_when_content_is_empty():
     engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
     runtime = engine._model_runtime
     raw = SimpleNamespace(
@@ -144,9 +144,10 @@ def test_extract_response_text_uses_reasoning_content_when_content_is_empty():
         )
     )
 
-    text = runtime._extract_response_text(raw)
-
-    assert text == "Conclusion: the checksum logic is the trigger. Next: write a candidate."
+    assert runtime._extract_response_text(raw) == ""
+    assert runtime._extract_reasoning_content(raw) == (
+        "Conclusion: the checksum logic is the trigger. Next: write a candidate."
+    )
 
 
 def test_extract_response_text_empty_for_tool_calls_without_content_or_reasoning():

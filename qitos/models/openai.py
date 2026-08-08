@@ -213,18 +213,25 @@ def _disable_thinking_for_forced_tool_choice(kwargs: Dict[str, Any]) -> Dict[str
     if not _is_forced_tool_choice(kwargs.get("tool_choice")):
         return kwargs
     result = dict(kwargs)
+    disabled_thinking = False
     if "enable_thinking" in result:
         result["enable_thinking"] = False
+        disabled_thinking = True
     if "thinking" in result:
         result["thinking"] = {"type": "disabled"}
+        disabled_thinking = True
     extra_body = result.get("extra_body")
     if isinstance(extra_body, dict):
         patched_extra = dict(extra_body)
         if "enable_thinking" in patched_extra:
             patched_extra["enable_thinking"] = False
+            disabled_thinking = True
         if "thinking" in patched_extra:
             patched_extra["thinking"] = {"type": "disabled"}
+            disabled_thinking = True
         result["extra_body"] = patched_extra
+    if disabled_thinking:
+        result.pop("reasoning_effort", None)
     return result
 
 

@@ -594,24 +594,30 @@ def test_openai_compatible_model_disables_thinking_for_forced_tool_choice(
         [{"role": "user", "content": "Call a tool"}],
         tools=[{"type": "function", "function": {"name": "greet"}}],
         tool_choice="required",
+        reasoning_effort="max",
         extra_body={"enable_thinking": True},
     )
     llm.call_raw(
         [{"role": "user", "content": "Maybe call a tool"}],
         tools=[{"type": "function", "function": {"name": "greet"}}],
         tool_choice="auto",
+        reasoning_effort="max",
         extra_body={"enable_thinking": True},
     )
     llm.call_raw(
         [{"role": "user", "content": "Call greet"}],
         tools=[{"type": "function", "function": {"name": "greet"}}],
         tool_choice={"type": "function", "function": {"name": "greet"}},
+        reasoning_effort="max",
         extra_body={"thinking": {"type": "enabled"}},
     )
 
     assert captured[0]["extra_body"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in captured[0]
     assert captured[1]["extra_body"] == {"enable_thinking": True}
+    assert captured[1]["reasoning_effort"] == "max"
     assert captured[2]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in captured[2]
 
 
 def test_explicit_provider_override_wins(monkeypatch) -> None:

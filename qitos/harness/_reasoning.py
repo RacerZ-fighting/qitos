@@ -83,6 +83,10 @@ _OPENAI_REASONING_POLICY = ReasoningPolicy(
     ),
     wire_format="openai_effort",
 )
+_OPENAI_GPT_56_REASONING_POLICY = ReasoningPolicy(
+    supported_efforts=(*_OPENAI_REASONING_POLICY.supported_efforts, ReasoningEffort.MAX),
+    wire_format="openai_effort",
+)
 _GLM_52_POLICY = ReasoningPolicy(
     supported_efforts=(ReasoningEffort.HIGH, ReasoningEffort.MAX),
     wire_format="glm_effort",
@@ -147,6 +151,8 @@ def _policy_for_model(family_id: str, model_name: str) -> ReasoningPolicy:
         return _GLM_52_POLICY
     if family == "glm" and model.startswith("glm-"):
         return _THINKING_OBJECT_POLICY
+    if family == "openai" and model.startswith("gpt-5.6"):
+        return _OPENAI_GPT_56_REASONING_POLICY
     if family == "openai" and model.startswith(("gpt-5", "o3", "o4", "codex")):
         return _OPENAI_REASONING_POLICY
     return _DEFAULT_POLICY

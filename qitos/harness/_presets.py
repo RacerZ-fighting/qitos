@@ -180,7 +180,14 @@ _PRESETS: tuple[FamilyPreset, ...] = (
     FamilyPreset(
         id="openai",
         display_name="OpenAI",
-        model_matchers=("gpt-4.1", "gpt-4o", "o3", "o4-mini", "chatgpt-4o"),
+        model_matchers=(
+            "gpt-5",
+            "gpt-4.1",
+            "gpt-4o",
+            "o3",
+            "o4-mini",
+            "chatgpt-4o",
+        ),
         adapter_kind="openai-compatible",
         default_protocol="json_decision_v1",
         fallback_protocols=("react_text_v1",),
