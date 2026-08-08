@@ -1244,7 +1244,7 @@ def test_engine_salvages_glm_text_tool_call_markup_before_parser():
     assert record.model_response["tool_calls"][0]["function"]["name"] == "add"
 
 
-def test_engine_native_tool_call_lane_falls_back_to_parser_on_bad_arguments():
+def test_engine_native_tool_call_lane_returns_paired_error_on_bad_arguments():
     class _BadArgsModel:
         model = "qwen-plus"
 
@@ -1257,11 +1257,14 @@ def test_engine_native_tool_call_lane_falls_back_to_parser_on_bad_arguments():
                     "native_tool_call_preferred": True,
                 },
             }
+            self.calls: list[list[dict[str, Any]]] = []
 
         def call_raw(self, messages):
-            _ = messages
+            self.calls.append(messages)
+            if len(self.calls) > 1:
+                return {"content": "Final Answer: recovered", "tool_calls": []}
             return {
-                "content": "Final Answer: recovered",
+                "content": "Final Answer: must not bypass the invalid call",
                 "tool_calls": [
                     {
                         "id": "call_1",
@@ -1274,28 +1277,34 @@ def test_engine_native_tool_call_lane_falls_back_to_parser_on_bad_arguments():
     class _Agent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _BadArgsModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
 
         def decide(self, state: DemoState, observation: dict[str, Any]):
-            _ = observation
-            if state.current_step > 0:
-                return Decision.final("done")
+            _ = state, observation
             return None
 
-    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=3)).run("compute")
+    model = _BadArgsModel()
+    agent = _Agent()
+    result = Engine(agent=agent, budget=RuntimeBudget(max_steps=3)).run("compute")
+
+    assert len(model.calls) == 2
     assert result.state.final_result == "recovered"
     record = result.records[0]
-    assert record.decision_source == "parser"
-    assert record.native_tool_call_used is False
-    assert record.native_tool_call_fallback_reason == "tool_call_arguments_invalid"
-    fallback_events = [
-        e
-        for e in result.events
-        if getattr(e.phase, "value", e.phase) == "DECIDE"
-        and (e.payload or {}).get("stage") == "native_tool_call_fallback"
+    assert record.decision_source == "native_tool_calls"
+    assert record.native_tool_call_used is True
+    assert record.native_tool_call_fallback_reason is None
+    assert record.tool_invocations[0]["action_id"] == "call_1"
+    assert record.tool_invocations[0]["attempts"] == 0
+    assert record.tool_invocations[0]["error_category"] == (
+        "tool_call_arguments_invalid"
+    )
+    assert record.action_results[0].status == "error"
+    assert "TOOL_CALL_ARGUMENTS_INVALID" in record.action_results[0].output
+    tool_messages = [
+        message for message in model.calls[1] if message.get("role") == "tool"
     ]
-    assert fallback_events
+    assert [message.get("tool_call_id") for message in tool_messages] == ["call_1"]
 
 
 def test_engine_native_tool_call_lane_repairs_control_chars_in_arguments():

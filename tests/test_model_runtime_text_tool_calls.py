@@ -369,6 +369,121 @@ def test_native_tool_call_history_keeps_assistant_text_and_tool_calls():
     assert first.tool_calls[0]["function"]["name"] == "add"
 
 
+def test_native_tool_calls_bypass_agent_text_interpreter():
+    interpreted: list[ModelResponse] = []
+
+    class _NativeResponseModel:
+        model = "native-model"
+        qitos_harness_metadata = {
+            "tool_policy": {"native_tool_call_preferred": True}
+        }
+
+        def __call__(self, messages):
+            _ = messages
+            return {
+                "content": "I will calculate this with the add tool.",
+                "finish_reason": "tool_calls",
+                "tool_calls": [
+                    {
+                        "id": "call_native_add",
+                        "type": "function",
+                        "function": {
+                            "name": "add",
+                            "arguments": '{"a": 20, "b": 22}',
+                        },
+                    }
+                ],
+            }
+
+    class _InterpretingAgent(_ToolCallAgent):
+        def interpret_model_response(self, state, observation, response):
+            _ = state, observation
+            interpreted.append(response)
+            return Decision.final("incorrect interpreter final")
+
+    agent = _InterpretingAgent(llm=_NativeResponseModel())
+    result = Engine(agent=agent, budget=RuntimeBudget(max_steps=2)).run("compute")
+
+    assert interpreted == []
+    assert result.state.final_result == "done"
+    assert result.records[0].decision_source == "native_tool_calls"
+    assert result.records[0].native_tool_call_used is True
+    assert result.records[0].action_results[0].output == 42
+    assistant_messages = [m for m in agent.history.messages if m.role == "assistant"]
+    tool_messages = [m for m in agent.history.messages if m.role == "tool"]
+    assert assistant_messages[0].tool_calls[0]["id"] == "call_native_add"
+    assert tool_messages[0].tool_call_id == "call_native_add"
+
+
+def test_mixed_native_tool_batch_commits_each_result_once_in_call_order():
+    blocked_tool_executed = False
+
+    class _MixedToolModel:
+        model = "native-model"
+        qitos_harness_metadata = {
+            "tool_policy": {"native_tool_call_preferred": True}
+        }
+
+        def __call__(self, messages):
+            _ = messages
+            return {
+                "content": None,
+                "finish_reason": "tool_calls",
+                "tool_calls": [
+                    {
+                        "id": "call_add",
+                        "type": "function",
+                        "function": {
+                            "name": "add",
+                            "arguments": '{"a": 20, "b": 22}',
+                        },
+                    },
+                    {
+                        "id": "call_blocked",
+                        "type": "function",
+                        "function": {
+                            "name": "blocked_tool",
+                            "arguments": "{}",
+                        },
+                    },
+                ],
+            }
+
+    class _MixedToolAgent(_ToolCallAgent):
+        def __init__(self):
+            super().__init__(llm=_MixedToolModel())
+
+            @tool(name="blocked_tool")
+            def blocked_tool() -> str:
+                nonlocal blocked_tool_executed
+                blocked_tool_executed = True
+                return "must not execute"
+
+            self.tool_registry.register(blocked_tool)
+
+        def block_action(self, state, action):
+            _ = state
+            if action.name == "blocked_tool":
+                return "blocked by test policy"
+            return None
+
+    agent = _MixedToolAgent()
+    result = Engine(agent=agent, budget=RuntimeBudget(max_steps=2)).run("compute")
+
+    assert result.state.final_result == "done"
+    assert blocked_tool_executed is False
+    assert [item.output for item in result.records[0].action_results] == [
+        42,
+        {
+            "status": "blocked",
+            "message": "blocked by test policy",
+            "tool_name": "blocked_tool",
+        },
+    ]
+    tool_messages = [m for m in agent.history.messages if m.role == "tool"]
+    assert [m.tool_call_id for m in tool_messages] == ["call_add", "call_blocked"]
+
+
 def test_parser_tool_actions_use_the_same_assistant_tool_result_history_chain():
     class _ParserToolModel:
         model = "parser-model"

@@ -65,6 +65,11 @@ How to update:
 
 ### Fixed
 
+- Fixed native-capable agent turns so provider `tool_calls` are authoritative before
+  custom text interpreters or parsers, API-delivered tools no longer receive a second
+  framework text action contract, malformed native arguments produce a paired recoverable
+  error without executing the tool, and mixed executable/blocked batches commit exactly
+  one tool result per call id in the model's original order.
 - Fixed lower-level OpenAI-compatible transport errors such as read-timeout and TLS
   exceptions being treated as non-retryable; they now use the existing bounded model
   retry policy instead of immediately terminating the agent loop. Unsupported stream

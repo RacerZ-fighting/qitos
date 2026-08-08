@@ -586,6 +586,37 @@ class ActionExecutor:
         attempts = 0
         last_error = None
         tool_meta = self._tool_meta(action.name)
+        protocol_error = str(action.metadata.get("protocol_error") or "").strip()
+        if protocol_error:
+            error_code = protocol_error.upper()
+            card = "\n".join(
+                [
+                    "[TOOL:invalid_call]",
+                    "",
+                    f"Tool: `{action.name}`",
+                    f"Code: `{error_code}`",
+                    "",
+                    "No tool was executed.",
+                    "Retry the call with an exact tool name and a valid JSON object for arguments.",
+                ]
+            )
+            return self._finish_result(
+                action=action,
+                status=ActionStatus.ERROR,
+                start=start,
+                attempts=0,
+                tool_meta=tool_meta,
+                output=card,
+                error=protocol_error,
+                extra_metadata={
+                    "error_category": protocol_error,
+                    "raw_arguments": action.metadata.get("raw_arguments"),
+                    "recoverable": True,
+                    "executed": False,
+                    "segment_index": segment_index,
+                    "started": False,
+                },
+            )
         runtime_context = self._build_runtime_context(action.name, env=env, state=state)
         ordering_meta: Dict[str, Any] = {
             "segment_index": segment_index,

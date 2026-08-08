@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One native tool-call lane**: when a model preset prefers provider-native tools,
+  typed calls now bypass text interpreters and parsers, API requests omit the duplicate
+  framework action contract, and every accepted, rejected, or malformed call commits one
+  ordered result with the original call id. Malformed arguments never execute a tool.
 - **Clearer child-agent fan-out**: `AgentTool` now tells models to issue one same-response
   call per independent multi-step task, avoid duplicating delegated work in the parent,
   and keep dependent or cheap mechanical work local.

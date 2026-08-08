@@ -116,7 +116,28 @@ The model-level declarations in step 4 are attached by `build_model_for_preset(.
 
 ## Empty model responses
 
-After a model call, the Engine records the normalized response and gives `AgentModule.interpret_model_response()` the first opportunity to turn it into a decision. If the hook returns `None` and the response contains neither non-whitespace text nor tool calls, the Engine classifies the result as a `model_error` before it reaches the parser. The default recovery path retries once; a second consecutive empty response stops the run with `unrecoverable_error` instead of consuming the remaining step budget as parser `wait` decisions.
+After a model call, the Engine records the normalized response. When the selected model
+policy prefers native tool calls and the provider returns `tool_calls`, those calls are
+authoritative: the Engine bypasses `AgentModule.interpret_model_response()` and the text
+parser, then commits one terminal tool result per call id in the provider's original
+order. A mixed batch of executable and policy-blocked calls follows the same single
+commit path, so a blocked result cannot be duplicated or moved ahead of an earlier call.
+If a native call has a missing name or malformed arguments, QitOS does not reinterpret
+the assistant text as a separate action. It preserves the call id, skips execution, and
+returns a recoverable protocol error in the corresponding tool-result turn.
+
+For API or hybrid tool-schema delivery in this native mode, QitOS also omits its
+framework-owned text action contract from the system prompt. Agent-authored task and
+final-result instructions remain unchanged. If API delivery is unavailable and prompt
+injection becomes the effective fallback, the text contract remains available.
+
+For responses outside that native-call branch, the Engine gives
+`AgentModule.interpret_model_response()` the first opportunity to turn the response into
+a decision. If the hook returns `None` and the response contains neither non-whitespace
+text nor tool calls, the Engine classifies the result as a `model_error` before it reaches
+the parser. The default recovery path retries once; a second consecutive empty response
+stops the run with `unrecoverable_error` instead of consuming the remaining step budget
+as parser `wait` decisions.
 
 The `model_output` event and `StepRecord.model_response` still retain the response's `finish_reason`, usage, model, and provider fields. This guard does not change native tool-call responses, explicit `Decision.wait` values, or parser feedback for non-empty malformed model output.
 

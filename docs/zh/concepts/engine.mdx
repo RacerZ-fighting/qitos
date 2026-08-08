@@ -75,7 +75,23 @@ engine = Engine(
 
 ## 空模型响应
 
-模型调用完成后，Engine 会先记录规范化响应，并优先让 `AgentModule.interpret_model_response()` 将其解释为决策。如果该钩子返回 `None`，且响应既没有非空白文本也没有工具调用，Engine 会在进入 parser 之前将其归类为 `model_error`。默认恢复路径会重试一次；若连续第二次仍为空，运行会以 `unrecoverable_error` 停止，而不是继续生成 parser `wait` 并消耗剩余步数预算。
+模型调用完成后，Engine 会先记录规范化响应。当选定模型策略优先使用原生工具调用，
+且服务商返回了 `tool_calls` 时，这些调用具有唯一控制权：Engine 会跳过
+`AgentModule.interpret_model_response()` 与文本 parser，再按照服务商原始顺序为每个
+call id 提交一个终态工具结果。可执行调用与策略拒绝调用混合出现时也走同一个提交点，
+因此拒绝结果不会重复，也不会跑到更早的调用之前。
+若原生调用缺少名称或参数损坏，QitOS 不会再把 assistant 文本解释成另一项动作，而是
+保留 call id、跳过工具执行，并在对应的工具结果回合返回可恢复的协议错误。
+
+在该原生模式下使用 API 或 hybrid 工具 schema 交付时，QitOS 也不会再向 system
+prompt 注入框架自带的文本动作契约。Agent 自己编写的任务和最终结果说明保持不变；若
+API 交付不可用并实际回退到 prompt injection，文本契约仍会保留。
+
+对于不属于原生调用分支的响应，Engine 会优先让
+`AgentModule.interpret_model_response()` 将其解释为决策。如果该钩子返回 `None`，且
+响应既没有非空白文本也没有工具调用，Engine 会在进入 parser 之前将其归类为
+`model_error`。默认恢复路径会重试一次；若连续第二次仍为空，运行会以
+`unrecoverable_error` 停止，而不是继续生成 parser `wait` 并消耗剩余步数预算。
 
 `model_output` 事件和 `StepRecord.model_response` 仍会保留响应的 `finish_reason`、usage、model 与 provider 字段。该防护不会改变原生工具调用响应、显式 `Decision.wait`，也不会改变对非空但格式错误输出的 parser feedback 行为。
 

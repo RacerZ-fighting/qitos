@@ -486,6 +486,9 @@ def test_manual_build_system_prompt_keeps_api_parameter_tool_schema() -> None:
 
         def __init__(self) -> None:
             self.calls: list[tuple[list[dict[str, str]], dict[str, Any]]] = []
+            self.qitos_harness_metadata = {
+                "tool_policy": {"native_tool_call_preferred": True}
+            }
 
         def supports_tool_schema_delivery(
             self, delivery: str, protocol: Any = None
@@ -542,6 +545,8 @@ def test_manual_build_system_prompt_keeps_api_parameter_tool_schema() -> None:
     assert result.state.final_result == "ok"
     messages, kwargs = llm.calls[0]
     assert messages[0]["content"].startswith("Use the handwritten system prompt.")
+    assert "Output contract:" not in messages[0]["content"]
+    assert "output_contract" not in result.records[0].prompt_metadata["sections_used"]
     assert kwargs["tool_choice"] == "auto"
     assert kwargs["delivery"] == "api_parameter"
     assert kwargs["tools"][0]["function"]["name"] == "lookup"

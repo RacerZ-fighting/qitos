@@ -33,6 +33,7 @@ from ..core.multimodal import (
     text_block,
 )
 from ..core.observation import Observation
+from ..harness._types import native_tool_calls_preferred
 from ..protocols import get_protocol, resolve_protocol_chain
 from ..core.state import StateSchema
 from ._context_runtime import ContextOverflowError, DecisionContextConfigurationError
@@ -157,18 +158,28 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             model_response = self._run_llm_decide(
                 state=state, observation=observation, record=record
             )
-            interpreted = self._interpret_model_response(
-                state=state,
-                observation=observation,
-                response=model_response,
-                record=record,
+            native_tool_calls_are_authoritative = (
+                isinstance(model_response.tool_calls, list)
+                and bool(model_response.tool_calls)
+                and self._native_tool_call_preferred()
             )
-            if interpreted is None:
-                self._raise_for_empty_model_response(
+            if native_tool_calls_are_authoritative:
+                raw_decision = model_response
+            else:
+                interpreted = self._interpret_model_response(
+                    state=state,
+                    observation=observation,
                     response=model_response,
-                    step=record.step_id,
+                    record=record,
                 )
-            raw_decision = interpreted if interpreted is not None else model_response
+                if interpreted is None:
+                    self._raise_for_empty_model_response(
+                        response=model_response,
+                        step=record.step_id,
+                    )
+                raw_decision = (
+                    interpreted if interpreted is not None else model_response
+                )
 
         decision = self.normalize_decision(
             raw_decision, step=record.step_id, record=record
@@ -2783,23 +2794,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             return None
         actions: List[Action] = []
         for item in response.tool_calls:
-            normalized = self._action_from_tool_call(item)
-            if normalized is None:
-                reason = "tool_call_arguments_invalid"
-                if record is not None:
-                    record.native_tool_call_used = False
-                    record.native_tool_call_fallback_reason = reason
-                self.engine._emit(
-                    step,
-                    RuntimePhase.DECIDE,
-                    payload={
-                        "stage": "native_tool_call_fallback",
-                        "reason": reason,
-                        "tool_call": item,
-                    },
-                )
-                return None
-            actions.append(normalized)
+            actions.append(self._action_from_tool_call(item))
         decision: Decision[ActionT] = cast(
             Decision[ActionT],
             Decision.act(
@@ -2829,14 +2824,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
 
     def _native_tool_call_preferred(self) -> bool:
         llm = getattr(self.engine.agent, "llm", None)
-        metadata = dict(getattr(llm, "qitos_harness_metadata", {}) or {}) if llm is not None else {}
-        tool_policy = metadata.get("tool_policy")
-        if isinstance(tool_policy, dict) and tool_policy.get("native_tool_call_preferred") is True:
-            return True
-        protocol = self.engine.resolve_protocol()
-        if protocol is not None and getattr(protocol, "supports_native_tool_call_markup", False):
-            return True
-        return False
+        return native_tool_calls_preferred(
+            llm=llm,
+            protocol=self.engine.resolve_protocol(),
+        )
 
     def _trim_native_tool_history(
         self, history: List[Dict[str, Any]], *, max_rounds: int
@@ -3087,19 +3078,17 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             cleaned.append(payload)
         return cleaned
 
-    def _action_from_tool_call(self, tool_call: Dict[str, Any]) -> Action | None:
-        if not isinstance(tool_call, dict):
-            return None
+    def _action_from_tool_call(self, tool_call: Dict[str, Any]) -> Action:
         function = tool_call.get("function")
-        if not isinstance(function, dict):
-            return None
-        name = str(function.get("name") or "").strip()
-        if not name:
-            return None
-        arguments = function.get("arguments")
+        function_payload = function if isinstance(function, dict) else {}
+        name = str(function_payload.get("name") or "").strip()
+        arguments = function_payload.get("arguments")
         args: Dict[str, Any] = {}
         repaired_arguments = False
-        if isinstance(arguments, dict):
+        protocol_error: str | None = None
+        if not isinstance(function, dict) or not name:
+            protocol_error = "tool_call_invalid"
+        elif isinstance(arguments, dict):
             args = dict(arguments)
         elif isinstance(arguments, str):
             text = arguments.strip()
@@ -3109,25 +3098,36 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 except json.JSONDecodeError:
                     repaired = escape_json_string_control_chars(text)
                     if repaired is None:
-                        return None
-                    try:
-                        parsed = json.loads(repaired)
-                    except json.JSONDecodeError:
-                        return None
-                    repaired_arguments = True
-                if not isinstance(parsed, dict):
-                    return None
-                args = dict(parsed)
+                        protocol_error = "tool_call_arguments_invalid"
+                    else:
+                        try:
+                            parsed = json.loads(repaired)
+                        except json.JSONDecodeError:
+                            protocol_error = "tool_call_arguments_invalid"
+                        else:
+                            repaired_arguments = True
+                if protocol_error is None:
+                    if not isinstance(parsed, dict):
+                        protocol_error = "tool_call_arguments_invalid"
+                    else:
+                        args = dict(parsed)
         elif arguments is not None:
-            return None
+            protocol_error = "tool_call_arguments_invalid"
         metadata = {
             "tool_call_type": tool_call.get("type"),
             "decision_source": "native_tool_calls",
         }
         if repaired_arguments:
             metadata["arguments_repair"] = "escaped_control_chars"
+        if protocol_error is not None:
+            metadata.update(
+                {
+                    "protocol_error": protocol_error,
+                    "raw_arguments": arguments,
+                }
+            )
         return Action(
-            name=name,
+            name=name or "<invalid-native-tool-call>",
             args=args,
             action_id=(str(tool_call.get("id")) if tool_call.get("id") is not None else None),
             metadata=metadata,

@@ -109,24 +109,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                     "error_category": "action_blocked",
                     "error": "action_blocked",
                 }))
-                engine._memory_append("action_result", blocked_result, record.step_id)
-                if self._history_tool_calls_enabled(record):
-                    tool_call_id = normalized_action.action_id or f"call_{record.step_id}_{i}"
-                    engine._history_append(
-                        "tool",
-                        self._serialize_for_tool_message(
-                            blocked_result.output,
-                            blocked_result.error,
-                        ),
-                        record.step_id,
-                        metadata={
-                            "source": "engine",
-                            "tool_name": normalized_action.name,
-                        },
-                        tool_call_id=tool_call_id,
-                        name=normalized_action.name,
-                    )
-                else:
+                if not self._history_tool_calls_enabled(record):
                     # When a custom MessageBuilder is active, avoid injecting
                     # synthetic user messages for blocked actions.  The
                     # block_reason is already carried in the ToolResult.
@@ -193,16 +176,6 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                         "error_category": "tool_call_loop_detected",
                         "error": "tool_call_loop_detected",
                     }))
-                    if self._history_tool_calls_enabled(record):
-                        tool_call_id = normalized_action.action_id or f"call_{record.step_id}_{i}"
-                        engine._history_append(
-                            "tool",
-                            self._serialize_for_tool_message(loop_tool_result.output, loop_tool_result.error),
-                            record.step_id,
-                            metadata={"source": "loop_detector", "tool_name": normalized_action.name},
-                            tool_call_id=tool_call_id,
-                            name=normalized_action.name,
-                        )
                     engine._emit(
                         record.step_id,
                         RuntimePhase.ACT,
@@ -228,10 +201,21 @@ class _ActionRuntime(Generic[StateT, ActionT]):
 
         # If all actions were blocked, return immediately
         if len(blocked_indices) == len(actions):
-            merged_results = [br for _, br in sorted(blocked_results, key=lambda x: x[0])]
-            merged_invocations = [bi for _, bi in sorted(blocked_invocations, key=lambda x: x[0])]
-            record.action_results = merged_results
-            record.tool_invocations = merged_invocations
+            blocked_only_results = [
+                result for _, result in sorted(blocked_results, key=lambda pair: pair[0])
+            ]
+            blocked_only_invocations = [
+                invocation
+                for _, invocation in sorted(
+                    blocked_invocations,
+                    key=lambda pair: pair[0],
+                )
+            ]
+            record.action_results = blocked_only_results
+            record.tool_invocations = blocked_only_invocations
+            for item in blocked_only_results:
+                engine._memory_append("action_result", item, record.step_id)
+            self._commit_tool_result_history(actions, blocked_only_results, record)
             engine._dispatch_hook(
                 "on_after_act",
                 engine._hook_context(
@@ -239,11 +223,11 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                     phase=RuntimePhase.ACT,
                     state=state,
                     decision=decision,
-                    action_results=[r.to_dict() for r in merged_results],
+                    action_results=[r.to_dict() for r in blocked_only_results],
                     record=record,
                 ),
             )
-            return [r.to_dict() for r in merged_results]
+            return [r.to_dict() for r in blocked_only_results]
 
         # Execute non-blocked actions
         executable_actions = [a for i, a in enumerate(actions) if i not in blocked_indices]
@@ -423,29 +407,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                     normalized_action.name, dict(normalized_action.args or {})
                 )
 
-        if self._history_tool_calls_enabled(record):
-            for idx, result in enumerate(results):
-                payload = result.output
-                if isinstance(payload, dict) and set(payload.keys()) == {"env"}:
-                    continue
-                tool_name = actions[idx].name if idx < len(actions) else ""
-                tool_call_id = None
-                if idx < len(actions):
-                    tool_call_id = actions[idx].action_id
-                if not tool_call_id:
-                    tool_call_id = f"call_{record.step_id}_{idx}"
-                model_payload = self._model_visible_tool_output(tool_name, payload)
-                serialized = self._serialize_for_tool_message(model_payload, result.error)
-                engine._history_append(
-                    "tool",
-                    serialized[
-                        : max(256, int(getattr(engine.context_config, "tool_result_max_chars", 4000)))
-                    ],
-                    record.step_id,
-                    metadata={"source": "engine", "tool_name": tool_name},
-                    tool_call_id=tool_call_id,
-                    name=(tool_name or None),
-                )
+        self._commit_tool_result_history(actions, results, record)
         engine._emit(
             record.step_id,
             RuntimePhase.ACT,
@@ -484,6 +446,49 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             ),
         )
         return [item.to_dict() for item in results]
+
+    def _commit_tool_result_history(
+        self,
+        actions: List[Action],
+        results: List[ToolResult],
+        record: StepRecord,
+    ) -> None:
+        """Commit one ordered terminal result for every model tool call."""
+
+        if not self._history_tool_calls_enabled(record):
+            return
+        engine = self.engine
+        max_chars = max(
+            256,
+            int(
+                getattr(
+                    engine.context_config,
+                    "tool_result_max_chars",
+                    4000,
+                )
+            ),
+        )
+        for idx, result in enumerate(results):
+            payload = result.output
+            if isinstance(payload, dict) and set(payload.keys()) == {"env"}:
+                continue
+            tool_name = actions[idx].name if idx < len(actions) else ""
+            tool_call_id = actions[idx].action_id if idx < len(actions) else None
+            if not tool_call_id:
+                tool_call_id = f"call_{record.step_id}_{idx}"
+            model_payload = self._model_visible_tool_output(tool_name, payload)
+            serialized = self._serialize_for_tool_message(
+                model_payload,
+                result.error,
+            )
+            engine._history_append(
+                "tool",
+                serialized[:max_chars],
+                record.step_id,
+                metadata={"source": "engine", "tool_name": tool_name},
+                tool_call_id=tool_call_id,
+                name=(tool_name or None),
+            )
 
     def _serialize_for_tool_message(self, output: Any, error: str | None) -> str:
         # ``output`` has already passed through ``_model_visible_tool_output``.

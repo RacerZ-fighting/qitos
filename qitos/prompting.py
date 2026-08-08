@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
-import json
 from typing import Any, Dict, List, Optional
+
+from .harness._types import native_tool_calls_preferred
 
 
 PROMPT_BUILDER_VERSION = "v1"
@@ -99,6 +100,14 @@ class PromptBuilder:
             delivery_requested, llm=llm, protocol=protocol
         )
         delivery_fallback_used = delivery_effective != delivery_requested
+        native_tool_call_preferred = native_tool_calls_preferred(
+            llm=llm,
+            protocol=protocol,
+        )
+        include_text_contract = spec.include_contract and not (
+            native_tool_call_preferred
+            and delivery_effective in {"api_parameter", "hybrid"}
+        )
         tool_schema_payload = self._tool_schema_payload(
             tool_registry, delivery_effective
         )
@@ -111,6 +120,7 @@ class PromptBuilder:
             protocol=protocol,
             tool_registry=tool_registry,
             delivery=delivery_effective,
+            include_contract=include_text_contract,
         )
         static_parts: List[str] = []
         dynamic_parts: List[str] = []
@@ -173,6 +183,8 @@ class PromptBuilder:
             "tool_schema_delivery": delivery_effective,
             "tool_schema_delivery_requested": delivery_requested,
             "delivery_fallback_used": delivery_fallback_used,
+            "native_tool_call_preferred": native_tool_call_preferred,
+            "output_contract_injected": "output_contract" in sections_used,
             "repair_injected": repair_injected,
             "continuation_injected": continuation_injected,
             "repair_injection_mode": repair_mode,
@@ -230,6 +242,7 @@ class PromptBuilder:
         protocol: Any,
         tool_registry: Any,
         delivery: str,
+        include_contract: bool,
     ) -> Dict[str, str]:
         sections: Dict[str, str] = {}
         if spec.include_tool_schema and delivery in {"prompt_injection", "hybrid"}:
@@ -241,7 +254,7 @@ class PromptBuilder:
                     schema = ""
                 if schema:
                     sections["tool_schema"] = f"Available tools:\n{schema}"
-        if spec.include_contract:
+        if include_contract:
             contract_renderer = getattr(protocol, "contract_renderer", None)
             if callable(contract_renderer):
                 try:
