@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -19,6 +20,13 @@ from ..core.errors import (
     ModelExecutionError,
     ParseExecutionError,
     RuntimeErrorInfo,
+)
+from ..core.history import (
+    HistoryMessage,
+    group_history_rounds,
+    message_tool_call_ids,
+    message_tool_result_ids,
+    select_recent_history,
 )
 from ..core.model_response import ModelResponse
 from ..core.multimodal import (
@@ -36,7 +44,11 @@ from ..core.observation import Observation
 from ..harness._types import native_tool_calls_preferred
 from ..protocols import get_protocol, resolve_protocol_chain
 from ..core.state import StateSchema
-from ._context_runtime import ContextOverflowError, DecisionContextConfigurationError
+from ._context_runtime import (
+    ContextCompactionRequired,
+    ContextOverflowError,
+    DecisionContextConfigurationError,
+)
 from ._protocol import _EngineProtocol
 from .streaming import to_stream_handler
 from .parser import (
@@ -54,6 +66,41 @@ _logger = logging.getLogger("qitos.engine._model_runtime")
 StateT = TypeVar("StateT", bound=StateSchema)
 ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
+
+
+def _measure_prompt(
+    prompt_meter: Any,
+    *,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    request_options: Dict[str, Any],
+    llm: Any,
+) -> Any:
+    """Invoke old and new prompt-meter contracts without masking meter errors."""
+
+    measure = prompt_meter.measure
+    kwargs: Dict[str, Any] = {
+        "messages": messages,
+        "tools": tools,
+        "llm": llm,
+    }
+    try:
+        parameters = inspect.signature(measure).parameters.values()
+    except (TypeError, ValueError):
+        # Opaque callables used to receive the current contract. Any resulting
+        # error is reported by the caller as meter unavailability.
+        kwargs["request_options"] = request_options
+    else:
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            or (
+                parameter.name == "request_options"
+                and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
+            )
+            for parameter in parameters
+        ):
+            kwargs["request_options"] = request_options
+    return measure(**kwargs)
 
 
 def _escape_runtime_context_content(content: str) -> str:
@@ -327,20 +374,26 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             patch = engine._critic_instruction_patch
             engine._critic_instruction_patch = None  # Consume once
             effective_system_prompt = effective_system_prompt + "\n\n" + patch
+        request_options = self._build_model_request_options(
+            prompt_bundle=prompt_bundle,
+            protocol=protocol,
+        )
         pre_context = context_runtime.build_pre_request(
             llm=engine.agent.llm,
             system_prompt=effective_system_prompt,
             prepared=str(prepared),
+            message_injections=prompt_messages,
+            user_content_blocks=prompt_user_content_blocks,
+            request_options=request_options,
         )
         messages: List[Dict[str, Any]] = []
+        pending_system_history: Optional[str] = None
+        pending_builder_history: List[Dict[str, Any]] = []
         if effective_system_prompt.strip():
             system = effective_system_prompt.strip()
             messages.append({"role": "system", "content": system})
             if system != engine._last_system_prompt:
-                engine._history_append(
-                    "system", system, record.step_id, metadata={"source": "engine"}
-                )
-                engine._last_system_prompt = system
+                pending_system_history = system
         history: List[Dict[str, Any]] = []
         query = engine.history_policy.build_query(
             step_id=record.step_id,
@@ -385,10 +438,62 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             )
             if callable(get_last_message_metadata):
                 history_metadata = list(get_last_message_metadata() or [])
-        except Exception:
-            history = []
-            history_metadata = []
-            compact_events = []
+        except Exception as exc:
+            raw_history = getattr(history_impl, "messages", None)
+            if not isinstance(raw_history, list) or not all(
+                isinstance(message, HistoryMessage) for message in raw_history
+            ):
+                raise
+            fallback = list(raw_history)
+            roles = query.get("roles") if isinstance(query, dict) else None
+            if roles:
+                allowed_roles = {str(role) for role in roles}
+                fallback = [
+                    message for message in fallback
+                    if message.role in allowed_roles
+                ]
+            step_min = query.get("step_min") if isinstance(query, dict) else None
+            step_max = query.get("step_max") if isinstance(query, dict) else None
+            if step_min is not None:
+                fallback = [
+                    message for message in fallback
+                    if message.step_id >= int(step_min)
+                ]
+            if step_max is not None:
+                fallback = [
+                    message for message in fallback
+                    if message.step_id <= int(step_max)
+                ]
+            max_items = int(query.get("max_items") or 0)
+            if max_items > 0:
+                fallback = select_recent_history(fallback, max_items)
+            history = engine._normalize_history_messages(fallback)
+            history_metadata = [
+                {
+                    "role": message.role,
+                    "step_id": message.step_id,
+                    "content_chars": len(str(message.content or "")),
+                    "projection_fallback": True,
+                }
+                for message in fallback
+            ]
+            compact_events = [
+                {
+                    "stage": "context_history",
+                    "context": {
+                        "stage": "compact_failed_fallback",
+                        "strategy": history_impl.__class__.__name__,
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                        "messages_before": len(raw_history),
+                        "messages_after": len(fallback),
+                    },
+                }
+            ]
+            _logger.warning(
+                "history projection failed; using canonical bounded history: %s",
+                exc,
+            )
         pre_context = context_runtime.finalize_input(
             llm=engine.agent.llm,
             telemetry=pre_context,
@@ -488,16 +593,11 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     )
                     messages.append(current_user)
                     runtime_context_delivery["effective"] = "user"
-            for entry in build_result.history_entries:
-                engine._history_append(
-                    entry.get("role", "user"),
-                    entry.get("content", ""),
-                    entry.get("step_id", record.step_id),
-                    metadata=entry.get("metadata", {}),
-                    tool_calls=entry.get("tool_calls"),
-                    tool_call_id=entry.get("tool_call_id"),
-                    name=entry.get("name"),
-                )
+            pending_builder_history = [
+                dict(entry)
+                for entry in build_result.history_entries
+                if isinstance(entry, dict)
+            ]
             prepared_full = str(prepared)
         else:
             # --- Default message construction (original logic) ---
@@ -546,23 +646,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         # Normalize dangling calls before auditing or dispatching. The sidecar
         # and digest must describe the exact payload handed to the provider.
         messages = self._ensure_chain_consistency(messages)
-        tool_calls = [
-            str(call.get("id")) for message in messages
-            if isinstance(message, dict) and message.get("role") == "assistant"
-            for call in list(message.get("tool_calls") or [])
-            if isinstance(call, dict) and call.get("id")
-        ]
-        tool_results = [
-            str(message.get("tool_call_id")) for message in messages
-            if isinstance(message, dict) and message.get("role") == "tool" and message.get("tool_call_id")
-        ]
-        parity = {
-            "offered_call_count": len(tool_calls),
-            "result_count": len(tool_results),
-            "missing_result_ids": sorted(set(tool_calls) - set(tool_results)),
-            "orphan_result_ids": sorted(set(tool_results) - set(tool_calls)),
-        }
-        parity["valid"] = not parity["missing_result_ids"] and not parity["orphan_result_ids"]
         llm_messages = self._strip_internal_message_keys(messages)
         decision_context_source = runtime_context or str(prepared or "")
         source_context_blocks = _DECISION_CONTEXT_PATTERN.findall(
@@ -600,218 +683,34 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 authoritative_source=decision_context_source,
                 delivery=runtime_context_delivery,
             )
-        request_options = self._build_model_request_options(
-            prompt_bundle=prompt_bundle,
-            protocol=protocol,
-        )
         pre_context = context_runtime.finalize_assembled_input(
             llm=engine.agent.llm,
             telemetry=pre_context,
             messages=llm_messages,
+            request_options=request_options,
             compact_events=compact_events,
         )
         prompt_meter = getattr(engine.agent, "prompt_meter", None)
         if prompt_meter is not None and callable(getattr(prompt_meter, "measure", None)):
             try:
-                meter_result = prompt_meter.measure(
+                meter_result = _measure_prompt(
+                    prompt_meter,
                     messages=llm_messages,
                     tools=list(request_options.get("tools") or []),
+                    request_options=dict(request_options),
                     llm=engine.agent.llm,
                 )
             except Exception as exc:
-                meter_result = {"status": "unavailable", "meter_source": "sglang_tokenize", "meter_error": f"{type(exc).__name__}: {exc}"}
-            pre_context = context_runtime.apply_prompt_meter(pre_context, meter_result)
-            if bool(getattr(prompt_meter, "required", False)) and str(meter_result.get("status") or "") != "ready":
-                raise ContextOverflowError("required SGLang prompt meter is unavailable")
-            # CyberGym exposes a deterministic sliding-window capability. It
-            # is invoked after measuring the exact provider packet, including
-            # native schemas. The soft target is deliberately below strict
-            # provider capacity, so recovery happens before a request can be
-            # rejected for context length.
-            slider = getattr(history_impl, "slide_window", None)
-            if callable(slider):
-                def _remeasure_after_slide(
-                    window_result: Dict[str, Any], before: int
-                ) -> None:
-                    nonlocal messages, history, llm_messages, pre_context, meter_result
-                    dropped_steps = {
-                        int(item)
-                        for item in list(window_result.get("dropped_step_ids") or [])
-                    }
-                    if not window_result.get("applied") or not dropped_steps:
-                        return
-                    messages = [
-                        message for message in messages
-                        if not (
-                            isinstance(message.get("_step_id"), int)
-                            and int(message["_step_id"]) in dropped_steps
-                        )
-                    ]
-                    history = [
-                        message for message in history
-                        if not (
-                            isinstance(message.get("_step_id"), int)
-                            and int(message["_step_id"]) in dropped_steps
-                        )
-                    ]
-                    messages = self._ensure_chain_consistency(messages)
-                    llm_messages = self._strip_internal_message_keys(messages)
-                    if decision_context_required:
-                        llm_messages, _ = self._normalize_decision_context_packet(
-                            messages=llm_messages,
-                            authoritative_source=decision_context_source,
-                            delivery=runtime_context_delivery,
-                        )
-                    pre_context = context_runtime.finalize_assembled_input(
-                        llm=engine.agent.llm,
-                        telemetry=pre_context,
-                        messages=llm_messages,
-                        compact_events=compact_events,
-                    )
-                    try:
-                        next_meter = prompt_meter.measure(
-                            messages=llm_messages,
-                            tools=list(request_options.get("tools") or []),
-                            llm=engine.agent.llm,
-                        )
-                    except Exception as exc:
-                        next_meter = {
-                            "status": "unavailable",
-                            "meter_source": "sglang_tokenize",
-                            "meter_error": f"{type(exc).__name__}: {exc}",
-                        }
-                    after = next_meter.get("planned_prompt_tokens")
-                    recorder = getattr(history_impl, "record_window_event", None)
-                    if callable(recorder) and isinstance(after, int):
-                        compact_events.append(
-                            recorder(
-                                window_result,
-                                before_prompt_tokens=before,
-                                after_prompt_tokens=after,
-                            )
-                        )
-                    meter_result = next_meter
-                    pre_context = context_runtime.apply_prompt_meter(
-                        pre_context, meter_result
-                    )
-
-                soft_target = min(
-                    int(
-                        pre_context.soft_input_target
-                        or getattr(history_impl, "high_watermark", 150_000)
-                    ),
-                    int(getattr(history_impl, "high_watermark", 150_000)),
-                )
-                target = min(
-                    int(getattr(history_impl, "target_watermark", 130_000)),
-                    max(1, soft_target - 1_000),
-                )
-                for _ in range(3):
-                    planned = meter_result.get("planned_prompt_tokens")
-                    if not isinstance(planned, int) or planned <= soft_target:
-                        break
-                    window_result = slider(
-                        current_prompt_tokens=planned,
-                        target_prompt_tokens=target,
-                        reason="soft_input_target",
-                        recovery_stage="preemptive_slide",
-                    )
-                    if not window_result.get("applied"):
-                        break
-                    _remeasure_after_slide(window_result, planned)
-
-                # If regular eviction cannot fit the packet, clear the
-                # remaining *complete* history transactions.  The stable
-                # prompt and current Decision Context are rebuilt below, and
-                # incomplete call/result pairs are retained by the history.
-                planned = meter_result.get("planned_prompt_tokens")
-                hard = pre_context.hard_input_budget or pre_context.available_input_budget
-                if isinstance(planned, int) and isinstance(hard, int) and planned > hard:
-                    compact_events.append(
-                        {
-                            "stage": "context_history",
-                            "context": {
-                                "stage": "hard_slide",
-                                "input_tokens": planned,
-                                "hard_input_budget": hard,
-                                "reason": "soft sliding did not free enough history",
-                            },
-                        }
-                    )
-                    fresh_result = slider(
-                        current_prompt_tokens=planned,
-                        target_prompt_tokens=target,
-                        required_savings_tokens=planned,
-                        reason="hard_provider_capacity",
-                        retain_latest_complete=False,
-                        recovery_stage="fresh_history_window",
-                    )
-                    _remeasure_after_slide(fresh_result, planned)
-
-                # A very large stable prompt/Decision Context can still fit if
-                # this one request asks for fewer output tokens.  Lower only
-                # this request, never the configured model default.
-                planned = meter_result.get("planned_prompt_tokens")
-                hard = pre_context.hard_input_budget or pre_context.available_input_budget
-                if isinstance(planned, int) and isinstance(hard, int) and planned > hard:
-                    reduced = context_runtime.emergency_output_limit(
-                        llm=engine.agent.llm,
-                        input_tokens=planned,
-                        current_max_output_tokens=pre_context.max_output_tokens,
-                    )
-                    if reduced is not None and reduced < pre_context.max_output_tokens:
-                        context_runtime.apply_effective_output_limit(
-                            llm=engine.agent.llm,
-                            telemetry=pre_context,
-                            max_output_tokens=reduced,
-                        )
-                        request_options["max_tokens"] = reduced
-                        compact_events.append(
-                            {
-                                "stage": "context_history",
-                                "context": {
-                                    "stage": "output_reserve_reduced",
-                                    "before_max_output_tokens": pre_context.configured_max_output_tokens,
-                                    "after_max_output_tokens": reduced,
-                                    "input_tokens": planned,
-                                },
-                            }
-                        )
-                recovery_stages = {
-                    str((item.get("context") or {}).get("stage") or "")
-                    for item in compact_events
-                    if isinstance(item, dict) and item.get("stage") == "context_history"
+                meter_result = {
+                    "status": "unavailable",
+                    "meter_source": "provider_tokenize",
+                    "meter_error": f"{type(exc).__name__}: {exc}",
                 }
-                if recovery_stages & {
-                    "preemptive_slide",
-                    "hard_slide",
-                    "fresh_history_window",
-                    "output_reserve_reduced",
-                }:
-                    compact_events.append(
-                        {
-                            "stage": "context_history",
-                            "context": {
-                                "stage": "recovered",
-                                "from": sorted(recovery_stages),
-                                "input_tokens": meter_result.get("planned_prompt_tokens"),
-                                "effective_max_output_tokens": pre_context.max_output_tokens,
-                            },
-                        }
-                    )
-                history_metadata = list(
-                    getattr(history_impl, "get_last_message_metadata", lambda: [])()
-                    or []
-                )
-            pre_context = context_runtime.finalize_assembled_input(
-                llm=engine.agent.llm,
-                telemetry=pre_context,
-                messages=llm_messages,
-                compact_events=compact_events,
-            )
-            pre_context = context_runtime.apply_prompt_meter(
-                pre_context, meter_result
-            )
+            pre_context = context_runtime.apply_prompt_meter(pre_context, meter_result)
+            if bool(getattr(prompt_meter, "required", False)) and str(
+                meter_result.get("status") or ""
+            ) != "ready":
+                raise ContextOverflowError("required prompt meter is unavailable")
         # Historical blocks are an audit signal only.  They are stripped from
         # the projected provider packet by the normalizer and never make a
         # long-running CyberGym task terminal.
@@ -852,33 +751,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     ).hexdigest(),
                 },
             )
-        final_tool_calls = [
-            str(call.get("id"))
-            for message in llm_messages
-            if isinstance(message, dict) and message.get("role") == "assistant"
-            for call in list(message.get("tool_calls") or [])
-            if isinstance(call, dict) and call.get("id")
-        ]
-        final_tool_results = [
-            str(message.get("tool_call_id"))
-            for message in llm_messages
-            if isinstance(message, dict)
-            and message.get("role") == "tool"
-            and message.get("tool_call_id")
-        ]
-        parity = {
-            "offered_call_count": len(final_tool_calls),
-            "result_count": len(final_tool_results),
-            "missing_result_ids": sorted(
-                set(final_tool_calls) - set(final_tool_results)
-            ),
-            "orphan_result_ids": sorted(
-                set(final_tool_results) - set(final_tool_calls)
-            ),
-        }
-        parity["valid"] = (
-            not parity["missing_result_ids"] and not parity["orphan_result_ids"]
-        )
+        parity = self._tool_transaction_parity(llm_messages)
         normalized_compact_events = context_runtime.normalize_history_events(
             compact_events, pre_context
         )
@@ -896,6 +769,18 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             )
             raise ContextOverflowError(
                 f"context overflow: input_tokens={pre_context.input_tokens_total} budget={pre_context.available_input_budget}"
+            )
+        if context_runtime.should_force_compact(pre_context):
+            engine._emit(
+                record.step_id,
+                RuntimePhase.COMPACT,
+                payload=context_runtime.force_compaction_event(pre_context),
+            )
+            raise ContextCompactionRequired(
+                "context compaction required: "
+                f"input_tokens={pre_context.input_tokens_total} "
+                f"budget={pre_context.available_input_budget} "
+                f"ratio={engine.context_config.compact_ratio}"
             )
         model_input_digest = self._model_input_digest(state, record.step_id, llm_messages)
         tool_schema_digest = self._tool_schema_digest(request_options.get("tools"))
@@ -951,13 +836,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 "runtime_context_display": runtime_context_display,
             },
         )
-        history_content = str(prepared)
-        if custom_builder is None:
-            if record.step_id > 0:
-                history_content = _wrap_runtime_context(history_content)
-            engine._history_append(
-                "user", history_content, record.step_id, metadata={"source": "engine"}
-            )
         raw_decision = self._call_llm(engine.agent.llm, llm_messages, request_options)
         response = self._normalize_model_response(raw_decision)
         post_context = context_runtime.finalize_output(
@@ -965,6 +843,36 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             telemetry=pre_context,
             raw_output=response.text,
         )
+        if pending_system_history is not None:
+            engine._history_append(
+                "system",
+                pending_system_history,
+                record.step_id,
+                metadata={"source": "engine"},
+            )
+            engine._last_system_prompt = pending_system_history
+        for entry in pending_builder_history:
+            engine._history_append(
+                entry.get("role", "user"),
+                entry.get("content", ""),
+                entry.get("step_id", record.step_id),
+                metadata=entry.get("metadata", {}),
+                reasoning_content=entry.get("reasoning_content"),
+                tool_calls=entry.get("tool_calls"),
+                tool_call_id=entry.get("tool_call_id"),
+                name=entry.get("name"),
+                native_items=entry.get("native_items"),
+            )
+        if custom_builder is None:
+            history_content = str(prepared)
+            if record.step_id > 0:
+                history_content = _wrap_runtime_context(history_content)
+            engine._history_append(
+                "user",
+                history_content,
+                record.step_id,
+                metadata={"source": "engine"},
+            )
         record.context = context_runtime.telemetry_dict(post_context)
         self._write_model_input_bundle_sidecar(
             state,
@@ -1373,26 +1281,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         if callable(call_raw):
             if not request_options:
                 return call_raw(messages)
-            try:
-                return call_raw(messages, **request_options)
-            except TypeError:
-                _logger.warning(
-                    "call_raw rejected request_options (TypeError), "
-                    "falling back without options. Keys: %s",
-                    list(request_options.keys()),
-                )
-                return call_raw(messages)
+            return call_raw(messages, **request_options)
         if not request_options:
             return llm(messages)
-        try:
-            return llm(messages, **request_options)
-        except TypeError:
-            _logger.warning(
-                "LLM call rejected request_options (TypeError), "
-                "falling back without options. Keys: %s",
-                list(request_options.keys()),
-            )
-            return llm(messages)
+        return llm(messages, **request_options)
 
     def _call_llm_streaming(
         self,
@@ -1418,10 +1310,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         if not request_options:
             stream_iter = stream_fn(messages)
         else:
-            try:
-                stream_iter = stream_fn(messages, **request_options)
-            except TypeError:
-                stream_iter = stream_fn(messages)
+            stream_iter = stream_fn(messages, **request_options)
 
         try:
             for chunk in stream_iter:
@@ -2832,46 +2721,78 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
     def _trim_native_tool_history(
         self, history: List[Dict[str, Any]], *, max_rounds: int
     ) -> List[Dict[str, Any]]:
-        if max_rounds <= 0:
+        if max_rounds <= 0 or not history:
             return history
-        # A tool-call batch is an atomic transaction.  Only complete batches
-        # are eligible for retention; keeping a call without all of its
-        # results produces an invalid provider history and misleading replay.
-        expected_by_step: Dict[int, set[str]] = {}
-        responded_by_step: Dict[int, set[str]] = {}
-        for message in history:
-            if not isinstance(message, dict):
-                continue
-            role = str(message.get("role") or "")
-            step_id = message.get("_step_id")
-            if not isinstance(step_id, int):
-                continue
-            if role == "assistant":
-                for call in message.get("tool_calls") or []:
-                    call_id = call.get("id") if isinstance(call, dict) else None
-                    if call_id:
-                        expected_by_step.setdefault(step_id, set()).add(str(call_id))
-            elif role == "tool" and message.get("tool_call_id"):
-                responded_by_step.setdefault(step_id, set()).add(
-                    str(message["tool_call_id"])
-                )
-        complete_steps = sorted(
-            step for step, expected in expected_by_step.items()
-            if expected and expected <= responded_by_step.get(step, set())
-        )
-        if not complete_steps:
-            return history
-        keep_steps = complete_steps[-max_rounds:]
-        earliest_step = min(keep_steps)
-        incomplete_steps = set(expected_by_step) - set(complete_steps)
-        trimmed: List[Dict[str, Any]] = []
-        for message in history:
+        wrapped: List[HistoryMessage] = []
+        for index, message in enumerate(history):
             step_marker = message.get("_step_id")
-            if isinstance(step_marker, int) and step_marker in incomplete_steps:
-                continue
-            if not isinstance(step_marker, int) or step_marker >= earliest_step:
-                trimmed.append(message)
-        return trimmed
+            step_id = int(step_marker) if isinstance(step_marker, int) else 0
+            wrapped.append(
+                HistoryMessage(
+                    role=str(message.get("role") or "user"),
+                    content=message.get("content"),
+                    step_id=step_id,
+                    reasoning_content=message.get("reasoning_content"),
+                    tool_calls=[
+                        dict(call)
+                        for call in list(message.get("tool_calls") or [])
+                        if isinstance(call, dict)
+                    ],
+                    tool_call_id=(
+                        str(message["tool_call_id"])
+                        if message.get("tool_call_id") not in (None, "")
+                        else None
+                    ),
+                    name=(
+                        str(message["name"])
+                        if message.get("name") not in (None, "")
+                        else None
+                    ),
+                    metadata={"history_index": index},
+                    native_items=[
+                        dict(item)
+                        for item in list(message.get("native_items") or [])
+                        if isinstance(item, dict)
+                    ],
+                )
+            )
+        groups = group_history_rounds(wrapped)
+        selected = groups[-int(max_rounds) :]
+        keep_indices = {
+            int(message.metadata["history_index"])
+            for group in selected
+            for message in group
+        }
+        return [
+            message
+            for index, message in enumerate(history)
+            if index in keep_indices
+        ]
+
+    def _tool_transaction_parity(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        offered = [
+            call_id
+            for message in messages
+            if message.get("role") == "assistant"
+            for call_id in message_tool_call_ids(message)
+        ]
+        results = [
+            result_id
+            for message in messages
+            for result_id in message_tool_result_ids(message)
+        ]
+        missing = sorted(set(offered) - set(results))
+        orphaned = sorted(set(results) - set(offered))
+        return {
+            "offered_call_count": len(offered),
+            "result_count": len(results),
+            "missing_result_ids": missing,
+            "orphan_result_ids": orphaned,
+            "valid": not missing and not orphaned,
+        }
 
     def _merge_runtime_context_into_last_tool(
         self, messages: List[Dict[str, Any]], runtime_context: str
@@ -2998,70 +2919,87 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
     def _ensure_chain_consistency(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Ensure assistant tool calls and tool responses form a valid chain.
+        """Project a strict, immutable assistant/tool transaction chain.
 
-        Window trimming can retain a tool response after its declaring
-        assistant message has been evicted. Errors or crashes can leave the
-        opposite shape: an assistant tool call without a response. LLM APIs
-        reject both forms. Remove orphan responses, then preserve the existing
-        recovery behavior by adding placeholder responses for missing ones.
+        Every assistant call is followed immediately by exactly one result in
+        call order. Existing results are moved next to their declaring call,
+        duplicate and orphan results are dropped, and an interrupted call gets
+        one deterministic terminal placeholder. The canonical history remains
+        unchanged.
         """
         if not messages:
             return messages
 
-        # Collect all tool_call_ids from assistant messages
         expected_tool_ids: List[str] = []
         for msg in messages:
             if msg.get("role") != "assistant":
                 continue
-            tool_calls = msg.get("tool_calls", [])
-            if not tool_calls:
-                continue
-            for tc in tool_calls:
-                tc_id = tc.get("id") if isinstance(tc, dict) else None
-                if tc_id:
-                    expected_tool_ids.append(tc_id)
-
-        expected_tool_id_set = set(expected_tool_ids)
-        result = [
-            msg
-            for msg in messages
-            if msg.get("role") != "tool"
-            or msg.get("tool_call_id") in expected_tool_id_set
-        ]
+            expected_tool_ids.extend(message_tool_call_ids(msg))
 
         if not expected_tool_ids:
-            return result
+            return [msg for msg in messages if not message_tool_result_ids(msg)]
 
-        # Collect all tool_call_ids that already have responses
-        responded_ids: set = set()
-        for msg in result:
-            if msg.get("role") == "tool":
-                tc_id = msg.get("tool_call_id")
-                if tc_id:
-                    responded_ids.add(tc_id)
+        expected_set = set(expected_tool_ids)
+        results_by_id: Dict[str, List[int]] = {}
+        result_ids_by_index: Dict[int, List[str]] = {}
+        for index, msg in enumerate(messages):
+            result_ids = [
+                result_id
+                for result_id in message_tool_result_ids(msg)
+                if result_id in expected_set
+            ]
+            if not result_ids:
+                continue
+            result_ids_by_index[index] = result_ids
+            for result_id in result_ids:
+                results_by_id.setdefault(result_id, []).append(index)
 
-        # Find dangling tool calls and add placeholder responses
-        missing_ids = [tid for tid in expected_tool_ids if tid not in responded_ids]
-        if not missing_ids:
-            return result
-
-        # This is a last-resort provider parity guard for a genuinely current
-        # interrupted batch. Historical incomplete transactions are removed by
-        # _trim_native_tool_history or the orphan filter above and never
-        # receive synthetic prose.
-        for tid in missing_ids:
-            result.append({
-                "role": "tool",
-                "tool_call_id": tid,
-                "content": json.dumps({
-                    "status": "error",
-                    "code": "tool_call_not_completed",
-                    "reason": "The tool call did not produce a result in this transaction.",
-                    "next_action": "Retry the call if it is still relevant.",
-                }, sort_keys=True),
-            })
-        return result
+        projected: List[Dict[str, Any]] = []
+        used_result_indices: set[int] = set()
+        satisfied_result_ids: set[str] = set()
+        for index, msg in enumerate(messages):
+            if index in result_ids_by_index:
+                continue
+            projected.append(msg)
+            if msg.get("role") != "assistant":
+                continue
+            for normalized_id in message_tool_call_ids(msg):
+                if normalized_id in satisfied_result_ids:
+                    continue
+                available = [
+                    result_index
+                    for result_index in results_by_id.get(normalized_id, [])
+                    if result_index not in used_result_indices
+                ]
+                if available:
+                    result_index = available[0]
+                    used_result_indices.add(result_index)
+                    satisfied_result_ids.update(
+                        result_ids_by_index[result_index]
+                    )
+                    projected.append(messages[result_index])
+                    continue
+                projected.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": normalized_id,
+                        "content": json.dumps(
+                            {
+                                "status": "error",
+                                "code": "tool_call_not_completed",
+                                "reason": (
+                                    "The tool call did not produce a result in this "
+                                    "transaction."
+                                ),
+                                "next_action": (
+                                    "Retry the call if it is still relevant."
+                                ),
+                            },
+                            sort_keys=True,
+                        ),
+                    }
+                )
+        return projected
 
     def _strip_internal_message_keys(
         self, messages: List[Dict[str, Any]]

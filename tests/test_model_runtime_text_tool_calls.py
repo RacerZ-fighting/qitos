@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -9,6 +10,7 @@ from qitos.core.message_builder import MessageBuildRequest, MessageBuildResult
 from qitos.core.model_response import ModelResponse
 from qitos.core.state import StateSchema
 from qitos.engine import RuntimeBudget
+from qitos.engine._model_runtime import _measure_prompt
 from qitos.engine.recovery import RecoveryPolicy, build_failure_report
 from qitos.engine.states import StepRecord
 from qitos.kit.parser import (
@@ -719,6 +721,190 @@ def test_native_tool_chain_preserves_complete_call_and_result_pair():
     repaired = engine._model_runtime._ensure_chain_consistency(messages)
 
     assert repaired == messages
+    assert engine._model_runtime._tool_transaction_parity(repaired) == {
+        "offered_call_count": 1,
+        "result_count": 1,
+        "missing_result_ids": [],
+        "orphan_result_ids": [],
+        "valid": True,
+    }
+
+
+def test_native_only_tool_chain_preserves_complete_call_and_result_pair() -> None:
+    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "native_items": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_native",
+                    "name": "add",
+                    "arguments": '{"a": 20, "b": 22}',
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "42",
+            "tool_call_id": "call_native",
+        },
+    ]
+
+    repaired = engine._model_runtime._ensure_chain_consistency(messages)
+
+    assert repaired == messages
+    assert engine._model_runtime._tool_transaction_parity(repaired) == {
+        "offered_call_count": 1,
+        "result_count": 1,
+        "missing_result_ids": [],
+        "orphan_result_ids": [],
+        "valid": True,
+    }
+
+
+def test_native_output_tool_chain_preserves_complete_transaction() -> None:
+    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "native_items": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_native_output",
+                    "name": "add",
+                    "arguments": '{"a": 20, "b": 22}',
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": "42",
+            "native_items": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_native_output",
+                    "output": "42",
+                }
+            ],
+        },
+    ]
+
+    repaired = engine._model_runtime._ensure_chain_consistency(messages)
+
+    assert repaired == messages
+    assert engine._model_runtime._tool_transaction_parity(repaired) == {
+        "offered_call_count": 1,
+        "result_count": 1,
+        "missing_result_ids": [],
+        "orphan_result_ids": [],
+        "valid": True,
+    }
+
+
+def test_prompt_meter_supports_legacy_and_request_option_signatures() -> None:
+    class _LegacyMeter:
+        def __init__(self) -> None:
+            self.seen_tools: list[dict[str, Any]] = []
+
+        def measure(self, messages, tools, llm):
+            _ = messages, llm
+            self.seen_tools = tools
+            return {"status": "ready", "input_tokens": 7}
+
+    class _CurrentMeter:
+        def __init__(self) -> None:
+            self.seen_options: dict[str, Any] = {}
+
+        def measure(self, messages, tools, request_options, llm):
+            _ = messages, tools, llm
+            self.seen_options = request_options
+            return {"status": "ready", "input_tokens": 11}
+
+    legacy = _LegacyMeter()
+    current = _CurrentMeter()
+    kwargs = {
+        "messages": [{"role": "user", "content": "continue"}],
+        "tools": [{"type": "function", "name": "lookup"}],
+        "request_options": {"reasoning": {"effort": "high"}},
+        "llm": object(),
+    }
+
+    assert _measure_prompt(legacy, **kwargs)["input_tokens"] == 7
+    assert _measure_prompt(current, **kwargs)["input_tokens"] == 11
+    assert legacy.seen_tools == kwargs["tools"]
+    assert current.seen_options == kwargs["request_options"]
+
+
+def test_model_call_does_not_silently_drop_unsupported_request_options() -> None:
+    class _StrictModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def call_raw(self, messages: list[dict[str, Any]]) -> str:
+            _ = messages
+            self.calls += 1
+            return "Final Answer: incorrectly retried without tools"
+
+    model = _StrictModel()
+    runtime = Engine(
+        agent=_ToolCallAgent(llm=model),
+        budget=RuntimeBudget(max_steps=1),
+    )._model_runtime
+
+    with pytest.raises(TypeError):
+        runtime._call_llm(
+            model,
+            [{"role": "user", "content": "use the offered tool"}],
+            {"tools": [{"type": "function", "function": {"name": "add"}}]},
+        )
+
+    assert model.calls == 0
+
+
+def test_default_model_token_count_includes_native_protocol_payloads() -> None:
+    from qitos.models.base import Model
+
+    class _TokenModel(Model):
+        def _call_api(
+            self,
+            messages: list[dict[str, Any]],
+            **kwargs: Any,
+        ) -> str:
+            _ = messages, kwargs
+            return ""
+
+    model = _TokenModel(model="token-test")
+    plain = [{"role": "assistant", "content": "continue"}]
+    native = [
+        {
+            "role": "assistant",
+            "content": "continue",
+            "reasoning_content": "opaque reasoning payload " * 20,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": '{"query":"context budget"}',
+                    },
+                }
+            ],
+            "native_items": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": '{"query":"context budget"}',
+                }
+            ],
+        }
+    ]
+
+    assert model.count_request_tokens(native) > model.count_request_tokens(plain)
 
 
 def test_native_tool_chain_keeps_existing_missing_result_placeholder_recovery():
@@ -755,6 +941,60 @@ def test_native_tool_chain_keeps_existing_missing_result_placeholder_recovery():
             ),
         },
     ]
+
+
+def test_native_tool_chain_projects_results_adjacent_in_call_order() -> None:
+    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
+    assistant = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "call_a", "type": "function", "function": {"name": "a"}},
+            {"id": "call_b", "type": "function", "function": {"name": "b"}},
+        ],
+    }
+    result_a = {"role": "tool", "tool_call_id": "call_a", "content": "a"}
+    result_b = {"role": "tool", "tool_call_id": "call_b", "content": "b"}
+    duplicate_a = {
+        "role": "tool",
+        "tool_call_id": "call_a",
+        "content": "duplicate",
+    }
+    later_user = {"role": "user", "content": "continue"}
+    messages = [assistant, later_user, result_b, result_a, duplicate_a]
+    original = [dict(message) for message in messages]
+
+    projected = engine._model_runtime._ensure_chain_consistency(messages)
+
+    assert messages == original
+    assert projected == [assistant, result_a, result_b, later_user]
+
+
+def test_native_tool_chain_places_interruption_before_later_user_message() -> None:
+    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
+    assistant = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_interrupted",
+                "type": "function",
+                "function": {"name": "lookup"},
+            }
+        ],
+    }
+    later_user = {"role": "user", "content": "continue"}
+
+    projected = engine._model_runtime._ensure_chain_consistency(
+        [assistant, later_user]
+    )
+
+    assert [message["role"] for message in projected] == [
+        "assistant",
+        "tool",
+        "user",
+    ]
+    assert projected[1]["tool_call_id"] == "call_interrupted"
 
 
 def _native_text_engine(*, parser=None, protocol="react_text_v1"):

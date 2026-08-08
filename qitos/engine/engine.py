@@ -25,7 +25,12 @@ from ..core.action import ActionExecutionPolicy
 from ..core.decision import Decision
 from ..core.errors import ErrorCategory, StopReason
 from ..core.env import Env, EnvObservation, EnvStepResult
-from ..core.history import History, HistoryMessage, HistoryPolicy
+from ..core.history import (
+    History,
+    HistoryMessage,
+    HistoryPolicy,
+    select_recent_history,
+)
 from ..core.interceptor import InterceptorChain, ToolInterceptor
 from ..core.memory import Memory, MemoryRecord
 from ..core.runtime_input import RuntimeInput
@@ -108,7 +113,7 @@ class _EngineWindowHistory(History):
         if step_max is not None:
             items = [x for x in items if x.step_id <= int(step_max)]
         if max_items > 0:
-            items = items[-max_items:]
+            items = select_recent_history(items, max_items)
         return items
 
     def summarize(self, max_items: int = 5) -> str:
@@ -124,12 +129,17 @@ class _EngineWindowHistory(History):
     def evict(self) -> int:
         if self.window_size <= 0 or len(self._items) <= self.window_size:
             return 0
-        removed = len(self._items) - self.window_size
-        self._items = self._items[-self.window_size :]
+        retained = select_recent_history(self._items, self.window_size)
+        removed = len(self._items) - len(retained)
+        self._items = retained
         return removed
 
     def reset(self, run_id: Optional[str] = None) -> None:
         self._items = []
+
+    @property
+    def messages(self) -> List[HistoryMessage]:
+        return list(self._items)
 
 
 @dataclass

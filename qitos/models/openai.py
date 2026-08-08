@@ -27,6 +27,8 @@ from ._openai_responses import (
     _normalize_api_mode,
     _responses_completion,
     _responses_stream,
+    _normalize_request_kwargs,
+    _to_responses_input,
 )
 from ._openai_retry import (
     ModelRetryPolicy,
@@ -277,6 +279,38 @@ def _to_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             payload["content"] = str(content or "")
         out.append(payload)
     return out
+
+
+def _count_openai_request_tokens(
+    adapter: Model,
+    messages: List[Dict[str, Any]],
+    request_options: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    """Count the adapter's actual Chat or Responses input shape."""
+
+    api_mode = str(getattr(adapter, "api_mode", "chat_completions"))
+    wire_messages = (
+        _to_responses_input(messages)
+        if api_mode == "responses"
+        else _to_openai_messages(messages)
+    )
+    # A Responses item is not a chat-template message. Wrapping it in the
+    # provider's ``input`` field makes tokenizer-backed compatible adapters
+    # serialize every native field instead of discarding call/reasoning data as
+    # unknown chat-message metadata.
+    message_payload: Any = (
+        {"input": wire_messages} if api_mode == "responses" else wire_messages
+    )
+    message_tokens = adapter.count_tokens(message_payload)
+    option_payload = dict(request_options or {})
+    if api_mode == "responses":
+        option_payload = _normalize_request_kwargs(option_payload)
+    option_tokens = (
+        adapter.count_tokens(option_payload) if option_payload else 0
+    )
+    if not isinstance(message_tokens, int) or not isinstance(option_tokens, int):
+        return None
+    return max(0, message_tokens) + max(0, option_tokens)
 
 
 def _to_openai_content_blocks(content: List[Any]) -> List[Dict[str, Any]]:
@@ -677,6 +711,13 @@ class OpenAIModel(Model):
             return {}
         return {"tools": wire}
 
+    def count_request_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        request_options: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        return _count_openai_request_tokens(self, messages, request_options)
+
     def supports_multimodal_input(self) -> bool:
         return True
 
@@ -874,6 +915,13 @@ class OpenAICompatibleModel(Model):
         if not wire:
             return {}
         return {"tools": wire}
+
+    def count_request_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        request_options: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        return _count_openai_request_tokens(self, messages, request_options)
 
     def supports_multimodal_input(self) -> bool:
         return True

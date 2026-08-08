@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+import json
+import math
+import re
+import warnings
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterable, List, Optional
 
-from qitos.core.history import History, HistoryMessage
+from qitos.core.history import (
+    History,
+    HistoryMessage,
+    group_history_rounds,
+    message_token_payloads,
+    select_recent_history,
+)
 
 
 @dataclass
@@ -14,66 +26,51 @@ class CompactConfig:
 
     max_tokens: int = 16000
     keep_last_rounds: int = 2
-    keep_last_messages: int = 8
-    hard_window: int = 96
-    warning_ratio: float = 0.8
+    # Compatibility-only: arbitrary message slicing is no longer used because
+    # it can split provider tool transactions. New callers should omit it.
+    keep_last_messages: Optional[int] = None
+    # Canonical history is token-controlled by default. Count-based eviction
+    # remains an explicit opt-in for applications that accept permanent loss.
+    hard_window: int = 0
+    # Ratios are relative to the force-compaction budget supplied by Engine.
+    # With Engine's 0.80 total-input trigger these defaults warn near 56% and
+    # microcompact near 60%, leaving full summarization for the 80% boundary.
+    warning_ratio: float = 0.70
+    microcompact_ratio: float = 0.75
     auto_compact: bool = True
-    compact_long_messages_over_chars: int = 900
-    microcompact_preview_chars: int = 220
-    summary_max_chars: int = 1400
+    compact_long_messages_over_chars: int = 4_000
+    microcompact_preview_chars: int = 800
+    summary_max_chars: int = 24_000
     # Number of most recent messages kept verbatim in the summary request; older
     # messages are elided to `microcompact_preview_chars` but never dropped.
-    summary_input_message_limit: int = 28
+    summary_input_message_limit: int = 64
     summary_metadata_source: str = "compact_history"
     emit_skipped_events: bool = True
+
+    def __post_init__(self) -> None:
+        if self.keep_last_messages is not None:
+            warnings.warn(
+                "keep_last_messages is deprecated; compaction now preserves "
+                "complete rounds",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+
+@dataclass(frozen=True)
+class _SummaryCheckpoint:
+    """Immutable summary boundary for one canonical history prefix."""
+
+    text: str
+    source_digest: str
+    message_count: int
 
 
 class MessageGrouper:
     """Group messages into compactable rounds."""
 
     def group(self, messages: Iterable[HistoryMessage]) -> List[List[HistoryMessage]]:
-        items = list(messages)
-        if not items:
-            return []
-
-        step_groups = self._group_by_step(items)
-        if len(step_groups) > 1:
-            return step_groups
-        return self._group_by_assistant_boundary(items)
-
-    def _group_by_step(self, items: List[HistoryMessage]) -> List[List[HistoryMessage]]:
-        groups: List[List[HistoryMessage]] = []
-        current: List[HistoryMessage] = []
-        current_step: Optional[int] = None
-        for msg in items:
-            step = int(getattr(msg, "step_id", 0))
-            if current and current_step is not None and step != current_step:
-                groups.append(current)
-                current = []
-            current.append(msg)
-            current_step = step
-        if current:
-            groups.append(current)
-        return groups
-
-    def _group_by_assistant_boundary(
-        self, items: List[HistoryMessage]
-    ) -> List[List[HistoryMessage]]:
-        groups: List[List[HistoryMessage]] = []
-        current: List[HistoryMessage] = []
-        seen_assistant = False
-        for msg in items:
-            if current and msg.role == "assistant" and seen_assistant:
-                groups.append(current)
-                current = [msg]
-                seen_assistant = True
-                continue
-            current.append(msg)
-            if msg.role == "assistant":
-                seen_assistant = True
-        if current:
-            groups.append(current)
-        return groups
+        return group_history_rounds(messages)
 
 
 class MicroCompactor:
@@ -171,28 +168,44 @@ class SummaryCompactor:
                         {
                             "role": "system",
                             "content": (
-                                "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n"
-                                "Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.\n"
-                                "You already have all the context you need in the conversation above.\n"
-                                "Tool calls will be REJECTED and will waste your only turn.\n"
-                                "Your entire response must be plain text: an <analysis> block "
-                                "followed by a <summary> block.\n\n"
-                                "Create a detailed summary of the conversation so far, paying close "
-                                "attention to the user's explicit requests and your previous actions. "
-                                "Preserve user intent, constraints, discoveries, failed attempts, "
-                                "file/code references, tool findings, current status, and next step."
+                                "Create durable continuation state for an agent loop. "
+                                "Do not call tools or reveal private reasoning. Return only "
+                                "one <summary> block that preserves decisions, evidence, "
+                                "constraints, failures, current state, and the next action."
                             ),
                         },
                         {"role": "user", "content": prompt},
                     ]
                 )
-                summary = str(response or "").strip()
+                summary = self._normalize_summary(str(response or ""))
                 if summary:
                     return summary[: int(self.config.summary_max_chars)]
-            except Exception:
-                pass
+            except Exception as exc:
+                raise RuntimeError("history summarization failed") from exc
+            raise RuntimeError("history summarizer returned an empty summary")
 
         return self._heuristic_summary(items, prior_summary=prior_summary)
+
+    def _normalize_summary(self, value: str) -> str:
+        """Strip the model's drafting scratchpad from the durable summary."""
+
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        summary_match = re.search(
+            r"<summary>\s*(.*?)\s*</summary>",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if summary_match is not None:
+            return summary_match.group(1).strip()
+        text = re.sub(
+            r"<analysis>.*?</analysis>",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return text.strip()
 
     def render_body(self, messages: List[HistoryMessage]) -> str:
         """Render every message for the summary request, eliding instead of dropping.
@@ -208,6 +221,36 @@ class SummaryCompactor:
         lines: List[str] = []
         for index, message in enumerate(messages):
             text = str(message.content or "")
+            if message.tool_calls:
+                calls = json.dumps(
+                    message.tool_calls,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                text = f"{text}\ntool_calls={calls}".strip()
+            native_calls = [
+                item
+                for item in list(message.native_items or [])
+                if isinstance(item, dict) and item.get("type") == "function_call"
+            ]
+            if native_calls and not message.tool_calls:
+                calls = json.dumps(
+                    native_calls,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                text = f"{text}\nnative_function_calls={calls}".strip()
+            if message.reasoning_content or any(
+                isinstance(item, dict) and item.get("type") == "reasoning"
+                for item in list(message.native_items or [])
+            ):
+                text = f"{text}\n[opaque reasoning continuation omitted]".strip()
+            if message.tool_call_id:
+                text = (
+                    f"tool_result_for={message.tool_call_id}\n{text}"
+                ).strip()
             if index < elide_before and len(text) > preview:
                 dropped = len(text) - preview
                 text = f"{text[:preview].rstrip()} ...[elided {dropped} chars]"
@@ -229,20 +272,12 @@ class SummaryCompactor:
                 "</previous_summary>\n\n"
             )
         return (
-            "Create a compact continuation summary of the earlier conversation.\n\n"
-            "Before providing your final summary, wrap your analysis in <analysis> tags "
-            "to organize your thoughts and ensure you've covered all necessary points.\n\n"
-            "Your summary should include:\n"
-            "1. Primary Request and Intent: All of the user's explicit requests in detail\n"
-            "2. Key Technical Concepts: Technologies, frameworks, and patterns discussed\n"
-            "3. Files and Code Sections: Specific files examined, modified, or created with code snippets where applicable\n"
-            "4. Errors and Fixes: All errors encountered and how they were fixed\n"
-            "5. Problem Solving: Problems solved and ongoing troubleshooting\n"
-            "6. All User Messages: ALL non-tool-result user messages — critical for understanding intent\n"
-            "7. Pending Tasks: Any tasks explicitly requested but not yet completed\n"
-            "8. Current Work: Precisely what was being worked on immediately before this summary request\n"
-            "9. Optional Next Step: The next step directly in line with the most recent work\n\n"
-            "REMINDER: Do NOT call any tools. Respond with plain text only — an <analysis> block followed by a <summary> block.\n\n"
+            "Summarize the earlier conversation as continuation state. Preserve:\n"
+            "- the user's goal, explicit constraints, and unresolved choices;\n"
+            "- decisions, evidence, relevant files or identifiers, and completed work;\n"
+            "- failed attempts and why they failed;\n"
+            "- pending work and the single next action.\n"
+            "Keep facts precise, omit private reasoning, and do not invent completion.\n\n"
             f"{prior_block}"
             f"{body}"
         )
@@ -295,6 +330,14 @@ class CompactionController:
         self.grouper = grouper or MessageGrouper()
         self.micro = micro or MicroCompactor(config)
         self.summary = summary or SummaryCompactor(config, llm=llm)
+        self._summary_cache: OrderedDict[str, str] = OrderedDict()
+        self._summary_cache_limit = 8
+        self._summary_failures: OrderedDict[str, int] = OrderedDict()
+        self._summary_failure_limit = 3
+
+    def clear_cache(self) -> None:
+        self._summary_cache.clear()
+        self._summary_failures.clear()
 
     def retrieve(
         self,
@@ -303,317 +346,415 @@ class CompactionController:
         budget: int,
         pending_content: str,
         auto_compact: bool,
-        prior_summary: str | None = None,
+        prior_summary: _SummaryCheckpoint | None = None,
     ) -> tuple[List[HistoryMessage], List[Dict[str, Any]], List[Dict[str, Any]]]:
         events: List[Dict[str, Any]] = []
-        before_tokens = self._estimate_tokens(items) + self._estimate_text_tokens(
-            pending_content
-        )
-        warning_threshold = max(1, int(budget * float(self.config.warning_ratio)))
+        pending_tokens = self._estimate_text_tokens(pending_content)
+        before_tokens = self._estimate_tokens(items) + pending_tokens
         metadata = [self._metadata_for_message(m) for m in items]
+        if budget <= 0:
+            events.append(
+                self._compaction_event(
+                    "within_budget",
+                    before_tokens=before_tokens,
+                    after_tokens=before_tokens,
+                    budget=budget,
+                    pending_tokens=pending_tokens,
+                    messages_before=len(items),
+                    messages_after=len(items),
+                    reason="budget_disabled",
+                )
+            )
+            return items, events, metadata
+
+        warning_threshold = max(
+            1,
+            math.ceil(budget * float(self.config.warning_ratio)),
+        )
+        micro_threshold = max(
+            1,
+            math.ceil(budget * float(self.config.microcompact_ratio)),
+        )
 
         if before_tokens >= warning_threshold:
             events.append(
-                {
-                    "stage": "context_history",
-                    "context": {
-                        "stage": "warning",
-                        "before_tokens": before_tokens,
-                        "after_tokens": before_tokens,
-                        "saved_tokens": 0,
-                        "budget": budget,
-                        "pending_tokens": self._estimate_text_tokens(pending_content),
-                        "messages_before": len(items),
-                        "messages_after": len(items),
-                        "strategy": "compact_history",
-                        "warning_ratio": float(self.config.warning_ratio),
-                        "warning_threshold": warning_threshold,
-                    },
-                }
+                self._compaction_event(
+                    "warning",
+                    before_tokens=before_tokens,
+                    after_tokens=before_tokens,
+                    budget=budget,
+                    pending_tokens=pending_tokens,
+                    messages_before=len(items),
+                    messages_after=len(items),
+                    warning_threshold=warning_threshold,
+                    microcompact_threshold=micro_threshold,
+                )
             )
 
-        if budget <= 0 or before_tokens <= budget:
-            if before_tokens < warning_threshold or self.config.emit_skipped_events:
+        if before_tokens < micro_threshold:
+            if self.config.emit_skipped_events:
                 events.append(
-                    {
-                        "stage": "context_history",
-                        "context": {
-                            "stage": "within_budget",
-                            "before_tokens": before_tokens,
-                            "after_tokens": before_tokens,
-                            "saved_tokens": 0,
-                            "budget": budget,
-                            "pending_tokens": self._estimate_text_tokens(
-                                pending_content
-                            ),
-                            "messages_before": len(items),
-                            "messages_after": len(items),
-                            "strategy": "compact_history",
-                            "warning_ratio": float(self.config.warning_ratio),
-                            "reason": "within_budget",
-                        },
-                    }
+                    self._compaction_event(
+                        "within_budget",
+                        before_tokens=before_tokens,
+                        after_tokens=before_tokens,
+                        budget=budget,
+                        pending_tokens=pending_tokens,
+                        messages_before=len(items),
+                        messages_after=len(items),
+                        reason="below_microcompact_threshold",
+                        microcompact_threshold=micro_threshold,
+                    )
                 )
             return items, events, metadata
 
         if not auto_compact:
             if self.config.emit_skipped_events:
                 events.append(
-                    {
-                        "stage": "context_history",
-                        "context": {
-                            "stage": "compact_skipped",
-                            "before_tokens": before_tokens,
-                            "after_tokens": before_tokens,
-                            "saved_tokens": 0,
-                            "budget": budget,
-                            "pending_tokens": self._estimate_text_tokens(
-                                pending_content
-                            ),
-                            "messages_before": len(items),
-                            "messages_after": len(items),
-                            "strategy": "compact_history",
-                            "warning_ratio": float(self.config.warning_ratio),
-                            "reason": "auto_compact_disabled",
-                        },
-                    }
+                    self._compaction_event(
+                        "compact_skipped",
+                        before_tokens=before_tokens,
+                        after_tokens=before_tokens,
+                        budget=budget,
+                        pending_tokens=pending_tokens,
+                        messages_before=len(items),
+                        messages_after=len(items),
+                        reason="auto_compact_disabled",
+                    )
                 )
             return items, events, metadata
 
         groups = self.grouper.group(items)
+        if not groups:
+            return items, events, metadata
         keep_rounds = max(1, int(self.config.keep_last_rounds))
         preserved_groups = groups[-keep_rounds:]
         older_groups = groups[:-keep_rounds]
         preserved = [msg for group in preserved_groups for msg in group]
         older = [msg for group in older_groups for msg in group]
+        compacted_older = self.micro.compact(older)
+        micro_candidate = [*compacted_older, *preserved]
+        after_micro_tokens = self._estimate_tokens(micro_candidate) + pending_tokens
+        micro_applied = after_micro_tokens < before_tokens
+        if micro_applied:
+            events.append(
+                self._compaction_event(
+                    "microcompact_applied",
+                    before_tokens=before_tokens,
+                    after_tokens=after_micro_tokens,
+                    budget=budget,
+                    pending_tokens=pending_tokens,
+                    messages_before=len(items),
+                    messages_after=len(micro_candidate),
+                    compaction_level=1,
+                    microcompact_threshold=micro_threshold,
+                    messages_compacted=sum(
+                        1
+                        for msg in compacted_older
+                        if msg.metadata.get("compaction_mode") == "micro"
+                    ),
+                )
+            )
+        if before_tokens < budget or after_micro_tokens < budget:
+            result = micro_candidate if micro_applied else items
+            return (
+                result,
+                events,
+                [self._metadata_for_message(m) for m in result],
+            )
 
+        summary_candidate: List[HistoryMessage] | None = None
         if older:
-            compacted_older = self.micro.compact(older)
-            micro_candidate = [*compacted_older, *preserved]
-            after_micro_tokens = self._estimate_tokens(
-                micro_candidate
-            ) + self._estimate_text_tokens(pending_content)
-            if after_micro_tokens < before_tokens:
-                events.append(
-                    {
-                        "stage": "context_history",
-                        "context": {
-                            "stage": "microcompact_applied",
-                            "before_tokens": before_tokens,
-                            "after_tokens": after_micro_tokens,
-                            "saved_tokens": max(0, before_tokens - after_micro_tokens),
-                            "budget": budget,
-                            "pending_tokens": self._estimate_text_tokens(
-                                pending_content
-                            ),
-                            "messages_before": len(items),
-                            "messages_after": len(micro_candidate),
-                            "strategy": "compact_history",
-                            "warning_ratio": float(self.config.warning_ratio),
-                            "messages_compacted": sum(
-                                1
-                                for msg in compacted_older
-                                if msg.metadata.get("compaction_mode") == "micro"
-                            ),
-                        },
-                    }
-                )
-            if after_micro_tokens <= budget:
-                return (
-                    micro_candidate,
-                    events,
-                    [self._metadata_for_message(m) for m in micro_candidate],
-                )
-
-            summary_input = (
-                older if self._estimate_tokens(older) <= budget else compacted_older
+            summary_candidate, summary_trace = self._summary_projection(
+                covered=older,
+                preserved=preserved,
+                budget=max(1, budget - pending_tokens),
+                prior_summary=prior_summary,
+                compaction_level=2,
             )
-            summary_input_mode = "full" if summary_input is older else "microcompacted"
-            carried_summary = self._carried_summary(older, prior_summary)
-            summary_text = self.summary.summarize(
-                summary_input, prior_summary=carried_summary
+            after_summary_tokens = (
+                self._estimate_tokens(summary_candidate) + pending_tokens
             )
-            summary_trace = {
-                "summarized_message_count": len(older),
-                "summary_input_message_count": len(summary_input),
-                "summary_input_mode": summary_input_mode,
-                "summary_dropped_message_count": max(
-                    0, len(older) - len(summary_input)
-                ),
-                "summarized_step_range": [older[0].step_id, older[-1].step_id],
-                "summary_input_step_range": [
-                    summary_input[0].step_id,
-                    summary_input[-1].step_id,
-                ],
-                "summary_input_chars": len(self.summary.render_body(summary_input)),
-                "built_on_prior_summary": bool(carried_summary),
-            }
-            summary_message = HistoryMessage(
-                role="system",
-                content=summary_text,
-                step_id=older[-1].step_id,
-                metadata={
-                    "summary": True,
-                    "source": self.config.summary_metadata_source,
-                    "summarized_through_step": older[-1].step_id,
+            events.append(
+                self._compaction_event(
+                    "summary_compact_applied",
+                    before_tokens=before_tokens,
+                    after_tokens=after_summary_tokens,
+                    budget=budget,
+                    pending_tokens=pending_tokens,
+                    messages_before=len(items),
+                    messages_after=len(summary_candidate),
+                    compaction_level=2,
+                    preserved_round_count=len(preserved_groups),
+                    preserved_message_count=len(preserved),
                     **summary_trace,
-                },
+                )
             )
-            summary_candidate = [summary_message, *preserved]
-            after_summary_tokens = self._estimate_tokens(
-                summary_candidate
-            ) + self._estimate_text_tokens(pending_content)
-            events.append(
-                {
-                    "stage": "context_history",
-                    "context": {
-                        "stage": "summary_compact_applied",
-                        "before_tokens": before_tokens,
-                        "after_tokens": after_summary_tokens,
-                        "saved_tokens": max(0, before_tokens - after_summary_tokens),
-                        "budget": budget,
-                        "pending_tokens": self._estimate_text_tokens(pending_content),
-                        "messages_before": len(items),
-                        "messages_after": len(summary_candidate),
-                        "strategy": "compact_history",
-                        "warning_ratio": float(self.config.warning_ratio),
-                        "preserved_round_count": len(preserved_groups),
-                        "preserved_message_count": len(preserved),
-                        "summary_chars": len(str(summary_text or "")),
-                        **summary_trace,
-                    },
-                }
-            )
-            trimmed_candidate = self._trim_to_budget(
-                summary_candidate, budget=budget, pending_content=pending_content
-            )
-            return (
-                trimmed_candidate,
-                events,
-                [self._metadata_for_message(m) for m in trimmed_candidate],
-            )
+            if after_summary_tokens <= budget:
+                return (
+                    summary_candidate,
+                    events,
+                    [self._metadata_for_message(m) for m in summary_candidate],
+                )
 
-        compacted = self.micro.compact(items)
-        after_tokens = self._estimate_tokens(compacted) + self._estimate_text_tokens(
-            pending_content
-        )
-        if after_tokens < before_tokens:
+        hard_preserved_groups = groups[-1:]
+        hard_older_groups = groups[:-1]
+        hard_preserved = [
+            message for group in hard_preserved_groups for message in group
+        ]
+        hard_older = [message for group in hard_older_groups for message in group]
+        if not hard_older:
+            result = summary_candidate or micro_candidate
+            after_hard_tokens = self._estimate_tokens(result) + pending_tokens
             events.append(
-                {
-                    "stage": "context_history",
-                    "context": {
-                        "stage": "microcompact_applied",
-                        "before_tokens": before_tokens,
-                        "after_tokens": after_tokens,
-                        "saved_tokens": max(0, before_tokens - after_tokens),
-                        "budget": budget,
-                        "pending_tokens": self._estimate_text_tokens(pending_content),
-                        "messages_before": len(items),
-                        "messages_after": len(compacted),
-                        "strategy": "compact_history",
-                        "warning_ratio": float(self.config.warning_ratio),
-                        "messages_compacted": sum(
-                            1
-                            for msg in compacted
-                            if msg.metadata.get("compaction_mode") == "micro"
-                        ),
-                    },
-                }
+                self._compaction_event(
+                    "hard_compact_blocked",
+                    before_tokens=before_tokens,
+                    after_tokens=after_hard_tokens,
+                    budget=budget,
+                    pending_tokens=pending_tokens,
+                    messages_before=len(items),
+                    messages_after=len(result),
+                    compaction_level=3,
+                    reason="latest_transaction_is_indivisible",
+                )
             )
-            return (
-                self._trim_to_budget(
-                    compacted, budget=budget, pending_content=pending_content
+            return result, events, [self._metadata_for_message(m) for m in result]
+
+        if len(preserved_groups) == 1 and summary_candidate is not None:
+            hard_candidate = summary_candidate
+            hard_trace = {
+                key: value
+                for key, value in summary_candidate[0].metadata.items()
+                if key
+                not in {
+                    "summary",
+                    "source",
+                    "compaction_level",
+                    "summarized_through_step",
+                }
+            }
+        else:
+            hard_candidate, hard_trace = self._summary_projection(
+                covered=hard_older,
+                preserved=hard_preserved,
+                budget=max(1, budget - pending_tokens),
+                prior_summary=prior_summary,
+                compaction_level=3,
+            )
+        after_hard_tokens = self._estimate_tokens(hard_candidate) + pending_tokens
+        hard_stage = (
+            "hard_compact_applied"
+            if after_hard_tokens <= budget
+            else "hard_compact_blocked"
+        )
+        events.append(
+            self._compaction_event(
+                hard_stage,
+                before_tokens=before_tokens,
+                after_tokens=after_hard_tokens,
+                budget=budget,
+                pending_tokens=pending_tokens,
+                messages_before=len(items),
+                messages_after=len(hard_candidate),
+                compaction_level=3,
+                preserved_round_count=1,
+                preserved_message_count=len(hard_preserved),
+                reason=(
+                    None
+                    if hard_stage == "hard_compact_applied"
+                    else "summary_and_latest_transaction_exceed_budget"
                 ),
-                events,
-                [self._metadata_for_message(m) for m in compacted],
+                **hard_trace,
             )
-
-        if self.config.emit_skipped_events:
-            events.append(
-                {
-                    "stage": "context_history",
-                    "context": {
-                        "stage": "compact_skipped",
-                        "before_tokens": before_tokens,
-                        "after_tokens": before_tokens,
-                        "saved_tokens": 0,
-                        "budget": budget,
-                        "pending_tokens": self._estimate_text_tokens(pending_content),
-                        "messages_before": len(items),
-                        "messages_after": len(items),
-                        "strategy": "compact_history",
-                        "warning_ratio": float(self.config.warning_ratio),
-                        "reason": "insufficient_prefix_to_compact",
-                    },
-                }
-            )
+        )
         return (
-            self._trim_to_budget(items, budget=budget, pending_content=pending_content),
+            hard_candidate,
             events,
-            metadata,
+            [self._metadata_for_message(m) for m in hard_candidate],
         )
 
-    def _trim_to_budget(
-        self, items: List[HistoryMessage], *, budget: int, pending_content: str
-    ) -> List[HistoryMessage]:
-        trimmed = list(items)
-        summary_head: List[HistoryMessage] = []
-        if trimmed and trimmed[0].metadata.get("summary"):
-            summary_head = [trimmed[0]]
-            trimmed = trimmed[1:]
-        keep_tail = max(1, int(self.config.keep_last_messages))
-        active_round_start = self._active_native_tool_round_start(trimmed)
-        if len(trimmed) > keep_tail:
-            tail_start = len(trimmed) - keep_tail
-            if active_round_start is not None:
-                tail_start = min(tail_start, active_round_start)
-            trimmed = trimmed[tail_start:]
-        protected_start = self._active_native_tool_round_start(trimmed)
-        candidate = [*summary_head, *trimmed]
-        while (
-            len(trimmed) > 1
-            and self._estimate_tokens(candidate)
-            + self._estimate_text_tokens(pending_content)
-            > budget
-        ):
-            if protected_start == 0:
-                break
-            trimmed.pop(0)
-            if protected_start is not None:
-                protected_start -= 1
-            candidate = [*summary_head, *trimmed]
-        return [*summary_head, *trimmed]
-
-    def _active_native_tool_round_start(
-        self, messages: List[HistoryMessage]
-    ) -> Optional[int]:
-        for index in range(len(messages) - 1, -1, -1):
-            message = messages[index]
-            if message.role != "assistant":
-                continue
-            if any(
-                isinstance(item, dict) and item.get("type") == "function_call"
-                for item in list(message.native_items or [])
+    def _summary_projection(
+        self,
+        *,
+        covered: List[HistoryMessage],
+        preserved: List[HistoryMessage],
+        budget: int,
+        prior_summary: _SummaryCheckpoint | None,
+        compaction_level: int,
+    ) -> tuple[List[HistoryMessage], Dict[str, Any]]:
+        carried_summary, carried_message_count = self._carried_summary(
+            covered,
+            prior_summary,
+        )
+        newly_covered = covered[carried_message_count:]
+        compacted = self.micro.compact(newly_covered)
+        summary_input = (
+            newly_covered
+            if self._estimate_tokens(newly_covered) <= budget
+            else compacted
+        )
+        summary_input_mode = (
+            "checkpoint"
+            if not summary_input and carried_summary
+            else "full"
+            if summary_input is newly_covered
+            else "microcompacted"
+        )
+        source_digest = self._source_digest(covered)
+        summary_token_allowance = max(
+            1,
+            budget - self._estimate_tokens(preserved),
+        )
+        summary_char_limit = max(
+            1,
+            min(
+                int(self.config.summary_max_chars),
+                summary_token_allowance * 4,
+            ),
+        )
+        cache_key_payload = {
+            "source_digest": source_digest,
+            "budget": budget,
+            "compaction_level": compaction_level,
+            "summary_char_limit": summary_char_limit,
+            "summary_max_chars": int(self.config.summary_max_chars),
+            "summary_input_message_limit": int(
+                self.config.summary_input_message_limit
+            ),
+            "microcompact_preview_chars": int(
+                self.config.microcompact_preview_chars
+            ),
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(
+                cache_key_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        cached_summary = self._summary_cache.get(cache_key)
+        if cached_summary is not None:
+            self._summary_cache.move_to_end(cache_key)
+        summary_text = str(cached_summary or "").strip()
+        if not summary_text and carried_summary and not summary_input:
+            summary_text = carried_summary
+        if not summary_text:
+            if (
+                self._summary_failures.get(source_digest, 0)
+                >= self._summary_failure_limit
             ):
-                return index
-            return None
-        return None
+                raise RuntimeError("history summarization circuit is open")
+            try:
+                summary_text = str(
+                    self.summary.summarize(
+                        summary_input,
+                        prior_summary=carried_summary,
+                    )
+                    or ""
+                ).strip()
+            except Exception:
+                self._summary_failures[source_digest] = (
+                    self._summary_failures.get(source_digest, 0) + 1
+                )
+                self._summary_failures.move_to_end(source_digest)
+                while len(self._summary_failures) > self._summary_cache_limit:
+                    self._summary_failures.popitem(last=False)
+                raise
+        if not summary_text:
+            raise RuntimeError("history compactor returned an empty summary")
+        summary_text = summary_text[:summary_char_limit].rstrip()
+        if not summary_text:
+            raise RuntimeError("history compactor returned an empty bounded summary")
+        self._summary_failures.pop(source_digest, None)
+        self._summary_cache[cache_key] = summary_text
+        self._summary_cache.move_to_end(cache_key)
+        while len(self._summary_cache) > self._summary_cache_limit:
+            self._summary_cache.popitem(last=False)
+        summary_input_step_range = (
+            [summary_input[0].step_id, summary_input[-1].step_id]
+            if summary_input
+            else None
+        )
+        built_on_prior_summary = bool(
+            carried_summary and cached_summary is None and summary_input
+        )
+        trace = {
+            "summarized_message_count": len(covered),
+            "source_digest": source_digest,
+            "summary_input_message_count": len(summary_input),
+            "summary_carried_message_count": carried_message_count,
+            "summary_input_mode": summary_input_mode,
+            "summary_dropped_message_count": 0,
+            "summarized_step_range": [covered[0].step_id, covered[-1].step_id],
+            "summary_input_step_range": summary_input_step_range,
+            "summary_input_chars": (
+                len(self.summary.render_body(summary_input)) if summary_input else 0
+            ),
+            "built_on_prior_summary": built_on_prior_summary,
+            "summary_cache_hit": cached_summary is not None,
+            "summary_budget": budget,
+            "summary_char_limit": summary_char_limit,
+            "summary_chars": len(summary_text),
+        }
+        summary_message = HistoryMessage(
+            role="system",
+            content=summary_text,
+            step_id=covered[-1].step_id,
+            metadata={
+                "summary": True,
+                "source": self.config.summary_metadata_source,
+                "compaction_level": compaction_level,
+                "summarized_through_step": covered[-1].step_id,
+                **trace,
+            },
+        )
+        return [summary_message, *preserved], trace
+
+    def _compaction_event(
+        self,
+        stage: str,
+        *,
+        before_tokens: int,
+        after_tokens: int,
+        budget: int,
+        pending_tokens: int,
+        messages_before: int,
+        messages_after: int,
+        **detail: Any,
+    ) -> Dict[str, Any]:
+        context = {
+            "stage": stage,
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+            "saved_tokens": max(0, before_tokens - after_tokens),
+            "budget": budget,
+            "pending_tokens": pending_tokens,
+            "messages_before": messages_before,
+            "messages_after": messages_after,
+            "strategy": "compact_history",
+            "warning_ratio": float(self.config.warning_ratio),
+            "microcompact_ratio": float(self.config.microcompact_ratio),
+        }
+        context.update(detail)
+        return {"stage": "context_history", "context": context}
 
     def _carried_summary(
-        self, older: List[HistoryMessage], prior_summary: str | None
-    ) -> Optional[str]:
-        """Return the earlier summary to consolidate, if it is not already inline."""
+        self,
+        covered: List[HistoryMessage],
+        prior_summary: _SummaryCheckpoint | None,
+    ) -> tuple[Optional[str], int]:
+        """Reuse a prior summary only when its exact source is still a prefix."""
 
-        text = str(prior_summary or "").strip()
-        if not text:
-            return None
-        for message in older:
-            if (
-                message.metadata.get("summary")
-                and str(message.content or "").strip() == text
-            ):
-                return None
-        return text
+        if prior_summary is None:
+            return None, 0
+        count = int(prior_summary.message_count)
+        text = str(prior_summary.text or "").strip()
+        if not text or count <= 0 or count > len(covered):
+            return None, 0
+        if self._source_digest(covered[:count]) != prior_summary.source_digest:
+            return None, 0
+        return text, count
 
     def _metadata_for_message(self, message: HistoryMessage) -> Dict[str, Any]:
         meta = dict(message.metadata or {})
@@ -630,11 +771,35 @@ class CompactionController:
 
     def _estimate_tokens(self, messages: Iterable[HistoryMessage]) -> int:
         return sum(
-            self._estimate_text_tokens(m.content)
-            + self._estimate_text_tokens(m.reasoning_content)
-            + self._estimate_text_tokens(m.native_items)
-            for m in messages
+            sum(
+                self._estimate_text_tokens(payload)
+                for payload in message_token_payloads(message)
+            )
+            for message in messages
         )
+
+    def _source_digest(self, messages: Iterable[HistoryMessage]) -> str:
+        payload = [
+            {
+                "role": message.role,
+                "step_id": message.step_id,
+                "content": message.content,
+                "reasoning_content": message.reasoning_content,
+                "tool_calls": message.tool_calls,
+                "tool_call_id": message.tool_call_id,
+                "name": message.name,
+                "native_items": message.native_items,
+            }
+            for message in messages
+        ]
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
     def _estimate_text_tokens(self, text: Any) -> int:
         s = str(text or "")
@@ -663,6 +828,12 @@ class CompactHistory(History):
         if keep_last_rounds is not None:
             cfg.keep_last_rounds = int(keep_last_rounds)
         if keep_last_messages is not None:
+            warnings.warn(
+                "keep_last_messages is deprecated; compaction now preserves "
+                "complete rounds",
+                DeprecationWarning,
+                stacklevel=2,
+            )
             cfg.keep_last_messages = int(keep_last_messages)
         if hard_window is not None:
             cfg.hard_window = int(hard_window)
@@ -675,10 +846,12 @@ class CompactHistory(History):
         self._controller = CompactionController(cfg, llm=llm)
         self._pending_runtime_events: List[Dict[str, Any]] = []
         self._last_message_metadata: List[Dict[str, Any]] = []
-        self._last_summary: Optional[str] = None
+        self._summary_checkpoint: _SummaryCheckpoint | None = None
+        self._revision = 0
 
     def append(self, message: HistoryMessage) -> None:
         self._messages.append(message)
+        self._revision += 1
         self.evict()
 
     def retrieve(
@@ -688,45 +861,75 @@ class CompactHistory(History):
         observation: Any = None,
     ) -> List[HistoryMessage]:
         query = query or {}
+        source_revision = self._revision
         items = self._filter_messages(query)
-        max_items = int(
-            query.get("max_items", len(items) if items else self.config.hard_window)
-        )
-        if max_items > 0:
-            items = items[-max_items:]
-
         budget = int(query.get("max_tokens") or self.config.max_tokens)
         pending = str(query.get("pending_content") or "")
         auto_compact = bool(query.get("auto_compact", self.config.auto_compact))
+        max_items = int(
+            query.get("max_items", len(items) if items else self.config.hard_window)
+        )
+        # A token-aware strategy must see the complete canonical prefix so it
+        # can summarize it. Count windows remain available when compaction is
+        # explicitly disabled.
+        if max_items > 0 and not auto_compact:
+            items = select_recent_history(items, max_items)
+
         result, events, metadata = self._controller.retrieve(
             items,
             budget=budget,
             pending_content=pending,
             auto_compact=auto_compact,
-            prior_summary=self._last_summary,
+            prior_summary=self._summary_checkpoint,
         )
+        if self._revision != source_revision:
+            raise RuntimeError("history changed while compaction was in progress")
+        result = [
+            replace(
+                message,
+                metadata={
+                    **message.metadata,
+                    "source_history_version": source_revision,
+                },
+            )
+            if message.metadata.get("summary")
+            else message
+            for message in result
+        ]
+        for item in metadata:
+            if item.get("summary"):
+                item.setdefault("source_history_version", source_revision)
+        for event in events:
+            context = event.get("context")
+            if isinstance(context, dict):
+                context.setdefault("source_history_version", source_revision)
         self._pending_runtime_events = list(events)
         self._last_message_metadata = list(metadata)
         self._remember_summary(result)
         return result
 
     def summarize(self, max_items: int = 5) -> str:
-        items = self._messages[-max_items:]
+        items = select_recent_history(self._messages, max_items)
         return self._controller.summary.summarize(items)
 
     def evict(self) -> int:
         hard_window = int(self.config.hard_window)
         if hard_window <= 0 or len(self._messages) <= hard_window:
             return 0
-        removed = len(self._messages) - hard_window
-        self._messages = self._messages[-hard_window:]
+        retained = select_recent_history(self._messages, hard_window)
+        removed = len(self._messages) - len(retained)
+        self._messages = retained
+        if removed:
+            self._revision += 1
         return removed
 
     def reset(self, run_id: Optional[str] = None) -> None:
         self._messages = []
         self._pending_runtime_events = []
         self._last_message_metadata = []
-        self._last_summary = None
+        self._summary_checkpoint = None
+        self._controller.clear_cache()
+        self._revision += 1
 
     def _remember_summary(self, result: List[HistoryMessage]) -> None:
         """Keep the newest continuation summary so later passes can build on it.
@@ -741,12 +944,30 @@ class CompactHistory(History):
         if not head.metadata.get("summary"):
             return
         text = str(head.content or "").strip()
-        if text:
-            self._last_summary = text
+        source_digest = head.metadata.get("source_digest")
+        message_count = head.metadata.get("summarized_message_count")
+        if (
+            text
+            and isinstance(source_digest, str)
+            and source_digest
+            and isinstance(message_count, int)
+            and message_count > 0
+        ):
+            self._summary_checkpoint = _SummaryCheckpoint(
+                text=text,
+                source_digest=source_digest,
+                message_count=message_count,
+            )
 
     @property
     def last_summary(self) -> Optional[str]:
-        return self._last_summary
+        if self._summary_checkpoint is None:
+            return None
+        return self._summary_checkpoint.text
+
+    @property
+    def history_version(self) -> int:
+        return self._revision
 
     def consume_runtime_events(self) -> List[Dict[str, Any]]:
         events = list(self._pending_runtime_events)

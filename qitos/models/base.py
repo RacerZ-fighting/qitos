@@ -9,13 +9,14 @@ Design Principles:
 3. Output: Text by default, with optional raw-response access for structured runtimes
 """
 
+import json
 import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Type
 
-from ..core.multimodal import content_to_text, normalize_messages
+from ..core.multimodal import normalize_messages
 from .context_registry import infer_context_window
 
 
@@ -187,6 +188,22 @@ class Model(ABC):
         pieces = re.findall(r"\w+|[^\s\w]", text, flags=re.UNICODE)
         return len(pieces)
 
+    def count_request_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        request_options: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Estimate tokens for one complete provider input request.
+
+        Adapters whose wire message shape differs from canonical QitOS
+        messages should override this method. Request options passed here are
+        already limited to fields that can contribute provider input tokens.
+        """
+
+        payload: Dict[str, Any] = {"messages": list(messages)}
+        payload.update(dict(request_options or {}))
+        return self.count_tokens(payload)
+
     def extract_usage(self, response: Any = None) -> Optional[Dict[str, Any]]:
         """
         Return provider-reported token usage for the most recent call when available.
@@ -212,18 +229,14 @@ class Model(ABC):
             return ""
         if isinstance(payload, str):
             return payload
-        if isinstance(payload, list):
-            parts: List[str] = []
-            for item in payload:
-                if isinstance(item, dict):
-                    role = item.get("role", "")
-                    content = content_to_text(item.get("content"))
-                    parts.append(f"{role}: {content}")
-                else:
-                    parts.append(str(item))
-            return "\n".join(parts)
-        if isinstance(payload, dict):
-            return "\n".join(f"{k}: {v}" for k, v in payload.items())
+        if isinstance(payload, (dict, list)):
+            return json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
         return str(payload)
 
     def format_messages(

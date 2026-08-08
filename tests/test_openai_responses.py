@@ -12,6 +12,7 @@ from qitos.models.openai import (
     AsyncOpenAICompatibleModel,
     OpenAICompatibleModel,
     OpenAIModel,
+    _count_openai_request_tokens,
 )
 
 
@@ -124,6 +125,141 @@ def test_responses_input_replays_native_items_and_tool_outputs() -> None:
         },
         {"type": "function_call_output", "call_id": "call_1", "output": "3"},
     ]
+
+
+def test_responses_input_keeps_text_and_generic_tool_transaction() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": "I will verify that now.",
+            "tool_calls": [
+                {
+                    "id": "call_lookup",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": '{"key":"target"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_lookup",
+            "name": "lookup",
+            "content": "verified",
+        },
+    ]
+
+    assert responses_module._to_responses_input(messages) == [
+        {"role": "assistant", "content": "I will verify that now."},
+        {
+            "type": "function_call",
+            "call_id": "call_lookup",
+            "name": "lookup",
+            "arguments": '{"key":"target"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_lookup",
+            "output": "verified",
+        },
+    ]
+
+
+def test_responses_input_deduplicates_generic_native_mirrors() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "content": "checking",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+            "native_items": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                },
+            ],
+        }
+    ]
+
+    payload = responses_module._to_responses_input(messages)
+
+    assert payload[0] == {"role": "assistant", "content": "checking"}
+    assert sum(item.get("type") == "function_call" for item in payload) == 1
+
+
+def test_responses_request_count_uses_normalized_wire_options_without_duplicate_calls() -> None:
+    class _RecordingAdapter:
+        api_mode = "responses"
+
+        def __init__(self) -> None:
+            self.payloads: list[Any] = []
+
+        def count_tokens(self, payload: Any) -> int:
+            self.payloads.append(payload)
+            return len(str(payload))
+
+    adapter = _RecordingAdapter()
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+            "native_items": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}",
+                }
+            ],
+        }
+    ]
+
+    count = _count_openai_request_tokens(
+        adapter,  # type: ignore[arg-type]
+        messages,
+        {
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+            "response_format": {"type": "json_object"},
+        },
+    )
+
+    assert isinstance(count, int) and count > 0
+    message_payload, wire_options = adapter.payloads
+    wire_messages = message_payload["input"]
+    assert sum(item.get("type") == "function_call" for item in wire_messages) == 1
+    assert wire_options["tools"][0]["name"] == "lookup"
+    assert "function" not in wire_options["tools"][0]
+    assert wire_options["text"]["format"]["type"] == "json_object"
 
 
 def test_responses_tools_flatten_chat_function_schema() -> None:

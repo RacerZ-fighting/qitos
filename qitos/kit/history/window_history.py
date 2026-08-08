@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from qitos.core.history import History, HistoryMessage
+from qitos.core.history import (
+    History,
+    HistoryMessage,
+    message_token_payloads,
+    select_recent_history,
+)
 
 
 class WindowHistory(History):
@@ -44,7 +49,7 @@ class WindowHistory(History):
         if step_max is not None:
             items = [m for m in items if m.step_id <= int(step_max)]
         if max_items > 0:
-            items = items[-max_items:]
+            items = select_recent_history(items, max_items)
         pending = str(query.get("pending_content") or "")
         budget = int(query.get("max_tokens") or 0)
         before_tokens = self._estimate_tokens(items) + self._estimate_text_tokens(
@@ -86,8 +91,9 @@ class WindowHistory(History):
     def evict(self) -> int:
         if self.window_size <= 0 or len(self._messages) <= self.window_size:
             return 0
-        removed = len(self._messages) - self.window_size
-        self._messages = self._messages[-self.window_size :]
+        retained = select_recent_history(self._messages, self.window_size)
+        removed = len(self._messages) - len(retained)
+        self._messages = retained
         return removed
 
     def reset(self, run_id: Optional[str] = None) -> None:
@@ -122,9 +128,11 @@ class WindowHistory(History):
 
     def _estimate_tokens(self, messages: List[HistoryMessage]) -> int:
         return sum(
-            self._estimate_text_tokens(m.content)
-            + self._estimate_text_tokens(m.reasoning_content)
-            for m in messages
+            sum(
+                self._estimate_text_tokens(payload)
+                for payload in message_token_payloads(message)
+            )
+            for message in messages
         )
 
     def _estimate_text_tokens(self, text: Any) -> int:

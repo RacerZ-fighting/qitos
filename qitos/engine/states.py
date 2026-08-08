@@ -45,31 +45,25 @@ class ContextConfig:
 
     Three thresholds act on one request, in this order:
 
-    * ``warning_ratio`` (0.80) — occupancy at which a ``warning`` context event
+    * ``warning_ratio`` (0.75) — occupancy at which a ``warning`` context event
       is emitted. Observability only; nothing is reduced.
-    * ``compact_ratio`` (0.85) — fraction of the provider-safe hard history
-      budget at which the history strategy is asked to compact. Lowering it
-      compacts earlier.
+    * ``compact_ratio`` (0.80) — fraction of the provider-safe total input
+      budget at which the history strategy must compact. System and current
+      user tokens count toward this threshold.
     * overflow (1.0) — exceeding ``available_input_budget`` raises
       ``ContextOverflowError`` when ``strict_overflow`` is set.
 
-    ``target_utilization`` is a different axis: it sets the soft target used by
-    preventive history sliding. It is not multiplied by ``compact_ratio``;
-    the hard provider capacity remains available to deterministic recovery.
+    The compaction threshold is also exposed as ``soft_input_target`` in
+    telemetry. There is no second sliding-window target: all normal reduction
+    goes through the configured transaction-aware history strategy.
     """
 
     enabled: bool = True
-    warning_ratio: float = 0.80
-    compact_ratio: float = 0.85
-    target_utilization: float = 0.85
+    warning_ratio: float = 0.75
+    compact_ratio: float = 0.80
     safety_reserve_tokens: Optional[int] = None
     safety_reserve_ratio: float = 0.05
     min_safety_reserve_tokens: int = 1024
-    # Keep deterministic history recovery comfortably below the actual
-    # provider capacity.  This is intentionally distinct from the hard
-    # context-window calculation.
-    compaction_headroom_tokens: int = 8_000
-    min_output_reserve_tokens: int = 1_024
     default_context_window: int = 128000
     tool_result_max_chars: int = 50000
     tool_result_per_message_max_chars: int = 200000
@@ -87,26 +81,18 @@ class ContextConfig:
 
 
 @dataclass
-class ContextBudget:
-    max_input_tokens: int
-    target_utilization: float = 0.85
-    tool_result_max_chars: int = 50000
-    conversation_max_rounds: int = 10
-
-    @property
-    def target_tokens(self) -> int:
-        return int(self.max_input_tokens * self.target_utilization)
-
-
-@dataclass
 class ContextTelemetry:
     context_window: Optional[int] = None
     available_input_budget: Optional[int] = None
     hard_input_budget: Optional[int] = None
     soft_input_target: Optional[int] = None
+    input_budget_source: str = "unresolved"
     system_prompt_tokens: int = 0
     history_tokens: int = 0
     prepared_tokens: int = 0
+    message_injection_tokens: int = 0
+    user_content_block_tokens: int = 0
+    request_overhead_tokens: int = 0
     input_tokens_total: int = 0
     output_tokens: int = 0
     provider_prompt_tokens: Optional[int] = None
@@ -119,7 +105,7 @@ class ContextTelemetry:
     meter_error: str = ""
     token_estimate_error: Optional[int] = None
     occupancy_ratio: float = 0.0
-    warning_threshold_ratio: float = 0.80
+    warning_threshold_ratio: float = 0.75
     counting_mode: str = "disabled"
     prompt_tokens_total: int = 0
     completion_tokens_total: int = 0

@@ -8,7 +8,11 @@ from typing import Any, Dict, Generic, List, Optional, TypeVar
 from ..core.decision import Decision
 from ..core.errors import StopReason
 from ..core.state import StateSchema
-from ._context_runtime import ContextOverflowError, DecisionContextConfigurationError
+from ._context_runtime import (
+    ContextCompactionRequired,
+    ContextOverflowError,
+    DecisionContextConfigurationError,
+)
 from ._protocol import _EngineProtocol
 from .critic_result import CriticResult
 from .states import RuntimePhase, StepRecord
@@ -354,94 +358,30 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
             return False
 
         if isinstance(exc, ContextOverflowError) or self._is_api_context_overflow(exc):
-            # Reactive recovery for provider-side context errors. CyberGym's
-            # history owns durable state outside the conversation, so it can
-            # safely evict complete transactions without a model summary.
-            reactive_compact_limit = 3
-            if getattr(engine.context_config, "reactive_compact", True):
-                ctx_runtime = getattr(engine, "_context_runtime", None)
-                attempts = getattr(ctx_runtime, "reactive_compact_attempts", 0) if ctx_runtime else 0
-                history = engine._history()
-                if attempts < reactive_compact_limit and hasattr(history, "_messages") and len(history._messages) > 4:
-                    # CyberGym exposes deterministic whole-transaction
-                    # sliding. Never route it through QitOS's model-summary
-                    # compactor; durable state already lives in its controller.
-                    try:
-                        slider = getattr(history, "slide_window", None)
-                        if callable(slider):
-                            result = slider(
-                                required_savings_tokens=25_000,
-                                reason="reactive_provider_overflow",
-                                recovery_stage="provider_overflow_retry",
-                            )
-                            if not result.get("applied"):
-                                result = slider(
-                                    required_savings_tokens=10**9,
-                                    reason="reactive_provider_overflow",
-                                    retain_latest_complete=False,
-                                    recovery_stage="fresh_history_window",
-                                )
-                            if result.get("applied"):
-                                if ctx_runtime is not None:
-                                    ctx_runtime.reactive_compact_attempts = attempts + 1
-                                engine._emit(
-                                    step_id,
-                                    RuntimePhase.COMPACT,
-                                    payload={
-                                        "stage": "context_history",
-                                        "context": {
-                                            "stage": str(
-                                                result.get("recovery_stage")
-                                                or "provider_overflow_retry"
-                                            ),
-                                            **dict(result),
-                                        },
-                                    },
-                                )
-                                return True
-                            raise RuntimeError(
-                                "transaction history has no further complete window to slide"
-                            )
-                        from ..kit.history.compact_history import CompactionController, CompactConfig
-                        config = CompactConfig(
-                            keep_last_rounds=1,
-                            keep_last_messages=4,
-                            auto_compact=True,
-                        )
-                        controller = CompactionController(config, llm=getattr(engine.agent, "llm", None))
-                        items = list(history._messages)
-                        result, events, _ = controller.retrieve(
-                            items,
-                            budget=max(4000, len(items) * 50),
-                            pending_content="",
-                            auto_compact=True,
-                        )
-                        # Replace history with compacted version
-                        history._messages = result
-                        # Increment reactive compact counter
-                        if ctx_runtime is not None:
-                            ctx_runtime.reactive_compact_attempts = attempts + 1
-                        engine._emit(
-                            step_id,
-                            RuntimePhase.COMPACT,
-                            payload={
-                                "stage": "reactive_compact",
-                                "messages_before": len(items),
-                                "messages_after": len(result),
-                                "reason": "context_overflow",
-                            },
-                        )
-                        # Don't stop — let the engine retry with compacted history
-                        return True
-                    except Exception:
-                        pass
-            # A CyberGym fresh window with no history left means the stable
-            # prompt/schema/Decision Context itself cannot fit. That is a
-            # fixed launch/configuration defect, not an agent failure.
-            if hasattr(engine._history(), "slide_window"):
-                state.set_stop(StopReason.INFRASTRUCTURE_INVALID)
-            else:
-                state.set_stop(StopReason.CONTEXT_OVERFLOW)
+            # Provider overflow is a bounded last-resort signal, not permission
+            # to mutate or arbitrarily slice canonical history. Each retry asks
+            # the normal transaction-aware projection for a smaller budget.
+            retry = engine._context_runtime.begin_reactive_compaction()
+            if retry is not None:
+                engine._emit(
+                    step_id,
+                    RuntimePhase.COMPACT,
+                    payload={
+                        "stage": "context_history",
+                        "context": {
+                            "stage": "reactive_compact_retry",
+                            "reason": (
+                                "force_threshold_reached"
+                                if isinstance(exc, ContextCompactionRequired)
+                                else "provider_context_overflow"
+                            ),
+                            "canonical_history_mutated": False,
+                            **retry,
+                        },
+                    },
+                )
+                return True
+            state.set_stop(StopReason.CONTEXT_OVERFLOW)
             return False
 
         decision = engine.recovery_policy.handle(state, phase.value, step_id, exc)

@@ -60,18 +60,36 @@ def _to_responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for raw_message in messages:
         if not isinstance(raw_message, dict):
             continue
-        native_items = raw_message.get("native_items")
-        if isinstance(native_items, list) and native_items:
-            for item in native_items:
-                native_item = _native_value(item)
-                if isinstance(native_item, dict):
-                    items.append(dict(native_item))
-            continue
+
+        native_items: List[Dict[str, Any]] = []
+        native_call_ids: set[str] = set()
+        native_output_ids: set[str] = set()
+        has_native_message = False
+        seen_native_transactions: set[tuple[str, str]] = set()
+        for raw_item in raw_message.get("native_items") or []:
+            native_item = _native_value(raw_item)
+            if not isinstance(native_item, dict):
+                continue
+            item_type = str(native_item.get("type") or "").strip()
+            call_id = str(native_item.get("call_id") or "").strip()
+            if item_type in {"function_call", "function_call_output"} and call_id:
+                transaction_key = (item_type, call_id)
+                if transaction_key in seen_native_transactions:
+                    continue
+                seen_native_transactions.add(transaction_key)
+                if item_type == "function_call":
+                    native_call_ids.add(call_id)
+                else:
+                    native_output_ids.add(call_id)
+            if item_type == "message":
+                has_native_message = True
+            native_items.append(dict(native_item))
 
         role = str(raw_message.get("role") or "user").strip() or "user"
         if role == "tool":
             call_id = str(raw_message.get("tool_call_id") or "").strip()
-            if call_id:
+            items.extend(native_items)
+            if call_id and call_id not in native_output_ids:
                 items.append(
                     {
                         "type": "function_call_output",
@@ -82,7 +100,14 @@ def _to_responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             continue
 
         content = raw_message.get("content")
-        if content is None and role == "assistant" and raw_message.get("tool_calls"):
+        emitted_content = content is not None and not has_native_message
+        if emitted_content:
+            message = {"role": role, "content": content}
+            items.append(cast(Dict[str, Any], _native_value(message)))
+
+        items.extend(native_items)
+        emitted_call = False
+        if role == "assistant":
             for tool_call in raw_message.get("tool_calls") or []:
                 if not isinstance(tool_call, dict):
                     continue
@@ -91,18 +116,21 @@ def _to_responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     continue
                 call_id = str(tool_call.get("id") or "").strip()
                 name = str(function.get("name") or "").strip()
-                if call_id and name:
-                    items.append(
-                        {
-                            "type": "function_call",
-                            "call_id": call_id,
-                            "name": name,
-                            "arguments": str(function.get("arguments") or "{}"),
-                        }
-                    )
-            continue
-        message = {"role": role, "content": content if content is not None else ""}
-        items.append(cast(Dict[str, Any], _native_value(message)))
+                if not call_id or not name or call_id in native_call_ids:
+                    continue
+                items.append(
+                    {
+                        "type": "function_call",
+                        "call_id": call_id,
+                        "name": name,
+                        "arguments": str(function.get("arguments") or "{}"),
+                    }
+                )
+                native_call_ids.add(call_id)
+                emitted_call = True
+
+        if not emitted_content and not native_items and not emitted_call:
+            items.append({"role": role, "content": ""})
     return items
 
 

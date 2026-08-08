@@ -49,6 +49,17 @@ How to update:
 
 ### Changed
 
+- Context control now measures the complete provider input, including native tool
+  schemas and response schemas, and forces transaction-safe compaction at 80% of
+  the provider-safe input budget. `CompactHistory` uses three bounded levels
+  (microcompact, recent-round summary, and all-but-latest-round resummary), applies
+  summaries only to immutable projections, reuses exact-prefix summary checkpoints,
+  and bounds repeated summary failures with a three-attempt circuit. Overflow recovery
+  uses `.70/.50/.35` history budgets without mutating canonical history. The unsafe
+  `keep_last_messages` slicing option is deprecated;
+  it remains accepted as a compatibility-only no-op while callers migrate to complete
+  round retention. Responses text/tool payloads and generic/native mirrors now keep one
+  complete, accurately counted call/result transaction.
 - Async Engine runs now use a daemon worker with cooperative cancellation, and the two
   duplicated stream cleanup paths share one lifecycle implementation. Early consumer
   close requests Engine cancellation; normal completion still propagates Engine errors.
