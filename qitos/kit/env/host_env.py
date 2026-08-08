@@ -430,13 +430,12 @@ class HostEnv(Env):
     def supports_action(self, action: Any) -> bool:
         name = self._to_action_name(action)
         return name in {
-            "view",
             "read_file",
             "write_file",
-            "replace_lines",
+            "edit_file",
             "run_command",
             "list_files",
-            "search",
+            "grep",
         }
 
     def execute_action(self, action: Any, state: Any = None) -> Any:
@@ -444,7 +443,7 @@ class HostEnv(Env):
         name = act.name
         args = act.args or {}
         try:
-            if name in {"view", "read_file"}:
+            if name == "read_file":
                 path = str(args.get("path") or args.get("filename") or "")
                 content = self.fs.read_text(path)
                 return {"status": "success", "path": path, "content": content}
@@ -462,18 +461,18 @@ class HostEnv(Env):
                     "files": files,
                     "count": len(files),
                 }
-            if name == "search":
+            if name == "grep":
                 path = str(args.get("path") or "")
-                query = str(args.get("query") or "")
-                return self._search(
-                    path=path, query=query, limit=int(args.get("limit", 50))
+                pattern = str(args.get("pattern") or "")
+                return self._grep_file(
+                    path=path, pattern=pattern, limit=int(args.get("limit", 50))
                 )
-            if name == "replace_lines":
-                return self._replace_lines(
+            if name == "edit_file":
+                return self._edit_file(
                     path=str(args.get("path", "")),
-                    start_line=int(args.get("start_line", 1)),
-                    end_line=int(args.get("end_line", 1)),
-                    replacement=str(args.get("replacement", "")),
+                    old_text=str(args.get("old_text", "")),
+                    new_text=str(args.get("new_text", "")),
+                    replace_all=bool(args.get("replace_all", False)),
                 )
             if name == "run_command":
                 return self.cmd.run(
@@ -484,40 +483,44 @@ class HostEnv(Env):
             self._last_error = str(exc)
             return {"status": "error", "error": str(exc), "action": name}
 
-    def _replace_lines(
-        self, path: str, start_line: int, end_line: int, replacement: str
+    def _edit_file(
+        self, path: str, old_text: str, new_text: str, replace_all: bool
     ) -> Dict[str, Any]:
         text = self.fs.read_text(path)
-        lines = text.splitlines()
-        if start_line < 1 or end_line < start_line or end_line > len(lines):
-            return {"status": "error", "error": "invalid line range", "path": path}
-        new_lines = (
-            lines[: start_line - 1] + replacement.splitlines() + lines[end_line:]
-        )
-        self.fs.write_text(
-            path, "\n".join(new_lines) + ("\n" if text.endswith("\n") else "")
-        )
+        if not old_text:
+            return {"status": "error", "error": "old_text cannot be empty", "path": path}
+        count = text.count(old_text)
+        if count == 0:
+            return {"status": "error", "error": "text not found", "path": path}
+        if count > 1 and not replace_all:
+            return {
+                "status": "error",
+                "error": "text replacement must be unique",
+                "path": path,
+                "occurrences": count,
+            }
+        updated = text.replace(old_text, new_text, -1 if replace_all else 1)
+        self.fs.write_text(path, updated)
         return {
             "status": "success",
             "path": path,
-            "start_line": start_line,
-            "end_line": end_line,
+            "replacements": count if replace_all else 1,
         }
 
-    def _search(self, path: str, query: str, limit: int = 50) -> Dict[str, Any]:
-        if not query:
-            return {"status": "error", "error": "empty query"}
+    def _grep_file(self, path: str, pattern: str, limit: int = 50) -> Dict[str, Any]:
+        if not pattern:
+            return {"status": "error", "error": "empty pattern"}
         text = self.fs.read_text(path)
         out: List[Dict[str, Any]] = []
         for idx, line in enumerate(text.splitlines(), start=1):
-            if re.search(re.escape(query), line):
+            if re.search(pattern, line):
                 out.append({"line": idx, "text": line})
                 if len(out) >= limit:
                     break
         return {
             "status": "success",
             "path": path,
-            "query": query,
+            "pattern": pattern,
             "matches": out,
             "count": len(out),
         }

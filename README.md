@@ -68,8 +68,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   cheap mechanical work local.
 - **Environment-backed coding tools**: named Env capability groups now let the same
   bounded workspace tools run against host, container, or remote providers. The compact
-  workspace profile includes reads/writes/exact edits, fixed-argv `rg` search, hex view,
-  and directory inspection without per-tool backend adapters.
+  workspace profile exposes one lowercase surface (`read_file`, `write_file`,
+  `edit_file`, `glob`, `grep`, and related tools). Search uses fixed-argv `rg`, stable
+  bounded results, NUL-safe paths, and explicit hidden/ignored-file controls without
+  per-tool backend adapters.
 - **Managed public web fetch**: a provider-neutral `web_fetch` tool now accepts
   host-injected providers. An explicitly configured Kimi managed-fetch adapter adds
   public-initial-URL validation, bounded results, and provider failure categories; QitOS

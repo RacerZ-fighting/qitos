@@ -463,11 +463,20 @@ def __init__(
     workspace_root: str = ".",
     shell_timeout: int = 30,
     include_notebook: bool = True,
+    *,
     enable_lsp: bool = True,
     enable_tasks: bool = True,
     enable_web: bool = True,
+    profile: str = "full",
+    include_http_tools: bool = False,
+    auto_approve: bool = False,
+    allow_local_fallback: bool = True,
 )
 ```
+
+Profiles expose one exact lowercase tool surface. `glob` and `grep` use fixed-argv
+`rg`, respect ignore files by default, and accept separate `include_hidden` and
+`include_ignored` controls.
 
 **Typical usage**
 
@@ -483,7 +492,6 @@ registry.register_toolset(
         enable_lsp=False,
         enable_tasks=False,
         enable_web=False,
-        expose_modern_names=False,
     )
 )
 ```

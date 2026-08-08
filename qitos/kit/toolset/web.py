@@ -15,8 +15,6 @@ class WebToolSet(CodingToolSet):
             enable_lsp=False,
             enable_tasks=False,
             enable_web=True,
-            expose_legacy_aliases=True,
-            expose_modern_names=True,
             profile="web",
             include_http_tools=True,
         )

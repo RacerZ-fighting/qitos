@@ -1,7 +1,7 @@
 """Built-in sub-agent types for the Agent tool.
 
 Each sub-agent is an AgentModule subclass optimized for a specific task:
-- ExploreAgent: Fast codebase search (Read, Glob, Grep only, low max_steps)
+- ExploreAgent: Fast codebase search (read_file, glob, grep only, low max_steps)
 - PlanAgent: Read-only architecture analysis (plan mode, no write tools)
 - GeneralAgent: General-purpose agent with full tool access
 """
@@ -9,7 +9,7 @@ Each sub-agent is an AgentModule subclass optimized for a specific task:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 from qitos import AgentModule, Decision, StateSchema
 from qitos.kit import CodingToolSet
@@ -26,7 +26,7 @@ class ExploreState(StateSchema):
 class ExploreAgent(AgentModule[ExploreState, Any, Any]):
     """Fast codebase search agent with only read tools.
 
-    Optimized for speed: Read, Glob, Grep only, max_steps=8.
+    Optimized for speed: read_file, glob, grep only, max_steps=8.
     """
 
     name = "explore"
@@ -43,7 +43,6 @@ class ExploreAgent(AgentModule[ExploreState, Any, Any]):
         toolset = CodingToolSet(
             workspace_root=workspace_root,
             profile="codebase",
-            expose_modern_names=True,
         )
         super().__init__(
             llm=llm,
@@ -60,8 +59,8 @@ class ExploreAgent(AgentModule[ExploreState, Any, Any]):
     def build_system_prompt(self, state: ExploreState) -> str:
         return (
             "You are a fast codebase search agent. Your job is to quickly find "
-            "relevant code and information. Use Glob to find files, Grep to search "
-            "content, and Read to inspect files. Be concise and focused. "
+            "relevant code and information. Use glob to find files, grep to search "
+            "content, and read_file to inspect files. Be concise and focused. "
             "Report your findings clearly. Do NOT edit any files.\n\n"
             "When reporting findings:\n"
             "- Include file paths and line numbers for every relevant result\n"
@@ -110,7 +109,6 @@ class PlanAgent(AgentModule[PlanState, Any, Any]):
         toolset = CodingToolSet(
             workspace_root=workspace_root,
             profile="codebase",
-            expose_modern_names=True,
         )
         super().__init__(
             llm=llm,
@@ -181,7 +179,6 @@ class GeneralAgent(AgentModule[GeneralState, Any, Any]):
     ):
         toolset = CodingToolSet(
             workspace_root=workspace_root,
-            expose_modern_names=True,
         )
         super().__init__(
             llm=llm,

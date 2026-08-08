@@ -43,19 +43,18 @@ class _OpsWriteFile(BaseTool):
         return {"status": "success", "path": filename, "size": len(content)}
 
 
-def test_host_env_replace_lines_and_command(tmp_path: Path):
+def test_host_env_edit_file_and_command(tmp_path: Path):
     target = tmp_path / "m.py"
     target.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
     env = HostEnv(workspace_root=str(tmp_path))
 
     out = env.execute_action(
         Action(
-            name="replace_lines",
+            name="edit_file",
             args={
                 "path": "m.py",
-                "start_line": 2,
-                "end_line": 2,
-                "replacement": "    return a + b",
+                "old_text": "    return a - b",
+                "new_text": "    return a + b",
             },
         )
     )

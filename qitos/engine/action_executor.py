@@ -1656,14 +1656,9 @@ class ActionExecutor:
 
     # ── Read-before-write support ──────────────────────────────────────────────
 
-    _WRITE_TOOL_NAMES = frozenset({
-        "file_edit_v2", "write_file", "Edit", "Write",
-        "str_replace", "insert", "replace_lines", "append_file",
-    })
+    _WRITE_TOOL_NAMES = frozenset({"edit_file", "write_file"})
 
-    _READ_TOOL_NAMES = frozenset({
-        "file_read_v2", "read_file", "Read", "view",
-    })
+    _READ_TOOL_NAMES = frozenset({"read_file"})
 
     def _check_read_before_write(self, action: Action) -> Optional[ActionResult]:
         """Check read-before-write enforcement for file editing tools.

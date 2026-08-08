@@ -6,24 +6,14 @@ from qitos.kit.tool.internal.coding_impl import CodingToolSet
 from qitos.kit.tool.internal.delegating import DelegatingTool
 
 
-class GlobFiles(DelegatingTool):
+class Glob(DelegatingTool):
     def __init__(self, workspace_root: str = "."):
-        super().__init__(CodingToolSet(workspace_root=workspace_root).glob_files)
+        super().__init__(CodingToolSet(workspace_root=workspace_root).glob)
 
 
-class GrepFiles(DelegatingTool):
+class Grep(DelegatingTool):
     def __init__(self, workspace_root: str = "."):
-        super().__init__(CodingToolSet(workspace_root=workspace_root).grep_files)
-
-
-class ReadFileRange(DelegatingTool):
-    def __init__(self, workspace_root: str = "."):
-        super().__init__(CodingToolSet(workspace_root=workspace_root).read_file_range)
-
-
-class SearchInFile(DelegatingTool):
-    def __init__(self, workspace_root: str = "."):
-        super().__init__(CodingToolSet(workspace_root=workspace_root).search)
+        super().__init__(CodingToolSet(workspace_root=workspace_root).grep)
 
 
 class ListTree(DelegatingTool):
@@ -32,9 +22,7 @@ class ListTree(DelegatingTool):
 
 
 __all__ = [
-    "GlobFiles",
-    "GrepFiles",
+    "Glob",
+    "Grep",
     "ListTree",
-    "ReadFileRange",
-    "SearchInFile",
 ]

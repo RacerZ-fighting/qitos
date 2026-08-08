@@ -132,7 +132,6 @@ registry.register_toolset(
         enable_lsp=False,
         enable_tasks=False,
         enable_web=False,
-        expose_modern_names=False,
     )
 )
 ```
@@ -141,8 +140,12 @@ Tools from a toolset are automatically namespaced: `toolset_name.tool_name`. You
 
 ```python
 registry.register_toolset(CodingToolSet(workspace_root="/tmp/work"), namespace="coding")
-# registers as coding.view, coding.str_replace, coding.run_command, etc.
+# registers as coding.read_file, coding.edit_file, coding.run_command, etc.
 ```
+
+Built-in coding profiles expose only canonical lowercase names. Historical uppercase
+and `*_v2` aliases are not registered, so prompts, permission rules, and direct registry
+lookups all use the same exact names.
 
 ---
 

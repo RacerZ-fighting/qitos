@@ -11,8 +11,8 @@ from qitos.qita.cli import _discover_runs
 def _react_fix_outputs() -> list[str]:
     verify_command = 'python -c "import buggy_module; assert buggy_module.add(20, 22) == 42"'
     return [
-        'Thought: inspect target\nAction: view(path="buggy_module.py")',
-        'Thought: patch logic\nAction: replace_lines(path="buggy_module.py", start_line=2, end_line=2, replacement="    return a + b")',
+        'Thought: inspect target\nAction: read_file(path="buggy_module.py")',
+        'Thought: patch logic\nAction: edit_file(path="buggy_module.py", old_text="    return a - b", new_text="    return a + b")',
         f'Thought: verify change\nAction: run_command(command="{verify_command}")',
         "Final Answer: Patch applied and verification passed.",
     ]

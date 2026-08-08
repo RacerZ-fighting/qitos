@@ -66,7 +66,6 @@ class ClaudeCodeAgent(AgentModule[ClaudeCodeState, Any, Any]):
     ):
         toolset = CodingToolSet(
             workspace_root=workspace_root,
-            expose_modern_names=True,
         )
 
         # Build a coding-optimized CompactHistory if none provided.

@@ -26,7 +26,7 @@ from qitos.kit.tool import (
 from qitos.kit.tool.tools import advanced_coding_tools
 
 
-def test_codebase_toolset_glob_grep_read_append(tmp_path):
+def test_codebase_toolset_glob_grep_and_read(tmp_path):
     root = tmp_path
     (root / "src").mkdir()
     (root / "src" / "a.py").write_text(
@@ -40,29 +40,23 @@ def test_codebase_toolset_glob_grep_read_append(tmp_path):
         enable_lsp=False,
         enable_tasks=False,
         enable_web=False,
-        expose_modern_names=False,
         profile="codebase",
     )
 
-    glob_out = toolset.glob_files(pattern="*.py")
+    glob_out = toolset.glob(pattern="*.py")
     assert glob_out["status"] == "success"
     assert glob_out["files"] == ["src/a.py"]
 
-    grep_out = toolset.grep_files(pattern="hello", glob="*.md", regex=False)
+    grep_out = toolset.grep(pattern="hello", glob="*.md", regex=False)
     assert grep_out["status"] == "success"
-    assert grep_out["num_matches"] == 2
+    assert grep_out["match_count"] == 2
     assert grep_out["matches"][0]["path"] == "src/b.md"
 
-    read_out = toolset.read_file_range(path="src/a.py", offset=1, limit=1)
+    read_out = toolset.read_file(path="src/a.py", line_offset=1, line_count=1)
     assert read_out["status"] == "success"
-    assert read_out["offset"] == 1
-    assert read_out["limit"] == 1
-    assert "lines" not in read_out
+    assert read_out["line_offset"] == 1
+    assert read_out["line_count"] == 1
     assert "return a + b" in read_out["content"]
-
-    append_out = toolset.append_file(path="src/b.md", content="extra\n")
-    assert append_out["status"] == "success"
-    assert (root / "src" / "b.md").read_text(encoding="utf-8").endswith("extra\n")
 
 
 def test_notebook_toolset_read_replace_insert(tmp_path):
@@ -154,23 +148,21 @@ def test_predefined_registry_builders_expose_atomic_tools(tmp_path):
     report_registry = report_tools(str(tmp_path))
     audit_registry = security_audit_tools(str(tmp_path))
 
-    assert "codebase.glob_files" in code_registry.list_tools()
-    assert "codebase.grep_files" in code_registry.list_tools()
+    assert "codebase.glob" in code_registry.list_tools()
+    assert "codebase.grep" in code_registry.list_tools()
     assert "read_file" in code_registry.list_tools()
     assert "write_file" in code_registry.list_tools()
     assert "notebook.read_notebook" in notebook_registry.list_tools()
     assert "http_get" in web_registry.list_tools()
     assert "extract_web_text" in web_registry.list_tools()
     assert "web_fetch" in web_registry.list_tools()
-    assert "view" in coding_registry.list_tools()
-    assert "glob_files" in coding_registry.list_tools()
+    assert "read_file" in coding_registry.list_tools()
+    assert "glob" in coding_registry.list_tools()
     assert "run_command" in coding_registry.list_tools()
     assert "todo_write" in coding_registry.list_tools()
     assert "tool_search" in coding_registry.list_tools()
-    assert "bash_v2" not in coding_registry.list_tools()
-    assert "bash_v2" not in advanced_registry.list_tools()
-    assert "file_read_v2" not in advanced_registry.list_tools()
-    assert "file_edit_v2" not in advanced_registry.list_tools()
+    assert "edit_file" in coding_registry.list_tools()
+    assert "edit_file" in advanced_registry.list_tools()
     assert "tool_search" in advanced_registry.list_tools()
     assert "task_create" in task_registry.list_tools()
     assert "task_update" in task_registry.list_tools()
@@ -187,14 +179,11 @@ def test_predefined_registry_builders_expose_atomic_tools(tmp_path):
             enable_lsp=False,
             enable_tasks=False,
             enable_web=False,
-            expose_modern_names=False,
             profile="codebase",
         ),
         namespace="codebase",
     )
-    assert (
-        reg.describe_tool("codebase.read_file_range")["origin"]["source"] == "toolset"
-    )
+    assert reg.describe_tool("codebase.read_file")["origin"]["source"] == "toolset"
 
 
 def test_coding_toolset_collects_editor_shell_and_codebase(tmp_path):
@@ -207,8 +196,8 @@ def test_coding_toolset_collects_editor_shell_and_codebase(tmp_path):
             )
         )
     assert "run_command" in names
-    assert "view" in names
-    assert "glob_files" in names
+    assert "read_file" in names
+    assert "glob" in names
     assert "tool_search" in names
     assert "read_notebook" in names
 
@@ -243,24 +232,47 @@ def test_tool_descriptions_come_from_docstrings():
 def test_coding_toolset_uses_one_canonical_schema_surface():
     registry = coding_tools(".")
     names = set(registry.list_tools())
-    assert "file_read_v2" not in names
-    assert "file_edit_v2" not in names
-    assert "bash_v2" not in names
-    assert "glob_v2" not in names
-    assert "grep_v2" not in names
-    assert "web_fetch_v2" not in names
+    removed_names = {
+        "file_read_v2",
+        "file_edit_v2",
+        "bash_v2",
+        "glob_v2",
+        "grep_v2",
+        "web_fetch_v2",
+        "view",
+        "create",
+        "str_replace",
+        "insert",
+        "replace_lines",
+        "append_file",
+        "glob_files",
+        "grep_files",
+        "read_file_range",
+        "search",
+        "Read",
+        "Edit",
+        "Write",
+        "Glob",
+        "Grep",
+        "Bash",
+        "WebFetch",
+        "AskUserQuestion",
+    }
+    assert names.isdisjoint(removed_names)
 
     read_schema = registry.describe_tool("read_file")["input_schema"]["properties"]
     write_schema = registry.describe_tool("write_file")["input_schema"]["properties"]
-    append_schema = registry.describe_tool("append_file")["input_schema"]["properties"]
-    create_schema = registry.describe_tool("create")["input_schema"]["properties"]
-    range_schema = registry.describe_tool("read_file_range")["input_schema"]["properties"]
+    edit_schema = registry.describe_tool("edit_file")["input_schema"]["properties"]
 
     assert set(read_schema) == {"path", "line_offset", "line_count"}
     assert set(write_schema) == {"path", "content"}
-    assert set(append_schema) == {"path", "content"}
-    assert set(create_schema) == {"path", "content"}
-    assert set(range_schema) == {"path", "offset", "limit"}
+    assert set(edit_schema) == {
+        "path",
+        "old_text",
+        "new_text",
+        "replace_all",
+        "expected_mtime",
+    }
 
 
 def test_tool_package_only_exposes_canonical_toolsets():

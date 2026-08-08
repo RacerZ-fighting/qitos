@@ -11,11 +11,6 @@ class ReadFile(DelegatingTool):
         super().__init__(CodingToolSet(workspace_root=workspace_root).read_file)
 
 
-class ViewFile(DelegatingTool):
-    def __init__(self, workspace_root: str = "."):
-        super().__init__(CodingToolSet(workspace_root=workspace_root).view)
-
-
 class ListFiles(DelegatingTool):
     def __init__(self, workspace_root: str = "."):
         super().__init__(CodingToolSet(workspace_root=workspace_root).list_files)
@@ -26,29 +21,9 @@ class WriteFile(DelegatingTool):
         super().__init__(CodingToolSet(workspace_root=workspace_root).write_file)
 
 
-class CreateFile(DelegatingTool):
+class EditFile(DelegatingTool):
     def __init__(self, workspace_root: str = "."):
-        super().__init__(CodingToolSet(workspace_root=workspace_root).create)
-
-
-class StrReplace(DelegatingTool):
-    def __init__(self, workspace_root: str = "."):
-        super().__init__(CodingToolSet(workspace_root=workspace_root).str_replace)
-
-
-class InsertText(DelegatingTool):
-    def __init__(self, workspace_root: str = "."):
-        super().__init__(CodingToolSet(workspace_root=workspace_root).insert)
-
-
-class ReplaceLines(DelegatingTool):
-    def __init__(self, workspace_root: str = "."):
-        super().__init__(CodingToolSet(workspace_root=workspace_root).replace_lines)
-
-
-class AppendFile(DelegatingTool):
-    def __init__(self, workspace_root: str = "."):
-        super().__init__(CodingToolSet(workspace_root=workspace_root).append_file)
+        super().__init__(CodingToolSet(workspace_root=workspace_root).edit_file)
 
 
 class MakeDirectory(DelegatingTool):
@@ -57,14 +32,9 @@ class MakeDirectory(DelegatingTool):
 
 
 __all__ = [
-    "AppendFile",
-    "CreateFile",
-    "InsertText",
+    "EditFile",
     "ListFiles",
     "MakeDirectory",
     "ReadFile",
-    "ReplaceLines",
-    "StrReplace",
-    "ViewFile",
     "WriteFile",
 ]

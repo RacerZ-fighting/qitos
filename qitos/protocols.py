@@ -344,17 +344,17 @@ Rules:
 - Examples:
 
 <tool_use>
-<tool_name>bash_v2</tool_name>
+<tool_name>run_command</tool_name>
 <arguments>{"command": "ls -la"}</arguments>
 </tool_use>
 
 <tool_use>
-<tool_name>glob_v2</tool_name>
+<tool_name>glob</tool_name>
 <arguments>{"pattern": "**/*.py"}</arguments>
 </tool_use>
 
 <tool_use>
-<tool_name>file_read_v2</tool_name>
+<tool_name>read_file</tool_name>
 <arguments>{"path": "/tmp/test.py"}</arguments>
 </tool_use>"""
 
@@ -377,12 +377,12 @@ Rules:
 - Examples:
 
 <|tool_calls_section_begin|>
-<|tool_call_begin|> functions.Bash:0 <|tool_call_argument_begin|> {"command": "ls -la"} <|tool_call_end|>
-<|tool_call_begin|> functions.Glob:1 <|tool_call_argument_begin|> {"pattern": "**/*.py"} <|tool_call_end|>
+<|tool_call_begin|> functions.run_command:0 <|tool_call_argument_begin|> {"command": "ls -la"} <|tool_call_end|>
+<|tool_call_begin|> functions.glob:1 <|tool_call_argument_begin|> {"pattern": "**/*.py"} <|tool_call_end|>
 <|tool_calls_section_end|>
 
 <|tool_calls_section_begin|>
-<|tool_call_begin|> functions.Read:0 <|tool_call_argument_begin|> {"file_path": "/tmp/test.py"} <|tool_call_end|>
+<|tool_call_begin|> functions.read_file:0 <|tool_call_argument_begin|> {"path": "/tmp/test.py"} <|tool_call_end|>
 <|tool_calls_section_end|>"""
 
 

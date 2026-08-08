@@ -79,7 +79,6 @@ def build_planner_executor_system(
                         enable_lsp=False,
                         enable_tasks=False,
                         enable_web=False,
-                        expose_modern_names=False,
                     )
                 )
             super().__init__(
@@ -127,7 +126,6 @@ def build_planner_executor_system(
                         enable_lsp=False,
                         enable_tasks=False,
                         enable_web=False,
-                        expose_modern_names=False,
                     )
                 )
             super().__init__(

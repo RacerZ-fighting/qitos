@@ -166,12 +166,12 @@ def test_terminus_json_parser_handles_actions_completion_and_feedback() -> None:
     assert complete.meta["task_complete_requested"] is True
 
     tool_act = parser.parse(
-        '{"analysis":"inventory repo","plan":"use audit tools","tools":[{"name":"audit_inventory","args":{}},{"name":"grep_files","args":{"pattern":"SECRET_KEY"}}]}'
+        '{"analysis":"inventory repo","plan":"use audit tools","tools":[{"name":"audit_inventory","args":{}},{"name":"grep","args":{"pattern":"SECRET_KEY"}}]}'
     )
     assert tool_act.mode == "act"
     assert [item["name"] for item in tool_act.actions] == [
         "audit_inventory",
-        "grep_files",
+        "grep",
     ]
 
     wrapped = parser.parse(
@@ -194,14 +194,14 @@ This should help.
         """Context before.
 {"analysis":"small","plan":"skip","commands":[{"keystrokes":"pwd\\n","duration":0.1}]}
 More notes.
-{"analysis":"inspect files","plan":"use tools","tools":[{"name":"audit_inventory","args":{}},{"name":"grep_files","args":{"pattern":"SECRET_KEY","path_glob":"**/*"}}]}
+{"analysis":"inspect files","plan":"use tools","tools":[{"name":"audit_inventory","args":{}},{"name":"grep","args":{"pattern":"SECRET_KEY","glob":"**/*"}}]}
 Context after.
 """
     )
     assert largest.mode == "act"
     assert [item["name"] for item in largest.actions] == [
         "audit_inventory",
-        "grep_files",
+        "grep",
     ]
     assert largest.meta["parser_diagnostics"]["extraction_mode"] == "extracted"
 

@@ -142,8 +142,6 @@ class SecurityAuditAgent(AgentModule[SecurityAuditState, Observation, Action]):
                     enable_lsp=False,
                     enable_tasks=False,
                     enable_web=False,
-                    expose_legacy_aliases=True,
-                    expose_modern_names=False,
                     profile="codebase",
                 ),
                 TaskToolSet(workspace_root=workspace_root),

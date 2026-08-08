@@ -367,7 +367,7 @@ def test_local_openai_compatible_like_parsing_supports_tool_calls() -> None:
                 "tool_calls": [
                     {
                         "function": {
-                            "name": "grep_files",
+                            "name": "grep",
                             "arguments": {"pattern": "TODO"},
                         }
                     }
@@ -375,7 +375,7 @@ def test_local_openai_compatible_like_parsing_supports_tool_calls() -> None:
             }
         }
     )
-    assert out == 'Action: grep_files(pattern="TODO")'
+    assert out == 'Action: grep(pattern="TODO")'
 
 
 def test_context_registry_infers_anthropic_and_gemini_windows() -> None:

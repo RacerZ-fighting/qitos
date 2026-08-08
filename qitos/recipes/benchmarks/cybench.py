@@ -103,7 +103,6 @@ class CyBenchReactAgent(AgentModule[CyBenchState, Dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         registry.register(SubmitAnswer())

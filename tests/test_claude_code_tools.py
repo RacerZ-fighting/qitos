@@ -1,4 +1,4 @@
-"""Tests for Phase 2: tool aliases, sub-agents, cron, worktree manager."""
+"""Tests for sub-agents, cron, and worktree management."""
 
 import os
 import tempfile
@@ -6,93 +6,12 @@ import threading
 import time
 from types import SimpleNamespace
 
-from qitos.kit import CodingToolSet
 from qitos.kit.tool.internal.coding_utils import (
     is_image_file,
     is_notebook_file,
     is_pdf_file,
     read_image_as_base64,
 )
-
-
-# ── Claude Code tool aliases ──────────────────────────────────────────────────
-
-
-class TestToolAliases:
-    """Verify that Claude Code modern-name aliases are registered."""
-
-    def _get_tool_names(self, **kwargs):
-        ts = CodingToolSet(workspace_root=".", expose_modern_names=True, **kwargs)
-        tools = ts.tools()
-        names = set()
-        for t in tools:
-            if hasattr(t, "name"):
-                names.add(t.name)
-            elif hasattr(t, "__name__"):
-                names.add(t.__name__)
-        return names
-
-    def test_read_alias_exists(self):
-        names = self._get_tool_names()
-        assert "Read" in names
-
-    def test_edit_alias_exists(self):
-        names = self._get_tool_names()
-        assert "Edit" in names
-
-    def test_write_alias_exists(self):
-        names = self._get_tool_names()
-        assert "Write" in names
-
-    def test_glob_alias_exists(self):
-        names = self._get_tool_names()
-        assert "Glob" in names
-
-    def test_grep_alias_exists(self):
-        names = self._get_tool_names()
-        assert "Grep" in names
-
-    def test_bash_alias_exists(self):
-        names = self._get_tool_names()
-        assert "Bash" in names
-
-    def test_webfetch_alias_exists(self):
-        names = self._get_tool_names(enable_web=True)
-        assert "WebFetch" in names
-
-    def test_askuserquestion_alias_exists(self):
-        names = self._get_tool_names()
-        assert "AskUserQuestion" in names
-
-    def test_no_modern_names_by_default(self):
-        ts = CodingToolSet(workspace_root=".", expose_modern_names=False)
-        tools = ts.tools()
-        names = set()
-        for t in tools:
-            if hasattr(t, "name"):
-                names.add(t.name)
-            elif hasattr(t, "__name__"):
-                names.add(t.__name__)
-        assert "Read" not in names
-        assert "Edit" not in names
-        assert "Write" not in names
-
-    def test_legacy_and_modern_coexist(self):
-        ts = CodingToolSet(
-            workspace_root=".",
-            expose_modern_names=True,
-            expose_legacy_aliases=True,
-        )
-        tools = ts.tools()
-        names = set()
-        for t in tools:
-            if hasattr(t, "name"):
-                names.add(t.name)
-            elif hasattr(t, "__name__"):
-                names.add(t.__name__)
-        # Both old and new should exist
-        assert "file_read_v2" in names or "read_file" in names
-        assert "Read" in names
 
 
 # ── File detection helpers ────────────────────────────────────────────────────

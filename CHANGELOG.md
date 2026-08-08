@@ -58,6 +58,9 @@ How to update:
   backoff. `ToolSpec.retry_policy` is the only tool retry owner, validation and
   permission checks run once, HTTP transport retries are disabled, and bounded daemon
   workers prevent blocked admission or concurrent-drain paths from owning process exit.
+- Built-in coding search now uses one fixed-argv `rg` boundary with NUL-delimited file
+  paths, stable ordering, strict result limits, explicit hidden/ignored-file controls,
+  reconstructable context records, and structured exit, timeout, and launch failures.
 - Reasoning effort now resolves through model-specific preset capabilities across sync,
   async, and streaming request defaults. GPT-5.6 accepts `max`; older OpenAI models keep
   their existing `xhigh` ceiling.
@@ -97,6 +100,8 @@ How to update:
 
 ### Fixed
 
+- Fixed workspace path validation so lexical parent traversal is rejected while
+  intentional workspace-owned symlinks retain their documented behavior.
 - Fixed streaming completion being flattened to a synthetic `stop`. Chat,
   Responses, and Anthropic adapters now preserve provider finish reasons, async Chat
   retains incremental and completed tool calls, incomplete streams fail explicitly,
@@ -169,6 +174,9 @@ How to update:
   concurrency-safe name list. Class tools now implement only
   `execute(args, runtime_context)`; the registry performs exact-name lookup and the
   executor owns the complete invocation lifecycle.
+- Removed duplicate uppercase, `*_v2`, and historical editor/search built-in tools.
+  Coding profiles now expose only the lowercase canonical names such as `read_file`,
+  `edit_file`, `glob`, `grep`, `run_command`, and `web_fetch`.
 
 ### Breaking
 
@@ -177,6 +185,8 @@ How to update:
   `Engine`/`ActionExecutor`. Tools run in parallel only when their spec explicitly sets
   `concurrency_safe=True`. A `FunctionTool` remains directly callable as the ordinary
   host-side behavior of `@function_tool`; agent execution never uses that shortcut.
+- `CodingToolSet` no longer accepts `expose_legacy_aliases` or
+  `expose_modern_names`. Callers must use the canonical lowercase tool names.
 
 ## v0.6.0 (2026-05-28)
 

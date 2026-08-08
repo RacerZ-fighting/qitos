@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from copy import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -14,7 +15,6 @@ import requests
 
 from qitos.core.env import CommandCapability, FileSystemCapability
 from qitos.core.function_tool_decorator import function_tool
-from qitos.core.tool import ToolPermission
 from qitos.kit.env.host_env import HostCommandCapability, HostFSCapability
 from qitos.kit.tool.internal.coding_utils import (
     build_diff,
@@ -34,6 +34,7 @@ except Exception:  # pragma: no cover
 
 
 TASK_STATUSES = {"pending", "in_progress", "blocked", "completed", "cancelled"}
+_MAX_SEARCH_RESULTS = 2000
 
 
 def _utc_now() -> str:
@@ -50,22 +51,6 @@ def _detect_line_ending(raw: bytes) -> str:
 
 def _truncate_text(text: str, max_chars: int) -> tuple[str, bool]:
     return truncate_text(text, max_chars)
-
-
-def _select_line_chunk(
-    lines: List[str], start: int, max_lines: int, max_chars: int
-) -> tuple[List[str], bool]:
-    end = min(len(lines), start + max_lines)
-    chunk: List[str] = []
-    char_count = 0
-    enforce_chars = max_chars > 0
-    for line in lines[start:end]:
-        char_count += len(line) + (1 if chunk else 0)
-        chunk.append(line)
-        if enforce_chars and char_count >= max_chars:
-            break
-    truncated = bool(enforce_chars and start + len(chunk) < end)
-    return chunk, truncated
 
 
 def _build_diff(old_content: str, new_content: str, path: str) -> str:
@@ -95,11 +80,191 @@ def _capability_basename(path: str) -> str:
     return str(path or ".").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
 
 
+class _SearchProcessError(RuntimeError):
+    """Structured failure raised by the ripgrep process boundary."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        status: str = "error",
+        exit_code: int | None = None,
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.status = status
+        self.exit_code = exit_code
+        self.stderr = stderr
+
+
+def _search_limit(value: int) -> int:
+    limit = int(value)
+    if not 1 <= limit <= _MAX_SEARCH_RESULTS:
+        raise ValueError(f"limit must be between 1 and {_MAX_SEARCH_RESULTS}")
+    return limit
+
+
+def _search_process_result(
+    result: Dict[str, Any], operation: str
+) -> tuple[int, str, str]:
+    raw_exit_code = result.get("returncode")
+    status = str(result.get("status") or "").strip().lower()
+    stderr = str(result.get("stderr") or result.get("error") or "")
+    if status in {"timed_out", "cancelled", "error"}:
+        category = {
+            "timed_out": "process_timeout",
+            "cancelled": "process_cancelled",
+            "error": "process_error",
+        }[status]
+        raise _SearchProcessError(
+            stderr.strip() or f"{operation} process {status}",
+            category=category,
+            status=status,
+            exit_code=int(raw_exit_code) if raw_exit_code is not None else None,
+            stderr=stderr,
+        )
+    if raw_exit_code is None:
+        raise _SearchProcessError(
+            f"{operation} process returned no exit code",
+            category="invalid_process_result",
+            stderr=stderr,
+        )
+
+    exit_code = int(raw_exit_code)
+    if exit_code not in {0, 1}:
+        raise _SearchProcessError(
+            stderr.strip() or f"ripgrep exited with code {exit_code}",
+            category="search_process_error",
+            exit_code=exit_code,
+            stderr=stderr,
+        )
+    return exit_code, str(result.get("stdout") or ""), stderr
+
+
+def _search_error_payload(
+    error: Exception,
+    *,
+    pattern: str,
+    path: str,
+) -> Dict[str, Any]:
+    if isinstance(error, _SearchProcessError):
+        return {
+            "status": error.status,
+            "message": str(error),
+            "error_category": error.category,
+            "exit_code": error.exit_code,
+            "stderr": error.stderr,
+            "pattern": pattern,
+            "path": path,
+        }
+    if isinstance(error, subprocess.TimeoutExpired):
+        stderr = error.stderr or ""
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return {
+            "status": "timed_out",
+            "message": str(error),
+            "error_category": "process_timeout",
+            "exit_code": None,
+            "stderr": stderr,
+            "pattern": pattern,
+            "path": path,
+        }
+    if isinstance(error, FileNotFoundError):
+        return {
+            "status": "error",
+            "message": f"ripgrep is unavailable: {error}",
+            "error_category": "search_tool_unavailable",
+            "exit_code": None,
+            "stderr": "",
+            "pattern": pattern,
+            "path": path,
+        }
+    return {
+        "status": "error",
+        "message": str(error),
+        "error_category": (
+            "invalid_search_arguments"
+            if isinstance(error, (TypeError, ValueError))
+            else "search_error"
+        ),
+        "pattern": pattern,
+        "path": path,
+    }
+
+
 class CodingToolSet:
     """Canonical coding toolset with one stable, traditional tool surface."""
 
     name = "coding"
     version = "2"
+    _PROFILE_TOOL_NAMES = {
+        "workspace": (
+            "read_file",
+            "write_file",
+            "edit_file",
+            "glob",
+            "grep",
+            "hex_view",
+            "list_files",
+            "list_tree",
+            "make_directory",
+        ),
+        "editor": (
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_files",
+            "list_tree",
+            "make_directory",
+        ),
+        "codebase": (
+            "read_file",
+            "glob",
+            "grep",
+            "hex_view",
+            "list_files",
+            "list_tree",
+        ),
+        "files": (
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_files",
+            "list_tree",
+            "make_directory",
+        ),
+        "shell": ("run_command",),
+        "web": ("web_fetch",),
+        "full": (
+            "read_file",
+            "write_file",
+            "edit_file",
+            "glob",
+            "grep",
+            "hex_view",
+            "list_files",
+            "list_tree",
+            "make_directory",
+            "run_command",
+            "web_fetch",
+            "ask_user_choice",
+            "todo_write",
+            "tool_search",
+            "enter_plan_mode",
+            "exit_plan_mode",
+            "enter_worktree",
+            "exit_worktree",
+            "mcp_list_resources",
+            "mcp_read_resource",
+            "agent_spawn",
+            "cron_create",
+            "cron_delete",
+            "cron_list",
+        ),
+    }
 
     def __init__(
         self,
@@ -110,8 +275,6 @@ class CodingToolSet:
         enable_lsp: bool = True,
         enable_tasks: bool = True,
         enable_web: bool = True,
-        expose_legacy_aliases: bool = True,
-        expose_modern_names: bool = False,
         profile: str = "full",
         include_http_tools: bool = False,
         auto_approve: bool = False,
@@ -123,9 +286,12 @@ class CodingToolSet:
         self.enable_lsp = bool(enable_lsp)
         self.enable_tasks = bool(enable_tasks)
         self.enable_web = bool(enable_web)
-        self.expose_legacy_aliases = bool(expose_legacy_aliases)
-        self.expose_modern_names = bool(expose_modern_names)
         self.profile = str(profile or "full")
+        if self.profile not in self._PROFILE_TOOL_NAMES:
+            supported = ", ".join(sorted(self._PROFILE_TOOL_NAMES))
+            raise ValueError(
+                f"Unsupported coding tool profile {self.profile!r}; expected {supported}"
+            )
         self.include_http_tools = bool(include_http_tools)
         self.auto_approve = bool(auto_approve)
         self.allow_local_fallback = bool(allow_local_fallback)
@@ -152,91 +318,26 @@ class CodingToolSet:
         _ = context
 
     def tools(self) -> List[Any]:
-        items: List[Any] = []
-        if self.profile == "workspace":
+        tool_names = self._PROFILE_TOOL_NAMES[self.profile]
+        items = [
+            getattr(self, name)
+            for name in tool_names
+            if self.enable_web or name != "web_fetch"
+        ]
+        if (
+            self.profile in {"full", "web"}
+            and self.enable_web
+            and self.include_http_tools
+        ):
             items.extend(
                 [
-                    self.read_file,
-                    self.write_file,
-                    self.edit_file,
-                    self.glob,
-                    self.grep,
-                    self.hex_view,
-                    self.list_files,
-                    self.list_tree,
-                    self.make_directory,
+                    self.http_request,
+                    self.http_get,
+                    self.http_post,
+                    self.extract_web_text,
                 ]
             )
-        # Claude Code modern-name aliases (Read, Edit, Write, Glob, Grep, Bash, etc.)
-        elif self.expose_modern_names:
-            items.extend(
-                [
-                    self.Read,
-                    self.Edit,
-                    self.Write,
-                    self.Glob,
-                    self.Grep,
-                    self.Bash,
-                    self.WebFetch,
-                    self.AskUserQuestion,
-                ]
-            )
-        if self.profile in {"full", "editor"} and self.expose_legacy_aliases:
-            items.extend(
-                [
-                    self.view,
-                    self.create,
-                    self.str_replace,
-                    self.insert,
-                    self.search,
-                    self.list_tree,
-                    self.replace_lines,
-                ]
-            )
-        if self.profile in {"full", "codebase"} and self.expose_legacy_aliases:
-            items.extend(
-                [
-                    self.glob_files,
-                    self.grep_files,
-                    self.read_file_range,
-                    self.append_file,
-                    self.make_directory,
-                ]
-            )
-        if self.profile in {"full", "codebase", "files"} and self.expose_legacy_aliases:
-            items.extend([self.read_file, self.write_file, self.list_files])
-        if self.profile in {"full", "shell"} and self.expose_legacy_aliases:
-            items.append(self.run_command)
-        if self.profile in {"full", "web"} and self.enable_web:
-            if self.expose_legacy_aliases:
-                items.append(self.web_fetch)
-            if self.include_http_tools:
-                items.extend(
-                    [
-                        self.http_request,
-                        self.http_get,
-                        self.http_post,
-                        self.extract_web_text,
-                    ]
-                )
         if self.profile == "full":
-            items.extend(
-                [
-                    self.ask_user_choice,
-                    self.todo_write,
-                    self.tool_search,
-                    self.enter_plan_mode,
-                    self.exit_plan_mode,
-                    self.enter_worktree,
-                    self.exit_worktree,
-                    self.mcp_list_resources,
-                    self.mcp_read_resource,
-                    self.agent_spawn,
-                    self.cron_create,
-                    self.cron_delete,
-                    self.cron_list,
-                ]
-            )
             if self.enable_lsp:
                 items.append(self.lsp_query)
             if self.enable_tasks:
@@ -245,29 +346,28 @@ class CodingToolSet:
                 )
             if self._notebook is not None:
                 items.extend(self._notebook.tools())
-        if not self.allow_local_fallback:
+        if not self.allow_local_fallback or self.auto_approve:
             bound_items: List[Any] = []
             for item in items:
                 isolated = copy(item)
                 isolated.spec = copy(item.spec)
                 if hasattr(item, "meta"):
                     isolated.meta = copy(item.meta)
-                isolated.spec.required_ops = list(
-                    dict.fromkeys(
-                        [
-                            *list(isolated.spec.required_ops or []),
-                            *list(isolated.spec.environment_ops or []),
-                        ]
+                if not self.allow_local_fallback:
+                    isolated.spec.required_ops = list(
+                        dict.fromkeys(
+                            [
+                                *list(isolated.spec.required_ops or []),
+                                *list(isolated.spec.environment_ops or []),
+                            ]
+                        )
                     )
-                )
+                if self.auto_approve:
+                    if hasattr(isolated, "meta"):
+                        isolated.meta.needs_approval = False
+                    isolated.spec.needs_approval = False
                 bound_items.append(isolated)
             items = bound_items
-        if self.auto_approve:
-            for item in items:
-                if hasattr(item, "meta") and getattr(item.meta, "needs_approval", False):
-                    item.meta.needs_approval = False
-                if hasattr(item, "spec") and getattr(item.spec, "needs_approval", False):
-                    item.spec.needs_approval = False
         return items
 
     def _file_ops(
@@ -279,6 +379,24 @@ class CodingToolSet:
         self, runtime_context: Optional[Dict[str, Any]]
     ) -> CommandCapability:
         return select_runtime_ops(runtime_context, "process", self._local_process_ops)
+
+    def _require_search_directory(
+        self,
+        path: str,
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> None:
+        try:
+            info = self._file_ops(runtime_context).stat(path)
+        except FileNotFoundError as exc:
+            raise _SearchProcessError(
+                f"Search path not found: {path}",
+                category="search_path_not_found",
+            ) from exc
+        if not info.is_directory:
+            raise _SearchProcessError(
+                f"Path is not a directory: {path}",
+                category="invalid_search_path",
+            )
 
     def _read_text_file(
         self,
@@ -311,27 +429,27 @@ class CodingToolSet:
         target_dir: str,
         pattern: str,
         include_hidden: bool,
+        include_ignored: bool,
         runtime_context: Optional[Dict[str, Any]],
-    ) -> List[str]:
-        cmd = ["rg", "--files", "--sort=path", "--glob", pattern]
+    ) -> tuple[List[str], int, str]:
+        cmd = ["rg", "--files", "--sort=path", "--null", "--glob", pattern]
         if include_hidden:
             cmd.append("--hidden")
+        if include_ignored:
+            cmd.append("--no-ignore")
         cmd.append(".")
         result = self._process_ops(runtime_context).run_argv(
             cmd,
             timeout=self.shell_timeout,
             cwd=target_dir,
         )
-        returncode = int(result.get("returncode", 1))
-        if returncode not in {0, 1}:
-            message = str(result.get("stderr") or result.get("error") or "rg failed")
-            raise RuntimeError(f"Glob failed: {message.strip()}")
-        rows = [line.strip() for line in str(result.get("stdout", "")).splitlines()]
-        return sorted(
+        exit_code, stdout, stderr = _search_process_result(result, "glob")
+        matches = sorted(
             _join_capability_path(target_dir, row)
-            for row in rows
-            if row.strip()
+            for row in stdout.split("\0")
+            if row
         )
+        return matches, exit_code, stderr
 
     def _run_rg_grep(
         self,
@@ -343,9 +461,19 @@ class CodingToolSet:
         files_with_matches: bool,
         context: int,
         file_type: Optional[str],
+        include_hidden: bool,
+        include_ignored: bool,
         runtime_context: Optional[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        cmd = ["rg", "--color", "never"]
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, str]:
+        cmd = [
+            "rg",
+            "--color",
+            "never",
+            "--sort=path",
+            "--max-columns",
+            "2000",
+            "--max-columns-preview",
+        ]
         if files_with_matches:
             cmd.extend(["--files-with-matches", "--null"])
         else:
@@ -358,6 +486,10 @@ class CodingToolSet:
             cmd.extend(["--glob", glob])
         if file_type:
             cmd.extend(["--type", file_type])
+        if include_hidden:
+            cmd.append("--hidden")
+        if include_ignored:
+            cmd.append("--no-ignore")
         if context > 0 and not files_with_matches:
             cmd.extend(["--context", str(context)])
         cmd.extend(["--", pattern, "."])
@@ -366,38 +498,57 @@ class CodingToolSet:
             timeout=self.shell_timeout,
             cwd=target_dir,
         )
-        returncode = int(result.get("returncode", 1))
-        if returncode not in {0, 1}:
-            message = str(result.get("stderr") or result.get("error") or "rg failed")
-            raise RuntimeError(f"Grep failed: {message.strip()}")
-
-        stdout = str(result.get("stdout", ""))
+        exit_code, stdout, stderr = _search_process_result(result, "grep")
         matches: List[Dict[str, Any]] = []
         if files_with_matches:
-            return [
-                {"path": _join_capability_path(target_dir, row)}
+            files = sorted(
+                _join_capability_path(target_dir, row)
                 for row in stdout.split("\0")
                 if row
-            ]
+            )
+            return ([{"path": path} for path in files], [], exit_code, stderr)
 
+        records: List[Dict[str, Any]] = []
         for row in stdout.splitlines():
             if not row.strip():
                 continue
-            event = json.loads(row)
-            if event.get("type") != "match":
+            try:
+                event = json.loads(row)
+            except json.JSONDecodeError as exc:
+                raise _SearchProcessError(
+                    f"ripgrep returned invalid JSON: {exc}",
+                    category="invalid_search_output",
+                    exit_code=exit_code,
+                    stderr=stderr,
+                ) from exc
+            event_type = str(event.get("type") or "")
+            if event_type not in {"match", "context"}:
                 continue
             data = event.get("data") or {}
             raw_path = str((data.get("path") or {}).get("text") or "")
             line_number = int(data.get("line_number") or 0)
             text = str((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
-            matches.append(
-                {
-                    "path": _join_capability_path(target_dir, raw_path),
-                    "line": line_number,
-                    "text": text,
-                }
+            record = {
+                "kind": event_type,
+                "path": _join_capability_path(target_dir, raw_path),
+                "line": line_number,
+                "text": text,
+            }
+            records.append(record)
+            if event_type == "match":
+                matches.append(
+                    {key: value for key, value in record.items() if key != "kind"}
+                )
+        matches.sort(key=lambda item: (item["path"], item["line"], item["text"]))
+        records.sort(
+            key=lambda item: (
+                item["path"],
+                item["line"],
+                0 if item["kind"] == "match" else 1,
+                item["text"],
             )
-        return matches
+        )
+        return matches, records, exit_code, stderr
 
     def _tree_lines(
         self,
@@ -519,38 +670,6 @@ class CodingToolSet:
         self._task_counter += 1
         return f"task-{self._task_counter:03d}"
 
-    @function_tool(
-        name="bash_v2",
-        needs_approval=True,
-        supports_background=True,
-        environment_ops=["process"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def bash_v2(
-        self,
-        command: str,
-        read_only: bool = False,
-        allow_destructive: bool = False,
-        run_in_background: bool = False,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Run one shell command inside the workspace.
-
-        :param command: Shell command to execute.
-        :param read_only: Whether the command should avoid mutating the workspace.
-        :param allow_destructive: Whether destructive commands are explicitly allowed.
-        :param run_in_background: Whether to detach the command and return a log path.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        return self._run_bash_command(
-            command=command,
-            read_only=read_only,
-            allow_destructive=allow_destructive,
-            run_in_background=run_in_background,
-            runtime_context=runtime_context,
-        )
-
     def _run_bash_command(
         self,
         command: str,
@@ -607,27 +726,36 @@ class CodingToolSet:
     @function_tool(
         name="run_command",
         needs_approval=True,
+        supports_background=True,
         environment_ops=["process"],
         rule_scope_builder=_default_rule_scope,
     )
     def run_command(
-        self, command: str, runtime_context: Optional[Dict[str, Any]] = None
+        self,
+        command: str,
+        read_only: bool = False,
+        allow_destructive: bool = False,
+        run_in_background: bool = False,
+        runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Execute one shell command inside the configured working directory.
 
         :param command: Shell command string to execute.
+        :param read_only: Reject commands that appear to mutate the workspace.
+        :param allow_destructive: Explicitly allow commands classified as destructive.
+        :param run_in_background: Detach the command and return its task handle.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        return self.bash_v2(command=command, runtime_context=runtime_context)
+        return self._run_bash_command(
+            command=command,
+            read_only=read_only,
+            allow_destructive=allow_destructive,
+            run_in_background=run_in_background,
+            runtime_context=runtime_context,
+        )
 
-    @function_tool(
-        name="file_read_v2",
-        read_only=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def file_read_v2(
+    def _read_file_chunk(
         self,
         path: str,
         offset: int = 0,
@@ -700,7 +828,7 @@ class CodingToolSet:
         :param line_count: Maximum whole lines to return, capped at 1000.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        result = self.file_read_v2(
+        result = self._read_file_chunk(
             path=path,
             offset=line_offset,
             limit=line_count,
@@ -720,73 +848,6 @@ class CodingToolSet:
         result.pop("limit", None)
         result.pop("offset", None)
         return result
-
-    @function_tool(
-        name="view",
-        read_only=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def view(
-        self,
-        path: str,
-        view_range: Optional[List[int]] = None,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        View a file or directory under the workspace root.
-
-        :param path: Path relative to the workspace root (e.g., `src/main.py` or `src/`).
-        :param view_range: Optional inclusive line range `[start, end]` to show for files.
-
-        For files, returns structured line content. For directories, returns a
-        readable listing of immediate child entries.
-        """
-        try:
-            file_ops = self._file_ops(runtime_context)
-            info = file_ops.stat(path)
-            if info.is_directory:
-                entries = []
-                for item in sorted(
-                    file_ops.list_entries(path),
-                    key=lambda entry: (
-                        entry.is_file,
-                        _capability_basename(entry.path),
-                    ),
-                ):
-                    name = _capability_basename(item.path)
-                    if name.startswith("."):
-                        continue
-                    entries.append(
-                        {
-                            "name": name,
-                            "type": "directory" if item.is_directory else "file",
-                        }
-                    )
-                return {
-                    "status": "success",
-                    "kind": "directory",
-                    "path": path,
-                    "entries": entries,
-                    "count": len(entries),
-                }
-            start = 0
-            limit = 200
-            if isinstance(view_range, list) and len(view_range) == 2:
-                view_start = int(view_range[0])
-                view_end = int(view_range[1])
-                start = max(0, view_start - 1)
-                limit = 100_000 if view_end == -1 else max(1, view_end - view_start + 1)
-            return self.file_read_v2(
-                path=path,
-                offset=start,
-                limit=limit,
-                runtime_context=runtime_context,
-            )
-        except FileNotFoundError:
-            return {"status": "error", "message": f"File not found: {path}"}
-        except Exception as e:
-            return {"status": "error", "message": str(e), "path": path}
 
     @function_tool(
         name="list_files",
@@ -863,69 +924,26 @@ class CodingToolSet:
             return {"status": "error", "message": str(e), "path": path}
 
     @function_tool(
-        name="create",
+        name="edit_file",
         needs_approval=True,
         environment_ops=["file"],
         rule_scope_builder=_default_rule_scope,
     )
-    def create(
+    def edit_file(
         self,
         path: str,
-        content: str = "",
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Create a new file with the given content.
-
-        :param path: Path relative to the workspace root (e.g., `new_file.py`).
-        :param content: Content to write to the new file.
-        """
-        result = self.write_file(
-            path=path,
-            content=content,
-            runtime_context=runtime_context,
-        )
-        if result.get("status") != "success":
-            return result
-        return {
-            "status": "success",
-            "path": path,
-            "message": f"Created file: {path}",
-            "size": len(content),
-        }
-
-    @function_tool(
-        name="file_edit_v2",
-        needs_approval=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def file_edit_v2(
-        self,
-        path: str,
-        action: str,
-        old_text: str = "",
-        new_text: str = "",
-        insert_line: int = 0,
-        start_line: int = 0,
-        end_line: int = 0,
-        replacement: str = "",
+        old_text: str,
+        new_text: str,
         replace_all: bool = False,
         expected_mtime: Optional[float] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Edit one workspace file using a structured action.
+        """Replace exact text in one workspace file.
 
         :param path: Path relative to the workspace root.
-        :param action: Edit action such as `str_replace`, `insert`, or `replace_lines`.
-        :param old_text: Old text for `str_replace`.
-        :param new_text: New text for `str_replace`.
-        :param insert_line: Line number after which to insert new text.
-        :param start_line: Starting line number for `replace_lines`.
-        :param end_line: Ending line number for `replace_lines`.
-        :param replacement: Replacement content for `replace_lines`.
-        :param replace_all: Replace every occurrence for `str_replace`.
+        :param old_text: Exact text to replace. It must be unique by default.
+        :param new_text: Replacement text.
+        :param replace_all: Replace every occurrence instead of requiring uniqueness.
         :param expected_mtime: Optional optimistic concurrency check.
         :param runtime_context: Optional runtime context injected by the executor.
         """
@@ -946,107 +964,47 @@ class CodingToolSet:
                     "message": "File was modified since the expected mtime.",
                     "path": path,
                 }
-            normalized_action = str(action or "").strip()
-            if normalized_action == "str_replace":
-                if not old_text:
-                    return {
-                        "status": "error",
-                        "message": "old_text cannot be empty",
-                        "path": path,
-                    }
-                if old_text == new_text:
-                    return {
-                        "status": "error",
-                        "message": "old_text and new_text are identical",
-                        "path": path,
-                    }
-                count = old_content.count(old_text)
-                if count == 0:
-                    return {
-                        "status": "error",
-                        "message": f"Text not found in {path}",
-                        "path": path,
-                    }
-                if count > 1 and not replace_all:
-                    return {
-                        "status": "error",
-                        "message": "Text replacement must be unique",
-                        "path": path,
-                        "occurrences": count,
-                    }
-                replacement_count = count if replace_all else 1
-                new_content = old_content.replace(
-                    old_text,
-                    new_text,
-                    -1 if replace_all else 1,
-                )
-                message = (
-                    f"Replaced {replacement_count} occurrences in {path}"
-                    if replace_all
-                    else f"Replaced one occurrence in {path}"
-                )
-            elif normalized_action == "insert":
-                try:
-                    insert_line = int(insert_line)
-                except Exception:
-                    return {
-                        "status": "error",
-                        "message": f"Invalid insert_line: {insert_line}",
-                        "path": path,
-                    }
-                lines = old_content.splitlines()
-                if insert_line < 0 or insert_line > len(lines):
-                    return {
-                        "status": "error",
-                        "message": f"Invalid insert_line: {insert_line}",
-                        "path": path,
-                    }
-                updated_lines = lines[:insert_line] + [new_text] + lines[insert_line:]
-                new_content = "\n".join(updated_lines)
-                message = f"Inserted content after line {insert_line} in {path}"
-            elif normalized_action == "replace_lines":
-                try:
-                    start_line = int(start_line)
-                    end_line = int(end_line)
-                except Exception:
-                    return {
-                        "status": "error",
-                        "message": "Invalid line range",
-                        "path": path,
-                    }
-                lines = old_content.splitlines()
-                if start_line <= 0 or end_line < start_line or end_line > len(lines):
-                    return {
-                        "status": "error",
-                        "message": "Invalid line range",
-                        "path": path,
-                    }
-                if (
-                    isinstance(replacement, str)
-                    and replacement
-                    and not replacement[:1].isspace()
-                    and start_line == end_line
-                ):
-                    old_line = lines[start_line - 1]
-                    indent = old_line[: len(old_line) - len(old_line.lstrip())]
-                    if indent:
-                        replacement = indent + replacement
-                updated_lines = (
-                    lines[: start_line - 1] + [replacement] + lines[end_line:]
-                )
-                new_content = "\n".join(updated_lines)
-                message = f"Replaced lines {start_line}-{end_line} in {path}"
-            else:
+            if not old_text:
                 return {
                     "status": "error",
-                    "message": f"Unsupported action: {normalized_action}",
+                    "message": "old_text cannot be empty",
                     "path": path,
                 }
+            if old_text == new_text:
+                return {
+                    "status": "error",
+                    "message": "old_text and new_text are identical",
+                    "path": path,
+                }
+            count = old_content.count(old_text)
+            if count == 0:
+                return {
+                    "status": "error",
+                    "message": f"Text not found in {path}",
+                    "path": path,
+                }
+            if count > 1 and not replace_all:
+                return {
+                    "status": "error",
+                    "message": "Text replacement must be unique",
+                    "path": path,
+                    "occurrences": count,
+                }
+            replacement_count = count if replace_all else 1
+            new_content = old_content.replace(
+                old_text,
+                new_text,
+                -1 if replace_all else 1,
+            )
             self._write_text_file(path, new_content, line_ending, runtime_context)
             return {
                 "status": "success",
                 "path": path,
-                "message": message,
+                "message": (
+                    f"Replaced {replacement_count} occurrences in {path}"
+                    if replace_all
+                    else f"Replaced one occurrence in {path}"
+                ),
                 "diff": _build_diff(old_content, new_content, path),
                 "line_ending": line_ending,
                 "expected_mtime": expected_mtime,
@@ -1057,155 +1015,6 @@ class CodingToolSet:
                 "status": "error",
                 "message": f"File not found: {path}",
                 "path": path,
-            }
-        except Exception as e:
-            return {"status": "error", "message": str(e), "path": path}
-
-    @function_tool(
-        name="edit_file",
-        needs_approval=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def edit_file(
-        self,
-        path: str,
-        old_text: str,
-        new_text: str,
-        replace_all: bool = False,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Replace exact text in one workspace file.
-
-        :param path: Path relative to the workspace root.
-        :param old_text: Exact text to replace. It must be unique by default.
-        :param new_text: Replacement text.
-        :param replace_all: Replace every occurrence instead of requiring uniqueness.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        return self.file_edit_v2(
-            path=path,
-            action="str_replace",
-            old_text=old_text,
-            new_text=new_text,
-            replace_all=replace_all,
-            runtime_context=runtime_context,
-        )
-
-    @function_tool(
-        name="str_replace",
-        needs_approval=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def str_replace(
-        self,
-        path: str,
-        old_str: str,
-        new_str: str = "",
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Replace one unique string fragment in a file.
-
-        :param path: Path relative to the workspace root.
-        :param old_str: The exact string to replace. Must be unique in the file.
-        :param new_str: The new string to replace old_str with.
-        """
-        return self.file_edit_v2(
-            path=path,
-            action="str_replace",
-            old_text=old_str,
-            new_text=new_str,
-            runtime_context=runtime_context,
-        )
-
-    @function_tool(
-        name="insert",
-        needs_approval=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def insert(
-        self,
-        path: str,
-        insert_line: int,
-        new_str: str,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Insert new text after a given line number.
-
-        :param path: Path relative to the workspace root.
-        :param insert_line: Line number after which to insert new_str.
-        :param new_str: String to insert.
-        """
-        return self.file_edit_v2(
-            path=path,
-            action="insert",
-            insert_line=insert_line,
-            new_text=new_str,
-            runtime_context=runtime_context,
-        )
-
-    @function_tool(
-        name="replace_lines",
-        needs_approval=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def replace_lines(
-        self,
-        path: str,
-        start_line: int,
-        end_line: int,
-        replacement: str = "",
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Replace an inclusive line range with new content.
-
-        :param path: Path relative to the workspace root.
-        :param start_line: Starting line number.
-        :param end_line: Ending line number, inclusive.
-        :param replacement: Text to replace the specified lines with.
-        """
-        return self.file_edit_v2(
-            path=path,
-            action="replace_lines",
-            start_line=start_line,
-            end_line=end_line,
-            replacement=replacement,
-            runtime_context=runtime_context,
-        )
-
-    @function_tool(
-        name="append_file",
-        needs_approval=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def append_file(
-        self,
-        path: str,
-        content: str,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Append text to the end of a workspace file.
-
-        :param path: File path relative to the workspace root.
-        :param content: Text to append.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        try:
-            file_ops = self._file_ops(runtime_context)
-            file_ops.append_text(path, content)
-            return {
-                "status": "success",
-                "path": path,
-                "appended_size": len(content),
-                "size": file_ops.stat(path).size,
             }
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
@@ -1232,94 +1041,6 @@ class CodingToolSet:
             return {"status": "error", "message": str(e), "path": path}
 
     @function_tool(
-        name="glob_v2",
-        read_only=True,
-        environment_ops=["file", "process"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def glob_v2(
-        self,
-        pattern: str,
-        path: str = ".",
-        include_hidden: bool = False,
-        limit: int = 100,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Find files under the workspace that match a glob pattern.
-
-        :param pattern: Glob pattern such as `*.py` or `src/**/*.md`.
-        :param path: Directory path, relative to the workspace root, to search in.
-        :param include_hidden: Whether to include hidden files and directories.
-        :param limit: Maximum number of matching files to return.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        if not str(pattern or "").strip():
-            return {"status": "error", "message": "Pattern cannot be empty"}
-        try:
-            if not self._file_ops(runtime_context).stat(path).is_directory:
-                return {
-                    "status": "error",
-                    "message": f"Path is not a directory: {path}",
-                }
-            matches = self._run_rg_files(
-                path,
-                pattern,
-                include_hidden,
-                runtime_context,
-            )
-            capped = matches[: max(1, int(limit))]
-            return {
-                "status": "success",
-                "pattern": pattern,
-                "path": path,
-                "files": capped,
-                "match_count": len(capped),
-                "truncated": len(matches) > len(capped),
-                "context": {"include_hidden": include_hidden},
-            }
-        except Exception as e:
-            return {
-                "status": "error",
-                "message": str(e),
-                "pattern": pattern,
-                "path": path,
-            }
-
-    @function_tool(
-        name="glob_files",
-        read_only=True,
-        environment_ops=["file", "process"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def glob_files(
-        self,
-        pattern: str,
-        path: str = ".",
-        include_hidden: bool = False,
-        limit: int = 100,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Find files under the workspace that match a glob pattern.
-
-        :param pattern: Glob pattern such as `*.py`.
-        :param path: Directory path relative to the workspace root.
-        :param include_hidden: Whether to include hidden files and directories.
-        :param limit: Maximum number of matching files to return.
-        """
-        result = self.glob_v2(
-            pattern=pattern,
-            path=path,
-            include_hidden=include_hidden,
-            limit=limit,
-            runtime_context=runtime_context,
-        )
-        if result.get("status") == "success":
-            result["num_files"] = result.get("match_count", 0)
-        return result
-
-    @function_tool(
         name="glob",
         read_only=True,
         environment_ops=["file", "process"],
@@ -1330,136 +1051,52 @@ class CodingToolSet:
         pattern: str,
         path: str = ".",
         include_hidden: bool = False,
+        include_ignored: bool = False,
         limit: int = 200,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Find workspace files with ripgrep's file inventory.
-
-        :param pattern: Glob pattern relative to path.
-        :param path: Workspace-relative directory to search.
-        :param include_hidden: Include hidden paths when true.
-        :param limit: Maximum sorted paths to return.
-        :param runtime_context: Optional runtime context injected by the executor.
         """
-        return self.glob_v2(
-            pattern=pattern,
-            path=path,
-            include_hidden=include_hidden,
-            limit=limit,
-            runtime_context=runtime_context,
-        )
+        Find files under the workspace that match a glob pattern.
 
-    @function_tool(
-        name="grep_v2",
-        read_only=True,
-        environment_ops=["file", "process"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def grep_v2(
-        self,
-        pattern: str,
-        path: str = ".",
-        glob: Optional[str] = None,
-        case_sensitive: bool = False,
-        regex: bool = True,
-        files_with_matches: bool = False,
-        limit: int = 100,
-        context: int = 0,
-        file_type: Optional[str] = None,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Search workspace files for a regex or literal text pattern.
-
-        :param pattern: Regex or literal text to search for.
-        :param path: Directory path relative to the workspace root.
-        :param glob: Optional glob filter applied before reading candidate files.
-        :param case_sensitive: Whether matching should preserve case.
-        :param regex: Whether pattern should be interpreted as a regex.
-        :param files_with_matches: Whether to return only matching file paths.
-        :param limit: Maximum number of returned matches.
-        :param context: Reserved context-line count for future expansion.
-        :param file_type: Optional ripgrep file type filter.
+        :param pattern: Glob pattern such as `*.py` or `src/**/*.md`.
+        :param path: Directory path, relative to the workspace root, to search in.
+        :param include_hidden: Whether to include hidden files and directories.
+        :param include_ignored: Whether to bypass ignore files and VCS exclusions.
+        :param limit: Maximum number of matching files to return.
         :param runtime_context: Optional runtime context injected by the executor.
         """
         if not str(pattern or "").strip():
             return {"status": "error", "message": "Pattern cannot be empty"}
         try:
-            if not self._file_ops(runtime_context).stat(path).is_directory:
-                return {
-                    "status": "error",
-                    "message": f"Path is not a directory: {path}",
-                }
-            matches = self._run_rg_grep(
-                pattern,
+            result_limit = _search_limit(limit)
+            self._require_search_directory(path, runtime_context)
+            matches, exit_code, stderr = self._run_rg_files(
                 path,
-                glob,
-                case_sensitive,
-                regex,
-                files_with_matches,
-                max(0, int(context)),
-                file_type,
+                pattern,
+                include_hidden,
+                include_ignored,
                 runtime_context,
             )
-            capped = matches[: max(1, int(limit))]
+            capped = matches[:result_limit]
             return {
                 "status": "success",
                 "pattern": pattern,
                 "path": path,
-                "matches": capped,
+                "files": capped,
                 "match_count": len(capped),
+                "total_count": len(matches),
+                "returned_count": len(capped),
                 "truncated": len(matches) > len(capped),
+                "exit_code": exit_code,
+                "stderr": stderr,
                 "context": {
-                    "glob": glob,
-                    "case_sensitive": case_sensitive,
-                    "regex": regex,
-                    "files_with_matches": files_with_matches,
+                    "include_hidden": include_hidden,
+                    "include_ignored": include_ignored,
+                    "binary_files": "skipped",
                 },
             }
-        except Exception as e:
-            return {"status": "error", "message": str(e), "pattern": pattern}
-
-    @function_tool(
-        name="grep_files",
-        read_only=True,
-        environment_ops=["file", "process"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def grep_files(
-        self,
-        pattern: str,
-        path: str = ".",
-        glob: Optional[str] = None,
-        case_sensitive: bool = False,
-        regex: bool = True,
-        files_with_matches: bool = False,
-        limit: int = 100,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Search workspace files for a regex or literal text pattern.
-
-        :param pattern: Regex or literal text to search for.
-        :param path: Directory path relative to the workspace root.
-        :param glob: Optional glob filter applied before reading candidate files.
-        :param case_sensitive: Whether matching should preserve case.
-        :param regex: Whether pattern should be interpreted as a regex.
-        :param files_with_matches: Whether to return only one entry per matching file.
-        :param limit: Maximum number of returned matches.
-        """
-        result = self.grep_v2(
-            pattern=pattern,
-            path=path,
-            glob=glob,
-            case_sensitive=case_sensitive,
-            regex=regex,
-            files_with_matches=files_with_matches,
-            limit=limit,
-            runtime_context=runtime_context,
-        )
-        if result.get("status") == "success":
-            result["num_matches"] = result.get("match_count", 0)
-        return result
+        except Exception as error:
+            return _search_error_payload(error, pattern=pattern, path=path)
 
     @function_tool(
         name="grep",
@@ -1478,33 +1115,88 @@ class CodingToolSet:
         limit: int = 100,
         context: int = 0,
         file_type: Optional[str] = None,
+        include_hidden: bool = False,
+        include_ignored: bool = False,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Search workspace text with fixed-argv ripgrep.
+        """
+        Search workspace files for a regex or literal text pattern.
 
-        :param pattern: Regular expression or literal text to find.
-        :param path: Workspace-relative directory to search.
-        :param glob: Optional file glob filter.
-        :param case_sensitive: Preserve case when true.
-        :param regex: Interpret pattern as regex when true, literal text otherwise.
-        :param files_with_matches: Return only matching paths when true.
-        :param limit: Maximum returned matches.
-        :param context: Number of context lines requested from ripgrep.
-        :param file_type: Optional ripgrep file type such as py or rust.
+        :param pattern: Regex or literal text to search for.
+        :param path: Directory path relative to the workspace root.
+        :param glob: Optional glob filter applied before reading candidate files.
+        :param case_sensitive: Whether matching should preserve case.
+        :param regex: Whether pattern should be interpreted as a regex.
+        :param files_with_matches: Whether to return only matching file paths.
+        :param limit: Maximum number of returned matches.
+        :param context: Number of surrounding context lines to return as records.
+        :param file_type: Optional ripgrep file type filter.
+        :param include_hidden: Whether to include hidden files and directories.
+        :param include_ignored: Whether to bypass ignore files and VCS exclusions.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        return self.grep_v2(
-            pattern=pattern,
-            path=path,
-            glob=glob,
-            case_sensitive=case_sensitive,
-            regex=regex,
-            files_with_matches=files_with_matches,
-            limit=limit,
-            context=context,
-            file_type=file_type,
-            runtime_context=runtime_context,
-        )
+        if not str(pattern or "").strip():
+            return {"status": "error", "message": "Pattern cannot be empty"}
+        try:
+            result_limit = _search_limit(limit)
+            context_lines = int(context)
+            if context_lines < 0:
+                raise ValueError("context must be non-negative")
+            self._require_search_directory(path, runtime_context)
+            matches, records, exit_code, stderr = self._run_rg_grep(
+                pattern,
+                path,
+                glob,
+                case_sensitive,
+                regex,
+                files_with_matches,
+                context_lines,
+                file_type,
+                include_hidden,
+                include_ignored,
+                runtime_context,
+            )
+            capped = matches[:result_limit]
+            returned_keys = {(item["path"], item.get("line")) for item in capped}
+            capped_records = (
+                [
+                    item
+                    for item in records
+                    if any(
+                        item["path"] == path_value
+                        and isinstance(line_value, int)
+                        and abs(item["line"] - line_value) <= context_lines
+                        for path_value, line_value in returned_keys
+                    )
+                ]
+                if context_lines > 0
+                else []
+            )
+            return {
+                "status": "success",
+                "pattern": pattern,
+                "path": path,
+                "matches": capped,
+                "records": capped_records,
+                "match_count": len(capped),
+                "total_count": len(matches),
+                "returned_count": len(capped),
+                "truncated": len(matches) > len(capped),
+                "exit_code": exit_code,
+                "stderr": stderr,
+                "context": {
+                    "glob": glob,
+                    "case_sensitive": case_sensitive,
+                    "regex": regex,
+                    "files_with_matches": files_with_matches,
+                    "line_count": context_lines,
+                    "include_hidden": include_hidden,
+                    "include_ignored": include_ignored,
+                    "binary_files": "skipped",
+                },
+            }
+        except Exception as error:
+            return _search_error_payload(error, pattern=pattern, path=path)
 
     @function_tool(
         name="hex_view",
@@ -1575,69 +1267,6 @@ class CodingToolSet:
             }
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
-
-    @function_tool(
-        name="read_file_range",
-        read_only=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def read_file_range(
-        self,
-        path: str,
-        offset: int = 0,
-        limit: int = 200,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Read a bounded line range from one workspace file.
-
-        :param path: File path relative to the workspace root.
-        :param offset: Zero-based starting line offset.
-        :param limit: Maximum number of lines to return.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        result = self.file_read_v2(
-            path=path, offset=offset, limit=limit, runtime_context=runtime_context
-        )
-        if result.get("status") != "success":
-            return result
-        return {
-            "status": "success",
-            "path": path,
-            "offset": result.get("offset", offset),
-            "limit": result.get("limit", limit),
-            "total_lines": result.get("total_lines", 0),
-            "content": result.get("content", ""),
-            "has_more": result.get("has_more", False),
-            "truncated": result.get("truncated", False),
-        }
-
-    @function_tool(
-        name="search",
-        read_only=True,
-        environment_ops=["file", "process"],
-        rule_scope_builder=_default_rule_scope,
-    )
-    def search(
-        self,
-        path: str,
-        keyword: str,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Search for a keyword inside files within a directory tree.
-
-        :param path: Directory path relative to the workspace root.
-        :param keyword: Keyword to search for.
-        """
-        return self.grep_v2(
-            pattern=keyword,
-            path=path,
-            regex=False,
-            limit=15,
-            runtime_context=runtime_context,
-        )
 
     @function_tool(
         name="list_tree",
@@ -1804,11 +1433,11 @@ class CodingToolSet:
         }
 
     @function_tool(
-        name="web_fetch_v2",
+        name="web_fetch",
         needs_approval=True,
         rule_scope_builder=_default_rule_scope,
     )
-    def web_fetch_v2(
+    def web_fetch(
         self,
         url: str,
         prompt: str = "",
@@ -1852,35 +1481,9 @@ class CodingToolSet:
         return {
             "status": "success",
             "url": response.get("url", url),
-            "result": result,
+            "content": result,
             "title": extracted.get("title", ""),
             "auth_hint": auth_hint,
-        }
-
-    @function_tool(
-        name="web_fetch",
-        needs_approval=True,
-        rule_scope_builder=_default_rule_scope,
-    )
-    def web_fetch(
-        self, url: str, runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
-        """
-        Fetch one web page and extract readable text.
-
-        :param url: Absolute URL to fetch.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        payload = self.web_fetch_v2(url=url, prompt="", runtime_context=runtime_context)
-        if payload.get("status") != "success":
-            return payload
-        return {
-            "status": "success",
-            "url": payload.get("url", url),
-            "redirect_url": payload.get("redirect_url"),
-            "title": payload.get("title", ""),
-            "content": payload.get("result", ""),
-            "auth_hint": payload.get("auth_hint", ""),
         }
 
     @function_tool(name="ask_user_choice", requires_user_interaction=True)
@@ -2196,7 +1799,7 @@ class CodingToolSet:
             "Launch a new agent to handle a sub-task autonomously. "
             "The agent runs in an isolated context with its own tool set.\n\n"
             "Available agent types:\n"
-            "- explore: Fast codebase search agent (Read, Glob, Grep). Use for finding files, "
+            "- explore: Fast codebase search agent (read_file, glob, grep). Use for finding files, "
             "searching code, or answering questions about the codebase.\n"
             "- plan: Read-only architecture planning agent. Use for designing implementation approaches.\n"
             "- general: General-purpose agent with full tool access. Use for complex multi-step tasks.\n\n"
@@ -2227,8 +1830,6 @@ class CodingToolSet:
         if not task:
             return {"status": "error", "message": "No task provided for sub-agent."}
 
-        # Get the parent agent's LLM and protocol
-        state_obj = (runtime_context or {}).get("state")
         llm = None
         model_parser = None
         model_protocol = None
@@ -2432,383 +2033,6 @@ class CodingToolSet:
         """
         _ = runtime_context
         return {"status": "success", "jobs": []}
-
-    # ── Claude Code modern-name aliases ────────────────────────────────────────
-    # These match Claude Code's exact tool names and signatures for compatibility.
-
-    @function_tool(
-        name="Read",
-        read_only=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-        prompt=(
-            "Reads a file from the local filesystem. You can access any file directly by using this tool.\n"
-            "Assume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid.\n"
-            "Usage:\n"
-            "- The file_path parameter must be an absolute path, not a relative path\n"
-            "- By default, it reads up to 2000 lines starting from the beginning of the file\n"
-            "- You can optionally specify a line offset and limit, but it's recommended to read the whole file by not providing these parameters\n"
-            "- When you already know which part of the file you need, only read that part. This can be important for larger files.\n"
-            "- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.\n"
-            "- If you read a file that exists but has empty contents you will receive a system reminder warning."
-        ),
-    )
-    def Read(
-        self,
-        file_path: str,
-        offset: int = 0,
-        limit: int = 2000,
-        *,
-        pages: Optional[str] = None,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str | Dict[str, Any]:
-        """Read a file, image, PDF, or notebook. Returns content with line numbers.
-
-        :param file_path: Absolute or relative path to the file.
-        :param offset: Line number to start reading from (0-based).
-        :param limit: Maximum number of lines to read.
-        :param pages: Page range for PDF files (e.g., "1-5", "3").
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        result = self.file_read_v2(
-            path=file_path,
-            offset=offset,
-            limit=limit,
-            max_chars=200_000,
-            runtime_context=runtime_context,
-        )
-        if result.get("status") != "success":
-            return result
-        content = str(result.get("content", ""))
-        # Add line numbers like Claude Code
-        lines = content.splitlines() if content else []
-        numbered = []
-        start = int(result.get("offset", offset))
-        for i, line in enumerate(lines, start=start + 1):
-            numbered.append(f"{i}\t{line}")
-        if result.get("has_more"):
-            next_offset = start + len(lines)
-            numbered.append(
-                f"[truncated: use offset={next_offset} to continue; "
-                f"total_lines={result.get('total_lines', '?')}]"
-            )
-        return "\n".join(numbered)
-
-    @function_tool(
-        name="Edit",
-        needs_approval=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-        prompt=(
-            "Performs exact string replacements in files.\n"
-            "Usage:\n"
-            "- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file.\n"
-            "- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. Never include any part of the line number prefix in the old_string or new_string.\n"
-            "- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.\n"
-            "- The edit will FAIL if `old_string` is not unique in the file. Either provide a larger string with more surrounding context to make it unique or use `replace_all` to change every instance of `old_string`.\n"
-            "- Use `replace_all` for replacing and renaming strings across the file."
-        ),
-    )
-    def Edit(
-        self,
-        file_path: str,
-        old_string: str,
-        new_string: str,
-        replace_all: bool = False,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str | Dict[str, Any]:
-        """Replace old_string with new_string in a file. old_string must be unique unless replace_all=True.
-
-        :param file_path: Absolute or relative path to the file.
-        :param old_string: Text to find and replace. Must appear exactly once unless replace_all=True.
-        :param new_string: Replacement text.
-        :param replace_all: Replace all occurrences of old_string.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        result = self.file_edit_v2(
-            path=file_path,
-            action="str_replace",
-            old_text=old_string,
-            new_text=new_string,
-            replace_all=replace_all,
-            runtime_context=runtime_context,
-        )
-        if result.get("status") != "success":
-            return result
-        return str(result.get("message") or "Edit applied successfully")
-
-    @function_tool(
-        name="Write",
-        needs_approval=True,
-        environment_ops=["file"],
-        rule_scope_builder=_default_rule_scope,
-        prompt=(
-            "Writes a file to the local filesystem.\n"
-            "Usage:\n"
-            "- This tool will overwrite the existing file if there is one at the provided path.\n"
-            "- If this is an existing file, you MUST use the Read tool first to read the file's contents. This tool will fail if you did not read the file first.\n"
-            "- Prefer the Edit tool for modifying existing files — it only sends the diff. Only use this tool to create new files or for complete rewrites.\n"
-            "- NEVER create documentation files (*.md) or README files unless explicitly requested by the User."
-        ),
-    )
-    def Write(
-        self,
-        file_path: str,
-        content: str,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str | Dict[str, Any]:
-        """Write content to a file, creating it if it doesn't exist.
-
-        :param file_path: Absolute or relative path to the file.
-        :param content: Content to write.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        result = self.write_file(
-            path=file_path,
-            content=content,
-            runtime_context=runtime_context,
-        )
-        if result.get("status") != "success":
-            return result
-        return f"Successfully wrote to {file_path}"
-
-    @function_tool(
-        name="Glob",
-        read_only=True,
-        environment_ops=["file", "process"],
-        rule_scope_builder=_default_rule_scope,
-        prompt=(
-            "Fast file pattern matching tool that works with any codebase size.\n"
-            "Supports glob patterns like \"**/*.js\" or \"src/**/*.ts\". Returns matching file paths sorted by modification time.\n"
-            "Use this tool when you need to find files by name patterns. When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead."
-        ),
-    )
-    def Glob(
-        self,
-        pattern: str,
-        path: str = ".",
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str | Dict[str, Any]:
-        """Find files matching a glob pattern.
-
-        :param pattern: Glob pattern (e.g., "**/*.py", "src/**/*.ts").
-        :param path: Directory to search in.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        result = self.glob_v2(
-            pattern=pattern,
-            path=path,
-            runtime_context=runtime_context,
-        )
-        if result.get("status") != "success":
-            return result
-        files = result.get("files", [])
-        return "\n".join(files)
-
-    @function_tool(
-        name="Grep",
-        read_only=True,
-        environment_ops=["file", "process"],
-        rule_scope_builder=_default_rule_scope,
-        prompt=(
-            "A powerful search tool built on ripgrep.\n"
-            "Usage:\n"
-            "- ALWAYS use Grep for search tasks. NEVER invoke `grep` or `rg` as a Bash command. The Grep tool has been optimized for correct permissions and access.\n"
-            "- Supports full regex syntax (e.g., \"log.*Error\", \"function\\\\s+\\\\w+\")\n"
-            "- Filter files with glob parameter (e.g., \"*.js\", \"**/*.tsx\") or type parameter\n"
-            "- Output modes: \"content\" shows matching lines, \"files_with_matches\" shows only file paths (default), \"count\" shows match counts\n"
-            "- Use Agent tool for open-ended searches requiring multiple rounds"
-        ),
-    )
-    def Grep(
-        self,
-        pattern: str,
-        path: str = ".",
-        glob: Optional[str] = None,
-        type: Optional[str] = None,
-        output_mode: str = "content",
-        context: int = 0,
-        head_limit: int = 100,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str | Dict[str, Any]:
-        """Search file contents using regex patterns.
-
-        :param pattern: Regular expression pattern to search for.
-        :param path: Directory or file to search in.
-        :param glob: File pattern filter (e.g., "*.py").
-        :param type: File type filter (js, py, rust, etc.).
-        :param output_mode: "content", "files_with_matches", or "count".
-        :param context: Number of lines of context before/after matches.
-        :param head_limit: Maximum number of results.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        # Map Claude Code's output_mode to grep_v2 parameters
-        files_with_matches = output_mode == "files_with_matches"
-        result = self.grep_v2(
-            pattern=pattern,
-            path=path,
-            glob=glob,
-            case_sensitive=False,
-            regex=True,
-            files_with_matches=files_with_matches,
-            limit=head_limit,
-            context=context,
-            file_type=type,
-            runtime_context=runtime_context,
-        )
-        if result.get("status") != "success":
-            return result
-        if files_with_matches:
-            matches = result.get("matches", [])
-            return "\n".join(
-                str(match.get("path", ""))
-                for match in matches
-                if isinstance(match, dict)
-            )
-        matches = result.get("matches", [])
-        if output_mode == "count":
-            counts: Dict[str, int] = {}
-            for match in matches:
-                if isinstance(match, dict):
-                    match_path = str(match.get("path", ""))
-                    counts[match_path] = counts.get(match_path, 0) + 1
-            return "\n".join(
-                f"{match_path}:{count}" for match_path, count in sorted(counts.items())
-            )
-        lines = []
-        for m in matches:
-            if isinstance(m, dict):
-                lines.append(
-                    f"{m.get('path', '')}:{m.get('line', '')}:{m.get('text', '')}"
-                )
-            else:
-                lines.append(str(m))
-        return "\n".join(lines)
-
-    @function_tool(
-        name="Bash",
-        needs_approval=True,
-        supports_background=True,
-        environment_ops=["process"],
-        rule_scope_builder=_default_rule_scope,
-        prompt=(
-            "Executes a given bash command and returns its output.\n"
-            "The working directory persists between commands, but shell state does not. The shell environment is initialized from the user's profile (bash or zsh).\n"
-            "IMPORTANT: Avoid using this tool to run `find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user:\n"
-            " - File search: Use Glob (NOT find or ls)\n"
-            " - Content search: Use Grep (NOT grep or rg)\n"
-            " - Read files: Use Read (NOT cat/head/tail)\n"
-            " - Edit files: Use Edit (NOT sed/awk)\n"
-            " - Write files: Use Write (NOT echo >/cat <<EOF)\n"
-            "If your command will create new directories or files, first use this tool to run `ls` to verify the parent directory exists. Try to maintain your current working directory throughout the session by using absolute paths. You may specify an optional timeout in milliseconds. You can use `run_in_background` to run commands in the background.\n"
-            "For git commands: Prefer to create a new commit rather than amending an existing commit. Before running destructive operations, consider whether there is a safer alternative. Never skip hooks (--no-verify) unless the user has explicitly asked for it.\n"
-            "For git commit messages, use HEREDOC format: git commit -m \"$(cat <<'EOF'\\n  Commit message here.\\n  EOF\\n  )\""
-        ),
-    )
-    def Bash(
-        self,
-        command: str,
-        description: str = "",
-        timeout: Optional[int] = None,
-        run_in_background: bool = False,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str | Dict[str, Any]:
-        """Execute a shell command.
-
-        :param command: Shell command to execute.
-        :param description: Brief description of what the command does.
-        :param timeout: Timeout in milliseconds (max 600000).
-        :param run_in_background: Run command in background and return task ID.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        result = self.bash_v2(
-            command=command,
-            read_only=False,
-            allow_destructive=False,
-            run_in_background=run_in_background,
-            runtime_context=runtime_context,
-        )
-        if result.get("status") in {"error", "needs_input", "needs_approval"}:
-            return result
-        if result.get("status") != "success":
-            error = result.get("error") or result.get("message", "")
-            returncode = result.get("returncode", 1)
-            stdout = result.get("stdout", "")
-            if stdout:
-                return f"Exit code {returncode}:\n{stdout}\n{error}"
-            return f"Error: {error}"
-        stdout = result.get("stdout", "")
-        returncode = result.get("returncode", 0)
-        if returncode != 0:
-            stderr = result.get("stderr", "")
-            return f"Exit code {returncode}:\n{stdout}\n{stderr}"
-        return stdout
-
-    @function_tool(
-        name="WebFetch",
-        needs_approval=True,
-        rule_scope_builder=_default_rule_scope,
-        prompt=(
-            "Fetches content from a specified URL and processes it using an AI model. Takes a URL and a prompt as input. Fetches the URL content, converts HTML to markdown. Processes the content with the prompt using a small, fast model.\n"
-            "Usage notes:\n"
-            "- The URL must be a fully-formed valid URL. HTTP URLs will be automatically upgraded to HTTPS.\n"
-            "- The prompt should describe what information you want to extract from the page.\n"
-            "- This tool is read-only and does not modify any files.\n"
-            "- Results may be summarized if the content is very large.\n"
-            "- Includes a self-cleaning 15-minute cache for faster responses.\n"
-            "- For GitHub URLs, prefer using the gh CLI via Bash instead."
-        ),
-    )
-    def WebFetch(
-        self,
-        url: str,
-        prompt: str = "",
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> str:
-        """Fetch a URL and convert to markdown, optionally summarizing with AI.
-
-        :param url: URL to fetch.
-        :param prompt: Optional prompt for AI summarization of the content.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        result = self.web_fetch_v2(
-            url=url,
-            prompt=prompt,
-            runtime_context=runtime_context,
-        )
-        if result.get("status") != "success":
-            return f"Error fetching URL: {result.get('error', 'unknown error')}"
-        return result.get("content", "")
-
-    @function_tool(
-        name="AskUserQuestion",
-        requires_user_interaction=True,
-        prompt=(
-            "Use this tool when you need to ask the user questions during execution. This allows you to:\n"
-            "1. Gather user preferences or requirements\n"
-            "2. Clarify ambiguous instructions\n"
-            "3. Get decisions on implementation choices as you work\n"
-            "4. Offer choices to the user about what direction to take.\n"
-            "Usage notes:\n"
-            "- Users will always be able to select \"Other\" to provide custom text input\n"
-            "- Use multiSelect: true to allow multiple answers to be selected for a question\n"
-            "- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label"
-        ),
-    )
-    def AskUserQuestion(
-        self,
-        questions: List[Dict[str, Any]],
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Ask the user one or more questions with optional choices.
-
-        :param questions: List of question dicts with 'question', 'options', and optional 'preview'.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        return self.ask_user_choice(
-            questions=questions,
-            runtime_context=runtime_context,
-        )
 
 
 __all__ = ["CodingToolSet", "TASK_STATUSES", "_resolve_workspace_path"]

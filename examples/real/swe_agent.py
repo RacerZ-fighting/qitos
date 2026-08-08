@@ -101,7 +101,6 @@ class SWEDynamicPlanningAgent(AgentModule[SWEPlanState, dict[str, Any], Action])
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         super().__init__(
@@ -163,7 +162,7 @@ class SWEDynamicPlanningAgent(AgentModule[SWEPlanState, dict[str, Any], Action])
         if any(token in step_text for token in ["inspect", "read", "check"]):
             candidates.append(
                 Decision.act(
-                    [Action(name="view", args={"path": state.target_file})],
+                    [Action(name="read_file", args={"path": state.target_file})],
                     rationale="inspect_target_file",
                     meta={"score": 0.8},
                 )
@@ -173,12 +172,11 @@ class SWEDynamicPlanningAgent(AgentModule[SWEPlanState, dict[str, Any], Action])
                 Decision.act(
                     [
                         Action(
-                            name="replace_lines",
+                            name="edit_file",
                             args={
                                 "path": state.target_file,
-                                "start_line": 2,
-                                "end_line": 2,
-                                "replacement": "    return a + b",
+                                "old_text": "    return a - b",
+                                "new_text": "    return a + b",
                             },
                         )
                     ],

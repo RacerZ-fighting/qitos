@@ -18,7 +18,7 @@ from qitos.kit.tool import (
     TodoWriteTool,
     ToolSearchTool,
 )
-from qitos.kit.tool.file import ReadFile, ReplaceLines, StrReplace
+from qitos.kit.tool.file import EditFile, ReadFile
 from qitos.kit.tool.shell import RunCommand
 
 
@@ -299,7 +299,7 @@ def test_run_command_executes_in_workspace(tmp_path):
     assert str(tmp_path) in result["stdout"]
 
 
-def test_read_file_and_str_replace_preserve_line_endings(tmp_path):
+def test_read_and_edit_file_preserve_line_endings(tmp_path):
     path = tmp_path / "demo.txt"
     path.write_bytes(b"hello\r\nworld\r\n")
 
@@ -308,16 +308,15 @@ def test_read_file_and_str_replace_preserve_line_endings(tmp_path):
     assert read_out["status"] == "success"
     assert "hello" in read_out["content"]
 
-    editor = StrReplace(workspace_root=str(tmp_path))
+    editor = EditFile(workspace_root=str(tmp_path))
     edit_out = editor.execute(
-        {"path": "demo.txt", "old_str": "world", "new_str": "qitos"}
+        {"path": "demo.txt", "old_text": "world", "new_text": "qitos"}
     )
     assert edit_out["status"] == "success"
     assert b"\r\n" in path.read_bytes()
 
-    lines = ReplaceLines(workspace_root=str(tmp_path))
-    replaced = lines.execute(
-        {"path": "demo.txt", "start_line": 2, "end_line": 2, "replacement": "done"}
+    replaced = editor.execute(
+        {"path": "demo.txt", "old_text": "qitos", "new_text": "done"}
     )
     assert replaced["status"] == "success"
     assert "done" in path.read_text(encoding="utf-8")
