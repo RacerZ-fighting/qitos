@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Truthful typed model streams**: Chat, Responses, and Anthropic streams now retain
+  provider finish reasons, reasoning and tool-call deltas, completed tool calls, and
+  usage through one `ModelStreamChunk` contract. Incomplete streams fail instead of
+  fabricating completion, and Engine handlers no longer receive `on_end` after an error.
 - **One bounded model-request lifecycle**: every Engine model call now receives the
   run's absolute deadline and immediate cancellation signal. Provider timeouts and
   QitOS-owned retry backoff use live remaining time, SDK retries stay disabled, late

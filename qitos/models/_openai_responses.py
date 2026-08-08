@@ -7,7 +7,7 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, cast
 
 from ..core.errors import ModelTransportError
 from ..core.model_response import ModelResponse
-from ._openai_retry import ModelRetryPolicy, stream_with_retry
+from ._openai_retry import _close_stream, _close_sync_stream
 from .base import Model, ModelStreamChunk
 
 OPENAI_API_MODES = {"chat_completions", "responses"}
@@ -478,19 +478,6 @@ def _final_stream_chunk(
     *,
     provider: str,
 ) -> ModelStreamChunk:
-    if response is None:
-        normalized = _model_response_from_responses(
-            {"status": "completed", "output": completed_items},
-            provider=provider,
-        )
-        return ModelStreamChunk(
-            text="",
-            done=True,
-            tool_calls=normalized.tool_calls,
-            native_items=normalized.native_items,
-            event_type="response.completed",
-            event_metadata=dict(normalized.metadata),
-        )
     normalized = _model_response_from_responses(
         _merge_completed_output(response, completed_items),
         provider=provider,
@@ -504,6 +491,7 @@ def _final_stream_chunk(
         native_items=normalized.native_items,
         event_type="response.completed",
         event_metadata=dict(normalized.metadata),
+        finish_reason=normalized.finish_reason,
     )
 
 
@@ -513,7 +501,6 @@ def _responses_stream(
     messages: List[Dict[str, Any]],
     *,
     provider: str,
-    require_completed: bool = False,
     **kwargs: Any,
 ) -> Iterator[ModelStreamChunk]:
     events = _responses_create(client)(
@@ -527,25 +514,28 @@ def _responses_stream(
     )
     completed_items: List[Dict[str, Any]] = []
     completed_response: Any = None
-    for event in events:
-        chunk, item, response = _event_chunk(event)
-        if isinstance(item, dict):
-            completed_items.append(item)
-        if response is not None:
-            completed_response = response
-        if chunk is not None:
-            yield chunk
-            if chunk.done:
-                return
-    if require_completed and completed_response is None:
-        raise ModelTransportError(
-            "model stream ended before response.completed",
-            attempts=1,
-            retryable=True,
+    try:
+        for event in events:
+            chunk, item, response = _event_chunk(event)
+            if isinstance(item, dict):
+                completed_items.append(item)
+            if response is not None:
+                completed_response = response
+            if chunk is not None:
+                yield chunk
+                if chunk.done:
+                    return
+        if completed_response is None:
+            raise ModelTransportError(
+                "model stream ended before response.completed",
+                attempts=1,
+                retryable=True,
+            )
+        yield _final_stream_chunk(
+            adapter, completed_response, completed_items, provider=provider
         )
-    yield _final_stream_chunk(
-        adapter, completed_response, completed_items, provider=provider
-    )
+    finally:
+        _close_sync_stream(events)
 
 
 async def _async_responses_stream(
@@ -554,8 +544,6 @@ async def _async_responses_stream(
     messages: List[Dict[str, Any]],
     *,
     provider: str,
-    retry_events: bool = True,
-    require_completed: bool = False,
     **kwargs: Any,
 ) -> AsyncIterator[ModelStreamChunk]:
     payload = _request_payload(
@@ -565,37 +553,31 @@ async def _async_responses_stream(
         provider=provider,
         stream=True,
     )
-    policy = getattr(adapter, "retry_policy", None)
-    if retry_events and isinstance(policy, ModelRetryPolicy):
-        events = stream_with_retry(
-            lambda: _responses_create(client)(**payload),
-            policy=policy,
-            idle_timeout_seconds=float(getattr(adapter, "stream_idle_timeout", 60.0)),
-            request_timeout_seconds=float(getattr(adapter, "timeout", 120.0)),
-        )
-    else:
-        events = await _responses_create(client)(**payload)
+    events = await _responses_create(client)(**payload)
     completed_items: List[Dict[str, Any]] = []
     completed_response: Any = None
-    async for event in events:
-        chunk, item, response = _event_chunk(event)
-        if isinstance(item, dict):
-            completed_items.append(item)
-        if response is not None:
-            completed_response = response
-        if chunk is not None:
-            yield chunk
-            if chunk.done:
-                return
-    if require_completed and completed_response is None:
-        raise ModelTransportError(
-            "model stream ended before response.completed",
-            attempts=1,
-            retryable=True,
+    try:
+        async for event in events:
+            chunk, item, response = _event_chunk(event)
+            if isinstance(item, dict):
+                completed_items.append(item)
+            if response is not None:
+                completed_response = response
+            if chunk is not None:
+                yield chunk
+                if chunk.done:
+                    return
+        if completed_response is None:
+            raise ModelTransportError(
+                "model stream ended before response.completed",
+                attempts=1,
+                retryable=True,
+            )
+        yield _final_stream_chunk(
+            adapter, completed_response, completed_items, provider=provider
         )
-    yield _final_stream_chunk(
-        adapter, completed_response, completed_items, provider=provider
-    )
+    finally:
+        await _close_stream(events)
 
 
 __all__ = [

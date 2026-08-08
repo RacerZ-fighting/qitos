@@ -16,6 +16,10 @@ class StreamHandler(Protocol):
     Engines and REPLs can implement this protocol to manage streaming
     lifecycle events (spinner start/stop, buffer management, etc.)
     instead of using bare callables.
+
+    Rich handlers may additionally define ``on_chunk(chunk)`` to observe the
+    complete normalized model chunk and ``on_error(exc)`` for failed streams.
+    They stay optional so existing handlers retain structural compatibility.
     """
 
     def on_start(self) -> None:

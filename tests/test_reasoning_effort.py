@@ -207,3 +207,4 @@ def test_transactional_stream_preserves_reasoning_deltas(
         "check premise"
     )
     assert chunks[-1].done is True
+    assert chunks[-1].finish_reason == "stop"

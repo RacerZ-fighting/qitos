@@ -67,6 +67,14 @@ OpenAI SDK 的内置重试固定关闭，`ModelRetryPolicy` 是唯一重试 owne
 provider 会留在 daemon worker 中，其迟到结果会被丢弃，不能写入 history、action 或
 final state。
 
+所有模型流都使用 `ModelStreamChunk` 作为统一契约。终态 chunk 会保留供应商实际的
+`finish_reason`，文本、reasoning、类型化事件元数据、完整工具调用、原生 item 与 usage
+保持为独立字段。Chat 工具参数分片使用 `event_type="tool_call.delta"`；Responses 则
+保留供应商事件类型和序列元数据。若供应商在终态事件前关闭流，QitOS 会抛出
+`ModelTransportError`，不会伪造成功完成。原有 Engine handler 仍只需实现
+`on_start/on_delta/on_end`；需要完整观察能力时可选实现 `on_chunk(chunk)` 和
+`on_error(exc)`。
+
 ## AgentModule.run() 参数
 
 这些参数都可以直接传给 `agent.run(task, ...)`：

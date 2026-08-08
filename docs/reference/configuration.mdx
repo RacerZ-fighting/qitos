@@ -110,6 +110,16 @@ stalled response. Direct callers of the public
 live `stream()` / `astream()` APIs still receive deltas immediately, so those APIs retry
 only before output becomes observable.
 
+All model stream paths use `ModelStreamChunk` as the normalized contract. Its terminal
+chunk retains the provider's actual `finish_reason`; text, reasoning, typed event
+metadata, completed tool calls, native items, and usage remain separate fields. Chat
+tool-argument fragments use `event_type="tool_call.delta"`, while Responses keeps its
+provider event type and sequence metadata. A provider stream that closes without its
+terminal event raises `ModelTransportError` instead of inventing a successful finish.
+Existing Engine stream handlers keep `on_start/on_delta/on_end`; richer handlers may
+optionally implement `on_chunk(chunk)` and `on_error(exc)` without changing the required
+protocol.
+
 ```python
 from qitos.models import AsyncOpenAICompatibleModel
 

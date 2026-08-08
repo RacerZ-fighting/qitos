@@ -648,6 +648,7 @@ def test_responses_stream_emits_typed_text_and_completed_tool_call(
     )
     assert completed_function.native_items[0]["call_id"] == "call_1"
     assert chunks[-1].done is True
+    assert chunks[-1].finish_reason == "completed"
     assert chunks[-1].tool_calls
     assert chunks[-1].tool_calls[0]["id"] == "call_1"
     assert chunks[-1].native_items
@@ -670,7 +671,7 @@ def test_responses_stream_emits_typed_text_and_completed_tool_call(
     assert chunks[-1].usage["prompt_tokens"] == 11
 
 
-def test_responses_stream_can_finish_from_output_item_events(
+def test_responses_stream_rejects_missing_completed_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     function_item = _response_with_function_calls().output[1]
@@ -699,11 +700,8 @@ def test_responses_stream_can_finish_from_output_item_events(
         api_mode="responses",
     )
 
-    chunks = list(model.stream([{"role": "user", "content": "go"}]))
-
-    assert chunks[-1].done is True
-    assert chunks[-1].tool_calls and chunks[-1].tool_calls[0]["id"] == "call_1"
-    assert chunks[-1].native_items and chunks[-1].native_items[0]["id"] == "fc_1"
+    with pytest.raises(ModelTransportError, match="before response.completed"):
+        list(model.stream([{"role": "user", "content": "go"}]))
 
 
 def test_async_responses_transport_uses_shared_normalization(
@@ -794,6 +792,7 @@ def test_async_responses_stream_preserves_typed_events(
     assert chunks[0].text == "async text"
     assert chunks[0].event_type == "response.output_text.delta"
     assert chunks[-1].done is True
+    assert chunks[-1].finish_reason == "completed"
     assert chunks[-1].tool_calls and chunks[-1].tool_calls[0]["id"] == "call_1"
 
 

@@ -859,6 +859,15 @@ def test_engine_uses_transactional_stream_native_tool_calls_before_parser():
             _ = messages
             yield ModelStreamChunk(
                 text="",
+                event_type="tool_call.delta",
+                event_metadata={
+                    "index": 0,
+                    "call_id": "call_1",
+                    "arguments_delta": '{"a": 20',
+                },
+            )
+            yield ModelStreamChunk(
+                text="",
                 done=True,
                 tool_calls=[
                     {
@@ -875,6 +884,7 @@ def test_engine_uses_transactional_stream_native_tool_calls_before_parser():
                     "completion_tokens": 4,
                     "total_tokens": 14,
                 },
+                finish_reason="tool_calls",
             )
 
         def call_raw(self, messages):
@@ -899,7 +909,26 @@ def test_engine_uses_transactional_stream_native_tool_calls_before_parser():
                 return Decision.final("42")
             return None
 
-    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=3)).run("compute")
+    class _ChunkHandler:
+        def __init__(self) -> None:
+            self.events: list[object] = []
+
+        def on_start(self) -> None:
+            self.events.append("start")
+
+        def on_delta(self, text: str) -> None:
+            self.events.append(text)
+
+        def on_chunk(self, chunk: ModelStreamChunk) -> None:
+            self.events.append((chunk.event_type, dict(chunk.event_metadata)))
+
+        def on_end(self) -> None:
+            self.events.append("end")
+
+    handler = _ChunkHandler()
+    engine = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=3))
+    engine.stream_callback = handler
+    result = engine.run("compute")
     assert result.state.final_result == "42"
     record = result.records[0]
     assert record.decision_source == "native_tool_calls"
@@ -908,6 +937,17 @@ def test_engine_uses_transactional_stream_native_tool_calls_before_parser():
     assert record.actions[0].name == "add"
     assert record.actions[0].args == {"a": 20, "b": 22}
     assert record.model_response["tool_calls"][0]["function"]["name"] == "add"
+    assert record.model_response["finish_reason"] == "tool_calls"
+    assert handler.events[0] == "start"
+    assert handler.events[1] == (
+        "tool_call.delta",
+        {
+            "index": 0,
+            "call_id": "call_1",
+            "arguments_delta": '{"a": 20',
+        },
+    )
+    assert handler.events[-1] == "end"
     native_events = [
         e
         for e in result.events

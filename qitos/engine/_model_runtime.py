@@ -22,6 +22,7 @@ from ..core.errors import (
     ModelExecutionError,
     ModelRequestCancelled,
     ModelRequestDeadlineExceeded,
+    ModelTransportError,
     ParseExecutionError,
     RuntimeErrorInfo,
 )
@@ -1357,7 +1358,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         final_usage: Optional[Dict[str, Any]] = None
         final_tool_calls: Optional[List[Dict[str, Any]]] = None
         final_native_items: Optional[List[Dict[str, Any]]] = None
+        final_finish_reason: Optional[str] = None
         started = False
+        terminal_seen = False
+        stream_error: Exception | None = None
 
         if not request_options:
             stream_iter = stream_fn(messages)
@@ -1374,15 +1378,34 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 usage = getattr(chunk, "usage", None)
                 tool_calls = getattr(chunk, "tool_calls", None)
                 native_items = getattr(chunk, "native_items", None)
+                event_type = getattr(chunk, "event_type", None)
+                finish_reason = getattr(chunk, "finish_reason", None)
+
+                observable = bool(
+                    text
+                    or reasoning
+                    or done
+                    or tool_calls
+                    or native_items
+                    or event_type
+                )
+                if observable and not started:
+                    started = True
+                    if handler is not None:
+                        try:
+                            handler.on_start()
+                        except Exception:
+                            pass
+
+                if observable and handler is not None:
+                    on_chunk = getattr(handler, "on_chunk", None)
+                    if callable(on_chunk):
+                        try:
+                            on_chunk(chunk)
+                        except Exception:
+                            pass
 
                 if text:
-                    if not started:
-                        started = True
-                        if handler is not None:
-                            try:
-                                handler.on_start()
-                            except Exception:
-                                pass
                     accumulated_text.append(text)
                     if handler is not None:
                         try:
@@ -1394,12 +1417,31 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     accumulated_reasoning.append(str(reasoning))
 
                 if done:
+                    terminal_seen = True
                     if usage is not None and isinstance(usage, dict):
                         final_usage = usage
                     if tool_calls is not None and isinstance(tool_calls, list):
                         final_tool_calls = tool_calls
                     if native_items is not None and isinstance(native_items, list):
                         final_native_items = native_items
+                    if finish_reason is not None:
+                        final_finish_reason = str(finish_reason)
+            if not terminal_seen:
+                raise ModelTransportError(
+                    "model stream ended before a terminal chunk",
+                    attempts=1,
+                    retryable=True,
+                )
+        except Exception as exc:
+            stream_error = exc
+            if handler is not None:
+                on_error = getattr(handler, "on_error", None)
+                if callable(on_error):
+                    try:
+                        on_error(exc)
+                    except Exception:
+                        pass
+            raise
         finally:
             close = getattr(stream_iter, "close", None)
             if callable(close):
@@ -1407,7 +1449,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     close()
                 except Exception:
                     _logger.debug("model stream close failed", exc_info=True)
-            if handler is not None and started:
+            if (
+                handler is not None
+                and started
+                and terminal_seen
+                and stream_error is None
+            ):
                 try:
                     ensure_request_active()
                     handler.on_end()
@@ -1425,7 +1472,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         result: Dict[str, Any] = {
             "text": full_text,
             "usage": final_usage or {},
-            "finish_reason": "stop",
+            "finish_reason": final_finish_reason,
         }
         if final_tool_calls:
             result["tool_calls"] = final_tool_calls

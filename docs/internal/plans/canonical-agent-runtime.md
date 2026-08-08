@@ -52,6 +52,8 @@ execution. Parser-only final-text compatibility remains for a later explicit-lan
 - [x] Make async stream shutdown request Engine cancellation and guarantee a terminal
   stream event even when the bounded event queue is full.
 - [x] Audit OpenAI model adapters so the provider transport has one retry owner.
+- [x] Preserve provider finish reasons and typed reasoning/tool-call stream events
+  through the canonical model chunk and Engine response path.
 
 Done when deterministic tests cover cancellation before admission, queued actions,
 running actions, partial streams, provider retry, tool retry, and queue saturation.
@@ -80,6 +82,12 @@ timeouts, QitOS-owned retry backoff, synchronous and asynchronous streams, and i
 cancellation. Official OpenAI adapters share the compatible transport with SDK retries
 disabled; blocked synchronous calls detach on daemon workers, streams close on every
 exit path, and late output cannot update callbacks, history, actions, or final state.
+
+Progress (2026-08-08): Chat, Responses, and Anthropic streams now retain their real
+finish reason, reasoning/tool-call deltas, completed calls, and usage through one
+`ModelStreamChunk`. Async Chat reuses the canonical accumulator, incomplete streams no
+longer fabricate completion, and rich handlers receive optional normalized chunk/error
+callbacks without changing the required stream-handler protocol.
 
 ### 3. Context, compression, and reasoning
 

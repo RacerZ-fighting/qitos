@@ -10,6 +10,7 @@ from typing import Any
 
 from qitos import AgentModule, Decision, Engine, StateSchema, ToolRegistry
 from qitos.core.action import Action, ActionResult, ActionStatus
+from qitos.core.errors import ModelTransportError
 from qitos.core.tool import (
     BaseTool,
     RetryPolicy,
@@ -536,4 +537,40 @@ def test_model_stream_discards_callbacks_after_deadline() -> None:
     assert handler.events == [
         ("start", None),
         ("delta", "before deadline"),
+    ]
+
+
+def test_model_stream_reports_error_without_normal_end() -> None:
+    class _BrokenStreamModel:
+        def transactional_stream(self, messages: list[dict[str, Any]], **kwargs: Any):
+            _ = messages, kwargs
+            yield ModelStreamChunk(text="partial")
+            raise ModelTransportError(
+                "stream broke",
+                attempts=1,
+                retryable=False,
+            )
+
+    class _DetailedStreamHandler(_RecordingStreamHandler):
+        def on_chunk(self, chunk: ModelStreamChunk) -> None:
+            self.events.append(("chunk", chunk.event_type))
+
+        def on_error(self, exc: Exception) -> None:
+            self.events.append(("error", type(exc).__name__))
+
+    handler = _DetailedStreamHandler()
+    engine = Engine(
+        _ModelDeadlineAgent(_BrokenStreamModel()),
+        budget=RuntimeBudget(max_steps=1),
+    )
+    engine.stream_callback = handler
+
+    result = engine.run("stream")
+
+    assert result.state.stop_reason == "unrecoverable_error"
+    assert handler.events == [
+        ("start", None),
+        ("chunk", None),
+        ("delta", "partial"),
+        ("error", "ModelTransportError"),
     ]

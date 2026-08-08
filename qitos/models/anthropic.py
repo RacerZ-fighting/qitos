@@ -7,11 +7,13 @@ going through an OpenAI-compatible proxy.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
+from ..core.errors import ModelTransportError
 from .base import Model, ModelFactory, ModelStreamChunk
 from ._request_runtime import effective_request_timeout
 
@@ -192,52 +194,171 @@ class AnthropicModel(Model):
         )
         response.raise_for_status()
 
-        usage_data = None
-        for line in response.iter_lines(decode_unicode=True):
-            if not line or not line.startswith("data: "):
-                continue
-            data_str = line[6:]
-            if data_str.strip() == "[DONE]":
-                break
-            import json as _json
+        usage_data: Dict[str, Any] = {}
+        tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
+        terminal_seen = False
 
-            try:
-                event = _json.loads(data_str)
-            except _json.JSONDecodeError:
-                continue
+        def terminal_usage() -> Optional[Dict[str, Any]]:
+            prompt_tokens = usage_data.get("prompt_tokens")
+            completion_tokens = usage_data.get("completion_tokens")
+            if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
+                usage_data["total_tokens"] = prompt_tokens + completion_tokens
+            return dict(usage_data) if usage_data else None
 
-            event_type = event.get("type", "")
+        def completed_tool_calls() -> Optional[List[Dict[str, Any]]]:
+            calls: List[Dict[str, Any]] = []
+            for index in sorted(tool_calls_by_index):
+                call = tool_calls_by_index[index]
+                if call.get("id") and call.get("function", {}).get("name"):
+                    function = call["function"]
+                    if not function.get("arguments"):
+                        function["arguments"] = "{}"
+                    calls.append(call)
+            return calls or None
 
-            if event_type == "content_block_delta":
-                delta = event.get("delta", {})
-                if delta.get("type") == "text_delta":
-                    text = delta.get("text", "")
-                    if text:
-                        yield ModelStreamChunk(text=text, done=False)
-
-            elif event_type == "message_delta":
-                delta = event.get("delta", {})
-                if delta.get("stop_reason"):
-                    msg_usage = event.get("usage", {})
-                    if msg_usage:
-                        output_tokens = msg_usage.get("output_tokens")
-                        usage_data = {"completion_tokens": output_tokens}
-                    yield ModelStreamChunk(text="", done=True, usage=usage_data)
+        try:
+            for line in response.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str.strip() == "[DONE]":
                     break
 
-            elif event_type == "message_start":
-                msg_data = event.get("message", {})
-                msg_usage = msg_data.get("usage", {})
-                if msg_usage:
-                    input_tokens = msg_usage.get("input_tokens")
-                    usage_data = {"prompt_tokens": input_tokens}
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
 
-            elif event_type == "message_stop":
-                yield ModelStreamChunk(text="", done=True, usage=usage_data)
-                break
+                event_type = event.get("type", "")
+                raw_index = event.get("index")
+                index = raw_index if isinstance(raw_index, int) else 0
 
-        if usage_data:
-            self._set_last_usage(usage_data)
+                if event_type == "content_block_start":
+                    block = event.get("content_block", {})
+                    if block.get("type") != "tool_use":
+                        continue
+                    initial_input = block.get("input")
+                    arguments = (
+                        json.dumps(initial_input, ensure_ascii=False)
+                        if initial_input
+                        else ""
+                    )
+                    tool_calls_by_index[index] = {
+                        "id": block.get("id"),
+                        "type": "function",
+                        "function": {
+                            "name": str(block.get("name") or ""),
+                            "arguments": arguments,
+                        },
+                    }
+                    yield ModelStreamChunk(
+                        text="",
+                        event_type="tool_call.start",
+                        event_metadata={
+                            "index": index,
+                            "call_id": block.get("id"),
+                            "name": block.get("name"),
+                        },
+                    )
+
+                elif event_type == "content_block_delta":
+                    delta = event.get("delta", {})
+                    delta_type = delta.get("type")
+                    if delta_type == "text_delta":
+                        text = str(delta.get("text") or "")
+                        if text:
+                            yield ModelStreamChunk(
+                                text=text,
+                                event_type="text.delta",
+                                event_metadata={"index": index},
+                            )
+                    elif delta_type == "thinking_delta":
+                        reasoning = str(delta.get("thinking") or "")
+                        if reasoning:
+                            yield ModelStreamChunk(
+                                text="",
+                                reasoning_content=reasoning,
+                                event_type="reasoning.delta",
+                                event_metadata={"index": index},
+                            )
+                    elif delta_type == "input_json_delta":
+                        arguments = str(delta.get("partial_json") or "")
+                        call = tool_calls_by_index.get(index)
+                        if call is not None and arguments:
+                            function = call["function"]
+                            function["arguments"] = (
+                                str(function.get("arguments") or "") + arguments
+                            )
+                        metadata: Dict[str, Any] = {
+                            "index": index,
+                            "arguments_delta": arguments,
+                        }
+                        if call is not None:
+                            metadata["call_id"] = call.get("id")
+                            metadata["name"] = call["function"].get("name")
+                        yield ModelStreamChunk(
+                            text="",
+                            event_type="tool_call.delta",
+                            event_metadata=metadata,
+                        )
+
+                elif event_type == "message_delta":
+                    msg_usage = event.get("usage", {})
+                    if isinstance(msg_usage, dict):
+                        output_tokens = msg_usage.get("output_tokens")
+                        if output_tokens is not None:
+                            usage_data["completion_tokens"] = output_tokens
+                    stop_reason = event.get("delta", {}).get("stop_reason")
+                    if stop_reason:
+                        terminal_seen = True
+                        yield ModelStreamChunk(
+                            text="",
+                            done=True,
+                            usage=terminal_usage(),
+                            tool_calls=completed_tool_calls(),
+                            event_type="message.stop",
+                            finish_reason=str(stop_reason),
+                        )
+                        break
+
+                elif event_type == "message_start":
+                    msg_usage = event.get("message", {}).get("usage", {})
+                    if isinstance(msg_usage, dict):
+                        input_tokens = msg_usage.get("input_tokens")
+                        if input_tokens is not None:
+                            usage_data["prompt_tokens"] = input_tokens
+
+                elif event_type == "message_stop":
+                    terminal_seen = True
+                    yield ModelStreamChunk(
+                        text="",
+                        done=True,
+                        usage=terminal_usage(),
+                        tool_calls=completed_tool_calls(),
+                        event_type="message.stop",
+                    )
+                    break
+
+                elif event_type == "error":
+                    raise ModelTransportError(
+                        f"Anthropic stream failed: {event.get('error')}",
+                        attempts=1,
+                        retryable=False,
+                    )
+        finally:
+            close = getattr(response, "close", None)
+            if callable(close):
+                close()
+
+        if not terminal_seen:
+            raise ModelTransportError(
+                "Anthropic stream ended before message_stop",
+                attempts=1,
+                retryable=True,
+            )
+        final_usage = terminal_usage()
+        if final_usage:
+            self._set_last_usage(final_usage)
 
 
 ModelFactory.register("anthropic")(AnthropicModel)

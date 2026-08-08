@@ -11,6 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, cast
 
+from ..core.errors import ModelTransportError
 from ..core.model_response import ModelResponse
 from ..core.multimodal import (
     content_to_text,
@@ -82,6 +83,7 @@ class _ChatStreamAccumulator:
         self._adapter = adapter
         self._tool_calls: List[Dict[str, Any]] = []
         self._usage: Optional[Dict[str, Any]] = None
+        self._finish_reason: Optional[str] = None
         self.finished = False
 
     def consume(self, chunk: Any) -> Iterator[ModelStreamChunk]:
@@ -101,13 +103,14 @@ class _ChatStreamAccumulator:
                 reasoning_content=str(reasoning) if reasoning else None,
                 done=False,
             )
-        self._accumulate_tool_calls(getattr(delta, "tool_calls", None))
+        yield from self._accumulate_tool_calls(getattr(delta, "tool_calls", None))
         if choice.finish_reason is None:
             return
 
         usage = _usage_payload(getattr(chunk, "usage", None))
         if usage:
             self._usage = usage
+        self._finish_reason = str(choice.finish_reason)
         self.finished = True
 
     def complete(self) -> ModelStreamChunk | None:
@@ -119,9 +122,10 @@ class _ChatStreamAccumulator:
             done=True,
             usage=self._usage,
             tool_calls=self._tool_calls or None,
+            finish_reason=self._finish_reason,
         )
 
-    def _accumulate_tool_calls(self, deltas: Any) -> None:
+    def _accumulate_tool_calls(self, deltas: Any) -> Iterator[ModelStreamChunk]:
         for item in list(deltas or []):
             index = getattr(item, "index", len(self._tool_calls))
             while len(self._tool_calls) <= index:
@@ -140,15 +144,31 @@ class _ChatStreamAccumulator:
             if tool_call_type:
                 tool_call["type"] = tool_call_type
             function = getattr(item, "function", None)
-            if not function:
-                continue
-            name = getattr(function, "name", None)
+            name = getattr(function, "name", None) if function else None
             if name:
                 tool_call["function"]["name"] = name
-            arguments = getattr(function, "arguments", None)
+            arguments = getattr(function, "arguments", None) if function else None
             if arguments:
                 previous = tool_call["function"].get("arguments", "")
                 tool_call["function"]["arguments"] = previous + arguments
+
+            metadata = {
+                key: value
+                for key, value in {
+                    "index": index,
+                    "call_id": tool_call_id,
+                    "tool_type": tool_call_type,
+                    "name": name,
+                    "arguments_delta": arguments,
+                }.items()
+                if value is not None
+            }
+            if len(metadata) > 1:
+                yield ModelStreamChunk(
+                    text="",
+                    event_type="tool_call.delta",
+                    event_metadata=metadata,
+                )
 
 
 def _wire_tool_schema(
@@ -776,22 +796,24 @@ class OpenAICompatibleModel(Model):
         for chunk in response:
             yield from accumulator.consume(chunk)
         completed = accumulator.complete()
-        if completed is not None:
-            yield completed
+        if completed is None:
+            raise ModelTransportError(
+                "model stream ended before a terminal chunk",
+                attempts=1,
+                retryable=True,
+            )
+        yield completed
 
     def _responses_stream_once(
         self,
         messages: List[Dict[str, Any]],
         kwargs: Dict[str, Any],
-        *,
-        require_completed: bool,
     ) -> Iterator[ModelStreamChunk]:
         yield from _responses_stream(
             self,
             self._stream_client(),
             messages,
             provider=self.provider_name,
-            require_completed=require_completed,
             **kwargs,
         )
 
@@ -803,9 +825,7 @@ class OpenAICompatibleModel(Model):
         kwargs = self._request_kwargs(kwargs)
         if self.api_mode == "responses":
             yield from sync_stream_with_retry(
-                lambda: self._responses_stream_once(
-                    messages, dict(kwargs), require_completed=False
-                ),
+                lambda: self._responses_stream_once(messages, dict(kwargs)),
                 policy=self.retry_policy,
             )
             return
@@ -824,9 +844,7 @@ class OpenAICompatibleModel(Model):
         kwargs = self._request_kwargs(kwargs)
         if self.api_mode == "responses":
             yield from sync_transactional_stream_with_retry(
-                lambda: self._responses_stream_once(
-                    messages, dict(kwargs), require_completed=True
-                ),
+                lambda: self._responses_stream_once(messages, dict(kwargs)),
                 policy=self.retry_policy,
                 is_complete=lambda chunk: chunk.done,
             )
@@ -1084,45 +1102,16 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
         self, messages: List[Dict[str, Any]], **kwargs: Any
     ) -> AsyncIterator[ModelStreamChunk]:
         """Async stream OpenAI-compatible response as chunks."""
-        import openai
-
         self._last_usage = None
         kwargs = self._request_kwargs(kwargs)
-        if self.api_mode == "responses":
-            client = openai.AsyncOpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-                timeout=effective_request_timeout(self.timeout),
-                max_retries=0,
-            )
-            async for chunk in _async_responses_stream(
-                self, client, messages, provider=self.provider_name, **kwargs
-            ):
-                yield chunk
-            return
-        client = openai.AsyncOpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url,
-            timeout=effective_request_timeout(self.timeout),
-            max_retries=0,
+        request_kwargs = (
+            dict(kwargs)
+            if self.api_mode == "responses"
+            else self._chat_stream_request(messages, dict(kwargs))
         )
-        safe_kwargs = _disable_thinking_for_forced_tool_choice(
-            _relocate_chat_template_kwargs(kwargs)
-        )
-        request_kwargs: Dict[str, Any] = {
-            "model": self.model,
-            "messages": cast(Any, _to_openai_messages(messages)),
-            "max_tokens": self.max_tokens,
-            "stream": True,
-            **safe_kwargs,
-        }
-        if self.temperature is not None:
-            request_kwargs["temperature"] = self.temperature
 
-        async def create_stream() -> AsyncIterator[Any]:
-            return await client.chat.completions.create(
-                **self._attempt_request_kwargs(request_kwargs)
-            )
+        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+            return self._astream_once(messages, request_kwargs)
 
         async for chunk in stream_with_retry(
             create_stream,
@@ -1130,25 +1119,9 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
             idle_timeout_seconds=self.stream_idle_timeout,
             request_timeout_seconds=float(self.timeout),
         ):
-            if not chunk.choices:
-                if hasattr(chunk, "usage") and chunk.usage:
-                    self._set_last_usage(_usage_payload(chunk.usage))
-                continue
-            delta = chunk.choices[0].delta
-            text = delta.content or ""
-            reasoning = getattr(delta, "reasoning_content", None)
-            if text or reasoning:
-                yield ModelStreamChunk(
-                    text=text,
-                    reasoning_content=str(reasoning) if reasoning else None,
-                    done=False,
-                )
-            if chunk.choices[0].finish_reason is not None:
-                usage_data = _usage_payload(getattr(chunk, "usage", None))
-                self._set_last_usage(usage_data)
-                yield ModelStreamChunk(text="", done=True, usage=usage_data)
+            yield chunk
 
-    async def _atransactional_stream_once(
+    async def _astream_once(
         self,
         messages: List[Dict[str, Any]],
         request_kwargs: Dict[str, Any],
@@ -1158,7 +1131,7 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
         client = openai.AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
-            timeout=_stream_timeout(self.stream_idle_timeout),
+            timeout=effective_request_timeout(self.timeout),
             max_retries=0,
         )
         if self.api_mode == "responses":
@@ -1167,8 +1140,6 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
                 client,
                 messages,
                 provider=self.provider_name,
-                retry_events=False,
-                require_completed=True,
                 **request_kwargs,
             ):
                 yield chunk
@@ -1214,7 +1185,7 @@ class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
         )
 
         async def create_stream() -> AsyncIterator[ModelStreamChunk]:
-            return self._atransactional_stream_once(messages, request_kwargs)
+            return self._astream_once(messages, request_kwargs)
 
         async for chunk in transactional_stream_with_retry(
             create_stream,

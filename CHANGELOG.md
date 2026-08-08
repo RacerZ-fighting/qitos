@@ -97,6 +97,11 @@ How to update:
 
 ### Fixed
 
+- Fixed streaming completion being flattened to a synthetic `stop`. Chat,
+  Responses, and Anthropic adapters now preserve provider finish reasons, async Chat
+  retains incremental and completed tool calls, incomplete streams fail explicitly,
+  and rich Engine handlers can observe normalized chunks or failures without receiving
+  a false normal-end callback.
 - Fixed model requests and streams outliving the Engine deadline, late responses being
   accepted as successful decisions, async Responses completion bypassing QitOS retry,
   Azure retaining SDK retries, and provider attempts reusing stale timeout values.

@@ -32,6 +32,7 @@ class ModelStreamChunk:
     event_type: Optional[str] = None
     event_metadata: Dict[str, Any] = field(default_factory=dict)
     reasoning_content: Optional[str] = None
+    finish_reason: Optional[str] = None
 
     @property
     def is_final(self) -> bool:

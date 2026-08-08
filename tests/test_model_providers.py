@@ -41,6 +41,19 @@ class _FakeHTTPResponse:
             raise error
 
 
+class _FakeStreamHTTPResponse(_FakeHTTPResponse):
+    def __init__(self, events: list[dict[str, object]]) -> None:
+        super().__init__({})
+        self._events = events
+
+    def iter_lines(self, decode_unicode: bool = False):
+        _ = decode_unicode
+        for event in self._events:
+            import json
+
+            yield f"data: {json.dumps(event)}"
+
+
 def test_anthropic_native_messages_adapter(monkeypatch) -> None:
     captured = {}
 
@@ -84,6 +97,76 @@ def test_anthropic_native_messages_adapter(monkeypatch) -> None:
         "prompt_tokens": 103,
         "completion_tokens": 22,
         "total_tokens": 125,
+    }
+
+
+def test_anthropic_stream_preserves_reasoning_tool_delta_and_finish_reason(
+    monkeypatch,
+) -> None:
+    events = [
+        {
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 8}},
+        },
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "lookup",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"q":"x"}'},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "thinking_delta", "thinking": "check evidence"},
+        },
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "tool_use"},
+            "usage": {"output_tokens": 5},
+        },
+        {"type": "message_stop"},
+    ]
+
+    def fake_post(*args, **kwargs):
+        _ = args, kwargs
+        return _FakeStreamHTTPResponse(events)
+
+    monkeypatch.setattr("qitos.models.anthropic.requests.post", fake_post)
+    model = AnthropicModel(api_key="anthropic-test", model="claude-test")
+
+    chunks = list(model.stream([{"role": "user", "content": "look up x"}]))
+
+    tool_delta = next(chunk for chunk in chunks if chunk.event_type == "tool_call.delta")
+    assert tool_delta.event_metadata == {
+        "index": 0,
+        "call_id": "toolu_1",
+        "name": "lookup",
+        "arguments_delta": '{"q":"x"}',
+    }
+    assert "".join(chunk.reasoning_content or "" for chunk in chunks) == "check evidence"
+    terminal = [chunk for chunk in chunks if chunk.done]
+    assert len(terminal) == 1
+    assert terminal[0].finish_reason == "tool_use"
+    assert terminal[0].tool_calls == [
+        {
+            "id": "toolu_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+        }
+    ]
+    assert terminal[0].usage == {
+        "prompt_tokens": 8,
+        "completion_tokens": 5,
+        "total_tokens": 13,
     }
 
 
@@ -501,6 +584,26 @@ def test_async_openai_compatible_stream_retries_and_preserves_errors(
     attempts = 0
     client_kwargs: dict[str, object] = {}
 
+    class _UsageThenTimeoutStream:
+        def __init__(self) -> None:
+            self._sent_usage = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self._sent_usage:
+                self._sent_usage = True
+                return SimpleNamespace(
+                    choices=[],
+                    usage=SimpleNamespace(
+                        prompt_tokens=999,
+                        completion_tokens=0,
+                        total_tokens=999,
+                    ),
+                )
+            raise TimeoutError("request timed out")
+
     class _Stream:
         def __init__(self) -> None:
             self._chunks = iter(
@@ -508,7 +611,19 @@ def test_async_openai_compatible_stream_retries_and_preserves_errors(
                     SimpleNamespace(
                         choices=[
                             SimpleNamespace(
-                                delta=SimpleNamespace(content='{"ok":true}'),
+                                delta=SimpleNamespace(
+                                    content='{"ok":true}',
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            index=0,
+                                            id="call_1",
+                                            type="function",
+                                            function=SimpleNamespace(
+                                                name="lookup", arguments='{"q":'
+                                            ),
+                                        )
+                                    ],
+                                ),
                                 finish_reason=None,
                             )
                         ],
@@ -517,8 +632,20 @@ def test_async_openai_compatible_stream_retries_and_preserves_errors(
                     SimpleNamespace(
                         choices=[
                             SimpleNamespace(
-                                delta=SimpleNamespace(content=""),
-                                finish_reason="stop",
+                                delta=SimpleNamespace(
+                                    content="",
+                                    tool_calls=[
+                                        SimpleNamespace(
+                                            index=0,
+                                            id=None,
+                                            type=None,
+                                            function=SimpleNamespace(
+                                                name=None, arguments='"x"}'
+                                            ),
+                                        )
+                                    ],
+                                ),
+                                finish_reason="tool_calls",
                             )
                         ],
                         usage=SimpleNamespace(
@@ -545,7 +672,7 @@ def test_async_openai_compatible_stream_retries_and_preserves_errors(
             attempts += 1
             assert kwargs["stream"] is True
             if attempts == 1:
-                raise TimeoutError("request timed out")
+                return _UsageThenTimeoutStream()
             return _Stream()
 
     class _Client:
@@ -579,7 +706,20 @@ def test_async_openai_compatible_stream_retries_and_preserves_errors(
     assert attempts == 2
     assert client_kwargs["max_retries"] == 0
     assert "".join(chunk.text for chunk in chunks) == '{"ok":true}'
+    assert [
+        chunk.event_metadata["arguments_delta"]
+        for chunk in chunks
+        if chunk.event_type == "tool_call.delta"
+    ] == ['{"q":', '"x"}']
     assert chunks[-1].done is True
+    assert chunks[-1].finish_reason == "tool_calls"
+    assert chunks[-1].tool_calls == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+        }
+    ]
     assert model.extract_usage() == {
         "prompt_tokens": 3,
         "completion_tokens": 2,
