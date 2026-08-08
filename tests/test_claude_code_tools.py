@@ -248,45 +248,9 @@ class TestAgentTool:
     def test_call_without_prompt(self):
         from qitos.kit.tool.agent import AgentTool
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tool = AgentTool(workspace_root=tmpdir)
-            result = tool.execute({"subagent_type": "explore"})
-            assert result["status"] == "error"
-
-    def test_call_unknown_agent_type(self):
-        from qitos.kit.tool.agent import AgentTool
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tool = AgentTool(workspace_root=tmpdir)
-            result = tool.execute({"prompt": "test", "subagent_type": "nonexistent_type"})
-            # Should return error about unknown type
-            assert result.get("error") is not None or result.get("status") == "error"
-
-    def test_register_agent_type(self):
-        from qitos.kit.tool.agent import AgentTool
-
-        class FakeAgent:
-            pass
-
-        AgentTool.register_agent_type("test_type", FakeAgent)
-        assert "test_type" in AgentTool._agent_types
-        # Cleanup
-        del AgentTool._agent_types["test_type"]
-
-    def test_background_execution(self):
-        from qitos.kit.tool.agent import AgentTool
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tool = AgentTool(workspace_root=tmpdir)
-            result = tool.execute(
-                {
-                    "prompt": "test",
-                    "subagent_type": "explore",
-                    "run_in_background": True,
-                }
-            )
-            assert result["status"] == "running"
-            assert "task_id" in result
+        tool = AgentTool(invocation_factory=lambda request, _context: None)
+        result = tool.execute({"description": "missing task"})
+        assert result == {"status": "error", "error": "prompt is required"}
 
     def test_run_scoped_factory_creates_fresh_invocation_per_call(self):
         from contextlib import contextmanager
@@ -331,7 +295,7 @@ class TestAgentTool:
         tool = AgentTool(
             invocation_factory=build_invocation,
             execution_scope=execution_scope,
-            allow_background=False,
+            execution_mode="foreground",
         )
         first = tool.execute(
             {"description": "first task", "prompt": "one"},
@@ -357,7 +321,7 @@ class TestAgentTool:
 
         tool = AgentTool(
             invocation_factory=lambda request, context: None,
-            allow_background=False,
+            execution_mode="foreground",
         )
         result = tool.execute(
             {"description": "nested task", "prompt": "recurse"},
@@ -931,26 +895,3 @@ class TestAgentTool:
         assert not factory_called.is_set()
         assert tool.active_background_count == 0
         assert tool.close(wait_seconds=0) == 0
-
-
-# ── Sub-agents import ─────────────────────────────────────────────────────────
-
-
-class TestSubAgents:
-    def test_explore_agent_import(self):
-        from qitos.kit.tool.internal.subagents import ExploreAgent, ExploreState
-
-        assert ExploreAgent is not None
-        assert ExploreState is not None
-
-    def test_plan_agent_import(self):
-        from qitos.kit.tool.internal.subagents import PlanAgent, PlanState
-
-        assert PlanAgent is not None
-        assert PlanState is not None
-
-    def test_general_agent_import(self):
-        from qitos.kit.tool.internal.subagents import GeneralAgent, GeneralState
-
-        assert GeneralAgent is not None
-        assert GeneralState is not None

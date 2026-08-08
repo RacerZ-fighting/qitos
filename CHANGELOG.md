@@ -49,6 +49,11 @@ How to update:
 
 ### Changed
 
+- **Breaking:** `AgentTool` now requires one explicit `invocation_factory` and uses only
+  the canonical `execution_mode`. Removed the class registry, generic model/workspace
+  construction, hidden worktree argument, `allow_background` alias, and the separate
+  `CodingToolSet.agent_spawn` loop; applications own fresh child Engine construction.
+
 - Model calls now run under one Engine-scoped absolute request deadline. Provider
   timeouts and retry backoff are clamped to live remaining time, immediate cancellation
   stops waiting, and uncooperative synchronous calls remain on bounded daemon workers.

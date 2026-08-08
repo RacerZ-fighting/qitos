@@ -12,7 +12,6 @@ from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from ....core.agent_module import AgentModule
 from ....core.runtime_input import RuntimeInput
 from ....core.tool import BaseTool, ToolPermission, ToolSpec
 from ....core.tool_result import ToolResult
@@ -58,7 +57,6 @@ class AgentResult:
     success: bool
     output: Any = None
     error: str | None = None
-    workspace_root: str | None = None
     run_id: str | None = None
     name: str = ""
     description: str = ""
@@ -71,24 +69,17 @@ class AgentResult:
 class AgentTool(BaseTool):
     """Launch a fresh child agent for a parent-authored task.
 
-    Applications with run-scoped resources should inject ``invocation_factory``.
     The factory is called once per invocation and must return a fresh Engine; this
     prevents concurrent children from sharing an AgentModule history or model client.
-    The class registry remains as a compatibility path for QitOS's built-in agents.
     """
-
-    _agent_types: dict[str, type[AgentModule]] = {}
 
     def __init__(
         self,
-        workspace_root: str = ".",
-        model_factory: Callable[..., Any] | None = None,
-        max_background_workers: int = 4,
         *,
-        invocation_factory: AgentInvocationFactory | None = None,
+        invocation_factory: AgentInvocationFactory,
         execution_scope: AgentExecutionScope | None = None,
-        allow_background: bool = True,
-        execution_mode: AgentExecutionMode | None = None,
+        execution_mode: AgentExecutionMode = "foreground",
+        max_background_workers: int = 4,
         max_delegate_depth: int = 1,
         max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
     ) -> None:
@@ -98,20 +89,15 @@ class AgentTool(BaseTool):
             raise ValueError("max_delegate_depth must be positive")
         if max_turns <= 0:
             raise ValueError("max_turns must be positive")
-        resolved_mode: AgentExecutionMode = execution_mode or (
-            "optional_background" if allow_background else "foreground"
-        )
-        if resolved_mode not in {
+        if execution_mode not in {
             "foreground",
             "optional_background",
             "background",
         }:
-            raise ValueError(f"unsupported Agent execution_mode: {resolved_mode}")
-        self.workspace_root = workspace_root
-        self.model_factory = model_factory
+            raise ValueError(f"unsupported Agent execution_mode: {execution_mode}")
         self._invocation_factory = invocation_factory
         self._execution_scope = execution_scope
-        self._execution_mode = resolved_mode
+        self._execution_mode = execution_mode
         self._max_delegate_depth = max_delegate_depth
         self._max_turns = max_turns
         self._executor = DaemonTaskPool(
@@ -147,7 +133,7 @@ class AgentTool(BaseTool):
                 ),
             },
         }
-        if resolved_mode == "optional_background":
+        if execution_mode == "optional_background":
             parameters["run_in_background"] = {
                 "type": "boolean",
                 "description": "Run asynchronously and return a task id.",
@@ -162,7 +148,7 @@ class AgentTool(BaseTool):
                 "This runtime always starts the child asynchronously and immediately "
                 "returns a task id. Completion is delivered as a later runtime event. "
             ),
-        }[resolved_mode]
+        }[execution_mode]
         description = execution_description + (
             "Launch an independent child agent for one clearly scoped multi-step task. "
             "For two or more independent multi-step tasks, make one Agent call per task "
@@ -179,16 +165,10 @@ class AgentTool(BaseTool):
             required=["description", "prompt"],
             permissions=ToolPermission(),
             concurrency_safe=True,
-            supports_background=resolved_mode != "foreground",
+            supports_background=execution_mode != "foreground",
         )
         super().__init__(spec=tool_spec)
         self.spec.description = description
-
-    @classmethod
-    def register_agent_type(cls, name: str, agent_class: type[AgentModule]) -> None:
-        """Register one legacy class-constructed agent type."""
-
-        cls._agent_types[name] = agent_class
 
     def execute(
         self, args: dict[str, Any], runtime_context: dict[str, Any] | None = None
@@ -207,9 +187,9 @@ class AgentTool(BaseTool):
         prompt = str(args.get("prompt", "")).strip()
         if not prompt:
             return {"status": "error", "error": "prompt is required"}
-        # The model schema requires a description, while this fallback preserves
-        # compatibility for older programmatic callers that passed only a prompt.
-        description = str(args.get("description", "")).strip() or prompt
+        description = str(args.get("description", "")).strip()
+        if not description:
+            return {"status": "error", "error": "description is required"}
 
         current_depth = int(context.get("delegate_depth", 0))
         if current_depth >= self._max_delegate_depth:
@@ -231,10 +211,6 @@ class AgentTool(BaseTool):
             ),
             max_turns=self._max_turns,
         )
-        workspace = self._resolve_workspace(args.get("isolation"))
-        if isinstance(workspace, dict):
-            return workspace
-
         requested_background = bool(args.get("run_in_background", False))
         if requested_background and self._execution_mode == "foreground":
             return {
@@ -257,7 +233,6 @@ class AgentTool(BaseTool):
                     self._run_request,
                     request,
                     context,
-                    workspace,
                     task_id,
                     cancel_event,
                 )
@@ -302,36 +277,21 @@ class AgentTool(BaseTool):
                 "task_id": task_id,
                 "agent_type": request.subagent_type,
                 "description": request.description,
-                "workspace": workspace if args.get("isolation") == "worktree" else None,
             }
 
         return self._result_payload(
             self._run_request(
                 request,
                 context,
-                workspace,
                 task_id=None,
                 cancel_event=None,
             )
         )
 
-    def _resolve_workspace(self, isolation: Any) -> str | dict[str, Any]:
-        workspace = self.workspace_root
-        if isolation != "worktree":
-            return workspace
-        try:
-            from ....kit.agent.worktree_manager import WorktreeManager
-
-            manager = WorktreeManager(workspace_root=workspace)
-            return manager.create_worktree(f"agent-{uuid.uuid4().hex[:8]}")
-        except Exception as exc:
-            return {"status": "error", "error": f"Failed to create worktree: {exc}"}
-
     def _run_request(
         self,
         request: AgentRequest,
         runtime_context: dict[str, Any],
-        workspace_root: str,
         task_id: str | None,
         cancel_event: threading.Event | None,
     ) -> AgentResult:
@@ -348,14 +308,11 @@ class AgentTool(BaseTool):
             with scope:
                 if cancel_event is not None and cancel_event.is_set():
                     raise RuntimeError("Child agent was cancelled before it started")
-                if self._invocation_factory is not None:
-                    result = self._run_invocation(
-                        request,
-                        scoped_context,
-                        task_id=task_id,
-                    )
-                else:
-                    result = self._run_legacy_agent(request, workspace_root)
+                result = self._run_invocation(
+                    request,
+                    scoped_context,
+                    task_id=task_id,
+                )
         except Exception as exc:
             result = AgentResult(
                 agent_type=request.subagent_type,
@@ -382,10 +339,7 @@ class AgentTool(BaseTool):
         *,
         task_id: str | None,
     ) -> AgentResult:
-        factory = self._invocation_factory
-        if factory is None:  # pragma: no cover - guarded by _run_request
-            raise RuntimeError("run-scoped invocation factory is unavailable")
-        invocation = factory(request, runtime_context)
+        invocation = self._invocation_factory(request, runtime_context)
         if not isinstance(invocation, AgentInvocation):
             raise TypeError("invocation_factory must return AgentInvocation")
         if task_id is not None:
@@ -419,56 +373,6 @@ class AgentTool(BaseTool):
             total_tokens=int(getattr(engine_result, "total_tokens", 0) or 0),
             stop_reason=stop_reason,
         )
-
-    def _run_legacy_agent(
-        self, request: AgentRequest, workspace_root: str
-    ) -> AgentResult:
-        agent_class = self._agent_types.get(request.subagent_type)
-        if agent_class is None:
-            return AgentResult(
-                agent_type=request.subagent_type,
-                task=request.prompt,
-                success=False,
-                error=(
-                    f"Unknown agent type: {request.subagent_type}. "
-                    f"Available: {list(self._agent_types.keys())}"
-                ),
-                name=request.name,
-                description=request.description,
-            )
-        try:
-            kwargs: dict[str, Any] = {"workspace_root": workspace_root}
-            if self.model_factory:
-                kwargs["llm"] = self.model_factory()
-            agent = agent_class(**kwargs)
-            result = agent.run(task=request.prompt, max_steps=request.max_turns)
-            output = None
-            if hasattr(result, "final_answer"):
-                output = result.final_answer
-            elif hasattr(result, "output"):
-                output = result.output
-            elif hasattr(result, "state") and hasattr(result.state, "final_result"):
-                output = result.state.final_result
-            return AgentResult(
-                agent_type=request.subagent_type,
-                task=request.prompt,
-                success=True,
-                output=output,
-                workspace_root=workspace_root,
-                name=request.name,
-                description=request.description,
-                steps=int(getattr(result, "step_count", 0) or 0),
-                total_tokens=int(getattr(result, "total_tokens", 0) or 0),
-            )
-        except Exception as exc:
-            return AgentResult(
-                agent_type=request.subagent_type,
-                task=request.prompt,
-                success=False,
-                error=str(exc),
-                name=request.name,
-                description=request.description,
-            )
 
     @staticmethod
     def _result_payload(result: AgentResult) -> dict[str, Any]:

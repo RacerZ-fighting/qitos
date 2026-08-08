@@ -103,11 +103,6 @@ class CronListTool(_DelegatingTool):
         super().__init__(CodingToolSet().cron_list)
 
 
-class AgentSpawnTool(_DelegatingTool):
-    def __init__(self):
-        super().__init__(CodingToolSet().agent_spawn)
-
-
 class AdvancedCodingToolSet(CodingToolSet):
     """Claude-style coding toolset on the same canonical traditional surface."""
 
@@ -135,7 +130,6 @@ class AdvancedCodingToolSet(CodingToolSet):
 
 __all__ = [
     "AdvancedCodingToolSet",
-    "AgentSpawnTool",
     "AskUserChoiceTool",
     "CronCreateTool",
     "CronDeleteTool",
