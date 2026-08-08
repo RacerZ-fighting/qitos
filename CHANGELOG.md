@@ -110,6 +110,9 @@ How to update:
 
 ### Fixed
 
+- Fixed the documented contributor pytest gate so asynchronous tests and OpenAI
+  Responses, transport retry, and reasoning tests install their required checker and
+  optional SDK dependencies instead of failing on a clean environment.
 - Fixed workspace path validation so lexical parent traversal is rejected while
   intentional workspace-owned symlinks retain their documented behavior.
 - Fixed streaming completion being flattened to a synthetic `stop`. Chat,

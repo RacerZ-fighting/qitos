@@ -143,7 +143,12 @@ This includes, as applicable:
 Default project validations:
 
 ```bash
-uv run --no-project --python 3.11 --with-editable . --with 'pytest>=7' pytest -q
+uv run --no-project --python 3.11 \
+  --with-editable . \
+  --with 'pytest>=7' \
+  --with 'pytest-asyncio>=0.23' \
+  --with 'openai>=1.66.0' \
+  pytest -q
 ```
 
 Stable-surface static checks:
