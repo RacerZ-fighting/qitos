@@ -17,8 +17,6 @@ import threading
 import time
 from typing import Any, Dict, List
 
-import pytest
-
 from qitos.core.action import Action, ActionExecutionPolicy, ActionStatus
 from qitos.core.tool import BaseTool, ToolSpec
 from qitos.core.tool_registry import ToolRegistry
@@ -162,8 +160,15 @@ def test_max_concurrency_peaks_at_limit_with_order_preserved():
 
 
 class AsyncTool(BaseTool):
-    def __init__(self, name: str = "async_tool", delay: float = 0.0) -> None:
-        super().__init__(ToolSpec(name=name, description=name))
+    def __init__(
+        self,
+        name: str = "async_tool",
+        delay: float = 0.0,
+        timeout_s: float | None = None,
+    ) -> None:
+        super().__init__(
+            ToolSpec(name=name, description=name, timeout_s=timeout_s)
+        )
         self._delay = delay
 
     async def execute(self, args: Dict[str, Any], runtime_context: Any = None) -> Any:
@@ -182,16 +187,6 @@ def test_async_handler_is_awaited(recwarn):
     ), "coroutine leaked without being awaited"
 
 
-def test_action_timeout_yields_timed_out_status():
-    rec = _Recorder()
-    tools = {"slow": TimelineTool("slow", rec, delay=0.5)}
-    result = _executor(tools).execute([Action(name="slow", timeout_s=0.01)])[0]
-
-    assert result.status == ActionStatus.TIMED_OUT
-    assert result.metadata.get("timeout_source") == "action"
-    assert result.metadata.get("timeout_s") == pytest.approx(0.01)
-
-
 def test_tool_spec_timeout_is_enforced():
     rec = _Recorder()
     tools = {"slow": TimelineTool("slow", rec, delay=0.5, timeout_s=0.01)}
@@ -201,26 +196,21 @@ def test_tool_spec_timeout_is_enforced():
     assert result.metadata.get("timeout_source") == "tool_spec"
 
 
-def test_action_timeout_overrides_tool_spec_timeout():
-    rec = _Recorder()
-    tools = {"quick": TimelineTool("quick", rec, delay=0.02, timeout_s=0.001)}
-    # Action-level timeout is generous and must win over the tight spec default.
-    result = _executor(tools).execute([Action(name="quick", timeout_s=5.0)])[0]
-
-    assert result.status == ActionStatus.SUCCESS
-
-
 def test_async_tool_timeout_is_enforced():
-    executor = _executor({"async_tool": AsyncTool(delay=0.5)})
-    result = executor.execute([Action(name="async_tool", timeout_s=0.01)])[0]
+    executor = _executor(
+        {"async_tool": AsyncTool(delay=0.5, timeout_s=0.01)}
+    )
+    result = executor.execute([Action(name="async_tool")])[0]
 
     assert result.status == ActionStatus.TIMED_OUT
 
 
 def test_timeout_does_not_claim_thread_was_killed():
     rec = _Recorder()
-    tools = {"slow": TimelineTool("slow", rec, delay=0.3)}
-    result = _executor(tools).execute([Action(name="slow", timeout_s=0.01)])[0]
+    tools = {
+        "slow": TimelineTool("slow", rec, delay=0.3, timeout_s=0.01)
+    }
+    result = _executor(tools).execute([Action(name="slow")])[0]
 
     assert result.metadata.get("worker_still_running") is True
 

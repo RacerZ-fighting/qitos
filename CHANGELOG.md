@@ -49,6 +49,10 @@ How to update:
 
 ### Changed
 
+- Tool actions now have one absolute budget covering admission, invocation retries, and
+  backoff. `ToolSpec.retry_policy` is the only tool retry owner, validation and
+  permission checks run once, HTTP transport retries are disabled, and bounded daemon
+  workers prevent blocked admission or concurrent-drain paths from owning process exit.
 - Reasoning effort now resolves through model-specific preset capabilities across sync,
   async, and streaming request defaults. GPT-5.6 accepts `max`; older OpenAI models keep
   their existing `xhigh` ceiling.
@@ -88,6 +92,9 @@ How to update:
 
 ### Fixed
 
+- Fixed action-level timeouts being resolved before approval and permission work, retry
+  attempts each receiving a fresh timeout, and parallel execution waiting indefinitely
+  for a non-daemon executor to drain.
 - Fixed forced compatible-Chat tool calls sending contradictory reasoning controls,
   official Responses requests omitting encrypted continuation fields, streamed output
   item data being overwritten by `response.completed`, and reasoning-only content being
@@ -118,6 +125,7 @@ How to update:
 - Fixed message-window trimming so native tool results whose declaring assistant call has been evicted are removed before provider dispatch, while complete tool chains and existing interrupted-call recovery remain unchanged.
 - Fixed direct `Engine(agent=...)` construction so models created with `build_model_for_preset(...)` retain their declared protocol and native API tool-schema delivery, including provider aliases such as Kimi K3 that cannot be inferred from the model name alone.
 - Fixed empty model responses with neither usable text nor tool calls being misclassified as parser `wait` decisions. The Engine now records them as `model_error`, retries once through bounded recovery, and stops with `unrecoverable_error` if the empty response repeats while preserving response diagnostics in traces.
+
 - Fixed native response text extraction so OpenAI-compatible messages with null content no longer become repr-string final answers.
 - Fixed OpenAI-compatible forced tool-call requests so conflicting thinking options are disabled, and repaired JSON/tool-call parsing for bare control characters inside string values.
 - Fixed JSON-like object extraction so apostrophes in surrounding natural-language text no longer hide valid JSON payloads.
@@ -129,6 +137,10 @@ How to update:
 
 ### Removed
 
+- Removed unused `ActionKind`, action-level timeout/retry/idempotency/classification
+  fields, integer `max_retries` tool metadata, nonfunctional functional-task retry and
+  timeout options, and the duplicate ToolInterceptor middleware (including broken cache
+  and retry interceptors). Engine hooks and runtime events remain the observation path.
 - Removed class-tool `run`/`call`/callable adapters, `ToolRegistry.call()`, automatic
   short and separator aliases, normalized-name dispatch, duck-typed executor fallbacks,
   callable approval flags, read-only concurrency inference, and the historical

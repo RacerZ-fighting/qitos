@@ -31,10 +31,14 @@ def read_file(path: str) -> str:
 |---|---|---|
 | `name` | `str \| None` | 在 `Decision.actions` 中使用的工具名。默认是函数 `__name__`。 |
 | `description` | `str \| None` | 展示给大模型的工具说明。默认回退到文档字符串。 |
-| `timeout_s` | `float \| None` | 单次调用超时时间，单位秒。`None` 表示不限时。 |
-| `max_retries` | `int` | 失败时重试次数。默认 `0`。 |
+| `timeout_s` | `float \| None` | 整个 action 的超时，包括预检、重试和实际调用。 |
+| `retry_policy` | `RetryPolicy \| None` | 显式调用重试策略；未配置时只执行一次。 |
 | `permissions` | `ToolPermission \| None` | 声明该工具需要的系统能力。 |
 | `required_ops` | `list[str] \| None` | 环境层面的低级操作能力标识。 |
+
+`ActionExecutor` 是工具重试的唯一责任方。输入校验、权限检查和审批只执行一次，
+只有通过预检的实际调用可以重试；所有 attempt 和 backoff 共享工具 timeout 与
+Engine 更早的运行 deadline。配置 `RetryPolicy` 时，底层 HTTP/SDK 重试必须关闭。
 
 ### `ToolPermission`
 

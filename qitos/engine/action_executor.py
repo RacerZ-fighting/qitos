@@ -4,20 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import random
 import threading
 import time
 from concurrent.futures import (
     FIRST_COMPLETED,
-    Future,
-    ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
     wait,
 )
-from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 from ..core.action import Action, ActionExecutionPolicy, ActionResult, ActionStatus
 from ..core.env import Env
-from ..core.interceptor import InterceptorChain, InterceptorContext
 from ..core.tool_result import ToolResult
 from ..core.tool_registry import ToolRegistry
 from ..core.tool import (
@@ -26,7 +24,9 @@ from ..core.tool import (
     ToolPermissionDecision,
     ToolValidationResult,
 )
-from .states import RuntimePhase
+from ._daemon_pool import DaemonTaskPool
+from .interrupt import EngineInterrupt
+from .states import RuntimeEvent, RuntimePhase
 
 if TYPE_CHECKING:
     from ._protocol import _EngineProtocol
@@ -59,6 +59,24 @@ class _ConcurrencyTracker:
             self._active -= 1
 
 
+class _ActionProgress:
+    """Thread-safe invocation count for a possibly detached action worker."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._attempts = 0
+
+    def begin_attempt(self) -> int:
+        with self._lock:
+            self._attempts += 1
+            return self._attempts
+
+    @property
+    def attempts(self) -> int:
+        with self._lock:
+            return self._attempts
+
+
 class ActionExecutor:
     """Executes normalized actions against a tool registry."""
 
@@ -73,7 +91,6 @@ class ActionExecutor:
         permission_pipeline: Any = None,
         read_before_write_enforcer: Any = None,
         permission_interaction_callback: Optional[Any] = None,
-        interceptor_chain: Optional[InterceptorChain] = None,
         auto_approve: bool = False,
         cancel_token: Optional[CancelToken] = None,
     ):
@@ -86,7 +103,6 @@ class ActionExecutor:
         self._pipeline = permission_pipeline
         self._rbw_enforcer = read_before_write_enforcer
         self._permission_interaction_callback = permission_interaction_callback
-        self._interceptor_chain = interceptor_chain
         self.auto_approve = auto_approve
         self._cancel_token = cancel_token
         # Populated by execute(); consumed by the trace layer.
@@ -328,7 +344,12 @@ class ActionExecutor:
         max_workers = min(max(1, self.policy.max_concurrency), len(segment))
         abort_reason: Optional[str] = None
 
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool = DaemonTaskPool(
+            max_workers=max_workers,
+            thread_name_prefix="qitos-action",
+            propagate_context=True,
+        )
+        try:
             futures: Dict[Any, int] = {}
             for idx in segment:
                 future = pool.submit(
@@ -343,11 +364,50 @@ class ActionExecutor:
 
             pending = set(futures)
             while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                remaining = self._remaining_runtime_seconds()
+                if remaining is not None and remaining <= 0:
+                    abort_reason = "runtime_deadline"
+                    for future in pending:
+                        idx = futures[future]
+                        future.cancel()
+                        results[idx] = self._deadline_result(
+                            action=actions[idx],
+                            start=time.monotonic(),
+                            attempts=0,
+                            tool_meta=self._tool_meta(actions[idx].name),
+                            segment_index=segment_index,
+                            started=False,
+                            worker_still_running=future.running(),
+                        )
+                    pending.clear()
+                    break
+                done, pending = wait(
+                    pending,
+                    timeout=(
+                        0.05 if remaining is None else min(0.05, remaining)
+                    ),
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    if self._is_cancelled():
+                        abort_reason = "cancel_token"
+                        for future in pending:
+                            idx = futures[future]
+                            future.cancel()
+                            results[idx] = self._terminal_result(
+                                actions[idx],
+                                ActionStatus.CANCELLED,
+                                abort_reason,
+                                segment_index=segment_index,
+                            )
+                        pending.clear()
+                    continue
                 for future in done:
                     idx = futures[future]
                     try:
                         results[idx] = future.result()
+                    except EngineInterrupt:
+                        raise
                     except Exception as exc:  # pragma: no cover - defensive path
                         results[idx] = self._error_result(actions[idx], str(exc))
                     item = results[idx]
@@ -376,7 +436,8 @@ class ActionExecutor:
                         else:
                             still_pending.add(future)
                     pending = still_pending
-
+        finally:
+            pool.shutdown(wait_for_workers=False, cancel_futures=True)
         return abort_reason
 
     def _terminal_result(
@@ -429,29 +490,42 @@ class ActionExecutor:
             metadata={"error_category": "concurrent_execution_error"},
         )
 
-    # ── Timeout resolution ─────────────────────────────────────────────────────
+    # ── Deadline resolution ────────────────────────────────────────────────────
 
-    def _resolve_timeout(
-        self, action: Action, tool: BaseTool
-    ) -> Tuple[Optional[float], str]:
-        """Resolve the effective timeout for an action.
+    def _resolve_action_deadline(
+        self, action: Action, started: float
+    ) -> tuple[Optional[float], str, Optional[float]]:
+        """Return one absolute deadline for admission, retries, and invocation."""
 
-        Precedence: ``Action.timeout_s`` override > ``ToolSpec.timeout_s``
-        default > no timeout. Returns ``(timeout_s, source)``.
-        """
-        timeout: Optional[float] = None
-        source = "none"
-        action_timeout = action.timeout_s
-        if action_timeout is not None and action_timeout > 0:
-            timeout = float(action_timeout)
-            source = "action"
-        elif tool.spec.timeout_s is not None and tool.spec.timeout_s > 0:
-            timeout = float(tool.spec.timeout_s)
-            source = "tool_spec"
-        remaining = self._remaining_runtime_seconds()
-        if remaining is not None and (timeout is None or remaining < timeout):
-            return remaining, "runtime_deadline"
-        return timeout, source
+        tool = self._resolve_tool(action.name)
+        tool_timeout = (
+            float(tool.spec.timeout_s)
+            if tool is not None and tool.spec.timeout_s is not None
+            else None
+        )
+        tool_deadline = started + tool_timeout if tool_timeout is not None else None
+        runtime_deadline = (
+            getattr(self._engine, "runtime_deadline_monotonic", None)
+            if self._engine is not None
+            else None
+        )
+        if runtime_deadline is not None and (
+            tool_deadline is None or runtime_deadline <= tool_deadline
+        ):
+            return (
+                float(runtime_deadline),
+                "runtime_deadline",
+                max(0.0, float(runtime_deadline) - started),
+            )
+        if tool_deadline is not None:
+            return tool_deadline, "tool_spec", tool_timeout
+        return None, "none", None
+
+    @staticmethod
+    def _remaining_action_seconds(deadline_monotonic: Optional[float]) -> Optional[float]:
+        if deadline_monotonic is None:
+            return None
+        return max(0.0, deadline_monotonic - time.monotonic())
 
     def _resolve_awaitable(self, value: Any, timeout_s: Optional[float]) -> Any:
         """Drive a coroutine/awaitable returned by a tool to completion.
@@ -489,52 +563,19 @@ class ActionExecutor:
         except asyncio.TimeoutError as exc:
             raise TimeoutError("async action timed out") from exc
 
-    def _call_tool_with_timeout(
+    def _invoke_tool(
         self,
         tool: BaseTool,
-        name: str,
         args: Dict[str, Any],
         runtime_context: Optional[Dict[str, Any]],
         timeout_s: Optional[float],
     ) -> Any:
-        """Call a tool, enforcing ``timeout_s`` and awaiting async handlers.
+        """Invoke a tool in the current daemon action worker."""
 
-        Sync handlers run on a bounded worker thread so the timeout can be
-        observed. Python cannot forcibly kill that thread, so a timeout is
-        reported as such without claiming the worker was terminated.
-        """
-        def _invoke() -> Any:
-            output = self._call_tool(tool, args, runtime_context=runtime_context)
-            if inspect.isawaitable(output):
-                output = self._resolve_awaitable(output, timeout_s)
-            return output
-
-        if timeout_s is None:
-            return _invoke()
-
-        # A ThreadPoolExecutor registers non-daemon workers for interpreter
-        # shutdown, so shutdown(wait=False) still lets timed-out tools block
-        # process exit. A dedicated daemon worker preserves honest timeout
-        # reporting without turning an uncooperative tool into a CLI hang.
-        future: Future[Any] = Future()
-
-        def _run() -> None:
-            if not future.set_running_or_notify_cancel():
-                return
-            try:
-                future.set_result(_invoke())
-            except BaseException as exc:
-                future.set_exception(exc)
-
-        threading.Thread(
-            target=_run,
-            name=f"qitos-tool-{name}",
-            daemon=True,
-        ).start()
-        try:
-            return future.result(timeout=timeout_s)
-        except FuturesTimeoutError as exc:
-            raise TimeoutError(f"action exceeded timeout of {timeout_s}s") from exc
+        output = self._call_tool(tool, args, runtime_context=runtime_context)
+        if inspect.isawaitable(output):
+            return self._resolve_awaitable(output, timeout_s)
+        return output
 
     def _execute_one(
         self,
@@ -544,12 +585,113 @@ class ActionExecutor:
         tracker: Optional[_ConcurrencyTracker] = None,
         segment_index: int = 0,
     ) -> ActionResult:
+        start = time.monotonic()
+        deadline, timeout_source, timeout_s = self._resolve_action_deadline(
+            action, start
+        )
+        progress = _ActionProgress()
         if tracker is not None:
             tracker.enter()
         try:
-            return self._execute_one_inner(
-                action, env=env, state=state, segment_index=segment_index
+            token = self._resolve_cancel_token()
+            if deadline is None and token is None:
+                return self._execute_one_inner(
+                    action,
+                    env=env,
+                    state=state,
+                    segment_index=segment_index,
+                    action_deadline_monotonic=None,
+                    timeout_source=timeout_source,
+                    timeout_s=timeout_s,
+                    progress=progress,
+                )
+
+            pool = DaemonTaskPool(
+                max_workers=1,
+                thread_name_prefix=f"qitos-tool-{action.name}",
+                propagate_context=True,
             )
+            future = pool.submit(
+                self._execute_one_inner,
+                action,
+                env,
+                state,
+                segment_index,
+                deadline,
+                timeout_source,
+                timeout_s,
+                progress,
+            )
+            try:
+                while True:
+                    if self._is_cancelled():
+                        grace = self._remaining_action_seconds(deadline)
+                        grace = 0.05 if grace is None else min(0.05, grace)
+                        if grace > 0:
+                            try:
+                                return future.result(timeout=grace)
+                            except FuturesTimeoutError:
+                                pass
+                            except EngineInterrupt:
+                                raise
+                        future.cancel()
+                        return self._finish_result(
+                            action=action,
+                            status=ActionStatus.CANCELLED,
+                            start=start,
+                            attempts=progress.attempts,
+                            tool_meta=self._tool_meta(action.name),
+                            error="action cancelled",
+                            extra_metadata={
+                                "error_category": "cancelled",
+                                "cancel_source": "cancel_token",
+                                "segment_index": segment_index,
+                                "started": progress.attempts > 0,
+                                "worker_still_running": future.running(),
+                                "ended_at": time.time(),
+                            },
+                        )
+                    remaining = self._remaining_action_seconds(deadline)
+                    if remaining is not None and remaining <= 0:
+                        future.cancel()
+                        return self._deadline_result(
+                            action=action,
+                            start=start,
+                            attempts=progress.attempts,
+                            tool_meta=self._tool_meta(action.name),
+                            segment_index=segment_index,
+                            started=progress.attempts > 0,
+                            timeout_source=timeout_source,
+                            timeout_s=timeout_s,
+                            worker_still_running=future.running(),
+                        )
+                    wait_seconds = (
+                        0.05 if remaining is None else min(0.05, remaining)
+                    )
+                    try:
+                        return future.result(timeout=wait_seconds)
+                    except FuturesTimeoutError:
+                        continue
+                    except EngineInterrupt:
+                        raise
+                    except Exception as exc:
+                        return self._finish_result(
+                            action=action,
+                            status=ActionStatus.ERROR,
+                            start=start,
+                            attempts=progress.attempts,
+                            tool_meta=self._tool_meta(action.name),
+                            error=str(exc),
+                            extra_metadata={
+                                "error_category": "action_runtime_error",
+                                "segment_index": segment_index,
+                                "started": progress.attempts > 0,
+                                "worker_still_running": False,
+                                "ended_at": time.time(),
+                            },
+                        )
+            finally:
+                pool.shutdown(wait_for_workers=False, cancel_futures=True)
         finally:
             if tracker is not None:
                 tracker.exit()
@@ -560,22 +702,29 @@ class ActionExecutor:
         env: Optional[Env] = None,
         state: Any = None,
         segment_index: int = 0,
+        action_deadline_monotonic: Optional[float] = None,
+        timeout_source: str = "none",
+        timeout_s: Optional[float] = None,
+        progress: Optional[_ActionProgress] = None,
     ) -> ActionResult:
         start = time.monotonic()
+        progress = progress or _ActionProgress()
         started_at = time.time()
         attempts = 0
         last_error = None
         tool_meta = self._tool_meta(action.name)
-        remaining = self._remaining_runtime_seconds()
-        if remaining is not None and remaining <= 0:
-            return self._deadline_result(
-                action=action,
-                start=start,
-                attempts=0,
-                tool_meta=tool_meta,
-                segment_index=segment_index,
-                started=False,
-            )
+        stop_result = self._action_stop_result(
+            action=action,
+            start=start,
+            attempts=0,
+            tool_meta=tool_meta,
+            segment_index=segment_index,
+            action_deadline_monotonic=action_deadline_monotonic,
+            timeout_source=timeout_source,
+            timeout_s=timeout_s,
+        )
+        if stop_result is not None:
+            return stop_result
         protocol_error = str(action.metadata.get("protocol_error") or "").strip()
         if protocol_error:
             error_code = protocol_error.upper()
@@ -628,7 +777,7 @@ class ActionExecutor:
                 action=action,
                 status=ActionStatus.ERROR,
                 start=start,
-                attempts=1,
+                attempts=0,
                 tool_meta=tool_meta,
                 output=card,
                 error=f"Unknown tool: {action.name}",
@@ -641,32 +790,33 @@ class ActionExecutor:
                     "executed": False,
                 },
             )
-        runtime_context = self._build_runtime_context(tool, env=env, state=state)
+        runtime_context = self._build_runtime_context(
+            tool,
+            env=env,
+            state=state,
+            deadline_monotonic=action_deadline_monotonic,
+        )
         ordering_meta: Dict[str, Any] = {
             "segment_index": segment_index,
             "started_at": started_at,
-            "started": True,
+            "started": False,
         }
+        if timeout_s is not None:
+            ordering_meta["timeout_s"] = timeout_s
+            ordering_meta["timeout_source"] = timeout_source
 
-        _retry_policy = tool.spec.retry_policy
-        _on_failure = tool.spec.on_failure
-
-        # Unified timeout: Action.timeout_s override > ToolSpec.timeout_s default
-        _timeout_s, _timeout_source = self._resolve_timeout(action, tool)
-        if _timeout_s is not None:
-            ordering_meta["timeout_s"] = _timeout_s
-            ordering_meta["timeout_source"] = _timeout_source
-
-        # 1. Interceptor before_execute — can modify action args
-        interceptor_context = InterceptorContext(
-            tool_name=action.name,
-            tool_args=dict(action.args),
-            step_id=getattr(state, "current_step", 0) if state else 0,
-            state=self._engine,
-            run_id=getattr(self._engine, "_active_run_id", "") if self._engine else "",
+        stop_result = self._action_stop_result(
+            action=action,
+            start=start,
+            attempts=0,
+            tool_meta=tool_meta,
+            segment_index=segment_index,
+            action_deadline_monotonic=action_deadline_monotonic,
+            timeout_source=timeout_source,
+            timeout_s=timeout_s,
         )
-        if self._interceptor_chain is not None:
-            action = self._interceptor_chain.before_execute(action, interceptor_context)
+        if stop_result is not None:
+            return stop_result
 
         # 2. Check needs_approval — triggers interrupt() for human approval
         _auto_approved = False
@@ -688,155 +838,259 @@ class ActionExecutor:
                         action=action,
                         status=ActionStatus.DENIED,
                         start=start,
-                        attempts=1,
+                        attempts=0,
                         tool_meta=tool_meta,
                         output={"message": "User denied approval"},
                         error="User denied approval",
                         extra_metadata={"error_category": "approval_denied"},
                     )
 
-        # Compute effective max attempts from retry_policy or fallback to max_retries
-        if _retry_policy is not None:
-            _max_attempts = _retry_policy.max_attempts
-            _backoff_factor = _retry_policy.backoff_factor
-            _max_backoff = _retry_policy.max_backoff
-            _jitter = _retry_policy.jitter
-            _retryable_exceptions = _retry_policy.retryable_exceptions
-        else:
-            _max_attempts = action.max_retries + 1  # existing behavior
-            _backoff_factor = 0
-            _max_backoff = 0
-            _jitter = False
-            _retryable_exceptions = (Exception,)
+        stop_result = self._action_stop_result(
+            action=action,
+            start=start,
+            attempts=0,
+            tool_meta=tool_meta,
+            segment_index=segment_index,
+            action_deadline_monotonic=action_deadline_monotonic,
+            timeout_source=timeout_source,
+            timeout_s=timeout_s,
+        )
+        if stop_result is not None:
+            return stop_result
 
-        while attempts < _max_attempts:
-            remaining = self._remaining_runtime_seconds()
-            if remaining is not None and remaining <= 0:
-                return self._deadline_result(
-                    action=action,
-                    start=start,
-                    attempts=attempts,
-                    tool_meta=tool_meta,
-                    segment_index=segment_index,
-                    started=attempts > 0,
-                )
-            attempts += 1
-            try:
-                validation = self._validate(tool, action.args, runtime_context)
-                if not validation.valid:
+        try:
+            permission = self._check_permissions(tool, action.args, runtime_context)
+        except EngineInterrupt:
+            raise
+        except Exception as exc:
+            return self._finish_result(
+                action=action,
+                status=ActionStatus.ERROR,
+                start=start,
+                attempts=0,
+                tool_meta=tool_meta,
+                error=str(exc),
+                extra_metadata={
+                    **ordering_meta,
+                    "error_category": "permission_error",
+                    "executed": False,
+                },
+            )
+        if permission.decision == "deny":
+            self._dispatch_tool_hook(
+                "on_permission_denied",
+                action.name,
+                action.args,
+                tool_result=None,
+                permission_decision="deny",
+            )
+            return self._finish_result(
+                action=action,
+                status=ActionStatus.DENIED,
+                start=start,
+                attempts=0,
+                tool_meta=tool_meta,
+                output={"message": permission.message, "scope": permission.scope},
+                error=permission.message or "Tool permission denied",
+                extra_metadata={
+                    **ordering_meta,
+                    "error_category": "permission_denied",
+                    "permission": self._permission_payload(permission),
+                },
+            )
+        if permission.decision == "ask":
+            if self._permission_interaction_callback is not None:
+                try:
+                    user_decision = self._permission_interaction_callback(
+                        tool_name=action.name,
+                        args=action.args,
+                        permission=permission,
+                    )
+                except EngineInterrupt:
+                    raise
+                except Exception as exc:
                     return self._finish_result(
                         action=action,
                         status=ActionStatus.ERROR,
                         start=start,
-                        attempts=attempts,
+                        attempts=0,
                         tool_meta=tool_meta,
-                        error=validation.message or "tool input validation failed",
+                        error=str(exc),
                         extra_metadata={
-                            "error_category": validation.code or "validation_error",
-                            "validation": {
-                                "valid": validation.valid,
-                                "message": validation.message,
-                                "code": validation.code,
-                                "suggested_args": validation.suggested_args,
-                            },
+                            **ordering_meta,
+                            "error_category": "permission_interaction_error",
+                            "executed": False,
                         },
                     )
-
-                # Read-before-write check for file editing tools
-                rbw_blocked = self._check_read_before_write(action)
-                if rbw_blocked is not None:
-                    return rbw_blocked
-
-                permission = self._check_permissions(tool, action.args, runtime_context)
-                if permission.decision == "deny":
+                if user_decision == "allow":
+                    permission = ToolPermissionDecision.allow(
+                        scope=permission.scope,
+                        updated_args=permission.updated_args,
+                    )
+                elif user_decision == "deny":
                     self._dispatch_tool_hook(
-                        "on_permission_denied", action.name, action.args,
-                        tool_result=None, permission_decision="deny",
+                        "on_permission_denied",
+                        action.name,
+                        action.args,
+                        tool_result=None,
+                        permission_decision="deny",
                     )
                     return self._finish_result(
                         action=action,
                         status=ActionStatus.DENIED,
                         start=start,
-                        attempts=attempts,
+                        attempts=0,
                         tool_meta=tool_meta,
                         output={
-                            "message": permission.message,
+                            "message": "User denied permission",
                             "scope": permission.scope,
                         },
-                        error=permission.message or "Tool permission denied",
+                        error="User denied permission",
                         extra_metadata={
+                            **ordering_meta,
                             "error_category": "permission_denied",
                             "permission": self._permission_payload(permission),
                         },
                     )
-                if permission.decision == "ask":
-                    # Try interactive resolution if callback is set
-                    if self._permission_interaction_callback is not None:
-                        try:
-                            user_decision = self._permission_interaction_callback(
-                                tool_name=action.name,
-                                args=action.args,
-                                permission=permission,
-                            )
-                            if user_decision == "allow":
-                                permission = ToolPermissionDecision.allow()
-                            elif user_decision == "deny":
-                                self._dispatch_tool_hook(
-                                    "on_permission_denied", action.name, action.args,
-                                    tool_result=None, permission_decision="deny",
-                                )
-                                return self._finish_result(
-                                    action=action,
-                                    status=ActionStatus.DENIED,
-                                    start=start,
-                                    attempts=attempts,
-                                    tool_meta=tool_meta,
-                                    output={
-                                        "message": "User denied permission",
-                                        "scope": permission.scope,
-                                    },
-                                    error="User denied permission",
-                                    extra_metadata={
-                                        "error_category": "permission_denied",
-                                        "permission": self._permission_payload(permission),
-                                    },
-                                )
-                            # else: fall through to SKIPPED
-                        except Exception:
-                            pass  # Callback failed, fall through to SKIPPED
-
-                    self._dispatch_tool_hook(
-                        "on_permission_denied", action.name, action.args,
-                        tool_result=None, permission_decision="ask",
-                    )
-                    return self._finish_result(
-                        action=action,
-                        status=ActionStatus.NEEDS_APPROVAL,
-                        start=start,
-                        attempts=attempts,
-                        tool_meta=tool_meta,
-                        output={
-                            "message": permission.message,
-                            "scope": permission.scope,
-                        },
-                        extra_metadata={
-                            "error_category": "permission_ask",
-                            "permission": self._permission_payload(permission),
-                        },
-                    )
-
-                effective_args = dict(permission.updated_args or action.args)
+            if permission.decision == "ask":
                 self._dispatch_tool_hook(
-                    "on_before_tool_use", action.name, effective_args,
-                    tool_result=None, permission_decision=permission.decision,
-                )
-                output = self._call_tool_with_timeout(
-                    tool,
+                    "on_permission_denied",
                     action.name,
+                    action.args,
+                    tool_result=None,
+                    permission_decision="ask",
+                )
+                return self._finish_result(
+                    action=action,
+                    status=ActionStatus.NEEDS_APPROVAL,
+                    start=start,
+                    attempts=0,
+                    tool_meta=tool_meta,
+                    output={"message": permission.message, "scope": permission.scope},
+                    extra_metadata={
+                        **ordering_meta,
+                        "error_category": "permission_ask",
+                        "permission": self._permission_payload(permission),
+                    },
+                )
+
+        effective_args = dict(
+            action.args
+            if permission.updated_args is None
+            else permission.updated_args
+        )
+        try:
+            validation = self._validate(tool, effective_args, runtime_context)
+        except EngineInterrupt:
+            raise
+        except Exception as exc:
+            return self._finish_result(
+                action=action,
+                status=ActionStatus.ERROR,
+                start=start,
+                attempts=0,
+                tool_meta=tool_meta,
+                error=str(exc),
+                extra_metadata={
+                    **ordering_meta,
+                    "error_category": "validation_error",
+                    "executed": False,
+                },
+            )
+        if not validation.valid:
+            return self._finish_result(
+                action=action,
+                status=ActionStatus.ERROR,
+                start=start,
+                attempts=0,
+                tool_meta=tool_meta,
+                error=validation.message or "tool input validation failed",
+                extra_metadata={
+                    **ordering_meta,
+                    "error_category": validation.code or "validation_error",
+                    "executed": False,
+                    "validation": {
+                        "valid": validation.valid,
+                        "message": validation.message,
+                        "code": validation.code,
+                        "suggested_args": validation.suggested_args,
+                    },
+                },
+            )
+
+        admitted_action = Action(
+            name=action.name,
+            args=effective_args,
+            action_id=action.action_id,
+            metadata=dict(action.metadata),
+        )
+        rbw_blocked = self._check_read_before_write(admitted_action)
+        if rbw_blocked is not None:
+            return rbw_blocked
+
+        stop_result = self._action_stop_result(
+            action=action,
+            start=start,
+            attempts=0,
+            tool_meta=tool_meta,
+            segment_index=segment_index,
+            action_deadline_monotonic=action_deadline_monotonic,
+            timeout_source=timeout_source,
+            timeout_s=timeout_s,
+        )
+        if stop_result is not None:
+            return stop_result
+
+        self._dispatch_tool_hook(
+            "on_before_tool_use",
+            action.name,
+            effective_args,
+            tool_result=None,
+            permission_decision=permission.decision,
+        )
+
+        retry_policy = tool.spec.retry_policy
+        max_attempts = retry_policy.max_attempts if retry_policy is not None else 1
+        retryable_exceptions = (
+            retry_policy.retryable_exceptions if retry_policy is not None else ()
+        )
+
+        while attempts < max_attempts:
+            stop_result = self._action_stop_result(
+                action=action,
+                start=start,
+                attempts=attempts,
+                tool_meta=tool_meta,
+                segment_index=segment_index,
+                action_deadline_monotonic=action_deadline_monotonic,
+                timeout_source=timeout_source,
+                timeout_s=timeout_s,
+            )
+            if stop_result is not None:
+                return stop_result
+            attempts = progress.begin_attempt()
+            ordering_meta["started"] = True
+            try:
+                output = self._invoke_tool(
+                    tool,
                     effective_args,
                     runtime_context=runtime_context,
-                    timeout_s=_timeout_s,
+                    timeout_s=self._remaining_action_seconds(
+                        action_deadline_monotonic
+                    ),
                 )
+                stop_result = self._action_stop_result(
+                    action=action,
+                    start=start,
+                    attempts=attempts,
+                    tool_meta=tool_meta,
+                    segment_index=segment_index,
+                    action_deadline_monotonic=action_deadline_monotonic,
+                    timeout_source=timeout_source,
+                    timeout_s=timeout_s,
+                )
+                if stop_result is not None:
+                    return stop_result
                 if output is None:
                     card = "\n".join(
                         [
@@ -906,14 +1160,10 @@ class ActionExecutor:
                     latency_ms=latency,
                     metadata=result_metadata,
                 )
-                # 6. Interceptor after_execute — can modify result
-                if self._interceptor_chain is not None:
-                    result = self._interceptor_chain.after_execute(action, result, interceptor_context)
                 return result
+            except EngineInterrupt:
+                raise
             except TimeoutError as exc:
-                # A timeout is a distinct terminal state, never retried: the
-                # worker thread may still be running and we must not claim
-                # otherwise.
                 timed_out_result = self._finish_result(
                     action=action,
                     status=ActionStatus.TIMED_OUT,
@@ -924,27 +1174,29 @@ class ActionExecutor:
                     extra_metadata={
                         **ordering_meta,
                         "error_category": "timeout",
-                        "worker_still_running": True,
+                        "worker_still_running": False,
                         "ended_at": time.time(),
                     },
                 )
-                if self._interceptor_chain is not None:
-                    timed_out_result = self._interceptor_chain.after_execute(
-                        action, timed_out_result, interceptor_context
-                    )
                 return timed_out_result
             except Exception as exc:  # pragma: no cover - defensive path
                 last_error = str(exc)
-                # Check if this exception type is retryable
-                if not isinstance(exc, _retryable_exceptions):
+                if not isinstance(exc, retryable_exceptions):
                     break
-                # Exponential backoff with optional jitter
-                if attempts < _max_attempts and _backoff_factor > 0:
-                    import random
-                    delay = min(_backoff_factor * (2 ** (attempts - 1)), _max_backoff)
-                    if _jitter:
+                if (
+                    retry_policy is not None
+                    and attempts < max_attempts
+                    and retry_policy.backoff_factor > 0
+                ):
+                    delay = min(
+                        retry_policy.backoff_factor * (2 ** (attempts - 1)),
+                        retry_policy.max_backoff,
+                    )
+                    if retry_policy.jitter:
                         delay = delay * (0.5 + random.random())
-                    remaining = self._remaining_runtime_seconds()
+                    remaining = self._remaining_action_seconds(
+                        action_deadline_monotonic
+                    )
                     if remaining is not None and delay >= remaining:
                         return self._deadline_result(
                             action=action,
@@ -953,10 +1205,13 @@ class ActionExecutor:
                             tool_meta=tool_meta,
                             segment_index=segment_index,
                             started=True,
+                            timeout_source=timeout_source,
+                            timeout_s=timeout_s,
                         )
-                    token = self._resolve_cancel_token()
-                    wait_for_cancel = getattr(token, "wait", None)
-                    if callable(wait_for_cancel) and wait_for_cancel(timeout=delay):
+                    if self._wait_for_retry(
+                        delay,
+                        deadline_monotonic=action_deadline_monotonic,
+                    ):
                         return self._finish_result(
                             action=action,
                             status=ActionStatus.CANCELLED,
@@ -971,17 +1226,19 @@ class ActionExecutor:
                                 "ended_at": time.time(),
                             },
                         )
-                    if not callable(wait_for_cancel):
-                        time.sleep(delay)
 
         error_category = "runtime_error"
         if last_error and "not found" in last_error.lower():
             error_category = "tool_not_found"
 
         # Call on_failure callback if registered
-        if _on_failure is not None:
+        if tool.spec.on_failure is not None:
             try:
-                _on_failure(action=action, error=last_error, attempts=attempts)
+                tool.spec.on_failure(
+                    action=action,
+                    error=last_error,
+                    attempts=attempts,
+                )
             except Exception:
                 pass  # on_failure must not raise
 
@@ -1000,10 +1257,80 @@ class ActionExecutor:
                 "ended_at": time.time(),
             },
         )
-        # Interceptor after_execute on error path too
-        if self._interceptor_chain is not None:
-            error_result = self._interceptor_chain.after_execute(action, error_result, interceptor_context)
         return error_result
+
+    def _wait_for_retry(
+        self,
+        delay: float,
+        *,
+        deadline_monotonic: Optional[float],
+    ) -> bool:
+        """Wait for retry backoff, returning true when cancellation wins."""
+
+        wake_at = time.monotonic() + max(0.0, delay)
+        while True:
+            if self._is_cancelled():
+                return True
+            now = time.monotonic()
+            if now >= wake_at:
+                return False
+            if deadline_monotonic is not None and now >= deadline_monotonic:
+                return False
+            remaining_delay = wake_at - now
+            remaining_deadline = (
+                None
+                if deadline_monotonic is None
+                else max(0.0, deadline_monotonic - now)
+            )
+            sleep_for = min(0.05, remaining_delay)
+            if remaining_deadline is not None:
+                sleep_for = min(sleep_for, remaining_deadline)
+            if sleep_for <= 0:
+                return False
+            time.sleep(sleep_for)
+
+    def _action_stop_result(
+        self,
+        *,
+        action: Action,
+        start: float,
+        attempts: int,
+        tool_meta: Dict[str, Any],
+        segment_index: int,
+        action_deadline_monotonic: Optional[float],
+        timeout_source: str,
+        timeout_s: Optional[float],
+    ) -> Optional[ActionResult]:
+        if self._is_cancelled():
+            return self._finish_result(
+                action=action,
+                status=ActionStatus.CANCELLED,
+                start=start,
+                attempts=attempts,
+                tool_meta=tool_meta,
+                error="action cancelled",
+                extra_metadata={
+                    "error_category": "cancelled",
+                    "cancel_source": "cancel_token",
+                    "segment_index": segment_index,
+                    "started": attempts > 0,
+                    "worker_still_running": False,
+                    "ended_at": time.time(),
+                },
+            )
+        remaining = self._remaining_action_seconds(action_deadline_monotonic)
+        if remaining is None or remaining > 0:
+            return None
+        return self._deadline_result(
+            action=action,
+            start=start,
+            attempts=attempts,
+            tool_meta=tool_meta,
+            segment_index=segment_index,
+            started=attempts > 0,
+            timeout_source=timeout_source,
+            timeout_s=timeout_s,
+        )
 
     def _deadline_result(
         self,
@@ -1014,21 +1341,29 @@ class ActionExecutor:
         tool_meta: Dict[str, Any],
         segment_index: int,
         started: bool,
+        timeout_source: str = "runtime_deadline",
+        timeout_s: Optional[float] = 0.0,
+        worker_still_running: bool = False,
     ) -> ActionResult:
+        label = (
+            "runtime deadline"
+            if timeout_source == "runtime_deadline"
+            else "tool deadline"
+        )
         return self._finish_result(
             action=action,
             status=ActionStatus.TIMED_OUT,
             start=start,
             attempts=attempts,
             tool_meta=tool_meta,
-            error="runtime deadline expired before tool completion",
+            error=f"{label} expired before action completion",
             extra_metadata={
                 "error_category": "timeout",
-                "timeout_source": "runtime_deadline",
-                "timeout_s": 0.0,
+                "timeout_source": timeout_source,
+                "timeout_s": timeout_s,
                 "segment_index": segment_index,
                 "started": started,
-                "worker_still_running": False,
+                "worker_still_running": worker_still_running,
                 "ended_at": time.time(),
             },
         )
@@ -1073,7 +1408,12 @@ class ActionExecutor:
         )
 
     def _build_runtime_context(
-        self, tool: BaseTool, env: Optional[Env], state: Any
+        self,
+        tool: BaseTool,
+        env: Optional[Env],
+        state: Any,
+        *,
+        deadline_monotonic: Optional[float] = None,
     ) -> Dict[str, Any]:
         required_ops = list(tool.spec.required_ops)
         environment_ops = list(tool.spec.environment_ops)
@@ -1098,11 +1438,28 @@ class ActionExecutor:
                 return False
             return bool(self._engine.post_runtime_event(event, run_id=active_run_id))
 
-        runtime_deadline = (
-            getattr(self._engine, "runtime_deadline_monotonic", None)
-            if self._engine is not None
-            else None
-        )
+        def _record_runtime_event(phase: str, payload: Dict[str, Any]) -> None:
+            if self._engine is None:
+                return
+            try:
+                runtime_phase = RuntimePhase(phase)
+            except ValueError:
+                return
+            events = getattr(self._engine, "events", None)
+            if not isinstance(events, list):
+                return
+            events.append(
+                RuntimeEvent(
+                    step_id=int(getattr(state, "current_step", 0) or 0),
+                    phase=runtime_phase,
+                    payload=dict(payload),
+                )
+            )
+
+        runtime_deadline = deadline_monotonic
+
+        def _remaining_seconds() -> Optional[float]:
+            return self._remaining_action_seconds(runtime_deadline)
 
         return {
             "env": env,
@@ -1121,8 +1478,9 @@ class ActionExecutor:
             "delegate_depth": self.delegate_depth,
             "parent_run_id": "",
             "post_runtime_event": _post_runtime_event,
+            "record_runtime_event": _record_runtime_event,
             "deadline_monotonic": runtime_deadline,
-            "remaining_seconds": self._remaining_runtime_seconds,
+            "remaining_seconds": _remaining_seconds,
             "agent_cancelled": self._is_cancelled,
             "trace_writer": self.trace_writer,
             "shared_memory": self.shared_memory,
@@ -1330,7 +1688,7 @@ class ActionExecutor:
             action=action,
             status=ActionStatus.DENIED,
             start=start,
-            attempts=1,
+            attempts=0,
             tool_meta=self._tool_meta(action.name),
             output={
                 "message": reason,

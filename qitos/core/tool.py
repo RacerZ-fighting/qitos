@@ -206,8 +206,8 @@ class RetryPolicy:
     """Per-tool retry configuration with exponential backoff and exception filtering.
 
     When attached to a tool via ``@function_tool(retry_policy=...)`` or
-    ``ToolSpec.retry_policy``, the :class:`ActionExecutor` uses this policy
-    instead of the bare ``max_retries`` integer.
+    ``ToolSpec.retry_policy``, the :class:`ActionExecutor` uses it as the sole
+    owner of invocation retries. Tools without a policy run exactly once.
 
     Attributes:
         max_attempts: Total attempts including the first call (e.g. 3 = 1 initial + 2 retries).
@@ -222,9 +222,17 @@ class RetryPolicy:
     backoff_factor: float = 0.5
     max_backoff: float = 60.0
     jitter: bool = True
-    retryable_exceptions: tuple = (Exception,)
+    retryable_exceptions: tuple[type[BaseException], ...] = (Exception,)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        if isinstance(self.max_attempts, bool) or self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        if self.backoff_factor < 0:
+            raise ValueError("backoff_factor must be non-negative")
+        if self.max_backoff < 0:
+            raise ValueError("max_backoff must be non-negative")
+        if not isinstance(self.jitter, bool):
+            raise TypeError("jitter must be a boolean")
         for exc_type in self.retryable_exceptions:
             if not (isinstance(exc_type, type) and issubclass(exc_type, BaseException)):
                 raise TypeError(
@@ -239,7 +247,6 @@ class ToolSpec:
     parameters: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     required: List[str] = field(default_factory=list)
     timeout_s: Optional[float] = None
-    max_retries: int = 0
     retry_policy: Optional[RetryPolicy] = None
     on_failure: Optional[Callable] = None
     permissions: ToolPermission = field(default_factory=ToolPermission)
@@ -258,6 +265,8 @@ class ToolSpec:
     prompt: str = ""
 
     def __post_init__(self) -> None:
+        if self.timeout_s is not None and self.timeout_s <= 0:
+            raise ValueError("timeout_s must be positive or None")
         if not isinstance(self.needs_approval, bool):
             raise TypeError("needs_approval must be a boolean")
         if self.concurrency_safe is not None and not isinstance(
@@ -272,7 +281,6 @@ class ToolMeta:
     description: Optional[str] = None
     prompt: str = ""
     timeout_s: Optional[float] = None
-    max_retries: int = 0
     retry_policy: Optional[RetryPolicy] = None
     on_failure: Optional[Callable] = None
     permissions: ToolPermission = field(default_factory=ToolPermission)
@@ -414,7 +422,6 @@ def tool(
     description: Optional[str] = None,
     prompt: str = "",
     timeout_s: Optional[float] = None,
-    max_retries: int = 0,
     retry_policy: Optional[RetryPolicy] = None,
     on_failure: Optional[Callable] = None,
     permissions: Optional[ToolPermission] = None,
@@ -439,7 +446,6 @@ def tool(
             description=description,
             prompt=prompt,
             timeout_s=timeout_s,
-            max_retries=max_retries,
             retry_policy=retry_policy,
             on_failure=on_failure,
             permissions=permissions or ToolPermission(),
@@ -589,7 +595,6 @@ def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
         parameters=params,
         required=required,
         timeout_s=meta.timeout_s,
-        max_retries=meta.max_retries,
         retry_policy=meta.retry_policy,
         on_failure=meta.on_failure,
         permissions=meta.permissions,

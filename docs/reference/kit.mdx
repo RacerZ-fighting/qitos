@@ -730,7 +730,7 @@ def __init__(
     self,
     headers: Optional[Dict[str, str]] = None,
     timeout: int = 30,
-    max_retries: int = 2,
+    retry_policy: Optional[RetryPolicy] = None,
 )
 ```
 
@@ -743,8 +743,7 @@ def __init__(
     self,
     headers: Optional[Dict[str, str]] = None,
     timeout: int = 30,
-    max_retries: int = 2,
-    backoff_factor: float = 0.4,
+    retry_policy: Optional[RetryPolicy] = None,
     user_agent: str = "QitOS-WebTool/1.0",
 )
 ```
@@ -752,6 +751,10 @@ def __init__(
 `HTTPRequest.execute(args, runtime_context)` accepts an `args` dictionary containing
 `method`, `url`, `params`, `data`, `json_data`, `headers`, `timeout`, `verify_tls`,
 `allow_redirects`, and `max_content_chars`.
+
+The requests transport disables its own retry loop. When retries are safe for the
+specific HTTP operation, pass an explicit QitOS `RetryPolicy`; otherwise the request
+runs once.
 
 </Accordion>
 

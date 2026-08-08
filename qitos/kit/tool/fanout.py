@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ...core.agent_spec import AgentSpec, AgentRegistry, ContextStrategy
 from ...core.tool import BaseTool, ToolSpec
@@ -57,7 +57,6 @@ class FanOutTool(BaseTool):
             },
             required=["tasks"],
             timeout_s=300.0,
-            max_retries=0,
             concurrency_safe=True,
             supports_background=True,
         )

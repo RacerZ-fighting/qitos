@@ -113,7 +113,7 @@ class TestNeedsApproval:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=False)
 
-        action = Action(name="approval_action", args={"command": "rm -rf /"}, kind="tool")
+        action = Action(name="approval_action", args={"command": "rm -rf /"})
         with pytest.raises(EngineInterrupt):
             executor._execute_one(action)
 
@@ -123,7 +123,7 @@ class TestNeedsApproval:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=True)
 
-        action = Action(name="approval_action", args={"command": "echo hello"}, kind="tool")
+        action = Action(name="approval_action", args={"command": "echo hello"})
         result = executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 
@@ -133,7 +133,7 @@ class TestNeedsApproval:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=False)
 
-        action = Action(name="read_and_approve", args={"path": "/etc/passwd"}, kind="tool")
+        action = Action(name="read_and_approve", args={"path": "/etc/passwd"})
         with pytest.raises(EngineInterrupt):
             executor._execute_one(action)
 
@@ -147,7 +147,7 @@ class TestReadOnly:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=False)
 
-        action = Action(name="read_only_query", args={"query": "test"}, kind="tool")
+        action = Action(name="read_only_query", args={"query": "test"})
         result = executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 
@@ -182,7 +182,7 @@ class TestReadOnly:
         assert executor._is_concurrency_safe("basic_tool") is False
 
         # No needs_approval → no interrupt
-        action = Action(name="basic_tool", args={"value": "test"}, kind="tool")
+        action = Action(name="basic_tool", args={"value": "test"})
         result = executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 

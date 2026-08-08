@@ -18,6 +18,12 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One bounded tool-action lifecycle**: one absolute deadline now covers interceptor-
+  free admission, approval, permission checks, invocation retries, and backoff.
+  `ToolSpec.retry_policy` is the sole retry owner; validation and authorization run once,
+  HTTP client retries are disabled, and daemon action workers avoid unbounded concurrent
+  executor drain. Dead Action execution knobs and the duplicate interceptor middleware
+  have been removed.
 - **One class-tool execution contract**: class tools now expose only
   `execute(args, runtime_context)`. `ToolRegistry` performs exact canonical-name lookup,
   while `ActionExecutor` alone owns validation, permissions, timeout/retry handling,

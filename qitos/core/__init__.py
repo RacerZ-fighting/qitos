@@ -5,7 +5,6 @@ from .decision import Decision
 from .action import (
     Action,
     ActionResult,
-    ActionKind,
     ActionStatus,
     ActionExecutionPolicy,
 )
@@ -74,7 +73,6 @@ __all__ = [
     "Decision",
     "Action",
     "ActionResult",
-    "ActionKind",
     "ActionStatus",
     "ActionExecutionPolicy",
     "ErrorCategory",

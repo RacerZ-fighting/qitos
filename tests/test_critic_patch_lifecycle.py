@@ -64,7 +64,7 @@ def test_handoff_method_does_not_clear_instruction_patch_inline():
     engine = Engine(agent=agent)
     engine._critic_instruction_patch = "some_patch"
     # Call the handoff check
-    action = Action(name="transfer_to_agent_b", args={"rationale": "test"}, kind="tool")
+    action = Action(name="transfer_to_agent_b", args={"rationale": "test"})
     result = engine._intercept_handoff_action(action)
     # The patch should NOT be cleared by this method (it's handled in _reset_run_state)
     assert engine._critic_instruction_patch == "some_patch"

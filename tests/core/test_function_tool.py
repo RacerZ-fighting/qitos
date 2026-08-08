@@ -3,7 +3,7 @@
 from typing import Optional
 
 from qitos.core.function_tool_decorator import function_tool
-from qitos.core.tool import FunctionTool, tool
+from qitos.core.tool import FunctionTool, RetryPolicy, tool
 from qitos.core.tool_registry import ToolRegistry
 
 
@@ -53,13 +53,15 @@ class TestFunctionToolDecorator:
 
         assert my_fn.spec.description == "Custom description"
 
-    def test_with_timeout_and_retries(self) -> None:
-        @function_tool(timeout_s=30.0, max_retries=3)
+    def test_with_timeout_and_retry_policy(self) -> None:
+        retry_policy = RetryPolicy(max_attempts=4)
+
+        @function_tool(timeout_s=30.0, retry_policy=retry_policy)
         def slow_fn(x: int) -> int:
             return x
 
         assert slow_fn.spec.timeout_s == 30.0
-        assert slow_fn.spec.max_retries == 3
+        assert slow_fn.spec.retry_policy is retry_policy
 
     def test_with_read_only_and_concurrency_safe(self) -> None:
         @function_tool(read_only=True, concurrency_safe=True)

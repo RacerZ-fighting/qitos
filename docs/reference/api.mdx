@@ -468,12 +468,7 @@ def branch(
 class Action:
     name: str
     args: Dict[str, Any] = field(default_factory=dict)
-    kind: ActionKind = ActionKind.TOOL
     action_id: Optional[str] = None
-    timeout_s: Optional[float] = None
-    max_retries: int = 0
-    idempotent: bool = True
-    classification: str = "default"
     metadata: Dict[str, Any] = field(default_factory=dict)
 ```
 
@@ -481,12 +476,7 @@ class Action:
 |-------|------|-------------|
 | `name` | `str` | Tool name to call |
 | `args` | `Dict[str, Any]` | Keyword arguments forwarded to the tool |
-| `kind` | `ActionKind` | Currently only `ActionKind.TOOL` (`"tool"`) |
 | `action_id` | `str \| None` | Optional unique identifier for the action |
-| `timeout_s` | `float \| None` | Per-action timeout override in seconds |
-| `max_retries` | `int` | Number of retries on failure |
-| `idempotent` | `bool` | Whether the action is safe to retry |
-| `classification` | `str` | User-defined label for grouping/filtering |
 | `metadata` | `Dict[str, Any]` | Arbitrary extra metadata |
 
 **`Action.from_dict(payload)`** — Construct from a plain dict.
@@ -647,7 +637,7 @@ def tool(
     name: Optional[str] = None,
     description: Optional[str] = None,
     timeout_s: Optional[float] = None,
-    max_retries: int = 0,
+    retry_policy: Optional[RetryPolicy] = None,
     permissions: Optional[ToolPermission] = None,
     required_ops: Optional[List[str]] = None,
 )
@@ -657,8 +647,8 @@ def tool(
 |-----------|------|-------------|
 | `name` | `str \| None` | Override the tool name (defaults to the function's `__name__`) |
 | `description` | `str \| None` | Override the tool description (defaults to the docstring) |
-| `timeout_s` | `float \| None` | Per-call timeout in seconds |
-| `max_retries` | `int` | Number of retries on failure |
+| `timeout_s` | `float \| None` | Whole-action timeout in seconds |
+| `retry_policy` | `RetryPolicy \| None` | Explicit invocation retry policy |
 | `permissions` | `ToolPermission \| None` | Permission flags for the tool |
 | `required_ops` | `List[str] \| None` | Runtime ops required from the environment |
 

@@ -294,6 +294,38 @@ class TestDelegateToolExecution:
             context=context,
         )
 
+    def test_execute_records_delegate_runtime_events(self):
+        spec = _make_spec()
+        registry = AgentRegistry()
+        registry.register(spec)
+        tool = registry.get_delegate_tools()[0]
+        recorded: list[tuple[str, dict[str, Any]]] = []
+
+        mock_result = MagicMock()
+        mock_result.state.final_result = "research complete"
+        mock_result.state.stop_reason = "final"
+        mock_result.step_count = 2
+
+        with patch("qitos.engine.engine.Engine") as mock_engine:
+            mock_engine.return_value.run.return_value = mock_result
+            result = tool.execute(
+                {"task": "research"},
+                runtime_context={
+                    "record_runtime_event": (
+                        lambda phase, payload: recorded.append(
+                            (phase, dict(payload))
+                        )
+                    )
+                },
+            )
+
+        assert result["status"] == "success"
+        assert [phase for phase, _ in recorded] == [
+            "DELEGATE_START",
+            "DELEGATE_END",
+        ]
+        assert recorded[-1][1]["status"] == "success"
+
 
 # ── RuntimePhase extension tests ─────────────────────────────────────────
 
@@ -322,6 +354,7 @@ class TestActionExecutorContext:
         ctx = executor._build_runtime_context(tool, env=None, state=None)
         assert "delegate_depth" in ctx
         assert "parent_run_id" in ctx
+        assert "record_runtime_event" in ctx
         assert "trace_writer" in ctx
         assert ctx["delegate_depth"] == 0
         assert ctx["parent_run_id"] == ""

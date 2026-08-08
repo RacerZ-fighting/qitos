@@ -31,7 +31,6 @@ from ..core.history import (
     HistoryPolicy,
     select_recent_history,
 )
-from ..core.interceptor import InterceptorChain, ToolInterceptor
 from ..core.memory import Memory, MemoryRecord
 from ..core.runtime_input import RuntimeInput
 from ..core.state import StateSchema
@@ -302,7 +301,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         permission_interaction_callback: Optional[Any] = None,
         loop_detector: Optional[ToolCallLoopDetector] = None,
         tracing_provider: Optional[Any] = None,
-        interceptors: Optional[List[ToolInterceptor]] = None,
         auto_approve: bool = False,
         action_execution_policy: Optional[ActionExecutionPolicy] = None,
     ):
@@ -354,17 +352,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         # Wire permission pipeline and RBW enforcer: explicit params > agent attrs
         resolved_pipeline = permission_pipeline or getattr(agent, "permission_pipeline", None)
         resolved_rbw = read_before_write_enforcer or getattr(agent, "_rbw_enforcer", None)
-
-        # Build interceptor chain from interceptors list
-        self._interceptor_chain: Optional[InterceptorChain] = None
-        all_interceptors: List[ToolInterceptor] = list(interceptors or [])
-        self._delegate_interceptor: Optional[Any] = None
-        if agent_registry is not None:
-            from .interceptors import DelegateEventInterceptor
-            self._delegate_interceptor = DelegateEventInterceptor(event_sink=None)
-            all_interceptors.append(self._delegate_interceptor)
-        if all_interceptors:
-            self._interceptor_chain = InterceptorChain(all_interceptors)
 
         self.auto_approve = auto_approve
         # Action execution policy is public API and must survive executor
@@ -466,7 +453,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         Single source of truth for executor construction so that rebuilds
         (handoff, resume) cannot silently drop the execution policy, the
-        permission pipeline, interceptors, or the cancellation token.
+        permission pipeline or the cancellation token.
         """
         if tool_registry is None:
             return None
@@ -480,7 +467,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             permission_pipeline=self._permission_pipeline,
             read_before_write_enforcer=self._rbw_enforcer,
             permission_interaction_callback=self._permission_interaction_callback,
-            interceptor_chain=self._interceptor_chain,
             auto_approve=self.auto_approve,
         )
 
@@ -898,9 +884,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         _resume_step = kwargs.pop("_resume_step", None)
 
         self._reset_run_state()
-        # Wire delegate interceptor to engine's event list
-        if self._delegate_interceptor is not None:
-            self._delegate_interceptor._event_sink = self.events
         memory = self._memory()
         if memory is not None:
             try:

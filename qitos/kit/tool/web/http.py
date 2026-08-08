@@ -9,9 +9,8 @@ from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-from qitos.core.tool import BaseTool, ToolPermission, ToolSpec
+from qitos.core.tool import BaseTool, RetryPolicy, ToolPermission, ToolSpec
 
 try:  # optional dependency, with graceful fallback
     from bs4 import BeautifulSoup
@@ -20,14 +19,13 @@ except Exception:  # pragma: no cover - optional dependency path
 
 
 class HTTPRequest(BaseTool):
-    """Generic HTTP request tool with retries, timeout, and structured output."""
+    """Generic HTTP request tool with timeout and structured output."""
 
     def __init__(
         self,
         headers: Optional[Dict[str, str]] = None,
         timeout: int = 30,
-        max_retries: int = 2,
-        backoff_factor: float = 0.4,
+        retry_policy: RetryPolicy | None = None,
         user_agent: str = "QitOS-WebTool/1.0",
     ):
         self._headers = dict(headers or {})
@@ -35,25 +33,13 @@ class HTTPRequest(BaseTool):
             self._headers["User-Agent"] = user_agent
         self._timeout = timeout
         self._session = requests.Session()
-        retry = Retry(
-            total=max_retries,
-            connect=max_retries,
-            read=max_retries,
-            status=max_retries,
-            backoff_factor=backoff_factor,
-            status_forcelist=[408, 409, 429, 500, 502, 503, 504],
-            allowed_methods=frozenset(
-                {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
-            ),
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry)
+        adapter = HTTPAdapter(max_retries=0)
         self._session.mount("http://", adapter)
         self._session.mount("https://", adapter)
         super().__init__(
             ToolSpec(
                 name="http_request",
-                description="HTTP request with retries and structured response payload",
+                description="HTTP request with bounded structured response payload",
                 parameters={
                     "method": {"type": "string"},
                     "url": {"type": "string"},
@@ -67,6 +53,8 @@ class HTTPRequest(BaseTool):
                     "max_content_chars": {"type": "integer"},
                 },
                 required=["method", "url"],
+                timeout_s=float(timeout),
+                retry_policy=retry_policy,
                 permissions=ToolPermission(network=True),
             )
         )
@@ -111,58 +99,41 @@ class HTTPRequest(BaseTool):
         if headers:
             merged_headers.update(headers)
 
-        try:
-            response = self._session.request(
-                method=method,
-                url=url,
-                params=params,
-                data=data,
-                json=json_data,
-                headers=merged_headers,
-                timeout=int(timeout or self._timeout),
-                verify=verify_tls,
-                allow_redirects=allow_redirects,
-            )
-            content = self._safe_text(response)
-            truncated = False
-            if max_content_chars > 0 and len(content) > max_content_chars:
-                content = content[:max_content_chars] + "\n... [truncated]"
-                truncated = True
-            payload: Dict[str, Any] = {
-                "status": "success" if response.status_code < 400 else "error",
-                "ok": bool(response.ok),
-                "method": method,
-                "url": response.url,
-                "status_code": response.status_code,
-                "reason": response.reason,
-                "headers": dict(response.headers),
-                "content_type": response.headers.get("Content-Type", ""),
-                "content": content,
-                "content_length": len(content),
-                "truncated": truncated,
-                "elapsed_ms": int(response.elapsed.total_seconds() * 1000),
-                "history": [h.url for h in response.history],
-            }
-            parsed_json = self._try_parse_json(response)
-            if parsed_json is not None:
-                payload["json"] = parsed_json
-            return payload
-        except requests.RequestException as e:
-            return {
-                "status": "error",
-                "message": str(e),
-                "method": method,
-                "url": url,
-                "error_type": e.__class__.__name__,
-            }
-        except Exception as e:  # pragma: no cover - defensive path
-            return {
-                "status": "error",
-                "message": str(e),
-                "method": method,
-                "url": url,
-                "error_type": e.__class__.__name__,
-            }
+        response = self._session.request(
+            method=method,
+            url=url,
+            params=params,
+            data=data,
+            json=json_data,
+            headers=merged_headers,
+            timeout=int(timeout or self._timeout),
+            verify=verify_tls,
+            allow_redirects=allow_redirects,
+        )
+        content = self._safe_text(response)
+        truncated = False
+        if max_content_chars > 0 and len(content) > max_content_chars:
+            content = content[:max_content_chars] + "\n... [truncated]"
+            truncated = True
+        payload: Dict[str, Any] = {
+            "status": "success" if response.status_code < 400 else "error",
+            "ok": bool(response.ok),
+            "method": method,
+            "url": response.url,
+            "status_code": response.status_code,
+            "reason": response.reason,
+            "headers": dict(response.headers),
+            "content_type": response.headers.get("Content-Type", ""),
+            "content": content,
+            "content_length": len(content),
+            "truncated": truncated,
+            "elapsed_ms": int(response.elapsed.total_seconds() * 1000),
+            "history": [h.url for h in response.history],
+        }
+        parsed_json = self._try_parse_json(response)
+        if parsed_json is not None:
+            payload["json"] = parsed_json
+        return payload
 
     def _validate_url(self, url: str) -> Optional[str]:
         if not url:
@@ -202,15 +173,17 @@ class HTTPGet(BaseTool):
         self,
         headers: Optional[Dict[str, str]] = None,
         timeout: int = 30,
-        max_retries: int = 2,
+        retry_policy: RetryPolicy | None = None,
     ):
         self._request = HTTPRequest(
-            headers=headers, timeout=timeout, max_retries=max_retries
+            headers=headers,
+            timeout=timeout,
+            retry_policy=retry_policy,
         )
         super().__init__(
             ToolSpec(
                 name="http_get",
-                description="HTTP GET request with retries and structured output",
+                description="HTTP GET request with bounded structured output",
                 parameters={
                     "url": {"type": "string"},
                     "params": {"type": "object"},
@@ -220,6 +193,8 @@ class HTTPGet(BaseTool):
                     "allow_redirects": {"type": "boolean"},
                 },
                 required=["url"],
+                timeout_s=float(timeout),
+                retry_policy=retry_policy,
                 permissions=ToolPermission(network=True),
             )
         )
@@ -262,15 +237,17 @@ class HTTPPost(BaseTool):
         self,
         headers: Optional[Dict[str, str]] = None,
         timeout: int = 30,
-        max_retries: int = 2,
+        retry_policy: RetryPolicy | None = None,
     ):
         self._request = HTTPRequest(
-            headers=headers, timeout=timeout, max_retries=max_retries
+            headers=headers,
+            timeout=timeout,
+            retry_policy=retry_policy,
         )
         super().__init__(
             ToolSpec(
                 name="http_post",
-                description="HTTP POST request with retries and structured output",
+                description="HTTP POST request with bounded structured output",
                 parameters={
                     "url": {"type": "string"},
                     "data": {"type": "object"},
@@ -281,6 +258,8 @@ class HTTPPost(BaseTool):
                     "allow_redirects": {"type": "boolean"},
                 },
                 required=["url"],
+                timeout_s=float(timeout),
+                retry_policy=retry_policy,
                 permissions=ToolPermission(network=True),
             )
         )

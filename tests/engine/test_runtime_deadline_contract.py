@@ -10,7 +10,13 @@ from typing import Any
 
 from qitos import AgentModule, Decision, Engine, StateSchema, ToolRegistry
 from qitos.core.action import Action, ActionResult, ActionStatus
-from qitos.core.tool import BaseTool, RetryPolicy, ToolSpec
+from qitos.core.tool import (
+    BaseTool,
+    RetryPolicy,
+    ToolPermissionDecision,
+    ToolSpec,
+    ToolValidationResult,
+)
 from qitos.engine.action_executor import ActionExecutor
 from qitos.engine.cancellation import CancelToken
 from qitos.engine.states import RuntimeBudget
@@ -137,6 +143,146 @@ def test_retry_backoff_does_not_cross_the_runtime_deadline() -> None:
     assert result.metadata["timeout_source"] == "runtime_deadline"
 
 
+class _AdmissionCountingTool(BaseTool):
+    def __init__(self) -> None:
+        super().__init__(
+            ToolSpec(
+                name="admission_once",
+                description="fail twice",
+                retry_policy=RetryPolicy(
+                    max_attempts=3,
+                    backoff_factor=0,
+                    jitter=False,
+                    retryable_exceptions=(RuntimeError,),
+                ),
+            )
+        )
+        self.validation_calls = 0
+        self.permission_calls = 0
+        self.execution_calls = 0
+
+    def validate_input(
+        self,
+        args: dict[str, Any],
+        runtime_context: dict[str, Any] | None = None,
+    ) -> ToolValidationResult:
+        _ = args, runtime_context
+        self.validation_calls += 1
+        return ToolValidationResult.ok()
+
+    def check_permissions(
+        self,
+        args: dict[str, Any],
+        runtime_context: dict[str, Any] | None = None,
+    ) -> ToolPermissionDecision:
+        _ = args, runtime_context
+        self.permission_calls += 1
+        return ToolPermissionDecision.allow()
+
+    def execute(self, args: dict[str, Any], runtime_context: Any = None) -> str:
+        _ = args, runtime_context
+        self.execution_calls += 1
+        if self.execution_calls < 3:
+            raise RuntimeError("retry")
+        return "ok"
+
+
+def test_tool_retry_repeats_only_the_admitted_invocation() -> None:
+    tool = _AdmissionCountingTool()
+    result = _execute(tool, _RuntimeEngine(time.monotonic() + 1.0))
+
+    assert result.status is ActionStatus.SUCCESS
+    assert result.attempts == 3
+    assert tool.validation_calls == 1
+    assert tool.permission_calls == 1
+    assert tool.execution_calls == 3
+
+
+class _BlockingPermissionTool(BaseTool):
+    def __init__(self, release: threading.Event) -> None:
+        super().__init__(
+            ToolSpec(
+                name="blocking_permission",
+                description="block during admission",
+                timeout_s=0.02,
+                concurrency_safe=True,
+            )
+        )
+        self.release = release
+        self.executed = False
+
+    def check_permissions(
+        self,
+        args: dict[str, Any],
+        runtime_context: dict[str, Any] | None = None,
+    ) -> ToolPermissionDecision:
+        _ = args, runtime_context
+        self.release.wait(timeout=1.0)
+        return ToolPermissionDecision.allow()
+
+    def execute(self, args: dict[str, Any], runtime_context: Any = None) -> str:
+        _ = args, runtime_context
+        self.executed = True
+        return "unexpected"
+
+
+def test_tool_timeout_bounds_permission_admission() -> None:
+    release = threading.Event()
+    tool = _BlockingPermissionTool(release)
+    started = time.monotonic()
+
+    result = ActionExecutor(ToolRegistry().register(tool)).execute(
+        [Action(name=tool.name)]
+    )[0]
+    release.set()
+
+    assert time.monotonic() - started < 0.15
+    assert result.status is ActionStatus.TIMED_OUT
+    assert result.attempts == 0
+    assert result.metadata["timeout_source"] == "tool_spec"
+    assert result.metadata["worker_still_running"] is True
+    assert tool.executed is False
+
+
+class _SharedRetryBudgetTool(BaseTool):
+    def __init__(self) -> None:
+        super().__init__(
+            ToolSpec(
+                name="shared_retry_budget",
+                description="share one deadline across retries",
+                timeout_s=0.025,
+                retry_policy=RetryPolicy(
+                    max_attempts=3,
+                    backoff_factor=0,
+                    jitter=False,
+                    retryable_exceptions=(RuntimeError,),
+                ),
+            )
+        )
+        self.calls = 0
+
+    def execute(self, args: dict[str, Any], runtime_context: Any = None) -> str:
+        _ = args, runtime_context
+        self.calls += 1
+        time.sleep(0.015)
+        raise RuntimeError("retry")
+
+
+def test_tool_retries_share_one_tool_deadline() -> None:
+    tool = _SharedRetryBudgetTool()
+    started = time.monotonic()
+
+    result = ActionExecutor(ToolRegistry().register(tool)).execute(
+        [Action(name=tool.name)]
+    )[0]
+
+    assert time.monotonic() - started < 0.1
+    assert result.status is ActionStatus.TIMED_OUT
+    assert result.metadata["timeout_source"] == "tool_spec"
+    assert 1 <= result.attempts < 3
+    assert tool.calls == result.attempts
+
+
 class _CancellationAwareTool(BaseTool):
     def __init__(self) -> None:
         super().__init__(ToolSpec(name="cancel_aware", description="cooperative cancel"))
@@ -182,7 +328,8 @@ def test_tool_runtime_context_exposes_live_deadline_and_cancellation() -> None:
     assert tool.observed_cancel is True
     assert tool.deadline_monotonic == engine.runtime_deadline_monotonic
     assert callable(tool.remaining_seconds)
-    assert result_holder[0].output == "cancelled"
+    assert result_holder[0].status is ActionStatus.CANCELLED
+    assert "action cancelled" in result_holder[0].output
 
 
 @dataclass

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import queue
 import threading
 import time
 import uuid
@@ -17,6 +16,7 @@ from ....core.agent_module import AgentModule
 from ....core.runtime_input import RuntimeInput
 from ....core.tool import BaseTool, ToolPermission, ToolSpec
 from ....core.tool_result import ToolResult
+from ....engine._daemon_pool import DaemonTaskPool
 
 DEFAULT_SUBAGENT_MAX_TURNS = 200
 
@@ -68,82 +68,6 @@ class AgentResult:
     stop_reason: str = ""
 
 
-class _DaemonTaskPool:
-    """Small bounded daemon pool for independently blocking child engines."""
-
-    _STOP = object()
-
-    def __init__(self, max_workers: int) -> None:
-        self._max_workers = max_workers
-        self._tasks: queue.Queue[Any] = queue.Queue()
-        self._threads: list[threading.Thread] = []
-        self._lock = threading.Lock()
-        self._closed = False
-
-    def submit(
-        self,
-        function: Callable[..., AgentResult],
-        *args: Any,
-        **kwargs: Any,
-    ) -> Future[AgentResult]:
-        future: Future[AgentResult] = Future()
-        with self._lock:
-            if self._closed:
-                raise RuntimeError("Agent task pool is closed")
-            self._tasks.put((future, function, args, kwargs))
-            if len(self._threads) < self._max_workers:
-                thread = threading.Thread(
-                    target=self._worker,
-                    name=(
-                        f"qitos-agent-{id(self):x}-{len(self._threads) + 1}"
-                    ),
-                    daemon=True,
-                )
-                self._threads.append(thread)
-                thread.start()
-        return future
-
-    def shutdown(self, *, wait_for_workers: bool, cancel_futures: bool) -> None:
-        with self._lock:
-            if not self._closed:
-                self._closed = True
-                if cancel_futures:
-                    while True:
-                        try:
-                            item = self._tasks.get_nowait()
-                        except queue.Empty:
-                            break
-                        try:
-                            if item is not self._STOP:
-                                item[0].cancel()
-                        finally:
-                            self._tasks.task_done()
-                for _ in self._threads:
-                    self._tasks.put(self._STOP)
-            threads = list(self._threads)
-        if wait_for_workers:
-            for thread in threads:
-                thread.join()
-
-    def _worker(self) -> None:
-        while True:
-            item = self._tasks.get()
-            try:
-                if item is self._STOP:
-                    return
-                future, function, args, kwargs = item
-                if not future.set_running_or_notify_cancel():
-                    continue
-                try:
-                    result = function(*args, **kwargs)
-                except BaseException as exc:
-                    future.set_exception(exc)
-                else:
-                    future.set_result(result)
-            finally:
-                self._tasks.task_done()
-
-
 class AgentTool(BaseTool):
     """Launch a fresh child agent for a parent-authored task.
 
@@ -190,7 +114,10 @@ class AgentTool(BaseTool):
         self._execution_mode = resolved_mode
         self._max_delegate_depth = max_delegate_depth
         self._max_turns = max_turns
-        self._executor = _DaemonTaskPool(max_workers=max_background_workers)
+        self._executor = DaemonTaskPool(
+            max_workers=max_background_workers,
+            thread_name_prefix="qitos-agent",
+        )
         self._lock = threading.RLock()
         self._closed = False
         self._background_tasks: dict[str, Future[AgentResult]] = {}
@@ -251,7 +178,6 @@ class AgentTool(BaseTool):
             description=description,
             parameters=parameters,
             required=["description", "prompt"],
-            max_retries=0,
             permissions=ToolPermission(),
             concurrency_safe=True,
             supports_background=resolved_mode != "foreground",

@@ -32,10 +32,15 @@ def read_file(path: str) -> str:
 | ------------- | --------------------------- | ---------------------------------------------------------------------------- |
 | `name`        | `str \| None`               | Tool name used in `Decision.actions`. Defaults to the function's `__name__`. |
 | `description` | `str \| None`               | Description shown to the LLM. Falls back to the function's docstring.        |
-| `timeout_s`   | `float \| None`             | Per-call timeout in seconds. `None` means no timeout.                        |
-| `max_retries` | `int`                       | How many times to retry on failure. Defaults to `0`.                         |
+| `timeout_s`   | `float \| None`             | Whole-action timeout, including admission, retries, and invocation.          |
+| `retry_policy`| `RetryPolicy \| None`       | Explicit invocation retry policy. No policy means exactly one attempt.       |
 | `permissions` | `ToolPermission \| None`    | Declares which system capabilities this tool requires.                        |
 | `required_ops`| `list[str] \| None`         | Low-level operation identifiers required from the environment.               |
+
+`ActionExecutor` is the only tool retry owner. Validation, permission checks, and
+approval run once; only the admitted invocation may repeat. All attempts and backoff
+share the tool timeout and the Engine's earlier runtime deadline. Provider or HTTP
+client retries must remain disabled when an explicit `RetryPolicy` is attached.
 
 ### `ToolPermission`
 

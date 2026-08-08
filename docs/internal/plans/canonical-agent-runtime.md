@@ -45,6 +45,8 @@ execution. Parser-only final-text compatibility remains for a later explicit-lan
   runtime context.
 - [x] Clamp tool admission, tool timeout, runtime wait, and retry backoff to remaining
   time.
+- [x] Make `ToolSpec.retry_policy` the sole tool retry owner and share one absolute
+  action deadline across admission, attempts, backoff, and concurrent drain.
 - [ ] Clamp model attempts and provider transport timeouts to remaining time.
 - [x] Preserve action status and attempts through ToolResult, history, hooks, and trace.
 - [x] Make async stream shutdown request Engine cancellation and guarantee a terminal
@@ -67,6 +69,11 @@ timeout, cancellation, denial, input/approval, partial, and background states th
 Engine records, observations, history, events, summaries, and success metrics. Legacy
 status aliases and flattened result fields were removed; domain outcomes no longer
 occupy the execution-status field in maintained built-ins.
+
+Progress (2026-08-08): action-level retry/timeout knobs and the duplicate interceptor
+middleware were removed. Admission runs once, explicit invocation retries share the
+tool/runtime deadline, HTTP transport retries stay disabled, and bounded daemon action
+workers detach blocked admission or concurrent work instead of waiting indefinitely.
 
 ### 3. Context, compression, and reasoning
 

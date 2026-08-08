@@ -173,6 +173,9 @@ If you cannot run a check, explicitly say so and explain why.
 - Function-style tools should continue to use the canonical decorator path.
 - `ToolRegistry` owns registration and exact-name lookup; `ActionExecutor` owns
   validation, permission checks, timeout handling, execution, and result normalization.
+- `ToolSpec.retry_policy` is the only tool retry control. Admission runs once; retry
+  attempts and backoff share one absolute action deadline. Do not add integer retry
+  fields, transport retry loops, retry interceptors, or action-level timeout overrides.
 - Parallel execution requires an explicit `ToolSpec.concurrency_safe=True`; read-only
   metadata and historical tool names never imply concurrency safety.
 - Env-backed operations should consume env ops rather than assuming host filesystem/process access directly.

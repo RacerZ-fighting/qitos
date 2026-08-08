@@ -7,10 +7,6 @@ from enum import Enum
 from typing import Any, Dict, FrozenSet, Optional
 
 
-class ActionKind(str, Enum):
-    TOOL = "tool"
-
-
 class ActionStatus(str, Enum):
     SUCCESS = "success"
     PARTIAL = "partial"
@@ -30,12 +26,7 @@ class Action:
 
     name: str
     args: Dict[str, Any] = field(default_factory=dict)
-    kind: ActionKind = ActionKind.TOOL
     action_id: Optional[str] = None
-    timeout_s: Optional[float] = None
-    max_retries: int = 0
-    idempotent: bool = True
-    classification: str = "default"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -43,12 +34,7 @@ class Action:
         return cls(
             name=payload.get("name", ""),
             args=payload.get("args", {}),
-            kind=ActionKind(payload.get("kind", ActionKind.TOOL.value)),
             action_id=payload.get("action_id"),
-            timeout_s=payload.get("timeout_s"),
-            max_retries=int(payload.get("max_retries", 0)),
-            idempotent=bool(payload.get("idempotent", True)),
-            classification=payload.get("classification", "default"),
             metadata=payload.get("metadata", {}),
         )
 

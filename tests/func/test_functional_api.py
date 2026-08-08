@@ -37,7 +37,7 @@ class TestTaskDecorator:
         assert add.name == "add"
 
     def test_decorator_with_kwargs(self):
-        @task(name="search", max_retries=2, timeout_s=10.0)
+        @task(name="search")
         def my_search(query: str) -> list[str]:
             return [query]
 
