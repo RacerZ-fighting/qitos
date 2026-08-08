@@ -125,7 +125,8 @@ How to update:
 - Fixed runtime deadlines being checked only at Engine step boundaries. The effective
   deadline now clamps tool admission, execution timeout, retry backoff, and runtime
   waits. Timed-out synchronous tools use daemon workers so an orphan cannot block
-  interpreter shutdown, and a saturated event queue still retains its terminal marker.
+  interpreter shutdown. Saturated event queues now report dropped deliveries, retain
+  exactly one priority `run_end` before the close marker, and terminate late subscribers.
 - Fixed native-capable agent turns so provider `tool_calls` are authoritative before
   custom text interpreters or parsers, API-delivered tools no longer receive a second
   framework text action contract, malformed native arguments produce a paired recoverable

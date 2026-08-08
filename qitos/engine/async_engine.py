@@ -145,6 +145,19 @@ class AsyncEngine(Generic[StateT, ObservationT, ActionT]):
         def _run() -> EngineResult[StateT]:
             try:
                 return self._engine.run(task, **kwargs)
+            except BaseException as exc:
+                stream.emit_sync(
+                    EngineEvent(
+                        event_type=EngineEventType.RUN_END,
+                        ok=False,
+                        payload={
+                            "stop_reason": "error",
+                            "error_type": type(exc).__name__,
+                        },
+                        error=str(exc),
+                    )
+                )
+                raise
             finally:
                 stream.close()
 

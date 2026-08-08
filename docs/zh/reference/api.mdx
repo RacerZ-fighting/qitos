@@ -295,6 +295,8 @@ class EngineEvent:
 
 ```python
 class EventStream:
+    @property
+    def dropped_event_count(self) -> int              # 有界队列丢弃数量
     def emit(self, event: EngineEvent) -> None       # 线程安全发送
     def emit_sync(self, event: EngineEvent) -> None   # 同步调用者别名
     def close(self) -> None                            # 发出流结束信号

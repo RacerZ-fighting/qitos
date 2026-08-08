@@ -187,6 +187,37 @@ class TestAsyncEngine:
         assert EngineEventType.RUN_END in types
         assert EngineEventType.STEP_START in types or EngineEventType.STEP_END in types
 
+    def test_arun_stream_emits_one_terminal_event_before_run_error(self):
+        class _BrokenAgent(DemoAgent):
+            def init_state(self, task, **kwargs):
+                _ = task, kwargs
+                raise RuntimeError("broken initialization")
+
+        engine = AsyncEngine(
+            agent=_BrokenAgent(),
+            budget=RuntimeBudget(max_steps=5),
+        )
+
+        async def _run():
+            events = []
+            with pytest.raises(RuntimeError, match="broken initialization"):
+                async for event in engine.arun_stream("test task"):
+                    events.append(event)
+            return events
+
+        loop = asyncio.new_event_loop()
+        try:
+            events = loop.run_until_complete(_run())
+        finally:
+            loop.close()
+
+        terminal = [
+            event for event in events if event.event_type is EngineEventType.RUN_END
+        ]
+        assert len(terminal) == 1
+        assert terminal[0].ok is False
+        assert terminal[0].payload["error_type"] == "RuntimeError"
+
     def test_sync_run_delegates(self):
         agent = DemoAgent(answer="sync test")
         engine = AsyncEngine(agent=agent, budget=RuntimeBudget(max_steps=5))

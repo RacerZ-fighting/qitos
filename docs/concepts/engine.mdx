@@ -265,7 +265,7 @@ async for event in async_engine.arun_stream("analyze the data"):
     print(event.event_type, event.step_id, event.payload)
 ```
 
-Events are emitted at step boundaries (`step_start`, `step_end`), phase transitions (`decide`, `act`, `reduce`, `critic`, `check_stop`), and multi-agent events (`handoff`, `delegate`, `fanout`). The stream always begins with `run_start` and ends with `run_end`.
+Events are emitted at step boundaries (`step_start`, `step_end`), phase transitions (`decide`, `act`, `reduce`, `critic`, `check_stop`), and multi-agent events (`handoff`, `delegate`, `fanout`). The stream always begins with `run_start` and ends with exactly one `run_end`. Event queues are bounded: intermediate deliveries may be dropped under sustained backpressure, `dropped_event_count` records that loss, and the `run_end` payload includes the count while retaining terminal priority.
 
 ### `EngineEvent`
 

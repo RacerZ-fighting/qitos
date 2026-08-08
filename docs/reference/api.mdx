@@ -357,6 +357,8 @@ class EngineEvent:
 
 ```python
 class EventStream:
+    @property
+    def dropped_event_count(self) -> int              # bounded delivery loss
     def emit(self, event: EngineEvent) -> None       # thread-safe emit
     def emit_sync(self, event: EngineEvent) -> None   # alias for sync callers
     def close(self) -> None                            # signal end of stream

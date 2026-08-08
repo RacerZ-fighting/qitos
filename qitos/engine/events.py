@@ -84,6 +84,9 @@ class EventStream:
         self._queue: asyncio.Queue[Optional[EngineEvent]] = asyncio.Queue(maxsize=4096)
         self._subscribers: List[asyncio.Queue[Optional[EngineEvent]]] = []
         self._closed = False
+        self._run_end_emitted = False
+        self._dropped_event_count = 0
+        self._state_lock = threading.RLock()
         self._loop: Optional[asyncio.AbstractEventLoop]
         try:
             self._loop = asyncio.get_running_loop()
@@ -105,55 +108,78 @@ class EventStream:
     def _dispatch(self, callback: Callable[[], None]) -> None:
         """Run queue mutations on the consumer loop when it is active."""
 
-        loop = self._loop
-        if loop is None or not loop.is_running():
-            callback()
-            return
-        try:
-            current_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            current_loop = None
-        if current_loop is loop:
-            callback()
-        elif not loop.is_closed():
-            loop.call_soon_threadsafe(callback)
+        with self._loop_lock:
+            loop = self._loop
+            if loop is None or loop.is_closed() or not loop.is_running():
+                callback()
+                return
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is loop:
+                callback()
+                return
+            try:
+                loop.call_soon_threadsafe(callback)
+            except RuntimeError:
+                callback()
 
     @staticmethod
     def _put_event(
         queue: asyncio.Queue[Optional[EngineEvent]],
         event: Optional[EngineEvent],
-    ) -> None:
+    ) -> bool:
         try:
             queue.put_nowait(event)
         except asyncio.QueueFull:
-            pass
+            return False
+        return True
 
-    @staticmethod
-    def _put_terminal(queue: asyncio.Queue[Optional[EngineEvent]]) -> None:
-        if queue.full():
+    def _reserve_terminal_slots(
+        self,
+        queue: asyncio.Queue[Optional[EngineEvent]],
+        count: int = 1,
+    ) -> None:
+        if queue.maxsize <= 0:
+            return
+        target_size = queue.maxsize - min(count, queue.maxsize)
+        while queue.qsize() > target_size:
             try:
                 queue.get_nowait()
             except asyncio.QueueEmpty:
-                pass
-        try:
-            queue.put_nowait(None)
-        except asyncio.QueueFull:  # pragma: no cover - defensive race guard
-            pass
+                break
+            else:
+                self._dropped_event_count += 1
 
     def _emit_now(self, event: EngineEvent) -> None:
-        if self._closed:
-            return
-        for queue in self._subscribers:
-            self._put_event(queue, event)
-        self._put_event(self._queue, event)
+        with self._state_lock:
+            if self._closed or self._run_end_emitted:
+                return
+            queues = [*self._subscribers, self._queue]
+            if event.event_type is EngineEventType.RUN_END:
+                self._run_end_emitted = True
+                for queue in queues:
+                    self._reserve_terminal_slots(queue, count=2)
+                event.payload = {
+                    **event.payload,
+                    "dropped_events": self._dropped_event_count,
+                }
+                for queue in queues:
+                    self._put_event(queue, event)
+                return
+            for queue in queues:
+                if not self._put_event(queue, event):
+                    self._dropped_event_count += 1
 
     def _close_now(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        for queue in self._subscribers:
-            self._put_terminal(queue)
-        self._put_terminal(self._queue)
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            for queue in [*self._subscribers, self._queue]:
+                self._reserve_terminal_slots(queue)
+                self._put_event(queue, None)
 
     def emit(self, event: EngineEvent) -> None:
         """Emit an event to all subscribers (thread-safe for sync callers)."""
@@ -167,6 +193,13 @@ class EventStream:
         """Signal end of stream."""
         self._dispatch(self._close_now)
 
+    @property
+    def dropped_event_count(self) -> int:
+        """Return the number of event deliveries discarded by bounded queues."""
+
+        with self._state_lock:
+            return self._dropped_event_count
+
     async def __aiter__(self) -> AsyncIterator[EngineEvent]:
         self._bind_running_loop()
         while True:
@@ -179,7 +212,11 @@ class EventStream:
         """Create a new subscriber queue for fan-out consumption."""
         self._bind_running_loop()
         q: asyncio.Queue[Optional[EngineEvent]] = asyncio.Queue(maxsize=1024)
-        self._subscribers.append(q)
+        with self._state_lock:
+            if self._closed or self._run_end_emitted:
+                q.put_nowait(None)
+            else:
+                self._subscribers.append(q)
         return q
 
 

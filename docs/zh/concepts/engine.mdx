@@ -210,7 +210,7 @@ async for event in async_engine.arun_stream("分析数据"):
     print(event.event_type, event.step_id, event.payload)
 ```
 
-事件在步骤边界（`step_start`、`step_end`）、阶段切换（`decide`、`act`、`reduce`、`critic`、`check_stop`）和多智能体事件（`handoff`、`delegate`、`fanout`）时产出。流总是以 `run_start` 开始、以 `run_end` 结束。
+事件在步骤边界（`step_start`、`step_end`）、阶段切换（`decide`、`act`、`reduce`、`critic`、`check_stop`）和多智能体事件（`handoff`、`delegate`、`fanout`）时产出。流总是以 `run_start` 开始、以唯一一个 `run_end` 结束。事件队列是有界的：持续背压时可丢弃中间事件，`dropped_event_count` 记录丢弃数量，`run_end` 的 payload 也会携带该数量并以终态优先级保留。
 
 ### `EngineEvent`
 
