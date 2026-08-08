@@ -19,6 +19,9 @@ How to update:
 
 ### Added
 
+- Added a qita same-spec comparison preflight that checks stable model, prompt, tool,
+  environment, context, budget, source, run-spec, and experiment provenance before
+  presenting outcome deltas as repeat-comparable.
 - Added absolute monotonic run deadlines and live `remaining_seconds`,
   `deadline_monotonic`, and `agent_cancelled` accessors to tool runtime context.
 - Added backend-neutral `CapabilityEnv` composition plus bounded filesystem and

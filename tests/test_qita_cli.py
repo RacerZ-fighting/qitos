@@ -49,6 +49,22 @@ def _make_run(root: Path, run_id: str) -> Path:
                         "salvage_count": 1,
                         "error_codes": {"missing_required_field": 1},
                     },
+                    "run_meta": {
+                        "budget": {
+                            "max_steps": 10,
+                            "max_runtime_seconds": 120.0,
+                            "max_tokens": 4096,
+                            "deadline_constrained": True,
+                        },
+                        "env": {"type": "host"},
+                        "context": {
+                            "context_window": 128000,
+                            "compact_ratio": 0.8,
+                            "warning_ratio": 0.75,
+                            "strict_overflow": True,
+                        },
+                        "harness": {"family_preset": "Qwen"},
+                    },
                 },
                 "schema_version": "v1",
                 "model_id": "x",
@@ -839,12 +855,51 @@ def test_build_run_diff_and_render(tmp_path: Path):
     assert diff["left"]["official_run"] is True
     assert diff["left"]["replay_mode"] == "best_effort"
     assert any(item["field"].endswith("parser_name") for item in diff["config_diff"])
+    assert diff["comparison"]["compatible"] is False
+    assert diff["comparison"]["status"] == "configuration_mismatch"
+    assert any(
+        field.endswith("parser_name")
+        for field in diff["comparison"]["mismatch_fields"]
+    )
 
     html = _render_diff_html(diff, embedded=False)
     assert "QitOS Diff" in html
     assert "Run Config Diff" in html
     assert "official_run" in html
     assert "max_steps" in html
+    assert "Outcome deltas are descriptive, not causal." in html
+
+
+def test_build_run_diff_accepts_only_complete_same_spec_runs(tmp_path: Path):
+    left = _make_run(tmp_path, "left-same")
+    right = _make_run(tmp_path, "right-same")
+
+    diff = _build_run_diff(_load_run_payload(left), _load_run_payload(right))
+
+    assert diff["comparison"] == {
+        "compatible": True,
+        "status": "same_spec",
+        "missing_fields": [],
+        "mismatch_fields": [],
+    }
+    html = _render_diff_html(diff, embedded=False)
+    assert "Same-spec comparison" in html
+    assert "external nondeterminism may remain" in html
+
+
+def test_build_run_diff_rejects_missing_provenance(tmp_path: Path):
+    left = _make_run(tmp_path, "left-missing")
+    right = _make_run(tmp_path, "right-missing")
+    manifest_path = right / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["prompt_hash"] = "unknown"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    diff = _build_run_diff(_load_run_payload(left), _load_run_payload(right))
+
+    assert diff["comparison"]["compatible"] is False
+    assert diff["comparison"]["status"] == "incomplete_provenance"
+    assert "right.prompt_hash" in diff["comparison"]["missing_fields"]
 
 
 def test_main_export(tmp_path: Path):

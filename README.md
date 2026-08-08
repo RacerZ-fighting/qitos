@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Same-spec qita comparisons**: compare views now verify recorded model, prompt,
+  tools, environment, context policy, budget, source revision, and experiment
+  provenance first. Mismatched or incomplete pairs are explicitly descriptive rather
+  than causal; matching pairs remain subject to provider and environment nondeterminism.
 - **Truthful typed model streams**: Chat, Responses, and Anthropic streams now retain
   provider finish reasons, reasoning and tool-call deltas, completed tool calls, and
   usage through one `ModelStreamChunk` contract. Incomplete streams fail instead of

@@ -298,6 +298,15 @@ class _TraceRuntime(Generic[StateT]):
             "tool_count": len(tools),
             "tools": tools,
             "env": env_info,
+            "budget": {
+                "max_steps": engine.budget.max_steps,
+                "max_runtime_seconds": engine.budget.max_runtime_seconds,
+                "max_tokens": engine.budget.max_tokens,
+                # Absolute monotonic values are process-local timestamps and
+                # therefore cannot be compared across runs.  Record only the
+                # stable fact that an external deadline constrained this run.
+                "deadline_constrained": engine.budget.deadline_monotonic is not None,
+            },
             "context": engine._context_runtime.run_meta(llm),
             "prompt": dict(getattr(engine, "_last_prompt_metadata", {}) or {}),
             "harness": harness_meta,

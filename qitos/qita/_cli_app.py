@@ -421,7 +421,7 @@ def _build_handler(root: Path):
 
                 # Resolve run directory
                 run_dir = None
-                for candidate in _discover_runs(logdir_root):
+                for candidate in _discover_runs(root):
                     if candidate.get("run_id") == run_id or Path(candidate.get("path", "")).name == run_id:
                         run_dir = Path(candidate["path"])
                         break
@@ -506,8 +506,6 @@ def _build_handler(root: Path):
 
         def _send_sse_events(self, run_dir: Path) -> None:
             """Stream run events as Server-Sent Events for real-time UI updates."""
-            import time as _time
-
             payload = _load_run_payload(run_dir)
             steps = payload.get("steps", [])
             events = payload.get("events", [])
@@ -576,7 +574,6 @@ def _build_handler(root: Path):
 
         def _send_live_sse(self, run_dir: Path) -> None:
             """Tail events.jsonl for a running run and push new lines as SSE events."""
-            import struct
             import time as _time
 
             self.send_response(200)
@@ -1925,7 +1922,8 @@ def _flatten_dict(value: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
     return out
 
 
-def _config_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _comparison_contract(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return only stable run configuration used by qita comparisons."""
     manifest = payload.get("manifest") or {}
     run_spec = manifest.get("run_spec") if isinstance(manifest.get("run_spec"), dict) else {}
     experiment_spec = (
@@ -1934,21 +1932,101 @@ def _config_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
         else {}
     )
     run_meta = ((manifest.get("summary") or {}).get("run_meta") or {})
-    snapshot = {
+    context = run_meta.get("context") if isinstance(run_meta.get("context"), dict) else {}
+    stable_context = {
+        key: context.get(key)
+        for key in (
+            "context_window",
+            "reserve_tokens",
+            "available_input_budget",
+            "hard_input_budget",
+            "soft_input_target",
+            "input_budget_source",
+            "max_output_tokens",
+            "configured_max_output_tokens",
+            "warning_ratio",
+            "compact_ratio",
+            "strict_overflow",
+        )
+    }
+    return {
         "model_id": manifest.get("model_id"),
         "model_family": manifest.get("model_family"),
         "family_preset": (((run_meta.get("harness") or {}).get("family_preset")) or ((run_spec.get("metadata") or {}).get("family_preset"))),
+        "prompt_hash": manifest.get("prompt_hash"),
         "prompt_protocol": manifest.get("prompt_protocol"),
         "parser_name": manifest.get("parser_name"),
+        "tool_versions": manifest.get("tool_versions"),
+        "tool_manifest": manifest.get("tool_manifest"),
+        "seed": manifest.get("seed"),
+        "run_config_hash": manifest.get("run_config_hash"),
+        "git_sha": manifest.get("git_sha"),
+        "package_version": manifest.get("package_version"),
         "benchmark_name": manifest.get("benchmark_name"),
         "benchmark_split": manifest.get("benchmark_split"),
-        "official_run": manifest.get("official_run"),
-        "replay_mode": manifest.get("replay_mode"),
+        "budget": run_meta.get("budget"),
+        "environment": run_meta.get("env"),
+        "context": stable_context,
+        "harness": run_meta.get("harness"),
         "run_spec": run_spec,
         "experiment_spec": experiment_spec,
-        "run_meta": run_meta,
     }
-    return _flatten_dict(snapshot)
+
+
+def _config_snapshot(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _flatten_dict(_comparison_contract(payload))
+
+
+def _missing_comparison_provenance(
+    contract: Dict[str, Any], *, side: str
+) -> List[str]:
+    missing: List[str] = []
+    for field in (
+        "model_id",
+        "prompt_hash",
+        "prompt_protocol",
+        "parser_name",
+        "run_config_hash",
+        "git_sha",
+        "package_version",
+    ):
+        value = contract.get(field)
+        if value is None or str(value).strip().lower() in {"", "unknown"}:
+            missing.append(f"{side}.{field}")
+    if not isinstance(contract.get("budget"), dict):
+        missing.append(f"{side}.budget")
+    if not isinstance(contract.get("run_spec"), dict) or not contract.get("run_spec"):
+        missing.append(f"{side}.run_spec")
+    return missing
+
+
+def _comparison_preflight(
+    left: Dict[str, Any], right: Dict[str, Any]
+) -> Dict[str, Any]:
+    left_contract = _comparison_contract(left)
+    right_contract = _comparison_contract(right)
+    missing_fields = _missing_comparison_provenance(
+        left_contract, side="left"
+    ) + _missing_comparison_provenance(right_contract, side="right")
+    left_flat = _flatten_dict(left_contract)
+    right_flat = _flatten_dict(right_contract)
+    mismatch_fields = sorted(
+        key
+        for key in set(left_flat) | set(right_flat)
+        if left_flat.get(key) != right_flat.get(key)
+    )
+    if missing_fields:
+        status = "incomplete_provenance"
+    elif mismatch_fields:
+        status = "configuration_mismatch"
+    else:
+        status = "same_spec"
+    return {
+        "compatible": status == "same_spec",
+        "status": status,
+        "missing_fields": missing_fields,
+        "mismatch_fields": mismatch_fields,
+    }
 
 
 def _step_action_label(step: Dict[str, Any]) -> str:
@@ -2050,6 +2128,7 @@ def _build_run_diff(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, An
             "parser": right_summary.get("parser", {}),
             "first_failure_step": _first_failure_step(right),
         },
+        "comparison": _comparison_preflight(left, right),
         "config_diff": config_diff,
     }
 
@@ -2407,12 +2486,36 @@ def _render_compare_prompt() -> str:
 def _render_diff_html(diff: Dict[str, Any], embedded: bool) -> str:
     left = diff.get("left") or {}
     right = diff.get("right") or {}
+    comparison = diff.get("comparison") or {}
     config_rows = "".join(
         f"<tr><td>{html.escape(str(item.get('field')))}</td><td>{html.escape(str(item.get('left')))}</td><td>{html.escape(str(item.get('right')))}</td></tr>"
         for item in (diff.get("config_diff") or [])
     )
     if not config_rows:
         config_rows = '<tr><td colspan="3">No config differences.</td></tr>'
+    if comparison.get("compatible"):
+        comparison_class = "ok"
+        comparison_title = "Same-spec comparison"
+        comparison_message = (
+            "Recorded model, prompt, tools, environment, budget, and source match. "
+            "Outcome deltas describe repeat variability; external nondeterminism may remain."
+        )
+    else:
+        comparison_class = "warn"
+        comparison_title = (
+            "Comparison provenance is incomplete"
+            if comparison.get("status") == "incomplete_provenance"
+            else "Configuration mismatch"
+        )
+        fields = list(comparison.get("missing_fields") or []) + list(
+            comparison.get("mismatch_fields") or []
+        )
+        field_text = ", ".join(str(field) for field in fields[:12])
+        if len(fields) > 12:
+            field_text += f", +{len(fields) - 12} more"
+        comparison_message = "Outcome deltas are descriptive, not causal."
+        if field_text:
+            comparison_message += f" Check: {field_text}."
 
     def metric_rows(side: Dict[str, Any]) -> str:
         failure = side.get("first_failure_step") or {}
@@ -2459,6 +2562,8 @@ def _render_diff_html(diff: Dict[str, Any], embedded: bool) -> str:
 .btn{{display:inline-block;border:1px solid var(--line);padding:7px 11px;border-radius:var(--radius-md);text-decoration:none;color:var(--txt);background:var(--surface-1);font-size:12px}}
 .btn:hover{{border-color:var(--accent)}} .btn.ghost{{background:transparent}} .grid{{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:14px}}
 .card{{background:var(--surface-1);border:1px solid var(--line);border-radius:var(--radius-lg);padding:12px}} .meta{{color:var(--muted);font-size:12px}}
+.compare-gate{{margin-top:14px;border:1px solid var(--line);border-radius:var(--radius-lg);padding:12px}}
+.compare-gate.ok{{background:var(--ok-soft);border-color:var(--ok-border)}} .compare-gate.warn{{background:var(--warn-soft);border-color:var(--warn-border)}}
 table{{width:100%;border-collapse:collapse;margin-top:10px}} td,th{{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top;font-size:12px}}
 th{{color:var(--muted);font-weight:700}} .full{{margin-top:12px}} code{{background:var(--surface-2);padding:2px 5px;border-radius:var(--radius-sm)}}
 @media (max-width:980px){{.grid{{grid-template-columns:1fr}}}}
@@ -2467,6 +2572,10 @@ th{{color:var(--muted);font-weight:700}} .full{{margin-top:12px}} code{{backgrou
   <div class="top">
     <div><div style="font-size:24px;font-weight:800">QitOS Diff</div><div class="meta">{left_id} vs {right_id}</div></div>
     <div>{buttons}</div>
+  </div>
+  <div class="compare-gate {comparison_class}">
+    <div style="font-size:16px;font-weight:700">{html.escape(comparison_title)}</div>
+    <div class="meta" style="margin-top:4px">{html.escape(comparison_message)}</div>
   </div>
   <div class="grid">
     <div class="card"><div style="font-size:18px;font-weight:700">{left_id}</div><table>{metric_rows(left)}</table></div>

@@ -146,12 +146,18 @@ for every maintained built-in tool family.
 - [ ] Make role profiles select the exact advertised tool surface.
 - [ ] Remove redundant protocol wiring and text-tool salvage after QitOS conformance is
   proven, while retaining branch-result compatibility.
-- [ ] Add a deterministic same-spec A/B harness and semantic trace-closure checks before
+- [x] Add a deterministic same-spec A/B harness and semantic trace-closure checks before
   running optional live benchmark slices.
 
 Progress (2026-08-08): qita now derives tool statistics from its canonical per-call
 action/result pairing. Exact lifecycle counts and unmatched action/result evidence make
 trace-closure gaps visible without assigning a step-level failure to unrelated calls.
+
+Progress (2026-08-09): qita compares only stable configuration fields, records the
+effective step/runtime/token budget without persisting process-local deadline values,
+and rejects mismatched or incomplete provenance before outcome deltas can be read as a
+same-spec repeat. A scripted model test executes the same traced run twice and verifies
+the comparison contract; separate tests reject parser drift and missing prompt identity.
 
 Done when PentestAgent keeps its Planner/Facts/AuthSession/Artifact/Shell boundaries,
 passes `make check`, and produces a closed QitOS transcript with no parser salvage on a
@@ -171,10 +177,6 @@ PentestAgent uses its own `make check`; it never substitutes for the commands ab
 
 ## Known baseline issues
 
-- Full QitOS test collection in its independent uv environment currently stops on
-  existing `qitos_zoo`/PentAGI import failures (`AuditAgent` and `pentagi`). The focused
-  native-runtime surface is therefore the acceptance baseline until those unrelated
-  collection failures are repaired.
 - Existing trace replay is an artifact viewer/fork helper, not deterministic Engine
-  replay. Initial conformance tests use scripted models and tools rather than claiming
-  live provider reproducibility.
+  replay. Conformance tests use scripted models and tools rather than claiming live
+  provider reproducibility.
