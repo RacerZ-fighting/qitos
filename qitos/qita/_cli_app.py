@@ -2010,6 +2010,10 @@ def _missing_comparison_provenance(
                     missing.append(
                         f"{side}.run_spec.metadata.application.{field}"
                     )
+            if application.get("dirty") is not False:
+                missing.append(
+                    f"{side}.run_spec.metadata.application.clean_source"
+                )
     return missing
 
 

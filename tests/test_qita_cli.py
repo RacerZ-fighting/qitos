@@ -897,6 +897,7 @@ def test_build_run_diff_rejects_missing_provenance(tmp_path: Path):
         "name": "pentestagent",
         "version": "0.0.0",
         "git_sha": "unknown",
+        "dirty": True,
     }
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
@@ -907,6 +908,10 @@ def test_build_run_diff_rejects_missing_provenance(tmp_path: Path):
     assert "right.prompt_hash" in diff["comparison"]["missing_fields"]
     assert (
         "right.run_spec.metadata.application.git_sha"
+        in diff["comparison"]["missing_fields"]
+    )
+    assert (
+        "right.run_spec.metadata.application.clean_source"
         in diff["comparison"]["missing_fields"]
     )
 
