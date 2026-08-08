@@ -537,6 +537,121 @@ class TestAgentTool:
         assert tool.active_background_count == 0
         assert tool.close(wait_seconds=0) == 0
 
+    def test_background_invocation_is_created_after_execution_slot_opens(self):
+        from contextlib import contextmanager
+
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        waiting = threading.Event()
+        open_slot = threading.Event()
+        factory_called = threading.Event()
+        parent_messages = ["before-launch"]
+        received_parent_history = ()
+
+        @contextmanager
+        def execution_scope(_runtime_context):
+            waiting.set()
+            assert open_slot.wait(timeout=1)
+            yield
+
+        class FakeEngine:
+            active_run_id = "child-run"
+
+            def run(self, task, **kwargs):
+                _ = kwargs
+                return SimpleNamespace(
+                    state=SimpleNamespace(final_result=task, stop_reason="final"),
+                    records=[],
+                    step_count=1,
+                    total_tokens=1,
+                )
+
+            def cancel(self, mode):
+                _ = mode
+
+        def invocation_factory(request, _runtime_context):
+            nonlocal received_parent_history
+            factory_called.set()
+            received_parent_history = _runtime_context["parent_history"]
+            return AgentInvocation(engine=FakeEngine(), task=request.prompt)
+
+        tool = AgentTool(
+            invocation_factory=invocation_factory,
+            execution_scope=execution_scope,
+            execution_mode="background",
+        )
+        launched = tool.call(
+            {"description": "queued route", "prompt": "inspect"},
+            runtime_context={
+                "delegate_depth": 0,
+                "agent": SimpleNamespace(
+                    history=SimpleNamespace(messages=parent_messages)
+                ),
+            },
+        )
+
+        assert launched["status"] == "running"
+        assert waiting.wait(timeout=1)
+        assert not factory_called.is_set()
+        parent_messages.append("after-launch")
+        open_slot.set()
+        deadline = time.monotonic() + 1
+        result = tool.get_background_result(launched["task_id"])
+        while result and result["status"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.01)
+            result = tool.get_background_result(launched["task_id"])
+
+        assert factory_called.is_set()
+        assert received_parent_history == ("before-launch",)
+        assert result is not None and result["status"] == "success"
+        assert tool.close(wait_seconds=0) == 0
+
+    def test_background_child_becomes_terminal_before_event_delivery(self):
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        delivery_started = threading.Event()
+        release_delivery = threading.Event()
+
+        class FakeEngine:
+            active_run_id = "child-run"
+
+            def run(self, task, **kwargs):
+                _ = kwargs
+                return SimpleNamespace(
+                    state=SimpleNamespace(final_result=task, stop_reason="final"),
+                    records=[],
+                    step_count=1,
+                    total_tokens=1,
+                )
+
+            def cancel(self, mode):
+                _ = mode
+
+        def post_runtime_event(_event):
+            delivery_started.set()
+            assert release_delivery.wait(timeout=1)
+
+        tool = AgentTool(
+            invocation_factory=lambda request, _context: AgentInvocation(
+                engine=FakeEngine(),
+                task=request.prompt,
+            ),
+            execution_mode="background",
+        )
+        launched = tool.call(
+            {"description": "fast route", "prompt": "inspect"},
+            runtime_context={
+                "delegate_depth": 0,
+                "post_runtime_event": post_runtime_event,
+            },
+        )
+
+        assert launched["status"] == "running"
+        assert delivery_started.wait(timeout=1)
+        assert tool.active_background_count == 0
+        release_delivery.set()
+        assert tool.close(wait_seconds=1) == 0
+
     def test_background_budget_stop_returns_partial_tool_evidence(self):
         from qitos.engine.states import StepRecord
         from qitos.kit.tool.agent import AgentInvocation, AgentTool
@@ -758,6 +873,53 @@ class TestAgentTool:
         assert tool.close(wait_seconds=1) == 0
         assert cancelled.is_set()
 
+    def test_later_close_can_wait_for_an_already_cancelled_child(self):
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        started = threading.Event()
+        cancelled = threading.Event()
+        release = threading.Event()
+
+        class FakeEngine:
+            active_run_id = "child-run"
+
+            def run(self, task, **kwargs):
+                _ = task, kwargs
+                started.set()
+                assert cancelled.wait(timeout=1)
+                assert release.wait(timeout=1)
+                return SimpleNamespace(
+                    state=SimpleNamespace(
+                        final_result="",
+                        stop_reason="cancelled_immediate",
+                    ),
+                    records=[],
+                    step_count=0,
+                    total_tokens=0,
+                )
+
+            def cancel(self, mode):
+                assert mode == "immediate"
+                cancelled.set()
+
+        tool = AgentTool(
+            invocation_factory=lambda request, _context: AgentInvocation(
+                engine=FakeEngine(),
+                task=request.prompt,
+            ),
+            execution_mode="background",
+        )
+        result = tool.call(
+            {"description": "long route", "prompt": "wait"},
+            runtime_context={"delegate_depth": 0},
+        )
+
+        assert result["status"] == "running"
+        assert started.wait(timeout=1)
+        assert tool.close(wait_seconds=0) == 1
+        release.set()
+        assert tool.close(wait_seconds=1) == 0
+
     def test_close_wakes_a_child_waiting_for_an_execution_slot(self):
         from contextlib import contextmanager
 
@@ -765,6 +927,7 @@ class TestAgentTool:
 
         waiting = threading.Event()
         child_started = threading.Event()
+        factory_called = threading.Event()
 
         @contextmanager
         def blocked_scope(runtime_context):
@@ -786,11 +949,12 @@ class TestAgentTool:
             def cancel(self, mode):
                 _ = mode
 
+        def invocation_factory(request, _context):
+            factory_called.set()
+            return AgentInvocation(engine=FakeEngine(), task=request.prompt)
+
         tool = AgentTool(
-            invocation_factory=lambda request, _context: AgentInvocation(
-                engine=FakeEngine(),
-                task=request.prompt,
-            ),
+            invocation_factory=invocation_factory,
             execution_scope=blocked_scope,
             execution_mode="background",
         )
@@ -802,6 +966,10 @@ class TestAgentTool:
         assert result["status"] == "running"
         assert waiting.wait(timeout=1)
         assert tool.close(wait_seconds=1) == 0
+        terminal = tool.get_background_result(result["task_id"])
+        assert terminal is not None
+        assert terminal["stop_reason"] == "cancelled_immediate"
+        assert not factory_called.is_set()
         assert not child_started.is_set()
 
 

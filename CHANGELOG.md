@@ -63,6 +63,10 @@ How to update:
 - Async Engine runs now use a daemon worker with cooperative cancellation, and the two
   duplicated stream cleanup paths share one lifecycle implementation. Early consumer
   close requests Engine cancellation; normal completion still propagates Engine errors.
+- Background `AgentTool` runs now snapshot parent history at launch but defer model,
+  Engine, and trace construction until an execution slot opens. A bounded daemon pool,
+  repeatable bounded close, canonical cancellation stops, and terminal-before-wakeup
+  ordering keep child teardown from extending process lifetime indefinitely.
 - Clarified the generic `AgentTool` model contract: independent multi-step tasks can be
   delegated in one response for concurrent execution, while dependent steps and cheap
   mechanical variants remain in the parent. Explicit tool guidance is no longer replaced

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait
+from concurrent.futures import CancelledError, Future, wait
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -67,6 +68,82 @@ class AgentResult:
     stop_reason: str = ""
 
 
+class _DaemonTaskPool:
+    """Small bounded daemon pool for independently blocking child engines."""
+
+    _STOP = object()
+
+    def __init__(self, max_workers: int) -> None:
+        self._max_workers = max_workers
+        self._tasks: queue.Queue[Any] = queue.Queue()
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def submit(
+        self,
+        function: Callable[..., AgentResult],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Future[AgentResult]:
+        future: Future[AgentResult] = Future()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Agent task pool is closed")
+            self._tasks.put((future, function, args, kwargs))
+            if len(self._threads) < self._max_workers:
+                thread = threading.Thread(
+                    target=self._worker,
+                    name=(
+                        f"qitos-agent-{id(self):x}-{len(self._threads) + 1}"
+                    ),
+                    daemon=True,
+                )
+                self._threads.append(thread)
+                thread.start()
+        return future
+
+    def shutdown(self, *, wait_for_workers: bool, cancel_futures: bool) -> None:
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                if cancel_futures:
+                    while True:
+                        try:
+                            item = self._tasks.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            if item is not self._STOP:
+                                item[0].cancel()
+                        finally:
+                            self._tasks.task_done()
+                for _ in self._threads:
+                    self._tasks.put(self._STOP)
+            threads = list(self._threads)
+        if wait_for_workers:
+            for thread in threads:
+                thread.join()
+
+    def _worker(self) -> None:
+        while True:
+            item = self._tasks.get()
+            try:
+                if item is self._STOP:
+                    return
+                future, function, args, kwargs = item
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    result = function(*args, **kwargs)
+                except BaseException as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
+            finally:
+                self._tasks.task_done()
+
+
 class AgentTool(BaseTool):
     """Launch a fresh child agent for a parent-authored task.
 
@@ -113,7 +190,7 @@ class AgentTool(BaseTool):
         self._execution_mode = resolved_mode
         self._max_delegate_depth = max_delegate_depth
         self._max_turns = max_turns
-        self._executor = ThreadPoolExecutor(max_workers=max_background_workers)
+        self._executor = _DaemonTaskPool(max_workers=max_background_workers)
         self._lock = threading.RLock()
         self._closed = False
         self._background_tasks: dict[str, Future[AgentResult]] = {}
@@ -194,6 +271,14 @@ class AgentTool(BaseTool):
         """Run one child synchronously, or start a configured background run."""
 
         context = dict(runtime_context or {})
+        parent_agent = context.get("agent")
+        parent_messages = getattr(
+            getattr(parent_agent, "history", None),
+            "messages",
+            None,
+        )
+        if parent_messages is not None and "parent_history" not in context:
+            context["parent_history"] = tuple(parent_messages)
         prompt = str(args.get("prompt", "")).strip()
         if not prompt:
             return {"status": "error", "error": "prompt is required"}
@@ -235,29 +320,10 @@ class AgentTool(BaseTool):
             self._execution_mode == "optional_background" and requested_background
         )
         if run_in_background:
-            with self._lock:
-                if self._closed:
-                    return {
-                        "status": "error",
-                        "error": "This Agent runtime has already closed.",
-                    }
-            prepared_invocation: AgentInvocation | None = None
-            if self._invocation_factory is not None:
-                try:
-                    prepared_invocation = self._invocation_factory(request, context)
-                except Exception as exc:
-                    return {"status": "error", "error": str(exc)}
-                if not isinstance(prepared_invocation, AgentInvocation):
-                    return {
-                        "status": "error",
-                        "error": "invocation_factory must return AgentInvocation",
-                    }
             task_id = f"agent-{uuid.uuid4().hex[:8]}"
             cancel_event = threading.Event()
             with self._lock:
                 if self._closed:
-                    if prepared_invocation is not None:
-                        prepared_invocation.engine.cancel("immediate")
                     return {
                         "status": "error",
                         "error": "This Agent runtime has already closed.",
@@ -268,7 +334,6 @@ class AgentTool(BaseTool):
                     context,
                     workspace,
                     task_id,
-                    prepared_invocation,
                     cancel_event,
                 )
                 self._background_tasks[task_id] = future
@@ -286,7 +351,7 @@ class AgentTool(BaseTool):
                         error="Child agent was cancelled.",
                         name=request.name,
                         description=request.description,
-                        stop_reason="cancelled",
+                        stop_reason="cancelled_immediate",
                     )
                 except Exception as exc:  # pragma: no cover - defensive callback
                     result = AgentResult(
@@ -296,13 +361,13 @@ class AgentTool(BaseTool):
                         error=str(exc),
                         name=request.name,
                         description=request.description,
+                        stop_reason="error",
                     )
                 with self._lock:
                     self._background_results[tid] = result
                     self._background_engines.pop(tid, None)
-                self._post_completion_event(tid, result, context)
-                with self._lock:
                     self._background_terminal.add(tid)
+                self._post_completion_event(tid, result, context)
 
             future.add_done_callback(_on_done)
             return {
@@ -319,7 +384,6 @@ class AgentTool(BaseTool):
                 context,
                 workspace,
                 task_id=None,
-                prepared_invocation=None,
                 cancel_event=None,
             )
         )
@@ -342,7 +406,6 @@ class AgentTool(BaseTool):
         runtime_context: dict[str, Any],
         workspace_root: str,
         task_id: str | None,
-        prepared_invocation: AgentInvocation | None,
         cancel_event: threading.Event | None,
     ) -> AgentResult:
         started = time.monotonic()
@@ -356,12 +419,13 @@ class AgentTool(BaseTool):
         )
         try:
             with scope:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError("Child agent was cancelled before it started")
                 if self._invocation_factory is not None:
                     result = self._run_invocation(
                         request,
                         scoped_context,
                         task_id=task_id,
-                        invocation=prepared_invocation,
                     )
                 else:
                     result = self._run_legacy_agent(request, workspace_root)
@@ -373,6 +437,13 @@ class AgentTool(BaseTool):
                 error=str(exc),
                 name=request.name,
                 description=request.description,
+                stop_reason=(
+                    "cancelled_immediate"
+                    if cancel_event is not None and cancel_event.is_set()
+                    else "budget_time"
+                    if isinstance(exc, TimeoutError)
+                    else "error"
+                ),
             )
         result.elapsed_seconds = max(0.0, time.monotonic() - started)
         return result
@@ -383,13 +454,11 @@ class AgentTool(BaseTool):
         runtime_context: dict[str, Any],
         *,
         task_id: str | None,
-        invocation: AgentInvocation | None,
     ) -> AgentResult:
-        if invocation is None:
-            factory = self._invocation_factory
-            if factory is None:  # pragma: no cover - guarded by _run_request
-                raise RuntimeError("run-scoped invocation factory is unavailable")
-            invocation = factory(request, runtime_context)
+        factory = self._invocation_factory
+        if factory is None:  # pragma: no cover - guarded by _run_request
+            raise RuntimeError("run-scoped invocation factory is unavailable")
+        invocation = factory(request, runtime_context)
         if not isinstance(invocation, AgentInvocation):
             raise TypeError("invocation_factory must return AgentInvocation")
         if task_id is not None:
@@ -578,11 +647,6 @@ class AgentTool(BaseTool):
         if wait_seconds < 0:
             raise ValueError("wait_seconds must be non-negative")
         with self._lock:
-            if self._closed:
-                return sum(
-                    task_id not in self._background_terminal
-                    for task_id in self._background_tasks
-                )
             self._closed = True
             futures = list(self._background_tasks.values())
             engines = list(self._background_engines.values())
@@ -594,7 +658,10 @@ class AgentTool(BaseTool):
             for future in futures:
                 future.cancel()
         _, pending = wait(futures, timeout=wait_seconds) if futures else (set(), set())
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(
+            wait_for_workers=False,
+            cancel_futures=True,
+        )
         return len(pending)
 
     @staticmethod

@@ -682,9 +682,11 @@ The result reports output, steps, total tokens, elapsed time, stop reason, and r
 The optional mode exposes `run_in_background` to the model. The background mode omits
 that argument, always returns a running receipt with a task id, and posts an
 `agent.child.completed` `RuntimeInput` to the exact parent Engine run when the child
-terminates. Invocation factories run before the background submission so parent context
-is frozen at launch. If a child has no final answer, the completion payload contains a
-bounded projection of its recent tool evidence instead of silently dropping useful work.
+terminates. `AgentTool` snapshots the parent history at launch, but does not call the
+invocation factory until `execution_scope` admits the task. Queued work therefore retains
+its launch context without allocating a model, Engine, or trace before it can run. If a
+child has no final answer, the completion payload contains a bounded projection of its
+recent tool evidence instead of silently dropping useful work.
 
 `active_background_count`, `get_background_result(task_id)`, `cancel_background(task_id)`,
 `snapshot_background_events()`, and `close()` expose lifecycle control to the owning
@@ -692,8 +694,12 @@ application. A snapshot projects only the active children's bounded, completed t
 results into `agent.child.snapshot` runtime events; it does not expose model responses or
 reasoning. This lets an owner preserve evidence immediately before a forced conclusion.
 `close()` cooperatively cancels outstanding child Engines; applications with run-scoped
-resources should call it before those resources leave scope. An `execution_scope` that
-waits for an application slot should also observe the
+resources should call it before those resources leave scope. It returns the number of
+tasks still winding down after the requested bounded wait, and a later call can wait
+again after an earlier non-blocking cancellation request. Background children use a
+bounded daemon worker pool, so an uncooperative synchronous child cannot keep interpreter
+shutdown alive indefinitely. Terminal result state is stored before QitOS attempts to
+wake the parent. An `execution_scope` that waits for an application slot should observe the
 `runtime_context["agent_cancelled"]` callback so teardown can wake a child that has not
 entered its Engine yet.
 
