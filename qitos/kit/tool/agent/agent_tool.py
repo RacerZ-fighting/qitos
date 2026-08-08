@@ -124,7 +124,6 @@ class AgentTool(BaseTool):
         self._background_results: dict[str, AgentResult] = {}
         self._background_engines: dict[str, Any] = {}
         self._background_requests: dict[str, AgentRequest] = {}
-        self._background_terminal: set[str] = set()
         self._background_cancel: dict[str, threading.Event] = {}
 
         parameters: dict[str, dict[str, Any]] = {
@@ -291,8 +290,10 @@ class AgentTool(BaseTool):
                     )
                 with self._lock:
                     self._background_results[tid] = result
+                    self._background_tasks.pop(tid, None)
                     self._background_engines.pop(tid, None)
-                    self._background_terminal.add(tid)
+                    self._background_requests.pop(tid, None)
+                    self._background_cancel.pop(tid, None)
                 self._post_completion_event(tid, result, context)
 
             future.add_done_callback(_on_done)
@@ -494,9 +495,8 @@ class AgentTool(BaseTool):
         with self._lock:
             result = self._background_results.get(task_id)
             future = self._background_tasks.get(task_id)
-            terminal = task_id in self._background_terminal
         if result is None:
-            if future is not None and not terminal:
+            if future is not None:
                 return {"status": "running", "task_id": task_id}
             return None
         return self._result_payload(result)
@@ -506,10 +506,7 @@ class AgentTool(BaseTool):
         """Return the number of submitted children that have not reached terminal state."""
 
         with self._lock:
-            return sum(
-                task_id not in self._background_terminal
-                for task_id in self._background_tasks
-            )
+            return len(self._background_tasks)
 
     def snapshot_background_events(self) -> list[RuntimeInput]:
         """Project active child tool evidence into bounded runtime events.
@@ -523,8 +520,7 @@ class AgentTool(BaseTool):
             active = [
                 (task_id, self._background_requests[task_id], engine)
                 for task_id, engine in self._background_engines.items()
-                if task_id not in self._background_terminal
-                and not self._background_tasks[task_id].done()
+                if not self._background_tasks[task_id].done()
             ]
 
         events: list[RuntimeInput] = []

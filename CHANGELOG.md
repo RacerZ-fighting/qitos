@@ -81,7 +81,9 @@ How to update:
 - Background `AgentTool` runs now snapshot parent history at launch but defer model,
   Engine, and trace construction until an execution slot opens. A bounded daemon pool,
   repeatable bounded close, canonical cancellation stops, and terminal-before-wakeup
-  ordering keep child teardown from extending process lifetime indefinitely.
+  ordering keep child teardown from extending process lifetime indefinitely. Terminal
+  children retain their queryable result while active task, request, Engine, and
+  cancellation records are reaped immediately.
 - Clarified the generic `AgentTool` model contract: independent multi-step tasks can be
   delegated in one response for concurrent execution, while dependent steps and cheap
   mechanical variants remain in the parent. Explicit tool guidance is no longer replaced

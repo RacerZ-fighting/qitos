@@ -563,6 +563,9 @@ class TestAgentTool:
         assert launched["status"] == "running"
         assert delivery_started.wait(timeout=1)
         assert tool.active_background_count == 0
+        terminal = tool.get_background_result(launched["task_id"])
+        assert terminal is not None and terminal["status"] == "success"
+        assert tool.cancel_background(launched["task_id"]) is False
         release_delivery.set()
         assert tool.close(wait_seconds=1) == 0
 
@@ -885,6 +888,49 @@ class TestAgentTool:
         assert terminal["stop_reason"] == "cancelled_immediate"
         assert not factory_called.is_set()
         assert not child_started.is_set()
+
+    def test_background_child_deadline_expires_before_execution_slot_opens(self):
+        from contextlib import contextmanager
+
+        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+        factory_called = threading.Event()
+
+        @contextmanager
+        def expired_scope(_runtime_context):
+            raise TimeoutError("deadline expired before child slot opened")
+            yield  # pragma: no cover
+
+        def invocation_factory(request, _context):
+            factory_called.set()
+            return AgentInvocation(engine=object(), task=request.prompt)
+
+        tool = AgentTool(
+            invocation_factory=invocation_factory,
+            execution_scope=expired_scope,
+            execution_mode="background",
+        )
+        launched = tool.execute(
+            {"description": "queued route", "prompt": "wait"},
+            runtime_context={"delegate_depth": 0},
+        )
+
+        deadline = time.monotonic() + 1
+        terminal = tool.get_background_result(launched["task_id"])
+        while (
+            terminal is not None
+            and terminal["status"] == "running"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+            terminal = tool.get_background_result(launched["task_id"])
+
+        assert terminal is not None
+        assert terminal["status"] == "error"
+        assert terminal["stop_reason"] == "budget_time"
+        assert not factory_called.is_set()
+        assert tool.active_background_count == 0
+        assert tool.close(wait_seconds=0) == 0
 
 
 # ── Sub-agents import ─────────────────────────────────────────────────────────
