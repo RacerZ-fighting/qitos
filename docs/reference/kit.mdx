@@ -312,8 +312,8 @@ dispatch. Summary work runs against an immutable history snapshot and is committ
 as a projection when the version still matches; canonical history remains untouched.
 Exact-prefix checkpoints let later projections summarize only newly covered complete
 rounds. With auto-compaction enabled, token selection precedes generic message-count
-windows. `keep_last_messages` is deprecated and accepted only as a no-op compatibility
-argument; use `keep_last_rounds`.
+windows. Use `keep_last_rounds` for transaction-safe recent retention; compact history
+does not expose arbitrary message slicing that could split provider tool transactions.
 
 </Tab>
 

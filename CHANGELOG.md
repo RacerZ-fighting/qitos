@@ -78,11 +78,9 @@ How to update:
   (microcompact, recent-round summary, and all-but-latest-round resummary), applies
   summaries only to immutable projections, reuses exact-prefix summary checkpoints,
   and bounds repeated summary failures with a three-attempt circuit. Overflow recovery
-  uses `.70/.50/.35` history budgets without mutating canonical history. The unsafe
-  `keep_last_messages` slicing option is deprecated;
-  it remains accepted as a compatibility-only no-op while callers migrate to complete
-  round retention. Responses text/tool payloads and generic/native mirrors now keep one
-  complete, accurately counted call/result transaction.
+  uses `.70/.50/.35` history budgets without mutating canonical history. Responses
+  text/tool payloads and generic/native mirrors now keep one complete, accurately
+  counted call/result transaction.
 - Async Engine runs now use a daemon worker with cooperative cancellation, and the two
   duplicated stream cleanup paths share one lifecycle implementation. Early consumer
   close requests Engine cancellation; normal completion still propagates Engine errors.
@@ -191,6 +189,9 @@ How to update:
 - Removed duplicate uppercase, `*_v2`, and historical editor/search built-in tools.
   Coding profiles now expose only the lowercase canonical names such as `read_file`,
   `edit_file`, `glob`, `grep`, `run_command`, and `web_fetch`.
+- Removed the compatibility-only compact-history message-slicing option. Recent history
+  retention is configured only through complete rounds; explicit count eviction remains
+  available through `hard_window`.
 
 ### Breaking
 
@@ -201,6 +202,9 @@ How to update:
   host-side behavior of `@function_tool`; agent execution never uses that shortcut.
 - `CodingToolSet` no longer accepts `expose_legacy_aliases` or
   `expose_modern_names`. Callers must use the canonical lowercase tool names.
+- `CompactConfig` and `CompactHistory` no longer accept the obsolete message-count
+  retention keyword. Callers must configure transaction-safe retention with
+  `keep_last_rounds`.
 
 ## v0.6.0 (2026-05-28)
 

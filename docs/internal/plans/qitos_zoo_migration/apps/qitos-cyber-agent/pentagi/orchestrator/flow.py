@@ -286,7 +286,6 @@ class PentAGIFlow:
             config = CompactConfig(
                 max_tokens=16000,
                 keep_last_rounds=2,
-                keep_last_messages=8,
                 auto_compact=True,
                 compact_long_messages_over_chars=900,
                 summary_max_chars=2000,

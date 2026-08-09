@@ -89,13 +89,6 @@ def test_compact_history_does_not_count_evict_canonical_messages_by_default() ->
     assert history.evict() == 0
 
 
-def test_keep_last_messages_is_a_deprecated_compatibility_option() -> None:
-    with pytest.deprecated_call(match="keep_last_messages"):
-        history = CompactHistory(keep_last_messages=4)
-
-    assert history.config.keep_last_messages == 4
-
-
 def test_recent_history_never_splits_generic_tool_transaction() -> None:
     messages = [
         HistoryMessage(

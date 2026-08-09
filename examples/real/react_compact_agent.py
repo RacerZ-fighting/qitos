@@ -61,7 +61,6 @@ class CompactReactAgent(AgentModule[CompactReactState, dict[str, Any], Action]):
                 llm=llm,
                 max_tokens=2200,
                 keep_last_rounds=2,
-                keep_last_messages=6,
                 hard_window=48,
             ),
         )

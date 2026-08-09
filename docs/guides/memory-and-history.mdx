@@ -141,9 +141,9 @@ summary from an earlier attempt.
 When auto-compaction is enabled, `CompactHistory` intentionally sees the complete
 filtered canonical history before applying a token budget; a generic `max_items`
 window cannot discard old turns before they reach the summarizer. Setting
-`auto_compact=False` restores count-window selection. The old
-`keep_last_messages` argument remains temporarily accepted for compatibility but no
-longer slices messages; use `keep_last_rounds` for transaction-safe retention.
+`auto_compact=False` restores count-window selection. Configure transaction-safe recent
+retention with `keep_last_rounds`; arbitrary message slicing is not part of the compact
+history API because it can split provider tool transactions.
 
 Typical setup:
 

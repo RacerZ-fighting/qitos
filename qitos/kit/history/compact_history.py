@@ -6,7 +6,6 @@ import hashlib
 import json
 import math
 import re
-import warnings
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterable, List, Optional
@@ -26,9 +25,6 @@ class CompactConfig:
 
     max_tokens: int = 16000
     keep_last_rounds: int = 2
-    # Compatibility-only: arbitrary message slicing is no longer used because
-    # it can split provider tool transactions. New callers should omit it.
-    keep_last_messages: Optional[int] = None
     # Canonical history is token-controlled by default. Count-based eviction
     # remains an explicit opt-in for applications that accept permanent loss.
     hard_window: int = 0
@@ -46,15 +42,6 @@ class CompactConfig:
     summary_input_message_limit: int = 64
     summary_metadata_source: str = "compact_history"
     emit_skipped_events: bool = True
-
-    def __post_init__(self) -> None:
-        if self.keep_last_messages is not None:
-            warnings.warn(
-                "keep_last_messages is deprecated; compaction now preserves "
-                "complete rounds",
-                DeprecationWarning,
-                stacklevel=2,
-            )
 
 
 @dataclass(frozen=True)
@@ -818,7 +805,6 @@ class CompactHistory(History):
         config: CompactConfig | None = None,
         max_tokens: Optional[int] = None,
         keep_last_rounds: Optional[int] = None,
-        keep_last_messages: Optional[int] = None,
         hard_window: Optional[int] = None,
         auto_compact: Optional[bool] = None,
     ):
@@ -827,14 +813,6 @@ class CompactHistory(History):
             cfg.max_tokens = int(max_tokens)
         if keep_last_rounds is not None:
             cfg.keep_last_rounds = int(keep_last_rounds)
-        if keep_last_messages is not None:
-            warnings.warn(
-                "keep_last_messages is deprecated; compaction now preserves "
-                "complete rounds",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            cfg.keep_last_messages = int(keep_last_messages)
         if hard_window is not None:
             cfg.hard_window = int(hard_window)
         if auto_compact is not None:

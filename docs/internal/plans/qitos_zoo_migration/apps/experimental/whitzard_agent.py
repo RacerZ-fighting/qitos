@@ -277,7 +277,6 @@ class WhitzardAgent(AgentModule[WhitzardState, dict[str, Any], dict[str, Any]]):
             llm=llm,
             max_tokens=14000,
             keep_last_rounds=3,
-            keep_last_messages=10,
             hard_window=72,
         )
         self.audit_memory = memory or AuditBoardMemory()

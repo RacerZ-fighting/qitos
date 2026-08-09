@@ -94,7 +94,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Transaction-safe context compaction**: complete provider inputs, including native
   tool schemas, now force compaction at 80% of the provider-safe input budget. Three
   bounded levels preserve complete tool exchanges, and failed or raced summaries never
-  mutate canonical history.
+  mutate canonical history. The obsolete message-slicing compatibility option is gone;
+  recent retention is expressed only in complete rounds.
 - **Modern CyberGym tool turns**: authoritative per-step runtime state is now folded into the final real tool result instead of creating a trailing user turn, preserving native `assistant -> tool` chains for compatible providers.
 - **qita trajectory workbench**: Run pages now open in a diagnosis-first view with a Focus Navigator, Agent Behavior Story, and right-side Inspector. Each step follows `Input -> Thought -> Action Calls -> Environment Observation`; every action is paired with its complete parameters, status, latency, and model-visible result, while canonical raw and unmatched evidence stays auditable in the Inspector. Failed calls expand by default, successful calls fold, and long content is wrapped and never available only as a truncated preview. CyberGym budget stops and `submit_poc` verification failures are promoted as review targets. Persistent light/dark themes cover board, run, replay, and compare pages.
 - **Consistent immediate cancellation traces**: once the Engine observes an immediate cancellation, State, task/result objects, END events, and trace manifests now agree on `cancelled_immediate`; qita sees the manifest as `stopped` rather than a normal completion.
