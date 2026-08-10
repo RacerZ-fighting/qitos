@@ -730,6 +730,70 @@ def test_native_tool_chain_preserves_complete_call_and_result_pair():
     }
 
 
+def test_native_tool_chain_preserves_reused_ids_across_forked_rounds() -> None:
+    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
+    first_call = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "shell_1", "type": "function", "function": {"name": "shell"}}
+        ],
+    }
+    first_result = {
+        "role": "tool",
+        "content": "parent",
+        "tool_call_id": "shell_1",
+    }
+    second_call = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "shell_1", "type": "function", "function": {"name": "shell"}}
+        ],
+    }
+    second_result = {
+        "role": "tool",
+        "content": "child",
+        "tool_call_id": "shell_1",
+    }
+    messages = [first_call, first_result, second_call, second_result]
+
+    projected = engine._model_runtime._ensure_chain_consistency(messages)
+
+    assert projected == messages
+    assert engine._model_runtime._tool_transaction_parity(projected) == {
+        "offered_call_count": 2,
+        "result_count": 2,
+        "missing_result_ids": [],
+        "orphan_result_ids": [],
+        "valid": True,
+    }
+
+
+def test_tool_transaction_parity_counts_reused_ids() -> None:
+    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
+    repeated_call = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {"id": "shell_1", "type": "function", "function": {"name": "shell"}}
+        ],
+    }
+    messages = [
+        repeated_call,
+        {"role": "tool", "content": "parent", "tool_call_id": "shell_1"},
+        repeated_call,
+    ]
+
+    assert engine._model_runtime._tool_transaction_parity(messages) == {
+        "offered_call_count": 2,
+        "result_count": 1,
+        "missing_result_ids": ["shell_1"],
+        "orphan_result_ids": [],
+        "valid": False,
+    }
+
+
 def test_native_only_tool_chain_preserves_complete_call_and_result_pair() -> None:
     engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
     messages = [

@@ -18,7 +18,11 @@ from qitos import (
     tool,
 )
 from qitos.engine import RuntimeBudget
-from qitos.core.history import HistoryMessage, select_recent_history
+from qitos.core.history import (
+    HistoryMessage,
+    HistorySnapshot,
+    select_recent_history,
+)
 from qitos.kit.history import CompactHistory, MessageGrouper
 from qitos.kit.parser import ReActTextParser
 
@@ -227,6 +231,57 @@ def test_recent_history_merges_native_output_with_declaring_call() -> None:
     ]
 
     assert select_recent_history(messages, max_items=1) == messages
+
+
+def test_reused_tool_call_id_keeps_parent_and_child_rounds_independent() -> None:
+    parent_call = HistoryMessage(
+        role="assistant",
+        content=None,
+        step_id=0,
+        tool_calls=[{"id": "shell_1", "function": {"name": "shell"}}],
+    )
+    parent_result = HistoryMessage(
+        role="tool", content="parent", step_id=0, tool_call_id="shell_1"
+    )
+    child_call = HistoryMessage(
+        role="assistant",
+        content=None,
+        step_id=0,
+        tool_calls=[{"id": "shell_1", "function": {"name": "shell"}}],
+    )
+    child_result = HistoryMessage(
+        role="tool", content="child", step_id=0, tool_call_id="shell_1"
+    )
+
+    selected = select_recent_history(
+        [parent_call, parent_result, child_call, child_result], max_items=1
+    )
+
+    assert selected == [child_call, child_result]
+
+
+def test_snapshot_stops_before_second_unanswered_use_of_same_call_id() -> None:
+    parent_call = HistoryMessage(
+        role="assistant",
+        content=None,
+        step_id=0,
+        tool_calls=[{"id": "shell_1", "function": {"name": "shell"}}],
+    )
+    parent_result = HistoryMessage(
+        role="tool", content="parent", step_id=0, tool_call_id="shell_1"
+    )
+    child_call = HistoryMessage(
+        role="assistant",
+        content=None,
+        step_id=0,
+        tool_calls=[{"id": "shell_1", "function": {"name": "shell"}}],
+    )
+
+    snapshot = HistorySnapshot.from_messages(
+        [parent_call, parent_result, child_call]
+    )
+
+    assert snapshot.messages == (parent_call, parent_result)
 
 
 def test_compact_estimate_deduplicates_generic_native_mirrors() -> None:

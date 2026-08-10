@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+from collections import Counter
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from typing import Any, Dict, Generic, List, Optional, TypeVar, cast
@@ -2888,8 +2889,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             for message in messages
             for result_id in message_tool_result_ids(message)
         ]
-        missing = sorted(set(offered) - set(results))
-        orphaned = sorted(set(results) - set(offered))
+        offered_counts = Counter(offered)
+        result_counts = Counter(results)
+        missing = sorted((offered_counts - result_counts).elements())
+        orphaned = sorted((result_counts - offered_counts).elements())
         return {
             "offered_call_count": len(offered),
             "result_count": len(results),
@@ -3060,7 +3063,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
 
         projected: List[Dict[str, Any]] = []
         used_result_indices: set[int] = set()
-        satisfied_result_ids: set[str] = set()
+        satisfied_result_counts: Counter[str] = Counter()
         for index, msg in enumerate(messages):
             if index in result_ids_by_index:
                 continue
@@ -3068,7 +3071,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             if msg.get("role") != "assistant":
                 continue
             for normalized_id in message_tool_call_ids(msg):
-                if normalized_id in satisfied_result_ids:
+                if satisfied_result_counts[normalized_id] > 0:
+                    satisfied_result_counts[normalized_id] -= 1
                     continue
                 available = [
                     result_index
@@ -3078,9 +3082,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 if available:
                     result_index = available[0]
                     used_result_indices.add(result_index)
-                    satisfied_result_ids.update(
-                        result_ids_by_index[result_index]
-                    )
+                    satisfied_result_counts.update(result_ids_by_index[result_index])
+                    satisfied_result_counts[normalized_id] -= 1
                     projected.append(messages[result_index])
                     continue
                 projected.append(

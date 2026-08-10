@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -95,16 +96,16 @@ def complete_history_prefix(
 ) -> List[HistoryMessage]:
     """Return the largest prefix with no dangling model tool calls."""
     items = list(messages)
-    result_ids = {
+    remaining_results = Counter(
         result_id
         for message in items
         for result_id in message_tool_result_ids(message)
-    }
+    )
     for index, message in enumerate(items):
-        if any(
-            call_id not in result_ids for call_id in message_tool_call_ids(message)
-        ):
-            return items[:index]
+        for call_id in message_tool_call_ids(message):
+            if remaining_results[call_id] <= 0:
+                return items[:index]
+            remaining_results[call_id] -= 1
     return items
 
 
@@ -209,20 +210,23 @@ def group_history_rounds(
         if current:
             groups.append(current)
 
-    call_groups: Dict[str, int] = {}
+    call_groups: dict[str, deque[int]] = defaultdict(deque)
     for group_index, group in enumerate(groups):
         for message in group:
             if message.role != "assistant":
                 continue
             for call_id in message_tool_call_ids(message):
-                call_groups.setdefault(call_id, group_index)
+                call_groups[call_id].append(group_index)
 
     unsafe_boundaries: set[int] = set()
     for result_group, group in enumerate(groups):
         for message in group:
             for result_id in message_tool_result_ids(message):
-                call_group = call_groups.get(result_id)
-                if call_group is None or call_group >= result_group:
+                matching_groups = call_groups.get(result_id)
+                if not matching_groups or matching_groups[0] > result_group:
+                    continue
+                call_group = matching_groups.popleft()
+                if call_group == result_group:
                     continue
                 unsafe_boundaries.update(range(call_group + 1, result_group + 1))
 
