@@ -29,6 +29,7 @@ from ..core.history import (
     History,
     HistoryMessage,
     HistoryPolicy,
+    HistorySnapshot,
     select_recent_history,
 )
 from ..core.memory import Memory, MemoryRecord
@@ -585,7 +586,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     # Public step-by-step API for interactive REPLs and external drivers
     # ------------------------------------------------------------------
 
-    def init_session(self, task: str, **kwargs: Any) -> tuple[StateT, ObservationT]:
+    def init_session(
+        self,
+        task: str,
+        *,
+        history_snapshot: HistorySnapshot | None = None,
+        **kwargs: Any,
+    ) -> tuple[StateT, ObservationT]:
         """Initialize a new session for step-by-step execution.
 
         Sets up Engine run state, creates initial state and observation.
@@ -598,10 +605,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 memory.reset()
             except Exception as exc:
                 _logger.debug("Failed to reset memory: %s", exc)
-        try:
-            self._history().reset()
-        except Exception as exc:
-            _logger.debug("Failed to reset history: %s", exc)
+        self._reset_history(history_snapshot)
         if hasattr(self.recovery_policy, "reset"):
             try:
                 self.recovery_policy.reset()
@@ -878,7 +882,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         """Return the configured TracingProvider, if any."""
         return self._tracing_provider
 
-    def run(self, task: str | Task, **kwargs: Any) -> EngineResult[StateT]:
+    def run(
+        self,
+        task: str | Task,
+        *,
+        history_snapshot: HistorySnapshot | None = None,
+        **kwargs: Any,
+    ) -> EngineResult[StateT]:
         # Check for resume-from-checkpoint internal kwargs
         _resume_state = kwargs.pop("_resume_state", None)
         _resume_step = kwargs.pop("_resume_step", None)
@@ -890,10 +900,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 memory.reset()
             except Exception as exc:
                 _logger.debug("Failed to reset memory: %s", exc)
-        try:
-            self._history().reset()
-        except Exception as exc:
-            _logger.debug("Failed to reset history: %s", exc)
+        self._reset_history(history_snapshot)
         if hasattr(self.recovery_policy, "reset"):
             try:
                 self.recovery_policy.reset()
@@ -2076,6 +2083,24 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             except Exception as exc:
                 _logger.debug("Failed to append context telemetry to history: %s", exc)
         return self._runtime_history
+
+    def _reset_history(self, snapshot: HistorySnapshot | None) -> None:
+        history = self._history()
+        try:
+            history.reset()
+        except Exception:
+            if snapshot is not None:
+                raise
+            _logger.debug("Failed to reset history", exc_info=True)
+            return
+        if snapshot is None:
+            return
+        try:
+            history.restore(snapshot)
+        except NotImplementedError as exc:
+            raise TypeError(
+                f"{type(history).__name__} cannot restore a history snapshot"
+            ) from exc
 
     def _history_append(
         self,

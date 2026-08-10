@@ -24,7 +24,7 @@ from .state import (
 from .memory import Memory, MemoryRecord
 from .model_response import ModelResponse
 from .runtime_input import RuntimeInput
-from .history import History, HistoryMessage, HistoryPolicy
+from .history import History, HistoryMessage, HistoryPolicy, HistorySnapshot
 from .observation import Observation
 from .env import (
     Env,
@@ -91,6 +91,7 @@ __all__ = [
     "History",
     "HistoryMessage",
     "HistoryPolicy",
+    "HistorySnapshot",
     "Observation",
     "RunSpec",
     "ExperimentSpec",

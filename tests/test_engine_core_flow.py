@@ -15,7 +15,7 @@ from qitos import (
 from qitos.core.history import History, HistoryMessage
 from qitos.kit.memory import WindowMemory
 from qitos.kit.env import ScreenshotEnv
-from qitos.kit.history import WindowHistory
+from qitos.kit.history import CompactHistory, WindowHistory
 from qitos.kit.parser import ReActTextParser
 from qitos.core.memory import Memory, MemoryRecord
 from qitos.engine import RuntimeBudget
@@ -396,6 +396,46 @@ def test_engine_uses_history_messages_for_next_llm_call():
     assert len(calls[1]) >= 4
     assert calls[1][1]["role"] == "user"
     assert calls[1][2]["role"] == "assistant"
+
+
+def test_engine_can_start_from_a_history_snapshot() -> None:
+    calls: list[list[dict[str, Any]]] = []
+
+    class _Model:
+        def __call__(self, messages: list[dict[str, Any]]) -> str:
+            calls.append(list(messages))
+            return "Final Answer: continued"
+
+    class _Agent(DemoAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.llm = _Model()
+            self.model_parser = ReActTextParser()
+            self.history = CompactHistory(auto_compact=False)
+
+        def decide(self, state: DemoState, observation: dict[str, Any]):
+            _ = state, observation
+            return None
+
+    parent = CompactHistory(auto_compact=False)
+    inherited_user = HistoryMessage(
+        role="user", content={"source": "parent", "sequence": 1}, step_id=0
+    )
+    inherited_assistant = HistoryMessage(
+        role="assistant", content={"source": "parent", "sequence": 2}, step_id=0
+    )
+    parent.append(inherited_user)
+    parent.append(inherited_assistant)
+
+    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=1)).run(
+        "continue", history_snapshot=parent.snapshot()
+    )
+
+    assert result.state.final_result == "continued"
+    assert any(
+        message.get("content") == inherited_assistant.content for message in calls[0]
+    )
+    assert parent.messages == [inherited_user, inherited_assistant]
 
 
 def test_engine_emits_parser_events_and_records_step_diagnostics():

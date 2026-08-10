@@ -1,6 +1,6 @@
 """Concrete history implementations."""
 
-from qitos.core.history import History, HistoryMessage
+from qitos.core.history import History, HistoryMessage, HistorySnapshot
 
 from .compact_history import (
     CompactConfig,
@@ -19,6 +19,7 @@ def window_history(window_size: int = 24) -> WindowHistory:
 __all__ = [
     "History",
     "HistoryMessage",
+    "HistorySnapshot",
     "WindowHistory",
     "TokenBudgetSummaryHistory",
     "CompactConfig",

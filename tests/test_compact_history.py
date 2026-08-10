@@ -89,6 +89,55 @@ def test_compact_history_does_not_count_evict_canonical_messages_by_default() ->
     assert history.evict() == 0
 
 
+def test_history_snapshot_stops_before_an_inflight_tool_transaction() -> None:
+    history = CompactHistory(auto_compact=False)
+    completed = HistoryMessage(role="user", content="known", step_id=0)
+    history.append(completed)
+    history.append(
+        HistoryMessage(
+            role="assistant",
+            content="",
+            step_id=1,
+            tool_calls=[
+                {"id": "call_a", "function": {"name": "a", "arguments": "{}"}},
+                {"id": "call_b", "function": {"name": "b", "arguments": "{}"}},
+            ],
+        )
+    )
+    history.append(
+        HistoryMessage(
+            role="tool",
+            content="a done",
+            step_id=1,
+            tool_call_id="call_a",
+        )
+    )
+
+    snapshot = history.snapshot()
+
+    assert snapshot.messages == (completed,)
+
+
+def test_forked_histories_append_independently() -> None:
+    parent = CompactHistory(auto_compact=False)
+    shared = HistoryMessage(role="user", content="shared", step_id=0)
+    parent_only = HistoryMessage(role="assistant", content="parent", step_id=1)
+    first_only = HistoryMessage(role="assistant", content="first", step_id=1)
+    second_only = HistoryMessage(role="assistant", content="second", step_id=1)
+    parent.append(shared)
+    snapshot = parent.snapshot()
+    first = parent.fork(snapshot)
+    second = parent.fork(snapshot)
+
+    parent.append(parent_only)
+    first.append(first_only)
+    second.append(second_only)
+
+    assert parent.messages == [shared, parent_only]
+    assert first.messages == [shared, first_only]
+    assert second.messages == [shared, second_only]
+
+
 def test_recent_history_never_splits_generic_tool_transaction() -> None:
     messages = [
         HistoryMessage(

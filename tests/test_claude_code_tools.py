@@ -423,8 +423,10 @@ class TestAgentTool:
         waiting = threading.Event()
         open_slot = threading.Event()
         factory_called = threading.Event()
-        parent_messages = ["before-launch"]
+        before_launch = object()
+        parent_messages = [before_launch]
         received_parent_history = ()
+        received_parent_snapshot = ()
 
         @contextmanager
         def execution_scope(_runtime_context):
@@ -448,9 +450,10 @@ class TestAgentTool:
                 _ = mode
 
         def invocation_factory(request, _runtime_context):
-            nonlocal received_parent_history
+            nonlocal received_parent_history, received_parent_snapshot
             factory_called.set()
             received_parent_history = _runtime_context["parent_history"]
+            received_parent_snapshot = _runtime_context["parent_history_snapshot"]
             return AgentInvocation(engine=FakeEngine(), task=request.prompt)
 
         tool = AgentTool(
@@ -459,11 +462,18 @@ class TestAgentTool:
             execution_mode="background",
         )
         launched = tool.execute(
-            {"description": "queued route", "prompt": "inspect"},
+            {
+                "description": "queued route",
+                "prompt": "inspect",
+                "subagent_type": "fork",
+            },
             runtime_context={
                 "delegate_depth": 0,
                 "agent": SimpleNamespace(
-                    history=SimpleNamespace(messages=parent_messages)
+                    history=SimpleNamespace(
+                        messages=parent_messages,
+                        snapshot=lambda: tuple(parent_messages),
+                    )
                 ),
             },
         )
@@ -471,7 +481,7 @@ class TestAgentTool:
         assert launched["status"] == "running"
         assert waiting.wait(timeout=1)
         assert not factory_called.is_set()
-        parent_messages.append("after-launch")
+        parent_messages.append(object())
         open_slot.set()
         deadline = time.monotonic() + 1
         result = tool.get_background_result(launched["task_id"])
@@ -480,7 +490,8 @@ class TestAgentTool:
             result = tool.get_background_result(launched["task_id"])
 
         assert factory_called.is_set()
-        assert received_parent_history == ("before-launch",)
+        assert received_parent_history == (before_launch,)
+        assert received_parent_snapshot == (before_launch,)
         assert result is not None and result["status"] == "success"
         assert tool.close(wait_seconds=0) == 0
 

@@ -177,13 +177,18 @@ class AgentTool(BaseTool):
 
         context = dict(runtime_context or {})
         parent_agent = context.get("agent")
-        parent_messages = getattr(
-            getattr(parent_agent, "history", None),
-            "messages",
-            None,
-        )
+        parent_history = getattr(parent_agent, "history", None)
+        parent_messages = getattr(parent_history, "messages", None)
         if parent_messages is not None and "parent_history" not in context:
             context["parent_history"] = tuple(parent_messages)
+        subagent_type = (
+            str(args.get("subagent_type", "general-purpose")).strip()
+            or "general-purpose"
+        )
+        if subagent_type == "fork" and "parent_history_snapshot" not in context:
+            snapshot = getattr(parent_history, "snapshot", None)
+            if callable(snapshot):
+                context["parent_history_snapshot"] = snapshot()
         prompt = str(args.get("prompt", "")).strip()
         if not prompt:
             return {"status": "error", "error": "prompt is required"}
@@ -205,10 +210,7 @@ class AgentTool(BaseTool):
             prompt=prompt,
             description=description,
             name=str(args.get("name", "")).strip(),
-            subagent_type=(
-                str(args.get("subagent_type", "general-purpose")).strip()
-                or "general-purpose"
-            ),
+            subagent_type=subagent_type,
             max_turns=self._max_turns,
         )
         requested_background = bool(args.get("run_in_background", False))

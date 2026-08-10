@@ -20,6 +20,27 @@ class HistoryMessage:
     native_items: List[Dict[str, Any]] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class HistorySnapshot:
+    """Read-only history prefix used to seed another agent loop."""
+
+    messages: tuple[HistoryMessage, ...]
+    source_revision: Optional[int] = None
+
+    @classmethod
+    def from_messages(
+        cls,
+        messages: Iterable[HistoryMessage],
+        *,
+        source_revision: Optional[int] = None,
+    ) -> "HistorySnapshot":
+        """Build a snapshot from the largest complete transaction prefix."""
+        return cls(
+            messages=tuple(complete_history_prefix(messages)),
+            source_revision=source_revision,
+        )
+
+
 def _message_value(message: Any, name: str, default: Any = None) -> Any:
     if isinstance(message, dict):
         return message.get(name, default)
@@ -67,6 +88,24 @@ def message_tool_result_ids(message: Any) -> List[str]:
             seen.add(normalized)
             result_ids.append(normalized)
     return result_ids
+
+
+def complete_history_prefix(
+    messages: Iterable[HistoryMessage],
+) -> List[HistoryMessage]:
+    """Return the largest prefix with no dangling model tool calls."""
+    items = list(messages)
+    result_ids = {
+        result_id
+        for message in items
+        for result_id in message_tool_result_ids(message)
+    }
+    for index, message in enumerate(items):
+        if any(
+            call_id not in result_ids for call_id in message_tool_call_ids(message)
+        ):
+            return items[:index]
+    return items
 
 
 def message_token_payloads(message: Any) -> List[Any]:
@@ -274,11 +313,25 @@ class History(ABC):
     def reset(self, run_id: Optional[str] = None) -> None:
         """Reset history runtime state for a new run."""
 
+    def snapshot(self) -> HistorySnapshot:
+        """Capture a transaction-complete history prefix."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support history snapshots"
+        )
+
+    def restore(self, snapshot: HistorySnapshot) -> None:
+        """Replace current history with a snapshot base."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support history snapshots"
+        )
+
 
 __all__ = [
     "History",
     "HistoryMessage",
+    "HistorySnapshot",
     "HistoryPolicy",
+    "complete_history_prefix",
     "group_history_rounds",
     "message_token_payloads",
     "message_tool_call_ids",

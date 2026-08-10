@@ -15,7 +15,7 @@ from .core.errors import QitosRuntimeError, StopReason
 from .core.memory import Memory
 from .core.model_response import ModelResponse
 from .core.runtime_input import RuntimeInput
-from .core.history import History, HistoryPolicy
+from .core.history import History, HistoryPolicy, HistorySnapshot
 from .core.observation import Observation
 from .core.tool_result import ToolResult, ToolResultStatus
 from .core.state import StateSchema
@@ -63,6 +63,7 @@ __all__ = [
     "ModelResponse",
     "History",
     "HistoryPolicy",
+    "HistorySnapshot",
     "Observation",
     "ToolResult",
     "ToolResultStatus",

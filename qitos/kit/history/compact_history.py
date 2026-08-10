@@ -8,11 +8,13 @@ import math
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, replace
+from threading import RLock
 from typing import Any, Dict, Iterable, List, Optional
 
 from qitos.core.history import (
     History,
     HistoryMessage,
+    HistorySnapshot,
     group_history_rounds,
     message_token_payloads,
     select_recent_history,
@@ -808,7 +810,7 @@ class CompactHistory(History):
         hard_window: Optional[int] = None,
         auto_compact: Optional[bool] = None,
     ):
-        cfg = config or CompactConfig()
+        cfg = replace(config) if config is not None else CompactConfig()
         if max_tokens is not None:
             cfg.max_tokens = int(max_tokens)
         if keep_last_rounds is not None:
@@ -820,17 +822,20 @@ class CompactHistory(History):
 
         self.llm = llm
         self.config = cfg
+        self._base_messages: tuple[HistoryMessage, ...] = ()
         self._messages: List[HistoryMessage] = []
         self._controller = CompactionController(cfg, llm=llm)
+        self._lock = RLock()
         self._pending_runtime_events: List[Dict[str, Any]] = []
         self._last_message_metadata: List[Dict[str, Any]] = []
         self._summary_checkpoint: _SummaryCheckpoint | None = None
         self._revision = 0
 
     def append(self, message: HistoryMessage) -> None:
-        self._messages.append(message)
-        self._revision += 1
-        self.evict()
+        with self._lock:
+            self._messages.append(message)
+            self._revision += 1
+            self.evict()
 
     def retrieve(
         self,
@@ -839,8 +844,10 @@ class CompactHistory(History):
         observation: Any = None,
     ) -> List[HistoryMessage]:
         query = query or {}
-        source_revision = self._revision
-        items = self._filter_messages(query)
+        with self._lock:
+            source_revision = self._revision
+            items = self._filter_messages_unlocked(query)
+            prior_summary = self._summary_checkpoint
         budget = int(query.get("max_tokens") or self.config.max_tokens)
         pending = str(query.get("pending_content") or "")
         auto_compact = bool(query.get("auto_compact", self.config.auto_compact))
@@ -858,10 +865,11 @@ class CompactHistory(History):
             budget=budget,
             pending_content=pending,
             auto_compact=auto_compact,
-            prior_summary=self._summary_checkpoint,
+            prior_summary=prior_summary,
         )
-        if self._revision != source_revision:
-            raise RuntimeError("history changed while compaction was in progress")
+        with self._lock:
+            if self._revision != source_revision:
+                raise RuntimeError("history changed while compaction was in progress")
         result = [
             replace(
                 message,
@@ -881,33 +889,68 @@ class CompactHistory(History):
             context = event.get("context")
             if isinstance(context, dict):
                 context.setdefault("source_history_version", source_revision)
-        self._pending_runtime_events = list(events)
-        self._last_message_metadata = list(metadata)
-        self._remember_summary(result)
+        with self._lock:
+            self._pending_runtime_events = list(events)
+            self._last_message_metadata = list(metadata)
+            self._remember_summary(result)
         return result
 
     def summarize(self, max_items: int = 5) -> str:
-        items = select_recent_history(self._messages, max_items)
+        with self._lock:
+            items = select_recent_history(self._all_messages_unlocked(), max_items)
         return self._controller.summary.summarize(items)
 
     def evict(self) -> int:
-        hard_window = int(self.config.hard_window)
-        if hard_window <= 0 or len(self._messages) <= hard_window:
-            return 0
-        retained = select_recent_history(self._messages, hard_window)
-        removed = len(self._messages) - len(retained)
-        self._messages = retained
-        if removed:
-            self._revision += 1
-        return removed
+        with self._lock:
+            items = self._all_messages_unlocked()
+            hard_window = int(self.config.hard_window)
+            if hard_window <= 0 or len(items) <= hard_window:
+                return 0
+            retained = select_recent_history(items, hard_window)
+            removed = len(items) - len(retained)
+            self._base_messages = tuple(retained)
+            self._messages = []
+            if removed:
+                self._revision += 1
+            return removed
 
     def reset(self, run_id: Optional[str] = None) -> None:
-        self._messages = []
-        self._pending_runtime_events = []
-        self._last_message_metadata = []
-        self._summary_checkpoint = None
-        self._controller.clear_cache()
-        self._revision += 1
+        with self._lock:
+            self._base_messages = ()
+            self._messages = []
+            self._pending_runtime_events = []
+            self._last_message_metadata = []
+            self._summary_checkpoint = None
+            self._controller.clear_cache()
+            self._revision += 1
+
+    def snapshot(self) -> HistorySnapshot:
+        """Capture a transaction-complete history prefix."""
+        with self._lock:
+            return HistorySnapshot.from_messages(
+                self._all_messages_unlocked(),
+                source_revision=self._revision,
+            )
+
+    def restore(self, snapshot: HistorySnapshot) -> None:
+        """Restore a snapshot as the shared history base."""
+        if not isinstance(snapshot, HistorySnapshot):
+            raise TypeError("snapshot must be a HistorySnapshot")
+        with self._lock:
+            self._base_messages = snapshot.messages
+            self._messages = []
+            self._pending_runtime_events = []
+            self._last_message_metadata = []
+            self._summary_checkpoint = None
+            self._controller.clear_cache()
+            self._revision += 1
+
+    def fork(self, snapshot: HistorySnapshot | None = None) -> "CompactHistory":
+        """Create a history with a copy-on-write snapshot base."""
+        inherited = snapshot if snapshot is not None else self.snapshot()
+        child = CompactHistory(llm=self.llm, config=replace(self.config))
+        child.restore(inherited)
+        return child
 
     def _remember_summary(self, result: List[HistoryMessage]) -> None:
         """Keep the newest continuation summary so later passes can build on it.
@@ -939,28 +982,39 @@ class CompactHistory(History):
 
     @property
     def last_summary(self) -> Optional[str]:
-        if self._summary_checkpoint is None:
-            return None
-        return self._summary_checkpoint.text
+        with self._lock:
+            if self._summary_checkpoint is None:
+                return None
+            return self._summary_checkpoint.text
 
     @property
     def history_version(self) -> int:
-        return self._revision
+        with self._lock:
+            return self._revision
 
     def consume_runtime_events(self) -> List[Dict[str, Any]]:
-        events = list(self._pending_runtime_events)
-        self._pending_runtime_events = []
-        return events
+        with self._lock:
+            events = list(self._pending_runtime_events)
+            self._pending_runtime_events = []
+            return events
 
     def get_last_message_metadata(self) -> List[Dict[str, Any]]:
-        return list(self._last_message_metadata)
+        with self._lock:
+            return list(self._last_message_metadata)
 
     @property
     def messages(self) -> List[HistoryMessage]:
-        return list(self._messages)
+        with self._lock:
+            return self._all_messages_unlocked()
 
     def _filter_messages(self, query: Dict[str, Any]) -> List[HistoryMessage]:
-        items = list(self._messages)
+        with self._lock:
+            return self._filter_messages_unlocked(query)
+
+    def _filter_messages_unlocked(
+        self, query: Dict[str, Any]
+    ) -> List[HistoryMessage]:
+        items = self._all_messages_unlocked()
         roles = query.get("roles")
         step_min = query.get("step_min")
         step_max = query.get("step_max")
@@ -972,6 +1026,9 @@ class CompactHistory(History):
         if step_max is not None:
             items = [m for m in items if m.step_id <= int(step_max)]
         return items
+
+    def _all_messages_unlocked(self) -> List[HistoryMessage]:
+        return [*self._base_messages, *self._messages]
 
 
 def compact_history(**kwargs: Any) -> CompactHistory:
