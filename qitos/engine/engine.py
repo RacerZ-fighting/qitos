@@ -1069,6 +1069,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         )
         cancelled = False
         try:
+            if _resume_state is None and _resume_step is None:
+                await self._save_checkpoint(
+                    step_id,
+                    state,
+                    task_text,
+                    source="input",
+                )
             while True:
                 # -- Cancellation check --
                 if self._cancel_token.is_cancel_requested:
@@ -2085,12 +2092,15 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             else type(self.agent.init_state(task_text))
         )
         state = state_type.from_dict(checkpoint.state_data)
+        resume_step = checkpoint.step + 1
+        if tuple_.metadata.get("source") == "input":
+            resume_step = checkpoint.step
 
         return await self.arun(
             task,
             history_snapshot=checkpoint.history,
             _resume_state=state,
-            _resume_step=checkpoint.step + 1,
+            _resume_step=resume_step,
             _resume_run_id=checkpoint.thread_id,
             _resume_checkpoint_id=checkpoint.id,
         )

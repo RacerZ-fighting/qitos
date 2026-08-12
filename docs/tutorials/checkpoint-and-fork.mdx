@@ -109,11 +109,16 @@ result = await engine.aresume_from_checkpoint(time_travel_config)
 
 ## Step 5: Durability Boundary
 
-`Engine.arun()` awaits `CheckpointStore.put()` after a complete step. A step is
-not considered durable until that write succeeds. SQLite work runs outside the
-event-loop thread, and cancellation waits for an active database call to settle
-before propagating. Store instances belong to one event loop. Memory and SQLite
-stores accept the same JSON-serializable payloads.
+Before its first provider request, a fresh `Engine.arun()` awaits an `input`
+checkpoint containing the initialized task, state, and history. Completed-step
+checkpoints descend from that input boundary. Resuming the input checkpoint retries
+step zero without writing a duplicate input checkpoint.
+
+The Engine also awaits `CheckpointStore.put()` after each complete step. A step is not
+considered durable until that write succeeds. SQLite work runs outside the event-loop
+thread, and cancellation waits for an active database call to settle before
+propagating. Store instances belong to one event loop. Memory and SQLite stores accept
+the same JSON-serializable payloads.
 
 ## Step 6: Inspecting the Snapshot
 

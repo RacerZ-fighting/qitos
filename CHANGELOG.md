@@ -55,6 +55,10 @@ How to update:
 
 ### Changed
 
+- Fresh Engine runs now persist an `input` checkpoint after task, state, and history
+  initialization but before the first provider request. Step checkpoints descend from
+  that boundary, and resuming it retries step zero without creating a second input
+  checkpoint.
 - **Breaking:** Checkpoints now have one asynchronous persistence owner. Engine waits
   for state, task, complete model history, and lineage to reach the configured store at
   each safe step boundary; SQLite operations run off the event loop and settle before

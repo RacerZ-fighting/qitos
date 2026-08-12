@@ -109,10 +109,14 @@ result = await engine.aresume_from_checkpoint(time_travel_config)
 
 ## Step 5: 持久化边界
 
-`Engine.arun()` 会在完整 step 结束后等待 `CheckpointStore.put()`。写入成功前，
-该 step 不算持久化完成。SQLite 操作在线程外执行；取消发生时，会先等待正在执行的
-数据库调用稳定结束，再继续传播取消。每个 store 实例只属于一个 event loop；内存与
-SQLite store 接受相同的 JSON 可序列化数据。
+全新运行的 `Engine.arun()` 会在第一次 Provider 请求前等待一个 `input` checkpoint，保存已
+初始化的任务、状态和历史。之后的完整 step checkpoint 以该输入边界为父级。恢复这个输入
+checkpoint 会重新执行 step zero，但不会再次写入 `input` checkpoint。
+
+Engine 也会在每个完整 step 结束后等待 `CheckpointStore.put()`。写入成功前，该 step 不算
+持久化完成。SQLite 操作在线程外执行；取消发生时，会先等待正在执行的数据库调用稳定结束，
+再继续传播取消。每个 store 实例只属于一个 event loop；内存与 SQLite store 接受相同的 JSON
+可序列化数据。
 
 ## Step 6: 检查快照
 
