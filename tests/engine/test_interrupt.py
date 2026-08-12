@@ -130,7 +130,8 @@ class TestInterruptWithCheckpointStore:
         assert result.interrupt_info.interrupt_id == "int_1"
         assert result.stop_reason == StopReason.INTERRUPT
 
-    def test_interrupt_with_store(self):
+    @pytest.mark.asyncio
+    async def test_interrupt_with_store(self):
         """Test that interrupt checkpoint can be saved and resumed."""
         store = InMemoryCheckpointStore()
         cp = Checkpoint(
@@ -141,10 +142,10 @@ class TestInterruptWithCheckpointStore:
         )
         config = CheckpointConfig(thread_id="t1")
         meta: CheckpointMetadata = {"source": "interrupt", "step": 3}
-        store.put(config, cp, meta, {})
+        await store.put(config, cp, meta)
 
         # Verify we can retrieve it
-        got = store.get(CheckpointConfig(thread_id="t1"))
+        got = await store.get(CheckpointConfig(thread_id="t1"))
         assert got is not None
         assert got.step == 3
         assert got.state_data["task"] == "hello"

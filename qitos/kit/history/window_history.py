@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from qitos.core.history import (
     History,
     HistoryMessage,
+    HistorySnapshot,
     message_token_payloads,
     select_recent_history,
 )
@@ -98,6 +99,16 @@ class WindowHistory(History):
 
     def reset(self, run_id: Optional[str] = None) -> None:
         self._messages = []
+        self._pending_runtime_events = []
+        self._last_message_metadata = []
+
+    def snapshot(self) -> HistorySnapshot:
+        return HistorySnapshot.from_messages(self._messages)
+
+    def restore(self, snapshot: HistorySnapshot) -> None:
+        if not isinstance(snapshot, HistorySnapshot):
+            raise TypeError("snapshot must be a HistorySnapshot")
+        self._messages = list(snapshot.messages)
         self._pending_runtime_events = []
         self._last_message_metadata = []
 

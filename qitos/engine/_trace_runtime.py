@@ -8,13 +8,14 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
 
 from ..core.errors import StopReason
 from ..core.spec import ExperimentSpec, RunSpec
 from ..core.state import StateSchema
 from ..core.task import Task, TaskCriterionResult, TaskResult, TaskValidationIssue
 from ..trace import runtime_event_to_trace, runtime_step_to_trace
+from ..trace.events import TraceEvent
 from .hooks import HookContext
 from .states import RuntimeEvent, RuntimePhase, StepRecord
 
@@ -37,6 +38,8 @@ class _TraceRuntime(Generic[StateT]):
         # Event index tracking for lightweight TraceStep (Fix 1B)
         self._step_event_start: Dict[int, int] = {}
         self._step_event_end: Dict[int, int] = {}
+        self._pending_step_events: Dict[int, List[TraceEvent]] = {}
+        self._committed_step_ids: set[int] = set()
 
     def emit(
         self,
@@ -70,41 +73,39 @@ class _TraceRuntime(Generic[StateT]):
         engine.events.append(event)
         if engine.records and engine.records[-1].step_id == step_id:
             engine.records[-1].phase_events.append(event)
-        self.write_trace_event(event)
+        writer = engine.trace_writer
+        if writer is not None:
+            trace_event = runtime_event_to_trace(writer.run_id, event)
+            # END/INTERRUPT events can be emitted after the step's durable
+            # marker or while an in-flight model turn is being cancelled.
+            # Keep those terminal lifecycle facts immediately observable;
+            # incomplete model/tool events remain uncommitted in memory.
+            if phase in {RuntimePhase.END, RuntimePhase.INTERRUPT} or (
+                step_id in self._committed_step_ids
+            ):
+                writer.write_event(trace_event)
+            else:
+                self._pending_step_events.setdefault(step_id, []).append(
+                    trace_event
+                )
         state = engine._active_state
         if state is not None:
             self.notify_event(event, state)
 
-    def write_trace_event(self, event: RuntimeEvent) -> None:
-        # Route through TracingProvider if available
-        provider = getattr(self.engine, "_tracing_provider", None)
-        if provider is not None:
-            # The LegacyTraceWriterProcessor handles the bridge,
-            # so we don't need to also write directly.
-            return
-        if self.engine.trace_writer is None:
-            return
-        self.engine.trace_writer.write_event(
-            runtime_event_to_trace(self.engine.trace_writer.run_id, event)
-        )
-
     def write_trace_step(self, step: StepRecord) -> None:
-        # Route through TracingProvider if available
-        provider = getattr(self.engine, "_tracing_provider", None)
-        if provider is not None:
-            return
         if self.engine.trace_writer is None:
             return
         step_id = getattr(step, "step_id", 0)
         event_start = self._step_event_start.get(step_id, -1)
         event_end = self._step_event_end.get(step_id, -1)
-        self.engine.trace_writer.write_step(
-            runtime_step_to_trace(
-                step,
-                event_start_idx=event_start,
-                event_end_idx=event_end,
-            )
+        trace_step = runtime_step_to_trace(
+            step,
+            event_start_idx=event_start,
+            event_end_idx=event_end,
         )
+        pending = self._pending_step_events.pop(step_id, [])
+        self.engine.trace_writer.write_transaction(pending, trace_step)
+        self._committed_step_ids.add(step_id)
 
     def finalize_step(self, record: StepRecord, state: StateT) -> None:
         self.write_trace_step(record)

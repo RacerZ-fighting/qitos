@@ -24,6 +24,13 @@ Every traced run writes a self-contained directory:
 
 The raw files are the source of truth. `qita` is the human inspection surface built on top of them.
 
+`TraceWriter` commits runtime events and their completed step record as one
+ordered step transaction. Event payloads are flushed before the step marker is
+written, so a reader can treat each step record as the commit marker for its
+event range. Lifecycle events such as cancellation and final `END` remain
+visible immediately; an interrupted step is never represented by a completed
+step marker.
+
 ## Why tracing is a first-class feature
 
 QitOS is built for agent research, not only one-off demos, so the framework must preserve:

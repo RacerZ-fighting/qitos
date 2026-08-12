@@ -83,10 +83,11 @@ When the trace ends, the processor writes aggregate metrics to `run.summary`:
 
 ## Combining with other processors
 
-`add_trace_processor` appends to the global processor list, so you can combine `WandbTraceProcessor` with any other `TraceProcessor` (for example, the default `LegacyTraceWriterProcessor` that writes to disk):
+`add_trace_processor` appends to the global processor list, so you can combine `WandbTraceProcessor` with any other `TraceProcessor` (for example, `JsonFileTraceProcessor` for a JSON export):
 
 ```python
 from qitos.tracing import add_trace_processor
+from qitos.tracing.json_processor import JsonFileTraceProcessor
 from qitos.tracing.wandb_processor import WandbTraceProcessor
 
 wandb_processor = WandbTraceProcessor(
@@ -94,8 +95,9 @@ wandb_processor = WandbTraceProcessor(
     config={"model": "gpt-4o"},
 )
 add_trace_processor(wandb_processor)
+add_trace_processor(JsonFileTraceProcessor(output_dir=".traces", streaming=True))
 
-# The default file-based trace writer is still active.
+# The provider now has both the W&B and JSON processors.
 result = agent.run(task="...", return_state=True)
 ```
 

@@ -8,7 +8,6 @@ from typing import Any
 import pytest
 
 from qitos import AgentModule, Decision, Action, Engine, StateSchema, ToolRegistry, tool
-from qitos.checkpoint import CheckpointManager
 from qitos.engine.engine import RuntimeBudget
 from qitos.experiment import ExperimentRunner, ExperimentResult, SweepSpec, sweep_product
 
@@ -200,19 +199,6 @@ class TestExperimentRunner:
                 data = json.load(f)
             assert data["experiment_name"] == "unnamed"
             assert len(data["results"]) == 1
-
-    def test_with_checkpoint_config(self):
-        agent = DemoAgent(answer="checkpointed")
-        tasks = [{"task": "task 1", "id": "t1"}]
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cp_dir = tmpdir + "/checkpoints"
-            runner = ExperimentRunner(
-                agent=agent,
-                output_dir=tmpdir,
-                checkpoint_config={"dir": cp_dir, "interval": 1},
-            )
-            result = runner.run(tasks=tasks)
-            assert result.completed_tasks == 1
 
     def test_summary_statistics(self):
         agent = DemoAgent(answer="ok")

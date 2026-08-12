@@ -371,12 +371,6 @@ def _experiment_run(args: argparse.Namespace) -> int:
     elif args.cache == "memory":
         cache_config = {"backend": "memory"}
 
-    # Build checkpoint config from metadata
-    checkpoint_config = None
-    cp_raw = config.metadata.get("checkpoint", {})
-    if cp_raw and isinstance(cp_raw, dict):
-        checkpoint_config = cp_raw
-
     # Resolve agent module
     agent = None
     if args.agent_module:
@@ -402,7 +396,6 @@ def _experiment_run(args: argparse.Namespace) -> int:
         sweep=sweep,
         experiment_spec=experiment_spec,
         cache_config=cache_config,
-        checkpoint_config=checkpoint_config,
         concurrency=args.concurrency,
         resume=args.resume,
         output_dir=args.output,

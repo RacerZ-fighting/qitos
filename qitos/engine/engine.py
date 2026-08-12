@@ -10,7 +10,7 @@ import sys
 import time
 import traceback
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar, cast
 from uuid import uuid4
@@ -23,11 +23,7 @@ from ..checkpoint.store import (
     CheckpointId,
     CheckpointMetadata,
     CheckpointStore,
-    StateVersions,
 )
-from ..checkpoint.versioning import StateVersionTracker
-from ..checkpoint.durability import DurabilityManager, DurabilityMode
-from ..checkpoint.pending_writes import PendingWriteManager
 from ..core.agent_module import AgentModule
 from ..core.action import ActionExecutionPolicy
 from ..core.decision import Decision
@@ -38,7 +34,6 @@ from ..core.history import (
     HistoryMessage,
     HistoryPolicy,
     HistorySnapshot,
-    select_recent_history,
 )
 from ..core.memory import Memory, MemoryRecord
 from ..core.runtime_input import RuntimeInput
@@ -86,69 +81,6 @@ ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
 
 RecoveryHandler = Callable[[StateT, RuntimePhase, Exception], None]
-
-
-class _EngineWindowHistory(History):
-    def __init__(self, window_size: int = 24):
-        self.window_size = int(window_size)
-        self._items: List[HistoryMessage] = []
-
-    def append(self, message: HistoryMessage) -> None:
-        self._items.append(message)
-        self.evict()
-
-    def retrieve(
-        self,
-        query: Optional[Dict[str, Any]] = None,
-        state: Any = None,
-        observation: Any = None,
-    ) -> Any:
-        query = query or {}
-        max_items = int(
-            query.get(
-                "max_items",
-                self.window_size if self.window_size > 0 else len(self._items),
-            )
-        )
-        roles = query.get("roles")
-        step_min = query.get("step_min")
-        step_max = query.get("step_max")
-        items = list(self._items)
-        if roles:
-            role_set = set(roles)
-            items = [x for x in items if x.role in role_set]
-        if step_min is not None:
-            items = [x for x in items if x.step_id >= int(step_min)]
-        if step_max is not None:
-            items = [x for x in items if x.step_id <= int(step_max)]
-        if max_items > 0:
-            items = select_recent_history(items, max_items)
-        return items
-
-    def summarize(self, max_items: int = 5) -> str:
-        items = self.retrieve(query={"max_items": max_items})
-        if not isinstance(items, list):
-            return ""
-        return "\n".join(
-            f"[{x.step_id}] {x.role}: {str(x.content)[:120]}"
-            for x in items
-            if isinstance(x, HistoryMessage)
-        )
-
-    def evict(self) -> int:
-        if self.window_size <= 0 or len(self._items) <= self.window_size:
-            return 0
-        retained = select_recent_history(self._items, self.window_size)
-        removed = len(self._items) - len(retained)
-        self._items = retained
-        return removed
-
-    def reset(self, run_id: Optional[str] = None) -> None:
-        self._items = []
-
-    @property
-    def messages(self) -> List[HistoryMessage]:
-        return list(self._items)
 
 
 @dataclass
@@ -305,9 +237,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         render_hooks: Optional[List[Any]] = None,
         context_config: Optional[ContextConfig | Dict[str, Any]] = None,
         cache_backend: Optional[Any] = None,
-        checkpoint_manager: Optional[Any] = None,
         checkpoint_store: Optional[CheckpointStore] = None,
-        checkpoint_durability: DurabilityMode = DurabilityMode.SYNC,
         permission_pipeline: Optional[Any] = None,
         read_before_write_enforcer: Optional[Any] = None,
         permission_interaction_callback: Optional[Any] = None,
@@ -391,7 +321,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._token_usage: int = 0
         self._active_run_id: str = ""
         self._runtime_deadline_monotonic: Optional[float] = None
-        self._runtime_history: History = _EngineWindowHistory(window_size=24)
+        from ..kit.history import WindowHistory
+
+        self._runtime_history: History = WindowHistory(window_size=24)
         self._tool_loop_detector = (
             loop_detector
             if self.context_config.tool_call_loop_detection_enabled
@@ -446,28 +378,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             if not isinstance(self.agent.llm, CachedModel):
                 self.agent.llm = CachedModel(self.agent.llm, self.cache_backend)
 
-        # Checkpoint: new CheckpointStore takes precedence over legacy CheckpointManager
         self._checkpoint_store = checkpoint_store
-        self._version_tracker: Optional[StateVersionTracker] = None
-        self._durability_manager: Optional[DurabilityManager] = None
-        self._pending_write_manager: Optional[PendingWriteManager] = None
         self._last_checkpoint_id: Optional[CheckpointId] = None
 
-        if checkpoint_store is not None:
-            self._durability_manager = DurabilityManager(
-                checkpoint_store, mode=checkpoint_durability
-            )
-            self._pending_write_manager = PendingWriteManager(checkpoint_store)
-
-        # Legacy checkpoint manager (deprecated — kept for backward compat)
-        self.checkpoint_manager = checkpoint_manager
-
-        # Tracing provider: if provided, bridge legacy TraceWriter to it
         self._tracing_provider = tracing_provider
-        if tracing_provider is not None and trace_writer is not None:
-            from ..tracing.legacy_processor import LegacyTraceWriterProcessor
-
-            tracing_provider.add_processor(LegacyTraceWriterProcessor(trace_writer))
 
         # Handoff tools: auto-register if agent declares handoff_targets
         self._handoff_tools: List[Any] = []
@@ -712,7 +626,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             decision = await self._run_decide(state, observation, record)
         except EngineInterrupt as ei:
             # Save checkpoint and report interrupt
-            cp_id = self._save_interrupt_checkpoint(step_id, state, ei)
+            cp_id = await self._save_interrupt_checkpoint(step_id, state, ei)
             info = InterruptInfo(
                 interrupt_id=ei.interrupt_id,
                 checkpoint_id=cp_id,
@@ -832,7 +746,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         try:
             self._run_reduce(state, new_observation, decision, record)
         except EngineInterrupt as ei:
-            cp_id = self._save_interrupt_checkpoint(step_id, state, ei)
+            cp_id = await self._save_interrupt_checkpoint(step_id, state, ei)
             info = InterruptInfo(
                 interrupt_id=ei.interrupt_id,
                 checkpoint_id=cp_id,
@@ -987,6 +901,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         # Check for resume-from-checkpoint internal kwargs
         _resume_state = kwargs.pop("_resume_state", None)
         _resume_step = kwargs.pop("_resume_step", None)
+        _resume_run_id = kwargs.pop("_resume_run_id", None)
+        _resume_checkpoint_id = kwargs.pop("_resume_checkpoint_id", None)
 
         self._reset_run_state()
         memory = self._memory()
@@ -1001,11 +917,12 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 self.recovery_policy.reset()
             except Exception as exc:
                 _logger.debug("Failed to reset recovery_policy: %s", exc)
-        self._active_run_id = (
+        self._active_run_id = str(_resume_run_id or "").strip() or (
             str(getattr(self.trace_writer, "run_id", "")).strip()
             if self.trace_writer is not None
             else ""
         ) or f"run_{uuid4().hex[:12]}"
+        self._last_checkpoint_id = _resume_checkpoint_id
         self._last_system_prompt = ""
         self._last_prompt_metadata = {}
         task_obj, task_text = self._normalize_task(task)
@@ -1023,10 +940,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 "agents": [s.name for s in self.agent_registry.list_available()],
             }
             self.trace_writer.metadata["agent_name"] = self.agent.name
-
-        # Initialize version tracker for checkpoint store
-        if self._checkpoint_store is not None:
-            self._version_tracker = StateVersionTracker()
 
         # Connect MCP servers and bridge their tools
         self._connected_mcp_servers: List[Any] = []
@@ -1537,7 +1450,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
                 self.validation_gate.after_phase(state, RuntimePhase.CHECK_STOP.value)
                 self._finalize_step(record, state)
-                self._save_checkpoint_if_needed(step_id, state, task_text, task_obj)
+                await self._save_checkpoint(step_id, state, task_text)
                 self._dispatch_hook(
                     "on_after_step",
                     HookContext(
@@ -1567,13 +1480,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     self._cancel_token.is_cancel_requested
                     and self._cancel_token.mode == CancelMode.AFTER_STEP
                 ):
-                    self._save_checkpoint_if_needed(
-                        step_id - 1,
-                        state,
-                        task_text,
-                        task_obj,
-                        force=True,
-                    )
                     self._emit(
                         step_id - 1,
                         RuntimePhase.END,
@@ -1608,7 +1514,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 and self._checkpoint_store is not None
             ):
                 try:
-                    self._save_checkpoint(
+                    await self._save_checkpoint(
                         step_id,
                         state,
                         task_text,
@@ -1618,13 +1524,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     _logger.warning(
                         "Checkpoint save failed during cancellation: %s", exc
                     )
-            # Flush durability manager on run end
-            if self._durability_manager is not None:
-                try:
-                    self._durability_manager.flush()
-                except Exception as exc:
-                    _logger.warning("Durability manager flush failed: %s", exc)
-
             # Cleanup MCP servers
             await self._cleanup_mcp_servers()
 
@@ -2108,80 +2007,40 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     ) -> None:
         self._trace_runtime.emit(step_id, phase, ok=ok, payload=payload, error=error)
 
-    def _write_trace_event(self, event: RuntimeEvent) -> None:
-        self._trace_runtime.write_trace_event(event)
-
     def _write_trace_step(self, step: StepRecord) -> None:
         self._trace_runtime.write_trace_step(step)
 
     def _finalize_step(self, record: StepRecord, state: StateT) -> None:
         self._trace_runtime.finalize_step(record, state)
 
-    def _save_checkpoint_if_needed(
-        self,
-        step_id: int,
-        state: StateT,
-        task_text: str,
-        task_obj: Optional[Any],
-        *,
-        force: bool = False,
-    ) -> None:
-        # --- New CheckpointStore path ---
-        if self._checkpoint_store is not None:
-            self._save_checkpoint(step_id, state, task_text, source="loop")
-            return
-        # --- Legacy CheckpointManager path (deprecated) ---
-        if self.checkpoint_manager is None:
-            return
-        if not force and not self.checkpoint_manager.should_checkpoint(step_id):
-            return
-        from ..checkpoint import CheckpointData
-
-        task_dict = None
-        if task_obj is not None and hasattr(task_obj, "to_dict"):
-            task_dict = task_obj.to_dict()
-        checkpoint = CheckpointData(
-            run_id=self._active_run_id,
-            step_id=step_id,
-            state_dict=state.to_dict(),
-            step_records=[asdict(r) for r in self.records],
-            runtime_events=[asdict(e) for e in self.events],
-            budget=asdict(self.budget),
-            token_usage=int(self._token_usage),
-            task_text=task_text,
-            task_dict=task_dict,
-        )
-        try:
-            self.checkpoint_manager.save(checkpoint)
-        except OSError:
-            pass
-
-    def _save_checkpoint(
+    async def _save_checkpoint(
         self,
         step_id: int,
         state: StateT,
         task_text: str,
         source: str = "loop",
     ) -> None:
-        """Save a checkpoint via the new CheckpointStore (every step)."""
-        if self._checkpoint_store is None or self._durability_manager is None:
+        """Persist one recoverable safe-boundary snapshot before returning."""
+        if self._checkpoint_store is None:
             return
 
-        state_data = state.to_dict()
-        new_versions: StateVersions = {}
-        if self._version_tracker is not None:
-            # Compute diff from last snapshot and bump versions
-            new_versions = self._version_tracker.snapshot()
-
+        task_data = (
+            self._active_task_obj.to_dict()
+            if isinstance(self._active_task_obj, Task)
+            else None
+        )
         checkpoint = Checkpoint(
             id=CheckpointId(uuid4().hex),
             thread_id=self._active_run_id,
             step=step_id,
-            state_data=state_data,
-            state_versions=new_versions,
-            versions_seen={},
-            pending_writes=[],
+            state_data=state.to_dict(),
+            task_text=task_text,
+            task_data=task_data,
+            history=self._history().snapshot(),
             parent_id=self._last_checkpoint_id,
+            parent_thread_id=(
+                self._active_run_id if self._last_checkpoint_id is not None else None
+            ),
         )
 
         metadata: CheckpointMetadata = {
@@ -2191,16 +2050,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         }
 
         config = CheckpointConfig(thread_id=self._active_run_id)
-        self._durability_manager.put(config, checkpoint, metadata, new_versions)
+        await self._checkpoint_store.put(config, checkpoint, metadata)
         self._last_checkpoint_id = checkpoint.id
-
-        # Also flush pending writes if any
-        if self._pending_write_manager is not None:
-            write_config = CheckpointConfig(
-                thread_id=self._active_run_id,
-                checkpoint_id=checkpoint.id,
-            )
-            self._pending_write_manager.commit_writes(write_config)
 
     async def aresume_from_checkpoint(
         self,
@@ -2217,39 +2068,31 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         if self._checkpoint_store is None:
             raise RuntimeError("No checkpoint_store configured; cannot resume.")
 
-        tuple_ = self._checkpoint_store.get_tuple(config)
+        tuple_ = await self._checkpoint_store.get_tuple(config)
         if tuple_ is None:
             raise ValueError(f"Checkpoint not found: {config}")
 
         checkpoint = tuple_.checkpoint
+        task: str | Task = (
+            Task.from_dict(checkpoint.task_data)
+            if checkpoint.task_data is not None
+            else checkpoint.task_text
+        )
+        task_text = task.objective if isinstance(task, Task) else task
         state_type: type[StateSchema] = (
-            type(self._active_state) if self._active_state is not None else StateSchema
+            type(self._active_state)
+            if self._active_state is not None
+            else type(self.agent.init_state(task_text))
         )
         state = state_type.from_dict(checkpoint.state_data)
 
-        # Restore version tracker
-        if self._version_tracker is not None:
-            self._version_tracker.apply_versions(checkpoint.state_versions)
-
-        # Set up internal state for resume
-        self._active_run_id = checkpoint.thread_id
-        self._last_checkpoint_id = checkpoint.id
-        self._active_task = tuple_.metadata.get("run_id", "")
-        self._active_state = state  # type: ignore[assignment]
-
-        # Load pending writes for crash recovery
-        if self._pending_write_manager is not None:
-            resume_config = CheckpointConfig(
-                thread_id=checkpoint.thread_id,
-                checkpoint_id=checkpoint.id,
-            )
-            self._pending_write_manager.load_pending_from_store(resume_config)
-
-        # Continue the run from the next step
         return await self.arun(
-            self._active_task,
+            task,
+            history_snapshot=checkpoint.history,
             _resume_state=state,
             _resume_step=checkpoint.step + 1,
+            _resume_run_id=checkpoint.thread_id,
+            _resume_checkpoint_id=checkpoint.id,
         )
 
     def resume_from_checkpoint(
@@ -2313,7 +2156,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             operation="resume",
         )
 
-    def _save_interrupt_checkpoint(
+    async def _save_interrupt_checkpoint(
         self,
         step_id: int,
         state: StateT,
@@ -2326,7 +2169,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             # No store configured — generate a transient ID
             return CheckpointId(uuid4().hex)
 
-        self._save_checkpoint(step_id, state, self._active_task, source="interrupt")
+        await self._save_checkpoint(
+            step_id, state, self._active_task, source="interrupt"
+        )
         # Update the interrupt exception with the checkpoint ID
         if (
             isinstance(interrupt_exc, EngineInterrupt)
@@ -2710,6 +2555,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._resolved_protocol_source = ""
         self._last_prompt_metadata = {}
         self._runtime_deadline_monotonic = None
+        self._last_checkpoint_id = None
         if self._tool_loop_detector is not None:
             self._tool_loop_detector.reset()
         self._handoff_history = []

@@ -10,6 +10,7 @@ state from an earlier checkpoint within the same thread.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import List, Optional
 from uuid import uuid4
 
@@ -23,7 +24,7 @@ from .store import (
 )
 
 
-def fork_checkpoint(
+async def fork_checkpoint(
     store: CheckpointStore,
     config: CheckpointConfig,
     new_thread_id: Optional[str] = None,
@@ -40,7 +41,7 @@ def fork_checkpoint(
     Returns:
         Config pointing to the newly created checkpoint.
     """
-    tuple_ = store.get_tuple(config)
+    tuple_ = await store.get_tuple(config)
     if tuple_ is None:
         raise ValueError(f"Checkpoint not found for config: {config}")
 
@@ -52,12 +53,12 @@ def fork_checkpoint(
         id=CheckpointId(uuid4().hex),
         thread_id=dest_thread,
         step=source.step,
-        state_data=source.state_data.copy(),
-        state_versions=dict(source.state_versions),
-        versions_seen={k: dict(v) for k, v in source.versions_seen.items()},
-        pending_writes=[],
+        state_data=deepcopy(source.state_data),
+        task_text=source.task_text,
+        task_data=deepcopy(source.task_data),
+        history=deepcopy(source.history),
         parent_id=source.id,
-        created_at=source.created_at,
+        parent_thread_id=source.thread_id,
         schema_version=source.schema_version,
     )
 
@@ -70,10 +71,10 @@ def fork_checkpoint(
         metadata["parents"] = {dest_thread: source.id}
 
     dest_config = CheckpointConfig(thread_id=dest_thread)
-    return store.put(dest_config, forked, metadata, forked.state_versions)
+    return await store.put(dest_config, forked, metadata)
 
 
-def list_fork_history(
+async def list_fork_history(
     store: CheckpointStore,
     config: CheckpointConfig,
     max_depth: int = 100,
@@ -88,7 +89,7 @@ def list_fork_history(
 
     current_config = config
     for _ in range(max_depth):
-        tuple_ = store.get_tuple(current_config)
+        tuple_ = await store.get_tuple(current_config)
         if tuple_ is None:
             break
         cp_id = tuple_.checkpoint.id

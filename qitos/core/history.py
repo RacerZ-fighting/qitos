@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections import Counter, defaultdict, deque
+from collections import defaultdict, deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -27,6 +28,21 @@ class HistorySnapshot:
 
     messages: tuple[HistoryMessage, ...]
     source_revision: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        """Detach the snapshot from the mutable runtime history.
+
+        ``HistoryMessage`` intentionally remains mutable for provider-side
+        projections, but a checkpoint/resume boundary must not share its
+        nested tool-call, metadata, or native-item containers with the live
+        history.  Copying here keeps every history implementation on the same
+        ownership contract.
+        """
+        object.__setattr__(
+            self,
+            "messages",
+            tuple(deepcopy(message) for message in self.messages),
+        )
 
     @classmethod
     def from_messages(
@@ -94,18 +110,42 @@ def message_tool_result_ids(message: Any) -> List[str]:
 def complete_history_prefix(
     messages: Iterable[HistoryMessage],
 ) -> List[HistoryMessage]:
-    """Return the largest prefix with no dangling model tool calls."""
+    """Return the largest prefix containing complete ordered tool rounds.
+
+    Tool ids are scoped to their ordered model call, not to the whole history.
+    A result before its declaration, a duplicate result, or a missing result
+    therefore cuts the prefix at the first invalid transaction.  This keeps a
+    checkpoint or compacted provider input from retaining an orphan result or
+    a dangling assistant call.
+    """
     items = list(messages)
-    remaining_results = Counter(
-        result_id
-        for message in items
-        for result_id in message_tool_result_ids(message)
-    )
+    pending: Dict[str, deque[int]] = defaultdict(deque)
     for index, message in enumerate(items):
         for call_id in message_tool_call_ids(message):
-            if remaining_results[call_id] <= 0:
-                return items[:index]
-            remaining_results[call_id] -= 1
+            pending[call_id].append(index)
+        for result_id in message_tool_result_ids(message):
+            declarations = pending.get(result_id)
+            if not declarations:
+                first_pending = min(
+                    (
+                        declaration_index
+                        for queued in pending.values()
+                        for declaration_index in queued
+                    ),
+                    default=index,
+                )
+                return items[: min(index, first_pending)]
+            declarations.popleft()
+            if not declarations:
+                pending.pop(result_id, None)
+
+    if pending:
+        first_unmatched = min(
+            declaration_index
+            for declarations in pending.values()
+            for declaration_index in declarations
+        )
+        return items[:first_unmatched]
     return items
 
 

@@ -1,19 +1,18 @@
-"""Checkpoint store abstraction and core data types.
-
-Borrowed from LangGraph's BaseCheckpointSaver design:
-- references/langgraph/libs/checkpoint/langgraph/checkpoint/base/__init__.py
-- Config-based addressing (thread_id + checkpoint_id)
-- Per-field state versioning (channel_versions)
-- Pending writes for crash recovery
-- Parent chain for fork / time-travel
-"""
+"""Asynchronous checkpoint persistence contracts and snapshot data."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, NamedTuple, NewType, Optional, Sequence, TypedDict
+from typing import Any, Dict, List, NamedTuple, NewType, Optional, TypedDict
+
+from ..core.history import (
+    HistoryMessage,
+    HistorySnapshot,
+    complete_history_prefix,
+)
 
 # ---------------------------------------------------------------------------
 # Core type aliases
@@ -22,13 +21,10 @@ from typing import Any, Dict, Iterator, List, NamedTuple, NewType, Optional, Seq
 CheckpointId = NewType("CheckpointId", str)
 """Unique identifier for a checkpoint (UUID-based)."""
 
-StateVersions = Dict[str, int]
-"""Mapping of state field name → monotonic version number."""
-
-
 # ---------------------------------------------------------------------------
 # CheckpointConfig — addresses a checkpoint within a store
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class CheckpointConfig:
@@ -40,21 +36,6 @@ class CheckpointConfig:
 
     thread_id: str
     checkpoint_id: Optional[CheckpointId] = None
-
-
-# ---------------------------------------------------------------------------
-# PendingWrite — partial tool results awaiting commit
-# ---------------------------------------------------------------------------
-
-class PendingWrite(NamedTuple):
-    """A partial tool-execution result linked to a checkpoint.
-
-    Borrowed from LangGraph's PendingWrite tuple (task_id, channel, value).
-    """
-
-    task_id: str
-    channel: str
-    value: Any
 
 
 # ---------------------------------------------------------------------------
@@ -76,65 +57,146 @@ class CheckpointMetadata(TypedDict, total=False):
 
 @dataclass
 class Checkpoint:
-    """State snapshot at a given point in time.
-
-    Replaces the legacy ``CheckpointData`` with richer versioning and
-    parent-chain support for fork / time-travel.
-    """
+    """One safe-boundary state and model-history snapshot."""
 
     id: CheckpointId
     thread_id: str
     step: int
     state_data: Dict[str, Any]
-    state_versions: StateVersions = field(default_factory=dict)
-    versions_seen: Dict[str, StateVersions] = field(default_factory=dict)
-    pending_writes: List[PendingWrite] = field(default_factory=list)
+    task_text: str = ""
+    task_data: Optional[Dict[str, Any]] = None
+    history: Optional[HistorySnapshot] = None
     parent_id: Optional[CheckpointId] = None
+    parent_thread_id: Optional[str] = None
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
-    schema_version: str = "v2"
+    schema_version: str = "v3"
 
     # ---- serialization helpers ----
 
     def to_dict(self) -> Dict[str, Any]:
+        """Return an owned, JSON-compatible checkpoint payload.
+
+        The store receives live engine state objects.  Serialization is kept
+        at this persistence boundary and returns no containers owned by the
+        caller, so an in-flight write cannot observe later state mutations.
+        """
         return {
             "id": self.id,
             "thread_id": self.thread_id,
             "step": self.step,
-            "state_data": self.state_data,
-            "state_versions": self.state_versions,
-            "versions_seen": self.versions_seen,
-            "pending_writes": [
-                {"task_id": w.task_id, "channel": w.channel, "value": w.value}
-                for w in self.pending_writes
-            ],
+            "state_data": deepcopy(self.state_data),
+            "task_text": self.task_text,
+            "task_data": deepcopy(self.task_data),
+            "history": (
+                None
+                if self.history is None
+                else deepcopy(
+                    {
+                        "messages": [
+                            asdict(message) for message in self.history.messages
+                        ],
+                        "source_revision": self.history.source_revision,
+                    }
+                )
+            ),
             "parent_id": self.parent_id,
+            "parent_thread_id": self.parent_thread_id,
             "created_at": self.created_at,
             "schema_version": self.schema_version,
         }
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> Checkpoint:
-        writes = [
-            PendingWrite(
-                task_id=w["task_id"],
-                channel=w["channel"],
-                value=w["value"],
+        """Build a checkpoint from a validated durable payload.
+
+        Malformed persisted data raises ``ValueError`` at the storage
+        boundary instead of leaking ``KeyError``/``TypeError`` from the
+        dataclass constructor into resume callers.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("checkpoint payload must be an object")
+        checkpoint_id = payload.get("id")
+        thread_id = payload.get("thread_id")
+        step = payload.get("step")
+        state_data = payload.get("state_data")
+        if not isinstance(checkpoint_id, str) or not checkpoint_id:
+            raise ValueError("checkpoint id must be a non-empty string")
+        if not isinstance(thread_id, str) or not thread_id:
+            raise ValueError("checkpoint thread_id must be a non-empty string")
+        if not isinstance(step, int) or isinstance(step, bool):
+            raise ValueError("checkpoint step must be an integer")
+        if not isinstance(state_data, dict):
+            raise ValueError("checkpoint state_data must be an object")
+
+        raw_history = payload.get("history")
+        history: Optional[HistorySnapshot] = None
+        if raw_history is not None:
+            if not isinstance(raw_history, dict):
+                raise ValueError("checkpoint history must be an object or null")
+            raw_messages = raw_history.get("messages")
+            if not isinstance(raw_messages, list):
+                raise ValueError("checkpoint history messages must be a list")
+            messages: List[HistoryMessage] = []
+            for item in raw_messages:
+                if not isinstance(item, dict):
+                    raise ValueError("checkpoint history message must be an object")
+                try:
+                    messages.append(HistoryMessage(**item))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("checkpoint history message is invalid") from exc
+            source_revision = raw_history.get("source_revision")
+            if source_revision is not None and (
+                not isinstance(source_revision, int)
+                or isinstance(source_revision, bool)
+            ):
+                raise ValueError(
+                    "checkpoint history source_revision must be an integer"
+                )
+            if len(complete_history_prefix(messages)) != len(messages):
+                raise ValueError(
+                    "checkpoint history contains an incomplete tool transaction"
+                )
+            history = HistorySnapshot(
+                messages=tuple(messages),
+                source_revision=source_revision,
             )
-            for w in payload.get("pending_writes", [])
-        ]
+
+        task_data = payload.get("task_data")
+        if task_data is not None and not isinstance(task_data, dict):
+            raise ValueError("checkpoint task_data must be an object or null")
+        task_text = payload.get("task_text", "")
+        if not isinstance(task_text, str):
+            raise ValueError("checkpoint task_text must be a string")
+        parent_id = payload.get("parent_id")
+        if parent_id is not None and (
+            not isinstance(parent_id, str) or not parent_id
+        ):
+            raise ValueError("checkpoint parent_id must be a string or null")
+        parent_thread_id = payload.get("parent_thread_id")
+        if parent_thread_id is not None and (
+            not isinstance(parent_thread_id, str) or not parent_thread_id
+        ):
+            raise ValueError(
+                "checkpoint parent_thread_id must be a string or null"
+            )
+        created_at = payload.get("created_at", "")
+        schema_version = payload.get("schema_version", "v3")
+        if not isinstance(created_at, str) or not isinstance(schema_version, str):
+            raise ValueError("checkpoint timestamps and schema version must be strings")
         return cls(
-            id=CheckpointId(payload["id"]),
-            thread_id=payload["thread_id"],
-            step=payload["step"],
-            state_data=payload["state_data"],
-            state_versions=payload.get("state_versions", {}),
-            versions_seen=payload.get("versions_seen", {}),
-            pending_writes=writes,
-            parent_id=payload.get("parent_id"),
-            created_at=payload.get("created_at", ""),
-            schema_version=payload.get("schema_version", "v2"),
+            id=CheckpointId(checkpoint_id),
+            thread_id=thread_id,
+            step=step,
+            state_data=deepcopy(state_data),
+            task_text=task_text,
+            task_data=deepcopy(task_data),
+            history=history,
+            parent_id=CheckpointId(parent_id) if parent_id is not None else None,
+            parent_thread_id=parent_thread_id,
+            created_at=created_at,
+            schema_version=schema_version,
         )
 
 
@@ -149,7 +211,6 @@ class CheckpointTuple(NamedTuple):
     checkpoint: Checkpoint
     metadata: CheckpointMetadata
     parent_config: Optional[CheckpointConfig] = None
-    pending_writes: Optional[List[PendingWrite]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -157,97 +218,50 @@ class CheckpointTuple(NamedTuple):
 # ---------------------------------------------------------------------------
 
 class CheckpointStore(ABC):
-    """Abstract base class for checkpoint persistence.
-
-    Borrowed from LangGraph's ``BaseCheckpointSaver`` interface
-    (``references/langgraph/libs/checkpoint/langgraph/checkpoint/base/__init__.py``).
-
-    Every method has both sync and async variants.  Subclasses should
-    override the async variants; the sync ones delegate via ``asyncio.run``
-    by default.
-    """
-
-    # ---- sync interface ----
+    """Single asynchronous owner for checkpoint persistence."""
 
     @abstractmethod
-    def put(
+    async def put(
         self,
         config: CheckpointConfig,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
-        new_versions: StateVersions,
     ) -> CheckpointConfig:
         """Store a checkpoint.  Returns the updated config."""
 
     @abstractmethod
-    def get_tuple(self, config: CheckpointConfig) -> Optional[CheckpointTuple]:
+    async def get_tuple(
+        self, config: CheckpointConfig
+    ) -> Optional[CheckpointTuple]:
         """Fetch a checkpoint tuple.  Returns ``None`` if not found."""
 
-    def get(self, config: CheckpointConfig) -> Optional[Checkpoint]:
+    async def get(self, config: CheckpointConfig) -> Optional[Checkpoint]:
         """Fetch just the checkpoint (convenience wrapper)."""
-        result = self.get_tuple(config)
+        result = await self.get_tuple(config)
         return result.checkpoint if result else None
 
     @abstractmethod
-    def list(
-        self,
-        config: CheckpointConfig,
-        *,
-        limit: Optional[int] = None,
-        before: Optional[CheckpointConfig] = None,
-    ) -> Iterator[CheckpointTuple]:
-        """List checkpoints for a thread, newest first."""
-
-    @abstractmethod
-    def put_writes(
-        self,
-        config: CheckpointConfig,
-        writes: Sequence[PendingWrite],
-        task_id: str,
-    ) -> None:
-        """Store intermediate writes linked to a checkpoint."""
-
-    @abstractmethod
-    def delete(self, config: CheckpointConfig) -> None:
-        """Delete a single checkpoint."""
-
-    # ---- async interface (default: delegate to sync) ----
-
-    async def aput(
-        self,
-        config: CheckpointConfig,
-        checkpoint: Checkpoint,
-        metadata: CheckpointMetadata,
-        new_versions: StateVersions,
-    ) -> CheckpointConfig:
-        return self.put(config, checkpoint, metadata, new_versions)
-
-    async def aget_tuple(self, config: CheckpointConfig) -> Optional[CheckpointTuple]:
-        return self.get_tuple(config)
-
-    async def aget(self, config: CheckpointConfig) -> Optional[Checkpoint]:
-        result = await self.aget_tuple(config)
-        return result.checkpoint if result else None
-
-    async def alist(
+    async def list(
         self,
         config: CheckpointConfig,
         *,
         limit: Optional[int] = None,
         before: Optional[CheckpointConfig] = None,
     ) -> List[CheckpointTuple]:
-        return list(self.list(config, limit=limit, before=before))
+        """List checkpoints for a thread, newest first."""
 
-    async def aput_writes(
-        self,
-        config: CheckpointConfig,
-        writes: Sequence[PendingWrite],
-        task_id: str,
-    ) -> None:
-        self.put_writes(config, writes, task_id)
+    @abstractmethod
+    async def delete(self, config: CheckpointConfig) -> None:
+        """Delete a single checkpoint."""
 
-    async def adelete(self, config: CheckpointConfig) -> None:
-        self.delete(config)
+    async def close(self) -> None:
+        """Release store-owned resources."""
+
+    async def __aenter__(self) -> CheckpointStore:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        await self.close()
 
 
 __all__ = [
@@ -257,6 +271,4 @@ __all__ = [
     "CheckpointMetadata",
     "CheckpointTuple",
     "CheckpointStore",
-    "PendingWrite",
-    "StateVersions",
 ]

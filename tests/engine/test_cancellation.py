@@ -6,10 +6,8 @@ import json
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
-
-import pytest
 
 from qitos.core.agent_module import AgentModule
 from qitos.core.decision import Decision
@@ -21,12 +19,9 @@ from qitos.trace.writer import TraceWriter
 from qitos.checkpoint.store import (
     Checkpoint,
     CheckpointConfig,
-    CheckpointId,
     CheckpointMetadata,
     CheckpointStore,
     CheckpointTuple,
-    PendingWrite,
-    StateVersions,
 )
 
 
@@ -68,15 +63,13 @@ class _InMemoryCheckpointStore(CheckpointStore):
 
     def __init__(self):
         self._data: Dict[str, CheckpointTuple] = {}
-        self._writes: Dict[str, List[PendingWrite]] = {}
         self.save_count = 0
 
-    def put(
+    async def put(
         self,
         config: CheckpointConfig,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
-        new_versions: StateVersions,
     ) -> CheckpointConfig:
         self.save_count += 1
         cid = f"cp_{self.save_count}"
@@ -85,14 +78,15 @@ class _InMemoryCheckpointStore(CheckpointStore):
             checkpoint=checkpoint,
             metadata=metadata,
             parent_config=None,
-            pending_writes=[],
         )
         return CheckpointConfig(
             thread_id=config.thread_id,
             checkpoint_id=cid,
         )
 
-    def get_tuple(self, config: CheckpointConfig) -> Optional[CheckpointTuple]:
+    async def get_tuple(
+        self, config: CheckpointConfig
+    ) -> Optional[CheckpointTuple]:
         cid = config.checkpoint_id
         if cid and cid in self._data:
             return self._data[cid]
@@ -101,28 +95,19 @@ class _InMemoryCheckpointStore(CheckpointStore):
             return self._data[last_key]
         return None
 
-    def list(
+    async def list(
         self,
         config: CheckpointConfig,
         *,
         limit: Optional[int] = None,
         before: Optional[CheckpointConfig] = None,
-        filter_by: Optional[Dict[str, Any]] = None,
-    ) -> Sequence[CheckpointTuple]:
+    ) -> List[CheckpointTuple]:
         items = list(self._data.values())
         if limit:
             items = items[:limit]
         return items
 
-    def put_writes(
-        self,
-        config: CheckpointConfig,
-        writes: Sequence[PendingWrite],
-        task_id: str,
-    ) -> None:
-        self._writes.setdefault(task_id, []).extend(writes)
-
-    def delete(self, config: CheckpointConfig) -> None:
+    async def delete(self, config: CheckpointConfig) -> None:
         cid = config.checkpoint_id
         if cid and cid in self._data:
             del self._data[cid]

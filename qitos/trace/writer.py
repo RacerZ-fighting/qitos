@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import threading
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, IO, List, Optional, cast
@@ -51,6 +52,14 @@ class _BufferedJsonlWriter:
 
 
 class TraceWriter:
+    """Persist one run's manifest and transaction-ordered trace artifacts.
+
+    Runtime callers stage a step's events and publish them through
+    :meth:`write_transaction`; ``steps.jsonl`` is the durable marker that the
+    event range reached a completed safe boundary. Lifecycle events use
+    :meth:`write_event` because they do not belong to a model/tool step.
+    """
+
     def __init__(
         self,
         output_dir: str,
@@ -70,6 +79,7 @@ class TraceWriter:
         self.manifest_path = os.path.join(self.run_dir, "manifest.json")
         self._event_count = 0
         self._step_count = 0
+        self._lock = threading.RLock()
 
         os.makedirs(self.run_dir, exist_ok=True)
         self._write_manifest(status="running")
@@ -79,22 +89,60 @@ class TraceWriter:
         self._steps_writer = _BufferedJsonlWriter(self.steps_path, flush_every=1)
 
     def write_event(self, event: TraceEvent) -> None:
-        line = json.dumps(_redact_dict(event.to_dict()), ensure_ascii=False) + "\n"
-        self._events_writer.append(line)
-        self._event_count += 1
+        """Persist one lifecycle/debug event immediately.
 
-    def write_step(self, step: TraceStep) -> None:
-        line = json.dumps(_redact_dict(step.to_dict()), ensure_ascii=False) + "\n"
-        self._steps_writer.append(line)
-        self._step_count += 1
+        Runtime step events use :meth:`write_transaction` so a model/tool
+        turn is published only with its terminal step marker.  Lifecycle
+        events have no step transaction and remain immediately observable.
+        """
+        with self._lock:
+            line = json.dumps(_redact_dict(event.to_dict()), ensure_ascii=False) + "\n"
+            self._events_writer.append(line)
+            # Lifecycle events are the observable record for cancellation and
+            # failure paths; do not leave them waiting for the batch threshold.
+            self._events_writer.flush()
+            self._event_count += 1
+
+    def write_transaction(
+        self,
+        events: List[TraceEvent],
+        step: TraceStep,
+    ) -> None:
+        """Publish one complete runtime step as the canonical trace unit.
+
+        Events are flushed before the step marker is appended.  Readers can
+        therefore treat a step line as the commit marker for its event range;
+        an interrupted model/tool turn that never reaches step finalization
+        is not published as a misleading partial transaction.
+        """
+        with self._lock:
+            if any(event.run_id != self.run_id for event in events):
+                raise ValueError("trace transaction contains another run")
+            if any(event.step_id != step.step_id for event in events):
+                raise ValueError("trace transaction mixes step ids")
+            event_lines = [
+                json.dumps(_redact_dict(event.to_dict()), ensure_ascii=False) + "\n"
+                for event in events
+            ]
+            step_line = (
+                json.dumps(_redact_dict(step.to_dict()), ensure_ascii=False) + "\n"
+            )
+            for line in event_lines:
+                self._events_writer.append(line)
+            self._event_count += len(event_lines)
+            # A step marker must not become visible before its event payloads.
+            self._events_writer.flush()
+            self._steps_writer.append(step_line)
+            self._step_count += 1
 
     def finalize(self, status: str, summary: Optional[Dict[str, Any]] = None) -> None:
-        # Flush buffered writers before validation
-        self._events_writer.close()
-        self._steps_writer.close()
-        self._write_manifest(status=status, summary=summary or {})
-        if self.strict_validate and status != "running":
-            self._validate_artifacts()
+        with self._lock:
+            # Flush buffered writers before validation
+            self._events_writer.close()
+            self._steps_writer.close()
+            self._write_manifest(status=status, summary=summary or {})
+            if self.strict_validate and status != "running":
+                self._validate_artifacts()
 
     def _write_manifest(
         self, status: str, summary: Optional[Dict[str, Any]] = None

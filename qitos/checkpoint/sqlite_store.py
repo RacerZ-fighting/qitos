@@ -1,17 +1,13 @@
-"""SQLite-backed checkpoint store with WAL mode.
-
-Provides durable, file-based checkpoint persistence suitable for
-production use.  Uses WAL mode for concurrent read/write support.
-"""
+"""SQLite-backed asynchronous checkpoint persistence."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
-from contextlib import contextmanager
-from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence
-from uuid import uuid4
+from collections.abc import Callable
+from copy import deepcopy
+from typing import Any, List, Optional, TypeVar
 
 from .store import (
     Checkpoint,
@@ -20,8 +16,6 @@ from .store import (
     CheckpointMetadata,
     CheckpointStore,
     CheckpointTuple,
-    PendingWrite,
-    StateVersions,
 )
 
 
@@ -30,287 +24,420 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     checkpoint_id  TEXT PRIMARY KEY,
     thread_id      TEXT NOT NULL,
     step           INTEGER NOT NULL,
-    state_data     TEXT NOT NULL,          -- JSON
-    state_versions TEXT NOT NULL DEFAULT '{}',  -- JSON
-    versions_seen  TEXT NOT NULL DEFAULT '{}',  -- JSON
+    state_data     TEXT NOT NULL,
+    task_text      TEXT NOT NULL DEFAULT '',
+    task_data      TEXT,
+    history_data   TEXT,
     parent_id      TEXT,
+    parent_thread_id TEXT,
     created_at     TEXT NOT NULL,
-    schema_version TEXT NOT NULL DEFAULT 'v2'
-);
-
-CREATE TABLE IF NOT EXISTS checkpoint_writes (
-    write_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    checkpoint_id TEXT NOT NULL REFERENCES checkpoints(checkpoint_id),
-    task_id       TEXT NOT NULL,
-    channel       TEXT NOT NULL,
-    value         TEXT,                     -- JSON (nullable)
-    UNIQUE(checkpoint_id, task_id, channel)
+    schema_version TEXT NOT NULL DEFAULT 'v3'
 );
 
 CREATE TABLE IF NOT EXISTS checkpoint_metadata (
     checkpoint_id TEXT PRIMARY KEY REFERENCES checkpoints(checkpoint_id),
     source        TEXT,
     step_int      INTEGER,
-    parents       TEXT DEFAULT '{}',        -- JSON
+    parents       TEXT DEFAULT '{}',
     run_id        TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_checkpoints_thread
     ON checkpoints(thread_id, step);
 
-CREATE INDEX IF NOT EXISTS idx_writes_checkpoint
-    ON checkpoint_writes(checkpoint_id);
 """
+
+_CHECKPOINT_COLUMNS = (
+    "checkpoint_id, thread_id, step, state_data, task_text, task_data, "
+    "history_data, parent_id, parent_thread_id, created_at, schema_version"
+)
+
+T = TypeVar("T")
 
 
 class SqliteCheckpointStore(CheckpointStore):
-    """SQLite-backed checkpoint store with WAL mode.
+    """Serialize SQLite work off the caller's event loop.
 
-    Args:
-        db_path: Path to the SQLite database file.
-            Use ``":memory:"`` for an in-memory database (testing only).
+    One connection and one async lock preserve operation ordering. Cancellation
+    waits for the active SQLite call to settle before it propagates, so callers
+    never have an unknown in-process write still using the connection.
     """
 
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.executescript(_SCHEMA_SQL)
-        self._conn.commit()
+        self._conn: sqlite3.Connection | None = None
+        self._lock = asyncio.Lock()
+        self._closed = False
 
-    def close(self) -> None:
-        """Close the database connection."""
-        if self._conn:
-            self._conn.close()
-            self._conn = None  # type: ignore[assignment]
+    async def _run(self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("checkpoint store is closed")
+            task = asyncio.create_task(
+                asyncio.to_thread(self._run_sync, operation)
+            )
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError as cancelled:
+                try:
+                    await asyncio.shield(task)
+                except Exception as exc:
+                    raise cancelled from exc
+                raise
 
-    def __enter__(self) -> SqliteCheckpointStore:
-        return self
+    def _run_sync(self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        return operation(self._ensure_connection())
 
-    def __exit__(self, *args: Any) -> None:
-        self.close()
+    def _ensure_connection(self) -> sqlite3.Connection:
+        if self._conn is not None:
+            return self._conn
+        conn = sqlite3.connect(self._db_path, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.executescript(_SCHEMA_SQL)
+            columns = {
+                str(row[1])
+                for row in conn.execute("PRAGMA table_info(checkpoints)").fetchall()
+            }
+            for name, declaration in (
+                ("task_text", "TEXT NOT NULL DEFAULT ''"),
+                ("task_data", "TEXT"),
+                ("history_data", "TEXT"),
+                ("parent_thread_id", "TEXT"),
+            ):
+                if name not in columns:
+                    conn.execute(
+                        f"ALTER TABLE checkpoints ADD COLUMN {name} {declaration}"
+                    )
+            conn.commit()
+        except BaseException:
+            conn.close()
+            raise
+        self._conn = conn
+        return conn
 
-    # ---- internal helpers ----
+    async def close(self) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            conn = self._conn
+            self._conn = None
+            if conn is None:
+                return
+            task = asyncio.create_task(asyncio.to_thread(conn.close))
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as cancelled:
+                try:
+                    await asyncio.shield(task)
+                except Exception as exc:
+                    raise cancelled from exc
+                raise
 
-    def _row_to_checkpoint(self, row: tuple) -> Checkpoint:
+    @staticmethod
+    def _row_to_checkpoint(row: tuple[Any, ...]) -> Checkpoint:
         (
-            cp_id, thread_id, step,
-            state_data_json, state_versions_json, versions_seen_json,
-            parent_id, created_at, schema_version,
+            checkpoint_id,
+            thread_id,
+            step,
+            state_data_json,
+            task_text,
+            task_data_json,
+            history_data_json,
+            parent_id,
+            parent_thread_id,
+            created_at,
+            schema_version,
         ) = row
-        return Checkpoint(
-            id=CheckpointId(cp_id),
-            thread_id=thread_id,
-            step=step,
-            state_data=json.loads(state_data_json),
-            state_versions=json.loads(state_versions_json),
-            versions_seen=json.loads(versions_seen_json),
-            parent_id=parent_id,
-            created_at=created_at,
-            schema_version=schema_version,
-        )
+        try:
+            payload: dict[str, Any] = {
+                "id": checkpoint_id,
+                "thread_id": thread_id,
+                "step": step,
+                "state_data": json.loads(state_data_json),
+                "task_text": task_text,
+                "task_data": (
+                    json.loads(task_data_json) if task_data_json is not None else None
+                ),
+                "history": (
+                    json.loads(history_data_json)
+                    if history_data_json is not None
+                    else None
+                ),
+                "parent_id": parent_id,
+                "parent_thread_id": parent_thread_id,
+                "created_at": created_at,
+                "schema_version": schema_version,
+            }
+            return Checkpoint.from_dict(payload)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("stored checkpoint payload is invalid") from exc
 
-    def _load_pending_writes(self, checkpoint_id: str) -> List[PendingWrite]:
-        cur = self._conn.execute(
-            "SELECT task_id, channel, value FROM checkpoint_writes "
-            "WHERE checkpoint_id = ?",
-            (checkpoint_id,),
-        )
-        writes = []
-        for task_id, channel, value_json in cur.fetchall():
-            value = json.loads(value_json) if value_json is not None else None
-            writes.append(PendingWrite(task_id=task_id, channel=channel, value=value))
-        return writes
-
-    def _load_metadata(self, checkpoint_id: str) -> CheckpointMetadata:
-        cur = self._conn.execute(
+    @staticmethod
+    def _load_metadata(
+        conn: sqlite3.Connection, checkpoint_id: str
+    ) -> CheckpointMetadata:
+        row = conn.execute(
             "SELECT source, step_int, parents, run_id FROM checkpoint_metadata "
             "WHERE checkpoint_id = ?",
             (checkpoint_id,),
-        )
-        row = cur.fetchone()
+        ).fetchone()
         if row is None:
             return CheckpointMetadata()
         source, step_int, parents_json, run_id = row
-        meta: CheckpointMetadata = {}
+        metadata: CheckpointMetadata = {}
         if source is not None:
-            meta["source"] = source
+            metadata["source"] = source
         if step_int is not None:
-            meta["step"] = step_int
+            metadata["step"] = step_int
         if parents_json is not None:
-            meta["parents"] = json.loads(parents_json)
+            try:
+                parents = json.loads(parents_json)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("stored checkpoint metadata is invalid") from exc
+            if not isinstance(parents, dict):
+                raise ValueError("stored checkpoint parents must be an object")
+            metadata["parents"] = parents
         if run_id is not None:
-            meta["run_id"] = run_id
-        return meta
+            metadata["run_id"] = run_id
+        return metadata
 
-    def _resolve_config(self, config: CheckpointConfig) -> Optional[CheckpointId]:
+    @staticmethod
+    def _resolve_id(
+        conn: sqlite3.Connection, config: CheckpointConfig
+    ) -> CheckpointId | None:
         if config.checkpoint_id is not None:
             return config.checkpoint_id
-        # find latest for thread
-        cur = self._conn.execute(
+        row = conn.execute(
             "SELECT checkpoint_id FROM checkpoints "
             "WHERE thread_id = ? ORDER BY step DESC, rowid DESC LIMIT 1",
             (config.thread_id,),
-        )
-        row = cur.fetchone()
+        ).fetchone()
         return CheckpointId(row[0]) if row else None
 
-    def _find_parent_config(self, thread_id: str, parent_id: Optional[str]) -> Optional[CheckpointConfig]:
-        if parent_id is None:
+    @classmethod
+    def _get_tuple_sync(
+        cls, conn: sqlite3.Connection, config: CheckpointConfig
+    ) -> CheckpointTuple | None:
+        checkpoint_id = cls._resolve_id(conn, config)
+        if checkpoint_id is None:
             return None
-        return CheckpointConfig(thread_id=thread_id, checkpoint_id=CheckpointId(parent_id))
+        row = conn.execute(
+            f"SELECT {_CHECKPOINT_COLUMNS} FROM checkpoints "
+            "WHERE checkpoint_id = ? AND thread_id = ?",
+            (checkpoint_id, config.thread_id),
+        ).fetchone()
+        if row is None:
+            return None
+        checkpoint = cls._row_to_checkpoint(row)
+        parent_config = (
+            None
+            if checkpoint.parent_id is None
+            else CheckpointConfig(
+                thread_id=checkpoint.parent_thread_id or checkpoint.thread_id,
+                checkpoint_id=checkpoint.parent_id,
+            )
+        )
+        return CheckpointTuple(
+            config=CheckpointConfig(
+                thread_id=checkpoint.thread_id,
+                checkpoint_id=checkpoint.id,
+            ),
+            checkpoint=checkpoint,
+            metadata=cls._load_metadata(conn, checkpoint_id),
+            parent_config=parent_config,
+        )
 
-    # ---- sync interface ----
-
-    def put(
+    async def put(
         self,
         config: CheckpointConfig,
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
-        new_versions: StateVersions,
     ) -> CheckpointConfig:
-        with self._conn:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO checkpoints "
-                "(checkpoint_id, thread_id, step, state_data, state_versions, "
-                "versions_seen, parent_id, created_at, schema_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    checkpoint.id,
-                    checkpoint.thread_id,
-                    checkpoint.step,
-                    json.dumps(checkpoint.state_data, ensure_ascii=False),
-                    json.dumps(checkpoint.state_versions, ensure_ascii=False),
-                    json.dumps(checkpoint.versions_seen, ensure_ascii=False),
-                    checkpoint.parent_id,
-                    checkpoint.created_at,
-                    checkpoint.schema_version,
-                ),
+        if config.thread_id != checkpoint.thread_id:
+            raise ValueError("checkpoint thread_id does not match config")
+        durable = checkpoint.to_dict()
+        Checkpoint.from_dict(durable)
+        owned_metadata = deepcopy(metadata)
+
+        def operation(conn: sqlite3.Connection) -> CheckpointConfig:
+            with conn:
+                conn.execute(
+                    "INSERT INTO checkpoints "
+                    "(checkpoint_id, thread_id, step, state_data, task_text, "
+                    "task_data, history_data, parent_id, parent_thread_id, "
+                    "created_at, schema_version) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(checkpoint_id) DO UPDATE SET "
+                    "thread_id = excluded.thread_id, "
+                    "step = excluded.step, "
+                    "state_data = excluded.state_data, "
+                    "task_text = excluded.task_text, "
+                    "task_data = excluded.task_data, "
+                    "history_data = excluded.history_data, "
+                    "parent_id = excluded.parent_id, "
+                    "parent_thread_id = excluded.parent_thread_id, "
+                    "created_at = excluded.created_at, "
+                    "schema_version = excluded.schema_version "
+                    "WHERE checkpoints.thread_id = excluded.thread_id",
+                    (
+                        durable["id"],
+                        durable["thread_id"],
+                        durable["step"],
+                        json.dumps(
+                            durable["state_data"],
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
+                        durable["task_text"],
+                        (
+                            json.dumps(
+                                durable["task_data"],
+                                ensure_ascii=False,
+                                allow_nan=False,
+                            )
+                            if durable["task_data"] is not None
+                            else None
+                        ),
+                        (
+                            json.dumps(
+                                durable["history"],
+                                ensure_ascii=False,
+                                allow_nan=False,
+                            )
+                            if durable["history"] is not None
+                            else None
+                        ),
+                        durable["parent_id"],
+                        durable["parent_thread_id"],
+                        durable["created_at"],
+                        durable["schema_version"],
+                    ),
+                )
+                row = conn.execute(
+                    "SELECT thread_id FROM checkpoints WHERE checkpoint_id = ?",
+                    (durable["id"],),
+                ).fetchone()
+                if row is None or row[0] != durable["thread_id"]:
+                    raise ValueError(
+                        "checkpoint id already belongs to another thread"
+                    )
+                conn.execute(
+                    "INSERT INTO checkpoint_metadata "
+                    "(checkpoint_id, source, step_int, parents, run_id) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(checkpoint_id) DO UPDATE SET "
+                    "source = excluded.source, "
+                    "step_int = excluded.step_int, "
+                    "parents = excluded.parents, "
+                    "run_id = excluded.run_id",
+                    (
+                        durable["id"],
+                        owned_metadata.get("source"),
+                        owned_metadata.get("step"),
+                        json.dumps(
+                            owned_metadata.get("parents", {}),
+                            ensure_ascii=False,
+                            allow_nan=False,
+                        ),
+                        owned_metadata.get("run_id"),
+                    ),
+                )
+            return CheckpointConfig(
+                thread_id=config.thread_id,
+                checkpoint_id=CheckpointId(durable["id"]),
             )
-            # metadata
-            self._conn.execute(
-                "INSERT OR REPLACE INTO checkpoint_metadata "
-                "(checkpoint_id, source, step_int, parents, run_id) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    checkpoint.id,
-                    metadata.get("source"),
-                    metadata.get("step"),
-                    json.dumps(metadata.get("parents", {}), ensure_ascii=False),
-                    metadata.get("run_id"),
-                ),
-            )
 
-        return CheckpointConfig(
-            thread_id=config.thread_id, checkpoint_id=checkpoint.id
-        )
+        return await self._run(operation)
 
-    def get_tuple(self, config: CheckpointConfig) -> Optional[CheckpointTuple]:
-        cp_id = self._resolve_config(config)
-        if cp_id is None:
-            return None
-        cur = self._conn.execute(
-            "SELECT checkpoint_id, thread_id, step, state_data, state_versions, "
-            "versions_seen, parent_id, created_at, schema_version "
-            "FROM checkpoints WHERE checkpoint_id = ?",
-            (cp_id,),
-        )
-        row = cur.fetchone()
-        if row is None:
-            return None
-        checkpoint = self._row_to_checkpoint(row)
-        pending_writes = self._load_pending_writes(cp_id)
-        meta = self._load_metadata(cp_id)
-        parent_config = self._find_parent_config(checkpoint.thread_id, checkpoint.parent_id)
+    async def get_tuple(
+        self, config: CheckpointConfig
+    ) -> Optional[CheckpointTuple]:
+        return await self._run(lambda conn: self._get_tuple_sync(conn, config))
 
-        return CheckpointTuple(
-            config=CheckpointConfig(
-                thread_id=checkpoint.thread_id, checkpoint_id=checkpoint.id
-            ),
-            checkpoint=checkpoint,
-            metadata=meta,
-            parent_config=parent_config,
-            pending_writes=pending_writes if pending_writes else None,
-        )
-
-    def list(
+    async def list(
         self,
         config: CheckpointConfig,
         *,
         limit: Optional[int] = None,
         before: Optional[CheckpointConfig] = None,
-    ) -> Iterator[CheckpointTuple]:
-        params: list = [config.thread_id]
-        sql = (
-            "SELECT checkpoint_id, thread_id, step, state_data, state_versions, "
-            "versions_seen, parent_id, created_at, schema_version "
-            "FROM checkpoints WHERE thread_id = ?"
-        )
-        if before is not None and before.checkpoint_id is not None:
-            sql += " AND step < (SELECT step FROM checkpoints WHERE checkpoint_id = ?)"
-            params.append(before.checkpoint_id)
-        sql += " ORDER BY step DESC, rowid DESC"
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(limit)
+    ) -> List[CheckpointTuple]:
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be non-negative or None")
 
-        cur = self._conn.execute(sql, params)
-        for row in cur.fetchall():
-            checkpoint = self._row_to_checkpoint(row)
-            pending_writes = self._load_pending_writes(checkpoint.id)
-            meta = self._load_metadata(checkpoint.id)
-            parent_config = self._find_parent_config(
-                checkpoint.thread_id, checkpoint.parent_id
-            )
-            yield CheckpointTuple(
-                config=CheckpointConfig(
-                    thread_id=checkpoint.thread_id,
-                    checkpoint_id=checkpoint.id,
-                ),
-                checkpoint=checkpoint,
-                metadata=meta,
-                parent_config=parent_config,
-                pending_writes=pending_writes if pending_writes else None,
-            )
+        def operation(conn: sqlite3.Connection) -> List[CheckpointTuple]:
+            params: list[Any] = [config.thread_id]
+            sql = f"SELECT {_CHECKPOINT_COLUMNS} FROM checkpoints WHERE thread_id = ?"
+            if before is not None and before.checkpoint_id is not None:
+                before_row = conn.execute(
+                    "SELECT step, rowid FROM checkpoints "
+                    "WHERE checkpoint_id = ? AND thread_id = ?",
+                    (before.checkpoint_id, config.thread_id),
+                ).fetchone()
+                if before_row is not None:
+                    sql += (
+                        " AND (step < ? OR (step = ? AND rowid < ?))"
+                    )
+                    params.extend([before_row[0], before_row[0], before_row[1]])
+            sql += " ORDER BY step DESC, rowid DESC"
+            if limit is not None:
+                sql += " LIMIT ?"
+                params.append(limit)
 
-    def put_writes(
-        self,
-        config: CheckpointConfig,
-        writes: Sequence[PendingWrite],
-        task_id: str,
-    ) -> None:
-        cp_id = self._resolve_config(config)
-        if cp_id is None:
-            return
-        with self._conn:
-            for w in writes:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO checkpoint_writes "
-                    "(checkpoint_id, task_id, channel, value) "
-                    "VALUES (?, ?, ?, ?)",
-                    (
-                        cp_id,
-                        w.task_id,
-                        w.channel,
-                        json.dumps(w.value, ensure_ascii=False) if w.value is not None else None,
-                    ),
+            results: List[CheckpointTuple] = []
+            for row in conn.execute(sql, params).fetchall():
+                checkpoint = self._row_to_checkpoint(row)
+                parent_config = (
+                    None
+                    if checkpoint.parent_id is None
+                    else CheckpointConfig(
+                        thread_id=(
+                            checkpoint.parent_thread_id or checkpoint.thread_id
+                        ),
+                        checkpoint_id=checkpoint.parent_id,
+                    )
+                )
+                results.append(
+                    CheckpointTuple(
+                        config=CheckpointConfig(
+                            thread_id=checkpoint.thread_id,
+                            checkpoint_id=checkpoint.id,
+                        ),
+                        checkpoint=checkpoint,
+                        metadata=self._load_metadata(conn, checkpoint.id),
+                        parent_config=parent_config,
+                    )
+                )
+            return results
+
+        return await self._run(operation)
+
+    async def delete(self, config: CheckpointConfig) -> None:
+        def operation(conn: sqlite3.Connection) -> None:
+            checkpoint_id = self._resolve_id(conn, config)
+            if checkpoint_id is None:
+                return
+            row = conn.execute(
+                "SELECT 1 FROM checkpoints WHERE checkpoint_id = ? "
+                "AND thread_id = ?",
+                (checkpoint_id, config.thread_id),
+            ).fetchone()
+            if row is None:
+                return
+            with conn:
+                conn.execute(
+                    "DELETE FROM checkpoint_metadata WHERE checkpoint_id = ?",
+                    (checkpoint_id,),
+                )
+                conn.execute(
+                    "DELETE FROM checkpoints WHERE checkpoint_id = ?",
+                    (checkpoint_id,),
                 )
 
-    def delete(self, config: CheckpointConfig) -> None:
-        cp_id = self._resolve_config(config)
-        if cp_id is None:
-            return
-        with self._conn:
-            self._conn.execute(
-                "DELETE FROM checkpoint_writes WHERE checkpoint_id = ?", (cp_id,)
-            )
-            self._conn.execute(
-                "DELETE FROM checkpoint_metadata WHERE checkpoint_id = ?", (cp_id,)
-            )
-            self._conn.execute(
-                "DELETE FROM checkpoints WHERE checkpoint_id = ?", (cp_id,)
-            )
+        await self._run(operation)
 
 
 __all__ = ["SqliteCheckpointStore"]

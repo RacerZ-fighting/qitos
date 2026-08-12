@@ -20,7 +20,6 @@ from .config import TracingMode
 from .models import NoOpTrace, Span, SpanData, SpanType, Trace
 from .processor import TraceProcessor
 from .provider import TracingProvider
-from .legacy_processor import LegacyTraceWriterProcessor
 
 # Optional W&B processor — only available when wandb is installed
 try:
@@ -91,8 +90,6 @@ __all__ = [
     "TracingMode",
     # provider
     "TracingProvider",
-    # legacy bridge
-    "LegacyTraceWriterProcessor",
     # global helpers
     "set_trace_processors",
     "add_trace_processor",

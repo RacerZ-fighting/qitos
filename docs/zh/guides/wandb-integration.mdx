@@ -83,10 +83,11 @@ result = agent.run(task="...", return_state=True)
 
 ## 与其他处理器组合
 
-`add_trace_processor` 会将处理器追加到全局列表，因此可以将 `WandbTraceProcessor` 与其他 `TraceProcessor`（例如默认写入磁盘的 `LegacyTraceWriterProcessor`）组合使用：
+`add_trace_processor` 会将处理器追加到全局列表，因此可以将 `WandbTraceProcessor` 与其他 `TraceProcessor`（例如用于 JSON 导出的 `JsonFileTraceProcessor`）组合使用：
 
 ```python
 from qitos.tracing import add_trace_processor
+from qitos.tracing.json_processor import JsonFileTraceProcessor
 from qitos.tracing.wandb_processor import WandbTraceProcessor
 
 wandb_processor = WandbTraceProcessor(
@@ -94,8 +95,9 @@ wandb_processor = WandbTraceProcessor(
     config={"model": "gpt-4o"},
 )
 add_trace_processor(wandb_processor)
+add_trace_processor(JsonFileTraceProcessor(output_dir=".traces", streaming=True))
 
-# 默认的文件 trace 写入器仍然生效
+# 当前 provider 同时启用 W&B 和 JSON 处理器
 result = agent.run(task="...", return_state=True)
 ```
 

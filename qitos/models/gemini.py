@@ -509,7 +509,10 @@ class GeminiModel(Model):
         }
         if self.base_url:
             http_options["base_url"] = self.base_url
-        owner = genai.Client(api_key=self.api_key, http_options=http_options)
+        owner = genai.Client(
+            api_key=self.api_key,
+            http_options=cast(Any, http_options),
+        )
         client = owner.aio
         try:
             responses = await client.models.generate_content_stream(

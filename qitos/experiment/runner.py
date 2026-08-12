@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..cache import CacheBackend, DiskCache, InMemoryCache
-from ..checkpoint import CheckpointManager
 from ..config.loader import AgentConfig
 from ..core.agent_module import AgentModule
 from ..core.spec import BenchmarkRunResult, ExperimentSpec
@@ -91,17 +90,6 @@ def _build_cache_backend(
     )
 
 
-def _build_checkpoint_manager(
-    checkpoint_config: Optional[Dict[str, Any]] = None,
-) -> Optional[CheckpointManager]:
-    """Build a CheckpointManager from experiment config dict."""
-    if not checkpoint_config:
-        return None
-    cp_dir = checkpoint_config.get("dir", "./runs/checkpoints")
-    interval = checkpoint_config.get("interval", 1)
-    return CheckpointManager(cp_dir, interval=interval)
-
-
 class ExperimentRunner:
     """Execute experiments across tasks and parameter sweeps.
 
@@ -111,7 +99,6 @@ class ExperimentRunner:
         sweep: Optional SweepSpec for parameter sweeps.
         experiment_spec: Optional ExperimentSpec metadata.
         cache_config: Optional dict for cache backend configuration.
-        checkpoint_config: Optional dict for checkpoint configuration.
         concurrency: Number of parallel tasks (default 1 = sequential).
         resume: If True, skip tasks that already have results.
         output_dir: Directory to write results.
@@ -124,7 +111,6 @@ class ExperimentRunner:
         sweep: Optional[SweepSpec] = None,
         experiment_spec: Optional[ExperimentSpec] = None,
         cache_config: Optional[Dict[str, Any]] = None,
-        checkpoint_config: Optional[Dict[str, Any]] = None,
         concurrency: int = 1,
         resume: bool = False,
         output_dir: str = "./runs/experiments",
@@ -134,7 +120,6 @@ class ExperimentRunner:
         self.sweep = sweep or SweepSpec()
         self.experiment_spec = experiment_spec or ExperimentSpec()
         self.cache_config = cache_config
-        self.checkpoint_config = checkpoint_config
         self.concurrency = max(1, concurrency)
         self.resume = resume
         self.output_dir = Path(output_dir)
@@ -248,16 +233,19 @@ class ExperimentRunner:
         """Extract tasks from AgentConfig dataset."""
         if not self.config.dataset:
             return []
-        return [
-            {
-                "task": item.task,
-                "expected": item.expected,
-                "metadata": item.metadata,
-            }
-            if hasattr(item, "task")
-            else item
-            for item in self.config.dataset
-        ]
+        tasks: List[Dict[str, Any]] = []
+        for item in self.config.dataset:
+            if isinstance(item, dict):
+                tasks.append(dict(item))
+                continue
+            tasks.append(
+                {
+                    "task": item.task,
+                    "expected": item.expected,
+                    "metadata": item.metadata,
+                }
+            )
+        return tasks
 
     def _run_single(
         self,
@@ -275,15 +263,16 @@ class ExperimentRunner:
 
             budget = RuntimeBudget(max_steps=max_steps)
 
-            # Build cache/checkpoint per-run to avoid shared mutable state
+            # Build cache per run to avoid shared mutable state.
             cache_backend = _build_cache_backend(self.cache_config)
-            checkpoint_manager = _build_checkpoint_manager(self.checkpoint_config)
 
+            agent = self.agent
+            if agent is None:
+                raise RuntimeError("experiment agent is not configured")
             engine = Engine(
-                agent=self.agent,
+                agent=agent,
                 budget=budget,
                 cache_backend=cache_backend,
-                checkpoint_manager=checkpoint_manager,
             )
 
             engine_result = engine.run(task_text)

@@ -18,6 +18,12 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **可恢复的异步 checkpoint**：Engine 只在安全 step 边界等待唯一的
+  `CheckpointStore`，保存原始任务、完整模型历史前缀、状态与 fork 链路。SQLite
+  操作不会阻塞 event loop，取消传播前会先等待数据库调用稳定结束；旧 JSON manager、
+  会丢数据的 durability 线程、空壳 pending-write 层和 trace 桥接均已删除。
+  `TraceWriter` 会先提交完整 step 的事件范围，再写入 step 标记；取消等生命周期事件
+  仍会立即可见。
 - **模型运行时只保留一条原生异步路径**：`Engine.arun()` 与 `Engine.astep()` 统一负责
   从模型请求到终态响应的完整过程。OpenAI Responses、Anthropic Messages、兼容 Chat
   Completions、Gemini、LiteLLM 与 Ollama 都实现同一个异步流契约；旧的同步/异步类层级、

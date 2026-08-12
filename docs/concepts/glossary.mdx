@@ -127,13 +127,8 @@ The abstract interface for saving and loading agent run state. Implementations i
 
 Creating a new checkpoint branch from an existing checkpoint without overwriting the original. Supports time-travel (same thread) and true branching (new thread).
 
-### DurabilityMode
-
-Controls how aggressively checkpoints are persisted. `SYNC` mode writes to disk before continuing the run.
-
-### StateVersionTracker
-
-Tracks per-field version numbers in agent state, enabling fine-grained change detection between checkpoints.
+Checkpoint writes are awaited at safe step boundaries. A failed write fails the
+run instead of being queued, dropped, or reported as successful.
 
 ## Integration terms
 

@@ -55,6 +55,19 @@ How to update:
 
 ### Changed
 
+- **Breaking:** Checkpoints now have one asynchronous persistence owner. Engine waits
+  for state, task, complete model history, and lineage to reach the configured store at
+  each safe step boundary; SQLite operations run off the event loop and settle before
+  cancellation propagates. Fork and checkpoint-store APIs are async-only.
+- **Breaking:** Removed the legacy JSON `CheckpointManager`, background durability
+  queue, unused pending-write manager, ineffective state-version tracker, and legacy
+  tracing bridge. Persistence failures are no longer dropped or reported as success.
+- Trace runtime events now commit through the existing `TraceWriter` at one completed
+  step boundary: event payloads flush before the step marker, while cancellation and
+  other lifecycle events remain immediately visible.
+- Checkpoint history snapshots now detach nested provider items and reject orphan or
+  incomplete tool transactions before they reach durable storage. SQLite updates keep
+  one checkpoint row per id and enforce thread-scoped reads, listing, and deletion.
 - **Breaking:** `AgentTool` now requires one explicit `invocation_factory` and uses only
   the canonical `execution_mode`. Removed the class registry, generic model/workspace
   construction, hidden worktree argument, `allow_background` alias, and the separate

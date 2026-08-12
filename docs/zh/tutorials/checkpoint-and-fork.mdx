@@ -30,11 +30,11 @@ agent = MyAgent()
 engine = Engine(agent, checkpoint_store=store, auto_approve=True)
 
 # 运行 Agent — 检查点自动保存
-result = engine.run("分析数据集")
+result = await engine.arun("分析数据集")
 
 # 访问最新检查点
 config = CheckpointConfig(thread_id=result.run_id)
-latest = store.get_tuple(config)
+latest = await store.get_tuple(config)
 print(f"Checkpoint at step {latest.checkpoint.step}")
 ```
 
@@ -56,8 +56,8 @@ from qitos.checkpoint import CheckpointConfig
 # thread_id 标识运行（通常是 run_id）
 config = CheckpointConfig(thread_id="my-run-001")
 
-# 恢复运行
-result = engine.run("继续分析", checkpoint_config=config)
+# 从状态和完整模型历史快照恢复运行
+result = await engine.aresume_from_checkpoint(config)
 ```
 
 Engine 从最新检查点恢复状态，从中断处继续执行。
@@ -76,20 +76,22 @@ source_config = CheckpointConfig(
 )
 
 # 分叉到新线程（真正分支）
-fork_config = fork_checkpoint(store, source_config, new_thread_id="my-run-001-branch-a")
+fork_config = await fork_checkpoint(
+    store,
+    source_config,
+    new_thread_id="my-run-001-branch-a",
+)
 
 # 从分叉状态以不同提示运行 Agent
-result = engine.run(
-    "尝试不同策略",
-    checkpoint_config=fork_config,
-)
+result = await engine.aresume_from_checkpoint(fork_config)
 ```
 
 原始运行不受影响。分叉运行从相同状态开始，但可以走不同路径。
 
 ## Step 4: 时间旅行（同线程分叉）
 
-如果省略 `new_thread_id`，分叉替换同线程内的当前状态——适用于"撤销并重试"场景：
+如果省略 `new_thread_id`，分叉会在同一线程创建新的检查点并保留原有链路——适用于
+"撤销并重试"场景：
 
 ```python
 from qitos.checkpoint import fork_checkpoint, CheckpointConfig
@@ -99,40 +101,27 @@ config = CheckpointConfig(
     thread_id="my-run-001",
     checkpoint_id="step2-checkpoint-id",
 )
-time_travel_config = fork_checkpoint(store, config)
+time_travel_config = await fork_checkpoint(store, config)
 
 # 从更早状态重新运行
-result = engine.run("从第 2 步重新开始，修改指令", checkpoint_config=time_travel_config)
+result = await engine.aresume_from_checkpoint(time_travel_config)
 ```
 
-## Step 5: 持久化模式
+## Step 5: 持久化边界
 
-控制检查点持久化的激进程度：
+`Engine.arun()` 会在完整 step 结束后等待 `CheckpointStore.put()`。写入成功前，
+该 step 不算持久化完成。SQLite 操作在线程外执行；取消发生时，会先等待正在执行的
+数据库调用稳定结束，再继续传播取消。
 
-```python
-from qitos.checkpoint import DurabilityMode
+## Step 6: 检查快照
 
-# SYNC: 继续前写入磁盘（最安全，较慢）
-engine = Engine(agent, checkpoint_store=store, checkpoint_durability=DurabilityMode.SYNC)
-
-# 默认: 检查点已保存，但持久化取决于存储实现
-```
-
-## Step 6: 状态版本追踪
-
-追踪检查点之间哪些状态字段发生了变化：
+每个 checkpoint 保存恢复和 fork 真正需要的状态、原始任务、完整模型历史前缀与父级链路：
 
 ```python
-from qitos.checkpoint import StateVersionTracker
-
-tracker = StateVersionTracker()
-
-# 每步之后，追踪变化
 config = CheckpointConfig(thread_id="my-run-001")
-tuple_ = store.get_tuple(config)
-versions = tuple_.checkpoint.state_versions
-print(f"State field versions: {versions}")
-# 例如 {'scratchpad': 3, 'current_step': 5, 'final_result': 1}
+tuple_ = await store.get_tuple(config)
+print(tuple_.checkpoint.task_text)
+print(tuple_.checkpoint.history.messages)
 ```
 
 ---
