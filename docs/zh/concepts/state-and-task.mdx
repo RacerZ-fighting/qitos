@@ -60,6 +60,39 @@ def init_state(self, task: str, **kwargs: Any) -> ResearchState:
     )
 ```
 
+### 轻量 WorkPlan
+
+长任务需要一份有序清单时，使用 `WorkPlanState`。它是强类型状态，不是 TaskBoard，也不是
+自由 metadata。`update_plan` 工具只返回经过校验的整表替换，AgentModule 再通过纯 reducer
+应用成功结果：
+
+```python
+from dataclasses import dataclass, field
+from typing import Sequence
+
+from qitos import Action, StateSchema, ToolResult, WorkPlanState, reduce_work_plan
+
+
+@dataclass
+class CodingState(StateSchema):
+    work_plan: WorkPlanState = field(default_factory=WorkPlanState)
+
+
+def commit_action_results(
+    self,
+    state: CodingState,
+    actions: Sequence[Action],
+    results: Sequence[ToolResult],
+    *,
+    step_id: int,
+) -> None:
+    state.work_plan = reduce_work_plan(state.work_plan, actions, results)
+```
+
+在 StateSchema codec 中使用 `work_plan_state_to_dict()` 和
+`work_plan_state_from_dict()`，checkpoint 才能重建强类型值。
+`render_work_plan_markdown()` 只生成可丢弃的 TODO 投影，不能反向读取为真源。
+
 ### 让运行停下来
 
 你可以在 `reduce` 中调用 `state.set_stop()`，让运行在下一次停止检查时终止。它接受 `StopReason` 枚举或等价字符串。

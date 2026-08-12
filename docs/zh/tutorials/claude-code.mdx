@@ -20,7 +20,7 @@ description: "构建一个长时间运行的编码智能体，并理解何时从
 |---|---|---|
 | 工具 | 手工注册表 + 裁剪版 `CodingToolSet` | `coding_tools(...)` 预设注册表 |
 | 提示词 | 规划器 + 执行器提示词 | 单个重工作流系统提示词 |
-| 状态 | 计划与游标 | 待办事项、模式、目标文件、验证命令、可选文档链接 |
+| 状态 | 计划与游标 | WorkPlan、模式、目标文件、验证命令、可选文档链接 |
 | 历史 | 默认行为 | 显式 `HistoryPolicy(max_messages=16, max_tokens=2800)` |
 | 记忆 | 不使用 | 默认仍不使用，但此时记忆开始成为真实选项 |
 | 上下文压缩 | 还未引入 | 作为更长运行的升级路径被正式引入 |
@@ -31,7 +31,7 @@ description: "构建一个长时间运行的编码智能体，并理解何时从
 
 ```text
 Workflow:
-- Start by writing a todo list with `todo_write`.
+- Start by writing a work plan with `update_plan`.
 - If you are unsure which tool to use, call `tool_search`.
 - Read before you edit.
 - Make the smallest correct change.

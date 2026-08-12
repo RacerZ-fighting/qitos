@@ -11,9 +11,21 @@ import argparse
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
-from qitos import Action, AgentModule, Decision, HistoryPolicy, RunSpec, StateSchema
+from qitos import (
+    Action,
+    AgentModule,
+    Decision,
+    HistoryPolicy,
+    RunSpec,
+    StateSchema,
+    ToolResult,
+    WorkPlanState,
+    reduce_work_plan,
+    work_plan_state_from_dict,
+    work_plan_state_to_dict,
+)
 from qitos.harness import build_harness_policy, build_model_for_preset, resolve_family_preset
 from qitos.kit import ReActTextParser, format_action
 from qitos.kit.toolset import coding_tools
@@ -31,7 +43,7 @@ DOC_URL = os.getenv("QITOS_CLAUDE_CODE_DOC_URL", "").strip()
 SYSTEM_PROMPT = """You are a Claude Code-style coding agent.
 
 Workflow:
-- Start by writing a todo list with `todo_write`.
+- Start by writing a work plan with `update_plan`.
 - If you are unsure which tool to use, call `tool_search`.
 - Read before you edit.
 - Make the smallest correct change.
@@ -43,18 +55,33 @@ Preferred tool patterns:
 - Editing: `edit_file`, `write_file`
 - Search: `glob`, `grep`, `tool_search`
 - Execution: `run_command`
-- Planning/state: `todo_write`, `enter_plan_mode`, `exit_plan_mode`
+- Planning/state: `update_plan`, `enter_plan_mode`, `exit_plan_mode`
 """
 
 
 @dataclass
 class ClaudeCodeState(StateSchema):
     scratchpad: list[str] = field(default_factory=list)
-    todos: list[dict[str, Any]] = field(default_factory=list)
+    work_plan: WorkPlanState = field(default_factory=WorkPlanState)
     target_file: str = TARGET_FILE
     test_command: str = TEST_COMMAND
     doc_url: str = DOC_URL
     mode: str = "work"
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = super().to_dict()
+        payload["work_plan"] = work_plan_state_to_dict(self.work_plan)
+        return payload
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: dict[str, Any],
+        strict: bool = True,
+    ) -> "ClaudeCodeState":
+        owned = dict(payload)
+        owned["work_plan"] = work_plan_state_from_dict(owned["work_plan"])
+        return super().from_dict(owned, strict=strict)
 
 
 class ClaudeCodeAgent(AgentModule[ClaudeCodeState, dict[str, Any], Action]):
@@ -102,16 +129,25 @@ class ClaudeCodeAgent(AgentModule[ClaudeCodeState, dict[str, Any], Action]):
         ]
         if state.doc_url:
             lines.append(f"Optional documentation URL: {state.doc_url}")
-        if state.todos:
-            lines.append("Current todos:")
-            for item in state.todos:
-                lines.append(
-                    f"- {item.get('content', '')} [{item.get('status', 'pending')}]"
-                )
+        if state.work_plan.items:
+            lines.append("Current work plan:")
+            for item in state.work_plan.items:
+                lines.append(f"- {item.step} [{item.status.value}]")
         if state.scratchpad:
             lines.append("Recent trajectory:")
             lines.extend(state.scratchpad[-10:])
         return "\n".join(lines)
+
+    def commit_action_results(
+        self,
+        state: ClaudeCodeState,
+        actions: Sequence[Action],
+        results: Sequence[ToolResult],
+        *,
+        step_id: int,
+    ) -> None:
+        _ = step_id
+        state.work_plan = reduce_work_plan(state.work_plan, actions, results)
 
     def reduce(
         self,
@@ -132,16 +168,12 @@ class ClaudeCodeAgent(AgentModule[ClaudeCodeState, dict[str, Any], Action]):
             first = action_results[0]
             state.scratchpad.append(f"Observation: {first}")
             if isinstance(first, dict):
-                if first.get("todos"):
-                    state.todos = list(first.get("todos") or [])
                 if first.get("current_mode"):
                     state.mode = str(first.get("current_mode"))
                 if int(first.get("returncode", 1)) == 0:
                     state.final_result = (
                         "Verification passed with the canonical coding toolset."
                     )
-            if state.metadata.get("todos"):
-                state.todos = list(state.metadata.get("todos") or [])
             if state.metadata.get("mode"):
                 state.mode = str(state.metadata.get("mode"))
         state.scratchpad = state.scratchpad[-40:]
@@ -331,7 +363,7 @@ def main(argv: list[str] | None = None) -> None:
     print("tool_delivery:", harness.tool_policy.primary_delivery)
     print("native_tool_call_preferred:", harness.tool_policy.native_tool_call_preferred)
     print("final_result:", result.state.final_result)
-    print("todos:", result.state.todos)
+    print("work_plan:", work_plan_state_to_dict(result.state.work_plan))
     print("mode:", result.state.mode)
     print("stop_reason:", result.state.stop_reason)
 

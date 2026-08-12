@@ -66,6 +66,22 @@ from .function_tool_decorator import function_tool
 from .channel import Append, Replace, Ephemeral, last_value, append_list, dict_merge, add_messages
 from .field_reducers import FieldReducerRegistry
 from .tool_registry import ToolRegistry
+from .work_plan import (
+    MAX_WORK_PLAN_EXPLANATION_CHARS,
+    MAX_WORK_PLAN_ITEMS,
+    MAX_WORK_PLAN_STEP_CHARS,
+    UPDATE_PLAN_TOOL_NAME,
+    WorkPlanContractError,
+    WorkPlanItem,
+    WorkPlanState,
+    WorkPlanStatus,
+    WorkPlanUpdate,
+    parse_work_plan_update,
+    reduce_work_plan,
+    render_work_plan_markdown,
+    work_plan_state_from_dict,
+    work_plan_state_to_dict,
+)
 from .agent_spec import AgentSpec, AgentRegistry, ContextStrategy, HandoffContext, StateAdapter
 from .shared_memory import SharedMemory, InMemorySharedMemory, FileSharedMemory, SharedMemoryNamespace, SharedMemoryManager
 
@@ -147,6 +163,20 @@ __all__ = [
     "add_messages",
     "FieldReducerRegistry",
     "ToolRegistry",
+    "MAX_WORK_PLAN_EXPLANATION_CHARS",
+    "MAX_WORK_PLAN_ITEMS",
+    "MAX_WORK_PLAN_STEP_CHARS",
+    "UPDATE_PLAN_TOOL_NAME",
+    "WorkPlanContractError",
+    "WorkPlanItem",
+    "WorkPlanState",
+    "WorkPlanStatus",
+    "WorkPlanUpdate",
+    "parse_work_plan_update",
+    "reduce_work_plan",
+    "render_work_plan_markdown",
+    "work_plan_state_from_dict",
+    "work_plan_state_to_dict",
     "AgentSpec",
     "AgentRegistry",
     "ContextStrategy",

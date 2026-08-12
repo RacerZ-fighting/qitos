@@ -25,6 +25,7 @@ from qitos.kit.tool.internal.coding_utils import (
     truncate_text,
     utc_now,
 )
+from qitos.kit.tool.internal.work_plan import UpdateWorkPlanTool
 from qitos.kit.tool.internal.runtime_ops import select_runtime_ops
 from qitos.kit.tool.notebook import NotebookToolSet
 
@@ -252,7 +253,7 @@ class CodingToolSet:
             "run_command",
             "web_fetch",
             "ask_user_choice",
-            "todo_write",
+            "update_plan",
             "tool_search",
             "enter_plan_mode",
             "exit_plan_mode",
@@ -311,6 +312,7 @@ class CodingToolSet:
         )
         self._session_tasks: Dict[str, Dict[str, Any]] = {}
         self._task_counter = 0
+        self.update_plan = UpdateWorkPlanTool()
 
     def setup(self, context: Dict[str, Any]) -> None:
         _ = context
@@ -1447,24 +1449,6 @@ class CodingToolSet:
         """
         _ = runtime_context
         return {"status": "needs_input", "questions": list(questions or [])}
-
-    @function_tool(name="todo_write")
-    def todo_write(
-        self,
-        todos: List[Dict[str, Any]],
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """
-        Write lightweight todo items into runtime state metadata.
-
-        :param todos: Todo item list.
-        :param runtime_context: Optional runtime context injected by the executor.
-        """
-        state = (runtime_context or {}).get("state")
-        normalized = [dict(item) for item in list(todos or [])]
-        if state is not None and hasattr(state, "metadata"):
-            state.metadata["todos"] = normalized
-        return {"status": "success", "count": len(normalized), "todos": normalized}
 
     @function_tool(name="tool_search", read_only=True)
     def tool_search(

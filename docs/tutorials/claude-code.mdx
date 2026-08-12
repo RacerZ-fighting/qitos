@@ -20,7 +20,7 @@ The lesson studies `examples/real/claude_code_agent.py`.
 |---|---|---|
 | Tools | Manual registry around a trimmed `CodingToolSet` | `coding_tools(...)` preset registry |
 | Prompt | Planner + executor prompts | One workflow-heavy system prompt |
-| State | Plan and cursor | Todos, mode, target file, verification command, optional doc URL |
+| State | Plan and cursor | WorkPlan, mode, target file, verification command, optional doc URL |
 | History | Default behavior | Explicit `HistoryPolicy(max_messages=16, max_tokens=2800)` |
 | Memory | None | Still none by default, but now memory becomes a real design option |
 | Compaction | Not introduced | Introduced as an upgrade path for longer runs -- summarizing older context to stay within token limits |
@@ -31,7 +31,7 @@ Unlike lesson 1, this prompt is not just a parser contract. It also encodes oper
 
 ```text
 Workflow:
-- Start by writing a todo list with `todo_write`.
+- Start by writing a work plan with `update_plan`.
 - If you are unsure which tool to use, call `tool_search`.
 - Read before you edit.
 - Make the smallest correct change.

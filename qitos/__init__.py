@@ -20,6 +20,18 @@ from .core.observation import Observation
 from .core.tool_result import ToolResult, ToolResultStatus
 from .core.artifact import ArtifactRef, ArtifactStore, ArtifactStoreError
 from .core.state import StateSchema
+from .core.work_plan import (
+    WorkPlanContractError,
+    WorkPlanItem,
+    WorkPlanState,
+    WorkPlanStatus,
+    WorkPlanUpdate,
+    parse_work_plan_update,
+    reduce_work_plan,
+    render_work_plan_markdown,
+    work_plan_state_from_dict,
+    work_plan_state_to_dict,
+)
 from .core.spec import BenchmarkRunResult, ExperimentSpec, RunSpec
 from .core.task import (
     Task,
@@ -62,6 +74,16 @@ __all__ = [
     "TaskBudget",
     "TaskResult",
     "StateSchema",
+    "WorkPlanContractError",
+    "WorkPlanItem",
+    "WorkPlanState",
+    "WorkPlanStatus",
+    "WorkPlanUpdate",
+    "parse_work_plan_update",
+    "reduce_work_plan",
+    "render_work_plan_markdown",
+    "work_plan_state_from_dict",
+    "work_plan_state_to_dict",
     "Decision",
     "Action",
     "Memory",

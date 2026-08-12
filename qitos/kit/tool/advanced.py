@@ -48,11 +48,6 @@ class ToolSearchTool(_DelegatingTool):
         super().__init__(CodingToolSet().tool_search)
 
 
-class TodoWriteTool(_DelegatingTool):
-    def __init__(self):
-        super().__init__(CodingToolSet().todo_write)
-
-
 class EnterPlanModeTool(_DelegatingTool):
     def __init__(self):
         super().__init__(CodingToolSet().enter_plan_mode)
@@ -141,6 +136,5 @@ __all__ = [
     "LSPQueryTool",
     "MCPListResourcesTool",
     "MCPReadResourceTool",
-    "TodoWriteTool",
     "ToolSearchTool",
 ]

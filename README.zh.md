@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **强类型 WorkPlan**：`WorkPlanState` 与 `update_plan` 提供经过校验、可随
+  checkpoint 恢复的轻量清单，并带有纯 reducer 和确定性 Markdown 投影。coding preset
+  不再直接修改自由格式的 todo metadata。
 - **Terminal resume trace 正确收尾**：恢复已经终止的 checkpoint 不会执行模型或工具，
   新配置的空 trace manifest 也会立即进入终态。
 - **唯一的 Shell 准入边界**：`run_command` 通过常规工具准入后直接执行，不再在

@@ -159,7 +159,8 @@ def test_predefined_registry_builders_expose_atomic_tools(tmp_path):
     assert "read_file" in coding_registry.list_tools()
     assert "glob" in coding_registry.list_tools()
     assert "run_command" in coding_registry.list_tools()
-    assert "todo_write" in coding_registry.list_tools()
+    assert "update_plan" in coding_registry.list_tools()
+    assert "todo_write" not in coding_registry.list_tools()
     assert "tool_search" in coding_registry.list_tools()
     assert "edit_file" in coding_registry.list_tools()
     assert "edit_file" in advanced_registry.list_tools()
@@ -207,7 +208,7 @@ def test_advanced_coding_toolset_registers_cleanly(tmp_path):
     registry = ToolRegistry()
     registry.register_toolset(toolset, namespace="")
     assert "web_fetch" in registry.list_tools()
-    assert "todo_write" in registry.list_tools()
+    assert "update_plan" in registry.list_tools()
 
 
 def test_tool_descriptions_come_from_docstrings():

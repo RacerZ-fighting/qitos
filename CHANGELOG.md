@@ -34,6 +34,9 @@ How to update:
 - Added an optional explicit process-environment snapshot for host command
   capabilities and `RunCommand`, applied consistently to shell, argv, and background
   subprocess paths while preserving inherited-environment behavior by default.
+- Added a typed lightweight `WorkPlanState`, pure ordered reducer, checkpoint codec,
+  deterministic Markdown projection, and mutation-free `update_plan` tool. The coding
+  preset now uses this contract instead of unchecked `todo_write` metadata.
 - Added typed `ArtifactRef`/`ArtifactStore` contracts and a workspace-relative
   `FileArtifactStore` for complete oversized tool outputs.
 - Added a qita same-spec comparison preflight that checks stable model, prompt, tool,

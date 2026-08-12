@@ -60,6 +60,40 @@ def init_state(self, task: str, **kwargs: Any) -> ResearchState:
     )
 ```
 
+### Lightweight WorkPlan
+
+Use `WorkPlanState` when a long-running agent needs a small ordered checklist. It is a
+typed state value, not a task board and not free-form metadata. The `update_plan` tool
+returns a complete validated replacement; your AgentModule applies successful results
+through the pure reducer:
+
+```python
+from dataclasses import dataclass, field
+from typing import Sequence
+
+from qitos import Action, StateSchema, ToolResult, WorkPlanState, reduce_work_plan
+
+
+@dataclass
+class CodingState(StateSchema):
+    work_plan: WorkPlanState = field(default_factory=WorkPlanState)
+
+
+def commit_action_results(
+    self,
+    state: CodingState,
+    actions: Sequence[Action],
+    results: Sequence[ToolResult],
+    *,
+    step_id: int,
+) -> None:
+    state.work_plan = reduce_work_plan(state.work_plan, actions, results)
+```
+
+Use `work_plan_state_to_dict()` and `work_plan_state_from_dict()` in your StateSchema
+codec so checkpoints reconstruct the typed value. `render_work_plan_markdown()` creates
+a disposable TODO projection; never read that projection back as canonical state.
+
 ### Stopping the run
 
 Call `state.set_stop()` from within `reduce` (the hook that folds the step's observation and decision back into state) to halt the run on the next stop check. It accepts a `StopReason` enum value or its string equivalent.

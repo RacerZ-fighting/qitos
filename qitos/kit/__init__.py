@@ -63,6 +63,7 @@ from .tool import (
     ReportToolSet,
     SendTerminalKeys,
     TaskToolSet,
+    UpdateWorkPlanTool,
     WorkspaceAwareMixin,
 )
 from .tool.toolset import toolset_from_tools
@@ -152,6 +153,7 @@ __all__ = [
     "ReportToolSet",
     "EpubToolSet",
     "TaskToolSet",
+    "UpdateWorkPlanTool",
     "WorkspaceAwareMixin",
     "toolset_from_tools",
     "coding_tools",

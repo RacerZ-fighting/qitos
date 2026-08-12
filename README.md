@@ -24,6 +24,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Application-owned command environments**: host command capabilities and
   `RunCommand` can now receive one explicit environment snapshot for shell, argv, and
   background processes, while existing callers continue to inherit by default.
+- **Typed work plans**: `WorkPlanState` and `update_plan` provide one validated,
+  checkpoint-friendly checklist with a pure reducer and deterministic Markdown
+  projection. The coding preset no longer mutates free-form todo metadata.
 - **Terminal resume traces close cleanly**: resuming an already terminal checkpoint
   creates no model or tool step and now finalizes its empty trace manifest.
 - **One shell admission boundary**: `run_command` now executes after normal tool

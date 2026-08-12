@@ -12,9 +12,9 @@ from .advanced import (
     LSPQueryTool,
     MCPListResourcesTool,
     MCPReadResourceTool,
-    TodoWriteTool,
     ToolSearchTool,
 )
+from .internal.work_plan import UpdateWorkPlanTool
 from .coding import CodingToolSet
 from .epub import EpubToolSet
 from .notebook import (
@@ -95,7 +95,7 @@ __all__ = [
     "BaseToolLibrary",
     "SkillToolSet",
     "WorkspaceAwareMixin",
-    "TodoWriteTool",
+    "UpdateWorkPlanTool",
     "ToolSearchTool",
     "math_tools",
     "editor_tools",

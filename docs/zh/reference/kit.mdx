@@ -60,6 +60,7 @@ from qitos.harness import build_harness_policy, build_model_for_preset
 
 ### 规划与搜索
 
+- `UpdateWorkPlanTool` / `update_plan`：维护一份强类型、可随 checkpoint 恢复的轻量清单
 - `NumberedPlanBuilder`
 - `PlanCursor`
 - `DynamicTreeSearch`
@@ -179,6 +180,7 @@ QitOS 的工具集帮你直接组合出一个工作环境，而不是一组松�
 
 规划辅助工具帮你在不重写运行时的情况下引入显式计划与搜索结构：
 
+- `UpdateWorkPlanTool`：校验并返回完整 WorkPlan 更新，不直接修改状态
 - `NumberedPlanBuilder`：从编号列表构建计划
 - `PlanCursor`：记录计划执行进度
 - `DynamicTreeSearch`：在分支候选之间做选择与扩展

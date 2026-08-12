@@ -16,7 +16,7 @@ from qitos.kit.tool import (
     LSPQueryTool,
     MCPListResourcesTool,
     MCPReadResourceTool,
-    TodoWriteTool,
+    UpdateWorkPlanTool,
     ToolSearchTool,
 )
 from qitos.kit.tool.file import EditFile, ReadFile
@@ -408,11 +408,11 @@ def test_session_tools_and_tool_search(tmp_path):
     state = _ExecutorState(task="advanced")
     ctx = {"state": state, "tool_registry": registry}
 
-    todo = TodoWriteTool().execute(
-        {"todos": [{"content": "ship", "status": "pending"}]},
+    todo = UpdateWorkPlanTool().execute(
+        {"plan": [{"step": "ship", "status": "pending"}]},
         runtime_context=ctx,
     )
-    assert todo["count"] == 1
+    assert len(todo["plan"]) == 1
 
     plan_enter = registry.get("enter_plan_mode").execute(
         {"reason": "decompose"}, runtime_context=ctx
