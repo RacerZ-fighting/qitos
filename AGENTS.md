@@ -60,6 +60,11 @@ These are non-negotiable:
 
 - Keep a single mainline architecture. Do not introduce parallel architecture tracks.
 - Do not create `V1`, `V2`, `Legacy`, `Next`, or alias-based duplicate concepts in core APIs.
+- Before adding a framework capability, inspect the existing QitOS owner, callers, and
+  behavior tests. Extend or correct that implementation in place instead of adding a
+  wrapper, gateway, mirror type, second codec, or parallel runtime path.
+- A replacement is complete only when callers, tests, exports, and documentation use the
+  canonical implementation and the superseded mechanism is removed in the same change.
 - Keep stable contracts in `qitos.core`; put replaceable concrete implementations in `qitos.kit`.
 - Preserve the `AgentModule + Engine` story as the primary public mental model.
 - Prefer explicit contracts and hook points over hidden magic.
