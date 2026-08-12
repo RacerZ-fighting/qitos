@@ -1,6 +1,8 @@
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from examples._support import SequenceModel
 from qitos import (
     Action,
     AgentModule,
@@ -15,16 +17,57 @@ from qitos import (
 from qitos.core.history import History, HistoryMessage
 from qitos.kit.memory import WindowMemory
 from qitos.kit.env import ScreenshotEnv
-from qitos.kit.history import WindowHistory
+from qitos.kit.history import CompactHistory, WindowHistory
 from qitos.kit.parser import ReActTextParser
 from qitos.core.memory import Memory, MemoryRecord
 from qitos.engine import RuntimeBudget
+from qitos.engine.states import ContextConfig
+from qitos.models import Model, ModelStreamChunk
 from qitos.trace import runtime_step_to_trace
 
 
 @dataclass
 class DemoState(StateSchema):
     logs: list[str] = field(default_factory=list)
+
+
+class _ChunkSequenceModel(Model):
+    """Deterministic model stream used by Engine behavior tests."""
+
+    def __init__(
+        self,
+        transactions: list[list[ModelStreamChunk]],
+        *,
+        model: str = "test-model",
+        provider: str = "test",
+        context_window: int = 128_000,
+        max_tokens: int = 2_048,
+    ) -> None:
+        super().__init__(
+            model=model,
+            context_window=context_window,
+            max_tokens=max_tokens,
+            temperature=None,
+        )
+        self.provider_name = provider
+        self.transactions = [list(chunks) for chunks in transactions]
+        self.calls: list[list[dict[str, Any]]] = []
+        self.request_options: list[dict[str, Any]] = []
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = deadline_monotonic
+        self.calls.append([dict(message) for message in messages])
+        self.request_options.append(dict(kwargs))
+        if not self.transactions:
+            raise AssertionError("no scripted model transaction remains")
+        for chunk in self.transactions.pop(0):
+            yield chunk
 
 
 class DemoAgent(AgentModule[DemoState, dict[str, Any], Action]):
@@ -78,6 +121,105 @@ def test_engine_happy_path():
     assert result.to_dict()["tool_calls_by_name"]["add"] == 1
 
 
+def test_tool_loop_detection_can_be_disabled_for_long_running_agents():
+    class RepeatingAgent(AgentModule[DemoState, dict[str, Any], Action]):
+        def __init__(self) -> None:
+            registry = ToolRegistry()
+            self.calls = 0
+
+            @tool(name="GLOB")
+            def glob() -> dict[str, str]:
+                self.calls += 1
+                return {
+                    "status": "success",
+                    "domain_outcome": "no_match",
+                    "model_summary": "[GLOB:no_match]\n\nEnumeration complete: yes",
+                }
+
+            registry.register(glob)
+            super().__init__(tool_registry=registry)
+
+        def init_state(self, task: str, **kwargs: Any) -> DemoState:
+            _ = kwargs
+            return DemoState(task=task, max_steps=6)
+
+        def decide(
+            self, state: DemoState, observation: dict[str, Any]
+        ) -> Decision[Action]:
+            _ = observation
+            if state.current_step < 5:
+                return Decision.act(actions=[Action(name="GLOB", args={})])
+            return Decision.final("done")
+
+        def reduce(
+            self,
+            state: DemoState,
+            observation: dict[str, Any],
+            decision: Decision[Action],
+        ) -> DemoState:
+            _ = observation, decision
+            return state
+
+    agent = RepeatingAgent()
+    result = Engine(
+        agent=agent,
+        budget=RuntimeBudget(max_steps=6),
+        context_config=ContextConfig(tool_call_loop_detection_enabled=False),
+    ).run("repeat")
+
+    assert result.state.final_result == "done"
+    assert agent.calls == 5
+    assert all(
+        record.action_results[0].status == "success" for record in result.records[:5]
+    )
+    assert not any(
+        event.payload.get("stage") == "tool_call_loop_detected"
+        for event in result.events
+    )
+
+
+def test_tool_loop_detection_remains_enabled_by_default():
+    class RepeatingAgent(AgentModule[DemoState, dict[str, Any], Action]):
+        def __init__(self) -> None:
+            registry = ToolRegistry()
+            self.calls = 0
+
+            @tool(name="GLOB")
+            def glob() -> dict[str, str]:
+                self.calls += 1
+                return {"model_summary": "[GLOB:no_match]"}
+
+            registry.register(glob)
+            super().__init__(tool_registry=registry)
+
+        def init_state(self, task: str, **kwargs: Any) -> DemoState:
+            _ = kwargs
+            return DemoState(task=task, max_steps=5)
+
+        def decide(
+            self, state: DemoState, observation: dict[str, Any]
+        ) -> Decision[Action]:
+            _ = observation
+            if state.current_step < 4:
+                return Decision.act(actions=[Action(name="GLOB", args={})])
+            return Decision.final("done")
+
+        def reduce(
+            self,
+            state: DemoState,
+            observation: dict[str, Any],
+            decision: Decision[Action],
+        ) -> DemoState:
+            _ = observation, decision
+            return state
+
+    agent = RepeatingAgent()
+    result = Engine(agent=agent, budget=RuntimeBudget(max_steps=5)).run("repeat")
+
+    assert agent.calls == 3
+    assert result.records[3].action_results[0].error == "tool_call_loop_detected"
+
+
 def test_agent_run_shortcut():
     agent = DemoAgent()
     assert agent.run("compute", trace=False, render=False) == "42"
@@ -89,7 +231,9 @@ def test_agent_condition_stop_is_not_automatic_success():
             _ = kwargs
             return DemoState(task=task, max_steps=3)
 
-        def decide(self, state: DemoState, observation: dict[str, Any]) -> Decision[Action]:
+        def decide(
+            self, state: DemoState, observation: dict[str, Any]
+        ) -> Decision[Action]:
             _ = observation
             return Decision.act(
                 actions=[Action(name="add", args={"a": 1, "b": 1})],
@@ -166,17 +310,12 @@ def test_engine_injects_memory_context_into_env_view():
 
 
 def test_engine_default_model_decide_with_prepare():
-    seen_messages: list[dict[str, str]] = []
-
-    class _DummyModel:
-        def __call__(self, messages):
-            seen_messages.extend(messages)
-            return "Action: add(a=20, b=22)"
+    model = SequenceModel(["Action: add(a=20, b=22)"])
 
     class LLMDrivenDemo(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _DummyModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
 
         def build_system_prompt(self, state: DemoState) -> str | None:
@@ -194,6 +333,7 @@ def test_engine_default_model_decide_with_prepare():
         "compute"
     )
     assert result.state.final_result == "42"
+    seen_messages = model.calls[0]
     assert len(seen_messages) == 2
     assert seen_messages[0]["role"] == "system"
     assert seen_messages[1]["role"] == "user"
@@ -204,23 +344,15 @@ def test_engine_includes_current_step_visual_input_in_user_message(tmp_path):
     png_path.write_bytes(
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x04\x00\x00\x00\xb5\x1c\x0c\x02\x00\x00\x00\x0bIDATx\xdac\xfc\xff\x1f\x00\x02\xeb\x01\xf5i\xf6\x81\xb7\x00\x00\x00\x00IEND\xaeB`\x82"
     )
-    seen_messages: list[dict[str, Any]] = []
-
-    class _VisualModel:
-        model = "gpt-4.1-mini"
-
-        def __call__(self, messages, **kwargs):
-            _ = kwargs
-            seen_messages.extend(messages)
-            return "Final Answer: visual complete"
-
-        def supports_multimodal_input(self) -> bool:
-            return True
+    model = SequenceModel(
+        ["Final Answer: visual complete"],
+        model="gpt-4.1-mini",
+    )
 
     class VisualDemo(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _VisualModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
 
         def build_system_prompt(self, state: DemoState) -> str | None:
@@ -243,7 +375,7 @@ def test_engine_includes_current_step_visual_input_in_user_message(tmp_path):
         "inspect"
     )
     assert result.state.final_result == "visual complete"
-    user_message = seen_messages[-1]
+    user_message = model.calls[0][-1]
     assert user_message["role"] == "user"
     assert isinstance(user_message["content"], list)
     assert user_message["content"][0]["type"] == "text"
@@ -255,17 +387,12 @@ def test_engine_includes_current_step_visual_input_in_user_message(tmp_path):
 
 
 def test_engine_uses_history_messages_for_next_llm_call():
-    calls: list[list[dict[str, str]]] = []
-
-    class _DummyModel:
-        def __call__(self, messages):
-            calls.append(list(messages))
-            return "Action: add(a=1, b=1)"
+    model = SequenceModel(["Action: add(a=1, b=1)", "Action: add(a=1, b=1)"])
 
     class MultiTurnLLMDemo(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _DummyModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
 
         def build_system_prompt(self, state: DemoState) -> str | None:
@@ -287,6 +414,7 @@ def test_engine_uses_history_messages_for_next_llm_call():
         history_policy=HistoryPolicy(max_messages=4),
     ).run("compute")
     assert result.state.final_result == "42"
+    calls = model.calls
     assert len(calls) == 2
     assert calls[0][0]["role"] == "system"
     assert calls[0][-1]["role"] == "user"
@@ -296,22 +424,55 @@ def test_engine_uses_history_messages_for_next_llm_call():
     assert calls[1][2]["role"] == "assistant"
 
 
-def test_engine_emits_parser_events_and_records_step_diagnostics():
-    class _DummyModel:
-        def __init__(self):
-            self.outputs = [
-                "Thought only without action",
-                "Action: add(a=20, b=22)",
-                "Final Answer: 42",
-            ]
+def test_engine_can_start_from_a_history_snapshot() -> None:
+    model = SequenceModel(["Final Answer: continued"])
 
-        def __call__(self, messages):
-            return self.outputs.pop(0)
+    class _Agent(DemoAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.llm = model
+            self.model_parser = ReActTextParser()
+            self.history = CompactHistory(auto_compact=False)
+
+        def decide(self, state: DemoState, observation: dict[str, Any]):
+            _ = state, observation
+            return None
+
+    parent = CompactHistory(auto_compact=False)
+    inherited_user = HistoryMessage(
+        role="user", content={"source": "parent", "sequence": 1}, step_id=0
+    )
+    inherited_assistant = HistoryMessage(
+        role="assistant", content={"source": "parent", "sequence": 2}, step_id=0
+    )
+    parent.append(inherited_user)
+    parent.append(inherited_assistant)
+
+    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=1)).run(
+        "continue", history_snapshot=parent.snapshot()
+    )
+
+    assert result.state.final_result == "continued"
+    assert any(
+        message.get("content") == inherited_assistant.content
+        for message in model.calls[0]
+    )
+    assert parent.messages == [inherited_user, inherited_assistant]
+
+
+def test_engine_emits_parser_events_and_records_step_diagnostics():
+    model = SequenceModel(
+        [
+            "Thought only without action",
+            "Action: add(a=20, b=22)",
+            "Final Answer: 42",
+        ]
+    )
 
     class ParserDiagDemo(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _DummyModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
 
         def build_system_prompt(self, state: DemoState) -> str | None:
@@ -350,29 +511,34 @@ def test_engine_emits_parser_events_and_records_step_diagnostics():
 
 def test_engine_interpret_model_response_bypasses_parser_and_records_summary():
     seen: list[ModelResponse] = []
-
-    class _ResponseModel:
-        model = "demo-model"
-        provider = "demo-provider"
-
-        def __call__(self, messages):
-            _ = messages
-            return {
-                "content": "model said to use the add tool",
-                "usage": {
-                    "prompt_tokens": 12,
-                    "completion_tokens": 5,
-                    "total_tokens": 17,
-                },
-                "finish_reason": "stop",
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "add", "arguments": '{"a": 20, "b": 22}'},
-                    }
-                ],
-            }
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    text="model said to use the add tool",
+                    done=True,
+                    usage={
+                        "prompt_tokens": 12,
+                        "completion_tokens": 5,
+                        "total_tokens": 17,
+                    },
+                    finish_reason="stop",
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": '{"a": 20, "b": 22}',
+                            },
+                        }
+                    ],
+                )
+            ]
+        ],
+        model="demo-model",
+        provider="demo-provider",
+    )
 
     class _NeverParser:
         def parse(self, raw_output, context=None):
@@ -385,7 +551,7 @@ def test_engine_interpret_model_response_bypasses_parser_and_records_summary():
     class _InterpretAgent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _ResponseModel()
+            self.llm = model
             self.model_parser = _NeverParser()
 
         def decide(self, state: DemoState, observation: dict[str, Any]):
@@ -443,21 +609,23 @@ def test_engine_interpret_model_response_bypasses_parser_and_records_summary():
 
 def test_engine_interpret_model_response_can_fall_back_to_parser():
     seen: list[ModelResponse] = []
-
-    class _ResponseModel:
-        model = "demo-model"
-
-        def __call__(self, messages):
-            _ = messages
-            return {
-                "content": "Final Answer: 42",
-                "usage": {
-                    "prompt_tokens": 9,
-                    "completion_tokens": 3,
-                    "total_tokens": 12,
-                },
-                "finish_reason": "stop",
-            }
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    text="Final Answer: 42",
+                    done=True,
+                    usage={
+                        "prompt_tokens": 9,
+                        "completion_tokens": 3,
+                        "total_tokens": 12,
+                    },
+                    finish_reason="stop",
+                )
+            ]
+        ],
+        model="demo-model",
+    )
 
     class _TrackingParser(ReActTextParser):
         def __init__(self):
@@ -473,7 +641,7 @@ def test_engine_interpret_model_response_can_fall_back_to_parser():
     class _InterpretAgent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _ResponseModel()
+            self.llm = model
             self.model_parser = parser
 
         def decide(self, state: DemoState, observation: dict[str, Any]):
@@ -544,17 +712,12 @@ def test_engine_uses_history_retrieve_contract():
         def reset(self, run_id=None) -> None:
             self._records = []
 
-    seen_messages: list[dict[str, str]] = []
-
-    class _DummyModel:
-        def __call__(self, messages):
-            seen_messages.extend(messages)
-            return "Final Answer: 42"
+    model = SequenceModel(["Final Answer: 42"])
 
     class LLMOnceAgent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _DummyModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
 
         def build_system_prompt(self, state: DemoState) -> str | None:
@@ -575,7 +738,7 @@ def test_engine_uses_history_retrieve_contract():
     assert result.state.final_result == "42"
     assert hist.retrieve_called >= 1
     assert mem.retrieve_called == 0
-    assert any(m.get("content") == "history_hint" for m in seen_messages)
+    assert any(m.get("content") == "history_hint" for m in model.calls[0])
 
 
 def test_memory_and_history_streams_are_strictly_separated():
@@ -617,14 +780,12 @@ def test_memory_and_history_streams_are_strictly_separated():
         def reset(self, run_id=None) -> None:
             self.messages = []
 
-    class _DummyModel:
-        def __call__(self, messages):
-            return "Final Answer: ok"
+    model = SequenceModel(["Final Answer: ok"])
 
     class OneShotLLMAgent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _DummyModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
 
         def build_system_prompt(self, state: DemoState) -> str | None:
@@ -656,18 +817,17 @@ def test_memory_and_history_streams_are_strictly_separated():
 
 
 def test_engine_records_context_telemetry_and_defaults_to_compact_runtime_history():
-    class _DummyModel:
-        model = "dummy-context"
-        max_tokens = 128
-        context_window = 4096
-
-        def __call__(self, messages):
-            return "Final Answer: ok"
+    model = _ChunkSequenceModel(
+        [[ModelStreamChunk(text="Final Answer: ok", done=True)]],
+        model="dummy-context",
+        max_tokens=128,
+        context_window=4096,
+    )
 
     class _Agent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _DummyModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
 
         def build_system_prompt(self, state: DemoState) -> str | None:
@@ -689,30 +849,29 @@ def test_engine_records_context_telemetry_and_defaults_to_compact_runtime_histor
 
 
 def test_engine_prefers_provider_usage_for_context_totals():
-    class _UsageModel:
-        model = "dummy-usage"
-        max_tokens = 128
-        context_window = 8192
-
-        def __init__(self):
-            self._used = False
-
-        def __call__(self, messages):
-            self._used = True
-            return "Final Answer: exact"
-
-        def count_tokens(self, payload):
-            return 10
-
-        def extract_usage(self):
-            if not self._used:
-                return None
-            return {"prompt_tokens": 123, "completion_tokens": 17, "total_tokens": 140}
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    text="Final Answer: exact",
+                    done=True,
+                    usage={
+                        "prompt_tokens": 123,
+                        "completion_tokens": 17,
+                        "total_tokens": 140,
+                    },
+                )
+            ]
+        ],
+        model="dummy-usage",
+        max_tokens=128,
+        context_window=8192,
+    )
 
     class _Agent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _UsageModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
 
         def build_system_prompt(self, state: DemoState) -> str | None:
@@ -727,66 +886,75 @@ def test_engine_prefers_provider_usage_for_context_totals():
     result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=2)).run("demo")
     ctx = result.records[0].context
     assert result.state.final_result == "exact"
+    # Provider usage is authoritative after completion; the pre-request
+    # estimate remains separately auditable when a meter provided one.
     assert ctx["counting_mode"] == "provider_usage"
     assert ctx["input_tokens_total"] == 123
+    assert ctx["provider_prompt_tokens"] == 123
+    assert ctx["provider_completion_tokens"] == 17
+    assert ctx["provider_total_tokens"] == 140
     assert ctx["output_tokens"] == 17
     assert ctx["tokens_total"] == 140
 
 
-def test_engine_uses_native_tool_call_lane_before_parser():
-    class _RawResponseModel:
-        model = "qwen-plus"
-        provider = "openai-compatible"
-
-        def __init__(self):
-            self.qitos_harness_metadata = {
-                "family_preset": "qwen",
-                "tool_policy": {
-                    "primary_delivery": "api_parameter",
-                    "fallback_delivery": "prompt_injection",
-                    "native_tool_call_preferred": True,
-                },
-            }
-
-        def call_raw(self, messages):
-            _ = messages
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "add",
-                                        "arguments": '{"a": 20, "b": 22}',
-                                    },
-                                }
-                            ],
-                        },
-                        "finish_reason": "tool_calls",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 4,
-                    "total_tokens": 14,
-                },
-                "model": "qwen-plus",
-            }
+def test_engine_uses_model_stream_native_tool_calls_before_parser():
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    text="",
+                    event_type="tool_call.delta",
+                    event_metadata={
+                        "index": 0,
+                        "call_id": "call_1",
+                        "arguments_delta": '{"a": 20',
+                    },
+                ),
+                ModelStreamChunk(
+                    done=True,
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": '{"a": 20, "b": 22}',
+                            },
+                        }
+                    ],
+                    usage={
+                        "prompt_tokens": 10,
+                        "completion_tokens": 4,
+                        "total_tokens": 14,
+                    },
+                    finish_reason="tool_calls",
+                ),
+            ]
+        ],
+        model="qwen-plus",
+        provider="openai-compatible",
+    )
+    model.qitos_harness_metadata = {
+        "family_preset": "qwen",
+        "tool_policy": {
+            "primary_delivery": "api_parameter",
+            "fallback_delivery": "prompt_injection",
+            "native_tool_call_preferred": True,
+        },
+    }
 
     class _NeverParser:
         def parse(self, raw_output, context=None):
             _ = raw_output
             _ = context
-            raise AssertionError("parser should be bypassed when native tool calls are used")
+            raise AssertionError(
+                "parser should be bypassed when native tool calls are used"
+            )
 
     class _Agent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _RawResponseModel()
+            self.llm = model
             self.model_parser = _NeverParser()
 
         def decide(self, state: DemoState, observation: dict[str, Any]):
@@ -795,7 +963,26 @@ def test_engine_uses_native_tool_call_lane_before_parser():
                 return Decision.final("42")
             return None
 
-    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=3)).run("compute")
+    class _ChunkHandler:
+        def __init__(self) -> None:
+            self.events: list[object] = []
+
+        def on_start(self) -> None:
+            self.events.append("start")
+
+        def on_delta(self, text: str) -> None:
+            self.events.append(text)
+
+        def on_chunk(self, chunk: ModelStreamChunk) -> None:
+            self.events.append((chunk.event_type, dict(chunk.event_metadata)))
+
+        def on_end(self) -> None:
+            self.events.append("end")
+
+    handler = _ChunkHandler()
+    engine = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=3))
+    engine.stream_callback = handler
+    result = engine.run("compute")
     assert result.state.final_result == "42"
     record = result.records[0]
     assert record.decision_source == "native_tool_calls"
@@ -804,6 +991,17 @@ def test_engine_uses_native_tool_call_lane_before_parser():
     assert record.actions[0].name == "add"
     assert record.actions[0].args == {"a": 20, "b": 22}
     assert record.model_response["tool_calls"][0]["function"]["name"] == "add"
+    assert record.model_response["finish_reason"] == "tool_calls"
+    assert handler.events[0] == "start"
+    assert handler.events[1] == (
+        "tool_call.delta",
+        {
+            "index": 0,
+            "call_id": "call_1",
+            "arguments_delta": '{"a": 20',
+        },
+    )
+    assert handler.events[-1] == "end"
     native_events = [
         e
         for e in result.events
@@ -816,63 +1014,114 @@ def test_engine_uses_native_tool_call_lane_before_parser():
     assert traced["native_tool_call_used"] is True
 
 
-def test_engine_sanitizes_submit_poc_native_tool_history_without_mutating_result():
-    seen_messages: list[list[dict[str, Any]]] = []
-
-    class _SubmitModel:
-        model = "GLM-5.1"
-        provider = "openai-compatible"
-
-        def __init__(self):
-            self.qitos_harness_metadata = {
-                "family_preset": "glm",
-                "tool_policy": {
-                    "primary_delivery": "api_parameter",
-                    "fallback_delivery": "prompt_injection",
-                    "native_tool_call_preferred": True,
-                },
-            }
-            self.calls = 0
-
-        def call_raw(self, messages):
-            self.calls += 1
-            seen_messages.append(list(messages))
-            if self.calls == 1:
-                return {
-                    "choices": [
+def test_engine_preserves_streamed_reasoning_for_trace_and_tool_follow_up():
+    reasoning = "Inspect the arguments before invoking the tool."
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(reasoning_content=reasoning),
+                ModelStreamChunk(
+                    done=True,
+                    tool_calls=[
                         {
-                            "message": {
-                                "content": "",
-                                "tool_calls": [
-                                    {
-                                        "id": "call_submit",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "submit_poc",
-                                            "arguments": "{}",
-                                        },
-                                    }
-                                ],
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": '{"a": 20, "b": 22}',
                             },
-                            "finish_reason": "tool_calls",
                         }
                     ],
-                    "model": "GLM-5.1",
-                }
-            return {
-                "choices": [
-                    {
-                        "message": {"content": "Final Answer: done"},
-                        "finish_reason": "stop",
-                    }
-                ],
-                "model": "GLM-5.1",
-            }
+                    finish_reason="tool_calls",
+                ),
+            ],
+            [ModelStreamChunk(text="Final Answer: done", done=True)],
+        ],
+        model="kimi-k3",
+        provider="openai-compatible",
+    )
+    model.qitos_harness_metadata = {
+        "family_preset": "kimi",
+        "tool_policy": {
+            "primary_delivery": "api_parameter",
+            "fallback_delivery": "prompt_injection",
+            "native_tool_call_preferred": True,
+        },
+    }
+
+    class _Agent(DemoAgent):
+        def __init__(self, llm: Model) -> None:
+            super().__init__()
+            self.llm = llm
+            self.model_parser = ReActTextParser()
+
+        def decide(self, state: DemoState, observation: dict[str, Any]):
+            _ = state, observation
+            return None
+
+    result = Engine(agent=_Agent(model), budget=RuntimeBudget(max_steps=3)).run(
+        "compute"
+    )
+
+    assert result.state.final_result == "done"
+    assert result.records[0].model_response["reasoning_content"] == reasoning
+    output_event = next(
+        event
+        for event in result.events
+        if getattr(event.phase, "value", event.phase) == "DECIDE"
+        and (event.payload or {}).get("stage") == "model_output"
+    )
+    assert output_event.payload["reasoning_content"] == reasoning
+    assistant = next(
+        message for message in model.calls[1] if message.get("role") == "assistant"
+    )
+    assert assistant["reasoning_content"] == reasoning
+    assert assistant["tool_calls"][0]["id"] == "call_1"
+
+
+def test_engine_sanitizes_submit_poc_native_tool_history_without_mutating_result():
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    done=True,
+                    tool_calls=[
+                        {
+                            "id": "call_submit",
+                            "type": "function",
+                            "function": {
+                                "name": "submit_poc",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ],
+            [
+                ModelStreamChunk(
+                    text="Final Answer: done",
+                    done=True,
+                    finish_reason="stop",
+                )
+            ],
+        ],
+        model="GLM-5.1",
+        provider="openai-compatible",
+    )
+    model.qitos_harness_metadata = {
+        "family_preset": "glm",
+        "tool_policy": {
+            "primary_delivery": "api_parameter",
+            "fallback_delivery": "prompt_injection",
+            "native_tool_call_preferred": True,
+        },
+    }
 
     class _SubmitAgent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _SubmitModel()
+            self.llm = model
 
             @tool(name="submit_poc")
             def submit_poc() -> dict[str, Any]:
@@ -888,6 +1137,7 @@ def test_engine_sanitizes_submit_poc_native_tool_history_without_mutating_result
                     "fix_stderr": "hidden stderr",
                     "vul_stdout": "target stdout",
                     "fix_stdout": "hidden stdout",
+                    "model_summary": "[submit_poc] attempt.bin\n\nNo vulnerable-target trigger was observed.\nVulnerable target exit: 0\nServer: wrong number of function inputs",
                 }
 
             self.tool_registry.register(submit_poc)
@@ -906,11 +1156,13 @@ def test_engine_sanitizes_submit_poc_native_tool_history_without_mutating_result
             _ = decision
             return state
 
-    result = Engine(agent=_SubmitAgent(), budget=RuntimeBudget(max_steps=3)).run("compute")
+    result = Engine(agent=_SubmitAgent(), budget=RuntimeBudget(max_steps=3)).run(
+        "compute"
+    )
 
     assert result.records[0].action_results[0].output["fix_exit_code"] == 0
-    assert len(seen_messages) >= 2
-    second_call_text = "\n".join(str(message) for message in seen_messages[1])
+    assert len(model.calls) >= 2
+    second_call_text = "\n".join(str(message) for message in model.calls[1])
     assert "wrong number of function inputs" in second_call_text
     assert "vul_exit_code" not in second_call_text
     assert "fix_exit_code" not in second_call_text
@@ -931,49 +1183,41 @@ def test_engine_sanitizes_submit_poc_native_tool_history_without_mutating_result
 
 def test_engine_agent_can_block_disallowed_actions_before_execution():
     executed = {"value": False}
-
-    class _RawResponseModel:
-        model = "qwen-plus"
-        provider = "openai-compatible"
-
-        def __init__(self):
-            self.qitos_harness_metadata = {
-                "family_preset": "qwen",
-                "tool_policy": {
-                    "primary_delivery": "api_parameter",
-                    "fallback_delivery": "prompt_injection",
-                    "native_tool_call_preferred": True,
-                },
-            }
-
-        def call_raw(self, messages):
-            _ = messages
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call_blocked",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "blocked_tool",
-                                        "arguments": "{}",
-                                    },
-                                }
-                            ],
-                        },
-                        "finish_reason": "tool_calls",
-                    }
-                ],
-                "model": "qwen-plus",
-            }
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    done=True,
+                    tool_calls=[
+                        {
+                            "id": "call_blocked",
+                            "type": "function",
+                            "function": {
+                                "name": "blocked_tool",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ]
+        ],
+        model="qwen-plus",
+        provider="openai-compatible",
+    )
+    model.qitos_harness_metadata = {
+        "family_preset": "qwen",
+        "tool_policy": {
+            "primary_delivery": "api_parameter",
+            "fallback_delivery": "prompt_injection",
+            "native_tool_call_preferred": True,
+        },
+    }
 
     class _BlockAgent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _RawResponseModel()
+            self.llm = model
 
             @tool(name="blocked_tool")
             def blocked_tool() -> str:
@@ -994,49 +1238,45 @@ def test_engine_agent_can_block_disallowed_actions_before_execution():
                 return "blocked for this state"
             return None
 
-    result = Engine(agent=_BlockAgent(), budget=RuntimeBudget(max_steps=3)).run("compute")
+    result = Engine(agent=_BlockAgent(), budget=RuntimeBudget(max_steps=3)).run(
+        "compute"
+    )
 
     assert executed["value"] is False
     first_result = result.records[0].action_results[0]
-    assert first_result.status == "error"
+    assert first_result.status == "denied"
     assert first_result.error == "action_blocked"
     assert first_result.metadata["error_category"] == "action_blocked"
     assert "blocked for this state" in str(first_result.output)
 
 
 def test_engine_salvages_glm_text_tool_call_markup_before_parser():
-    class _GLMMarkupModel:
-        model = "GLM-5.1"
-        provider = "openai-compatible"
-
-        def __init__(self):
-            self.qitos_harness_metadata = {
-                "family_preset": "glm",
-                "tool_policy": {
-                    "primary_delivery": "api_parameter",
-                    "fallback_delivery": "prompt_injection",
-                    "native_tool_call_preferred": True,
-                },
-            }
-
-        def call_raw(self, messages):
-            _ = messages
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                "<tool_call>add"
-                                "<arg_key>a</arg_key><arg_value>20</arg_value>"
-                                "<arg_key>b</arg_key><arg_value>22</arg_value>"
-                                "</tool_call>"
-                            ),
-                        },
-                        "finish_reason": "tool_calls",
-                    }
-                ],
-                "model": "GLM-5.1",
-            }
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    text=(
+                        "<tool_call>add"
+                        "<arg_key>a</arg_key><arg_value>20</arg_value>"
+                        "<arg_key>b</arg_key><arg_value>22</arg_value>"
+                        "</tool_call>"
+                    ),
+                    done=True,
+                    finish_reason="tool_calls",
+                )
+            ]
+        ],
+        model="GLM-5.1",
+        provider="openai-compatible",
+    )
+    model.qitos_harness_metadata = {
+        "family_preset": "glm",
+        "tool_policy": {
+            "primary_delivery": "api_parameter",
+            "fallback_delivery": "prompt_injection",
+            "native_tool_call_preferred": True,
+        },
+    }
 
     class _NeverParser:
         def parse(self, raw_output, context=None):
@@ -1047,7 +1287,7 @@ def test_engine_salvages_glm_text_tool_call_markup_before_parser():
     class _Agent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _GLMMarkupModel()
+            self.llm = model
             self.model_parser = _NeverParser()
 
         def decide(self, state: DemoState, observation: dict[str, Any]):
@@ -1066,89 +1306,101 @@ def test_engine_salvages_glm_text_tool_call_markup_before_parser():
     assert record.model_response["tool_calls"][0]["function"]["name"] == "add"
 
 
-def test_engine_native_tool_call_lane_falls_back_to_parser_on_bad_arguments():
-    class _BadArgsModel:
-        model = "qwen-plus"
-
-        def __init__(self):
-            self.qitos_harness_metadata = {
-                "family_preset": "qwen",
-                "tool_policy": {
-                    "primary_delivery": "api_parameter",
-                    "fallback_delivery": "prompt_injection",
-                    "native_tool_call_preferred": True,
-                },
-            }
-
-        def call_raw(self, messages):
-            _ = messages
-            return {
-                "content": "Final Answer: recovered",
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "add", "arguments": "{not-json"},
-                    }
-                ],
-            }
+def test_engine_native_tool_call_lane_returns_paired_error_on_bad_arguments():
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    text="Final Answer: must not bypass the invalid call",
+                    done=True,
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": "{not-json",
+                            },
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ],
+            [ModelStreamChunk(text="Final Answer: recovered", done=True)],
+        ],
+        model="qwen-plus",
+    )
+    model.qitos_harness_metadata = {
+        "family_preset": "qwen",
+        "tool_policy": {
+            "primary_delivery": "api_parameter",
+            "fallback_delivery": "prompt_injection",
+            "native_tool_call_preferred": True,
+        },
+    }
 
     class _Agent(DemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _BadArgsModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
 
         def decide(self, state: DemoState, observation: dict[str, Any]):
-            _ = observation
-            if state.current_step > 0:
-                return Decision.final("done")
+            _ = state, observation
             return None
 
-    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=3)).run("compute")
+    agent = _Agent()
+    result = Engine(agent=agent, budget=RuntimeBudget(max_steps=3)).run("compute")
+
+    assert len(model.calls) == 2
     assert result.state.final_result == "recovered"
     record = result.records[0]
-    assert record.decision_source == "parser"
-    assert record.native_tool_call_used is False
-    assert record.native_tool_call_fallback_reason == "tool_call_arguments_invalid"
-    fallback_events = [
-        e
-        for e in result.events
-        if getattr(e.phase, "value", e.phase) == "DECIDE"
-        and (e.payload or {}).get("stage") == "native_tool_call_fallback"
+    assert record.decision_source == "native_tool_calls"
+    assert record.native_tool_call_used is True
+    assert record.native_tool_call_fallback_reason is None
+    assert record.tool_invocations[0]["action_id"] == "call_1"
+    assert record.tool_invocations[0]["attempts"] == 0
+    assert record.tool_invocations[0]["error_category"] == (
+        "tool_call_arguments_invalid"
+    )
+    assert record.action_results[0].status == "error"
+    assert "TOOL_CALL_ARGUMENTS_INVALID" in record.action_results[0].output
+    tool_messages = [
+        message for message in model.calls[1] if message.get("role") == "tool"
     ]
-    assert fallback_events
+    assert [message.get("tool_call_id") for message in tool_messages] == ["call_1"]
 
 
 def test_engine_native_tool_call_lane_repairs_control_chars_in_arguments():
-    class _ControlCharArgsModel:
-        model = "qwen-plus"
-
-        def __init__(self):
-            self.qitos_harness_metadata = {
-                "family_preset": "qwen",
-                "tool_policy": {
-                    "primary_delivery": "api_parameter",
-                    "fallback_delivery": "prompt_injection",
-                    "native_tool_call_preferred": True,
-                },
-            }
-
-        def call_raw(self, messages):
-            _ = messages
-            return {
-                "content": None,
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "record_fact",
-                            "arguments": '{"evidence":"line1\nline2"}',
-                        },
-                    }
-                ],
-            }
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    done=True,
+                    tool_calls=[
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "record_fact",
+                                "arguments": '{"evidence":"line1\nline2"}',
+                            },
+                        }
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ]
+        ],
+        model="qwen-plus",
+    )
+    model.qitos_harness_metadata = {
+        "family_preset": "qwen",
+        "tool_policy": {
+            "primary_delivery": "api_parameter",
+            "fallback_delivery": "prompt_injection",
+            "native_tool_call_preferred": True,
+        },
+    }
 
     class _NeverParser:
         def parse(self, raw_output, context=None):
@@ -1168,7 +1420,7 @@ def test_engine_native_tool_call_lane_repairs_control_chars_in_arguments():
             AgentModule.__init__(
                 self,
                 tool_registry=registry,
-                llm=_ControlCharArgsModel(),
+                llm=model,
                 model_parser=_NeverParser(),
             )
 

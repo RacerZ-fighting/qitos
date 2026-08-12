@@ -9,31 +9,49 @@ import socketserver
 import tempfile
 import threading
 import zipfile
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from qitos.core import TerminalCapability
+from qitos.models import Model, ModelStreamChunk
 
 
-class SequenceModel:
-    """Deterministic callable model that returns one scripted output per call."""
+class SequenceModel(Model):
+    """Deterministic asynchronous model for examples and smoke tests."""
 
     def __init__(
         self,
         outputs: Iterable[str | Callable[[list[dict[str, Any]]], str]],
         *,
         model: str = "smoke-model",
-    ):
+    ) -> None:
+        super().__init__(model=model, temperature=None)
         self.outputs = list(outputs)
         self.calls: list[list[dict[str, Any]]] = []
-        self.model = model
 
-    def __call__(self, messages: list[dict[str, Any]], **_: Any) -> str:
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **_: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = deadline_monotonic
         self.calls.append(list(messages))
         if not self.outputs:
-            return "Final Answer: smoke complete"
-        item = self.outputs.pop(0)
-        return item(messages) if callable(item) else str(item)
+            text = "Final Answer: smoke complete"
+        else:
+            item = self.outputs.pop(0)
+            text = item(messages) if callable(item) else str(item)
+        if text:
+            yield ModelStreamChunk(text=text, event_type="text.delta")
+        yield ModelStreamChunk(
+            done=True,
+            event_type="scripted.completed",
+            event_metadata={"provider": self.provider_name, "model": self.model},
+            finish_reason="stop",
+        )
 
     def supports_multimodal_input(self) -> bool:
         return True
@@ -154,23 +172,23 @@ def write_minimal_epub(path: Path) -> None:
         zf.writestr("mimetype", "application/epub+zip")
         zf.writestr(
             "META-INF/container.xml",
-            "<?xml version=\"1.0\"?>"
-            "<container version=\"1.0\" xmlns=\"urn:oasis:names:tc:opendocument:xmlns:container\">"
-            "<rootfiles><rootfile full-path=\"OEBPS/content.opf\" media-type=\"application/oebps-package+xml\"/>"
+            '<?xml version="1.0"?>'
+            '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+            '<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>'
             "</rootfiles></container>",
         )
         zf.writestr(
             "OEBPS/content.opf",
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
-            "<package xmlns=\"http://www.idpf.org/2007/opf\" version=\"2.0\">"
-            "<metadata xmlns:dc=\"http://purl.org/dc/elements/1.1/\">"
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<package xmlns="http://www.idpf.org/2007/opf" version="2.0">'
+            '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
             "<dc:title>Smoke Book</dc:title></metadata>"
-            "<manifest><item id=\"chap1\" href=\"chapter1.xhtml\" media-type=\"application/xhtml+xml\"/></manifest>"
-            "<spine><itemref idref=\"chap1\"/></spine></package>",
+            '<manifest><item id="chap1" href="chapter1.xhtml" media-type="application/xhtml+xml"/></manifest>'
+            '<spine><itemref idref="chap1"/></spine></package>',
         )
         zf.writestr(
             "OEBPS/chapter1.xhtml",
-            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>Chapter 1</title></head>"
+            '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Chapter 1</title></head>'
             "<body><h1>Chapter 1</h1><p>The main argument of chapter 1 is that tests should be small and reliable.</p></body></html>",
         )
 

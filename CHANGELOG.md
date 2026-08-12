@@ -19,22 +19,150 @@ How to update:
 
 ### Added
 
-- Added opt-in OpenAI Responses API support for synchronous, asynchronous, and typed streaming calls, including structured output-item preservation, `call_id` tool-result correlation, stateless tool-round replay, and privacy-safe trace summaries. Chat Completions remains the default.
+- Added a qita same-spec comparison preflight that checks stable model, prompt, tool,
+  environment, context, budget, source, run-spec, and experiment provenance before
+  presenting outcome deltas as repeat-comparable.
+- Added absolute monotonic run deadlines and live `remaining_seconds`,
+  `deadline_monotonic`, and `agent_cancelled` accessors to tool runtime context.
+- Added backend-neutral `CapabilityEnv` composition plus bounded filesystem and
+  fixed-argv process contracts for tools that run on host, container, or remote
+  application providers without per-tool backend adapters.
+- Added a compact environment-backed coding workspace profile with bounded reads,
+  exact edits, `rg` glob/grep, binary hex inspection, listings, and directory creation.
+- Added provider-neutral managed `web_fetch` capability/tool support with an optional,
+  explicitly configured Kimi adapter, public-initial-URL validation, and bounded text
+  results. The selected model never implies a fetch service endpoint.
+- Added run-scoped `RuntimeInput` delivery and explicit idle wait/wakeup. Background
+  work can wake an Engine at the next model-safe boundary without polling, advancing
+  steps while idle, or fabricating a second tool result.
+- Added a bounded asynchronous model transport policy with one retry owner,
+  provider retry-hint handling, typed exhaustion errors, absolute deadlines, and
+  stream event-idle timeouts.
+- Added generic `model_summary` projection for native tool-call history and
+  model-visible observations. Tools can now retain full structured evidence
+  for reducers and replay while supplying a bounded readable result to models.
+- Added transient runtime-context delivery to `MessageBuildResult`. Custom
+  agents can fold authoritative controller state into the final real tool
+  result without persisting a synthetic user turn.
+- Added first-class OpenAI Responses API support alongside Anthropic Messages and the
+  compatible Chat Completions channel, including structured output-item preservation,
+  `call_id` tool-result correlation, stateless tool-round replay, and privacy-safe trace
+  summaries.
 - Added `AgentSpec.tool_name` so delegate workers can expose task-oriented model-facing tool names while keeping the registry agent name stable.
+- Added qita's trajectory analysis workbench with diagnosis-first run pages, derived failure insights, focus navigation, critical-step guidance, an inspector panel, and expandable full-content evidence views for long thoughts, observations, parser diagnostics, actions, and critic outputs.
+- Added qita `step_interactions`, a derived action-observation view that pairs each action with its complete arguments, invocation metadata, model-visible result, and canonical raw result while separating environment-only and unmatched evidence.
+- Added a qita light/dark theme system with a persistent toolbar toggle across board, run detail, replay, and comparison pages.
 
 ### Changed
 
+- **Breaking:** `AgentTool` now requires one explicit `invocation_factory` and uses only
+  the canonical `execution_mode`. Removed the class registry, generic model/workspace
+  construction, hidden worktree argument, `allow_background` alias, and the separate
+  `CodingToolSet.agent_spawn` loop; applications own fresh child Engine construction.
+
+- Model calls now use one async-native Engine path and one Engine-scoped absolute
+  request deadline. Provider connection, stream-idle, and retry waits are clamped to
+  live remaining time; immediate cancellation propagates through the active task and
+  closes the provider stream. Official providers implement the same asynchronous model
+  contract instead of maintaining synchronous and asynchronous transports.
+- Tool actions now have one absolute budget covering admission, invocation retries, and
+  backoff. `ToolSpec.retry_policy` is the only tool retry owner, validation and
+  permission checks run once, HTTP transport retries are disabled, and bounded daemon
+  workers prevent blocked admission or concurrent-drain paths from owning process exit.
+- Built-in coding search now uses one fixed-argv `rg` boundary with NUL-delimited file
+  paths, stable ordering, strict result limits, explicit hidden/ignored-file controls,
+  reconstructable context records, and structured exit, timeout, and launch failures.
+- Reasoning effort now resolves through model-specific preset capabilities across sync,
+  async, and streaming request defaults. GPT-5.6 accepts `max`; older OpenAI models keep
+  their existing `xhigh` ceiling.
+- Context control now measures the complete provider input, including native tool
+  schemas and response schemas, and forces transaction-safe compaction at 80% of
+  the provider-safe input budget. `CompactHistory` uses three bounded levels
+  (microcompact, recent-round summary, and all-but-latest-round resummary), applies
+  summaries only to immutable projections, reuses exact-prefix summary checkpoints,
+  and bounds repeated summary failures with a three-attempt circuit. Overflow recovery
+  uses `.70/.50/.35` history budgets without mutating canonical history. Responses
+  text/tool payloads and generic/native mirrors now keep one complete, accurately
+  counted call/result transaction.
+- `Engine.arun()` and `Engine.astep()` are now the canonical execution paths. The
+  synchronous `run()` and `step()` entry points only bridge at the process boundary and
+  reject calls from an active event loop; the daemon-thread `AsyncEngine` bridge has
+  been removed.
+- Background `AgentTool` runs now snapshot parent history at launch but defer model,
+  Engine, and trace construction until an execution slot opens. A bounded daemon pool,
+  repeatable bounded close, canonical cancellation stops, and terminal-before-wakeup
+  ordering keep child teardown from extending process lifetime indefinitely. Terminal
+  children retain their queryable result while active task, request, Engine, and
+  cancellation records are reaped immediately.
+- Clarified the generic `AgentTool` model contract: independent multi-step tasks can be
+  delegated in one response for concurrent execution, while dependent steps and cheap
+  mechanical variants remain in the parent. Explicit tool guidance is no longer replaced
+  by the `execute()` implementation docstring during initialization.
+- Model calls now use transactional streaming. Retryable mid-stream failures discard
+  the failed attempt's partial text and tool calls before retrying within the
+  QitOS-owned attempt budget and absolute request deadline; active streams use a
+  bounded event-idle timeout.
+- OpenAI-compatible clients now disable OpenAI SDK retries on paths where QitOS owns the
+  retry budget, preventing multiplicative retry delays.
 - Raised the optional OpenAI SDK floor to `openai>=1.66.0` and taught compact history to preserve active Responses function-call rounds atomically.
 - Strengthened the CyberGym PoC agent's task bootstrap with lightweight structured task-spec extraction and more relevant repo evidence ranking.
 - Clarified candidate provenance and lightweight failure taxonomy handling in the CyberGym agent without changing its single-agent runtime architecture.
+- Improved qita diagnostics for CyberGym-style traces so budget stops are marked as review-needed, `submit_poc` verification failures are promoted as critical inspection steps, and low-frequency metadata stays out of the default attention path.
+- Redesigned qita step stories around `Input -> Thought -> Action Calls -> Environment Observation`: multi-action calls now render as numbered paired units with status, latency, parameters, and their own result; failed calls expand by default, successful calls fold, and all long evidence remains available in wrapped, copyable code views and call-aware Inspector tabs.
 
 ### Fixed
 
+- Fixed the documented contributor pytest gate so asynchronous tests and OpenAI
+  Responses, transport retry, and reasoning tests install their required checker and
+  optional SDK dependencies instead of failing on a clean environment.
+- Fixed workspace path validation so lexical parent traversal is rejected while
+  intentional workspace-owned symlinks retain their documented behavior.
+- Fixed streaming completion being flattened to a synthetic `stop`. Chat,
+  Responses, and Anthropic adapters now preserve provider finish reasons, async Chat
+  retains incremental and completed tool calls, incomplete streams fail explicitly,
+  and rich Engine handlers can observe normalized chunks or failures without receiving
+  a false normal-end callback.
+- Fixed qita tool statistics attributing one failed result to every action in the same
+  step. Statistics now use the canonical action/result pairing, retain exact lifecycle
+  counts, and expose unmatched actions or results as trace-closure gaps.
+- Fixed model requests and streams outliving the Engine deadline, late responses being
+  accepted as successful decisions, async Responses completion bypassing QitOS retry,
+  Azure retaining SDK retries, and provider attempts reusing stale timeout values.
+- Fixed action-level timeouts being resolved before approval and permission work, retry
+  attempts each receiving a fresh timeout, and parallel execution waiting indefinitely
+  for a non-daemon executor to drain.
+- Fixed forced compatible-Chat tool calls sending contradictory reasoning controls,
+  official Responses requests omitting encrypted continuation fields, streamed output
+  item data being overwritten by `response.completed`, and reasoning-only content being
+  promoted to a visible final answer.
+- Fixed runtime deadlines being checked only at Engine step boundaries. The effective
+  deadline now clamps tool admission, execution timeout, retry backoff, and runtime
+  waits. Timed-out synchronous tools use daemon workers so an orphan cannot block
+  interpreter shutdown. Saturated event queues now report dropped deliveries, retain
+  exactly one priority `run_end` before the close marker, and terminate late subscribers.
+- Fixed native-capable agent turns so provider `tool_calls` are authoritative before
+  custom text interpreters or parsers, API-delivered tools no longer receive a second
+  framework text action contract, malformed native arguments produce a paired recoverable
+  error without executing the tool, and mixed executable/blocked batches commit exactly
+  one tool result per call id in the model's original order.
+- Fixed lower-level OpenAI-compatible transport errors such as read-timeout and TLS
+  exceptions being treated as non-retryable; they now use the existing bounded model
+  retry policy instead of immediately terminating the agent loop. Unsupported stream
+  options now fall back only after an explicit provider rejection and remain disabled
+  for the rest of that logical request.
+- Fixed structured tool lifecycle results being flattened to success or generic error.
+  Canonical results now retain partial, running, skipped/denied, input/approval, timeout,
+  and cancellation through observations, history, traces, summaries, and metrics;
+  unknown and legacy alias statuses fail closed, flattened legacy fields are removed,
+  and domain outcomes no longer overload execution status.
+- Fixed bound function tools and fail-closed coding profiles mutating shared permission
+  metadata across toolset instances.
 - Fixed immediate cancellation finalization so the END event, canonical State, `TaskResult`/`EngineResult`, and trace manifest all report `cancelled_immediate`; cancelled manifests now use the existing terminal `stopped` status instead of `completed`.
 - Fixed native text fallback so malformed structured action output enters parser recovery instead of being misreported as a successful final answer, while ordinary natural-language conclusions still use `native_text_final`.
 - Fixed message-window trimming so native tool results whose declaring assistant call has been evicted are removed before provider dispatch, while complete tool chains and existing interrupted-call recovery remain unchanged.
 - Fixed direct `Engine(agent=...)` construction so models created with `build_model_for_preset(...)` retain their declared protocol and native API tool-schema delivery, including provider aliases such as Kimi K3 that cannot be inferred from the model name alone.
 - Fixed empty model responses with neither usable text nor tool calls being misclassified as parser `wait` decisions. The Engine now records them as `model_error`, retries once through bounded recovery, and stops with `unrecoverable_error` if the empty response repeats while preserving response diagnostics in traces.
+
 - Fixed native response text extraction so OpenAI-compatible messages with null content no longer become repr-string final answers.
 - Fixed OpenAI-compatible forced tool-call requests so conflicting thinking options are disabled, and repaired JSON/tool-call parsing for bare control characters inside string values.
 - Fixed JSON-like object extraction so apostrophes in surrounding natural-language text no longer hide valid JSON payloads.
@@ -43,6 +171,53 @@ How to update:
 - Fixed CyberGym batch trace/result/render redaction so API keys and auth token markers are scrubbed before persisted artifacts are written.
 - Fixed CyberGym PoC generation runs so benchmark-local Bash commands can run without interactive command review while the default coding toolset review guard remains intact.
 - Fixed tool registration with name overrides so CyberGym uppercase aliases do not mutate source tool specs shared with ordinary coding toolsets.
+
+### Removed
+
+- Removed `AsyncEngine`, `AsyncModel`, synchronous provider calls, `call_raw`, provider
+  import-time registration, global model registries, and the parallel sync/async model
+  class hierarchy. Model construction is explicit and instance-scoped.
+- Removed the duplicate LM Studio and vLLM transports. Compatible endpoints configure
+  the canonical OpenAI-compatible adapter; Ollama and Azure keep the transport behavior
+  required by their native asynchronous clients.
+- Removed the legacy official OpenAI sync/async request implementations, including their
+  hard-coded three-attempt loop, implicit SDK retries, and error-as-success strings.
+- Removed provider-failure-as-model-text paths from the Anthropic, Gemini, LiteLLM,
+  Ollama, LM Studio, and vLLM adapters; transport failures now enter Engine recovery.
+- Removed legacy Cookiecutter mocks that depended on an undeclared optional package and
+  a Docker write test for the deleted shell-string transport.
+- Removed unused `ActionKind`, action-level timeout/retry/idempotency/classification
+  fields, integer `max_retries` tool metadata, nonfunctional functional-task retry and
+  timeout options, and the duplicate ToolInterceptor middleware (including broken cache
+  and retry interceptors). Engine hooks and runtime events remain the observation path.
+- Removed class-tool `run`/`call`/callable adapters, `ToolRegistry.call()`, automatic
+  short and separator aliases, normalized-name dispatch, duck-typed executor fallbacks,
+  callable approval flags, read-only concurrency inference, and the historical
+  concurrency-safe name list. Class tools now implement only
+  `execute(args, runtime_context)`; the registry performs exact-name lookup and the
+  executor owns the complete invocation lifecycle.
+- Removed duplicate uppercase, `*_v2`, and historical editor/search built-in tools.
+  Coding profiles now expose only the lowercase canonical names such as `read_file`,
+  `edit_file`, `glob`, `grep`, `run_command`, and `web_fetch`.
+- Removed the compatibility-only compact-history message-slicing option. Recent history
+  retention is configured only through complete rounds; explicit count eviction remains
+  available through `hard_window`.
+
+### Breaking
+
+- Model implementations must provide the asynchronous `Model.stream(...)` contract.
+  Applications in an event loop must call `Engine.arun()` or `Engine.astep()`; the
+  synchronous wrappers no longer emulate async execution with worker threads.
+- Direct class-tool callers must pass an argument dictionary to `execute(...)`.
+  Registry callers must resolve an exact canonical name with `get()` or execute through
+  `Engine`/`ActionExecutor`. Tools run in parallel only when their spec explicitly sets
+  `concurrency_safe=True`. A `FunctionTool` remains directly callable as the ordinary
+  host-side behavior of `@function_tool`; agent execution never uses that shortcut.
+- `CodingToolSet` no longer accepts `expose_legacy_aliases` or
+  `expose_modern_names`. Callers must use the canonical lowercase tool names.
+- `CompactConfig` and `CompactHistory` no longer accept the obsolete message-count
+  retention keyword. Callers must configure transaction-safe retention with
+  `keep_last_rounds`.
 
 ## v0.6.0 (2026-05-28)
 

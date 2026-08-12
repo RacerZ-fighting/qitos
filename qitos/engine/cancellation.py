@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import threading
 from enum import Enum
-from typing import Any, Optional
 
 
 class CancelMode(str, Enum):
@@ -37,6 +36,7 @@ class CancelToken:
     def __init__(self) -> None:
         self._mode = CancelMode.NONE
         self._lock = threading.Lock()
+        self._cancel_requested = threading.Event()
         self._step_complete = threading.Event()
 
     @property
@@ -59,12 +59,19 @@ class CancelToken:
         """
         with self._lock:
             self._mode = CancelMode(mode)
+            self._cancel_requested.set()
 
     def clear(self) -> None:
         """Reset the token (called at the start of each Engine run)."""
         with self._lock:
             self._mode = CancelMode.NONE
+            self._cancel_requested.clear()
         self._step_complete.clear()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait until cancellation is requested or the timeout elapses."""
+
+        return self._cancel_requested.wait(timeout=timeout)
 
     def mark_step_complete(self) -> None:
         """Signal that the current step has finished."""

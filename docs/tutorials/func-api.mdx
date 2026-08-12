@@ -35,13 +35,17 @@ Pass keyword arguments to the decorator to override defaults and control executi
 
 ```python
 from qitos import function_tool
+from qitos.core.tool import RetryPolicy
 
 @function_tool(
     name="search_files",
     description="Search for files matching a pattern",
     needs_approval=True,
     timeout_s=30.0,
-    max_retries=2,
+    retry_policy=RetryPolicy(
+        max_attempts=3,
+        retryable_exceptions=(ConnectionError,),
+    ),
     read_only=True,
     concurrency_safe=True,
 )
@@ -58,10 +62,14 @@ The available parameters are:
 | `name` | `str` | function name | Override the tool name |
 | `description` | `str` | docstring | Override the tool description |
 | `needs_approval` | `bool` | `False` | Require human approval before execution |
-| `timeout_s` | `float` | `None` | Maximum execution time in seconds |
-| `max_retries` | `int` | `0` | Number of automatic retries on failure |
+| `timeout_s` | `float` | `None` | Whole-action time budget in seconds |
+| `retry_policy` | `RetryPolicy` | `None` | Explicit invocation retry policy |
 | `read_only` | `bool` | `False` | Mark the tool as side-effect-free |
 | `concurrency_safe` | `bool` | `False` | Signal that the tool can run in parallel |
+
+Without `retry_policy`, a tool is invoked exactly once. Validation, approval, and
+permission checks are not repeated; all invocation attempts share `timeout_s` and the
+Engine runtime deadline.
 
 ## Step 3: Type hints become ToolSpec parameters
 
@@ -163,7 +171,8 @@ class GetTimeTool(BaseTool):
         )
         super().__init__(spec)
 
-    def execute(self, **kwargs) -> str:
+    def execute(self, args: dict, runtime_context: dict | None = None) -> str:
+        _ = args, runtime_context
         from datetime import datetime
         return datetime.now().isoformat()
 ```

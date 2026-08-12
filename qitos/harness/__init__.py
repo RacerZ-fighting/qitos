@@ -6,6 +6,13 @@ from typing import Any
 
 from ._adapters import OpenAICompatibleAdapter, adapter_for_kind
 from ._presets import known_family_presets, resolve_builtin_preset
+from ._reasoning import (
+    ReasoningEffort,
+    ReasoningPolicy,
+    ReasoningResolution,
+    parse_reasoning_effort,
+    resolve_reasoning,
+)
 from ._types import (
     ContextPolicy,
     FamilyPreset,
@@ -16,7 +23,9 @@ from ._types import (
 )
 
 
-def resolve_family_preset(identifier: str | None = None, *, family_id: str | None = None) -> FamilyPreset:
+def resolve_family_preset(
+    identifier: str | None = None, *, family_id: str | None = None
+) -> FamilyPreset:
     target = family_id if family_id is not None else identifier
     return resolve_builtin_preset(target)
 
@@ -56,13 +65,17 @@ def build_model_for_preset(
     base_url: str | None = None,
     protocol: Any = None,
     tool_delivery: str | None = None,
-    temperature: float = 0.2,
+    temperature: float | None = 0.2,
     max_tokens: int = 2048,
     timeout: int = 120,
     system_prompt: str | None = None,
     context_window: int | None = None,
     default_request_kwargs: dict[str, Any] | None = None,
     api_mode: str = "chat_completions",
+    max_attempts: int = 2,
+    stream_idle_timeout: float = 60.0,
+    retry_window_seconds: float = 300.0,
+    reasoning_effort: ReasoningEffort | str | None = ReasoningEffort.HIGH,
 ) -> Any:
     harness = build_harness_policy(
         model_name=model_name,
@@ -70,6 +83,21 @@ def build_model_for_preset(
         protocol=protocol,
         tool_delivery=tool_delivery,
     )
+    reasoning = resolve_reasoning(
+        family_id=harness.family_preset.id,
+        model_name=model_name,
+        api_mode=api_mode,
+        requested=reasoning_effort,
+    )
+    # Merge preset recommendations, caller options, then the resolved reasoning
+    # contract. Explicit reasoning intent is authoritative for its wire fields.
+    preset_kwargs = harness.family_preset.recommended_request_kwargs
+    effective_kwargs = _merge_request_options(
+        preset_kwargs,
+        default_request_kwargs,
+        reasoning.request_options,
+    )
+
     llm = harness.adapter.build_model(
         preset=harness.family_preset,
         model_name=model_name,
@@ -81,25 +109,50 @@ def build_model_for_preset(
         timeout=timeout,
         system_prompt=system_prompt,
         context_window=context_window,
-        default_request_kwargs=default_request_kwargs,
+        default_request_kwargs=effective_kwargs,
         api_mode=api_mode,
+        max_attempts=max_attempts,
+        stream_idle_timeout=stream_idle_timeout,
+        retry_window_seconds=retry_window_seconds,
     )
     metadata = dict(getattr(llm, "qitos_harness_metadata", {}) or {})
     metadata.update(harness.to_dict())
     metadata.setdefault(
         "decision_lane_preference",
-        "native_tool_calls"
-        if harness.tool_policy.native_tool_call_preferred
-        else "parser",
+        (
+            "native_tool_calls"
+            if harness.tool_policy.native_tool_call_preferred
+            else "parser"
+        ),
     )
     metadata.setdefault(
         "native_tool_call_preferred", harness.tool_policy.native_tool_call_preferred
     )
-    metadata.setdefault("effective_tool_delivery", harness.protocol.tool_schema_delivery)
+    metadata.setdefault(
+        "effective_tool_delivery", harness.protocol.tool_schema_delivery
+    )
+    metadata["reasoning"] = reasoning.to_dict()
     setattr(llm, "qitos_harness_metadata", metadata)
     setattr(llm, "qitos_family_preset", harness.family_preset.id)
     setattr(llm, "qitos_protocol", harness.protocol.id)
     return llm
+
+
+def _merge_request_options(
+    *options: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    merged: dict[str, Any] = {}
+    for option in options:
+        if not option:
+            continue
+        for key, value in option.items():
+            if key in {"extra_body", "reasoning"} and isinstance(value, dict):
+                nested = dict(merged.get(key) or {})
+                nested.update(value)
+                merged[key] = nested
+            else:
+                merged[key] = value
+    return merged or None
 
 
 __all__ = [
@@ -109,6 +162,11 @@ __all__ = [
     "ContextPolicy",
     "HarnessPolicy",
     "FamilyPreset",
+    "ReasoningEffort",
+    "ReasoningPolicy",
+    "ReasoningResolution",
+    "parse_reasoning_effort",
+    "resolve_reasoning",
     "resolve_family_preset",
     "build_model_for_preset",
     "build_harness_policy",

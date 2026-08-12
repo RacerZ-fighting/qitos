@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
-from .tool import FunctionTool, ToolMeta, ToolPermission, RetryPolicy
+from .tool import FunctionTool, ToolMeta, RetryPolicy
 from .tool_schema import function_schema
 
 
@@ -14,11 +14,10 @@ def function_tool(
     name: Optional[str] = None,
     description: Optional[str] = None,
     timeout_s: Optional[float] = None,
-    max_retries: int = 0,
     retry_policy: Optional[RetryPolicy] = None,
     on_failure: Optional[Callable] = None,
     read_only: bool = False,
-    concurrency_safe: bool = False,
+    concurrency_safe: Optional[bool] = None,
     needs_approval: bool = False,
     **extra_meta: Any,
 ) -> Any:
@@ -40,7 +39,6 @@ def function_tool(
             name=name,
             description=description,
             timeout_s=timeout_s,
-            max_retries=max_retries,
             retry_policy=retry_policy,
             on_failure=on_failure,
             read_only=read_only,
@@ -54,7 +52,7 @@ def function_tool(
         # Build spec using enhanced schema from tool_schema
         import inspect
 
-        from .tool import ToolSpec, build_tool_spec
+        from .tool import build_tool_spec
 
         schema_info = function_schema(fn)
         spec = build_tool_spec(fn, meta)

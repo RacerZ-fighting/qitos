@@ -51,7 +51,6 @@ class CompactReactAgent(AgentModule[CompactReactState, dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         super().__init__(
@@ -62,7 +61,6 @@ class CompactReactAgent(AgentModule[CompactReactState, dict[str, Any], Action]):
                 llm=llm,
                 max_tokens=2200,
                 keep_last_rounds=2,
-                keep_last_messages=6,
                 hard_window=48,
             ),
         )

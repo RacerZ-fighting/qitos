@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from examples._support import SequenceModel
 from qitos_zoo.qitos_coder.preset_agent import ClaudeCodeAgent, _resolve_runtime_config
@@ -12,6 +13,8 @@ from qitos.harness import (
     resolve_family_preset,
 )
 from qitos.models.profile_registry import infer_default_protocol, infer_model_profile
+from qitos.qita.cli import _build_run_diff
+from qitos.qita.data import _load_run_payload
 
 
 def test_resolve_family_preset_for_gold_families() -> None:
@@ -23,11 +26,12 @@ def test_resolve_family_preset_for_gold_families() -> None:
     assert resolve_family_preset("moonshot-v1-128k").id == "kimi"
     assert resolve_family_preset("MiniMax-M2.5").id == "minimax"
     assert resolve_family_preset("gpt-oss-120b").id == "gpt-oss"
+    assert resolve_family_preset("gpt-5.6-luna").id == "openai"
     assert resolve_family_preset("gemma-4-31b-it").id == "gemma-4"
 
 
 def test_profile_registry_is_derived_from_presets() -> None:
-    assert infer_model_profile("GLM-5.1-sii").default_protocol == "json_decision_v1"
+    assert infer_model_profile("GLM-5.1-sii").default_protocol == "json_decision_multi_v1"
     assert infer_model_profile("moonshot-v1-128k").default_protocol == "json_decision_v1"
     assert infer_model_profile("gpt-oss-120b").default_protocol == "json_decision_v1"
     assert infer_model_profile("gemma-4-31b-it").default_protocol == "json_decision_v1"
@@ -37,8 +41,9 @@ def test_profile_registry_is_derived_from_presets() -> None:
 def test_build_harness_policy_keeps_glm_native_chain() -> None:
     harness = build_harness_policy(model_name="GLM-5.1-sii")
     assert harness.family_preset.id == "glm"
-    assert harness.protocol.id == "json_decision_v1"
+    assert harness.protocol.id == "json_decision_multi_v1"
     assert harness.protocol.fallback_protocols == (
+        "json_decision_v1",
         "xml_decision_v1",
         "react_text_v1",
     )
@@ -87,7 +92,7 @@ def test_build_model_for_glm_preset_attaches_native_tool_call_metadata() -> None
     )
     metadata = dict(getattr(llm, "qitos_harness_metadata", {}) or {})
     assert metadata["family_preset"] == "glm"
-    assert metadata["protocol"] == "json_decision_v1"
+    assert metadata["protocol"] == "json_decision_multi_v1"
     assert metadata["native_tool_call_preferred"] is True
     assert metadata["decision_lane_preference"] == "native_tool_calls"
     assert metadata["effective_tool_delivery"] == "api_parameter"
@@ -210,3 +215,63 @@ def test_harness_metadata_reaches_trace_manifest(tmp_path: Path) -> None:
     assert manifest["prompt_protocol"] == "json_decision_v1"
     assert manifest["run_spec"]["metadata"]["family_preset"] == "kimi"
     assert manifest["run_spec"]["metadata"]["harness_policy"]["protocol"] == "json_decision_v1"
+    assert manifest["summary"]["run_meta"]["budget"] == {
+        "max_steps": 2,
+        "max_runtime_seconds": None,
+        "max_tokens": None,
+        "deadline_constrained": False,
+    }
+
+
+def test_scripted_runs_produce_a_same_spec_comparison(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def run_once(trace_root: Path) -> dict[str, Any]:
+        harness = build_harness_policy(family_id="kimi")
+        llm = SequenceModel(
+            ['{"thought":"done","final_answer":"ok"}'],
+            model="moonshot-v1-128k",
+        )
+        setattr(
+            llm,
+            "qitos_harness_metadata",
+            {
+                "family_preset": harness.family_preset.id,
+                "adapter_kind": harness.adapter.kind,
+                "protocol": harness.protocol.id,
+                "parser": harness.parser_name,
+                "tool_policy": harness.tool_policy.to_dict(),
+                "context_policy": harness.context_policy.to_dict(),
+            },
+        )
+        agent = ClaudeCodeAgent(
+            llm=llm,
+            workspace_root=str(workspace),
+            model_parser=harness.parser,
+            model_protocol=harness.protocol,
+        )
+        agent.run(
+            task="finish",
+            workspace=str(workspace),
+            max_steps=2,
+            render=False,
+            trace=True,
+            trace_logdir=str(trace_root),
+            return_state=False,
+        )
+        manifests = list(trace_root.glob("*/manifest.json"))
+        assert len(manifests) == 1
+        return _load_run_payload(manifests[0].parent)
+
+    diff = _build_run_diff(
+        run_once(tmp_path / "left-runs"),
+        run_once(tmp_path / "right-runs"),
+    )
+
+    assert diff["comparison"] == {
+        "compatible": True,
+        "status": "same_spec",
+        "missing_fields": [],
+        "mismatch_fields": [],
+    }

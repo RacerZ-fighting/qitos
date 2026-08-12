@@ -60,6 +60,47 @@ engine = Engine(
   Prefer calling `agent.run()` for single-run workflows. Use `Engine` directly when you need to reuse an Engine across multiple runs or configure hooks dynamically between runs.
 </Tip>
 
+## Runtime input and idle wait
+
+Long-running tools can return a handle before their work finishes. Use
+`RuntimeInput` to notify the same Engine run when that work reaches a terminal
+state:
+
+```python
+from qitos import RuntimeInput
+
+accepted = engine.post_runtime_event(
+    RuntimeInput(
+        event_id="command:42:terminal",
+        kind="command.terminal",
+        correlation_id="42",
+        source="shell",
+        payload={"status": "completed", "exit_code": 0},
+    ),
+    run_id=run_id,
+)
+```
+
+Capture `run_id` from `engine.active_run_id` after the run starts. A post returns
+`False` when the event id is a duplicate, the run id does not match, or the run
+has ended. Keep event payloads small. Store full command output behind the tool's
+normal result or read API.
+
+An agent can explicitly enter idle wait with
+`Decision.wait(meta={"runtime_wait": True})`. JSON decision agents can return:
+
+```json
+{"mode":"wait","runtime_wait":true}
+```
+
+While idle, the Engine does not call the model or advance the step. A runtime
+event, cancellation, or runtime deadline wakes it. Events are drained only before
+the next model request and are appended as runtime-sourced user context. QitOS
+does not forge a second tool result for a tool call that has already ended.
+
+Unmarked `Decision.wait()` retains its existing immediate-loop behavior for parser
+repair and search backtracking.
+
 ## Protocol resolution
 
 `Engine` resolves the model protocol once per run using the following precedence:
@@ -75,7 +116,28 @@ The model-level declarations in step 4 are attached by `build_model_for_preset(.
 
 ## Empty model responses
 
-After a model call, the Engine records the normalized response and gives `AgentModule.interpret_model_response()` the first opportunity to turn it into a decision. If the hook returns `None` and the response contains neither non-whitespace text nor tool calls, the Engine classifies the result as a `model_error` before it reaches the parser. The default recovery path retries once; a second consecutive empty response stops the run with `unrecoverable_error` instead of consuming the remaining step budget as parser `wait` decisions.
+After a model call, the Engine records the normalized response. When the selected model
+policy prefers native tool calls and the provider returns `tool_calls`, those calls are
+authoritative: the Engine bypasses `AgentModule.interpret_model_response()` and the text
+parser, then commits one terminal tool result per call id in the provider's original
+order. A mixed batch of executable and policy-blocked calls follows the same single
+commit path, so a blocked result cannot be duplicated or moved ahead of an earlier call.
+If a native call has a missing name or malformed arguments, QitOS does not reinterpret
+the assistant text as a separate action. It preserves the call id, skips execution, and
+returns a recoverable protocol error in the corresponding tool-result turn.
+
+For API or hybrid tool-schema delivery in this native mode, QitOS also omits its
+framework-owned text action contract from the system prompt. Agent-authored task and
+final-result instructions remain unchanged. If API delivery is unavailable and prompt
+injection becomes the effective fallback, the text contract remains available.
+
+For responses outside that native-call branch, the Engine gives
+`AgentModule.interpret_model_response()` the first opportunity to turn the response into
+a decision. If the hook returns `None` and the response contains neither non-whitespace
+text nor tool calls, the Engine classifies the result as a `model_error` before it reaches
+the parser. The default recovery path retries once; a second consecutive empty response
+stops the run with `unrecoverable_error` instead of consuming the remaining step budget
+as parser `wait` decisions.
 
 The `model_output` event and `StepRecord.model_response` still retain the response's `finish_reason`, usage, model, and provider fields. This guard does not change native tool-call responses, explicit `Decision.wait` values, or parser feedback for non-empty malformed model output.
 
@@ -137,6 +199,8 @@ You can also pass hooks at construction time via the `hooks` parameter, or at ru
 When the step budget, wall-clock time limit, or token budget is exceeded, the Engine sets `state.stop_reason` to the appropriate value and emits an `END` event. The run terminates gracefully and `EngineResult` is still returned — inspect `state.stop_reason` to detect this case.
 
 ```python
+import time
+
 from qitos.engine.states import RuntimeBudget
 
 engine = Engine(
@@ -145,9 +209,15 @@ engine = Engine(
         max_steps=30,
         max_runtime_seconds=120.0,
         max_tokens=50_000,
+        # Optional outer scheduler deadline; the earlier limit wins.
+        deadline_monotonic=time.monotonic() + 120.0,
     ),
 )
 ```
+
+The effective run deadline is shared by Engine step admission, runtime waits, tool
+admission and timeout, and tool retry backoff. Expiry requests graceful termination; it
+does not claim that Python forcibly killed a synchronous call already in progress.
 
 ## Building an Engine from AgentModule
 
@@ -163,35 +233,33 @@ result = engine.run(task)
 
 This is equivalent to `Engine(agent=agent, ...)` and is what `agent.run()` calls internally.
 
-## AsyncEngine
+## Async execution
 
-`AsyncEngine` provides non-blocking execution for agent workflows. It wraps the same `Engine` loop but runs blocking calls in a thread pool, making it safe to use inside `asyncio` event loops.
-
-```python
-from qitos import AsyncEngine
-
-async_engine = AsyncEngine(agent=agent, budget=RuntimeBudget(max_steps=20))
-```
-
-### `AsyncEngine.arun(task)`
-
-Run the agent loop asynchronously. Returns the same `EngineResult` as `Engine.run()`.
+`Engine` has one async-native execution path. `arun()` runs on the caller's event loop,
+and model providers stream without a worker-thread bridge.
 
 ```python
-result = await async_engine.arun("analyze the data")
+from qitos import Engine
+
+engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=20))
+result = await engine.arun("analyze the data")
 print(result.state.final_result)
 ```
 
-### `AsyncEngine.arun_stream(task)`
+Call synchronous `engine.run()` only at a synchronous application boundary. It raises
+`RuntimeError` inside an active event loop so the application cannot accidentally nest
+event loops.
+
+### `Engine.arun_stream(task)`
 
 Run the agent loop and yield structured `EngineEvent` objects as they occur — ideal for real-time UI updates or streaming progress to a client.
 
 ```python
-async for event in async_engine.arun_stream("analyze the data"):
+async for event in engine.arun_stream("analyze the data"):
     print(event.event_type, event.step_id, event.payload)
 ```
 
-Events are emitted at step boundaries (`step_start`, `step_end`), phase transitions (`decide`, `act`, `reduce`, `critic`, `check_stop`), and multi-agent events (`handoff`, `delegate`, `fanout`). The stream always begins with `run_start` and ends with `run_end`.
+Events are emitted at step boundaries (`step_start`, `step_end`), phase transitions (`decide`, `act`, `reduce`, `critic`, `check_stop`), and multi-agent events (`handoff`, `delegate`, `fanout`). The stream includes one `run_start` and ends with exactly one `run_end`. Event queues are bounded: intermediate deliveries may be dropped under sustained backpressure, `dropped_event_count` records that loss, and the `run_end` payload includes the count while retaining terminal priority.
 
 ### `EngineEvent`
 
@@ -220,21 +288,20 @@ q1 = stream.subscribe()  # asyncio.Queue for consumer 1
 q2 = stream.subscribe()  # asyncio.Queue for consumer 2
 ```
 
-### Async models
+### Model streams
 
-When the configured model implements `acall()` (from `AsyncModel`), `AsyncEngine` can invoke it without blocking the event loop. Built-in async model adapters:
+All model providers implement the canonical async `Model.stream()` contract. The Engine
+consumes provider-neutral stream chunks and preserves cancellation and request deadlines
+throughout the transaction.
 
 ```python
-from qitos.models import AsyncOpenAICompatibleModel, AsyncOpenAIModel
+from qitos.models import OpenAICompatibleModel
 
-llm = AsyncOpenAICompatibleModel(
+llm = OpenAICompatibleModel(
     model="qwen-plus",
     api_key="...",
     base_url="https://...",
 )
-result = await llm.acall([{"role": "user", "content": "Hello"}])
+engine = Engine(agent=MyAgent(llm=llm))
+result = await engine.arun("analyze the data")
 ```
-
-<Tip>
-  `AsyncEngine.arun()` works with any model — sync models are automatically dispatched to a thread pool. Use async model adapters when you need true non-blocking I/O, e.g. in high-concurrency web servers.
-</Tip>

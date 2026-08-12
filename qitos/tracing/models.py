@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import uuid
 from abc import ABC, abstractmethod
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -24,9 +24,7 @@ from typing import Any, Dict, List, Optional
 # Context variable for async-safe current-span tracking
 # ---------------------------------------------------------------------------
 
-_current_span: ContextVar[Optional["Span"]] = ContextVar(
-    "_current_span", default=None
-)
+_current_span: ContextVar[Optional["Span"]] = ContextVar("_current_span", default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +421,7 @@ class Span:
         self.error: Optional[str] = None
         self.output: Optional[Any] = None
         self._processor = processor
-        self._token = None  # ContextVar reset token
+        self._token: Token[Optional[Span]] | None = None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -604,7 +602,9 @@ class Trace:
         return list(self._spans)
 
     def __repr__(self) -> str:
-        return f"Trace(id={self.trace_id!r}, name={self.name!r}, spans={len(self._spans)})"
+        return (
+            f"Trace(id={self.trace_id!r}, name={self.name!r}, spans={len(self._spans)})"
+        )
 
 
 class NoOpTrace:

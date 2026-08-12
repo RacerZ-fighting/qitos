@@ -28,6 +28,7 @@ from qitos.core.tool import tool
 
 # 新
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool import RetryPolicy
 ```
 
 ### 2. 替换装饰器
@@ -83,7 +84,7 @@ class MyToolSet:
 ```python
 toolset = MyToolSet()
 # toolset.read_file 是一个绑定的 FunctionTool
-# toolset.read_file.run(path="test.txt") 会自动传入 self
+# toolset.read_file(path="test.txt") 会自动传入 self
 ```
 
 ## 自定义工具示例
@@ -95,8 +96,11 @@ from qitos.core.function_tool_decorator import function_tool
     name="web_search",
     description="Search the web for information",
     needs_approval=True,      # 网络访问需要审批
-    timeout_s=30.0,           # 30 秒超时
-    max_retries=2,            # 最多重试 2 次
+    timeout_s=30.0,           # 整个 action 的 30 秒预算
+    retry_policy=RetryPolicy(
+        max_attempts=3,
+        retryable_exceptions=(ConnectionError,),
+    ),
 )
 def web_search(query: str, max_results: int = 5) -> list[str]:
     """Search the web and return URLs."""

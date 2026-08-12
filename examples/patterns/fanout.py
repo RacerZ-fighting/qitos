@@ -69,7 +69,6 @@ class ExplorerAgent(AgentModule[ExplorerState, dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         super().__init__(
@@ -157,7 +156,6 @@ class CoordinatorAgent(AgentModule[CoordinatorState, dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         # Register delegation and fanout tools

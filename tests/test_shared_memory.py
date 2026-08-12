@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -146,12 +144,19 @@ class TestSharedMemoryInAgentSpec:
     def test_shared_memory_in_runtime_context(self):
         from qitos import ToolRegistry
         from qitos.core.shared_memory import InMemorySharedMemory
+        from qitos.core.tool import FunctionTool
         from qitos.engine.action_executor import ActionExecutor
 
         mem = InMemorySharedMemory()
         mem.write("test_key", "test_value")
 
-        executor = ActionExecutor(tool_registry=ToolRegistry(), shared_memory=mem)
-        ctx = executor._build_runtime_context("some_tool", env=None, state=None)
+        def some_tool() -> None:
+            return None
+
+        tool = FunctionTool(some_tool)
+        executor = ActionExecutor(
+            tool_registry=ToolRegistry().register(tool), shared_memory=mem
+        )
+        ctx = executor._build_runtime_context(tool, env=None, state=None)
         assert ctx["shared_memory"] is mem
         assert ctx["shared_memory"].read("test_key") == "test_value"

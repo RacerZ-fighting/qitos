@@ -238,6 +238,30 @@ Execute the agent loop for `task`. Resets run state, initialises the env, calls 
 ---
 
 ```python
+async def arun(self, task: str | Task, **kwargs: Any) -> EngineResult[StateT]
+```
+
+Execute the same loop on the caller's event loop. Provider requests and model streams remain async throughout the transaction.
+
+---
+
+```python
+async def arun_stream(self, task: str | Task, **kwargs: Any) -> AsyncIterator[EngineEvent]
+```
+
+Execute the loop and yield `EngineEvent` objects in real time. The stream includes one `run_start` event and ends with one `run_end` event.
+
+---
+
+```python
+def cancel(self, mode: str = "immediate") -> None
+```
+
+Request cancellation of the active run. Use `mode="after_step"` to let the current step reach its safe boundary.
+
+---
+
+```python
 def register_hook(self, hook: Any) -> None
 ```
 
@@ -261,63 +285,9 @@ Remove all registered hooks.
 
 </Accordion>
 
-<Accordion title="AsyncEngine">
-
-`AsyncEngine` provides non-blocking execution for agent workflows. It wraps the same `Engine` loop but runs blocking calls in a thread pool, making it safe to use inside `asyncio` event loops.
-
-```python
-class AsyncEngine(Generic[StateT, ObservationT, ActionT])
-```
-
-**Constructor**
-
-```python
-def __init__(
-    self,
-    agent: AgentModule[StateT, ObservationT, ActionT],
-    **engine_kwargs: Any,
-)
-```
-
-All keyword arguments are forwarded to the internal `Engine` constructor (same parameters as `Engine.__init__`).
-
-**Methods**
-
-```python
-async def arun(self, task: str | Task, **kwargs: Any) -> EngineResult[StateT]
-```
-
-Execute the agent loop asynchronously. Returns the same `EngineResult` as `Engine.run()`.
-
----
-
-```python
-async def arun_stream(self, task: str | Task, **kwargs: Any) -> AsyncIterator[EngineEvent]
-```
-
-Execute the agent loop and yield `EngineEvent` objects in real time. The stream begins with `run_start` and ends with `run_end`.
-
----
-
-```python
-def run(self, task: str | Task, **kwargs: Any) -> EngineResult[StateT]
-```
-
-Synchronous fallback — delegates to the underlying `Engine.run()`.
-
-**Properties**
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `engine` | `Engine` | The underlying sync Engine instance |
-| `agent` | `AgentModule` | Same as `engine.agent` |
-| `event_stream` | `EventStream \| None` | Active event stream during `arun_stream()`, otherwise `None` |
-
-</Accordion>
-
 <Accordion title="EngineEvent, EngineEventType, EventStream">
 
-`EngineEvent` is the structured event emitted by `AsyncEngine.arun_stream()`.
+`EngineEvent` is the structured event emitted by `Engine.arun_stream()`.
 
 ```python
 class EngineEventType(str, Enum):
@@ -355,6 +325,8 @@ class EngineEvent:
 
 ```python
 class EventStream:
+    @property
+    def dropped_event_count(self) -> int              # bounded delivery loss
     def emit(self, event: EngineEvent) -> None       # thread-safe emit
     def emit_sync(self, event: EngineEvent) -> None   # alias for sync callers
     def close(self) -> None                            # signal end of stream
@@ -466,12 +438,7 @@ def branch(
 class Action:
     name: str
     args: Dict[str, Any] = field(default_factory=dict)
-    kind: ActionKind = ActionKind.TOOL
     action_id: Optional[str] = None
-    timeout_s: Optional[float] = None
-    max_retries: int = 0
-    idempotent: bool = True
-    classification: str = "default"
     metadata: Dict[str, Any] = field(default_factory=dict)
 ```
 
@@ -479,12 +446,7 @@ class Action:
 |-------|------|-------------|
 | `name` | `str` | Tool name to call |
 | `args` | `Dict[str, Any]` | Keyword arguments forwarded to the tool |
-| `kind` | `ActionKind` | Currently only `ActionKind.TOOL` (`"tool"`) |
 | `action_id` | `str \| None` | Optional unique identifier for the action |
-| `timeout_s` | `float \| None` | Per-action timeout override in seconds |
-| `max_retries` | `int` | Number of retries on failure |
-| `idempotent` | `bool` | Whether the action is safe to retry |
-| `classification` | `str` | User-defined label for grouping/filtering |
 | `metadata` | `Dict[str, Any]` | Arbitrary extra metadata |
 
 **`Action.from_dict(payload)`** — Construct from a plain dict.
@@ -645,7 +607,7 @@ def tool(
     name: Optional[str] = None,
     description: Optional[str] = None,
     timeout_s: Optional[float] = None,
-    max_retries: int = 0,
+    retry_policy: Optional[RetryPolicy] = None,
     permissions: Optional[ToolPermission] = None,
     required_ops: Optional[List[str]] = None,
 )
@@ -655,8 +617,8 @@ def tool(
 |-----------|------|-------------|
 | `name` | `str \| None` | Override the tool name (defaults to the function's `__name__`) |
 | `description` | `str \| None` | Override the tool description (defaults to the docstring) |
-| `timeout_s` | `float \| None` | Per-call timeout in seconds |
-| `max_retries` | `int` | Number of retries on failure |
+| `timeout_s` | `float \| None` | Whole-action timeout in seconds |
+| `retry_policy` | `RetryPolicy \| None` | Explicit invocation retry policy |
 | `permissions` | `ToolPermission \| None` | Permission flags for the tool |
 | `required_ops` | `List[str] \| None` | Runtime ops required from the environment |
 
@@ -720,12 +682,15 @@ def get(self, name: str) -> Optional[BaseTool]
 def list_tools(self) -> List[str]
 def list_toolsets(self) -> List[str]
 def describe_tool(self, name: str) -> Dict[str, Any]
-def call(self, name: str, runtime_context: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Any
 def get_tool_descriptions(self) -> str
 def get_all_specs(self) -> List[Dict[str, Any]]
 def setup(self, context: Optional[Dict[str, Any]] = None) -> None
 def teardown(self, context: Optional[Dict[str, Any]] = None) -> None
 ```
+
+Lookup is exact. Execution belongs to `ActionExecutor`, which applies validation,
+permissions, timeouts, retries, and canonical result handling before calling
+`BaseTool.execute(args, runtime_context)`.
 
 **Example**
 

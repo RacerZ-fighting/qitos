@@ -4,17 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional
-
-
-class ActionKind(str, Enum):
-    TOOL = "tool"
+from typing import Any, Dict, FrozenSet, Optional
 
 
 class ActionStatus(str, Enum):
     SUCCESS = "success"
+    PARTIAL = "partial"
+    RUNNING = "running"
     ERROR = "error"
     SKIPPED = "skipped"
+    DENIED = "denied"
+    NEEDS_INPUT = "needs_input"
+    NEEDS_APPROVAL = "needs_approval"
     TIMED_OUT = "timed_out"
     CANCELLED = "cancelled"
 
@@ -25,12 +26,7 @@ class Action:
 
     name: str
     args: Dict[str, Any] = field(default_factory=dict)
-    kind: ActionKind = ActionKind.TOOL
     action_id: Optional[str] = None
-    timeout_s: Optional[float] = None
-    max_retries: int = 0
-    idempotent: bool = True
-    classification: str = "default"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -38,12 +34,7 @@ class Action:
         return cls(
             name=payload.get("name", ""),
             args=payload.get("args", {}),
-            kind=ActionKind(payload.get("kind", ActionKind.TOOL.value)),
             action_id=payload.get("action_id"),
-            timeout_s=payload.get("timeout_s"),
-            max_retries=int(payload.get("max_retries", 0)),
-            idempotent=bool(payload.get("idempotent", True)),
-            classification=payload.get("classification", "default"),
             metadata=payload.get("metadata", {}),
         )
 
@@ -69,3 +60,7 @@ class ActionExecutionPolicy:
     mode: str = "serial"  # serial | parallel
     fail_fast: bool = False
     max_concurrency: int = 4
+    # ``None`` preserves explicit ``ToolSpec.concurrency_safe`` declarations.
+    # A caller may restrict parallel execution to a smaller set without
+    # changing the registered tool metadata.
+    parallel_tool_names: FrozenSet[str] | None = None

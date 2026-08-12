@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
 
 from ..core.decision import Decision
-from ..core.errors import StopReason
+from ..core.errors import (
+    ModelRequestCancelled,
+    ModelRequestDeadlineExceeded,
+    StopReason,
+)
 from ..core.state import StateSchema
-from ._context_runtime import ContextOverflowError
-from ._protocol import _EngineProtocol
+from ._context_runtime import (
+    ContextCompactionRequired,
+    ContextOverflowError,
+    DecisionContextConfigurationError,
+)
 from .critic_result import CriticResult
 from .states import RuntimePhase, StepRecord
+
+if TYPE_CHECKING:
+    from .engine import Engine
 
 
 StateT = TypeVar("StateT", bound=StateSchema)
@@ -20,7 +30,7 @@ ActionT = TypeVar("ActionT")
 
 
 class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
-    def __init__(self, engine: _EngineProtocol):
+    def __init__(self, engine: Engine[StateT, ObservationT, ActionT]):
         self.engine = engine
 
     def run_reduce(
@@ -81,7 +91,13 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
         - reason: str | None
         """
         engine = self.engine
-        empty = {"action": "continue", "modified_prompt": None, "instruction_patch": None, "state_patch": None, "reason": None}
+        empty = {
+            "action": "continue",
+            "modified_prompt": None,
+            "instruction_patch": None,
+            "state_patch": None,
+            "reason": None,
+        }
         if not engine.critics:
             return empty
         engine._dispatch_hook(
@@ -139,7 +155,13 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
                         payload={"critic_outputs": outputs, "result": "stop"},
                     ),
                 )
-                return {"action": "stop", "modified_prompt": None, "instruction_patch": None, "state_patch": None, "reason": output.get("reason")}
+                return {
+                    "action": "stop",
+                    "modified_prompt": None,
+                    "instruction_patch": None,
+                    "state_patch": None,
+                    "reason": output.get("reason"),
+                }
             if action == "retry":
                 engine._emit(
                     record.step_id,
@@ -311,16 +333,15 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
                 return True, reason, detail
         return False, None, None
 
-    def budget_exhausted(self, step_id: int, started_at: float, state: StateT) -> bool:
+    def budget_exhausted(self, step_id: int, state: StateT) -> bool:
         engine = self.engine
         if step_id >= engine.budget.max_steps:
             state.set_stop(StopReason.BUDGET_STEPS)
             return True
-        if engine.budget.max_runtime_seconds is not None:
-            elapsed = time.monotonic() - started_at
-            if elapsed > engine.budget.max_runtime_seconds:
-                state.set_stop(StopReason.BUDGET_TIME)
-                return True
+        remaining = engine.remaining_runtime_seconds()
+        if remaining is not None and remaining <= 0:
+            state.set_stop(StopReason.BUDGET_TIME)
+            return True
         if engine.budget.max_tokens is not None and engine._token_usage >= int(
             engine.budget.max_tokens
         ):
@@ -350,49 +371,42 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
         if engine.recovery_handler is not None:
             engine.recovery_handler(state, phase, exc)
 
+        if isinstance(exc, DecisionContextConfigurationError):
+            state.set_stop(StopReason.INFRASTRUCTURE_INVALID)
+            return False
+
+        if isinstance(exc, ModelRequestCancelled):
+            state.set_stop(StopReason.CANCELLED_IMMEDIATE)
+            return False
+
+        if isinstance(exc, ModelRequestDeadlineExceeded):
+            state.set_stop(StopReason.BUDGET_TIME)
+            return False
+
         if isinstance(exc, ContextOverflowError) or self._is_api_context_overflow(exc):
-            # Reactive compact: try compacting history and retrying before giving up
-            reactive_compact_limit = 3
-            if getattr(engine.context_config, "reactive_compact", True):
-                ctx_runtime = getattr(engine, "_context_runtime", None)
-                attempts = getattr(ctx_runtime, "reactive_compact_attempts", 0) if ctx_runtime else 0
-                history = engine._history()
-                if attempts < reactive_compact_limit and hasattr(history, "_messages") and len(history._messages) > 4:
-                    # Force aggressive compaction: keep only last 2 rounds
-                    try:
-                        from ..kit.history.compact_history import CompactionController, CompactConfig
-                        config = CompactConfig(
-                            keep_last_rounds=1,
-                            keep_last_messages=4,
-                            auto_compact=True,
-                        )
-                        controller = CompactionController(config, llm=getattr(engine.agent, "llm", None))
-                        items = list(history._messages)
-                        result, events, _ = controller.retrieve(
-                            items,
-                            budget=max(4000, len(items) * 50),
-                            pending_content="",
-                            auto_compact=True,
-                        )
-                        # Replace history with compacted version
-                        history._messages = result
-                        # Increment reactive compact counter
-                        if ctx_runtime is not None:
-                            ctx_runtime.reactive_compact_attempts = attempts + 1
-                        engine._emit(
-                            step_id,
-                            RuntimePhase.COMPACT,
-                            payload={
-                                "stage": "reactive_compact",
-                                "messages_before": len(items),
-                                "messages_after": len(result),
-                                "reason": "context_overflow",
-                            },
-                        )
-                        # Don't stop — let the engine retry with compacted history
-                        return True
-                    except Exception:
-                        pass
+            # Provider overflow is a bounded last-resort signal, not permission
+            # to mutate or arbitrarily slice canonical history. Each retry asks
+            # the normal transaction-aware projection for a smaller budget.
+            retry = engine._context_runtime.begin_reactive_compaction()
+            if retry is not None:
+                engine._emit(
+                    step_id,
+                    RuntimePhase.COMPACT,
+                    payload={
+                        "stage": "context_history",
+                        "context": {
+                            "stage": "reactive_compact_retry",
+                            "reason": (
+                                "force_threshold_reached"
+                                if isinstance(exc, ContextCompactionRequired)
+                                else "provider_context_overflow"
+                            ),
+                            "canonical_history_mutated": False,
+                            **retry,
+                        },
+                    },
+                )
+                return True
             state.set_stop(StopReason.CONTEXT_OVERFLOW)
             return False
 
@@ -424,8 +438,15 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
     def _is_api_context_overflow(exc: Exception) -> bool:
         """Check if an exception is an API-level context overflow error."""
         msg = str(exc).lower()
-        return any(kw in msg for kw in (
-            "context_length_exceeded", "context length", "prompt too long",
-            "maximum context", "too many tokens", "reduce the length",
-            "input is too long",
-        ))
+        return any(
+            kw in msg
+            for kw in (
+                "context_length_exceeded",
+                "context length",
+                "prompt too long",
+                "maximum context",
+                "too many tokens",
+                "reduce the length",
+                "input is too long",
+            )
+        )

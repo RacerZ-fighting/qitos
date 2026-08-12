@@ -7,13 +7,11 @@ deny -> ask -> tool_specific -> safety -> bypass -> allow
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from ...core.tool import (
-    ToolPermission,
     ToolPermissionContext,
     ToolPermissionDecision,
-    ToolPermissionRule,
     ToolSpec,
 )
 from .bash_analyzer import BashCommandAnalyzer, CommandSafety
@@ -33,20 +31,13 @@ class PermissionMode(str, Enum):
 
 
 # Tool name sets for mode-based decisions
-WRITE_TOOL_NAMES = frozenset({
-    "file_edit_v2", "write_file", "Edit", "Write",
-    "str_replace", "insert", "replace_lines", "append_file",
-    "create", "make_directory",
-})
+WRITE_TOOL_NAMES = frozenset({"edit_file", "write_file", "make_directory"})
 
-READ_TOOL_NAMES = frozenset({
-    "file_read_v2", "read_file", "Read", "view",
-    "Glob", "Grep",
-})
+READ_TOOL_NAMES = frozenset(
+    {"read_file", "glob", "grep", "hex_view", "list_files", "list_tree"}
+)
 
-BASH_TOOL_NAMES = frozenset({
-    "bash_v2", "Bash", "run_command",
-})
+BASH_TOOL_NAMES = frozenset({"run_command"})
 
 
 class PermissionPipeline:
@@ -206,7 +197,7 @@ class PermissionPipeline:
                 return ToolPermissionDecision.allow(scope=scope)
             if tool_name in BASH_TOOL_NAMES:
                 return ToolPermissionDecision.ask(
-                    f"Bash command requires confirmation.",
+                    "Bash command requires confirmation.",
                     scope=scope,
                 )
 

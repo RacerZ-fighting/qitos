@@ -8,36 +8,27 @@ and ActionExecutor integration.
 import os
 import tempfile
 import time
-import pytest
-from typing import Any, Dict, Optional
 from unittest.mock import MagicMock
 
 from qitos.core.tool import (
     ToolPermission,
     ToolPermissionContext,
-    ToolPermissionDecision,
     ToolPermissionRule,
     ToolSpec,
+    tool,
 )
+from qitos.core.tool_registry import ToolRegistry
 from qitos.kit.permission.pipeline import (
     PermissionMode,
     PermissionPipeline,
-    WRITE_TOOL_NAMES,
-    READ_TOOL_NAMES,
-    BASH_TOOL_NAMES,
 )
 from qitos.kit.permission.bash_analyzer import (
     BashCommandAnalyzer,
     CommandSafety,
-    BashAnalysisResult,
 )
-from qitos.kit.permission.read_before_write import (
-    ReadBeforeWriteEnforcer,
-    FileReadState,
-)
+from qitos.kit.permission.read_before_write import ReadBeforeWriteEnforcer
 from qitos.kit.permission.auto_classifier import AutoPermissionClassifier
 from qitos.kit.permission.rules import (
-    PROTECTED_PATHS,
     build_default_deny_rules,
     build_default_ask_rules,
     is_protected_path,
@@ -78,43 +69,43 @@ class TestPermissionPipeline:
 
     def test_default_mode_allows_reads(self):
         pipeline = PermissionPipeline(mode=PermissionMode.DEFAULT)
-        spec = self._make_spec("file_read_v2", filesystem_read=True)
-        result = pipeline.evaluate("file_read_v2", {"path": "/tmp/test.py"}, spec)
+        spec = self._make_spec("read_file", filesystem_read=True)
+        result = pipeline.evaluate("read_file", {"path": "/tmp/test.py"}, spec)
         assert result.decision == "allow"
 
     def test_plan_mode_denies_writes(self):
         pipeline = PermissionPipeline(mode=PermissionMode.PLAN)
-        spec = self._make_spec("file_edit_v2", filesystem_write=True)
-        result = pipeline.evaluate("file_edit_v2", {"path": "/tmp/test.py"}, spec)
+        spec = self._make_spec("edit_file", filesystem_write=True)
+        result = pipeline.evaluate("edit_file", {"path": "/tmp/test.py"}, spec)
         assert result.decision == "deny"
         assert "plan mode" in result.message.lower()
 
     def test_plan_mode_denies_bash(self):
         pipeline = PermissionPipeline(mode=PermissionMode.PLAN)
-        spec = self._make_spec("bash_v2", command=True)
-        result = pipeline.evaluate("bash_v2", {"command": "ls"}, spec)
+        spec = self._make_spec("run_command", command=True)
+        result = pipeline.evaluate("run_command", {"command": "ls"}, spec)
         assert result.decision == "deny"
 
     def test_plan_mode_allows_reads(self):
         pipeline = PermissionPipeline(mode=PermissionMode.PLAN)
-        spec = self._make_spec("file_read_v2", filesystem_read=True)
-        result = pipeline.evaluate("file_read_v2", {"path": "/tmp/test.py"}, spec)
+        spec = self._make_spec("read_file", filesystem_read=True)
+        result = pipeline.evaluate("read_file", {"path": "/tmp/test.py"}, spec)
         assert result.decision == "allow"
 
     def test_accept_edits_mode_allows_file_edits(self):
         pipeline = PermissionPipeline(mode=PermissionMode.ACCEPT_EDITS)
-        result = pipeline.evaluate("file_edit_v2", {"path": "/tmp/test.py"})
+        result = pipeline.evaluate("edit_file", {"path": "/tmp/test.py"})
         assert result.decision == "allow"
 
     def test_accept_edits_mode_asks_for_bash(self):
         pipeline = PermissionPipeline(mode=PermissionMode.ACCEPT_EDITS)
-        result = pipeline.evaluate("bash_v2", {"command": "ls"})
+        result = pipeline.evaluate("run_command", {"command": "ls"})
         assert result.decision == "ask"
 
     def test_bypass_mode_allows_everything(self):
         pipeline = PermissionPipeline(mode=PermissionMode.BYPASS)
-        spec = self._make_spec("bash_v2", command=True)
-        result = pipeline.evaluate("bash_v2", {"command": "rm -rf /"}, spec)
+        spec = self._make_spec("run_command", command=True)
+        result = pipeline.evaluate("run_command", {"command": "rm -rf /"}, spec)
         assert result.decision == "allow"
 
     def test_deny_rule_takes_precedence(self):
@@ -122,7 +113,7 @@ class TestPermissionPipeline:
             deny_rules=[
                 ToolPermissionRule(
                     effect="deny",
-                    tool_name="file_edit_v2",
+                    tool_name="edit_file",
                     message="Editing is forbidden",
                 )
             ]
@@ -130,33 +121,33 @@ class TestPermissionPipeline:
         pipeline = PermissionPipeline(
             mode=PermissionMode.DEFAULT, context=context
         )
-        result = pipeline.evaluate("file_edit_v2", {"path": "/tmp/test.py"})
+        result = pipeline.evaluate("edit_file", {"path": "/tmp/test.py"})
         assert result.decision == "deny"
         assert "Editing is forbidden" in result.message
 
     def test_protected_path_denied(self):
         pipeline = PermissionPipeline(mode=PermissionMode.DEFAULT)
         result = pipeline.evaluate(
-            "file_edit_v2", {"path": ".git/config"}
+            "edit_file", {"path": ".git/config"}
         )
         assert result.decision == "deny"
         assert "protected" in result.message.lower()
 
     def test_bash_unsafe_command_denied(self):
         pipeline = PermissionPipeline(mode=PermissionMode.DEFAULT)
-        result = pipeline.evaluate("bash_v2", {"command": "rm -rf /"})
+        result = pipeline.evaluate("run_command", {"command": "rm -rf /"})
         assert result.decision == "deny"
 
     def test_bash_needs_review_asks(self):
         pipeline = PermissionPipeline(mode=PermissionMode.DEFAULT)
         result = pipeline.evaluate(
-            "bash_v2", {"command": "cat file.txt | grep pattern"}
+            "run_command", {"command": "cat file.txt | grep pattern"}
         )
         assert result.decision == "ask"
 
     def test_bash_safe_command_allowed(self):
         pipeline = PermissionPipeline(mode=PermissionMode.DEFAULT)
-        result = pipeline.evaluate("bash_v2", {"command": "ls -la"})
+        result = pipeline.evaluate("run_command", {"command": "ls -la"})
         assert result.decision == "allow"
 
 
@@ -391,29 +382,29 @@ class TestReadBeforeWriteEnforcer:
 class TestAutoPermissionClassifier:
     def test_safe_read_tools_auto_allowed(self):
         clf = AutoPermissionClassifier()
-        for tool_name in ("file_read_v2", "Read", "Glob", "Grep"):
+        for tool_name in ("read_file", "glob", "grep"):
             result = clf.classify(tool_name, {"path": "/tmp/test.py"})
             assert result == "allow", f"{tool_name} should be auto-allowed"
 
     def test_write_tool_without_read_asks(self):
         clf = AutoPermissionClassifier()
-        result = clf.classify("file_edit_v2", {"path": "/tmp/test.py"})
+        result = clf.classify("edit_file", {"path": "/tmp/test.py"})
         assert result == "ask"
 
     def test_write_tool_after_read_allowed(self):
         clf = AutoPermissionClassifier()
         clf.record_read("/tmp/test.py")
-        result = clf.classify("file_edit_v2", {"path": "/tmp/test.py"})
+        result = clf.classify("edit_file", {"path": "/tmp/test.py"})
         assert result == "allow"
 
     def test_bash_safe_command_allowed(self):
         clf = AutoPermissionClassifier()
-        result = clf.classify("bash_v2", {"command": "ls -la"})
+        result = clf.classify("run_command", {"command": "ls -la"})
         assert result == "allow"
 
     def test_bash_dangerous_command_denied(self):
         clf = AutoPermissionClassifier()
-        result = clf.classify("bash_v2", {"command": "rm -rf /"})
+        result = clf.classify("run_command", {"command": "rm -rf /"})
         assert result == "deny"
 
     def test_unknown_tool_asks(self):
@@ -452,7 +443,7 @@ class TestAutoPermissionClassifier:
         # Trigger lockout
         for _ in range(3):
             pipeline._auto_classifier.record_denial()
-        result = pipeline.evaluate("file_edit_v2", {"path": "/tmp/test.py"})
+        result = pipeline.evaluate("edit_file", {"path": "/tmp/test.py"})
         assert result.decision == "ask"
         assert "locked out" in result.message.lower()
 
@@ -516,7 +507,7 @@ class TestActionExecutorIntegration:
         engine_mock.hooks = [MagicMock()]
 
         executor = ActionExecutor(
-            tool_registry=MagicMock(), engine=engine_mock
+            tool_registry=ToolRegistry(), engine=engine_mock
         )
 
         # This should find hooks via engine.hooks, not engine._hooks
@@ -536,29 +527,23 @@ class TestActionExecutorIntegration:
         # Create a pipeline in PLAN mode that denies writes
         pipeline = PermissionPipeline(mode=PermissionMode.PLAN)
 
-        # Create a mock tool registry with a write tool
-        mock_tool = MagicMock()
-        mock_tool.name = "file_edit_v2"
-        mock_tool.spec = ToolSpec(
-            name="file_edit_v2",
-            description="edit file",
+        @tool(
+            name="edit_file",
             permissions=ToolPermission(filesystem_write=True),
         )
-        mock_tool.validate_input.return_value = MagicMock(valid=True)
-        mock_tool.check_permissions.return_value = ToolPermissionDecision.allow()
+        def edit_file(path: str) -> str:
+            return path
 
-        registry = MagicMock()
-        registry.get.return_value = mock_tool
-        registry.describe_tool.return_value = {"name": "file_edit_v2", "origin": {}}
+        registry = ToolRegistry().register(edit_file)
 
         executor = ActionExecutor(
             tool_registry=registry,
             permission_pipeline=pipeline,
         )
 
-        action = Action(name="file_edit_v2", args={"path": "test.py"})
+        action = Action(name="edit_file", args={"path": "test.py"})
         results = executor.execute([action])
-        assert results[0].status == ActionStatus.SKIPPED
+        assert results[0].status == ActionStatus.DENIED
 
     def test_rbw_enforcer_in_executor(self):
         """Test that read-before-write enforcer blocks writes to unread files."""
@@ -567,17 +552,11 @@ class TestActionExecutorIntegration:
 
         rbw = ReadBeforeWriteEnforcer()
 
-        mock_tool = MagicMock()
-        mock_tool.name = "file_edit_v2"
-        mock_tool.spec = ToolSpec(
-            name="file_edit_v2",
-            description="edit file",
-        )
-        mock_tool.validate_input.return_value = MagicMock(valid=True)
+        @tool(name="edit_file")
+        def edit_file(path: str) -> str:
+            return path
 
-        registry = MagicMock()
-        registry.get.return_value = mock_tool
-        registry.describe_tool.return_value = {"name": "file_edit_v2", "origin": {}}
+        registry = ToolRegistry().register(edit_file)
 
         executor = ActionExecutor(
             tool_registry=registry,
@@ -590,9 +569,9 @@ class TestActionExecutorIntegration:
             path = f.name
 
         try:
-            action = Action(name="file_edit_v2", args={"path": path})
+            action = Action(name="edit_file", args={"path": path})
             results = executor.execute([action])
-            assert results[0].status == ActionStatus.SKIPPED
+            assert results[0].status == ActionStatus.DENIED
             assert results[0].output.get("error_category") == "read_before_write"
         finally:
             os.unlink(path)

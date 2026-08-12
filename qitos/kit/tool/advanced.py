@@ -32,14 +32,6 @@ class _DelegatingTool(BaseTool):
     ) -> ToolPermissionDecision:
         return self._delegate.check_permissions(args, runtime_context=runtime_context)
 
-    def run(self, **kwargs: Any) -> Any:
-        return self._delegate.run(**kwargs)
-
-    def call(
-        self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Any:
-        return self._delegate.call(args, runtime_context=runtime_context)
-
     def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Any:
@@ -48,72 +40,67 @@ class _DelegatingTool(BaseTool):
 
 class AskUserChoiceTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).ask_user_choice)
+        super().__init__(CodingToolSet().ask_user_choice)
 
 
 class ToolSearchTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).tool_search)
+        super().__init__(CodingToolSet().tool_search)
 
 
 class TodoWriteTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).todo_write)
+        super().__init__(CodingToolSet().todo_write)
 
 
 class EnterPlanModeTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).enter_plan_mode)
+        super().__init__(CodingToolSet().enter_plan_mode)
 
 
 class ExitPlanModeTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).exit_plan_mode)
+        super().__init__(CodingToolSet().exit_plan_mode)
 
 
 class EnterWorktreeTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).enter_worktree)
+        super().__init__(CodingToolSet().enter_worktree)
 
 
 class ExitWorktreeTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).exit_worktree)
+        super().__init__(CodingToolSet().exit_worktree)
 
 
 class LSPQueryTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).lsp_query)
+        super().__init__(CodingToolSet().lsp_query)
 
 
 class MCPListResourcesTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).mcp_list_resources)
+        super().__init__(CodingToolSet().mcp_list_resources)
 
 
 class MCPReadResourceTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).mcp_read_resource)
+        super().__init__(CodingToolSet().mcp_read_resource)
 
 
 class CronCreateTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).cron_create)
+        super().__init__(CodingToolSet().cron_create)
 
 
 class CronDeleteTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).cron_delete)
+        super().__init__(CodingToolSet().cron_delete)
 
 
 class CronListTool(_DelegatingTool):
     def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).cron_list)
-
-
-class AgentSpawnTool(_DelegatingTool):
-    def __init__(self):
-        super().__init__(CodingToolSet(expose_legacy_aliases=False).agent_spawn)
+        super().__init__(CodingToolSet().cron_list)
 
 
 class AdvancedCodingToolSet(CodingToolSet):
@@ -136,8 +123,6 @@ class AdvancedCodingToolSet(CodingToolSet):
             enable_lsp=enable_lsp,
             enable_tasks=enable_tasks,
             enable_web=enable_web,
-            expose_legacy_aliases=True,
-            expose_modern_names=False,
             profile="full",
             include_http_tools=False,
         )
@@ -145,7 +130,6 @@ class AdvancedCodingToolSet(CodingToolSet):
 
 __all__ = [
     "AdvancedCodingToolSet",
-    "AgentSpawnTool",
     "AskUserChoiceTool",
     "CronCreateTool",
     "CronDeleteTool",

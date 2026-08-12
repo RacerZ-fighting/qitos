@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, List, TypeVar
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from .states import RuntimePhase
 
 if TYPE_CHECKING:
     from .engine import Engine
     from ..core.decision import Decision
-    from ..core.state import StateSchema
 
 StateT = TypeVar("StateT")
 ObservationT = TypeVar("ObservationT")
@@ -102,7 +101,11 @@ class IsolatedContextFilter(ContextFilter):
         # Add the task as a fresh user message
         if task:
             try:
-                task_msg = type(history[0])(role="user", content=task) if history else {"role": "user", "content": task}
+                task_msg = (
+                    type(history[0])(role="user", content=task)
+                    if history
+                    else {"role": "user", "content": task}
+                )
             except Exception:
                 task_msg = {"role": "user", "content": task}
             system_msgs.append(task_msg)
@@ -113,6 +116,7 @@ class IsolatedContextFilter(ContextFilter):
 # ---------------------------------------------------------------------------
 # Context filter factory
 # ---------------------------------------------------------------------------
+
 
 def get_context_filter(strategy: str | Any) -> ContextFilter:
     """Get a ContextFilter instance for the given strategy.
@@ -128,7 +132,11 @@ def get_context_filter(strategy: str | Any) -> ContextFilter:
     """
     from ..core.agent_spec import ContextStrategy
 
-    strategy_str = str(strategy).lower() if not isinstance(strategy, ContextStrategy) else strategy.value
+    strategy_str = (
+        str(strategy).lower()
+        if not isinstance(strategy, ContextStrategy)
+        else strategy.value
+    )
 
     filters = {
         "full": FullContextFilter,
@@ -137,7 +145,9 @@ def get_context_filter(strategy: str | Any) -> ContextFilter:
     }
     cls = filters.get(strategy_str)
     if cls is None:
-        raise ValueError(f"Unknown context strategy: {strategy!r}. Expected one of {list(filters)}")
+        raise ValueError(
+            f"Unknown context strategy: {strategy!r}. Expected one of {list(filters)}"
+        )
     return cls()
 
 
@@ -213,7 +223,10 @@ class _HandoffRuntime(Generic[StateT, ObservationT, ActionT]):
         messages_passed = len(filtered_history)
 
         # Apply filtered history
-        if hasattr(self.engine, "_runtime_history") and self.engine._runtime_history is not None:
+        if (
+            hasattr(self.engine, "_runtime_history")
+            and self.engine._runtime_history is not None
+        ):
             if hasattr(self.engine._runtime_history, "_items"):
                 self.engine._runtime_history._items = filtered_history
             elif hasattr(self.engine._runtime_history, "replace_all"):
@@ -298,7 +311,9 @@ class _HandoffRuntime(Generic[StateT, ObservationT, ActionT]):
                 context_strategy=context_strategy,
                 messages_passed=messages_passed,
             )
-            with provider.create_trace(name=f"handoff:{from_agent}->{to_agent}") as trace:
+            with provider.create_trace(
+                name=f"handoff:{from_agent}->{to_agent}"
+            ) as trace:
                 span = trace.create_span(SpanType.HANDOFF, span_data)
                 span.start()
                 span.finish()
@@ -364,13 +379,22 @@ class _HandoffRuntime(Generic[StateT, ObservationT, ActionT]):
 
         # Filter state fields if shared_state_fields is specified
         if hc.shared_state_fields:
-            from ..core.state import StateSchema
-            base_fields = {"schema_version", "task", "current_step", "max_steps",
-                           "final_result", "stop_reason", "metadata", "metrics"}
+            base_fields = {
+                "schema_version",
+                "task",
+                "current_step",
+                "max_steps",
+                "final_result",
+                "stop_reason",
+                "metadata",
+                "metrics",
+            }
             allowed = base_fields | set(hc.shared_state_fields)
             for key in list(state.__dict__.keys()):
                 if key not in allowed:
-                    state.metadata.setdefault("_handoff_removed_fields", {})[key] = state.__dict__.pop(key)
+                    state.metadata.setdefault("_handoff_removed_fields", {})[key] = (
+                        state.__dict__.pop(key)
+                    )
 
 
 def compact_handoff_history(
@@ -410,7 +434,9 @@ def compact_handoff_history(
             role = getattr(item, "role", "unknown")
         role_counts[role] = role_counts.get(role, 0) + 1
 
-    summary_parts = [f"{count} {role} message(s)" for role, count in role_counts.items()]
+    summary_parts = [
+        f"{count} {role} message(s)" for role, count in role_counts.items()
+    ]
     summary_text = summary_prefix + ", ".join(summary_parts)
 
     # Create a single summary item (using a simple dict-like structure)

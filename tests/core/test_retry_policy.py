@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import time
-from typing import Any, Dict, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -55,6 +53,19 @@ class TestRetryPolicyDataclass:
         with pytest.raises(TypeError, match="must contain exception types"):
             RetryPolicy(retryable_exceptions=(int, str))
 
+    @pytest.mark.parametrize("max_attempts", [0, -1, True])
+    def test_max_attempts_must_be_positive(self, max_attempts):
+        with pytest.raises(ValueError, match="at least 1"):
+            RetryPolicy(max_attempts=max_attempts)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("backoff_factor", -0.1), ("max_backoff", -0.1)],
+    )
+    def test_backoff_values_must_be_non_negative(self, field, value):
+        with pytest.raises(ValueError, match="non-negative"):
+            RetryPolicy(**{field: value})
+
 
 # ---------------------------------------------------------------------------
 # ToolSpec / ToolMeta fields
@@ -74,7 +85,9 @@ class TestToolSpecRetryPolicy:
         assert spec.retry_policy.max_attempts == 5
 
     def test_spec_with_on_failure(self):
-        cb = lambda: None
+        def cb():
+            return None
+
         spec = ToolSpec(name="t", description="test", on_failure=cb)
         assert spec.on_failure is cb
 
@@ -91,7 +104,9 @@ class TestToolMetaRetryPolicy:
         assert meta.retry_policy.max_attempts == 7
 
     def test_meta_with_on_failure(self):
-        cb = lambda: None
+        def cb():
+            return None
+
         meta = ToolMeta(on_failure=cb)
         assert meta.on_failure is cb
 
@@ -238,19 +253,6 @@ class TestActionExecutorRetry:
         )
         assert ft.spec.retry_policy.retryable_exceptions == (ValueError,)
         # TypeError is not in retryable_exceptions, so ActionExecutor won't retry it
-
-    def test_max_retries_backward_compat(self):
-        """max_retries still works without RetryPolicy."""
-        def simple_tool(x: int) -> int:
-            return x
-
-        ft = FunctionTool(
-            simple_tool,
-            meta=ToolMeta(max_retries=5),
-        )
-        assert ft.spec.max_retries == 5
-        assert ft.spec.retry_policy is None
-
 
 # ---------------------------------------------------------------------------
 # RetryPolicy edge cases

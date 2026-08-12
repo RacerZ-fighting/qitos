@@ -8,16 +8,18 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, TypeVar
 
 from ..core.errors import StopReason
 from ..core.spec import ExperimentSpec, RunSpec
 from ..core.state import StateSchema
 from ..core.task import Task, TaskCriterionResult, TaskResult, TaskValidationIssue
 from ..trace import runtime_event_to_trace, runtime_step_to_trace
-from ._protocol import _EngineProtocol
 from .hooks import HookContext
 from .states import RuntimeEvent, RuntimePhase, StepRecord
+
+if TYPE_CHECKING:
+    from .engine import Engine
 
 _logger = logging.getLogger("qitos.engine._trace_runtime")
 
@@ -26,12 +28,15 @@ StateT = TypeVar("StateT", bound=StateSchema)
 
 
 class _TraceRuntime(Generic[StateT]):
-    def __init__(self, engine: _EngineProtocol):
+    def __init__(self, engine: Engine[StateT, Any, Any]):
         self.engine = engine
         self.parser_error_count = 0
         self.parser_warning_count = 0
         self.parser_salvage_count = 0
         self.parser_error_codes: Counter[str] = Counter()
+        # Event index tracking for lightweight TraceStep (Fix 1B)
+        self._step_event_start: Dict[int, int] = {}
+        self._step_event_end: Dict[int, int] = {}
 
     def emit(
         self,
@@ -42,6 +47,12 @@ class _TraceRuntime(Generic[StateT]):
         error: Optional[str] = None,
     ) -> None:
         engine = self.engine
+        # Track event index for lightweight TraceStep
+        event_idx = len(engine.events)
+        if step_id not in self._step_event_start:
+            self._step_event_start[step_id] = event_idx
+        self._step_event_end[step_id] = event_idx
+
         event_ts = datetime.now(timezone.utc).isoformat()
         event_payload = dict(payload or {})
         event_payload.setdefault("run_id", engine._active_run_id)
@@ -84,7 +95,16 @@ class _TraceRuntime(Generic[StateT]):
             return
         if self.engine.trace_writer is None:
             return
-        self.engine.trace_writer.write_step(runtime_step_to_trace(step))
+        step_id = getattr(step, "step_id", 0)
+        event_start = self._step_event_start.get(step_id, -1)
+        event_end = self._step_event_end.get(step_id, -1)
+        self.engine.trace_writer.write_step(
+            runtime_step_to_trace(
+                step,
+                event_start_idx=event_start,
+                event_end_idx=event_end,
+            )
+        )
 
     def finalize_step(self, record: StepRecord, state: StateT) -> None:
         self.write_trace_step(record)
@@ -236,6 +256,8 @@ class _TraceRuntime(Generic[StateT]):
 
     def run_meta(self) -> Dict[str, Any]:
         engine = self.engine
+        run_spec = getattr(engine, "run_spec", None)
+        experiment_spec = getattr(engine, "experiment_spec", None)
         llm = getattr(engine.agent, "llm", None)
         model_name = getattr(llm, "model", None) if llm is not None else None
         harness_meta = (
@@ -243,7 +265,9 @@ class _TraceRuntime(Generic[StateT]):
             if llm is not None
             else {}
         )
-        protocol = engine.resolve_protocol() if hasattr(engine, "resolve_protocol") else None
+        protocol = (
+            engine.resolve_protocol() if hasattr(engine, "resolve_protocol") else None
+        )
         parser_name = (
             engine.parser.__class__.__name__
             if engine.parser is not None
@@ -270,7 +294,11 @@ class _TraceRuntime(Generic[StateT]):
             "model_name": model_name,
             "model_family": (
                 harness_meta.get("family_preset")
-                or (RunSpec.infer(model_name=model_name).model_family if model_name else None)
+                or (
+                    RunSpec.infer(model_name=model_name).model_family
+                    if model_name
+                    else None
+                )
             ),
             "protocol": getattr(protocol, "id", None) if protocol is not None else None,
             "protocol_resolution_source": getattr(
@@ -280,17 +308,22 @@ class _TraceRuntime(Generic[StateT]):
             "tool_count": len(tools),
             "tools": tools,
             "env": env_info,
+            "budget": {
+                "max_steps": engine.budget.max_steps,
+                "max_runtime_seconds": engine.budget.max_runtime_seconds,
+                "max_tokens": engine.budget.max_tokens,
+                # Absolute monotonic values are process-local timestamps and
+                # therefore cannot be compared across runs.  Record only the
+                # stable fact that an external deadline constrained this run.
+                "deadline_constrained": engine.budget.deadline_monotonic is not None,
+            },
             "context": engine._context_runtime.run_meta(llm),
             "prompt": dict(getattr(engine, "_last_prompt_metadata", {}) or {}),
             "harness": harness_meta,
-            "run_spec": (
-                engine.run_spec.to_dict()
-                if isinstance(getattr(engine, "run_spec", None), RunSpec)
-                else None
-            ),
+            "run_spec": (run_spec.to_dict() if isinstance(run_spec, RunSpec) else None),
             "experiment_spec": (
-                engine.experiment_spec.to_dict()
-                if isinstance(getattr(engine, "experiment_spec", None), ExperimentSpec)
+                experiment_spec.to_dict()
+                if isinstance(experiment_spec, ExperimentSpec)
                 else None
             ),
         }
@@ -499,6 +532,8 @@ class _TraceRuntime(Generic[StateT]):
         self.engine.records = []
         self.engine._last_env_observation = None
         self.engine._last_env_result = None
+        self._step_event_start.clear()
+        self._step_event_end.clear()
 
     def clear_active_context(self) -> None:
         self.engine._active_state = None

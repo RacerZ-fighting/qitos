@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import inspect
+import re
+from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, cast, get_type_hints
 
@@ -24,8 +27,9 @@ class ToolPermissionSpec:
     permissions: ToolPermission = field(default_factory=ToolPermission)
     needs_approval: bool = False
     read_only: bool = False
-    concurrency_safe: bool = False
+    concurrency_safe: Optional[bool] = None
     required_ops: List[str] = field(default_factory=list)
+    environment_ops: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -36,6 +40,7 @@ class ToolPermissionSpec:
             "read_only": self.read_only,
             "concurrency_safe": self.concurrency_safe,
             "required_ops": list(self.required_ops),
+            "environment_ops": list(self.environment_ops),
         }
 
 
@@ -201,8 +206,8 @@ class RetryPolicy:
     """Per-tool retry configuration with exponential backoff and exception filtering.
 
     When attached to a tool via ``@function_tool(retry_policy=...)`` or
-    ``ToolSpec.retry_policy``, the :class:`ActionExecutor` uses this policy
-    instead of the bare ``max_retries`` integer.
+    ``ToolSpec.retry_policy``, the :class:`ActionExecutor` uses it as the sole
+    owner of invocation retries. Tools without a policy run exactly once.
 
     Attributes:
         max_attempts: Total attempts including the first call (e.g. 3 = 1 initial + 2 retries).
@@ -217,9 +222,17 @@ class RetryPolicy:
     backoff_factor: float = 0.5
     max_backoff: float = 60.0
     jitter: bool = True
-    retryable_exceptions: tuple = (Exception,)
+    retryable_exceptions: tuple[type[BaseException], ...] = (Exception,)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        if isinstance(self.max_attempts, bool) or self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        if self.backoff_factor < 0:
+            raise ValueError("backoff_factor must be non-negative")
+        if self.max_backoff < 0:
+            raise ValueError("max_backoff must be non-negative")
+        if not isinstance(self.jitter, bool):
+            raise TypeError("jitter must be a boolean")
         for exc_type in self.retryable_exceptions:
             if not (isinstance(exc_type, type) and issubclass(exc_type, BaseException)):
                 raise TypeError(
@@ -234,15 +247,15 @@ class ToolSpec:
     parameters: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     required: List[str] = field(default_factory=list)
     timeout_s: Optional[float] = None
-    max_retries: int = 0
     retry_policy: Optional[RetryPolicy] = None
     on_failure: Optional[Callable] = None
     permissions: ToolPermission = field(default_factory=ToolPermission)
     required_ops: List[str] = field(default_factory=list)
+    environment_ops: List[str] = field(default_factory=list)
     input_schema: Optional[Dict[str, Any]] = None
     output_schema: Optional[Dict[str, Any]] = None
     read_only: bool = False
-    concurrency_safe: bool = False
+    concurrency_safe: Optional[bool] = None
     needs_approval: bool = False
     requires_user_interaction: bool = False
     supports_background: bool = False
@@ -250,6 +263,16 @@ class ToolSpec:
     produces_artifact: bool = False
     rule_scope_builder: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None
     prompt: str = ""
+
+    def __post_init__(self) -> None:
+        if self.timeout_s is not None and self.timeout_s <= 0:
+            raise ValueError("timeout_s must be positive or None")
+        if not isinstance(self.needs_approval, bool):
+            raise TypeError("needs_approval must be a boolean")
+        if self.concurrency_safe is not None and not isinstance(
+            self.concurrency_safe, bool
+        ):
+            raise TypeError("concurrency_safe must be a boolean or None")
 
 
 @dataclass
@@ -258,15 +281,15 @@ class ToolMeta:
     description: Optional[str] = None
     prompt: str = ""
     timeout_s: Optional[float] = None
-    max_retries: int = 0
     retry_policy: Optional[RetryPolicy] = None
     on_failure: Optional[Callable] = None
     permissions: ToolPermission = field(default_factory=ToolPermission)
     required_ops: List[str] = field(default_factory=list)
+    environment_ops: List[str] = field(default_factory=list)
     input_schema: Optional[Dict[str, Any]] = None
     output_schema: Optional[Dict[str, Any]] = None
     read_only: bool = False
-    concurrency_safe: bool = False
+    concurrency_safe: Optional[bool] = None
     needs_approval: bool = False
     requires_user_interaction: bool = False
     supports_background: bool = False
@@ -275,15 +298,11 @@ class ToolMeta:
     rule_scope_builder: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None
 
 
-class BaseTool:
-    """Base abstraction for callable tools."""
+class BaseTool(ABC):
+    """Canonical class-based tool contract."""
 
     def __init__(self, spec: ToolSpec):
-        description = (
-            inspect.getdoc(self.execute)
-            or inspect.getdoc(self.run)
-            or inspect.getdoc(self.__class__)
-        )
+        description = inspect.getdoc(self.execute) or inspect.getdoc(self.__class__)
         if description:
             spec.description = inspect.cleandoc(description)
         if spec.input_schema is None:
@@ -297,37 +316,6 @@ class BaseTool:
     @property
     def name(self) -> str:
         return self.spec.name
-
-    def _coerce_run_kwargs(
-        self, args: tuple[Any, ...], kwargs: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        if not args:
-            return dict(kwargs)
-        param_names = list(self.spec.parameters.keys())
-        if len(args) > len(param_names):
-            raise TypeError(
-                f"{self.__class__.__name__}.run() received too many positional arguments"
-            )
-        merged = dict(kwargs)
-        for name, value in zip(param_names, args):
-            if name in merged:
-                raise TypeError(
-                    f"{self.__class__.__name__}.run() got multiple values for argument '{name}'"
-                )
-            merged[name] = value
-        return merged
-
-    def run(self, *args: Any, **kwargs: Any) -> Any:
-        """Compatibility wrapper that routes legacy run calls through `execute(...)`."""
-        runtime_context = kwargs.pop("runtime_context", None)
-        coerced = self._coerce_run_kwargs(args, kwargs)
-        return self.execute(coerced, runtime_context=runtime_context)
-
-    def call(
-        self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Any:
-        """Normalized call path for tool execution."""
-        return self.execute(args, runtime_context=runtime_context)
 
     def validate_input(
         self,
@@ -358,25 +346,18 @@ class BaseTool:
             return str(value or "")
         return ""
 
+    @abstractmethod
     def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Any:
-        """Execute tool with optional runtime context."""
-        legacy_run = type(self).run
-        if legacy_run is not BaseTool.run:
-            call_kwargs = dict(args)
-            run_sig = inspect.signature(legacy_run)
-            if "runtime_context" in run_sig.parameters:
-                call_kwargs["runtime_context"] = runtime_context
-            return legacy_run(self, **call_kwargs)
-        raise NotImplementedError
-
-    def __call__(self, **kwargs: Any) -> Any:
-        return self.run(**kwargs)
+        """Execute one validated tool call with its runtime context."""
 
 
 class FunctionTool(BaseTool):
     """Tool wrapper around callable functions or bound methods."""
+
+    func: Callable[..., Any]
+    meta: ToolMeta
 
     def __init__(self, func: Callable[..., Any], meta: Optional[ToolMeta] = None):
         # If func is already a FunctionTool (e.g. from __get__ binding),
@@ -406,17 +387,14 @@ class FunctionTool(BaseTool):
         # Create a bound copy that prepends obj (self) to the function call
         bound = FunctionTool.__new__(FunctionTool)
         bound.func = self.func.__get__(obj, objtype)
-        bound.meta = self.meta
-        bound.spec = self.spec
+        bound.meta = deepcopy(self.meta)
+        bound.spec = deepcopy(self.spec)
         return bound
 
-    def run(self, **kwargs: Any) -> Any:
-        return self.func(**kwargs)
+    def __call__(self, **kwargs: Any) -> Any:
+        """Preserve ordinary function-call semantics for the function decorator."""
 
-    def call(
-        self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Any:
-        return self.execute(args, runtime_context=runtime_context)
+        return self.func(**kwargs)
 
     def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
@@ -444,15 +422,15 @@ def tool(
     description: Optional[str] = None,
     prompt: str = "",
     timeout_s: Optional[float] = None,
-    max_retries: int = 0,
     retry_policy: Optional[RetryPolicy] = None,
     on_failure: Optional[Callable] = None,
     permissions: Optional[ToolPermission] = None,
     required_ops: Optional[List[str]] = None,
+    environment_ops: Optional[List[str]] = None,
     input_schema: Optional[Dict[str, Any]] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     read_only: bool = False,
-    concurrency_safe: bool = False,
+    concurrency_safe: Optional[bool] = None,
     needs_approval: bool = False,
     requires_user_interaction: bool = False,
     supports_background: bool = False,
@@ -468,11 +446,11 @@ def tool(
             description=description,
             prompt=prompt,
             timeout_s=timeout_s,
-            max_retries=max_retries,
             retry_policy=retry_policy,
             on_failure=on_failure,
             permissions=permissions or ToolPermission(),
             required_ops=list(required_ops or []),
+            environment_ops=list(environment_ops or []),
             input_schema=input_schema,
             output_schema=output_schema,
             read_only=read_only,
@@ -502,6 +480,74 @@ def get_tool_meta(func: Callable[..., Any]) -> Optional[ToolMeta]:
     return None
 
 
+def _parse_param_descriptions(docstring: str) -> Dict[str, str]:
+    """Extract :param name: description pairs from a docstring.
+
+    Supports both Sphinx style (``:param name: desc``) and Google style
+    (``Args:\\n    name: desc``) formats.
+    """
+    param_descs: Dict[str, str] = {}
+    if not docstring:
+        return param_descs
+    # Sphinx / Epydoc style: :param name: description
+    for m in re.finditer(
+        r":param\s+(\w+)\s*:\s*(.*?)(?=\n\s*:param|\n\s*:type|\n\s*:return|\n\s*:raises|\Z)",
+        docstring,
+        re.DOTALL,
+    ):
+        name = m.group(1)
+        desc = " ".join(m.group(2).split()).strip()
+        if desc:
+            param_descs[name] = desc
+    # Google style: under "Args:" section, "    name: description"
+    if not param_descs:
+        args_match = re.search(
+            r"(?:Args|Arguments|Parameters)\s*:\s*\n((?:\s+\w+.*\n?)+)",
+            docstring,
+        )
+        if args_match:
+            for line in args_match.group(1).splitlines():
+                google_match = re.match(r"\s+(\w+)\s*:\s*(.*)", line)
+                if google_match:
+                    param_descs[google_match.group(1)] = google_match.group(2).strip()
+    return param_descs
+
+
+def _strip_param_docs(docstring: str) -> str:
+    """Remove :param / :type / :return / :raises lines from a docstring.
+
+    These belong in parameter descriptions, not in the top-level tool
+    description.  Keeps the summary and usage text clean.
+    """
+    if not docstring:
+        return docstring
+    lines = docstring.splitlines()
+    cleaned: List[str] = []
+    skip = False
+    for line in lines:
+        stripped = line.lstrip()
+        if (
+            stripped.startswith(":param ")
+            or stripped.startswith(":type ")
+            or stripped.startswith(":return")
+            or stripped.startswith(":raises ")
+        ):
+            skip = True
+            continue
+        if skip and stripped.startswith(":"):
+            # Could be a new :param — don't skip, let next iteration handle
+            skip = False
+        if skip and stripped and not stripped.startswith(":"):
+            # Continuation line of a :param block
+            continue
+        skip = False
+        cleaned.append(line)
+    # Remove trailing blank lines
+    while cleaned and not cleaned[-1].strip():
+        cleaned.pop()
+    return "\n".join(cleaned)
+
+
 def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
     sig = inspect.signature(func)
     target = getattr(func, "__func__", func)
@@ -521,6 +567,9 @@ def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
     params = {}
     required = []
 
+    raw_doc = inspect.getdoc(func) or ""
+    param_descs = _parse_param_descriptions(raw_doc)
+
     for name, p in sig.parameters.items():
         if name in {
             "self",
@@ -533,11 +582,16 @@ def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
         }:
             continue
         annotation = resolved_hints.get(name, p.annotation)
-        params[name] = {"type": _type_to_json(annotation), "description": ""}
+        params[name] = {
+            "type": _type_to_json(annotation),
+            "description": param_descs.get(name, ""),
+        }
         if p.default is inspect.Parameter.empty:
             required.append(name)
 
-    desc = inspect.getdoc(func) or meta.description or ""
+    # Strip :param lines from the top-level description so they don't
+    # duplicate the per-parameter descriptions the model already sees.
+    desc = _strip_param_docs(raw_doc) or meta.description or ""
     tool_name = str(meta.name or getattr(func, "__name__", "tool") or "tool")
 
     return ToolSpec(
@@ -546,11 +600,11 @@ def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
         parameters=params,
         required=required,
         timeout_s=meta.timeout_s,
-        max_retries=meta.max_retries,
         retry_policy=meta.retry_policy,
         on_failure=meta.on_failure,
         permissions=meta.permissions,
         required_ops=list(meta.required_ops),
+        environment_ops=list(meta.environment_ops),
         input_schema=meta.input_schema
         or {
             "type": "object",
@@ -607,7 +661,11 @@ def _type_to_json(annotation: Any) -> str:
     from .tool_schema import type_to_json_schema
 
     schema = type_to_json_schema(annotation)
-    if isinstance(schema, dict) and "type" in schema and isinstance(schema["type"], str):
+    if (
+        isinstance(schema, dict)
+        and "type" in schema
+        and isinstance(schema["type"], str)
+    ):
         return schema["type"]
     return "object"
 

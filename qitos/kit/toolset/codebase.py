@@ -16,8 +16,6 @@ class CodebaseToolSet(CodingToolSet):
             enable_lsp=False,
             enable_tasks=False,
             enable_web=False,
-            expose_legacy_aliases=True,
-            expose_modern_names=False,
             profile="codebase",
         )
 
@@ -32,8 +30,6 @@ class FilesToolSet(CodingToolSet):
             enable_lsp=False,
             enable_tasks=False,
             enable_web=False,
-            expose_legacy_aliases=True,
-            expose_modern_names=False,
             profile="files",
         )
 

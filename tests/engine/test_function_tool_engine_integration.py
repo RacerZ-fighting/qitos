@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from typing import Any, Dict
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -44,7 +43,7 @@ class _TestToolSet:
         read_only=True,
     )
     def read_only_tool(self, query: str) -> Dict[str, Any]:
-        return {"status": "ok", "query": query}
+        return {"status": "success", "query": query}
 
     @function_tool(
         name="approval_action",
@@ -52,7 +51,11 @@ class _TestToolSet:
         needs_approval=True,
     )
     def needs_approval_tool(self, command: str) -> Dict[str, Any]:
-        return {"status": "executed", "command": command}
+        return {
+            "status": "success",
+            "domain_outcome": "executed",
+            "command": command,
+        }
 
     @function_tool(
         name="read_and_approve",
@@ -61,14 +64,14 @@ class _TestToolSet:
         needs_approval=True,
     )
     def both_markers_tool(self, path: str) -> Dict[str, Any]:
-        return {"status": "ok", "path": path}
+        return {"status": "success", "path": path}
 
     @function_tool(
         name="basic_tool",
         description="A basic tool without markers",
     )
     def no_marker_tool(self, value: str) -> Dict[str, Any]:
-        return {"status": "ok", "value": value}
+        return {"status": "success", "value": value}
 
 
 # --- Test agent ---
@@ -110,7 +113,7 @@ class TestNeedsApproval:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=False)
 
-        action = Action(name="approval_action", args={"command": "rm -rf /"}, kind="tool")
+        action = Action(name="approval_action", args={"command": "rm -rf /"})
         with pytest.raises(EngineInterrupt):
             executor._execute_one(action)
 
@@ -120,7 +123,7 @@ class TestNeedsApproval:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=True)
 
-        action = Action(name="approval_action", args={"command": "echo hello"}, kind="tool")
+        action = Action(name="approval_action", args={"command": "echo hello"})
         result = executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 
@@ -130,7 +133,7 @@ class TestNeedsApproval:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=False)
 
-        action = Action(name="read_and_approve", args={"path": "/etc/passwd"}, kind="tool")
+        action = Action(name="read_and_approve", args={"path": "/etc/passwd"})
         with pytest.raises(EngineInterrupt):
             executor._execute_one(action)
 
@@ -144,16 +147,16 @@ class TestReadOnly:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=False)
 
-        action = Action(name="read_only_query", args={"query": "test"}, kind="tool")
+        action = Action(name="read_only_query", args={"query": "test"})
         result = executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 
-    def test_read_only_tool_is_concurrency_safe(self):
-        """A tool with read_only=True is classified as concurrency-safe."""
+    def test_read_only_tool_requires_an_explicit_concurrency_declaration(self):
+        """Read-only metadata alone does not prove shared-state safety."""
         ts = _TestToolSet()
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry)
-        assert executor._is_concurrency_safe("read_only_query") is True
+        assert executor._is_concurrency_safe("read_only_query") is False
 
     def test_needs_approval_tool_is_not_concurrency_safe(self):
         """A tool with needs_approval=True is NOT concurrency-safe."""
@@ -179,7 +182,7 @@ class TestReadOnly:
         assert executor._is_concurrency_safe("basic_tool") is False
 
         # No needs_approval → no interrupt
-        action = Action(name="basic_tool", args={"value": "test"}, kind="tool")
+        action = Action(name="basic_tool", args={"value": "test"})
         result = executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 

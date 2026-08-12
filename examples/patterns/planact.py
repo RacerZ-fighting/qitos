@@ -46,7 +46,6 @@ class PlanActAgent(AgentModule[PlanActState, dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         super().__init__(

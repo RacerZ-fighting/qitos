@@ -192,7 +192,7 @@ class AuditBoardMemory(Memory):
                 step_id=step_id,
                 reason="grep_hit",
                 status="search_hit",
-                source="grep_files",
+                source="grep",
                 bonus=16,
             )
 
@@ -231,7 +231,7 @@ class AuditBoardMemory(Memory):
             step_id=step_id,
             reason="focused_read",
             status="inspected",
-            source="read_file_range",
+            source="read_file",
             bonus=30,
         )
 
@@ -300,7 +300,7 @@ class AuditBoardMemory(Memory):
             top = targets[0]
             if top.get("status") in {"candidate", "search_hit"}:
                 lines.append(
-                    f"Best next evidence move: read_file_range on {top['path']} before launching another broad grep."
+                    f"Best next evidence move: read_file on {top['path']} before launching another broad grep."
                 )
 
         if self._all_targets_are_noise():
@@ -310,7 +310,7 @@ class AuditBoardMemory(Memory):
 
         if not lines:
             lines.append(
-                "Prefer evidence convergence: once grep_files hits a core file, switch to read_file_range and verify exploitability before searching again."
+                "Prefer evidence convergence: once grep hits a core file, switch to read_file and verify exploitability before searching again."
             )
         return lines
 

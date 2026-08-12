@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List
-from unittest.mock import MagicMock, patch
+from dataclasses import dataclass
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from qitos.core.agent_module import AgentModule
 from qitos.core.state import StateSchema
@@ -17,7 +19,9 @@ class FakeMCPServer(MCPServer):
     def __init__(self, name: str = "fake", tools: list | None = None):
         self._name = name
         self._tools = tools or [
-            MCPToolInfo(name="read", description="Read a file", input_schema={"type": "object"}),
+            MCPToolInfo(
+                name="read", description="Read a file", input_schema={"type": "object"}
+            ),
         ]
         self.connected = False
         self.cleaned_up = False
@@ -26,10 +30,10 @@ class FakeMCPServer(MCPServer):
     def name(self) -> str:
         return self._name
 
-    def connect(self) -> None:
+    async def connect(self) -> None:
         self.connected = True
 
-    def cleanup(self) -> None:
+    async def cleanup(self) -> None:
         self.cleaned_up = True
 
     async def list_tools(self) -> list[MCPToolInfo]:
@@ -65,7 +69,8 @@ class TestAgentModuleMCPServers:
         assert len(agent.mcp_servers) == 1
         assert agent.mcp_servers[0] is server
 
-    def test_engine_connects_mcp_servers_on_run(self):
+    @pytest.mark.asyncio
+    async def test_engine_connects_mcp_servers_on_run(self):
         server = FakeMCPServer()
         agent = DummyAgent(mcp_servers=[server])
         # Patch the engine's run loop to avoid actual execution
@@ -75,20 +80,24 @@ class TestAgentModuleMCPServers:
 
         # Mock the main run loop to just test MCP lifecycle
         with patch.object(engine, "_normalize_task", return_value=(None, "test task")):
-            with patch.object(engine.agent, "init_state", return_value=DummyState(task="test")):
+            with patch.object(
+                engine.agent, "init_state", return_value=DummyState(task="test")
+            ):
                 # Directly test connect/cleanup
                 engine._connected_mcp_servers = []
-                engine._connect_mcp_servers()
+                await engine._connect_mcp_servers()
                 assert server.connected
                 assert len(engine._connected_mcp_servers) == 1
 
-                engine._cleanup_mcp_servers()
+                await engine._cleanup_mcp_servers()
                 assert server.cleaned_up
                 assert engine._connected_mcp_servers == []
 
-    def test_engine_mcp_connect_failure_doesnt_crash(self):
+    @pytest.mark.asyncio
+    async def test_engine_mcp_connect_failure_doesnt_crash(self):
         """If an MCP server fails to connect, the engine should continue."""
         bad_server = MagicMock()
+        bad_server.connect = AsyncMock()
         bad_server.connect.side_effect = RuntimeError("Connection failed")
 
         agent = DummyAgent(mcp_servers=[bad_server])
@@ -96,23 +105,26 @@ class TestAgentModuleMCPServers:
 
         engine = Engine(agent)
         engine._connected_mcp_servers = []
-        engine._connect_mcp_servers()
+        await engine._connect_mcp_servers()
 
         # Should not have crashed, and the bad server should not be in connected list
         assert len(engine._connected_mcp_servers) == 0
 
-    def test_engine_mcp_cleanup_failure_doesnt_crash(self):
+    @pytest.mark.asyncio
+    async def test_engine_mcp_cleanup_failure_doesnt_crash(self):
         """If cleanup fails, other servers should still be cleaned up."""
         server1 = MagicMock()
+        server1.cleanup = AsyncMock()
         server1.cleanup.side_effect = RuntimeError("Cleanup failed")
         server2 = MagicMock()
+        server2.cleanup = AsyncMock()
 
         agent = DummyAgent(mcp_servers=[server1, server2])
         from qitos.engine.engine import Engine
 
         engine = Engine(agent)
         engine._connected_mcp_servers = [server1, server2]
-        engine._cleanup_mcp_servers()
+        await engine._cleanup_mcp_servers()
 
         # Both should have been attempted
         server1.cleanup.assert_called_once()

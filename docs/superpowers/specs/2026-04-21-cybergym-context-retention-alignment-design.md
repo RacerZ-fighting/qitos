@@ -38,7 +38,6 @@ The current stack has four layers:
      - `microcompact_preview_chars=180`
      - `summary_max_chars=2000`
      - `keep_last_rounds=3`
-     - `keep_last_messages=10`
      - `warning_ratio=0.75`
    - Source: `qitos/benchmark/cybergym/agent/agent.py`
 

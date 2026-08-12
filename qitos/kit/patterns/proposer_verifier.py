@@ -84,7 +84,6 @@ def build_proposer_verifier_system(
                         enable_lsp=False,
                         enable_tasks=False,
                         enable_web=False,
-                        expose_modern_names=False,
                     )
                 )
             super().__init__(
@@ -141,7 +140,6 @@ def build_proposer_verifier_system(
                         enable_lsp=False,
                         enable_tasks=False,
                         enable_web=False,
-                        expose_modern_names=False,
                     )
                 )
             # Register delegation tools for verifier

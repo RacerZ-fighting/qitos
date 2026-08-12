@@ -74,7 +74,7 @@ class _MockMCPServer(MCPServer):
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Any:
         if tool_name in self._call_results:
             return self._call_results[tool_name]
-        return {"status": "ok", "tool": tool_name, "arguments": arguments}
+        return {"status": "success", "tool": tool_name, "arguments": arguments}
 
 
 # --------------------------------------------------------------------------- #

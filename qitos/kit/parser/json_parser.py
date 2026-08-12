@@ -147,12 +147,23 @@ class JsonDecisionParser(BaseParser[dict[str, Any]]):
                 salvage_applied=extraction_mode not in {"", "direct"},
                 salvage_summary="; ".join(warnings),
             )
-        final_answer = (
-            first_dict_value(payload, self.final_keys)
-            or first_dict_value(payload, ("final_answer",))
-            or first_dict_value(payload, ("answer",))
-        )
+        normalized_payload = {norm(str(key)): value for key, value in payload.items()}
+        final_answer: str | None = None
+        for key in (*self.final_keys, "final_answer", "answer"):
+            candidate = normalized_payload.get(norm(key))
+            if isinstance(candidate, str) and candidate.strip():
+                final_answer = candidate.strip()
+                break
+            if isinstance(candidate, (dict, list)):
+                final_answer = json.dumps(
+                    candidate,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                break
 
+        if mode == "wait" and payload.get("runtime_wait") is True:
+            meta["runtime_wait"] = True
         if mode == "wait":
             return Decision.wait(rationale=thought, meta=meta)
         if mode == "final":
@@ -163,8 +174,14 @@ class JsonDecisionParser(BaseParser[dict[str, Any]]):
                     summary="JSON final mode is missing final_answer.",
                     raw_output=raw_output,
                     details="The payload set mode='final' but did not provide final_answer or answer.",
-                    repair_instruction="When mode is 'final', include `final_answer` as a string.",
-                    expected_shape='{"mode":"final","thought":"...","final_answer":"..."}',
+                    repair_instruction=(
+                        "When mode is 'final', include `final_answer` as a string "
+                        "or JSON object/array."
+                    ),
+                    expected_shape=(
+                        '{"mode":"final","final_answer":"..."} or '
+                        '{"mode":"final","final_answer":{"key":"value"}}'
+                    ),
                     issue_path="final_answer",
                     rationale=thought or None,
                     extra_meta=meta,

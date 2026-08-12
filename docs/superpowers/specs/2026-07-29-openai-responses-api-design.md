@@ -1,7 +1,7 @@
 # OpenAI Responses API Adapter Design
 
-Date: 2026-07-29  
-Status: Design approved in conversation, pending written spec review  
+Date: 2026-07-29
+Status: Design approved in conversation, pending written spec review
 Issue: https://github.com/WhitzardAgent/qitos/issues/29
 
 ## 1. Goal

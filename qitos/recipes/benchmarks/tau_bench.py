@@ -111,10 +111,13 @@ class TauActionTool:
                     )
                 )
 
-            def run(
-                self, runtime_context: Optional[Dict[str, Any]] = None, **kwargs: Any
+            def execute(
+                self,
+                args: Dict[str, Any],
+                runtime_context: Optional[Dict[str, Any]] = None,
             ) -> Dict[str, Any]:
-                return runner(name, kwargs)
+                _ = runtime_context
+                return runner(name, dict(args))
 
         self.impl = _Impl()
 

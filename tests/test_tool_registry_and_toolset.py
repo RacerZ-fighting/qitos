@@ -1,10 +1,9 @@
-import ast
 from typing import Any
 
 import pytest
 
 from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegistry, tool
-from qitos.core.tool import ToolMeta, build_tool_spec
+from qitos.core.tool import BaseTool, ToolMeta, ToolSpec, build_tool_spec
 from qitos.engine import RuntimeBudget
 from qitos.kit import tool as tool_pkg
 from qitos.kit.tool import (
@@ -16,7 +15,7 @@ from qitos.kit.tool import (
     ThinkingToolSet,
 )
 from qitos.kit.tool.gui import Click
-from qitos.kit.tool.codebase import GlobFiles
+from qitos.kit.tool.codebase import Glob
 from qitos.kit.tool.file import ReadFile
 from qitos.kit.tool.shell import RunCommand
 from qitos.kit.tool.toolset import toolset_from_tools
@@ -93,12 +92,11 @@ def test_tool_registry_include_and_toolset_lifecycle(tmp_path):
             enable_lsp=False,
             enable_tasks=False,
             enable_web=False,
-            expose_modern_names=False,
             profile="editor",
         )
     )
-    assert "view" in editor.list_tools()
-    assert "str_replace" in editor.list_tools()
+    assert "read_file" in editor.list_tools()
+    assert "edit_file" in editor.list_tools()
 
 
 def test_register_name_override_does_not_mutate_source_tool(tmp_path):
@@ -108,15 +106,14 @@ def test_register_name_override_does_not_mutate_source_tool(tmp_path):
         enable_lsp=False,
         enable_tasks=False,
         enable_web=False,
-        expose_modern_names=False,
         profile="editor",
     )
 
     registry = ToolRegistry()
-    registry.register(coding.str_replace, name="STR_REPLACE")
+    registry.register(coding.edit_file, name="EDIT_FILE")
 
-    assert "STR_REPLACE" in registry.list_tools()
-    assert coding.str_replace.spec.name == "str_replace"
+    assert "EDIT_FILE" in registry.list_tools()
+    assert coding.edit_file.spec.name == "edit_file"
 
 
 def test_curated_toolsets_register_cleanly(tmp_path):
@@ -133,7 +130,6 @@ def test_curated_toolsets_register_cleanly(tmp_path):
             enable_lsp=False,
             enable_tasks=False,
             enable_web=False,
-            expose_modern_names=False,
             profile="editor",
         ),
         CodingToolSet(
@@ -142,7 +138,6 @@ def test_curated_toolsets_register_cleanly(tmp_path):
             enable_lsp=False,
             enable_tasks=False,
             enable_web=False,
-            expose_modern_names=False,
             profile="codebase",
         ),
         CodingToolSet(workspace_root=str(tmp_path)),
@@ -210,20 +205,20 @@ def test_new_tool_domains_and_toolset_surface_are_importable(tmp_path):
     sample.write_text("hello\n", encoding="utf-8")
 
     read_file = ReadFile(workspace_root=str(tmp_path))
-    out = read_file.run(path="demo.txt")
+    out = read_file.execute({"path": "demo.txt"})
     assert out["status"] == "success"
     assert "hello" in out["content"]
 
-    glob = GlobFiles(workspace_root=str(tmp_path))
-    glob_out = glob.run(pattern="*.txt")
+    glob = Glob(workspace_root=str(tmp_path))
+    glob_out = glob.execute({"pattern": "*.txt"})
     assert glob_out["status"] == "success"
     assert glob_out["files"] == ["demo.txt"]
 
     shell = RunCommand(workspace_root=str(tmp_path))
     assert shell.spec.name == "run_command"
 
-    assert "view" in editor_tools_builder(str(tmp_path)).list_tools()
-    assert "glob_files" in coding_tools_builder(str(tmp_path)).list_tools()
+    assert "edit_file" in editor_tools_builder(str(tmp_path)).list_tools()
+    assert "glob" in coding_tools_builder(str(tmp_path)).list_tools()
     assert "audit_inventory" in security_audit_tools_builder(str(tmp_path)).list_tools()
     assert "click" in computer_use_tools_builder().list_tools()
 
@@ -239,8 +234,8 @@ def test_include_toolset_accepts_mixed_tools_toolsets_and_registries(tmp_path):
     )
     names = registry.list_tools()
     assert "run_command" in names
-    assert "glob_files" in names
-    assert "read_file_range" in names
+    assert "glob" in names
+    assert "read_file" in names
     assert "generate_report" in names
 
 
@@ -248,14 +243,14 @@ def test_static_toolset_and_toolset_from_tools_register_cleanly(tmp_path):
     static = StaticToolSet(
         [
             ReadFile(workspace_root=str(tmp_path)),
-            GlobFiles(workspace_root=str(tmp_path)),
+            Glob(workspace_root=str(tmp_path)),
         ],
         name="bundle",
         version="1",
     )
     registry = ToolRegistry().register_toolset(static, namespace="")
     assert "read_file" in registry.list_tools()
-    assert "glob_files" in registry.list_tools()
+    assert "glob" in registry.list_tools()
 
     helper = toolset_from_tools(
         [ReadFile(workspace_root=str(tmp_path))], name="helper_bundle", version="2"
@@ -274,7 +269,7 @@ def test_agent_module_can_be_initialized_with_toolset_list(tmp_path):
                 toolset=[
                     ReadFile(workspace_root=str(tmp_path)),
                     toolset_from_tools(
-                        [GlobFiles(workspace_root=str(tmp_path))], name="glob"
+                        [Glob(workspace_root=str(tmp_path))], name="glob"
                     ),
                 ]
             )
@@ -312,7 +307,7 @@ def test_computer_use_toolset_atomic_tools_are_callable() -> None:
     assert isinstance(tool_obj, Click)
 
 
-def test_tool_registry_resolves_alias_separator_variants_and_suggestions() -> None:
+def test_tool_registry_requires_exact_names_but_can_suggest_a_canonical_name() -> None:
     registry = ToolRegistry()
 
     @tool(name="coding.run_command")
@@ -326,13 +321,18 @@ def test_tool_registry_resolves_alias_separator_variants_and_suggestions() -> No
     registry.register(run_command)
     registry.register(list_files)
 
-    assert registry.resolve_name("coding.run_command") == "coding.run_command"
-    assert registry.resolve_name("run_command") == "coding.run_command"
-    assert registry.resolve_name("coding=run_command") == "coding.run_command"
-    assert registry.resolve_name("coding-run_command") == "coding.run_command"
+    assert registry.get("coding.run_command") is not None
+    assert registry.get("run_command") is None
+    assert registry.get("coding=run_command") is None
+    assert registry.get("coding-run_command") is None
+    assert "coding.list_files" in registry.suggest("coding=list_filez")
 
-    with pytest.raises(ValueError) as exc_info:
-        registry.call("coding=list_filez")
-    payload = ast.literal_eval(str(exc_info.value))
-    assert payload["error_category"] == "tool_not_found"
-    assert "coding.list_files" in payload["suggestions"]
+
+def test_class_tool_must_implement_execute() -> None:
+    def legacy_run(self: BaseTool, **kwargs: Any) -> Any:
+        return kwargs
+
+    run_only_tool = type("RunOnlyTool", (BaseTool,), {"run": legacy_run})
+
+    with pytest.raises(TypeError, match="abstract method execute"):
+        run_only_tool(ToolSpec(name="run_only", description="legacy"))

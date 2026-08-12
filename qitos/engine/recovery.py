@@ -99,18 +99,22 @@ class RecoveryPolicy:
             )
 
         scoped_limit = info.details.get("max_recoveries")
-        has_scoped_limit = (
-            isinstance(scoped_limit, int)
-            and not isinstance(scoped_limit, bool)
-            and scoped_limit >= 0
+        scoped_limit_value = (
+            scoped_limit
+            if (
+                isinstance(scoped_limit, int)
+                and not isinstance(scoped_limit, bool)
+                and scoped_limit >= 0
+            )
+            else None
         )
+        has_scoped_limit = scoped_limit_value is not None
         scoped_key = info.details.get("code")
         has_scoped_key = isinstance(scoped_key, str) and bool(scoped_key)
 
         # Update the consecutive-failure streak.
         is_consecutive = (
-            self._last_step_id is not None
-            and (step_id - self._last_step_id) <= 1
+            self._last_step_id is not None and (step_id - self._last_step_id) <= 1
         )
         if is_consecutive:
             self._recoveries += 1
@@ -132,7 +136,8 @@ class RecoveryPolicy:
         scoped_limit_exhausted = (
             has_scoped_limit
             and has_scoped_key
-            and self._scoped_recoveries > scoped_limit
+            and scoped_limit_value is not None
+            and self._scoped_recoveries > scoped_limit_value
         )
         if global_limit_exhausted or scoped_limit_exhausted:
             self.tracker.add(info, recommendation, decision="stop")

@@ -146,8 +146,8 @@ For each identified sink category, systematically search and trace:
 | Plugin/modeline exec | Auto-sourced config, modeline parsing, dynamic plugin loading |
 
 For each potential hit:
-1. Use grep_files or terminal grep to locate pattern occurrences
-2. Use read_file_range to examine surrounding context (±30 lines)
+1. Use grep or terminal grep to locate pattern occurrences
+2. Use read_file to examine surrounding context
 3. Trace the data flow backward from sink to source
 4. Determine if sanitization/validation exists on the path
 5. Record or discard based on evidence standard above
@@ -196,9 +196,9 @@ Your plan must contain:
 # TOOL USAGE STRATEGY
 
 **Prefer direct tools over terminal commands** when available:
-- Use glob_files for file discovery instead of find
-- Use grep_files for pattern search instead of grep
-- Use read_file_range for targeted code inspection instead of cat/head
+- Use glob for file discovery instead of find
+- Use grep for pattern search instead of terminal grep
+- Use read_file for targeted code inspection instead of cat/head
 - Use audit_* tools for structured security analysis
 - Use report_* tools for finding recording and report generation
 
@@ -258,17 +258,9 @@ class WhitzardAgent(AgentModule[WhitzardState, dict[str, Any], dict[str, Any]]):
             enable_lsp=False,
             enable_tasks=False,
             enable_web=False,
-            expose_legacy_aliases=True,
-            expose_modern_names=False,
             profile="codebase",
         )
-        for item in (
-            coding.glob_files,
-            coding.grep_files,
-            coding.read_file_range,
-            coding.read_file,
-        ):
-            registry.register(item)
+        registry.register_toolset(coding, namespace="")
 
         registry.register_toolset(
             SecurityAuditToolSet(
@@ -286,7 +278,6 @@ class WhitzardAgent(AgentModule[WhitzardState, dict[str, Any], dict[str, Any]]):
             llm=llm,
             max_tokens=14000,
             keep_last_rounds=3,
-            keep_last_messages=10,
             hard_window=72,
         )
         self.audit_memory = memory or AuditBoardMemory()
@@ -318,7 +309,7 @@ class WhitzardAgent(AgentModule[WhitzardState, dict[str, Any], dict[str, Any]]):
             "Audit flow:\n"
             "1. start with audit_inventory to inventory repository structure once\n"
             "2. move to audit_entrypoints and audit_hotspots to map trust boundaries\n"
-            "3. use grep_files to narrow candidates, then immediately switch to read_file_range or read_file on the best core-file hit\n"
+            "3. use grep to narrow candidates, then immediately switch to read_file on the best core-file hit\n"
             "4. only record evidence-backed findings with file and line references\n"
             "5. write the final markdown report before requesting completion\n"
             "6. do not repeat reconnaissance actions when structured audit tools already returned coverage\n"
@@ -334,8 +325,8 @@ class WhitzardAgent(AgentModule[WhitzardState, dict[str, Any], dict[str, Any]]):
             "- Use audit_inventory for reconnaissance, then advance to audit_entrypoints or audit_hotspots instead of repeating directory inspection\n"
             "- If the previous action returned structured fields such as entrypoint_candidates, hotspots, or findings, use them to advance the next phase\n"
             "- Do not loop on low-value reconnaissance; after inventory, move into mapping and focused code inspection\n"
-            "- grep_files uses regex by default; for literals like system(, eval(, modeline, or :execute, prefer regex=false unless you intentionally need regex\n"
-            "- When grep_files returns a strong core-file hit, the next action should usually be read_file_range on that file rather than another broad search\n"
+            "- grep uses regex by default; for literals like system(, eval(, modeline, or :execute, prefer regex=false unless you intentionally need regex\n"
+            "- When grep returns a strong core-file hit, the next action should usually be read_file on that file rather than another broad search\n"
             "- Down-rank tests, testdir, fixtures, and sample corpora unless they are the only remaining leads\n"
             "- Use terminal commands mainly for repository inspection, build checks, grep, or git history\n"
             "- When a shell command should execute immediately, call send_terminal_keys with submit=true\n"
@@ -641,16 +632,16 @@ class WhitzardAgent(AgentModule[WhitzardState, dict[str, Any], dict[str, Any]]):
         tool_name = str(result.get("tool") or result.get("name") or "").strip()
         data = result.get("data")
         payload = data if isinstance(data, dict) else result
-        if tool_name == "grep_files":
+        if tool_name == "grep":
             self.audit_memory.ingest_grep_result(result, state.current_step)
             return
-        if tool_name == "read_file_range":
+        if tool_name == "read_file":
             path = str(payload.get("path") or "").strip()
             if path:
                 self.audit_memory.ingest_read(
                     path=path,
-                    offset=int(payload.get("offset") or 0),
-                    limit=int(payload.get("limit") or 0),
+                    offset=int(payload.get("line_offset") or 0),
+                    limit=int(payload.get("line_count") or 0),
                     content=str(payload.get("content") or ""),
                     step_id=state.current_step,
                 )

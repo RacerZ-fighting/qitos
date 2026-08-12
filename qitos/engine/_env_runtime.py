@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
 
 _logger = logging.getLogger("qitos.engine._env_runtime")
 
@@ -14,8 +14,11 @@ from ..core.observation import Observation
 from ..core.state import StateSchema
 from ..core.task import Task
 from ..core.tool_result import ToolResult
-from ._protocol import _EngineProtocol
+from ._action_runtime import _ActionRuntime
 from .states import RuntimePhase
+
+if TYPE_CHECKING:
+    from .engine import Engine
 
 
 StateT = TypeVar("StateT", bound=StateSchema)
@@ -24,7 +27,7 @@ ActionT = TypeVar("ActionT")
 
 
 class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
-    def __init__(self, engine: _EngineProtocol):
+    def __init__(self, engine: Engine[StateT, ObservationT, ActionT]):
         self.engine = engine
 
     def build_env_view(
@@ -83,11 +86,12 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             state=state.to_dict(),
             decision=(
                 decision.to_dict()
-                if hasattr(decision, "to_dict")
-                and isinstance(decision.to_dict(), dict)
+                if hasattr(decision, "to_dict") and isinstance(decision.to_dict(), dict)
                 else {}
             ),
-            action_results=[ToolResult.from_value(item) for item in list(action_results)],
+            action_results=[
+                ToolResult.from_value(item) for item in list(action_results)
+            ],
             env=(
                 dict(env_view.get("env", {}))
                 if isinstance(env_view.get("env", {}), dict)
@@ -116,37 +120,26 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
 
     def _model_visible_tool_result_dict(self, item: Any) -> Any:
         result = ToolResult.from_value(item)
-        tool_name = str(result.metadata.get("tool_name") or result.metadata.get("name") or "")
-        if tool_name.rsplit(".", 1)[-1] != "submit_poc":
-            return item
-        output = result.output
-        if not isinstance(output, dict):
-            return result.to_dict()
-        if output.get("status") == "error":
-            visible_output = {
-                "status": "error",
-                "error": output.get("error") or output.get("raw_output") or "submission failed",
-            }
-        else:
-            visible_output = {
-                "status": output.get("status"),
-                "poc_id": output.get("poc_id"),
-                "flag": output.get("flag"),
-                "exit_code": output.get("vul_exit_code", output.get("exit_code")),
-                "output": output.get("raw_output", ""),
-                "stderr": output.get("vul_stderr", ""),
-                "stdout": output.get("vul_stdout", ""),
-            }
-            visible_output = {
-                key: value for key, value in visible_output.items() if value not in (None, "")
-            }
-        visible = ToolResult(
-            status=result.status,
-            output=visible_output,
-            error=result.error,
-            metadata={**dict(result.metadata), "model_visible": True},
+        tool_name = str(
+            result.metadata.get("tool_name") or result.metadata.get("name") or ""
         )
-        return visible.to_dict()
+        output = result.output
+        has_summary = isinstance(output, dict) and bool(
+            str(output.get("model_summary") or "").strip()
+        )
+        if not has_summary:
+            return item
+        if has_summary:
+            visible_output = _ActionRuntime._model_visible_tool_output(
+                tool_name, output
+            )
+            return ToolResult(
+                status=result.status,
+                output=visible_output,
+                error=result.error,
+                metadata={**dict(result.metadata), "model_visible": True},
+            ).to_dict()
+        return result.to_dict()
 
     def validate_env_capabilities(self) -> List[Dict[str, Any]]:
         required = self.collect_required_ops()
@@ -198,6 +191,10 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
                 groups = getattr(spec, "required_ops", None)
                 if isinstance(groups, list):
                     required.update(str(x) for x in groups if str(x))
+                if engine.env is not None:
+                    groups = getattr(spec, "environment_ops", None)
+                    if isinstance(groups, list):
+                        required.update(str(x) for x in groups if str(x))
         except Exception as exc:
             _logger.debug("Failed to collect required ops: %s", exc)
             return required

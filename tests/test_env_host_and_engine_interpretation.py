@@ -4,10 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict
 
+import pytest
+
 from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegistry
 from qitos.core.tool import BaseTool, ToolPermission, ToolSpec
 from qitos.engine import RuntimeBudget
 from qitos.kit.env import HostEnv
+from qitos.kit.env.host_env import HostCommandCapability, HostFSCapability
 
 
 class _OpsWriteFile(BaseTool):
@@ -40,19 +43,18 @@ class _OpsWriteFile(BaseTool):
         return {"status": "success", "path": filename, "size": len(content)}
 
 
-def test_host_env_replace_lines_and_command(tmp_path: Path):
+def test_host_env_edit_file_and_command(tmp_path: Path):
     target = tmp_path / "m.py"
     target.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
     env = HostEnv(workspace_root=str(tmp_path))
 
     out = env.execute_action(
         Action(
-            name="replace_lines",
+            name="edit_file",
             args={
                 "path": "m.py",
-                "start_line": 2,
-                "end_line": 2,
-                "replacement": "    return a + b",
+                "old_text": "    return a - b",
+                "new_text": "    return a + b",
             },
         )
     )
@@ -64,6 +66,74 @@ def test_host_env_replace_lines_and_command(tmp_path: Path):
     )
     assert isinstance(run, dict)
     assert int(run.get("returncode", 1)) == 0
+
+
+def test_host_file_capability_is_binary_safe_and_symlink_confined(tmp_path: Path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "data.bin").write_bytes(b"a\x00b")
+    (root / "escape").symlink_to(outside, target_is_directory=True)
+    fs = HostFSCapability(str(root))
+
+    assert fs.read_bytes("data.bin") == b"a\x00b"
+    assert fs.read_bytes("data.bin", limit=2) == b"a\x00"
+    assert fs.stat("data.bin").is_file is True
+    assert [entry.path for entry in fs.list_entries()] == ["data.bin", "escape"]
+    with pytest.raises(PermissionError, match="outside root"):
+        fs.resolve_path("escape/secret.txt", allow_missing=True)
+    with pytest.raises(PermissionError, match="parent traversal"):
+        fs.resolve_path("../outside/secret.txt", allow_missing=True)
+
+
+def test_host_file_capability_returns_bounded_text_chunks(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "sample.txt").write_text(
+        "first\r\nsecond-line-is-long\r\nthird\r\n",
+        encoding="utf-8",
+        newline="",
+    )
+    fs = HostFSCapability(str(root))
+
+    chunk = fs.read_text_chunk(
+        "sample.txt",
+        offset=1,
+        limit=2,
+        max_bytes=100,
+        max_line_bytes=10,
+    )
+
+    assert chunk.content == "second-...\nthird"
+    assert chunk.offset == 1
+    assert chunk.line_count == 2
+    assert chunk.total_lines == 3
+    assert chunk.has_more is False
+    assert chunk.truncated is True
+    assert chunk.line_ending == "crlf"
+
+
+def test_host_file_capability_rejects_binary_text_chunk(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "binary.bin").write_bytes(b"hello\x00world\n")
+    fs = HostFSCapability(str(root))
+
+    with pytest.raises(UnicodeError, match="NUL"):
+        fs.read_text_chunk("binary.bin")
+
+
+def test_host_command_capability_preserves_literal_argv(tmp_path: Path):
+    command = HostCommandCapability(str(tmp_path))
+
+    result = command.run_argv(
+        ["python", "-c", "import sys; print(sys.argv[1])", "$(touch injected)"],
+    )
+
+    assert result["returncode"] == 0
+    assert result["stdout"].strip() == "$(touch injected)"
+    assert not (tmp_path / "injected").exists()
 
 
 @dataclass

@@ -88,6 +88,10 @@ qita board --logdir ./runs --host 0.0.0.0 --port 9000
 - **评估器**：评估器输出
 - **追踪事件**：该步骤的原始 `RuntimeEvent`
 
+qita 会优先按 `action_id`，否则按 Engine 原始顺序把每个动作与结果配对。工具统计复用
+同一配对，因此一个失败结果只会归到对应调用；每个精确生命周期状态都会单独计数，
+`unmatched_actions` 与 `unmatched_results` 则直接暴露不完整的 trace 闭包，不会猜测归属。
+
 左侧**步骤导航器**支持：
 
 - 全文过滤
@@ -234,14 +238,14 @@ es.addEventListener('run_end', e => {
 
 qita 运行详情页包含一个 **live stream** 按钮，点击后会连接 SSE 端点并在浏览器控制台输出事件日志。这对于调试和理解已完成运行的事件流很有用。
 
-### 使用 AsyncEngine 流式推送
+### 使用 Engine 流式推送
 
-对于实时运行，使用 `AsyncEngine.arun_stream()` 以编程方式消费事件：
+对于实时运行，使用 `Engine.arun_stream()` 以编程方式消费事件：
 
 ```python
-from qitos import AsyncEngine
+from qitos import Engine
 
-engine = AsyncEngine(agent=agent, budget=RuntimeBudget(max_steps=10))
+engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=10))
 
 async for event in engine.arun_stream("分析数据"):
     if event.event_type == "step_end":

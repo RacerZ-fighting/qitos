@@ -13,7 +13,6 @@ from __future__ import annotations
 import os
 import platform
 import subprocess
-from typing import Optional
 
 
 def build_env_section(workspace_root: str) -> str:
@@ -121,7 +120,7 @@ def build_memory_section() -> str:
     parts = [
         "# auto memory",
         "",
-        f"You have a persistent, file-based memory system at {memory_dir}. This directory already exists — write to it directly with the Write tool.",
+        f"You have a persistent, file-based memory system at {memory_dir}. This directory already exists — write to it directly with the write_file tool.",
         "",
         "You should build up this memory system over time so that future conversations can have a complete picture of who the user is, how they'd like to collaborate with you, and the context behind the work the user gives you.",
         "",
@@ -140,7 +139,7 @@ def build_memory_section() -> str:
         "- Ephemeral task details from the current conversation",
         "",
         "## How to save",
-        "1. Write the memory to its own file using frontmatter: name, description, type",
+        "1. Write the memory to its own file with write_file using frontmatter: name, description, type",
         "2. Add a pointer to that file in MEMORY.md (one line per entry, under 150 chars)",
     ]
 
@@ -168,7 +167,7 @@ def build_session_guidance_section() -> str:
     """
     return (
         "# Session-specific guidance\n"
-        " - If you do not understand why the user has denied a tool call, use the AskUserQuestion tool to ask them.\n"
+        " - If you do not understand why the user has denied a tool call, use ask_user_choice to ask them.\n"
         " - If you need the user to run a shell command themselves (e.g., an interactive login like `gcloud auth login`), "
         "suggest they type `! <command>` in the prompt — the `!` prefix runs the command in this session so its output lands directly in the conversation.\n"
         " - Use the Agent tool with subagent_type=\"Explore\" for fast codebase search when you need to quickly find files or search code.\n"

@@ -3,7 +3,8 @@ title: "Tools 与 Registry"
 description: "理解 QitOS 中的工具、工具集以及 ToolRegistry 如何组合成智能体能力表面。"
 ---
 
-工具就是智能体可以执行的动作。运行时，Engine 会把 `Decision` 里的动作（标准化工具调用）分发给 `ToolRegistry`，由它查找并执行对应的可调用对象。
+工具就是智能体可以执行的动作。运行时，Engine 使用 `ToolRegistry` 做精确名称
+查找，再由 `ActionExecutor` 完成校验、授权和执行。
 
 ## `@tool` 装饰器
 
@@ -30,10 +31,14 @@ def read_file(path: str) -> str:
 |---|---|---|
 | `name` | `str \| None` | 在 `Decision.actions` 中使用的工具名。默认是函数 `__name__`。 |
 | `description` | `str \| None` | 展示给大模型的工具说明。默认回退到文档字符串。 |
-| `timeout_s` | `float \| None` | 单次调用超时时间，单位秒。`None` 表示不限时。 |
-| `max_retries` | `int` | 失败时重试次数。默认 `0`。 |
+| `timeout_s` | `float \| None` | 整个 action 的超时，包括预检、重试和实际调用。 |
+| `retry_policy` | `RetryPolicy \| None` | 显式调用重试策略；未配置时只执行一次。 |
 | `permissions` | `ToolPermission \| None` | 声明该工具需要的系统能力。 |
 | `required_ops` | `list[str] \| None` | 环境层面的低级操作能力标识。 |
+
+`ActionExecutor` 是工具重试的唯一责任方。输入校验、权限检查和审批只执行一次，
+只有通过预检的实际调用可以重试；所有 attempt 和 backoff 共享工具 timeout 与
+Engine 更早的运行 deadline。配置 `RetryPolicy` 时，底层 HTTP/SDK 重试必须关闭。
 
 ### `ToolPermission`
 
@@ -124,7 +129,6 @@ registry.register_toolset(
         enable_lsp=False,
         enable_tasks=False,
         enable_web=False,
-        expose_modern_names=False,
     )
 )
 ```
@@ -160,7 +164,9 @@ class DatabaseTool(BaseTool):
             )
         )
 
-    def run(self, sql: str) -> list:
+    def execute(self, args: dict, runtime_context: dict | None = None) -> list:
+        _ = runtime_context
+        sql = str(args["sql"])
         import sqlite3
         with sqlite3.connect(self.db_path) as conn:
             return conn.execute(sql).fetchall()
@@ -171,9 +177,52 @@ registry.register(DatabaseTool(db_path="data.db"))
 
 当你向 `register()` 传入普通可调用对象时，QitOS 内部会自动把它包装成 `FunctionTool`。大多数情况下你无需显式实例化它。
 
+类式工具只有一个执行入口：`execute(args, runtime_context)`。注册表只接受精确的
+已注册名称，本身不负责执行；不存在 `run`/`call` 适配、短名称别名、分隔符别名或
+大小写修复。需要权限、超时、重试和结果归一化时，应通过 `Engine` 使用
+`ActionExecutor`。`read_only=True` 只描述副作用；只有显式
+`concurrency_safe=True` 才允许并行。
+
 <Note>
   对于实际编码智能体，通常优先使用 `CodingToolSet` 或 `qitos.kit.toolset` 中的预设构建器，而不是手工把文件、Shell、Web 工具逐个注册。
 </Note>
+
+---
+
+## 工具结果契约
+
+普通返回值表示工具成功完成。结构化工具如果还在运行、只得到部分结果，或以非成功
+状态结束，应返回统一的生命周期 envelope：
+
+```python
+from qitos import ToolResult
+
+return ToolResult(
+    status="partial",
+    output={"preview": text, "omitted_chars": omitted},
+    metadata={"artifact_ref": artifact_ref},
+)
+```
+
+规范状态包括 `success`、`partial`、`running`、`error`、`skipped`、`denied`、
+`needs_input`、`needs_approval`、`timed_out` 与 `cancelled`。只有精确的 `success`
+才计入成功。该边界是严格的：`failed`、`needs_user_input`、
+`output_limit_exceeded`、`cancelling` 和 `canceled` 等旧写法会被拒绝，不会再做
+兼容归一化；任何未知的显式状态都会被视为错误，而不是猜成成功。
+
+执行生命周期和业务结果必须分开。例如搜索正常完成但没有匹配项：
+
+```python
+return {
+    "status": "success",
+    "domain_outcome": "no_match",
+    "matches": [],
+}
+```
+
+不要把 `usable`、`pending` 或 `no_match` 放进顶层 `status`。需要用户回答问题时用
+`needs_input`，需要执行审批时用 `needs_approval`。即使执行器成功取得了快照，后台
+`running` 和 `partial` 仍然不是操作成功终态。
 
 ---
 

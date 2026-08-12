@@ -60,7 +60,12 @@ Tighten `max_messages` when your model has a small context window, or set `step_
 
 ### Native tool-call chain integrity
 
-Message limits still count individual history messages, so a window boundary can fall inside a native tool-call round. Before dispatching a model request, the Engine correlates assistant tool calls and tool results by `tool_call_id`. It removes a tool result when the declaring assistant call is no longer present and keeps the existing interrupted-call placeholder for an assistant call whose result is missing. Valid complete chains keep their original order and content, and the configured message limit does not change.
+Built-in history windows select complete rounds rather than slicing individual messages.
+An assistant tool-call batch and its matching results therefore move through selection
+and compaction as one transaction. Before dispatch, the Engine also builds an immutable
+provider projection: it orders results by `tool_call_id`, removes duplicate or orphan
+results, and adds a deterministic interrupted-call result only when the declaring call
+has no result. The canonical stored history is not rewritten by this repair.
 
 ## Built-in history strategies
 
@@ -90,10 +95,11 @@ Choose it when:
 
 It combines:
 
-- warning thresholds before overflow
-- grouping into compactable rounds
-- micro-compaction for large old messages
-- summary compaction for older interaction history
+- a warning before the Engine's 80% force-compaction boundary
+- transaction-aware grouping of generic and provider-native tool rounds
+- level 1 micro-compaction for large messages in older complete rounds
+- level 2 summary compaction while preserving the configured recent rounds
+- level 3 resummarization of everything except the latest complete round
 - runtime compaction metadata that can surface in traces
 
 Choose it when:
@@ -111,7 +117,33 @@ Its main pieces are:
 - `CompactConfig` — thresholds and compaction policy
 - `MessageGrouper` — how messages are grouped into rounds
 - micro-compaction — trims very large old messages while keeping a preview
-- summary compaction — replaces older rounds with a compact continuation summary
+- summary compaction — projects older rounds as a compact continuation summary
+
+The Engine computes occupancy against the provider-safe input budget. It prefers an
+explicit model `max_input_tokens`; otherwise it derives the budget as context window
+minus output allocation and safety reserve. The complete request count includes system
+and user messages, history, native reasoning items, tool schemas, and response schemas.
+At 80%, model dispatch is blocked until the history projection is compacted. If the
+provider still rejects the request, QitOS asks the same immutable history strategy for
+progressively smaller `.70`, `.50`, and `.35` projections. It never uses an arbitrary
+message slice as the normal recovery path.
+
+`CompactHistory.retrieve()` snapshots a history version and digest before summary work.
+A concurrent append, cancellation, empty summary, or summarizer error leaves canonical
+history unchanged. Repeated projections of the same source reuse the cached summary;
+new source history carries a prior summary only when its exact source digest is still a
+prefix, then summarizes only the newly covered rounds. The cache is bounded, and three
+consecutive failures for one source open a circuit instead of repeatedly spending model
+calls on the same broken compaction request. Cache entries are also isolated by effective
+budget and compaction level, so a reactive smaller projection cannot reuse an oversized
+summary from an earlier attempt.
+
+When auto-compaction is enabled, `CompactHistory` intentionally sees the complete
+filtered canonical history before applying a token budget; a generic `max_items`
+window cannot discard old turns before they reach the summarizer. Setting
+`auto_compact=False` restores count-window selection. Configure transaction-safe recent
+retention with `keep_last_rounds`; arbitrary message slicing is not part of the compact
+history API because it can split provider tool transactions.
 
 Typical setup:
 
@@ -122,8 +154,7 @@ history = CompactHistory(
     config=CompactConfig(
         max_tokens=16000,
         keep_last_rounds=2,
-        keep_last_messages=8,
-        warning_ratio=0.8,
+        warning_ratio=0.7,
         auto_compact=True,
     ),
     llm=llm,

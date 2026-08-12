@@ -33,14 +33,6 @@ class DelegatingTool(BaseTool):
     ) -> ToolPermissionDecision:
         return self._delegate.check_permissions(args, runtime_context=runtime_context)
 
-    def run(self, **kwargs: Any) -> Any:
-        return self._delegate.run(**kwargs)
-
-    def call(
-        self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Any:
-        return self._delegate.call(args, runtime_context=runtime_context)
-
     def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Any:

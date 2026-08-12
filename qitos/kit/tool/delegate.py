@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import os
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ...core.agent_spec import AgentSpec, AgentRegistry, ContextStrategy
 from ...core.tool import BaseTool, ToolSpec
 
 if TYPE_CHECKING:
-    from ...engine.engine import Engine, EngineResult
+    from ...engine.engine import Engine
     from ...trace.writer import TraceWriter
 
 MAX_DELEGATE_DEPTH = 3
@@ -43,7 +43,6 @@ class DelegateTool(BaseTool):
             },
             required=["task"],
             timeout_s=120.0,
-            max_retries=0,
         )
         super().__init__(tool_spec)
         # Override description after BaseTool.__init__ which may replace it
@@ -66,10 +65,15 @@ class DelegateTool(BaseTool):
             }
 
         trace_writer = runtime_context.get("trace_writer")
+        record_runtime_event = runtime_context.get("record_runtime_event")
         parent_run_id = runtime_context.get("parent_run_id", "") or ""
 
         self._emit_delegate_event(
-            trace_writer, parent_run_id, "DELEGATE_START", args
+            trace_writer,
+            parent_run_id,
+            "DELEGATE_START",
+            args,
+            record_runtime_event,
         )
 
         try:
@@ -90,6 +94,7 @@ class DelegateTool(BaseTool):
                 parent_run_id,
                 "DELEGATE_END",
                 {"agent": self.agent_spec.name, "status": "error", "error": str(exc)},
+                record_runtime_event,
             )
             return {
                 "status": "error",
@@ -110,6 +115,7 @@ class DelegateTool(BaseTool):
                 "steps": result.step_count,
                 "stop_reason": stop_reason,
             },
+            record_runtime_event,
         )
 
         return {
@@ -192,7 +198,12 @@ class DelegateTool(BaseTool):
         parent_run_id: str,
         phase: str,
         payload: Dict[str, Any],
+        record_runtime_event: Optional[
+            Callable[[str, Dict[str, Any]], None]
+        ] = None,
     ) -> None:
+        if record_runtime_event is not None:
+            record_runtime_event(phase, payload)
         if trace_writer is None:
             return
 

@@ -35,13 +35,17 @@ def greet(name: str) -> str:
 
 ```python
 from qitos import function_tool
+from qitos.core.tool import RetryPolicy
 
 @function_tool(
     name="search_files",
     description="Search for files matching a pattern",
     needs_approval=True,
     timeout_s=30.0,
-    max_retries=2,
+    retry_policy=RetryPolicy(
+        max_attempts=3,
+        retryable_exceptions=(ConnectionError,),
+    ),
     read_only=True,
     concurrency_safe=True,
 )
@@ -58,10 +62,13 @@ def search(pattern: str, max_results: int = 10) -> list[str]:
 | `name` | `str` | 函数名 | 覆盖工具名称 |
 | `description` | `str` | 文档字符串 | 覆盖工具描述 |
 | `needs_approval` | `bool` | `False` | 执行前需要人工审批 |
-| `timeout_s` | `float` | `None` | 最大执行时间（秒） |
-| `max_retries` | `int` | `0` | 失败后自动重试次数 |
+| `timeout_s` | `float` | `None` | 整个 action 的时间预算（秒） |
+| `retry_policy` | `RetryPolicy` | `None` | 显式调用重试策略 |
 | `read_only` | `bool` | `False` | 标记工具为无副作用 |
 | `concurrency_safe` | `bool` | `False` | 表示工具可安全并行执行 |
+
+未配置 `retry_policy` 时，工具只调用一次。输入校验、审批与权限检查不会重复，
+所有调用 attempt 共享 `timeout_s` 和 Engine 的运行 deadline。
 
 ## Step 3: 类型注解自动转换为 ToolSpec 参数
 
@@ -163,7 +170,8 @@ class GetTimeTool(BaseTool):
         )
         super().__init__(spec)
 
-    def execute(self, **kwargs) -> str:
+    def execute(self, args: dict, runtime_context: dict | None = None) -> str:
+        _ = args, runtime_context
         from datetime import datetime
         return datetime.now().isoformat()
 ```

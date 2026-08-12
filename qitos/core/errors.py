@@ -31,6 +31,7 @@ class StopReason(str, Enum):
     ENV_TERMINAL = "env_terminal"
     TASK_VALIDATION_FAILED = "task_validation_failed"
     ENV_CAPABILITY_MISMATCH = "env_capability_mismatch"
+    INFRASTRUCTURE_INVALID = "infrastructure_invalid"
     UNRECOVERABLE_ERROR = "unrecoverable_error"
     CANCELLED_IMMEDIATE = "cancelled_immediate"
     INTERRUPT = "interrupt"
@@ -72,6 +73,31 @@ class SystemExecutionError(QitosRuntimeError):
     pass
 
 
+class ModelTransportError(Exception):
+    """A model request that exhausted its adapter-owned transport retries."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        attempts: int,
+        retryable: bool,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+        self.retryable = retryable
+        self.status_code = status_code
+
+
+class ModelRequestDeadlineExceeded(TimeoutError):
+    """The Engine deadline expired while a model request was in flight."""
+
+
+class ModelRequestCancelled(Exception):
+    """Immediate Engine cancellation stopped waiting for a model request."""
+
+
 def _is_network_error(exc: Exception) -> bool:
     """Check if an exception is a transient network/SSL error."""
     # Standard Python errors
@@ -107,6 +133,20 @@ def classify_exception(exc: Exception, phase: str, step_id: int) -> RuntimeError
         return exc.info
     if isinstance(exc, SystemExecutionError):
         return exc.info
+    if isinstance(exc, ModelTransportError):
+        return RuntimeErrorInfo(
+            category=ErrorCategory.MODEL,
+            message=str(exc),
+            phase=phase,
+            step_id=step_id,
+            recoverable=False,
+            details={
+                "code": "model_transport_exhausted",
+                "attempts": exc.attempts,
+                "retryable": exc.retryable,
+                "status_code": exc.status_code,
+            },
+        )
 
     msg = str(exc).lower()
 

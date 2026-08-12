@@ -2,29 +2,29 @@
 
 Handles formats like:
     <tool_use>
-    <bash_v2>
+    <run_command>
     <command>ls -la</command>
-    </bash_v2>
+    </run_command>
     </tool_use>
 
 Or with JSON arguments:
     <tool_use>
-    <glob_v2>
+    <glob>
     {"pattern": "*.py"}
-    </glob_v2>
+    </glob>
     </tool_use>
 
 Or nested tool arguments as child tags:
     <tool_use>
-    <file_read_v2>
+    <read_file>
     <path>/tmp/test.py</path>
-    </file_read_v2>
+    </read_file>
     </tool_use>
 
 Or GLM-style with separate tool_name/arguments:
     <tool_use>
     <server_name>filesystem</server_name>
-    <tool_name>glob_v2</tool_name>
+    <tool_name>glob</tool_name>
     <arguments>{"pattern": "*.py"}</arguments>
     </tool_use>
 """
@@ -132,8 +132,8 @@ class ToolUseXmlParser(BaseParser[dict[str, Any]]):
                         "Please use tools to accomplish the task. "
                         "Format tool calls as: "
                         "<tool_use><tool_name><arg>value</arg></tool_name></tool_use>\n"
-                        "For example: <tool_use><bash_v2><command>ls</command></bash_v2></tool_use>\n"
-                        "Or: <tool_use><glob_v2><pattern>*.py</pattern></glob_v2></tool_use>"
+                        "For example: <tool_use><run_command><command>ls</command></run_command></tool_use>\n"
+                        "Or: <tool_use><glob><pattern>*.py</pattern></glob></tool_use>"
                     ),
                 )
             # Later steps — treat as genuine final answer
@@ -150,7 +150,7 @@ class ToolUseXmlParser(BaseParser[dict[str, Any]]):
             raw_output=raw_output,
             details="The tool call XML structure could not be parsed.",
             repair_instruction="Format tool calls as: <tool_use><tool_name><arg>value</arg></tool_name></tool_use>",
-            expected_shape="<tool_use><bash_v2><command>ls</command></bash_v2></tool_use>",
+            expected_shape="<tool_use><run_command><command>ls</command></run_command></tool_use>",
         )
 
     @staticmethod
@@ -193,7 +193,7 @@ class ToolUseXmlParser(BaseParser[dict[str, Any]]):
                 actions.append(action)
 
         # Also try: bare JSON inside <tool_use> without nested tags
-        # e.g. <tool_use>{"name": "glob_v2", "arguments": {"pattern": "*.py"}}</tool_use>
+        # e.g. <tool_use>{"name": "glob", "arguments": {"pattern": "*.py"}}</tool_use>
         if not actions:
             for match in re.finditer(
                 r"<(?:tool_use|tool_call|tool)>(.*?)</(?:tool_use|tool_call|tool)>",
@@ -211,11 +211,11 @@ class ToolUseXmlParser(BaseParser[dict[str, Any]]):
         """Parse a single tool_use block content into an Action.
 
         Handles formats:
-        1. <bash_v2><command>ls</command></bash_v2>  (tool_name as XML tag)
-        2. <glob_v2>{"pattern": "*.py"}</glob_v2>   (tool_name as XML tag + JSON body)
-        3. <server_name>fs</server_name><tool_name>glob_v2</tool_name><arguments>...</arguments>
+        1. <run_command><command>ls</command></run_command>  (tool_name as XML tag)
+        2. <glob>{"pattern": "*.py"}</glob>   (tool_name as XML tag + JSON body)
+        3. <server_name>fs</server_name><tool_name>glob</tool_name><arguments>...</arguments>
            (GLM-style with separate tool_name and arguments elements)
-        4. <file_read_v2><path>/tmp/test.py</path></file_read_v2> (child tags as args)
+        4. <read_file><path>/tmp/test.py</path></read_file> (child tags as args)
         """
         # Try XML parsing first
         try:
@@ -248,14 +248,14 @@ class ToolUseXmlParser(BaseParser[dict[str, Any]]):
 
             # Format 1/2/4: tool_name as the XML tag itself
             # NOTE: Use root.tag directly, NOT norm(), to preserve underscores
-            # in tool names like "bash_v2"
+            # in tool names like "run_command"
             if norm(root.tag) == "root":
                 # Look for first non-metadata child as the tool element
                 for child in root:
                     child_tag_norm = norm(child.tag)
                     if child_tag_norm in self._METADATA_TAGS_NORM:
                         continue
-                    # Use original tag (preserves underscores like bash_v2)
+                    # Use original tag (preserves underscores like run_command)
                     tool_name = child.tag
                     args = self._extract_args_from_element(child)
                     if tool_name and args is not None:
@@ -362,22 +362,15 @@ class ToolUseXmlParser(BaseParser[dict[str, Any]]):
     def _infer_arg_name(tool_name: str) -> str:
         """Infer the primary argument name for a tool."""
         name = norm(tool_name)
-        # Bash tools
-        if name in ("bashv2", "bash", "run_command", "bash_v2"):
+        if name == "runcommand":
             return "command"
-        # File read tools
-        if name in ("filereadv2", "read_file", "read", "view", "file_read_v2"):
+        if name in ("readfile", "writefile", "editfile"):
             return "path"
-        # File write/edit tools
-        if name in ("fileeditv2", "write_file", "edit", "write", "str_replace", "file_edit_v2"):
-            return "path"
-        # Glob/Grep tools
-        if name in ("globv2", "glob", "glob_v2"):
+        if name == "glob":
             return "pattern"
-        if name in ("grepv2", "grep", "grep_v2"):
+        if name == "grep":
             return "pattern"
-        # Web tools
-        if name in ("webfetchv2", "webfetch", "web_fetch_v2"):
+        if name == "webfetch":
             return "url"
         # Default
         return "input"

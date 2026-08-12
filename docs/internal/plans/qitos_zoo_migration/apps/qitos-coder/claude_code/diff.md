@@ -250,7 +250,7 @@ The most impactful gaps are **architectural** (streaming, concurrency, context m
 | Tool | What it does | Why it matters |
 |------|-------------|----------------|
 | **WebSearch** | Server-side web search with citation support | Models cannot access current information without it |
-| **Agent (working)** | Spawn sub-agents for parallel work | `agent_spawn` is currently a **stub** — returns `{"spawned": False}` |
+| **Agent (working)** | Spawn sub-agents for parallel work | Framework `AgentTool` is available; this app has not injected a child `invocation_factory` |
 | **Plan mode enforcement** | Actually restrict tools in plan mode | Currently cosmetic — model can still write files in "plan mode" |
 | **MCP client** | Dynamic tool discovery and invocation | MCP tools are **stubs** that read from pre-injected dict |
 
@@ -280,7 +280,7 @@ The most impactful gaps are **architectural** (streaming, concurrency, context m
 
 | Aspect | Claude Code | QitOS |
 |--------|-------------|-------|
-| **Agent spawning** | `AgentTool` spawns child query loops | `agent_spawn` is a stub |
+| **Agent spawning** | `AgentTool` spawns child query loops | App-owned `AgentTool` wiring is not implemented |
 | **Fork mode** | Fork self with inherited context + prompt cache | Not supported |
 | **Background execution** | `run_in_background` with completion notifications | Not supported |
 | **Worktree isolation** | `isolation: "worktree"` for isolated git worktree | `enter_worktree` exists but not wired to agents |
@@ -288,7 +288,7 @@ The most impactful gaps are **architectural** (streaming, concurrency, context m
 | **Sub-agent types** | Explore, Plan, general-purpose, verification, guide | Explore, Plan, Guide defined but not callable from model |
 
 **What to build**:
-- Make `agent_spawn` actually work: create a child Engine with the sub-agent's toolset, run it, return results
+- Inject the canonical `AgentTool` with an application-owned factory that creates one fresh child Engine per call
 - Add `run_in_background` support: run agent in thread, notify on completion
 - Wire `enter_worktree` into agent spawning for isolation
 
@@ -332,7 +332,7 @@ These changes are required for the agent to be genuinely usable for real work:
 |---|------|-------|--------|--------|--------|
 | A1 | **Tool execution concurrency** | `action_executor.py` | Major latency reduction | High | Done |
 | A2 | **Plan mode enforcement** | `action_executor.py`, `engine.py`, `agent.py` | Safety — model can't write in plan mode | Low | Done |
-| A3 | **Agent spawning (make it work)** | `coding_impl.py` `agent_spawn`, new `subagents.py` | Multi-step task delegation | Medium | Done |
+| A3 | **Agent spawning** | App-owned `AgentTool` invocation factory | Multi-step task delegation | Medium | Not wired |
 | A4 | **WebSearch tool** | New `qitos/kit/tool/browser/` or `coding_impl.py` | Access to current information | Medium | Pending |
 | A5 | **Streaming tool execution** | `_model_runtime.py`, `engine.py` | Start tools before response completes | High | Pending |
 | A6 | **Context management improvements** | `states.py`, `_action_runtime.py`, `_control_runtime.py` | Long-session quality | Medium | Done |
@@ -387,7 +387,7 @@ These changes are required for the agent to be genuinely usable for real work:
 | **Plan mode enforcement** (permission pipeline + RBW enforcer wired to engine) | Done |
 | **Context management improvements** (8K→50K tool result limit, per-message 200K budget, reactive compact on overflow) | Done |
 | **Tool execution concurrency** (parallel read-only tools: Read, Glob, Grep, WebFetch) | Done |
-| **Agent spawning** (agent_spawn now creates real sub-agents: explore, plan, general) | Done |
+| **Canonical AgentTool lifecycle** (fresh child Engine supplied by the owning app) | Framework done; app wiring required |
 | **API context overflow recovery** (detects OpenAI/Anthropic context_length_exceeded, auto-compacts and retries) | Done |
 
 ---

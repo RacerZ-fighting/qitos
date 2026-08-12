@@ -36,6 +36,7 @@ class RuntimeBudget:
     max_steps: int = 10  # Default matches Engine's safe step limit
     max_runtime_seconds: Optional[float] = None
     max_tokens: Optional[int] = None
+    deadline_monotonic: Optional[float] = None
 
 
 @dataclass
@@ -44,23 +45,22 @@ class ContextConfig:
 
     Three thresholds act on one request, in this order:
 
-    * ``warning_ratio`` (0.80) — occupancy at which a ``warning`` context event
+    * ``warning_ratio`` (0.75) — occupancy at which a ``warning`` context event
       is emitted. Observability only; nothing is reduced.
-    * ``compact_ratio`` (0.85) — fraction of the per-request history budget at
-      which the history strategy is asked to compact. This is the knob that
-      controls *when* reduction starts; lowering it compacts earlier.
+    * ``compact_ratio`` (0.80) — fraction of the provider-safe total input
+      budget at which the history strategy must compact. System and current
+      user tokens count toward this threshold.
     * overflow (1.0) — exceeding ``available_input_budget`` raises
       ``ContextOverflowError`` when ``strict_overflow`` is set.
 
-    ``target_utilization`` is a different axis: it caps how much of the model
-    context window one request may ever occupy, and therefore sizes the budget
-    that ``compact_ratio`` is applied to.
+    The compaction threshold is also exposed as ``soft_input_target`` in
+    telemetry. There is no second sliding-window target: all normal reduction
+    goes through the configured transaction-aware history strategy.
     """
 
     enabled: bool = True
-    warning_ratio: float = 0.80
-    compact_ratio: float = 0.85
-    target_utilization: float = 0.85
+    warning_ratio: float = 0.75
+    compact_ratio: float = 0.80
     safety_reserve_tokens: Optional[int] = None
     safety_reserve_ratio: float = 0.05
     min_safety_reserve_tokens: int = 1024
@@ -69,6 +69,11 @@ class ContextConfig:
     tool_result_per_message_max_chars: int = 200000
     conversation_max_rounds: int = 10
     reactive_compact: bool = True
+    # Generic QitOS applications retain repeated-call protection by default.
+    # Long-running CyberGym tasks can opt out so that a recoverable tool Card
+    # remains observable instead of turning a repeated request into a
+    # permanent runtime block.
+    tool_call_loop_detection_enabled: bool = True
     loop_max_repeats: int = 3
     max_handoffs: int = 10
     strict_overflow: bool = True
@@ -76,28 +81,31 @@ class ContextConfig:
 
 
 @dataclass
-class ContextBudget:
-    max_input_tokens: int
-    target_utilization: float = 0.85
-    tool_result_max_chars: int = 50000
-    conversation_max_rounds: int = 10
-
-    @property
-    def target_tokens(self) -> int:
-        return int(self.max_input_tokens * self.target_utilization)
-
-
-@dataclass
 class ContextTelemetry:
     context_window: Optional[int] = None
     available_input_budget: Optional[int] = None
+    hard_input_budget: Optional[int] = None
+    soft_input_target: Optional[int] = None
+    input_budget_source: str = "unresolved"
     system_prompt_tokens: int = 0
     history_tokens: int = 0
     prepared_tokens: int = 0
+    message_injection_tokens: int = 0
+    user_content_block_tokens: int = 0
+    request_overhead_tokens: int = 0
     input_tokens_total: int = 0
     output_tokens: int = 0
+    provider_prompt_tokens: Optional[int] = None
+    provider_completion_tokens: Optional[int] = None
+    provider_total_tokens: Optional[int] = None
+    planned_prompt_tokens: Optional[int] = None
+    cached_tokens: Optional[int] = None
+    meter_source: str = "local_estimate"
+    meter_status: str = "not_configured"
+    meter_error: str = ""
+    token_estimate_error: Optional[int] = None
     occupancy_ratio: float = 0.0
-    warning_threshold_ratio: float = 0.80
+    warning_threshold_ratio: float = 0.75
     counting_mode: str = "disabled"
     prompt_tokens_total: int = 0
     completion_tokens_total: int = 0
@@ -108,6 +116,7 @@ class ContextTelemetry:
     compact_events: List[Dict[str, Any]] = field(default_factory=list)
     reserve_tokens: int = 0
     max_output_tokens: int = 0
+    configured_max_output_tokens: int = 0
     history_budget: Optional[int] = None
 
 
@@ -149,6 +158,9 @@ class StepRecord:
     agent_id: Optional[str] = None
     native_tool_call_used: bool = False
     native_tool_call_fallback_reason: Optional[str] = None
+    # Parser-derived actions are mirrored as OpenAI-compatible tool calls so
+    # their results can remain in the same durable conversation chain.
+    history_tool_calls_pending: bool = False
     visual_assets: List[Dict[str, Any]] = field(default_factory=list)
     observation_modalities: List[str] = field(default_factory=list)
     visual_asset_count: int = 0

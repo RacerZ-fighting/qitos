@@ -67,6 +67,7 @@ class StateSchema:
 
     # Subclasses can override this and set their own registry.
     migration_registry: ClassVar[StateMigrationRegistry] = StateMigrationRegistry()
+    _field_reducers_cache: ClassVar[Any]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -137,6 +138,7 @@ class StateSchema:
         # Check this specific class's own __dict__ (not inherited)
         if "_field_reducers_cache" not in cls.__dict__:
             from .field_reducers import FieldReducerRegistry
+
             cls._field_reducers_cache = FieldReducerRegistry.from_schema(cls)
         return cls.__dict__["_field_reducers_cache"]
 

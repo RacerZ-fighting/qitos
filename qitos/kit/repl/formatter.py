@@ -11,7 +11,7 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 # ---------------------------------------------------------------------------
@@ -34,39 +34,18 @@ RESET = "\033[0m"
 
 # Default tool display name mapping
 DEFAULT_TOOL_DISPLAY = {
-    "Glob": "Glob",
-    "glob_v2": "Glob",
-    "glob_files": "Glob",
-    "Grep": "Grep",
-    "grep_v2": "Grep",
-    "grep_files": "Grep",
-    "Read": "Read",
+    "glob": "Glob",
+    "grep": "Grep",
     "read_file": "Read",
-    "file_read_v2": "Read",
-    "read_file_range": "Read",
-    "view": "Read",
-    "Edit": "Edit",
-    "file_edit_v2": "Edit",
-    "str_replace": "Edit",
-    "replace_lines": "Edit",
-    "Write": "Write",
+    "edit_file": "Edit",
     "write_file": "Write",
-    "file_write_v2": "Write",
-    "Bash": "Bash",
-    "bash_v2": "Bash",
     "run_command": "Bash",
-    "WebFetch": "WebFetch",
-    "web_fetch_v2": "WebFetch",
     "web_fetch": "WebFetch",
-    "AskUserQuestion": "Ask",
     "ask_user_choice": "Ask",
+    "hex_view": "Hex",
     "list_tree": "LsTree",
     "list_files": "LsFiles",
-    "create": "Write",
-    "search": "Grep",
-    "insert": "Edit",
-    "append_file": "Edit",
-    "make_directory": "Bash",
+    "make_directory": "MkDir",
 }
 
 

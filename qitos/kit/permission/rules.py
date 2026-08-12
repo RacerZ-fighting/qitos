@@ -37,16 +37,10 @@ PROTECTED_PATHS: List[str] = [
 ]
 
 # Write tool names that should be checked against protected paths
-WRITE_TOOL_NAMES = frozenset({
-    "file_edit_v2", "write_file", "Edit", "Write",
-    "str_replace", "insert", "replace_lines", "append_file",
-    "create", "make_directory",
-})
+WRITE_TOOL_NAMES = frozenset({"edit_file", "write_file", "make_directory"})
 
 # Bash tool names
-BASH_TOOL_NAMES = frozenset({
-    "bash_v2", "Bash", "run_command",
-})
+BASH_TOOL_NAMES = frozenset({"run_command"})
 
 
 def is_protected_path(path: str) -> bool:

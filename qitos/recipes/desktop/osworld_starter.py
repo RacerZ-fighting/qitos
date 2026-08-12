@@ -6,6 +6,7 @@ import argparse
 import base64
 import os
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -25,13 +26,18 @@ from qitos import (
     ToolResult,
 )
 from qitos.engine.critic import Critic
-from qitos.harness import build_harness_policy, build_model_for_preset, resolve_family_preset
+from qitos.harness import (
+    build_harness_policy,
+    build_model_for_preset,
+    resolve_family_preset,
+)
 from qitos.kit.planning.state_ops import format_action
 from qitos.kit.prompts.computer_use import (
     computer_use_persona_prompt,
     computer_use_task_policy,
 )
 from qitos.kit.toolset.computer_use import ComputerUseToolSet
+from qitos.models import Model, ModelStreamChunk
 
 
 TASK_TEXT = "Open the target desktop workflow, interact with the visible UI, and report the grounded outcome."
@@ -47,25 +53,41 @@ DEFAULT_MODEL_FAMILY = os.getenv(
 MAX_STEPS = 8
 
 
-class _SequenceModel:
-    """Deterministic callable model that returns one scripted output per call."""
+class _SequenceModel(Model):
+    """Deterministic asynchronous model for the local starter run."""
 
     def __init__(
         self,
         outputs: Iterable[str | Callable[[list[dict[str, Any]]], str]],
         *,
         model: str = "smoke-model",
-    ):
+    ) -> None:
+        super().__init__(model=model, temperature=None)
         self.outputs = list(outputs)
         self.calls: list[list[dict[str, Any]]] = []
-        self.model = model
 
-    def __call__(self, messages: list[dict[str, Any]], **_: Any) -> str:
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **_: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = deadline_monotonic
         self.calls.append(list(messages))
         if not self.outputs:
-            return "Final Answer: smoke complete"
-        item = self.outputs.pop(0)
-        return item(messages) if callable(item) else str(item)
+            text = "Final Answer: smoke complete"
+        else:
+            item = self.outputs.pop(0)
+            text = item(messages) if callable(item) else str(item)
+        if text:
+            yield ModelStreamChunk(text=text, event_type="text.delta")
+        yield ModelStreamChunk(
+            done=True,
+            event_type="scripted.completed",
+            event_metadata={"provider": self.provider_name, "model": self.model},
+            finish_reason="stop",
+        )
 
     def supports_multimodal_input(self) -> bool:
         return True
@@ -163,7 +185,10 @@ class DesktopGroundingCritic(Critic):
                 "score": 0.1,
                 "details": {"failure_tag": "grounding_failure"},
             }
-        if getattr(state, "last_grounding_quality", "weak") == "weak" and name in click_like:
+        if (
+            getattr(state, "last_grounding_quality", "weak") == "weak"
+            and name in click_like
+        ):
             return {
                 "action": "retry",
                 "reason": "Grounding evidence is weak. Re-anchor on visible UI candidates or OCR before clicking.",
@@ -174,7 +199,9 @@ class DesktopGroundingCritic(Critic):
         if recent and len(recent) >= 2:
             last_actions = [x for x in recent[-4:] if str(x).startswith("Action: ")]
             current = "Action: " + _extract_action_label(decision)
-            if len(last_actions) >= 2 and all(item == current for item in last_actions[-2:]):
+            if len(last_actions) >= 2 and all(
+                item == current for item in last_actions[-2:]
+            ):
                 return {
                     "action": "retry",
                     "reason": "Do not repeat the same desktop action without new evidence.",
@@ -299,14 +326,31 @@ class OpenAICUAAgent(AgentModule[OpenAICUAState, dict[str, Any], Action]):
             state.planner_notes.append(plan_note)
         elif decision.final_answer:
             state.trajectory.append(f"Final: {decision.final_answer}")
-        action_results = observation.get("action_results", []) if isinstance(observation, dict) else []
+        action_results = (
+            observation.get("action_results", [])
+            if isinstance(observation, dict)
+            else []
+        )
         if action_results:
             first = action_results[0]
             state.trajectory.append(f"Observation: {first}")
             for result in action_results:
-                status = _safe_str((result or {}).get("status"))
-                if status in {"validation_error", "approval_required"} and "execution_environment_failure" not in state.failure_tags:
+                tool_result = ToolResult.from_value(result)
+                status = str(tool_result.status or "")
+                category = str(
+                    (tool_result.metadata or {}).get("error_category") or ""
+                ).strip()
+                if (
+                    status in {"denied", "needs_approval"}
+                    or category
+                    in {"validation_error", "permission_ask", "permission_denied"}
+                ) and "execution_environment_failure" not in state.failure_tags:
                     state.failure_tags.append("execution_environment_failure")
+                if (
+                    status != "success"
+                    and "action_selection_failure" not in state.failure_tags
+                ):
+                    state.failure_tags.append("action_selection_failure")
         state.trajectory = state.trajectory[-50:]
         state.planner_notes = state.planner_notes[-12:]
         state.grounding_notes = state.grounding_notes[-12:]
@@ -332,7 +376,9 @@ def build_model(
     if smoke:
         return _SequenceModel(_smoke_outputs(), model=f"smoke-{model_name}")
     if not api_key:
-        raise ValueError("Set OPENAI_API_KEY or QITOS_API_KEY before running this example.")
+        raise ValueError(
+            "Set OPENAI_API_KEY or QITOS_API_KEY before running this example."
+        )
     return build_model_for_preset(
         family_id=model_family,
         model_name=model_name,
@@ -355,7 +401,9 @@ def configure_runtime_for_task(
     arg_model_name = _safe_str(getattr(args, "model_name", None))
     arg_family = _safe_str(getattr(args, "model_family", None))
     model_name = arg_model_name or _safe_str(run_spec.model_name) or MODEL_NAME
-    model_family = arg_family or _safe_str(run_spec.model_family) or DEFAULT_MODEL_FAMILY
+    model_family = (
+        arg_family or _safe_str(run_spec.model_family) or DEFAULT_MODEL_FAMILY
+    )
     base_url = (
         _safe_str(getattr(args, "base_url", None))
         or _safe_str((run_spec.environment or {}).get("base_url"))
@@ -435,7 +483,9 @@ def build_task(
     }
     if provider == "container":
         env_config["container"] = container
-        env_config["workspace_root"] = os.getenv("QITOS_DESKTOP_WORKSPACE", "/workspace")
+        env_config["workspace_root"] = os.getenv(
+            "QITOS_DESKTOP_WORKSPACE", "/workspace"
+        )
 
     return Task(
         id="openai_cua_task",
@@ -535,7 +585,9 @@ def execute_desktop_task(
         task=task,
         workspace=str(target_workspace),
         observation_mode=DEFAULT_OBSERVATION_MODE,
-        max_steps=int(max_steps or getattr(task.budget, "max_steps", MAX_STEPS) or MAX_STEPS),
+        max_steps=int(
+            max_steps or getattr(task.budget, "max_steps", MAX_STEPS) or MAX_STEPS
+        ),
         render=render,
         trace=trace,
         trace_logdir=trace_logdir,
@@ -575,9 +627,7 @@ def build_benchmark_result(
     contract = dict((execution.task.metadata or {}).get("completion_contract") or {})
     final_text = str(getattr(state, "final_result", "") or "")
     expected = [
-        str(x)
-        for x in (contract.get("expects_substrings") or [])
-        if str(x).strip()
+        str(x) for x in (contract.get("expects_substrings") or []) if str(x).strip()
     ]
     if expected:
         success = all(token.lower() in final_text.lower() for token in expected)
@@ -606,13 +656,17 @@ def build_benchmark_result(
                 and "execution_environment_failure" not in failure_tags
             ):
                 failure_tags.append("execution_environment_failure")
-            if status == "error" and "action_selection_failure" not in failure_tags:
+            if status != "success" and "action_selection_failure" not in failure_tags:
                 failure_tags.append("action_selection_failure")
     return BenchmarkRunResult(
         task_id=str(execution.task.id),
         benchmark=benchmark_name,
         split=str(
-            (execution.experiment_spec.benchmark_split if execution.experiment_spec else None)
+            (
+                execution.experiment_spec.benchmark_split
+                if execution.experiment_spec
+                else None
+            )
             or execution.run_spec.benchmark_split
             or "starter"
         ),
@@ -621,13 +675,19 @@ def build_benchmark_result(
         stop_reason=str(getattr(state, "stop_reason", None) or "unknown"),
         steps=int(getattr(execution.result, "step_count", 0) or 0),
         latency_seconds=float(
-            ((task_result.metrics or {}).get("elapsed_seconds") if task_result else execution.elapsed_seconds)
+            (
+                (task_result.metrics or {}).get("elapsed_seconds")
+                if task_result
+                else execution.elapsed_seconds
+            )
             or execution.elapsed_seconds
         ),
         token_usage=int(
             ((task_result.metrics or {}).get("token_usage") if task_result else 0) or 0
         ),
-        cost=float(((task_result.metrics or {}).get("cost") if task_result else 0.0) or 0.0),
+        cost=float(
+            ((task_result.metrics or {}).get("cost") if task_result else 0.0) or 0.0
+        ),
         trace_run_dir=str(trace_run_dir) if trace_run_dir else None,
         run_spec_ref=execution.run_spec.fingerprint(),
         metadata={

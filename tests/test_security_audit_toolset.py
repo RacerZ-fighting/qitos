@@ -145,7 +145,8 @@ def test_security_dependency_audit_handles_unavailable_and_external_outputs(
 
     monkeypatch.setattr("shutil.which", lambda name: None)
     unavailable = toolset.audit_dependency_audit()
-    assert unavailable["status"] == "unavailable"
+    assert unavailable["status"] == "error"
+    assert unavailable["error_category"] == "unavailable"
 
     def _which(name: str):
         return f"/usr/bin/{name}"

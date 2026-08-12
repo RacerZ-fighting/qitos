@@ -11,19 +11,18 @@ from typing import Any, Dict, Optional, Set
 
 # Tool name sets for heuristic classification
 SAFE_READ_TOOLS: Set[str] = {
-    "file_read_v2", "read_file", "Read", "view",
-    "glob_v2", "Glob", "grep_v2", "Grep",
-    "list_directory", "AskUserQuestion",
+    "read_file",
+    "glob",
+    "grep",
+    "hex_view",
+    "list_files",
+    "list_tree",
+    "ask_user_choice",
 }
 
-WRITE_TOOLS: Set[str] = {
-    "file_edit_v2", "write_file", "Edit", "Write",
-    "str_replace", "insert", "replace_lines", "append_file",
-}
+WRITE_TOOLS: Set[str] = {"edit_file", "write_file", "make_directory"}
 
-BASH_TOOLS: Set[str] = {
-    "bash_v2", "Bash", "run_command",
-}
+BASH_TOOLS: Set[str] = {"run_command"}
 
 # Heuristically safe read-only bash commands
 SAFE_BASH_PREFIXES = (

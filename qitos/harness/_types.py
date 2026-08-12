@@ -62,6 +62,7 @@ class FamilyPreset:
     recommended_max_tokens: Optional[int] = None
     recommended_retry_budget: Optional[int] = None
     recommended_temperature: Optional[float] = None
+    recommended_request_kwargs: Optional[dict[str, Any]] = None
 
     def matches(self, value: str | None) -> bool:
         normalized = str(value or "").strip().lower()
@@ -90,6 +91,7 @@ class FamilyPreset:
             "recommended_max_tokens": self.recommended_max_tokens,
             "recommended_retry_budget": self.recommended_retry_budget,
             "recommended_temperature": self.recommended_temperature,
+            "recommended_request_kwargs": self.recommended_request_kwargs,
         }
 
     def override(self, **kwargs: Any) -> FamilyPreset:
@@ -181,3 +183,24 @@ def build_protocol_for_preset(
 
 
 Resolver = Callable[[str | None], FamilyPreset]
+
+
+def native_tool_calls_preferred(*, llm: Any = None, protocol: Any = None) -> bool:
+    """Return whether one resolved model lane treats native tool calls as canonical."""
+
+    metadata = getattr(llm, "qitos_harness_metadata", {}) if llm is not None else {}
+    if isinstance(metadata, dict):
+        if metadata.get("native_tool_call_preferred") is True:
+            return True
+        if metadata.get("decision_lane_preference") == "native_tool_calls":
+            return True
+        tool_policy = metadata.get("tool_policy")
+        if (
+            isinstance(tool_policy, dict)
+            and tool_policy.get("native_tool_call_preferred") is True
+        ):
+            return True
+    return bool(
+        protocol is not None
+        and getattr(protocol, "supports_native_tool_call_markup", False)
+    )

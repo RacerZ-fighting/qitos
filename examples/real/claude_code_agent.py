@@ -39,9 +39,9 @@ Workflow:
 - Only use `web_fetch` when the task needs documentation.
 
 Preferred tool patterns:
-- Inspection: `view`, `read_file`
-- Editing: `str_replace`, `replace_lines`, `write_file`, `create`
-- Search: `glob_files`, `grep_files`, `tool_search`
+- Inspection: `read_file`, `list_files`, `list_tree`
+- Editing: `edit_file`, `write_file`
+- Search: `glob`, `grep`, `tool_search`
 - Execution: `run_command`
 - Planning/state: `todo_write`, `enter_plan_mode`, `exit_plan_mode`
 """

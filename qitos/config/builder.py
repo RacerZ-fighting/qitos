@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from ..core.spec import RunSpec
 from ..core.tool_registry import ToolRegistry
-from ..models.base import ModelFactory
+from ..models import builtin_model_factory
+from ..models.base import Model, ModelFactory
 from .loader import AgentConfig, ModelConfig
 
 
@@ -22,11 +23,15 @@ _PROVIDER_ALIASES = {
     "litellm": "litellm",
     "ollama": "ollama",
     "lmstudio": "lmstudio",
-    "local": "ollama",
+    "vllm": "vllm",
 }
 
 
-def build_model(config: ModelConfig) -> Any:
+def build_model(
+    config: ModelConfig,
+    *,
+    factory: Optional[ModelFactory] = None,
+) -> Model:
     """Create a Model instance from ModelConfig using ModelFactory.
 
     Args:
@@ -46,21 +51,34 @@ def build_model(config: ModelConfig) -> Any:
         params["model"] = config.model or config.model_name
     if config.api_key:
         params["api_key"] = config.api_key
-    if config.base_url:
-        params["base_url"] = config.base_url
     params["temperature"] = config.temperature
     params["max_tokens"] = config.max_tokens
-    if provider_key in {
-        "openai",
-        "openai-compatible",
-        "async-openai",
-        "async-openai-compatible",
-    }:
+    if provider_key in {"openai", "openai-compatible", "lmstudio", "vllm"}:
+        if config.base_url:
+            params["base_url"] = config.base_url
+    elif provider_key == "azure":
+        if config.base_url:
+            params["endpoint"] = config.base_url
+        if config.model or config.model_name:
+            params.pop("model", None)
+            params["deployment"] = config.model or config.model_name
+    elif provider_key == "litellm":
+        if config.base_url:
+            params["api_base"] = config.base_url
+    elif provider_key == "ollama":
+        if config.base_url:
+            params["host"] = config.base_url
+    elif config.base_url:
+        params["base_url"] = config.base_url
+    if (
+        provider_key in {"openai", "openai-compatible", "lmstudio", "vllm"}
+        and config.api_mode
+    ):
         params["api_mode"] = config.api_mode
     if config.context_window is not None:
         params["context_window"] = config.context_window
 
-    return ModelFactory.create(provider_key, **params)
+    return (factory or builtin_model_factory()).create(provider_key, **params)
 
 
 def build_run_spec(config: AgentConfig) -> RunSpec:
@@ -117,9 +135,7 @@ def _register_tool_by_path(registry: ToolRegistry, dotted_path: str) -> None:
 
     func = getattr(module, func_name, None)
     if func is None:
-        raise ImportError(
-            f"Tool '{func_name}' not found in module '{module_path}'"
-        )
+        raise ImportError(f"Tool '{func_name}' not found in module '{module_path}'")
     registry.register(func)
 
 

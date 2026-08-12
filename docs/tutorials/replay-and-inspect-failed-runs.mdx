@@ -81,7 +81,20 @@ The v0.3 diff view focuses on the highest-signal fields:
 - first failure step
 - run config diff
 
-This is the fastest way to answer “what actually changed?”
+Before showing those deltas, qita runs a same-spec preflight over the recorded model,
+prompt hash, tools, environment, context policy, budget, source revision, run spec, and
+experiment spec. The comparison banner reports one of three states:
+
+- **Same-spec comparison**: the recorded configuration matches. The deltas describe
+  repeat variability; remote models and external environments may still be
+  nondeterministic.
+- **Configuration mismatch**: one or more recorded configuration fields differ. The
+  deltas are descriptive, not causal.
+- **Comparison provenance is incomplete**: a required field such as the prompt hash,
+  budget, source revision, or run spec is missing. Do not use the pair as an A/B result.
+
+This is the fastest way to answer “what actually changed?” without accidentally
+treating different models, prompts, tools, or budgets as one experiment.
 
 ## Step 5: export what matters
 

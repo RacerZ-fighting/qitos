@@ -1,17 +1,17 @@
-"""
-OpenAI Model Implementation
+"""Async OpenAI Responses and Chat Completions providers."""
 
-OpenAI API-based model calling implementation.
-Supports environment variable configuration: OPENAI_API_KEY, OPENAI_BASE_URL
-"""
+from __future__ import annotations
 
+import asyncio
 import json
 import os
+from collections import deque
+from collections.abc import AsyncIterator
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, cast
+from typing import Any, Deque, Dict, List, Optional, cast
 
-from ..core.model_response import ModelResponse
+from ..core.errors import ModelTransportError
 from ..core.multimodal import (
     content_to_text,
     ensure_data_url,
@@ -21,11 +21,16 @@ from ..core.multimodal import (
     normalize_messages,
 )
 from ._openai_responses import (
-    _async_responses_completion,
-    _async_responses_stream,
     _normalize_api_mode,
-    _responses_completion,
-    _responses_stream,
+    _normalize_request_kwargs,
+    _open_responses_stream,
+    _to_responses_input,
+)
+from .transport import (
+    ModelRetryPolicy,
+    close_async_resource,
+    effective_request_timeout,
+    transactional_stream_with_retry,
 )
 from .base import Model, ModelStreamChunk
 
@@ -33,21 +38,253 @@ from .base import Model, ModelStreamChunk
 GLM_TOKENIZER_ENV_VARS = ("QITOS_GLM_TOKENIZER_PATH", "GLM_TOKENIZER_PATH")
 
 
-def _relocate_chat_template_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Move ``chat_template_kwargs`` from top-level kwargs into ``extra_body``.
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
 
-    The OpenAI Python SDK does not accept ``chat_template_kwargs`` as a
-    top-level parameter.  vLLM-compatible serving endpoints expect it inside
-    ``extra_body`` instead.  Calling code that merges ``default_request_kwargs``
-    often places it at the top level, so we relocate it here.
-    """
+
+def _usage_payload(usage: Any) -> Optional[Dict[str, Any]]:
+    """Normalize Chat Completions usage, including cache reporting."""
+
+    if usage is None:
+        return None
+    prompt_tokens = _field(usage, "prompt_tokens")
+    completion_tokens = _field(usage, "completion_tokens")
+    total_tokens = _field(usage, "total_tokens")
+    details = _field(usage, "prompt_tokens_details")
+    cached = _field(details, "cached_tokens")
+    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+        return None
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cached_tokens": cached,
+    }
+
+
+class ChatStreamAccumulator:
+    """Normalize one Chat Completions stream attempt."""
+
+    def __init__(self, *, provider: str, model: str) -> None:
+        self._provider = provider
+        self._model = model
+        self._tool_calls: List[Dict[str, Any]] = []
+        self._usage: Optional[Dict[str, Any]] = None
+        self._finish_reason: Optional[str] = None
+
+    def consume(self, chunk: Any) -> List[ModelStreamChunk]:
+        events: List[ModelStreamChunk] = []
+        choices = list(_field(chunk, "choices", []) or [])
+        if not choices:
+            usage = _usage_payload(_field(chunk, "usage"))
+            if usage:
+                self._usage = usage
+            return events
+
+        choice = choices[0]
+        delta = _field(choice, "delta", {})
+        text = str(_field(delta, "content", "") or "")
+        reasoning = _field(delta, "reasoning_content")
+        if text or reasoning:
+            events.append(
+                ModelStreamChunk(
+                    text=text,
+                    reasoning_content=str(reasoning) if reasoning else None,
+                    event_type=("text.delta" if text else "reasoning.delta"),
+                )
+            )
+        events.extend(self._accumulate_tool_calls(_field(delta, "tool_calls")))
+
+        finish_reason = _field(choice, "finish_reason")
+        if finish_reason is not None:
+            self._finish_reason = str(finish_reason)
+        usage = _usage_payload(_field(chunk, "usage"))
+        if usage:
+            self._usage = usage
+        return events
+
+    def complete(self) -> ModelStreamChunk:
+        if self._finish_reason is None:
+            raise ModelTransportError(
+                "model stream ended before a terminal finish reason",
+                attempts=1,
+                retryable=True,
+            )
+        tool_calls = [
+            item
+            for item in self._tool_calls
+            if item.get("id") and item.get("function", {}).get("name")
+        ]
+        return ModelStreamChunk(
+            done=True,
+            usage=self._usage,
+            tool_calls=tool_calls or None,
+            event_type="chat.completion.completed",
+            event_metadata={
+                "provider": self._provider,
+                "model": self._model,
+                "api_mode": "chat_completions",
+            },
+            finish_reason=self._finish_reason,
+        )
+
+    def _accumulate_tool_calls(self, deltas: Any) -> List[ModelStreamChunk]:
+        events: List[ModelStreamChunk] = []
+        for item in list(deltas or []):
+            raw_index = _field(item, "index", len(self._tool_calls))
+            index = raw_index if isinstance(raw_index, int) else len(self._tool_calls)
+            while len(self._tool_calls) <= index:
+                self._tool_calls.append(
+                    {
+                        "id": None,
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                )
+            tool_call = self._tool_calls[index]
+            tool_call_id = _field(item, "id")
+            if tool_call_id:
+                tool_call["id"] = str(tool_call_id)
+            tool_call_type = _field(item, "type")
+            if tool_call_type:
+                tool_call["type"] = str(tool_call_type)
+            function = _field(item, "function")
+            name = _field(function, "name")
+            if name:
+                tool_call["function"]["name"] = str(name)
+            arguments = _field(function, "arguments")
+            if arguments:
+                previous = str(tool_call["function"].get("arguments") or "")
+                tool_call["function"]["arguments"] = previous + str(arguments)
+            metadata = {
+                key: value
+                for key, value in {
+                    "index": index,
+                    "call_id": tool_call_id,
+                    "tool_type": tool_call_type,
+                    "name": name,
+                    "arguments_delta": arguments,
+                }.items()
+                if value is not None
+            }
+            if len(metadata) > 1:
+                events.append(
+                    ModelStreamChunk(
+                        event_type="tool_call.delta",
+                        event_metadata=metadata,
+                    )
+                )
+        return events
+
+
+class ChatEventStream(AsyncIterator[ModelStreamChunk]):
+    """Own one connected Chat Completions stream and its client."""
+
+    def __init__(
+        self, response: Any, client: Any, *, provider: str, model: str
+    ) -> None:
+        self._response = response
+        self._client = client
+        self._iterator = response.__aiter__()
+        self._pending: Deque[ModelStreamChunk] = deque()
+        self._accumulator = ChatStreamAccumulator(provider=provider, model=model)
+        self._finished = False
+        self._closed = False
+
+    def __aiter__(self) -> ChatEventStream:
+        return self
+
+    async def __anext__(self) -> ModelStreamChunk:
+        if self._pending:
+            return self._pending.popleft()
+        if self._finished:
+            raise StopAsyncIteration
+        while True:
+            try:
+                chunk = await self._iterator.__anext__()
+            except StopAsyncIteration:
+                self._finished = True
+                return self._accumulator.complete()
+            self._pending.extend(self._accumulator.consume(chunk))
+            if self._pending:
+                return self._pending.popleft()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._finished = True
+        await close_async_resource(self._response)
+        await close_async_resource(self._client)
+
+
+class _OwnedEventStream(AsyncIterator[ModelStreamChunk]):
+    """Attach an SDK client lifecycle to a protocol event stream."""
+
+    def __init__(self, stream: AsyncIterator[ModelStreamChunk], client: Any) -> None:
+        self._stream = stream
+        self._client = client
+        self._closed = False
+
+    def __aiter__(self) -> _OwnedEventStream:
+        return self
+
+    async def __anext__(self) -> ModelStreamChunk:
+        return await self._stream.__anext__()
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        await close_async_resource(self._stream)
+        await close_async_resource(self._client)
+
+
+def _wire_tool_schema(
+    tool_schema_payload: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Return provider-valid function tools from registry metadata."""
+
+    wire: List[Dict[str, Any]] = []
+    for item in list(tool_schema_payload or []):
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if not isinstance(function, dict) or not function.get("name"):
+            continue
+        clean_function = {
+            key: function[key]
+            for key in ("name", "description", "parameters", "strict")
+            if key in function and function[key] is not None
+        }
+        wire.append({"type": "function", "function": clean_function})
+    return wire
+
+
+def _relocate_chat_template_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(kwargs)
-    ctk = result.pop("chat_template_kwargs", None)
-    if isinstance(ctk, dict) and ctk:
+    chat_template_kwargs = result.pop("chat_template_kwargs", None)
+    if isinstance(chat_template_kwargs, dict) and chat_template_kwargs:
         extra_body = dict(result.pop("extra_body", None) or {})
-        extra_body["chat_template_kwargs"] = ctk
+        extra_body["chat_template_kwargs"] = chat_template_kwargs
         result["extra_body"] = extra_body
     return result
+
+
+def _merge_request_kwargs(
+    defaults: Dict[str, Any], overrides: Dict[str, Any]
+) -> Dict[str, Any]:
+    merged = dict(defaults)
+    for key, value in overrides.items():
+        if key in {"extra_body", "reasoning"} and isinstance(value, dict):
+            nested = dict(merged.get(key) or {})
+            nested.update(value)
+            merged[key] = nested
+        else:
+            merged[key] = value
+    return merged
 
 
 def _is_forced_tool_choice(tool_choice: Any) -> bool:
@@ -60,19 +297,48 @@ def _disable_thinking_for_forced_tool_choice(kwargs: Dict[str, Any]) -> Dict[str
     if not _is_forced_tool_choice(kwargs.get("tool_choice")):
         return kwargs
     result = dict(kwargs)
+    disabled_thinking = False
     if "enable_thinking" in result:
         result["enable_thinking"] = False
+        disabled_thinking = True
     if "thinking" in result:
         result["thinking"] = {"type": "disabled"}
+        disabled_thinking = True
     extra_body = result.get("extra_body")
     if isinstance(extra_body, dict):
         patched_extra = dict(extra_body)
         if "enable_thinking" in patched_extra:
             patched_extra["enable_thinking"] = False
+            disabled_thinking = True
         if "thinking" in patched_extra:
             patched_extra["thinking"] = {"type": "disabled"}
+            disabled_thinking = True
         result["extra_body"] = patched_extra
+    if disabled_thinking:
+        result.pop("reasoning_effort", None)
     return result
+
+
+def _is_unsupported_stream_options_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code not in {400, 422}:
+        return False
+    detail = f"{exc} {getattr(exc, 'body', '')}".casefold()
+    return "stream_options" in detail and any(
+        marker in detail
+        for marker in (
+            "extra_forbidden",
+            "invalid",
+            "not support",
+            "not permitted",
+            "unknown",
+            "unrecognized",
+            "unsupported",
+            "unexpected",
+        )
+    )
 
 
 def _to_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -105,6 +371,30 @@ def _to_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _count_openai_request_tokens(
+    adapter: Model,
+    messages: List[Dict[str, Any]],
+    request_options: Optional[Dict[str, Any]],
+) -> Optional[int]:
+    api_mode = str(getattr(adapter, "api_mode", "chat_completions"))
+    wire_messages = (
+        _to_responses_input(messages)
+        if api_mode == "responses"
+        else _to_openai_messages(messages)
+    )
+    message_payload: Any = (
+        {"input": wire_messages} if api_mode == "responses" else wire_messages
+    )
+    message_tokens = adapter.count_tokens(message_payload)
+    option_payload = dict(request_options or {})
+    if api_mode == "responses":
+        option_payload = _normalize_request_kwargs(option_payload)
+    option_tokens = adapter.count_tokens(option_payload) if option_payload else 0
+    if not isinstance(message_tokens, int) or not isinstance(option_tokens, int):
+        return None
+    return max(0, message_tokens) + max(0, option_tokens)
+
+
 def _to_openai_content_blocks(content: List[Any]) -> List[Dict[str, Any]]:
     blocks: List[Dict[str, Any]] = []
     for raw in content:
@@ -116,28 +406,23 @@ def _to_openai_content_blocks(content: List[Any]) -> List[Dict[str, Any]]:
         detail = str(block.get("detail") or "").strip()
         if block_type == "image_url":
             image_url: Dict[str, Any] = {"url": str(block.get("url") or "")}
-            if detail:
-                image_url["detail"] = detail
-            blocks.append({"type": "image_url", "image_url": image_url})
-            continue
-        if block_type == "image_base64":
+        elif block_type == "image_base64":
             mime_type = str(block.get("mime_type") or "image/png")
-            image_url = {"url": ensure_data_url(str(block.get("data") or ""), mime_type=mime_type)}
-            if detail:
-                image_url["detail"] = detail
-            blocks.append({"type": "image_url", "image_url": image_url})
-            continue
-        if block_type == "image_file":
+            image_url = {
+                "url": ensure_data_url(
+                    str(block.get("data") or ""), mime_type=mime_type
+                )
+            }
+        elif block_type == "image_file":
             path = str(block.get("path") or "")
             mime_type = str(block.get("mime_type") or "")
-            image_url = {
-                "url": file_to_data_url(path, mime_type=mime_type or None)
-            }
-            if detail:
-                image_url["detail"] = detail
-            blocks.append({"type": "image_url", "image_url": image_url})
+            image_url = {"url": file_to_data_url(path, mime_type=mime_type or None)}
+        else:
+            blocks.append({"type": "text", "text": str(block)})
             continue
-        blocks.append({"type": "text", "text": str(block)})
+        if detail:
+            image_url["detail"] = detail
+        blocks.append({"type": "image_url", "image_url": image_url})
     return blocks
 
 
@@ -186,67 +471,40 @@ def _normalize_messages_for_tokenizer(payload: List[Any]) -> List[Dict[str, str]
             continue
         role = str(item.get("role") or "user").strip() or "user"
         content = content_to_text(item.get("content"))
-        extras: Dict[str, Any] = {}
-        for key in ("tool_calls", "tool_call_id", "name"):
-            if key in item and item.get(key) not in (None, "", []):
-                extras[key] = item.get(key)
+        extras = {
+            key: item.get(key)
+            for key in ("tool_calls", "tool_call_id", "name")
+            if item.get(key) not in (None, "", [])
+        }
         if extras:
             content = (
-                content
-                + "\n"
-                + json.dumps(extras, ensure_ascii=False, sort_keys=True)
+                content + "\n" + json.dumps(extras, ensure_ascii=False, sort_keys=True)
             ).strip()
         messages.append({"role": role, "content": content})
     return messages
 
 
-class OpenAIModel(Model):
-    """
-    OpenAI model calling implementation
+class OpenAICompatibleModel(Model):
+    """OpenAI-compatible provider with an explicit wire protocol."""
 
-    Environment variable configuration:
-    - OPENAI_API_KEY: OpenAI API key
-    - OPENAI_BASE_URL: OpenAI API base URL (optional, default https://api.openai.com/v1)
-
-    Output format:
-    - If model returns tool_calls: Convert to "Action: tool_name(args)" format
-    - If model returns content: Return directly
-    - Supports function calling format
-
-    Example:
-        llm = OpenAIModel(model="gpt-4")
-        result = llm([{"role": "user", "content": "Help me search for Python tutorials"}])
-        # Returns: "Action: search(query='Python tutorials')"
-    """
+    provider_name = "openai-compatible"
 
     def __init__(
         self,
-        model: str = "gpt-4",
+        model: str = "default",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         system_prompt: Optional[str] = None,
-        temperature: float = 0.7,
+        temperature: float | None = 0.7,
         max_tokens: int = 2048,
-        timeout: int = 60,
+        timeout: float = 120.0,
         context_window: Optional[int] = None,
         default_request_kwargs: Optional[Dict[str, Any]] = None,
         api_mode: str = "chat_completions",
-    ):
-        """
-        Initialize OpenAI model
-
-        Args:
-            model: Model name, default gpt-4
-            api_key: API key, default read from environment variable
-            base_url: API base URL, default read from environment variable
-            system_prompt: System prompt
-            temperature: Temperature parameter (0.0-1.0)
-            max_tokens: Maximum output token count
-            timeout: Request timeout (seconds)
-            context_window: Total model context window
-            default_request_kwargs: Extra kwargs merged into every API call
-            api_mode: OpenAI transport, ``chat_completions`` or ``responses``
-        """
+        max_attempts: int = 2,
+        stream_idle_timeout: float = 60.0,
+        retry_window_seconds: float = 300.0,
+    ) -> None:
         super().__init__(
             model=model,
             system_prompt=system_prompt,
@@ -254,228 +512,169 @@ class OpenAIModel(Model):
             max_tokens=max_tokens,
             context_window=context_window,
         )
-
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.base_url = base_url or os.getenv(
-            "OPENAI_BASE_URL", "https://api.openai.com/v1"
-        )
-        self.timeout = timeout
-        self.default_request_kwargs = default_request_kwargs or {}
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or "dummy-key"
+        self.base_url = base_url or os.getenv("OPENAI_BASE_URL", "")
+        if not self.base_url:
+            raise ValueError("OPENAI_BASE_URL must be configured")
+        if isinstance(timeout, bool) or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if isinstance(stream_idle_timeout, bool) or stream_idle_timeout <= 0:
+            raise ValueError("stream_idle_timeout must be positive")
+        self.timeout = float(timeout)
+        self.stream_idle_timeout = float(stream_idle_timeout)
+        self.default_request_kwargs = dict(default_request_kwargs or {})
         self.api_mode = _normalize_api_mode(api_mode)
-
-        if not self.api_key:
-            raise ValueError(
-                "OPENAI_API_KEY not set. Please set environment variable or pass api_key parameter."
-            )
-
-    def _call_api(self, messages: List[Dict[str, Any]], **kwargs: Any) -> str:
-        """
-        Call OpenAI API
-
-        Args:
-            messages: OpenAI-style messages list
-
-        Returns:
-            Text that can be parsed by parse_tool_calls()
-        """
-        import openai
-
-        try:
-            client = openai.OpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-            )
-
-            if self.api_mode == "responses":
-                response = _responses_completion(
-                    self, client, messages, provider="openai", **kwargs
-                )
-            else:
-                response = self._chat_completion(client, messages, **kwargs)
-            if isinstance(response, ModelResponse):
-                return response.text
-            return self._parse_response(response)
-
-        except openai.APIError as e:
-            return f"API Error: {str(e)}"
-        except Exception as e:
-            return f"Error: {str(e)}"
-
-    def _parse_response(self, response) -> str:
-        """
-        Parse OpenAI response and convert to target format
-
-        Args:
-            response: OpenAI API response object
-
-        Returns:
-            Text in parse_tool_calls compatible format
-        """
-        choice = response.choices[0]
-        message = choice.message
-
-        # Prioritize processing tool_calls
-        if message.tool_calls:
-            return self._format_tool_calls(message.tool_calls)
-
-        # Return content
-        if message.content:
-            return message.content.strip()
-
-        return ""
-
-    def _chat_completion(
-        self, client: Any, messages: List[Dict[str, Any]], **kwargs: Any
-    ) -> Any:
-        safe_kwargs = _relocate_chat_template_kwargs(kwargs)
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=cast(Any, _to_openai_messages(messages)),
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            **safe_kwargs,
+        self.retry_policy = ModelRetryPolicy(
+            max_attempts=max_attempts,
+            retry_window_seconds=retry_window_seconds,
         )
-        self._set_last_usage(self._usage_from_response(response))
-        return response
 
-    def call_raw(self, messages: List[Dict[str, Any]], **kwargs: Any) -> Any:
-        import openai
+    def _request_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        return _merge_request_kwargs(self.default_request_kwargs, kwargs)
 
-        self._last_usage = None
-        client = openai.OpenAI(
-            api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
+    def _attempt_request_kwargs(
+        self,
+        kwargs: Dict[str, Any],
+        *,
+        deadline_monotonic: float | None,
+    ) -> Dict[str, Any]:
+        attempt = dict(kwargs)
+        requested_timeout = attempt.get("timeout", self.timeout)
+        if isinstance(requested_timeout, bool) or not isinstance(
+            requested_timeout, (int, float)
+        ):
+            raise ValueError("model request timeout must be numeric")
+        attempt["timeout"] = effective_request_timeout(
+            min(self.timeout, float(requested_timeout)),
+            deadline_monotonic,
         )
-        if self.api_mode == "responses":
-            return _responses_completion(
-                self, client, messages, provider="openai", **kwargs
-            )
-        return self._chat_completion(client, messages, **kwargs)
+        return attempt
 
-    def stream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> Iterator[ModelStreamChunk]:
-        """Stream OpenAI response as chunks, yielding token-level text."""
+    def _new_client(self, *, timeout: float) -> Any:
         import openai
 
-        self._last_usage = None
-        try:
-            client = openai.OpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-            )
-            if self.api_mode == "responses":
-                yield from _responses_stream(
-                    self, client, messages, provider="openai", **kwargs
-                )
-                return
-            response = client.chat.completions.create(
-                model=self.model,
-                messages=cast(Any, _to_openai_messages(messages)),
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                stream=True,
-                **kwargs,
-            )
-            accumulated_tool_calls: List[Dict[str, Any]] = []
-            for chunk in response:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                text = delta.content or ""
-                if text:
-                    yield ModelStreamChunk(text=text, done=False)
-                # Accumulate streaming tool call deltas
-                delta_tool_calls = getattr(delta, "tool_calls", None)
-                if delta_tool_calls:
-                    for dtc in delta_tool_calls:
-                        idx = getattr(dtc, "index", len(accumulated_tool_calls))
-                        while len(accumulated_tool_calls) <= idx:
-                            accumulated_tool_calls.append(
-                                {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
-                            )
-                        tc = accumulated_tool_calls[idx]
-                        tc_id = getattr(dtc, "id", None)
-                        if tc_id:
-                            tc["id"] = tc_id
-                        tc_type = getattr(dtc, "type", None)
-                        if tc_type:
-                            tc["type"] = tc_type
-                        fn = getattr(dtc, "function", None)
-                        if fn:
-                            fn_name = getattr(fn, "name", None)
-                            if fn_name:
-                                tc["function"]["name"] = fn_name
-                            fn_args = getattr(fn, "arguments", None)
-                            if fn_args:
-                                tc["function"]["arguments"] = tc["function"].get("arguments", "") + fn_args
-                if chunk.choices[0].finish_reason is not None:
-                    usage_data = None
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage_data = {
-                            "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
-                            "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
-                            "total_tokens": getattr(chunk.usage, "total_tokens", None),
-                        }
-                        self._set_last_usage(usage_data)
-                    yield ModelStreamChunk(
-                        text="", done=True, usage=usage_data,
-                        tool_calls=accumulated_tool_calls if accumulated_tool_calls else None,
-                    )
-        except openai.APIError as e:
-            yield ModelStreamChunk(text=f"API Error: {str(e)}", done=True)
-        except Exception as e:
-            yield ModelStreamChunk(text=f"Error: {str(e)}", done=True)
+        return openai.AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=timeout,
+            max_retries=0,
+        )
 
-    def _usage_from_response(self, response: Any) -> Optional[Dict[str, Any]]:
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return None
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None)
-        if prompt_tokens is None and isinstance(usage, dict):
-            prompt_tokens = usage.get("prompt_tokens")
-            completion_tokens = usage.get("completion_tokens")
-            total_tokens = usage.get("total_tokens")
-        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
-            return None
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
+    def _chat_stream_request(
+        self,
+        messages: List[Dict[str, Any]],
+        kwargs: Dict[str, Any],
+        *,
+        deadline_monotonic: float | None,
+    ) -> Dict[str, Any]:
+        create_kwargs = _disable_thinking_for_forced_tool_choice(
+            _relocate_chat_template_kwargs(kwargs)
+        )
+        create_kwargs.setdefault("stream_options", {"include_usage": True})
+        request: Dict[str, Any] = {
+            **create_kwargs,
+            "model": self.model,
+            "messages": cast(Any, _to_openai_messages(messages)),
+            "stream": True,
         }
+        request.setdefault("max_tokens", self.max_tokens)
+        if self.temperature is not None:
+            request.setdefault("temperature", self.temperature)
+        return self._attempt_request_kwargs(
+            request,
+            deadline_monotonic=deadline_monotonic,
+        )
 
-    def _format_tool_calls(self, tool_calls) -> str:
-        """
-        Convert OpenAI tool_calls format to parse_tool_calls compatible format
-
-        Args:
-            tool_calls: OpenAI tool_calls list
-
-        Returns:
-            Formatted tool call text
-        """
-        parts = []
-
-        for i, call in enumerate(tool_calls):
-            function = call.function
-            name = function.name
-            args = function.arguments
-
+    async def _open_chat_stream(
+        self,
+        request_kwargs: Dict[str, Any],
+    ) -> AsyncIterator[ModelStreamChunk]:
+        client = self._new_client(timeout=float(request_kwargs["timeout"]))
+        try:
             try:
-                args_dict = json.loads(args) if args else {}
-            except json.JSONDecodeError:
-                args_dict = {"raw_args": args}
+                response = await client.chat.completions.create(**request_kwargs)
+            except Exception as exc:
+                if "stream_options" not in request_kwargs:
+                    raise
+                if not _is_unsupported_stream_options_error(exc):
+                    raise
+                fallback = dict(request_kwargs)
+                fallback.pop("stream_options", None)
+                request_kwargs.pop("stream_options", None)
+                response = await client.chat.completions.create(**fallback)
+        except (asyncio.CancelledError, Exception):
+            await close_async_resource(client)
+            raise
+        return ChatEventStream(
+            response,
+            client,
+            provider=self.provider_name,
+            model=self.model,
+        )
 
-            if len(tool_calls) > 1:
-                parts.append(f"Action {i + 1}: {name}")
-            else:
-                parts.append(f"Action: {name}")
+    async def _open_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        request_kwargs: Dict[str, Any],
+        *,
+        deadline_monotonic: float | None,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        if self.api_mode == "chat_completions":
+            chat_request = self._chat_stream_request(
+                messages,
+                request_kwargs,
+                deadline_monotonic=deadline_monotonic,
+            )
+            return await self._open_chat_stream(
+                chat_request,
+            )
 
-            if args_dict:
-                args_str = ", ".join(
-                    f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}"
-                    for k, v in args_dict.items()
-                )
-                parts[-1] += f"({args_str})"
+        client = self._new_client(
+            timeout=effective_request_timeout(self.timeout, deadline_monotonic)
+        )
+        try:
+            stream = await _open_responses_stream(
+                self,
+                client,
+                messages,
+                provider=self.provider_name,
+                request_kwargs=self._attempt_request_kwargs(
+                    request_kwargs,
+                    deadline_monotonic=deadline_monotonic,
+                ),
+            )
+        except (asyncio.CancelledError, Exception):
+            await close_async_resource(client)
+            raise
+        return _OwnedEventStream(stream, client)
 
-        return "\n".join(parts)
+    async def stream(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        """Stream one committed Responses or Chat transaction."""
+
+        request_kwargs = self._request_kwargs(dict(kwargs))
+
+        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+            return await self._open_stream(
+                messages,
+                dict(request_kwargs),
+                deadline_monotonic=deadline_monotonic,
+            )
+
+        async for chunk in transactional_stream_with_retry(
+            create_stream,
+            policy=self.retry_policy,
+            connection_timeout_seconds=self.timeout,
+            event_idle_timeout_seconds=self.stream_idle_timeout,
+            deadline_monotonic=deadline_monotonic,
+            is_terminal=lambda item: item.done,
+        ):
+            yield chunk
 
     def supports_tool_schema_delivery(
         self, delivery: str, protocol: Any = None
@@ -497,80 +696,18 @@ class OpenAIModel(Model):
         _ = protocol
         if str(delivery or "prompt_injection") not in {"api_parameter", "hybrid"}:
             return {}
-        if not tool_schema_payload:
-            return {}
-        return {"tools": tool_schema_payload}
+        wire = _wire_tool_schema(tool_schema_payload)
+        return {"tools": wire} if wire else {}
+
+    def count_request_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        request_options: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        return _count_openai_request_tokens(self, messages, request_options)
 
     def supports_multimodal_input(self) -> bool:
         return True
-
-
-class OpenAICompatibleModel(Model):
-    """
-    OpenAI compatible interface model
-
-    Supports any service compatible with OpenAI API format, such as:
-    - Azure OpenAI
-    - Anthropic (via compatible endpoints)
-    - LM Studio
-    - LocalAI
-    - Tongyi Qianwen
-    - Zhipu AI
-
-    Example:
-        llm = OpenAICompatibleModel(
-            model="qwen-turbo",
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1"
-        )
-    """
-
-    def __init__(
-        self,
-        model: str = "default",
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        system_prompt: Optional[str] = None,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        timeout: int = 60,
-        context_window: Optional[int] = None,
-        default_request_kwargs: Optional[Dict[str, Any]] = None,
-        api_mode: str = "chat_completions",
-    ):
-        """
-        Initialize compatible model
-
-        Args:
-            model: Model name
-            api_key: API key
-            base_url: API base URL
-            system_prompt: System prompt
-            temperature: Temperature parameter
-            max_tokens: Maximum output token count
-            timeout: Request timeout
-            context_window: Total model context window
-            default_request_kwargs: Extra kwargs merged into every API call
-                (e.g. {"chat_template_kwargs": {"thinking": True}})
-            api_mode: OpenAI transport, ``chat_completions`` or ``responses``
-        """
-        super().__init__(
-            model=model,
-            system_prompt=system_prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            context_window=context_window,
-        )
-
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or "dummy-key"
-        self.base_url = base_url or os.getenv("OPENAI_BASE_URL", "")
-        self.timeout = timeout
-        self.default_request_kwargs = default_request_kwargs or {}
-        self.api_mode = _normalize_api_mode(api_mode)
-
-        if not self.base_url:
-            raise ValueError(
-                "OPENAI_BASE_URL not set. Please set environment variable or pass base_url parameter."
-            )
 
     def count_tokens(self, messages_or_text: Any) -> Optional[int]:
         if self._should_use_glm_tokenizer():
@@ -591,295 +728,68 @@ class OpenAICompatibleModel(Model):
             return None
         try:
             tokenizer = _load_glm_tokenizer(path)
-        except Exception:
-            return None
-
-        try:
             if isinstance(payload, list):
-                messages = _normalize_messages_for_tokenizer(payload)
                 encoded = tokenizer.apply_chat_template(
-                    messages,
+                    _normalize_messages_for_tokenizer(payload),
                     tokenize=True,
                     add_generation_prompt=False,
                 )
-                return _tokenizer_count_result(encoded)
-            text = self._stringify_token_payload(payload)
-            encoded = tokenizer.encode(text, add_special_tokens=False)
+            else:
+                encoded = tokenizer.encode(
+                    self._stringify_token_payload(payload),
+                    add_special_tokens=False,
+                )
             return _tokenizer_count_result(encoded)
         except Exception:
             return None
 
-    def _call_api(self, messages: List[Dict[str, Any]], **kwargs: Any) -> str:
-        """
-        Call OpenAI compatible API
 
-        Args:
-            messages: OpenAI-style messages list
+class OpenAIModel(OpenAICompatibleModel):
+    """Official OpenAI provider; Responses is the default protocol."""
 
-        Returns:
-            Text that can be parsed by parse_tool_calls()
-        """
-        import openai
+    provider_name = "openai"
 
-        try:
-            client = openai.OpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-            )
-
-            if self.api_mode == "responses":
-                response = _responses_completion(
-                    self, client, messages, provider="openai-compatible", **kwargs
-                )
-            else:
-                response = self._chat_completion(client, messages, **kwargs)
-            if isinstance(response, ModelResponse):
-                return response.text
-            return self._parse_response(response)
-
-        except openai.APIError as e:
-            return f"API Error: {str(e)}"
-        except Exception as e:
-            return f"Error: {str(e)}"
-
-    def _parse_response(self, response) -> str:
-        """
-        Parse response
-        """
-        choice = response.choices[0]
-        message = choice.message
-
-        if message.tool_calls:
-            return self._format_tool_calls(message.tool_calls)
-
-        if message.content:
-            return message.content.strip()
-
-        return ""
-
-    def supports_tool_schema_delivery(
-        self, delivery: str, protocol: Any = None
-    ) -> bool:
-        _ = protocol
-        return str(delivery or "prompt_injection") in {
-            "prompt_injection",
-            "api_parameter",
-            "hybrid",
-        }
-
-    def build_tool_schema_request_options(
+    def __init__(
         self,
-        tool_schema_payload: Optional[List[Dict[str, Any]]],
-        *,
-        protocol: Any = None,
-        delivery: str = "prompt_injection",
-    ) -> Dict[str, Any]:
-        _ = protocol
-        if str(delivery or "prompt_injection") not in {"api_parameter", "hybrid"}:
-            return {}
-        if not tool_schema_payload:
-            return {}
-        return {"tools": tool_schema_payload}
-
-    def supports_multimodal_input(self) -> bool:
-        return True
-
-    def _format_tool_calls(self, tool_calls) -> str:
-        """
-        Format tool calls
-        """
-        import json
-
-        parts = []
-
-        for i, call in enumerate(tool_calls):
-            function = call.function
-            name = function.name
-            args = function.arguments or "{}"
-
-            try:
-                args_dict = json.loads(args)
-            except json.JSONDecodeError:
-                args_dict = {"raw": args}
-
-            if len(tool_calls) > 1:
-                parts.append(f"Action {i + 1}: {name}")
-            else:
-                parts.append(f"Action: {name}")
-
-            if args_dict:
-                args_str = ", ".join(
-                    f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}"
-                    for k, v in args_dict.items()
-                )
-                parts[-1] += f"({args_str})"
-
-        return "\n".join(parts)
-
-    def _chat_completion(
-        self, client: Any, messages: List[Dict[str, Any]], **kwargs: Any
-    ) -> Any:
-        safe_kwargs = _disable_thinking_for_forced_tool_choice(
-            _relocate_chat_template_kwargs(kwargs)
+        model: str = "gpt-5",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        temperature: float | None = None,
+        max_tokens: int = 2048,
+        timeout: float = 120.0,
+        context_window: Optional[int] = None,
+        default_request_kwargs: Optional[Dict[str, Any]] = None,
+        api_mode: str = "responses",
+        max_attempts: int = 2,
+        stream_idle_timeout: float = 60.0,
+        retry_window_seconds: float = 300.0,
+    ) -> None:
+        resolved_api_key = api_key or os.getenv("OPENAI_API_KEY")
+        if not resolved_api_key:
+            raise ValueError("OPENAI_API_KEY must be configured")
+        super().__init__(
+            model=model,
+            api_key=resolved_api_key,
+            base_url=base_url
+            or os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            context_window=context_window,
+            default_request_kwargs=default_request_kwargs,
+            api_mode=api_mode,
+            max_attempts=max_attempts,
+            stream_idle_timeout=stream_idle_timeout,
+            retry_window_seconds=retry_window_seconds,
         )
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=cast(Any, _to_openai_messages(messages)),
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            **safe_kwargs,
-        )
-        self._set_last_usage(self._usage_from_response(response))
-        return response
-
-    def call_raw(self, messages: List[Dict[str, Any]], **kwargs: Any) -> Any:
-        import openai
-
-        self._last_usage = None
-        client = openai.OpenAI(
-            api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-        )
-        if self.api_mode == "responses":
-            return _responses_completion(
-                self, client, messages, provider="openai-compatible", **kwargs
-            )
-        return self._chat_completion(client, messages, **kwargs)
-
-    def _usage_from_response(self, response: Any) -> Optional[Dict[str, Any]]:
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return None
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None)
-        if prompt_tokens is None and isinstance(usage, dict):
-            prompt_tokens = usage.get("prompt_tokens")
-            completion_tokens = usage.get("completion_tokens")
-            total_tokens = usage.get("total_tokens")
-        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
-            return None
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-        }
-
-    def stream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> Iterator[ModelStreamChunk]:
-        """Stream OpenAI-compatible response as chunks, yielding token-level text."""
-        import openai
-
-        self._last_usage = None
-        try:
-            client = openai.OpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-            )
-            if self.api_mode == "responses":
-                yield from _responses_stream(
-                    self, client, messages, provider="openai-compatible", **kwargs
-                )
-                return
-            # Build stream options — request usage in final chunk
-            # Not all OpenAI-compatible APIs support this, so we wrap it
-            create_kwargs: Dict[str, Any] = dict(kwargs)
-            if "stream_options" not in create_kwargs:
-                create_kwargs["stream_options"] = {"include_usage": True}
-            try:
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=cast(Any, _to_openai_messages(messages)),
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    stream=True,
-                    **create_kwargs,
-                )
-            except (openai.BadRequestError, openai.APIError):
-                # Retry without stream_options if the API doesn't support it
-                create_kwargs.pop("stream_options", None)
-                response = client.chat.completions.create(
-                    model=self.model,
-                    messages=cast(Any, _to_openai_messages(messages)),
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                    stream=True,
-                    **create_kwargs,
-                )
-            accumulated_tool_calls: List[Dict[str, Any]] = []
-            for chunk in response:
-                if not chunk.choices:
-                    # Empty choices chunk may carry usage data (OpenAI sends it last)
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage_data = {
-                            "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
-                            "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
-                            "total_tokens": getattr(chunk.usage, "total_tokens", None),
-                        }
-                        self._set_last_usage(usage_data)
-                    continue
-                delta = chunk.choices[0].delta
-                text = delta.content or ""
-                if text:
-                    yield ModelStreamChunk(text=text, done=False)
-                # Accumulate streaming tool call deltas
-                delta_tool_calls = getattr(delta, "tool_calls", None)
-                if delta_tool_calls:
-                    for dtc in delta_tool_calls:
-                        idx = getattr(dtc, "index", len(accumulated_tool_calls))
-                        # Extend list if needed
-                        while len(accumulated_tool_calls) <= idx:
-                            accumulated_tool_calls.append(
-                                {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
-                            )
-                        tc = accumulated_tool_calls[idx]
-                        tc_id = getattr(dtc, "id", None)
-                        if tc_id:
-                            tc["id"] = tc_id
-                        tc_type = getattr(dtc, "type", None)
-                        if tc_type:
-                            tc["type"] = tc_type
-                        fn = getattr(dtc, "function", None)
-                        if fn:
-                            fn_name = getattr(fn, "name", None)
-                            if fn_name:
-                                tc["function"]["name"] = fn_name
-                            fn_args = getattr(fn, "arguments", None)
-                            if fn_args:
-                                tc["function"]["arguments"] = tc["function"].get("arguments", "") + fn_args
-                if chunk.choices[0].finish_reason is not None:
-                    usage_data = None
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage_data = {
-                            "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
-                            "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
-                            "total_tokens": getattr(chunk.usage, "total_tokens", None),
-                        }
-                        self._set_last_usage(usage_data)
-                    yield ModelStreamChunk(
-                        text="", done=True, usage=usage_data,
-                        tool_calls=accumulated_tool_calls if accumulated_tool_calls else None,
-                    )
-        except openai.APIError as e:
-            yield ModelStreamChunk(text=f"API Error: {str(e)}", done=True)
-        except Exception as e:
-            yield ModelStreamChunk(text=f"Error: {str(e)}", done=True)
 
 
 class AzureOpenAIModel(OpenAICompatibleModel):
-    """
-    Azure OpenAI model implementation
+    """Azure OpenAI Chat Completions provider."""
 
-    Specifically optimized for Azure OpenAI service
-
-    Environment variable configuration:
-    - AZURE_OPENAI_API_KEY: Azure API key
-    - AZURE_OPENAI_ENDPOINT: Azure endpoint URL
-    - AZURE_OPENAI_DEPLOYMENT: Deployment name
-    - AZURE_OPENAI_API_VERSION: API version (default 2024-02-15-preview)
-
-    Example:
-        llm = AzureOpenAIModel(
-            deployment="gpt-4",
-            api_version="2024-02-15-preview"
-        )
-    """
+    provider_name = "azure"
 
     def __init__(
         self,
@@ -888,307 +798,46 @@ class AzureOpenAIModel(OpenAICompatibleModel):
         endpoint: Optional[str] = None,
         api_version: str = "2024-02-15-preview",
         system_prompt: Optional[str] = None,
-        temperature: float = 0.7,
+        temperature: float | None = 0.7,
         max_tokens: int = 2048,
-        timeout: int = 60,
+        timeout: float = 60.0,
         context_window: Optional[int] = None,
-    ):
-        """
-        Initialize Azure OpenAI model
-
-        Args:
-            deployment: Deployment name (used as model)
-            api_key: API key, default read from environment variable
-            endpoint: Endpoint URL, default read from environment variable
-            api_version: API version
-            system_prompt: System prompt
-            temperature: Temperature parameter
-            max_tokens: Maximum output token count
-            timeout: Request timeout
-            context_window: Total model context window
-        """
-        api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
-        endpoint = endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
-
-        if not endpoint:
-            raise ValueError(
-                "AZURE_OPENAI_ENDPOINT not set. Please set environment variable or pass endpoint parameter."
-            )
-
-        base_url = (
-            f"{endpoint.rstrip('/')}/openai/deployments/{deployment or 'default'}"
+        max_attempts: int = 2,
+        stream_idle_timeout: float = 60.0,
+    ) -> None:
+        resolved_endpoint = endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
+        resolved_api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
+        if not resolved_endpoint:
+            raise ValueError("AZURE_OPENAI_ENDPOINT must be configured")
+        self.endpoint = resolved_endpoint
+        self.deployment = deployment or os.getenv("AZURE_OPENAI_DEPLOYMENT") or ""
+        self.api_version = api_version or os.getenv(
+            "AZURE_OPENAI_API_VERSION", "2024-02-15-preview"
         )
-
         super().__init__(
-            model=deployment or "azure",
-            api_key=api_key,
-            base_url=base_url,
+            model=self.deployment or "azure",
+            api_key=resolved_api_key,
+            base_url=resolved_endpoint,
             system_prompt=system_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
             context_window=context_window,
+            api_mode="chat_completions",
+            max_attempts=max_attempts,
+            stream_idle_timeout=stream_idle_timeout,
         )
 
-        self.api_version = api_version
-        self.deployment = deployment
-        self.endpoint = endpoint
-
-    def _call_api(self, messages: List[Dict[str, Any]], **kwargs: Any) -> str:
-        """
-        Call Azure OpenAI API (adds api_version parameter)
-        """
+    def _new_client(self, *, timeout: float) -> Any:
         import openai
 
-        try:
-            client = openai.AzureOpenAI(
-                api_key=self.api_key,
-                azure_endpoint=self.endpoint,
-                api_version=self.api_version,
-                timeout=self.timeout,
-            )
-
-            response = client.chat.completions.create(
-                model=self.deployment or "",
-                messages=cast(Any, _to_openai_messages(messages)),
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                **kwargs,
-            )
-            self._set_last_usage(self._usage_from_response(response))
-
-            return self._parse_response(response)
-
-        except openai.APIError as e:
-            return f"API Error: {str(e)}"
-        except Exception as e:
-            return f"Error: {str(e)}"
-
-
-class AsyncOpenAICompatibleModel(OpenAICompatibleModel):
-    """
-    Async version of OpenAICompatibleModel using openai.AsyncOpenAI.
-
-    Supports any service compatible with the OpenAI API format.
-    Use ``await model.acall(messages)`` for non-blocking calls.
-
-    Example::
-
-        llm = AsyncOpenAICompatibleModel(
-            model="qwen-turbo",
-            base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        return openai.AsyncAzureOpenAI(
+            api_key=self.api_key,
+            azure_endpoint=self.endpoint,
+            api_version=self.api_version,
+            timeout=timeout,
+            max_retries=0,
         )
-        result = await llm.acall([{"role": "user", "content": "Hello"}])
-    """
-
-    async def _acall_api(self, messages: List[Dict[str, Any]], **kwargs: Any) -> str:
-        """Async call to OpenAI-compatible API."""
-        import openai
-
-        try:
-            client = openai.AsyncOpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-            )
-            if self.api_mode == "responses":
-                response = await _async_responses_completion(
-                    self, client, messages, provider="openai-compatible", **kwargs
-                )
-            else:
-                response = await self._achat_completion(client, messages, **kwargs)
-            if isinstance(response, ModelResponse):
-                return response.text
-            return self._parse_response(response)
-        except openai.APIError as e:
-            return f"API Error: {str(e)}"
-        except Exception as e:
-            return f"Error: {str(e)}"
-
-    async def _achat_completion(
-        self, client: Any, messages: List[Dict[str, Any]], **kwargs: Any
-    ) -> Any:
-        safe_kwargs = _disable_thinking_for_forced_tool_choice(
-            _relocate_chat_template_kwargs(kwargs)
-        )
-        response = await client.chat.completions.create(
-            model=self.model,
-            messages=cast(Any, _to_openai_messages(messages)),
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            **safe_kwargs,
-        )
-        self._set_last_usage(self._usage_from_response(response))
-        return response
-
-    async def acall_raw(self, messages: List[Dict[str, Any]], **kwargs: Any) -> Any:
-        """Async version of call_raw returning provider-native response."""
-        import openai
-
-        self._last_usage = None
-        client = openai.AsyncOpenAI(
-            api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-        )
-        if self.api_mode == "responses":
-            return await _async_responses_completion(
-                self, client, messages, provider="openai-compatible", **kwargs
-            )
-        return await self._achat_completion(client, messages, **kwargs)
-
-    async def astream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> AsyncIterator[ModelStreamChunk]:
-        """Async stream OpenAI-compatible response as chunks."""
-        import openai
-
-        self._last_usage = None
-        try:
-            client = openai.AsyncOpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-            )
-            if self.api_mode == "responses":
-                async for chunk in _async_responses_stream(
-                    self, client, messages, provider="openai-compatible", **kwargs
-                ):
-                    yield chunk
-                return
-            response = await client.chat.completions.create(
-                model=self.model,
-                messages=cast(Any, _to_openai_messages(messages)),
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                stream=True,
-                **kwargs,
-            )
-            async for chunk in response:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                text = delta.content or ""
-                if text:
-                    yield ModelStreamChunk(text=text, done=False)
-                if chunk.choices[0].finish_reason is not None:
-                    usage_data = None
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage_data = {
-                            "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
-                            "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
-                            "total_tokens": getattr(chunk.usage, "total_tokens", None),
-                        }
-                        self._set_last_usage(usage_data)
-                    yield ModelStreamChunk(text="", done=True, usage=usage_data)
-        except openai.APIError as e:
-            yield ModelStreamChunk(text=f"API Error: {str(e)}", done=True)
-        except Exception as e:
-            yield ModelStreamChunk(text=f"Error: {str(e)}", done=True)
 
 
-class AsyncOpenAIModel(OpenAIModel):
-    """
-    Async version of OpenAIModel using openai.AsyncOpenAI.
-
-    Example::
-
-        llm = AsyncOpenAIModel(model="gpt-4")
-        result = await llm.acall([{"role": "user", "content": "Hello"}])
-    """
-
-    async def _acall_api(self, messages: List[Dict[str, Any]], **kwargs: Any) -> str:
-        """Async call to OpenAI API."""
-        import openai
-
-        try:
-            client = openai.AsyncOpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-            )
-            if self.api_mode == "responses":
-                response = await _async_responses_completion(
-                    self, client, messages, provider="openai", **kwargs
-                )
-            else:
-                response = await self._achat_completion(client, messages, **kwargs)
-            if isinstance(response, ModelResponse):
-                return response.text
-            return self._parse_response(response)
-        except openai.APIError as e:
-            return f"API Error: {str(e)}"
-        except Exception as e:
-            return f"Error: {str(e)}"
-
-    async def _achat_completion(
-        self, client: Any, messages: List[Dict[str, Any]], **kwargs: Any
-    ) -> Any:
-        response = await client.chat.completions.create(
-            model=self.model,
-            messages=cast(Any, _to_openai_messages(messages)),
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            **kwargs,
-        )
-        self._set_last_usage(self._usage_from_response(response))
-        return response
-
-    async def acall_raw(self, messages: List[Dict[str, Any]], **kwargs: Any) -> Any:
-        """Async version of call_raw returning provider-native response."""
-        import openai
-
-        self._last_usage = None
-        client = openai.AsyncOpenAI(
-            api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-        )
-        if self.api_mode == "responses":
-            return await _async_responses_completion(
-                self, client, messages, provider="openai", **kwargs
-            )
-        return await self._achat_completion(client, messages, **kwargs)
-
-    async def astream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> AsyncIterator[ModelStreamChunk]:
-        """Async stream OpenAI response as chunks."""
-        import openai
-
-        self._last_usage = None
-        try:
-            client = openai.AsyncOpenAI(
-                api_key=self.api_key, base_url=self.base_url, timeout=self.timeout
-            )
-            if self.api_mode == "responses":
-                async for chunk in _async_responses_stream(
-                    self, client, messages, provider="openai", **kwargs
-                ):
-                    yield chunk
-                return
-            response = await client.chat.completions.create(
-                model=self.model,
-                messages=cast(Any, _to_openai_messages(messages)),
-                temperature=self.temperature,
-                max_tokens=self.max_tokens,
-                stream=True,
-                **kwargs,
-            )
-            async for chunk in response:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                text = delta.content or ""
-                if text:
-                    yield ModelStreamChunk(text=text, done=False)
-                if chunk.choices[0].finish_reason is not None:
-                    usage_data = None
-                    if hasattr(chunk, "usage") and chunk.usage:
-                        usage_data = {
-                            "prompt_tokens": getattr(chunk.usage, "prompt_tokens", None),
-                            "completion_tokens": getattr(chunk.usage, "completion_tokens", None),
-                            "total_tokens": getattr(chunk.usage, "total_tokens", None),
-                        }
-                        self._set_last_usage(usage_data)
-                    yield ModelStreamChunk(text="", done=True, usage=usage_data)
-        except openai.APIError as e:
-            yield ModelStreamChunk(text=f"API Error: {str(e)}", done=True)
-        except Exception as e:
-            yield ModelStreamChunk(text=f"Error: {str(e)}", done=True)
-
-
-# Register to factory
-from .base import ModelFactory
-
-ModelFactory.register("openai")(OpenAIModel)
-ModelFactory.register("azure")(AzureOpenAIModel)
-ModelFactory.register("openai-compatible")(OpenAICompatibleModel)
-ModelFactory.register("async-openai")(AsyncOpenAIModel)
-ModelFactory.register("async-openai-compatible")(AsyncOpenAICompatibleModel)
+__all__ = ["AzureOpenAIModel", "OpenAICompatibleModel", "OpenAIModel"]

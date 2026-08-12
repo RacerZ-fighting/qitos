@@ -2,24 +2,36 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
+import hashlib
+import inspect
 import json
 import logging
 import os
 import re
+from collections import Counter
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, Dict, Generic, List, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar, cast
 
 from ..core._json_repair import escape_json_string_control_chars
 from ..core.action import Action
-
-_logger = logging.getLogger("qitos.engine._model_runtime")
 from ..core.decision import Decision
 from ..core.errors import (
     ErrorCategory,
     ModelExecutionError,
+    ModelRequestDeadlineExceeded,
+    ModelTransportError,
     ParseExecutionError,
     RuntimeErrorInfo,
+)
+from ..core.history import (
+    HistoryMessage,
+    group_history_rounds,
+    message_tool_call_ids,
+    message_tool_result_ids,
+    select_recent_history,
 )
 from ..core.model_response import ModelResponse
 from ..core.multimodal import (
@@ -34,11 +46,16 @@ from ..core.multimodal import (
     text_block,
 )
 from ..core.observation import Observation
+from ..harness._types import native_tool_calls_preferred
+from ..models.base import Model, ModelStreamChunk
 from ..protocols import get_protocol, resolve_protocol_chain
 from ..core.state import StateSchema
-from ._context_runtime import ContextOverflowError
-from ._protocol import _EngineProtocol
-from .streaming import StreamHandler, to_stream_handler
+from ._context_runtime import (
+    ContextCompactionRequired,
+    ContextOverflowError,
+    DecisionContextConfigurationError,
+)
+from .streaming import to_stream_handler
 from .parser import (
     build_parser_diagnostics,
     normalize_parser_diagnostics,
@@ -47,18 +64,127 @@ from .parser import (
 )
 from .states import RuntimePhase, StepRecord
 
+if TYPE_CHECKING:
+    from .engine import Engine
+
+
+_logger = logging.getLogger("qitos.engine._model_runtime")
+
 
 StateT = TypeVar("StateT", bound=StateSchema)
 ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
 
 
-class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
-    def __init__(self, engine: _EngineProtocol):
-        self.engine = engine
-        self.stream_callback: Optional[Any] = None  # Callable[[str], None] or StreamHandler
+def _measure_prompt(
+    prompt_meter: Any,
+    *,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    request_options: Dict[str, Any],
+    llm: Any,
+) -> Any:
+    """Invoke old and new prompt-meter contracts without masking meter errors."""
 
-    def run_decide(
+    measure = prompt_meter.measure
+    kwargs: Dict[str, Any] = {
+        "messages": messages,
+        "tools": tools,
+        "llm": llm,
+    }
+    try:
+        parameters = inspect.signature(measure).parameters.values()
+    except (TypeError, ValueError):
+        # Opaque callables used to receive the current contract. Any resulting
+        # error is reported by the caller as meter unavailability.
+        kwargs["request_options"] = request_options
+    else:
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            or (
+                parameter.name == "request_options"
+                and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
+            )
+            for parameter in parameters
+        ):
+            kwargs["request_options"] = request_options
+    return measure(**kwargs)
+
+
+def _escape_runtime_context_content(content: str) -> str:
+    """Escape literal closing tags that would break the XML wrapper."""
+    return content.replace("</RUNTIME_CONTEXT>", "&lt;/RUNTIME_CONTEXT&gt;")
+
+
+_DECISION_CONTEXT_PATTERN = re.compile(
+    r"<DECISION_CONTEXT\b[^>]*>.*?</DECISION_CONTEXT>", re.DOTALL
+)
+
+
+def _is_decision_context_packet(content: str) -> bool:
+    """Return whether content carries one authoritative Decision Context.
+
+    Decision Context already has its own semantic boundary and contract.  A
+    second RUNTIME_CONTEXT wrapper adds no authority and makes the provider
+    packet harder to read.  Other agents' generic runtime state keeps the
+    existing wrapper.
+    """
+    return len(_DECISION_CONTEXT_PATTERN.findall(str(content or ""))) == 1
+
+
+def _strip_decision_context_content(content: Any) -> Any:
+    """Remove transient Decision Context blocks without changing other content."""
+    if isinstance(content, str):
+        return _DECISION_CONTEXT_PATTERN.sub("", content).rstrip()
+    if isinstance(content, list):
+        cleaned: list[Any] = []
+        for block in content:
+            if isinstance(block, dict) and str(block.get("type") or "") == "text":
+                updated = dict(block)
+                updated["text"] = _DECISION_CONTEXT_PATTERN.sub(
+                    "", str(updated.get("text") or "")
+                ).rstrip()
+                cleaned.append(updated)
+            else:
+                cleaned.append(block)
+        return cleaned
+    return content
+
+
+def _wrap_runtime_context(content: str) -> str:
+    """Wrap runtime-state user message in semantic XML tags."""
+    if _is_decision_context_packet(content):
+        return str(content or "")
+    safe_content = _escape_runtime_context_content(content)
+    return (
+        "<RUNTIME_CONTEXT\n"
+        '  source="agent_runtime_controller"\n'
+        '  kind="authoritative_state"\n'
+        '  task_continuation="true">\n'
+        f"{safe_content}\n"
+        "</RUNTIME_CONTEXT>"
+    )
+
+
+_RUNTIME_CONTEXT_IN_TOOL_NOTICE = (
+    "NOTE: The RUNTIME_CONTEXT block below was appended by the Agent Runtime "
+    "Controller and is NOT part of the tool result above. It is an "
+    "authoritative machine-generated working-state update; treat it as "
+    "current working state, not as tool output."
+)
+
+
+class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
+    def __init__(self, engine: Engine[StateT, ObservationT, ActionT]):
+        self.engine = engine
+        self.stream_callback: Optional[Any] = (
+            None  # Callable[[str], None] or StreamHandler
+        )
+        # Incremental sidecar tracking (Fix 1A)
+        self._last_message_count: int = 0
+        self._last_full_step: int = -1
+
+    async def run_decide(
         self, state: StateT, observation: ObservationT, record: StepRecord
     ) -> Decision[ActionT]:
         engine = self.engine
@@ -75,28 +201,44 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         engine._emit(
             record.step_id,
             RuntimePhase.DECIDE,
-            payload={"stage": "state_ready", "observation": observation},
+            payload={
+                "stage": "state_ready",
+                "observation_type": type(observation).__name__,
+                "observation_summary": self._observation_summary(observation),
+            },
         )
         engine._memory_append("state", state.to_dict(), record.step_id)
         engine._emit(record.step_id, RuntimePhase.DECIDE, payload={"stage": "start"})
-        raw_decision = engine.agent.decide(state, observation)
+        raw_decision: Decision[ActionT] | ModelResponse | None = engine.agent.decide(
+            state, observation
+        )
         model_response: ModelResponse | None = None
         if raw_decision is None:
-            model_response = self._run_llm_decide(
+            model_response = await self._run_llm_decide(
                 state=state, observation=observation, record=record
             )
-            interpreted = self._interpret_model_response(
-                state=state,
-                observation=observation,
-                response=model_response,
-                record=record,
+            native_tool_calls_are_authoritative = (
+                isinstance(model_response.tool_calls, list)
+                and bool(model_response.tool_calls)
+                and self._native_tool_call_preferred()
             )
-            if interpreted is None:
-                self._raise_for_empty_model_response(
+            if native_tool_calls_are_authoritative:
+                raw_decision = model_response
+            else:
+                interpreted = self._interpret_model_response(
+                    state=state,
+                    observation=observation,
                     response=model_response,
-                    step=record.step_id,
+                    record=record,
                 )
-            raw_decision = interpreted if interpreted is not None else model_response
+                if interpreted is None:
+                    self._raise_for_empty_model_response(
+                        response=model_response,
+                        step=record.step_id,
+                    )
+                raw_decision = (
+                    interpreted if interpreted is not None else model_response
+                )
 
         decision = self.normalize_decision(
             raw_decision, step=record.step_id, record=record
@@ -108,6 +250,30 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             raise ValueError(f"Invalid decision mode: {decision.mode}")
 
         decision.validate()
+        if (
+            model_response is not None
+            and decision.mode == "act"
+            and not record.native_tool_call_used
+        ):
+            self._append_parser_tool_call_history(
+                response=model_response,
+                decision=decision,
+                record=record,
+            )
+        elif model_response is not None and decision.mode != "act":
+            # A final/wait response has no tool result to pair with, but its
+            # real assistant text is still useful audit history (and preserves
+            # the generic QitOS history contract).
+            content: Any = (
+                model_response.text if str(model_response.text or "").strip() else None
+            )
+            if content is not None:
+                engine._history_append(
+                    "assistant",
+                    content,
+                    record.step_id,
+                    metadata={"source": "engine"},
+                )
         record.decision = decision
         record.actions = list(decision.actions)
         engine._memory_append("decision", decision, record.step_id)
@@ -171,7 +337,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             )
         )
 
-    def _run_llm_decide(
+    async def _run_llm_decide(
         self, state: StateT, observation: ObservationT, record: StepRecord
     ) -> ModelResponse:
         engine = self.engine
@@ -181,7 +347,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         setattr(engine.agent, "_runtime_observation", observation)
         setattr(engine.agent, "_runtime_step_id", record.step_id)
         setattr(engine.agent, "_runtime_protocol", protocol)
-        setattr(engine.agent, "_runtime_protocol_source", engine._resolved_protocol_source)
+        setattr(
+            engine.agent, "_runtime_protocol_source", engine._resolved_protocol_source
+        )
         try:
             prompt_bundle = engine.agent.build_prompt_bundle(state)
             system_prompt = prompt_bundle.system_prompt
@@ -214,28 +382,39 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         )
         context_runtime = engine._context_runtime
         # Apply critic patches if present
-        effective_system_prompt = system_prompt if isinstance(system_prompt, str) else ""
-        if getattr(engine, "_critic_modified_prompt", None) is not None:
-            effective_system_prompt = engine._critic_modified_prompt
+        effective_system_prompt = (
+            system_prompt if isinstance(system_prompt, str) else ""
+        )
+        modified_prompt = engine._critic_modified_prompt
+        if modified_prompt is not None:
+            effective_system_prompt = modified_prompt
             engine._critic_modified_prompt = None  # Consume once
-        if getattr(engine, "_critic_instruction_patch", None) is not None:
-            patch = engine._critic_instruction_patch
+        instruction_patch = engine._critic_instruction_patch
+        if instruction_patch is not None:
             engine._critic_instruction_patch = None  # Consume once
-            effective_system_prompt = effective_system_prompt + "\n\n" + patch
+            effective_system_prompt = (
+                effective_system_prompt + "\n\n" + instruction_patch
+            )
+        request_options = self._build_model_request_options(
+            prompt_bundle=prompt_bundle,
+            protocol=protocol,
+        )
         pre_context = context_runtime.build_pre_request(
             llm=engine.agent.llm,
             system_prompt=effective_system_prompt,
             prepared=str(prepared),
+            message_injections=prompt_messages,
+            user_content_blocks=prompt_user_content_blocks,
+            request_options=request_options,
         )
         messages: List[Dict[str, Any]] = []
+        pending_system_history: Optional[str] = None
+        pending_builder_history: List[Dict[str, Any]] = []
         if effective_system_prompt.strip():
             system = effective_system_prompt.strip()
             messages.append({"role": "system", "content": system})
             if system != engine._last_system_prompt:
-                engine._history_append(
-                    "system", system, record.step_id, metadata={"source": "engine"}
-                )
-                engine._last_system_prompt = system
+                pending_system_history = system
         history: List[Dict[str, Any]] = []
         query = engine.history_policy.build_query(
             step_id=record.step_id,
@@ -261,6 +440,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         query["max_tokens"] = min(int(current_max), int(history_budget))
                     except Exception:
                         query["max_tokens"] = history_budget
+        history_impl: Any = None
         try:
             history_impl = engine._history()
             retrieved = history_impl.retrieve(
@@ -279,16 +459,336 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             )
             if callable(get_last_message_metadata):
                 history_metadata = list(get_last_message_metadata() or [])
-        except Exception:
-            history = []
-            history_metadata = []
-            compact_events = []
+        except Exception as exc:
+            raw_history = getattr(history_impl, "messages", None)
+            if not isinstance(raw_history, list) or not all(
+                isinstance(message, HistoryMessage) for message in raw_history
+            ):
+                raise
+            fallback = list(raw_history)
+            roles = query.get("roles") if isinstance(query, dict) else None
+            if roles:
+                allowed_roles = {str(role) for role in roles}
+                fallback = [
+                    message for message in fallback if message.role in allowed_roles
+                ]
+            step_min = query.get("step_min") if isinstance(query, dict) else None
+            step_max = query.get("step_max") if isinstance(query, dict) else None
+            if step_min is not None:
+                fallback = [
+                    message for message in fallback if message.step_id >= int(step_min)
+                ]
+            if step_max is not None:
+                fallback = [
+                    message for message in fallback if message.step_id <= int(step_max)
+                ]
+            max_items = int(query.get("max_items") or 0)
+            if max_items > 0:
+                fallback = select_recent_history(fallback, max_items)
+            history = engine._normalize_history_messages(fallback)
+            history_metadata = [
+                {
+                    "role": message.role,
+                    "step_id": message.step_id,
+                    "content_chars": len(str(message.content or "")),
+                    "projection_fallback": True,
+                }
+                for message in fallback
+            ]
+            compact_events = [
+                {
+                    "stage": "context_history",
+                    "context": {
+                        "stage": "compact_failed_fallback",
+                        "strategy": history_impl.__class__.__name__,
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                        "messages_before": len(raw_history),
+                        "messages_after": len(fallback),
+                    },
+                }
+            ]
+            _logger.warning(
+                "history projection failed; using canonical bounded history: %s",
+                exc,
+            )
         pre_context = context_runtime.finalize_input(
             llm=engine.agent.llm,
             telemetry=pre_context,
             history_messages=history,
             compact_events=compact_events,
         )
+        # --- Custom MessageBuilder support ---
+        from ..core.message_builder import MessageBuilder as _MessageBuilderProto
+
+        custom_builder = getattr(engine.agent, "message_builder", None)
+        runtime_context_delivery: Dict[str, Any] = {
+            "requested": "none",
+            "effective": "none",
+            "target_tool_call_id": None,
+            "fallback_reason": None,
+        }
+        runtime_context_display: Dict[str, Any] | None = None
+        # Only agents that explicitly opt in to CyberGym's controller-owned
+        # Decision Context receive this strict packet invariant.  Generic
+        # QitOS agents may use ``prepare()`` for ordinary text and must retain
+        # their existing message-building behavior.
+        decision_context_required = bool(
+            getattr(custom_builder, "requires_decision_context", False)
+        )
+        # The default builder has no separate transient context, but the
+        # final sidecar uses one common schema for both builder modes.
+        runtime_context = ""
+        if custom_builder is not None and isinstance(
+            custom_builder, _MessageBuilderProto
+        ):
+            configured_rounds = int(
+                getattr(engine.context_config, "conversation_max_rounds", 16)
+            )
+            if configured_rounds > 0:
+                history = self._trim_native_tool_history(
+                    history, max_rounds=configured_rounds
+                )
+            from ..core.message_builder import MessageBuildRequest as _MBReq
+
+            build_req = _MBReq(
+                step_id=record.step_id,
+                state=state,
+                observation=observation,
+                prompt_bundle=prompt_bundle,
+                prepared=str(prepared),
+                history=history,
+                record=record,
+            )
+            build_result = custom_builder.build_messages(build_req)
+            messages = list(build_result.messages)
+            runtime_context = str(
+                getattr(build_result, "runtime_context", "") or ""
+            ).strip()
+            requested_delivery = (
+                str(getattr(build_result, "runtime_context_delivery", "none") or "none")
+                .strip()
+                .lower()
+            )
+            if requested_delivery not in {"none", "merge_tool", "user"}:
+                _logger.warning(
+                    "Unknown MessageBuildResult runtime-context delivery %r; ignoring it",
+                    requested_delivery,
+                )
+                requested_delivery = "none"
+            runtime_context_delivery["requested"] = requested_delivery
+            if runtime_context and requested_delivery != "none":
+                wrapped_runtime_context = _wrap_runtime_context(runtime_context)
+                should_merge = (
+                    requested_delivery == "merge_tool"
+                    and not self._current_user_has_multimodal_content(
+                        prompt_user_content_blocks, observation, record
+                    )
+                )
+                if should_merge:
+                    merged, tool_call_id = self._merge_runtime_context_into_last_tool(
+                        messages, wrapped_runtime_context
+                    )
+                    if merged:
+                        runtime_context_delivery.update(
+                            {
+                                "effective": "merge_tool",
+                                "target_tool_call_id": tool_call_id,
+                            }
+                        )
+                        # Runtime Context is transient provider state, but every
+                        # step must remain observable in the TUI/trace for
+                        # offline decision analysis.
+                        runtime_context_display = {
+                            "tool_call_id": tool_call_id,
+                            "content": wrapped_runtime_context,
+                        }
+                    else:
+                        runtime_context_delivery["fallback_reason"] = (
+                            "no_text_tool_result"
+                        )
+                elif requested_delivery == "merge_tool":
+                    runtime_context_delivery["fallback_reason"] = (
+                        "multimodal_user_content"
+                    )
+
+                if runtime_context_delivery["effective"] != "merge_tool":
+                    current_user = self._build_current_user_message(
+                        prepared_text=wrapped_runtime_context,
+                        prompt_user_content_blocks=prompt_user_content_blocks,
+                        observation=observation,
+                        record=record,
+                    )
+                    messages.append(current_user)
+                    runtime_context_delivery["effective"] = "user"
+            pending_builder_history = [
+                dict(entry)
+                for entry in build_result.history_entries
+                if isinstance(entry, dict)
+            ]
+            prepared_full = str(prepared)
+        else:
+            # --- Default message construction (original logic) ---
+            injection_prefixes: List[str] = []
+            if self._native_tool_call_preferred():
+                if os.environ.get(
+                    "CYBERGYM_DISABLE_HISTORY_TRIM", ""
+                ).strip().lower() not in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    configured_rounds = int(
+                        getattr(engine.context_config, "conversation_max_rounds", 10)
+                    )
+                    if configured_rounds > 0:
+                        history = self._trim_native_tool_history(
+                            history,
+                            max_rounds=configured_rounds,
+                        )
+            messages.extend(history)
+            for item in prompt_messages:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "user")
+                content = str(item.get("content") or "").strip()
+                if not content:
+                    continue
+                if role == "user":
+                    injection_prefixes.append(content)
+                    continue
+                messages.append({"role": role, "content": content})
+            current_user_content = "\n\n".join(injection_prefixes + [str(prepared)])
+            # Wrap runtime-state messages (step > 0) in semantic XML tags.
+            # Step 0 is the initial task assignment and must remain unwrapped.
+            if record.step_id > 0:
+                current_user_content = _wrap_runtime_context(current_user_content)
+            current_user = self._build_current_user_message(
+                prepared_text=current_user_content,
+                prompt_user_content_blocks=prompt_user_content_blocks,
+                observation=observation,
+                record=record,
+            )
+            messages.append(current_user)
+            prepared_full = content_to_text(current_user.get("content"))
+        # --- End custom MessageBuilder support ---
+        # Normalize dangling calls before auditing or dispatching. The sidecar
+        # and digest must describe the exact payload handed to the provider.
+        messages = self._ensure_chain_consistency(messages)
+        llm_messages = self._strip_internal_message_keys(messages)
+        decision_context_source = runtime_context or str(prepared or "")
+        source_context_blocks = _DECISION_CONTEXT_PATTERN.findall(
+            decision_context_source
+        )
+        # A malformed transient source is a fixed controller/configuration
+        # problem for Decision-Context-aware agents, but first give the state
+        # projector one fresh chance to render it.  Normal duplicate/stale
+        # packet recovery never reaches this branch.
+        if decision_context_required and len(source_context_blocks) != 1:
+            try:
+                decision_context_source = str(engine.agent.prepare(state) or "")
+            except Exception as exc:
+                raise DecisionContextConfigurationError(
+                    "could not render the authoritative DECISION_CONTEXT"
+                ) from exc
+            source_context_blocks = _DECISION_CONTEXT_PATTERN.findall(
+                decision_context_source
+            )
+        if decision_context_required and len(source_context_blocks) != 1:
+            raise DecisionContextConfigurationError(
+                "authoritative runtime state must contain exactly one DECISION_CONTEXT"
+            )
+        pre_rebuild_messages = list(llm_messages)
+        decision_context_recovery: Dict[str, Any] = {
+            "rebuild_required": False,
+            "reason": "",
+            "before_count": 0,
+            "after_count": 0,
+            "authoritative_context": "",
+        }
+        if decision_context_required:
+            llm_messages, decision_context_recovery = (
+                self._normalize_decision_context_packet(
+                    messages=llm_messages,
+                    authoritative_source=decision_context_source,
+                    delivery=runtime_context_delivery,
+                )
+            )
+        pre_context = context_runtime.finalize_assembled_input(
+            llm=engine.agent.llm,
+            telemetry=pre_context,
+            messages=llm_messages,
+            request_options=request_options,
+            compact_events=compact_events,
+        )
+        prompt_meter = getattr(engine.agent, "prompt_meter", None)
+        if prompt_meter is not None and callable(
+            getattr(prompt_meter, "measure", None)
+        ):
+            try:
+                meter_result = _measure_prompt(
+                    prompt_meter,
+                    messages=llm_messages,
+                    tools=list(request_options.get("tools") or []),
+                    request_options=dict(request_options),
+                    llm=engine.agent.llm,
+                )
+            except Exception as exc:
+                meter_result = {
+                    "status": "unavailable",
+                    "meter_source": "provider_tokenize",
+                    "meter_error": f"{type(exc).__name__}: {exc}",
+                }
+            pre_context = context_runtime.apply_prompt_meter(pre_context, meter_result)
+            if (
+                bool(getattr(prompt_meter, "required", False))
+                and str(meter_result.get("status") or "") != "ready"
+            ):
+                raise ContextOverflowError("required prompt meter is unavailable")
+        # Historical blocks are an audit signal only.  They are stripped from
+        # the projected provider packet by the normalizer and never make a
+        # long-running CyberGym task terminal.
+        history_context_blocks = self._decision_context_blocks(
+            self._strip_internal_message_keys(history)
+        )
+        provider_context_blocks = self._decision_context_blocks(llm_messages)
+        expects_decision_context = decision_context_required
+        if expects_decision_context and len(provider_context_blocks) != 1:
+            raise DecisionContextConfigurationError(
+                "packet normalization did not produce one current DECISION_CONTEXT"
+            )
+        if expects_decision_context and (
+            len(source_context_blocks) != 1
+            or provider_context_blocks[0] != source_context_blocks[0]
+        ):
+            raise DecisionContextConfigurationError(
+                "packet normalization did not preserve the authoritative DECISION_CONTEXT"
+            )
+        if decision_context_recovery.get("rebuild_required"):
+            self._write_pre_rebuild_packet_sidecar(
+                state,
+                record.step_id,
+                messages=pre_rebuild_messages,
+                recovery=decision_context_recovery,
+            )
+            engine._emit(
+                record.step_id,
+                RuntimePhase.DECIDE,
+                payload={
+                    "stage": "decision_context_packet_rebuilt",
+                    "reason": decision_context_recovery.get("reason"),
+                    "before_count": decision_context_recovery.get("before_count"),
+                    "after_count": decision_context_recovery.get("after_count"),
+                    "delivery": runtime_context_delivery.get("effective"),
+                    "authoritative_context_hash": hashlib.sha256(
+                        str(
+                            decision_context_recovery.get("authoritative_context") or ""
+                        ).encode("utf-8")
+                    ).hexdigest(),
+                },
+            )
+        parity = self._tool_transaction_parity(llm_messages)
         normalized_compact_events = context_runtime.normalize_history_events(
             compact_events, pre_context
         )
@@ -307,53 +807,46 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             raise ContextOverflowError(
                 f"context overflow: input_tokens={pre_context.input_tokens_total} budget={pre_context.available_input_budget}"
             )
-        injection_prefixes: List[str] = []
-        if self._native_tool_call_preferred():
-            if os.environ.get("CYBERGYM_DISABLE_HISTORY_TRIM", "").strip().lower() not in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }:
-                configured_rounds = int(
-                    getattr(engine.context_config, "conversation_max_rounds", 10)
-                )
-                if configured_rounds > 0:
-                    history = self._trim_native_tool_history(
-                        history,
-                        max_rounds=configured_rounds,
-                    )
-        messages.extend(history)
-        for item in prompt_messages:
-            if not isinstance(item, dict):
-                continue
-            role = str(item.get("role") or "user")
-            content = str(item.get("content") or "").strip()
-            if not content:
-                continue
-            if role == "user":
-                injection_prefixes.append(content)
-                continue
-            messages.append({"role": role, "content": content})
-        current_user_content = "\n\n".join(injection_prefixes + [str(prepared)])
-        current_user = self._build_current_user_message(
-            prepared_text=current_user_content,
-            prompt_user_content_blocks=prompt_user_content_blocks,
-            observation=observation,
-            record=record,
+        if context_runtime.should_force_compact(pre_context):
+            engine._emit(
+                record.step_id,
+                RuntimePhase.COMPACT,
+                payload=context_runtime.force_compaction_event(pre_context),
+            )
+            raise ContextCompactionRequired(
+                "context compaction required: "
+                f"input_tokens={pre_context.input_tokens_total} "
+                f"budget={pre_context.available_input_budget} "
+                f"ratio={engine.context_config.compact_ratio}"
+            )
+        model_input_digest = self._model_input_digest(
+            state, record.step_id, llm_messages
         )
-        messages.append(current_user)
-        # Repair native tool-call chains before tracing or provider dispatch so
-        # observability artifacts match the exact canonical request history.
-        messages = self._ensure_chain_consistency(messages)
-        prepared_full = content_to_text(current_user.get("content"))
-        self._write_assembled_messages_sidecar(state, record.step_id, messages)
+        tool_schema_digest = self._tool_schema_digest(request_options.get("tools"))
+        model_input_digest["tool_schema"] = tool_schema_digest
+        self._write_assembled_messages_sidecar(state, record.step_id, llm_messages)
+        self._write_model_input_bundle_sidecar(
+            state,
+            record.step_id,
+            messages=llm_messages,
+            request_options=request_options,
+            prompt_bundle=prompt_bundle,
+            protocol=protocol,
+            runtime_context=runtime_context,
+            runtime_context_delivery=runtime_context_delivery,
+            context=context_runtime.telemetry_dict(pre_context),
+            decision_context_recovery=decision_context_recovery,
+        )
         record.prompt_metadata = dict(prompt_metadata)
         record.prompt_metadata.update(
             {
                 "model_input_modalities": list(record.model_input_modalities),
                 "model_input_visual_count": int(record.model_input_visual_count),
                 "observation_modalities": list(record.observation_modalities),
+                "runtime_context_delivery": dict(runtime_context_delivery),
+                "tool_transaction_parity": parity,
+                "decision_context_block_count": len(provider_context_blocks),
+                "historical_decision_context_block_count": len(history_context_blocks),
             }
         )
         record.context = context_runtime.telemetry_dict(pre_context)
@@ -363,32 +856,86 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             RuntimePhase.DECIDE,
             payload={
                 "stage": "model_input",
+                "tool_transaction_parity": parity,
                 "prepared": str(prepared),
                 "prepared_full": prepared_full,
                 "history_message_count": len(history),
                 "history_messages_meta": history_metadata,
-                "messages": messages,
+                "message_count": len(llm_messages),
+                "messages_summary": [
+                    {
+                        "role": m.get("role"),
+                        "content_len": len(str(m.get("content", ""))),
+                    }
+                    for m in llm_messages
+                ],
+                "model_input_digest": model_input_digest,
+                "tool_schema_digest": tool_schema_digest,
                 "context": dict(record.context),
-                "state_stats": self._state_stats(observation, record.context),
+                "state_stats": self._state_stats(
+                    observation, record.context, state=state
+                ),
                 "prompt": dict(record.prompt_metadata),
+                "runtime_context_delivery": dict(runtime_context_delivery),
+                "runtime_context_display": runtime_context_display,
             },
         )
-        engine._history_append(
-            "user", str(prepared), record.step_id, metadata={"source": "engine"}
+        response = self._normalize_model_response(
+            await self._call_llm(
+                engine.agent.llm,
+                llm_messages,
+                request_options,
+            )
         )
-        request_options = self._build_model_request_options(
-            prompt_bundle=prompt_bundle,
-            protocol=protocol,
-        )
-        llm_messages = self._strip_internal_message_keys(messages)
-        raw_decision = self._call_llm(engine.agent.llm, llm_messages, request_options)
-        response = self._normalize_model_response(raw_decision)
         post_context = context_runtime.finalize_output(
             llm=engine.agent.llm,
             telemetry=pre_context,
             raw_output=response.text,
+            usage=response.usage,
         )
+        if pending_system_history is not None:
+            engine._history_append(
+                "system",
+                pending_system_history,
+                record.step_id,
+                metadata={"source": "engine"},
+            )
+            engine._last_system_prompt = pending_system_history
+        for entry in pending_builder_history:
+            engine._history_append(
+                entry.get("role", "user"),
+                entry.get("content", ""),
+                entry.get("step_id", record.step_id),
+                metadata=entry.get("metadata", {}),
+                reasoning_content=entry.get("reasoning_content"),
+                tool_calls=entry.get("tool_calls"),
+                tool_call_id=entry.get("tool_call_id"),
+                name=entry.get("name"),
+                native_items=entry.get("native_items"),
+            )
+        if custom_builder is None:
+            history_content = str(prepared)
+            if record.step_id > 0:
+                history_content = _wrap_runtime_context(history_content)
+            engine._history_append(
+                "user",
+                history_content,
+                record.step_id,
+                metadata={"source": "engine"},
+            )
         record.context = context_runtime.telemetry_dict(post_context)
+        self._write_model_input_bundle_sidecar(
+            state,
+            record.step_id,
+            messages=llm_messages,
+            request_options=request_options,
+            prompt_bundle=prompt_bundle,
+            protocol=protocol,
+            runtime_context=runtime_context,
+            runtime_context_delivery=runtime_context_delivery,
+            context=record.context,
+            decision_context_recovery=decision_context_recovery,
+        )
         record.model_response = response.to_summary_dict()
         engine._last_context_telemetry = dict(record.context)
         engine._emit(
@@ -397,6 +944,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             payload={
                 "stage": "model_output",
                 "raw_output": response.text,
+                "reasoning_content": response.reasoning_content,
                 "model_response": dict(record.model_response),
                 "context": dict(record.context),
                 "prompt": prompt_metadata,
@@ -408,26 +956,207 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 {
                     "id": item.get("id"),
                     "type": item.get("type", "function"),
-                    "function": dict(item.get("function", {}))
-                    if isinstance(item.get("function", {}), dict)
-                    else {},
+                    "function": (
+                        dict(item.get("function", {}))
+                        if isinstance(item.get("function", {}), dict)
+                        else {}
+                    ),
                 }
                 for item in list(response.tool_calls or [])
                 if isinstance(item, dict)
             ]
-        assistant_content: Any = response.text
-        if assistant_tool_calls and not str(response.text or "").strip():
-            assistant_content = None
-        engine._history_append(
-            "assistant",
-            assistant_content,
-            record.step_id,
-            metadata={"source": "engine"},
-            tool_calls=assistant_tool_calls,
-            native_items=response.native_items,
-        )
+        # Native calls can be recorded immediately. Parser-derived actions are
+        # normalized after parsing, when we know their action ids and schema.
+        # That prevents an orphan plain assistant turn before a tool result.
+        if assistant_tool_calls:
+            assistant_content: Any = response.text
+            if not str(response.text or "").strip():
+                assistant_content = None
+            engine._history_append(
+                "assistant",
+                assistant_content,
+                record.step_id,
+                metadata={"source": "engine"},
+                reasoning_content=response.reasoning_content,
+                tool_calls=assistant_tool_calls,
+                native_items=response.native_items,
+            )
 
         return response
+
+    def _append_parser_tool_call_history(
+        self,
+        *,
+        response: ModelResponse,
+        decision: Decision[Any],
+        record: StepRecord,
+    ) -> None:
+        """Store parsed tool actions in the same assistant -> tool shape.
+
+        Text protocols do not provide provider-assigned call ids. Stable ids
+        are generated once here and copied onto the Action, so the executor's
+        matching tool result has the exact same ``tool_call_id``.
+        """
+        calls: List[Dict[str, Any]] = []
+        for index, item in enumerate(list(decision.actions or [])):
+            action = item if isinstance(item, Action) else Action.from_dict(dict(item))
+            call_id = action.action_id or f"call_{record.step_id}_{index}"
+            action.action_id = call_id
+            if action is not item:
+                decision.actions[index] = action
+            try:
+                arguments = json.dumps(dict(action.args or {}), ensure_ascii=False)
+            except Exception:
+                arguments = "{}"
+            calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": action.name, "arguments": arguments},
+                }
+            )
+        if not calls:
+            return
+        content: Any = response.text if str(response.text or "").strip() else None
+        self.engine._history_append(
+            "assistant",
+            content,
+            record.step_id,
+            metadata={"source": "engine", "decision_source": "parser"},
+            reasoning_content=response.reasoning_content,
+            tool_calls=calls,
+        )
+        record.history_tool_calls_pending = True
+
+    def _model_input_digest(
+        self,
+        state: StateT,
+        step_id: int,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        try:
+            serialized = json.dumps(
+                messages, ensure_ascii=False, sort_keys=True, default=str
+            )
+        except Exception:
+            serialized = json.dumps([str(m) for m in messages], ensure_ascii=False)
+
+        role_counts: Dict[str, int] = {}
+        tool_call_count = 0
+        message_summaries: List[Dict[str, Any]] = []
+        for idx, message in enumerate(messages):
+            role = str(message.get("role") or "")
+            role_counts[role] = role_counts.get(role, 0) + 1
+            content_text = content_to_text(message.get("content"))
+            tool_calls = message.get("tool_calls")
+            tool_names: List[str] = []
+            if isinstance(tool_calls, list):
+                tool_call_count += len(tool_calls)
+                for call in tool_calls[:6]:
+                    if not isinstance(call, dict):
+                        continue
+                    fn = call.get("function")
+                    if isinstance(fn, dict) and fn.get("name"):
+                        tool_names.append(str(fn.get("name")))
+                    elif call.get("name"):
+                        tool_names.append(str(call.get("name")))
+            summary: Dict[str, Any] = {
+                "index": idx,
+                "role": role,
+                "content_len": len(content_text),
+            }
+            if message.get("name"):
+                summary["name"] = message.get("name")
+            if message.get("tool_call_id"):
+                summary["tool_call_id"] = message.get("tool_call_id")
+            if tool_names:
+                summary["tool_names"] = tool_names
+            message_summaries.append(summary)
+
+        system_text = "\n".join(
+            content_to_text(message.get("content"))
+            for message in messages
+            if message.get("role") == "system"
+        )
+        sections = {
+            "contract": "# CyberGym Agent Contract" in system_text
+            or "Core Rules" in system_text,
+            "runtime_context": "<runtime_context>" in system_text,
+            "exploration_prompt": "# Exploration Phase" in system_text,
+            "construction_prompt": "# Construction Phase" in system_text,
+            "runtime_reminder": "<runtime_reminder>" in system_text,
+        }
+
+        sidecar_path = ""
+        try:
+            metadata = dict(getattr(state, "metadata", {}) or {})
+            trace_root = str(metadata.get("trace_run_dir") or "").strip()
+            if trace_root:
+                sidecar_path = str(
+                    Path(trace_root)
+                    / "agent_steps"
+                    / f"step-{int(step_id):04d}"
+                    / "assembled_messages.json"
+                )
+        except Exception:
+            sidecar_path = ""
+
+        return {
+            "message_count": len(messages),
+            "role_counts": role_counts,
+            "tool_call_count": tool_call_count,
+            "messages_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest()[
+                :16
+            ],
+            "sections": sections,
+            "messages": message_summaries,
+            "recent_history": message_summaries[-8:],
+            "sidecar_path": sidecar_path,
+        }
+
+    def _write_pre_rebuild_packet_sidecar(
+        self,
+        state: StateT,
+        step_id: int,
+        *,
+        messages: List[Dict[str, Any]],
+        recovery: Dict[str, Any],
+    ) -> None:
+        """Persist a rejected packet only when Context normalization repairs it."""
+        try:
+            metadata = dict(getattr(state, "metadata", {}) or {})
+            trace_root = str(
+                metadata.get("trace_run_dir")
+                or getattr(state, "workspace_root", "")
+                or ""
+            ).strip()
+            if not trace_root:
+                return
+            step_dir = Path(trace_root) / "agent_steps" / f"step-{int(step_id):04d}"
+            step_dir.mkdir(parents=True, exist_ok=True)
+            (step_dir / "assembled_messages.pre_rebuild.json").write_text(
+                json.dumps(messages, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            (step_dir / "decision_context_recovery.json").write_text(
+                json.dumps(
+                    {
+                        "reason": recovery.get("reason"),
+                        "before_count": recovery.get("before_count"),
+                        "after_count": recovery.get("after_count"),
+                        "authoritative_context_hash": hashlib.sha256(
+                            str(recovery.get("authoritative_context") or "").encode(
+                                "utf-8"
+                            )
+                        ).hexdigest(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except Exception:
+            _logger.debug("pre-rebuild packet sidecar write failed", exc_info=True)
 
     def _write_assembled_messages_sidecar(
         self,
@@ -442,12 +1171,147 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 return
             step_dir = Path(trace_root) / "agent_steps" / f"step-{int(step_id):04d}"
             step_dir.mkdir(parents=True, exist_ok=True)
+
+            # Context can shrink after compaction, so count-based increments do
+            # not form a replayable audit trail. Every step gets the exact full
+            # message list that was hashed and sent to the model.
             (step_dir / "assembled_messages.json").write_text(
                 json.dumps(messages, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+
+            # Keep the canonical CyberGym state beside the exact prompt that
+            # consumed it. This makes an exported trace independently
+            # auditable even when the task workspace is later removed.
+            workspace = str(getattr(state, "workspace_root", "") or "").strip()
+            if workspace:
+                state_path = Path(workspace) / ".cybergym" / "state.json"
+                if state_path.is_file():
+                    (step_dir / "cybergym_state.json").write_text(
+                        state_path.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
+
+            self._last_message_count = len(messages)
+            self._last_full_step = step_id
         except Exception:
             return
+
+    @staticmethod
+    def _tool_schema_digest(tools: Any) -> Dict[str, Any]:
+        payload = list(tools or []) if isinstance(tools, list) else []
+        serialized = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, default=str
+        )
+        names = [
+            str((item.get("function") or {}).get("name") or "")
+            for item in payload
+            if isinstance(item, dict)
+        ]
+        return {
+            "tool_count": len(payload),
+            "tool_names": [name for name in names if name],
+            "schema_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16],
+        }
+
+    def _write_model_input_bundle_sidecar(
+        self,
+        state: StateT,
+        step_id: int,
+        *,
+        messages: List[Dict[str, Any]],
+        request_options: Dict[str, Any],
+        prompt_bundle: Any,
+        protocol: Any,
+        runtime_context: str = "",
+        runtime_context_delivery: Dict[str, Any] | None = None,
+        context: Dict[str, Any] | None = None,
+        decision_context_recovery: Dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            metadata = dict(getattr(state, "metadata", {}) or {})
+            trace_root = str(metadata.get("trace_run_dir") or "").strip()
+            if not trace_root:
+                return
+            step_dir = Path(trace_root) / "agent_steps" / f"step-{int(step_id):04d}"
+            step_dir.mkdir(parents=True, exist_ok=True)
+            tools = list(request_options.get("tools") or [])
+            message_json = json.dumps(
+                messages, ensure_ascii=False, sort_keys=True, default=str
+            )
+            tools_json = json.dumps(
+                tools, ensure_ascii=False, sort_keys=True, default=str
+            )
+            combined = message_json + "\n" + tools_json
+            decision_context_blocks = self._decision_context_blocks(messages)
+            bundle = {
+                "messages": messages,
+                "tools": tools,
+                "prompt_metadata": dict(getattr(prompt_bundle, "metadata", {}) or {}),
+                "protocol": str(getattr(protocol, "id", "") or ""),
+                "tool_delivery": str(
+                    dict(getattr(prompt_bundle, "metadata", {}) or {}).get(
+                        "tool_schema_delivery"
+                    )
+                    or ""
+                ),
+                "pre_merge_runtime_context": str(runtime_context or ""),
+                "runtime_context_delivery": dict(runtime_context_delivery or {}),
+                "context": dict(context or {}),
+                "messages_hash": hashlib.sha256(
+                    message_json.encode("utf-8")
+                ).hexdigest()[:16],
+                "schema_hash": hashlib.sha256(tools_json.encode("utf-8")).hexdigest()[
+                    :16
+                ],
+                "combined_hash": hashlib.sha256(combined.encode("utf-8")).hexdigest()[
+                    :16
+                ],
+                "decision_context_block_count": len(decision_context_blocks),
+                "decision_context_sha256": (
+                    hashlib.sha256(
+                        decision_context_blocks[0].encode("utf-8")
+                    ).hexdigest()
+                    if len(decision_context_blocks) == 1
+                    else ""
+                ),
+                "decision_context_recovery": {
+                    "rebuilt": bool(
+                        (decision_context_recovery or {}).get("rebuild_required")
+                    ),
+                    "reason": str(
+                        (decision_context_recovery or {}).get("reason") or ""
+                    ),
+                    "before_count": int(
+                        (decision_context_recovery or {}).get("before_count") or 0
+                    ),
+                    "after_count": int(
+                        (decision_context_recovery or {}).get("after_count") or 0
+                    ),
+                },
+            }
+            (step_dir / "model_input_bundle.json").write_text(
+                json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            if len(decision_context_blocks) == 1:
+                (step_dir / "decision_context.md").write_text(
+                    decision_context_blocks[0] + "\n", encoding="utf-8"
+                )
+        except Exception:
+            _logger.debug("model input bundle sidecar write failed", exc_info=True)
+
+    @staticmethod
+    def _decision_context_blocks(messages: List[Dict[str, Any]]) -> List[str]:
+        """Return actual non-system Decision Context blocks in a packet."""
+        blocks: List[str] = []
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") == "system":
+                continue
+            blocks.extend(
+                _DECISION_CONTEXT_PATTERN.findall(
+                    content_to_text(message.get("content"))
+                )
+            )
+        return blocks
 
     def _build_model_request_options(
         self, *, prompt_bundle: Any, protocol: Any
@@ -464,10 +1328,13 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             if callable(build_options):
                 try:
                     options.update(
-                        build_options(payload, protocol=protocol, delivery=delivery) or {}
+                        build_options(payload, protocol=protocol, delivery=delivery)
+                        or {}
                     )
                 except Exception:
-                    _logger.debug("build_tool_schema_request_options failed", exc_info=True)
+                    _logger.debug(
+                        "build_tool_schema_request_options failed", exc_info=True
+                    )
 
         # Merge default_request_kwargs from the model instance
         # (e.g. chat_template_kwargs for thinking mode)
@@ -478,84 +1345,91 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
 
         return options
 
-    def _call_llm(
-        self, llm: Any, messages: List[Dict[str, Any]], request_options: Dict[str, Any]
-    ) -> Any:
-        # If streaming is requested and the model supports it, use streaming path
-        if self.stream_callback is not None:
-            stream_fn = getattr(llm, "stream", None)
-            if callable(stream_fn):
-                return self._call_llm_streaming(llm, messages, request_options)
+    async def _call_llm(
+        self,
+        llm: Any,
+        messages: List[Dict[str, Any]],
+        request_options: Dict[str, Any],
+    ) -> ModelResponse:
+        """Consume the one canonical model stream into a completed response."""
 
-        call_raw = getattr(llm, "call_raw", None)
-        if callable(call_raw):
-            if not request_options:
-                return call_raw(messages)
-            try:
-                return call_raw(messages, **request_options)
-            except TypeError:
-                _logger.warning(
-                    "call_raw rejected request_options (TypeError), "
-                    "falling back without options. Keys: %s",
-                    list(request_options.keys()),
-                )
-                return call_raw(messages)
-        if not request_options:
-            return llm(messages)
-        try:
-            return llm(messages, **request_options)
-        except TypeError:
-            _logger.warning(
-                "LLM call rejected request_options (TypeError), "
-                "falling back without options. Keys: %s",
-                list(request_options.keys()),
+        if not isinstance(llm, Model):
+            raise TypeError(
+                "Agent.llm must implement the asynchronous qitos.models.Model "
+                "stream contract"
             )
-            return llm(messages)
-
-    def _call_llm_streaming(
-        self, llm: Any, messages: List[Dict[str, Any]], request_options: Dict[str, Any]
-    ) -> Any:
-        """Stream LLM response, forwarding text deltas via callback.
-
-        Returns a synthetic dict that mimics the structure _normalize_model_response
-        expects: {"text": ..., "usage": ..., "finish_reason": ..., "tool_calls": ...}.
-        """
-        stream_fn = getattr(llm, "stream", None)
-        if not callable(stream_fn):
-            return self._call_llm(llm, messages, request_options)
-
         handler = to_stream_handler(self.stream_callback)
         accumulated_text: List[str] = []
+        accumulated_reasoning: List[str] = []
         final_usage: Optional[Dict[str, Any]] = None
         final_tool_calls: Optional[List[Dict[str, Any]]] = None
         final_native_items: Optional[List[Dict[str, Any]]] = None
+        final_finish_reason: Optional[str] = None
+        final_metadata: Dict[str, Any] = {}
         started = False
+        terminal_seen = False
+        stream_error: Exception | None = None
+        stream_iter: AsyncIterator[ModelStreamChunk] = llm.stream(
+            messages,
+            deadline_monotonic=getattr(self.engine, "runtime_deadline_monotonic", None),
+            **request_options,
+        )
 
-        if not request_options:
-            stream_iter = stream_fn(messages)
-        else:
-            try:
-                stream_iter = stream_fn(messages, **request_options)
-            except TypeError:
-                stream_iter = stream_fn(messages)
-
+        iterator = stream_iter.__aiter__()
         try:
-            for chunk in stream_iter:
-                # Handle ModelStreamChunk objects
-                text = getattr(chunk, "text", None)
-                done = getattr(chunk, "done", False)
-                usage = getattr(chunk, "usage", None)
-                tool_calls = getattr(chunk, "tool_calls", None)
-                native_items = getattr(chunk, "native_items", None)
+            while True:
+                remaining = self.engine.remaining_runtime_seconds()
+                if remaining is not None and remaining <= 0:
+                    raise ModelRequestDeadlineExceeded("model request deadline expired")
+                try:
+                    next_chunk = iterator.__anext__()
+                    chunk = (
+                        await asyncio.wait_for(next_chunk, timeout=remaining)
+                        if remaining is not None
+                        else await next_chunk
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as exc:
+                    raise ModelRequestDeadlineExceeded(
+                        "model request deadline expired"
+                    ) from exc
+                if not isinstance(chunk, ModelStreamChunk):
+                    raise TypeError("Model.stream() must yield ModelStreamChunk values")
+                text = chunk.text
+                reasoning = chunk.reasoning_content
+                done = chunk.done
+                usage = chunk.usage
+                tool_calls = chunk.tool_calls
+                native_items = chunk.native_items
+                event_type = chunk.event_type
+                finish_reason = chunk.finish_reason
+
+                observable = bool(
+                    text
+                    or reasoning
+                    or done
+                    or tool_calls
+                    or native_items
+                    or event_type
+                )
+                if observable and not started:
+                    started = True
+                    if handler is not None:
+                        try:
+                            handler.on_start()
+                        except Exception:
+                            pass
+
+                if observable and handler is not None:
+                    on_chunk = getattr(handler, "on_chunk", None)
+                    if callable(on_chunk):
+                        try:
+                            on_chunk(chunk)
+                        except Exception:
+                            pass
 
                 if text:
-                    if not started:
-                        started = True
-                        if handler is not None:
-                            try:
-                                handler.on_start()
-                            except Exception:
-                                pass
                     accumulated_text.append(text)
                     if handler is not None:
                         try:
@@ -563,36 +1437,77 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         except Exception:
                             pass
 
+                if reasoning:
+                    accumulated_reasoning.append(str(reasoning))
+
                 if done:
+                    if terminal_seen:
+                        raise ModelTransportError(
+                            "model stream emitted more than one terminal chunk",
+                            attempts=1,
+                            retryable=False,
+                        )
+                    terminal_seen = True
                     if usage is not None and isinstance(usage, dict):
                         final_usage = usage
                     if tool_calls is not None and isinstance(tool_calls, list):
                         final_tool_calls = tool_calls
                     if native_items is not None and isinstance(native_items, list):
                         final_native_items = native_items
+                    if finish_reason is not None:
+                        final_finish_reason = str(finish_reason)
+                    final_metadata = dict(chunk.event_metadata)
+            if not terminal_seen:
+                raise ModelTransportError(
+                    "model stream ended before a terminal chunk",
+                    attempts=1,
+                    retryable=True,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            stream_error = exc
+            if handler is not None:
+                on_error = getattr(handler, "on_error", None)
+                if callable(on_error):
+                    try:
+                        on_error(exc)
+                    except Exception:
+                        pass
+            raise
         finally:
-            if handler is not None and started:
+            close = getattr(stream_iter, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _logger.debug("model stream close failed", exc_info=True)
+            if (
+                handler is not None
+                and started
+                and terminal_seen
+                and stream_error is None
+            ):
                 try:
                     handler.on_end()
                 except Exception:
                     pass
-        if final_usage is None:
-            last_usage = getattr(llm, "_last_usage", None)
-            if isinstance(last_usage, dict) and last_usage:
-                final_usage = last_usage
 
-        # Return a synthetic response that _normalize_model_response can process
-        full_text = "".join(accumulated_text)
-        result: Dict[str, Any] = {
-            "text": full_text,
-            "usage": final_usage or {},
-            "finish_reason": "stop",
-        }
-        if final_tool_calls:
-            result["tool_calls"] = final_tool_calls
-        if final_native_items:
-            result["native_items"] = final_native_items
-        return result
+        return ModelResponse(
+            text="".join(accumulated_text),
+            usage=final_usage,
+            finish_reason=final_finish_reason,
+            tool_calls=final_tool_calls,
+            model_name=llm.model,
+            provider=llm.provider_name,
+            metadata=final_metadata,
+            reasoning_content=(
+                "".join(accumulated_reasoning) if accumulated_reasoning else None
+            ),
+            native_items=final_native_items,
+        )
 
     def _build_current_user_message(
         self,
@@ -618,9 +1533,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         record.model_input_visual_count = sum(
             1 for block in content_blocks if str(block.get("type") or "text") != "text"
         )
-        if (
-            record.model_input_visual_count > 0
-            and not self._llm_supports_multimodal(getattr(self.engine.agent, "llm", None))
+        if record.model_input_visual_count > 0 and not self._llm_supports_multimodal(
+            getattr(self.engine.agent, "llm", None)
         ):
             raise ValueError(
                 "Configured model adapter does not support multimodal input content blocks."
@@ -628,6 +1542,25 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         if record.model_input_visual_count > 0:
             return {"role": "user", "content": content_blocks}
         return {"role": "user", "content": str(prepared_text or "")}
+
+    def _current_user_has_multimodal_content(
+        self,
+        prompt_user_content_blocks: List[Dict[str, Any]],
+        observation: ObservationT,
+        record: StepRecord,
+    ) -> bool:
+        """Return whether a runtime-context turn must stay a user message.
+
+        Tool results are serialized text in the OpenAI-compatible providers
+        supported by QitOS.  Do not discard image/file inputs merely to retain
+        a tool-terminal conversation shape.
+        """
+        blocks: List[Dict[str, Any]] = [
+            normalize_content_block(block) for block in prompt_user_content_blocks
+        ]
+        blocks.extend(self._task_visual_blocks())
+        blocks.extend(self._observation_visual_blocks(observation, record))
+        return any(str(block.get("type") or "text") != "text" for block in blocks)
 
     def _content_modalities(self, content_blocks: List[Dict[str, Any]]) -> List[str]:
         modalities: List[str] = []
@@ -743,8 +1676,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     metadata=metadata,
                 )
             ]
-        data_value = screenshot.get("data_url") or screenshot.get("data") or screenshot.get(
-            "base64"
+        data_value = (
+            screenshot.get("data_url")
+            or screenshot.get("data")
+            or screenshot.get("base64")
         )
         if data_value:
             return [
@@ -756,6 +1691,26 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 )
             ]
         return []
+
+    def _observation_summary(self, observation: ObservationT) -> Dict[str, Any]:
+        """Return a lightweight summary of the observation for trace events.
+
+        Avoids serializing the full observation into events.jsonl — the
+        full data is available via steps.jsonl if needed.
+        """
+        summary: Dict[str, Any] = {"type": type(observation).__name__}
+        if isinstance(observation, Observation):
+            action_results = getattr(observation, "action_results", None)
+            if action_results is not None:
+                summary["action_result_count"] = len(action_results)
+            if isinstance(observation.state, dict):
+                summary["state_keys"] = list(observation.state.keys())[:20]
+        elif isinstance(observation, dict):
+            summary["keys"] = list(observation.keys())[:20]
+            ar = observation.get("action_results")
+            if isinstance(ar, list):
+                summary["action_result_count"] = len(ar)
+        return summary
 
     def _observation_pack_payload(
         self, env_observation: Any, observation: ObservationT
@@ -795,7 +1750,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         return None
 
     def _state_stats(
-        self, observation: ObservationT, context: Dict[str, Any]
+        self,
+        observation: ObservationT,
+        context: Dict[str, Any],
+        state: Any = None,
     ) -> Dict[str, Any]:
         stats: Dict[str, Any] = {}
         if isinstance(observation, Observation):
@@ -818,14 +1776,151 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 stats["workspace_files"] = len(workspace_files)
         for key in (
             "input_tokens_total",
+            "available_input_budget",
+            "system_prompt_tokens",
+            "prepared_tokens",
             "history_tokens",
             "output_tokens",
             "occupancy_ratio",
             "context_window",
+            "counting_mode",
+            "provider_prompt_tokens",
+            "provider_completion_tokens",
+            "provider_total_tokens",
+            "planned_prompt_tokens",
+            "cached_tokens",
+            "meter_source",
+            "meter_status",
+            "token_estimate_error",
         ):
             if key in context:
                 stats[key] = context.get(key)
+        # Extract chain/gate/memory text from agent state for TUI.
+        # Prefer the live state object (passed from run_decide) over the
+        # serialised observation.state dict, since the live object has
+        # ChainNode/ChainGate dataclass instances and metadata.
+        state_obj = state
+        if state_obj is None:
+            state_obj = getattr(observation, "state", None)
+            if state_obj is None and isinstance(observation, dict):
+                state_obj = observation.get("state")
+        if state_obj is not None:
+            # Use the agent's own rendering methods if available
+            constraint_lines = self._extract_constraint_board_text(state_obj)
+            if constraint_lines:
+                stats["constraint_board"] = constraint_lines
+            task_memory_text = self._extract_task_memory_text(state_obj)
+            if task_memory_text:
+                stats["task_memory"] = task_memory_text
+            # Agent business phase and control mode for TUI badge
+            for attr in ("current_phase", "control_mode"):
+                val = getattr(state_obj, attr, None)
+                if val:
+                    stats[attr] = val
+            # Metadata-based overrides (cached by agent.prepare() and reduce())
+            metadata = getattr(state_obj, "metadata", None)
+            if isinstance(metadata, dict):
+                tui_phase = metadata.get("_tui_phase")
+                if isinstance(tui_phase, str) and tui_phase.strip():
+                    stats["current_phase"] = tui_phase
+                sink_text = metadata.get("_tui_sink_candidates")
+                if isinstance(sink_text, str) and sink_text.strip():
+                    stats["sink_candidates"] = sink_text
+                objective_text = metadata.get("_tui_objective")
+                if isinstance(objective_text, str) and objective_text.strip():
+                    stats["objective"] = objective_text
+                task_ctx_text = metadata.get("_tui_task_context")
+                if isinstance(task_ctx_text, str) and task_ctx_text.strip():
+                    stats["task_context"] = task_ctx_text
+                allowed_tools_text = metadata.get("_tui_allowed_tools")
+                if isinstance(allowed_tools_text, str) and allowed_tools_text.strip():
+                    stats["allowed_tools"] = allowed_tools_text
+                suggested_sinks_text = metadata.get("_tui_suggested_sinks")
+                if (
+                    isinstance(suggested_sinks_text, str)
+                    and suggested_sinks_text.strip()
+                ):
+                    stats["suggested_sinks"] = suggested_sinks_text
         return stats
+
+    @staticmethod
+    def _extract_constraint_board_text(state_obj: Any) -> str:
+        """Extract the Constraint Board section text from agent state.
+
+        The agent stores the exact same text in state.metadata that the LLM
+        sees in the observation packet.  This ensures TUI and LLM always
+        see identical content.
+        """
+        # Primary: use the pre-rendered text from the agent's prepare()
+        metadata = getattr(state_obj, "metadata", None)
+        if isinstance(metadata, dict):
+            cached = metadata.get("_tui_constraint_board")
+            if isinstance(cached, str) and cached.strip():
+                return cached
+        # Fallback: build from state fields directly (for agents that
+        # don't store the cached text, or before first prepare())
+        nodes = list(getattr(state_obj, "call_chain_nodes", []) or [])
+        gates = list(getattr(state_obj, "call_chain_gates", []) or [])
+        if not nodes and not gates:
+            return ""
+        lines: List[str] = []
+        confirmed = sum(1 for g in gates if getattr(g, "status", "") == "confirmed")
+        open_g = sum(
+            1 for g in gates if getattr(g, "status", "") in ("inferred", "unknown")
+        )
+        refuted = sum(1 for g in gates if getattr(g, "status", "") == "refuted")
+        lines.append(
+            f"Chain Gates: {confirmed} confirmed / {open_g} open / {refuted} refuted"
+        )
+        if nodes:
+            sorted_nodes = sorted(nodes, key=lambda n: getattr(n, "order", 0))
+            for n in sorted_nodes[:10]:
+                role = getattr(n, "role", "?")
+                func = getattr(n, "function", "?")
+                loc = getattr(n, "location", "")
+                status = getattr(n, "status", "?")
+                lines.append(
+                    f"  [{getattr(n, 'order', 0)}] [{status}] {role} {func} ({loc})"
+                )
+        for g in gates:
+            status = getattr(g, "status", "")
+            desc = getattr(g, "description", "")
+            cond = getattr(g, "required_condition", "")
+            hint = getattr(g, "repair_hint", "")
+            ev = getattr(g, "evidence", "")
+            parts = [f"  [{status}/{getattr(g, 'gate_type', '')}] {desc}"]
+            if cond:
+                parts.append(f"    required: {cond}")
+            if hint:
+                parts.append(f"    repair: {hint}")
+            if ev:
+                parts.append(f"    evidence: {ev}")
+            lines.extend(parts)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_task_memory_text(state_obj: Any) -> str:
+        """Extract Task Memory section text from agent state.
+
+        Same text the LLM sees in the observation packet.
+        """
+        metadata = getattr(state_obj, "metadata", None)
+        if isinstance(metadata, dict):
+            cached = metadata.get("_tui_task_memory")
+            if isinstance(cached, str) and cached.strip():
+                return cached
+        # Fallback
+        parts: List[str] = []
+        va = getattr(state_obj, "vulnerability_analysis", "")
+        if isinstance(va, str) and va.strip():
+            parts.append(f"Analysis: {va.strip()}")
+        ch = getattr(state_obj, "current_hypothesis", "")
+        if isinstance(ch, str) and ch.strip():
+            parts.append(f"Hypothesis: {ch.strip()}")
+        pt = getattr(state_obj, "path_trace", None)
+        if isinstance(pt, list) and pt:
+            parts.append("Path: " + " → ".join(pt[:8]))
+        return "\n".join(parts)
 
     def select_branch(
         self,
@@ -888,7 +1983,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             and str(response.text or "").strip()
         )
 
-        if is_native_text_response:
+        if is_native_text_response and response is not None:
             # Still try the parser chain first — if the model happened to
             # produce valid structured output (JSON with a final_answer, or
             # ReAct "Final Answer:" label), let the parser extract it.
@@ -905,19 +2000,21 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 # heuristic for plain text. Preserve the historical final
                 # fallback unless parsing actually failed on action-shaped text.
                 parser_error = bool(parse_outcome.meta.get("parser_error"))
-                if not parser_error and self._looks_like_explicit_wait(
-                    parser_input
-                ):
+                if not parser_error and self._looks_like_explicit_wait(parser_input):
                     return parse_outcome
-                if parser_error and self._looks_like_structured_action_intent(
-                    parser_input
-                ):
+                rejection_reason: str | None = None
+                if parser_error:
+                    if self._looks_like_structured_action_intent(parser_input):
+                        rejection_reason = "structured_action_parse_error"
+                    elif self._looks_like_structured_final_intent(parser_input):
+                        rejection_reason = "structured_final_parse_error"
+                if rejection_reason is not None:
                     self.engine._emit(
                         step,
                         RuntimePhase.DECIDE,
                         payload={
                             "stage": "native_text_final_rejected",
-                            "reason": "structured_action_parse_error",
+                            "reason": rejection_reason,
                             "parser_diagnostics": parse_outcome.meta.get(
                                 "parser_diagnostics"
                             ),
@@ -983,14 +2080,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         field_pattern = (
             r"actions?|tools?|tool[_-]?calls?|calls?|commands?|name|args|arguments"
         )
-        json_carrier_pattern = (
-            r"actions?|tools?|tool[_-]?calls?|calls?|commands?"
-        )
+        json_carrier_pattern = r"actions?|tools?|tool[_-]?calls?|calls?|commands?"
         if re.search(
             rf"(?i)[\"']({json_carrier_pattern})[\"']\s*:", source
-        ) or re.search(
-            rf"(?i)[{{,]\s*({json_carrier_pattern})\s*:", source
-        ):
+        ) or re.search(rf"(?i)[{{,]\s*({json_carrier_pattern})\s*:", source):
             return True
 
         structured_fields: set[str] = set()
@@ -1031,6 +2124,25 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             and normalized_fields & ({"name"} | argument_fields)
         )
 
+    @staticmethod
+    def _looks_like_structured_final_intent(text: Any) -> bool:
+        source = str(text or "").strip()
+        if not source:
+            return False
+        return bool(
+            re.search(
+                r"(?i)(?:[\"']mode[\"']|(?:^|[\{,])\s*mode)" r"\s*[:=]\s*[\"']?final\b",
+                source,
+            )
+            or re.search(
+                r"(?i)(?:[\"']final[_-]?answer[\"']\s*:|"
+                r"(?:^|[\{,])\s*final[_-]?answer\s*:)",
+                source,
+            )
+            or re.search(r"(?i)<\s*(?:final_answer|final)\b", source)
+            or re.search(r"(?im)^\s*final\s+answer\s*:", source)
+        )
+
     def _parse_with_protocol_chain(
         self,
         *,
@@ -1068,10 +2180,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         "parser": parser_name(parser),
                         "contract": parser_contract(parser),
                         "protocol": getattr(protocol, "id", None),
-                        "result": "success"
-                        if normalized is None
-                        or normalized.get("severity") != "error"
-                        else "error",
+                        "result": (
+                            "success"
+                            if normalized is None
+                            or normalized.get("severity") != "error"
+                            else "error"
+                        ),
                         "fallback_used": fallback_used,
                     }
                 )
@@ -1122,9 +2236,16 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 last_diagnostics["parser_attempts"] = list(parser_attempts)
                 continue
         if last_diagnostics is not None:
-            selected_parser = parser_name(candidates[-1]["parser"]) if candidates else "unknown_parser"
+            selected_parser = (
+                parser_name(candidates[-1]["parser"])
+                if candidates
+                else "unknown_parser"
+            )
             last_diagnostics.setdefault("selected_parser", selected_parser)
-            last_diagnostics.setdefault("fallback_used", any(item.get("fallback_used") for item in parser_attempts))
+            last_diagnostics.setdefault(
+                "fallback_used",
+                any(item.get("fallback_used") for item in parser_attempts),
+            )
             last_diagnostics.setdefault("parser_attempts", parser_attempts)
             self._record_parser_observability(
                 step=step,
@@ -1135,7 +2256,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 diagnostics=last_diagnostics,
                 protocol=candidates[-1].get("protocol") if candidates else None,
                 parser_attempts=parser_attempts,
-                fallback_used=any(item.get("fallback_used") for item in parser_attempts),
+                fallback_used=any(
+                    item.get("fallback_used") for item in parser_attempts
+                ),
             )
             if last_exception is not None:
                 info = RuntimeErrorInfo(
@@ -1314,40 +2437,14 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             )
             record.decision_source = "parser"
 
-    def _normalize_model_response(self, raw_output: Any) -> ModelResponse:
-        if isinstance(raw_output, ModelResponse):
-            response = raw_output
-        else:
-            response = ModelResponse(
-                text=self._extract_response_text(raw_output),
-                raw=raw_output,
-                usage=self._extract_response_usage(raw_output),
-                finish_reason=self._extract_finish_reason(raw_output),
-                tool_calls=self._extract_tool_calls(raw_output),
-                native_items=self._extract_native_items(raw_output),
-                model_name=self._extract_model_name(raw_output),
-                provider=self._extract_provider(raw_output),
-                metadata=self._extract_response_metadata(raw_output),
-            )
+    def _normalize_model_response(self, response: ModelResponse) -> ModelResponse:
+        """Apply Engine-only text tool-call salvage to a completed response."""
+
+        if not isinstance(response, ModelResponse):
+            raise TypeError("model response must be a ModelResponse")
         llm = getattr(self.engine.agent, "llm", None)
-        usage = response.usage
-        if usage is None and llm is not None and hasattr(llm, "extract_usage"):
-            try:
-                extracted = llm.extract_usage(raw_output)
-                if isinstance(extracted, dict):
-                    usage = extracted
-            except Exception:
-                usage = None
-        model_name = (
-            response.model_name
-            or getattr(llm, "model", None)
-            or getattr(llm, "model_name", None)
-        )
-        provider = (
-            response.provider
-            or getattr(llm, "provider", None)
-            or (llm.__class__.__name__ if llm is not None else None)
-        )
+        model_name = response.model_name or getattr(llm, "model", None)
+        provider = response.provider or getattr(llm, "provider_name", None)
         metadata = dict(response.metadata or {})
         text = str(response.text or "")
         tool_calls = (
@@ -1365,28 +2462,15 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     text = ""
         return ModelResponse(
             text=text,
-            raw=response.raw,
-            usage=dict(usage) if isinstance(usage, dict) else None,
+            usage=(dict(response.usage) if isinstance(response.usage, dict) else None),
             finish_reason=response.finish_reason,
             tool_calls=tool_calls,
             model_name=str(model_name) if model_name is not None else None,
             provider=str(provider) if provider is not None else None,
             metadata=metadata,
+            reasoning_content=response.reasoning_content,
             native_items=response.native_items,
         )
-
-    def _extract_native_items(
-        self, raw_output: Any
-    ) -> List[Dict[str, Any]] | None:
-        native_items = (
-            raw_output.get("native_items")
-            if isinstance(raw_output, dict)
-            else getattr(raw_output, "native_items", None)
-        )
-        if not isinstance(native_items, list):
-            return None
-        normalized = [dict(item) for item in native_items if isinstance(item, dict)]
-        return normalized or None
 
     def _extract_text_tool_call_markup(self, text: str) -> List[Dict[str, Any]] | None:
         """Salvage GLM-style textual tool-call markup into native tool calls."""
@@ -1444,204 +2528,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         ).strip()
         return not remainder
 
-    def _extract_response_text(self, raw_output: Any) -> str:
-        if raw_output is None:
-            return ""
-        if isinstance(raw_output, str):
-            return raw_output
-        if isinstance(raw_output, dict):
-            for key in ("text", "content", "output_text"):
-                value = raw_output.get(key)
-                if isinstance(value, str):
-                    return value
-            content = raw_output.get("content")
-            if isinstance(content, list):
-                parts: List[str] = []
-                for item in content:
-                    if isinstance(item, str):
-                        parts.append(item)
-                    elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                        parts.append(str(item.get("text")))
-                    elif hasattr(item, "text") and isinstance(
-                        getattr(item, "text", None), str
-                    ):
-                        parts.append(str(getattr(item, "text")))
-                if parts:
-                    return "\n".join(parts)
-            reasoning = raw_output.get("reasoning_content")
-            if isinstance(reasoning, str):
-                return reasoning
-            tool_calls = raw_output.get("tool_calls")
-            if isinstance(tool_calls, list) and tool_calls:
-                return ""
-            choices = raw_output.get("choices")
-            if isinstance(choices, list) and choices:
-                return self._extract_response_text(choices[0])
-            message = raw_output.get("message")
-            if isinstance(message, dict):
-                return self._extract_response_text(message)
-            if any(
-                key in raw_output
-                for key in ("content", "tool_calls", "reasoning_content")
-            ):
-                return ""
-            return str(raw_output)
-        choices = getattr(raw_output, "choices", None)
-        if isinstance(choices, list) and choices:
-            return self._extract_response_text(choices[0])
-        message = getattr(raw_output, "message", None)
-        if message is not None:
-            content = getattr(message, "content", None)
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts: List[str] = []
-                for item in content:
-                    if isinstance(item, str):
-                        parts.append(item)
-                    elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                        parts.append(str(item.get("text")))
-                    elif hasattr(item, "text") and isinstance(
-                        getattr(item, "text", None), str
-                    ):
-                        parts.append(str(getattr(item, "text")))
-                if parts:
-                    return "\n".join(parts)
-            reasoning = getattr(message, "reasoning_content", None)
-            if isinstance(reasoning, str):
-                return reasoning
-            text = getattr(message, "text", None)
-            if isinstance(text, str):
-                return text
-            tool_calls = getattr(message, "tool_calls", None)
-            if isinstance(tool_calls, list) and tool_calls:
-                return ""
-            if any(
-                hasattr(message, key)
-                for key in ("content", "tool_calls", "reasoning_content", "text")
-            ):
-                return ""
-        for key in ("text", "content", "output_text"):
-            value = getattr(raw_output, key, None)
-            if isinstance(value, str):
-                return value
-        return str(raw_output)
-
-    def _extract_response_usage(self, raw_output: Any) -> Dict[str, Any] | None:
-        usage = (
-            raw_output.get("usage")
-            if isinstance(raw_output, dict)
-            else getattr(raw_output, "usage", None)
-        )
-        if isinstance(usage, dict):
-            return dict(usage)
-        if usage is None:
-            return None
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None)
-        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
-            return None
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-        }
-
-    def _extract_finish_reason(self, raw_output: Any) -> str | None:
-        if isinstance(raw_output, dict):
-            finish_reason = raw_output.get("finish_reason")
-            if finish_reason is not None:
-                return str(finish_reason)
-            choices = raw_output.get("choices")
-            if isinstance(choices, list) and choices:
-                return self._extract_finish_reason(choices[0])
-            return None
-        finish_reason = getattr(raw_output, "finish_reason", None)
-        if finish_reason is not None:
-            return str(finish_reason)
-        choices = getattr(raw_output, "choices", None)
-        if isinstance(choices, list) and choices:
-            return self._extract_finish_reason(choices[0])
-        return None
-
-    def _extract_tool_calls(self, raw_output: Any) -> List[Dict[str, Any]] | None:
-        if isinstance(raw_output, dict):
-            tool_calls = raw_output.get("tool_calls")
-            if isinstance(tool_calls, list):
-                return [self._normalize_tool_call(item) for item in tool_calls]
-            choices = raw_output.get("choices")
-            if isinstance(choices, list) and choices:
-                return self._extract_tool_calls(choices[0])
-            message = raw_output.get("message")
-            if isinstance(message, dict):
-                return self._extract_tool_calls(message)
-            return None
-        tool_calls = getattr(raw_output, "tool_calls", None)
-        if isinstance(tool_calls, list):
-            return [self._normalize_tool_call(item) for item in tool_calls]
-        message = getattr(raw_output, "message", None)
-        if message is not None:
-            inner = getattr(message, "tool_calls", None)
-            if isinstance(inner, list):
-                return [self._normalize_tool_call(item) for item in inner]
-        choices = getattr(raw_output, "choices", None)
-        if isinstance(choices, list) and choices:
-            return self._extract_tool_calls(choices[0])
-        return None
-
-    def _normalize_tool_call(self, tool_call: Any) -> Dict[str, Any]:
-        if isinstance(tool_call, dict):
-            payload = dict(tool_call)
-            function = payload.get("function")
-            if isinstance(function, dict):
-                payload["function"] = dict(function)
-            return payload
-        function = getattr(tool_call, "function", None)
-        normalized: Dict[str, Any] = {
-            "id": getattr(tool_call, "id", None),
-            "type": getattr(tool_call, "type", None),
-        }
-        if function is not None:
-            normalized["function"] = {
-                "name": getattr(function, "name", None),
-                "arguments": getattr(function, "arguments", None),
-            }
-        return normalized
-
-    def _extract_model_name(self, raw_output: Any) -> str | None:
-        if isinstance(raw_output, dict):
-            for key in ("model_name", "model"):
-                value = raw_output.get(key)
-                if value is not None:
-                    return str(value)
-            return None
-        for key in ("model_name", "model"):
-            value = getattr(raw_output, key, None)
-            if value is not None:
-                return str(value)
-        return None
-
-    def _extract_provider(self, raw_output: Any) -> str | None:
-        if isinstance(raw_output, dict):
-            value = raw_output.get("provider")
-            return str(value) if value is not None else None
-        value = getattr(raw_output, "provider", None)
-        return str(value) if value is not None else None
-
-    def _extract_response_metadata(self, raw_output: Any) -> Dict[str, Any]:
-        metadata: Dict[str, Any] = {}
-        if isinstance(raw_output, dict):
-            for key in ("id", "response_id", "created"):
-                if key in raw_output:
-                    metadata[key] = raw_output.get(key)
-            return metadata
-        for key in ("id", "response_id", "created"):
-            value = getattr(raw_output, key, None)
-            if value is not None:
-                metadata[key] = value
-        return metadata
-
     def _decision_from_native_tool_calls(
         self,
         *,
@@ -1649,7 +2535,11 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         step: int,
         record: StepRecord | None,
     ) -> Decision[ActionT] | None:
-        if response is None or not isinstance(response.tool_calls, list) or not response.tool_calls:
+        if (
+            response is None
+            or not isinstance(response.tool_calls, list)
+            or not response.tool_calls
+        ):
             return None
         if not self._native_tool_call_preferred():
             if record is not None and not record.decision_source:
@@ -1657,23 +2547,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             return None
         actions: List[Action] = []
         for item in response.tool_calls:
-            normalized = self._action_from_tool_call(item)
-            if normalized is None:
-                reason = "tool_call_arguments_invalid"
-                if record is not None:
-                    record.native_tool_call_used = False
-                    record.native_tool_call_fallback_reason = reason
-                self.engine._emit(
-                    step,
-                    RuntimePhase.DECIDE,
-                    payload={
-                        "stage": "native_tool_call_fallback",
-                        "reason": reason,
-                        "tool_call": item,
-                    },
-                )
-                return None
-            actions.append(normalized)
+            actions.append(self._action_from_tool_call(item))
         decision: Decision[ActionT] = cast(
             Decision[ActionT],
             Decision.act(
@@ -1703,100 +2577,293 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
 
     def _native_tool_call_preferred(self) -> bool:
         llm = getattr(self.engine.agent, "llm", None)
-        metadata = dict(getattr(llm, "qitos_harness_metadata", {}) or {}) if llm is not None else {}
-        tool_policy = metadata.get("tool_policy")
-        if isinstance(tool_policy, dict) and tool_policy.get("native_tool_call_preferred") is True:
-            return True
-        protocol = self.engine.resolve_protocol()
-        if protocol is not None and getattr(protocol, "supports_native_tool_call_markup", False):
-            return True
-        return False
+        return native_tool_calls_preferred(
+            llm=llm,
+            protocol=self.engine.resolve_protocol(),
+        )
 
     def _trim_native_tool_history(
         self, history: List[Dict[str, Any]], *, max_rounds: int
     ) -> List[Dict[str, Any]]:
-        if max_rounds <= 0:
+        if max_rounds <= 0 or not history:
             return history
-        round_steps: List[int] = []
-        for message in history:
+        wrapped: List[HistoryMessage] = []
+        for index, message in enumerate(history):
+            step_marker = message.get("_step_id")
+            step_id = int(step_marker) if isinstance(step_marker, int) else 0
+            wrapped.append(
+                HistoryMessage(
+                    role=str(message.get("role") or "user"),
+                    content=message.get("content"),
+                    step_id=step_id,
+                    reasoning_content=message.get("reasoning_content"),
+                    tool_calls=[
+                        dict(call)
+                        for call in list(message.get("tool_calls") or [])
+                        if isinstance(call, dict)
+                    ],
+                    tool_call_id=(
+                        str(message["tool_call_id"])
+                        if message.get("tool_call_id") not in (None, "")
+                        else None
+                    ),
+                    name=(
+                        str(message["name"])
+                        if message.get("name") not in (None, "")
+                        else None
+                    ),
+                    metadata={"history_index": index},
+                    native_items=[
+                        dict(item)
+                        for item in list(message.get("native_items") or [])
+                        if isinstance(item, dict)
+                    ],
+                )
+            )
+        groups = group_history_rounds(wrapped)
+        selected = groups[-int(max_rounds) :]
+        keep_indices = {
+            int(message.metadata["history_index"])
+            for group in selected
+            for message in group
+        }
+        return [
+            message for index, message in enumerate(history) if index in keep_indices
+        ]
+
+    def _tool_transaction_parity(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        offered = [
+            call_id
+            for message in messages
+            if message.get("role") == "assistant"
+            for call_id in message_tool_call_ids(message)
+        ]
+        results = [
+            result_id
+            for message in messages
+            for result_id in message_tool_result_ids(message)
+        ]
+        offered_counts = Counter(offered)
+        result_counts = Counter(results)
+        missing = sorted((offered_counts - result_counts).elements())
+        orphaned = sorted((result_counts - offered_counts).elements())
+        return {
+            "offered_call_count": len(offered),
+            "result_count": len(results),
+            "missing_result_ids": missing,
+            "orphan_result_ids": orphaned,
+            "valid": not missing and not orphaned,
+        }
+
+    def _merge_runtime_context_into_last_tool(
+        self, messages: List[Dict[str, Any]], runtime_context: str
+    ) -> tuple[bool, str | None]:
+        """Attach transient controller state to the final real tool result.
+
+        The provider-visible tool chain remains valid because the message keeps
+        the tool call id produced by the model.  A synthetic hidden tool would
+        instead require fabricating an assistant call/result pair and degrade
+        trace accuracy.
+        """
+        context = str(runtime_context or "").strip()
+        if not context:
+            return False, None
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if not isinstance(message, dict) or message.get("role") != "tool":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            updated = dict(message)
+            if _is_decision_context_packet(context):
+                updated["content"] = f"{content.rstrip()}\n\n{context}"
+            else:
+                updated["content"] = (
+                    f"{content.rstrip()}\n\n[{_RUNTIME_CONTEXT_IN_TOOL_NOTICE}]\n{context}"
+                )
+            messages[index] = updated
+            tool_call_id = updated.get("tool_call_id")
+            return True, str(tool_call_id) if tool_call_id is not None else None
+        return False, None
+
+    def _normalize_decision_context_packet(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        authoritative_source: str,
+        delivery: Dict[str, Any],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Ensure the actual provider packet has one current Decision Context.
+
+        Decision Context is reconstructed from controller state every turn and
+        is never durable conversation history.  Old traces, a partial merge,
+        or a retry must therefore not be allowed to turn a duplicate transient
+        block into a terminal agent failure.
+        """
+        source_blocks = _DECISION_CONTEXT_PATTERN.findall(
+            str(authoritative_source or "")
+        )
+        if len(source_blocks) != 1:
+            return messages, {
+                "rebuild_required": True,
+                "reason": "authoritative_invalid",
+                "before_count": len(self._decision_context_blocks(messages)),
+                "after_count": len(self._decision_context_blocks(messages)),
+                "authoritative_context": "",
+            }
+        authoritative = source_blocks[0]
+        before_blocks = self._decision_context_blocks(messages)
+        valid = len(before_blocks) == 1 and before_blocks[0] == authoritative
+        if valid:
+            return messages, {
+                "rebuild_required": False,
+                "reason": "",
+                "before_count": 1,
+                "after_count": 1,
+                "authoritative_context": authoritative,
+            }
+
+        if not before_blocks:
+            reason = "missing"
+        elif len(before_blocks) > 1:
+            reason = "duplicate"
+        else:
+            reason = "mismatch"
+        rebuilt: List[Dict[str, Any]] = []
+        for message in messages:
             if not isinstance(message, dict):
                 continue
-            role = str(message.get("role") or "")
-            if not bool(message.get("tool_calls")) and role != "tool":
-                continue
-            step_id = message.get("_step_id")
-            if isinstance(step_id, int):
-                round_steps.append(step_id)
-        if not round_steps:
-            return history
-        keep_steps = sorted(set(round_steps))[-max_rounds:]
-        earliest_step = min(keep_steps)
-        trimmed: List[Dict[str, Any]] = []
-        for message in history:
-            step_marker = message.get("_step_id")
-            if not isinstance(step_marker, int) or step_marker >= earliest_step:
-                trimmed.append(message)
-        return trimmed
+            updated = dict(message)
+            # System prompt content is authored stable text.  Only transient
+            # non-system delivery is eligible for replacement.
+            if updated.get("role") != "system":
+                updated["content"] = _strip_decision_context_content(
+                    updated.get("content")
+                )
+            rebuilt.append(updated)
+
+        requested = str(delivery.get("requested") or "").strip().lower()
+        merged = False
+        if requested == "merge_tool":
+            merged, tool_call_id = self._merge_runtime_context_into_last_tool(
+                rebuilt, authoritative
+            )
+            if merged:
+                delivery.update(
+                    {
+                        "effective": "merge_tool",
+                        "target_tool_call_id": tool_call_id,
+                        "fallback_reason": None,
+                    }
+                )
+        if not merged:
+            rebuilt.append({"role": "user", "content": authoritative})
+            delivery.update(
+                {
+                    "effective": "user",
+                    "target_tool_call_id": None,
+                    "fallback_reason": (
+                        "no_text_tool_result" if requested == "merge_tool" else None
+                    ),
+                }
+            )
+        after_count = len(self._decision_context_blocks(rebuilt))
+        return rebuilt, {
+            "rebuild_required": True,
+            "reason": reason,
+            "before_count": len(before_blocks),
+            "after_count": after_count,
+            "authoritative_context": authoritative,
+        }
 
     def _ensure_chain_consistency(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Ensure assistant tool calls and tool responses form a valid chain.
+        """Project a strict, immutable assistant/tool transaction chain.
 
-        Window trimming can retain a tool response after its declaring
-        assistant message has been evicted. Errors or crashes can leave the
-        opposite shape: an assistant tool call without a response. LLM APIs
-        reject both forms. Remove orphan responses, then preserve the existing
-        recovery behavior by adding placeholder responses for missing ones.
+        Every assistant call is followed immediately by exactly one result in
+        call order. Existing results are moved next to their declaring call,
+        duplicate and orphan results are dropped, and an interrupted call gets
+        one deterministic terminal placeholder. The canonical history remains
+        unchanged.
         """
         if not messages:
             return messages
 
-        # Collect all tool_call_ids from assistant messages
         expected_tool_ids: List[str] = []
         for msg in messages:
             if msg.get("role") != "assistant":
                 continue
-            tool_calls = msg.get("tool_calls", [])
-            if not tool_calls:
-                continue
-            for tc in tool_calls:
-                tc_id = tc.get("id") if isinstance(tc, dict) else None
-                if tc_id:
-                    expected_tool_ids.append(tc_id)
-
-        expected_tool_id_set = set(expected_tool_ids)
-        result = [
-            msg
-            for msg in messages
-            if msg.get("role") != "tool"
-            or msg.get("tool_call_id") in expected_tool_id_set
-        ]
+            expected_tool_ids.extend(message_tool_call_ids(msg))
 
         if not expected_tool_ids:
-            return result
+            return [msg for msg in messages if not message_tool_result_ids(msg)]
 
-        # Collect all tool_call_ids that already have responses
-        responded_ids: set = set()
-        for msg in result:
-            if msg.get("role") == "tool":
-                tc_id = msg.get("tool_call_id")
-                if tc_id:
-                    responded_ids.add(tc_id)
+        expected_set = set(expected_tool_ids)
+        results_by_id: Dict[str, List[int]] = {}
+        result_ids_by_index: Dict[int, List[str]] = {}
+        for index, msg in enumerate(messages):
+            result_ids = [
+                result_id
+                for result_id in message_tool_result_ids(msg)
+                if result_id in expected_set
+            ]
+            if not result_ids:
+                continue
+            result_ids_by_index[index] = result_ids
+            for result_id in result_ids:
+                results_by_id.setdefault(result_id, []).append(index)
 
-        # Find dangling tool calls and add placeholder responses
-        missing_ids = [tid for tid in expected_tool_ids if tid not in responded_ids]
-        if not missing_ids:
-            return result
-
-        # Insert placeholder tool responses after the last message
-        for tid in missing_ids:
-            result.append({
-                "role": "tool",
-                "tool_call_id": tid,
-                "content": "[Tool execution was interrupted. No result available.]",
-            })
-        return result
+        projected: List[Dict[str, Any]] = []
+        used_result_indices: set[int] = set()
+        satisfied_result_counts: Counter[str] = Counter()
+        for index, msg in enumerate(messages):
+            if index in result_ids_by_index:
+                continue
+            projected.append(msg)
+            if msg.get("role") != "assistant":
+                continue
+            for normalized_id in message_tool_call_ids(msg):
+                if satisfied_result_counts[normalized_id] > 0:
+                    satisfied_result_counts[normalized_id] -= 1
+                    continue
+                available = [
+                    result_index
+                    for result_index in results_by_id.get(normalized_id, [])
+                    if result_index not in used_result_indices
+                ]
+                if available:
+                    result_index = available[0]
+                    used_result_indices.add(result_index)
+                    satisfied_result_counts.update(result_ids_by_index[result_index])
+                    satisfied_result_counts[normalized_id] -= 1
+                    projected.append(messages[result_index])
+                    continue
+                projected.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": normalized_id,
+                        "content": json.dumps(
+                            {
+                                "status": "error",
+                                "code": "tool_call_not_completed",
+                                "reason": (
+                                    "The tool call did not produce a result in this "
+                                    "transaction."
+                                ),
+                                "next_action": (
+                                    "Retry the call if it is still relevant."
+                                ),
+                            },
+                            sort_keys=True,
+                        ),
+                    }
+                )
+        return projected
 
     def _strip_internal_message_keys(
         self, messages: List[Dict[str, Any]]
@@ -1813,19 +2880,17 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             cleaned.append(payload)
         return cleaned
 
-    def _action_from_tool_call(self, tool_call: Dict[str, Any]) -> Action | None:
-        if not isinstance(tool_call, dict):
-            return None
+    def _action_from_tool_call(self, tool_call: Dict[str, Any]) -> Action:
         function = tool_call.get("function")
-        if not isinstance(function, dict):
-            return None
-        name = str(function.get("name") or "").strip()
-        if not name:
-            return None
-        arguments = function.get("arguments")
+        function_payload = function if isinstance(function, dict) else {}
+        name = str(function_payload.get("name") or "").strip()
+        arguments = function_payload.get("arguments")
         args: Dict[str, Any] = {}
         repaired_arguments = False
-        if isinstance(arguments, dict):
+        protocol_error: str | None = None
+        if not isinstance(function, dict) or not name:
+            protocol_error = "tool_call_invalid"
+        elif isinstance(arguments, dict):
             args = dict(arguments)
         elif isinstance(arguments, str):
             text = arguments.strip()
@@ -1835,26 +2900,39 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 except json.JSONDecodeError:
                     repaired = escape_json_string_control_chars(text)
                     if repaired is None:
-                        return None
-                    try:
-                        parsed = json.loads(repaired)
-                    except json.JSONDecodeError:
-                        return None
-                    repaired_arguments = True
-                if not isinstance(parsed, dict):
-                    return None
-                args = dict(parsed)
+                        protocol_error = "tool_call_arguments_invalid"
+                    else:
+                        try:
+                            parsed = json.loads(repaired)
+                        except json.JSONDecodeError:
+                            protocol_error = "tool_call_arguments_invalid"
+                        else:
+                            repaired_arguments = True
+                if protocol_error is None:
+                    if not isinstance(parsed, dict):
+                        protocol_error = "tool_call_arguments_invalid"
+                    else:
+                        args = dict(parsed)
         elif arguments is not None:
-            return None
+            protocol_error = "tool_call_arguments_invalid"
         metadata = {
             "tool_call_type": tool_call.get("type"),
             "decision_source": "native_tool_calls",
         }
         if repaired_arguments:
             metadata["arguments_repair"] = "escaped_control_chars"
+        if protocol_error is not None:
+            metadata.update(
+                {
+                    "protocol_error": protocol_error,
+                    "raw_arguments": arguments,
+                }
+            )
         return Action(
-            name=name,
+            name=name or "<invalid-native-tool-call>",
             args=args,
-            action_id=(str(tool_call.get("id")) if tool_call.get("id") is not None else None),
+            action_id=(
+                str(tool_call.get("id")) if tool_call.get("id") is not None else None
+            ),
             metadata=metadata,
         )

@@ -174,6 +174,10 @@ parser = JsonDecisionParser()
 # {"thought": "I need to search.", "action": {"name": "search", "args": {"query": "..."}}}
 ```
 
+`final_answer` normally contains text. A JSON object or array is also accepted and
+is normalized to compact JSON text in `Decision.final_answer`, preserving the core
+string contract for state and trace consumers.
+
 </Accordion>
 
 <Accordion title="XmlDecisionParser">
@@ -272,10 +276,11 @@ Use it when:
 
 It supports:
 
-- warning thresholds before overflow
-- round grouping with `MessageGrouper`
-- micro-compaction of large old messages
-- summary compaction for earlier rounds
+- warning thresholds before the Engine's 80% force boundary
+- transaction-aware round grouping with `MessageGrouper`
+- level 1 micro-compaction of large messages in older complete rounds
+- level 2 summaries that preserve configured recent rounds
+- level 3 resummaries that preserve the latest complete round
 - runtime metadata and compaction events that can surface in traces
 
 Use it when:
@@ -290,7 +295,6 @@ Use it when:
 
 - `max_tokens`
 - `keep_last_rounds`
-- `keep_last_messages`
 - `warning_ratio`
 - `auto_compact`
 - micro-compaction preview sizes
@@ -298,9 +302,18 @@ Use it when:
 
 ### MessageGrouper
 
-`MessageGrouper` groups messages into compactable rounds. It prefers grouping by step when possible, and falls back to assistant-boundary grouping otherwise.
+`MessageGrouper` groups messages into compactable rounds. It correlates assistant calls
+and tool results by call id even when they cross step boundaries, so selection and
+compaction never split one tool transaction.
 
-This matters because QitOS compacts context in ways that preserve the structure of an agent trajectory (the sequence of observations and decisions across steps).
+The Engine counts the complete provider packet, including API-delivered tool and response
+schemas, against a provider-safe input budget. At 80% it requests compaction before model
+dispatch. Summary work runs against an immutable history snapshot and is committed only
+as a projection when the version still matches; canonical history remains untouched.
+Exact-prefix checkpoints let later projections summarize only newly covered complete
+rounds. With auto-compaction enabled, token selection precedes generic message-count
+windows. Use `keep_last_rounds` for transaction-safe recent retention; compact history
+does not expose arbitrary message slicing that could split provider tool transactions.
 
 </Tab>
 
@@ -450,11 +463,20 @@ def __init__(
     workspace_root: str = ".",
     shell_timeout: int = 30,
     include_notebook: bool = True,
+    *,
     enable_lsp: bool = True,
     enable_tasks: bool = True,
     enable_web: bool = True,
+    profile: str = "full",
+    include_http_tools: bool = False,
+    auto_approve: bool = False,
+    allow_local_fallback: bool = True,
 )
 ```
+
+Profiles expose one exact lowercase tool surface. `glob` and `grep` use fixed-argv
+`rg`, respect ignore files by default, and accept separate `include_hidden` and
+`include_ignored` controls.
 
 **Typical usage**
 
@@ -470,7 +492,6 @@ registry.register_toolset(
         enable_lsp=False,
         enable_tasks=False,
         enable_web=False,
-        expose_modern_names=False,
     )
 )
 ```
@@ -631,6 +652,72 @@ Stand-alone tool objects you can register directly.
 
 <AccordionGroup>
 
+<Accordion title="AgentTool">
+
+Launch a fresh child-agent run from a normal tool call. The owning application must
+inject an invocation factory that constructs the child from its run-scoped resources.
+
+```python
+from qitos.kit.tool.agent import AgentInvocation, AgentTool
+
+def build_child(request, runtime_context):
+    child_engine = make_fresh_engine(
+        delegate_depth=runtime_context["delegate_depth"] + 1,
+    )
+    return AgentInvocation(engine=child_engine, task=request.prompt)
+
+tool = AgentTool(
+    invocation_factory=build_child,
+    execution_scope=acquire_run_scoped_slot,
+    execution_mode="background",
+    max_delegate_depth=1,
+    max_turns=200,
+)
+```
+
+The model-facing arguments are `description`, `prompt`, optional `name`, and optional
+`subagent_type`. Each factory call must return an independent Engine; sharing a mutable
+AgentModule, history, or model client between concurrent children is unsupported.
+`execution_scope` can enforce an application-owned concurrency or lifecycle boundary.
+The result reports output, steps, total tokens, elapsed time, stop reason, and run id.
+`max_turns` is a tool-level safety ceiling and defaults to the exported
+`DEFAULT_SUBAGENT_MAX_TURNS` value of 200. Invocation factories receive that value on
+`AgentRequest.max_turns`.
+
+`execution_mode` accepts `"foreground"`, `"optional_background"`, or `"background"`.
+The optional mode exposes `run_in_background` to the model. The background mode omits
+that argument, always returns a running receipt with a task id, and posts an
+`agent.child.completed` `RuntimeInput` to the exact parent Engine run when the child
+terminates. `AgentTool` snapshots the parent history at launch, but does not call the
+invocation factory until `execution_scope` admits the task. Queued work therefore retains
+its launch context without allocating a model, Engine, or trace before it can run. If a
+child has no final answer, the completion payload contains a bounded projection of its
+recent tool evidence instead of silently dropping useful work.
+
+`active_background_count`, `get_background_result(task_id)`, `cancel_background(task_id)`,
+`snapshot_background_events()`, and `close()` expose lifecycle control to the owning
+application. A snapshot projects only the active children's bounded, completed tool
+results into `agent.child.snapshot` runtime events; it does not expose model responses or
+reasoning. This lets an owner preserve evidence immediately before a forced conclusion.
+`close()` cooperatively cancels outstanding child Engines; applications with run-scoped
+resources should call it before those resources leave scope. It returns the number of
+tasks still winding down after the requested bounded wait, and a later call can wait
+again after an earlier non-blocking cancellation request. Background children use a
+bounded daemon worker pool, so an uncooperative synchronous child cannot keep interpreter
+shutdown alive indefinitely. Terminal result state is stored before QitOS attempts to
+wake the parent. An `execution_scope` that waits for an application slot should observe the
+`runtime_context["agent_cancelled"]` callback so teardown can wake a child that has not
+entered its Engine yet.
+
+Delegation depth is checked before the factory runs. Multiple Agent calls execute in
+parallel only when the parent Engine's `ActionExecutionPolicy` allows `Agent` and the
+tool remains marked concurrency-safe. The model-facing tool description recommends one
+same-response call per independent multi-step task, while dependent steps stay in the
+parent and cheap mechanical variants use ordinary tools in a bounded batch. The parent
+should not repeat work it has already delegated.
+
+</Accordion>
+
 <Accordion title="HTTPGet / HTTPPost / HTTPRequest">
 
 HTTP request tools with automatic retries and structured response payloads.
@@ -647,7 +734,7 @@ def __init__(
     self,
     headers: Optional[Dict[str, str]] = None,
     timeout: int = 30,
-    max_retries: int = 2,
+    retry_policy: Optional[RetryPolicy] = None,
 )
 ```
 
@@ -660,13 +747,18 @@ def __init__(
     self,
     headers: Optional[Dict[str, str]] = None,
     timeout: int = 30,
-    max_retries: int = 2,
-    backoff_factor: float = 0.4,
+    retry_policy: Optional[RetryPolicy] = None,
     user_agent: str = "QitOS-WebTool/1.0",
 )
 ```
 
-`HTTPRequest.run()` accepts `method`, `url`, `params`, `data`, `json_data`, `headers`, `timeout`, `verify_tls`, `allow_redirects`, `max_content_chars`.
+`HTTPRequest.execute(args, runtime_context)` accepts an `args` dictionary containing
+`method`, `url`, `params`, `data`, `json_data`, `headers`, `timeout`, `verify_tls`,
+`allow_redirects`, and `max_content_chars`.
+
+The requests transport disables its own retry loop. When retries are safe for the
+specific HTTP operation, pass an explicit QitOS `RetryPolicy`; otherwise the request
+runs once.
 
 </Accordion>
 
@@ -680,7 +772,8 @@ from qitos.kit import HTMLExtractText
 
 **Constructor** — `HTMLExtractText()` (no parameters)
 
-**`run(html, max_chars=6000, keep_links=False)`** — Returns `{"status", "content", "length", "title"}`.
+**`execute(args, runtime_context)`** — accepts `html`, `max_chars`, and `keep_links`
+inside `args`, and returns `{"status", "content", "length", "title"}`.
 
 </Accordion>
 
@@ -987,35 +1080,43 @@ Reads `OPENAI_API_KEY` and `OPENAI_BASE_URL` from the environment by default.
 <Accordion title="Local models">
 
 ```python
-from qitos.models import OllamaModel, LMStudioModel, VLLMModel
+from qitos.models import builtin_model_factory
 
-llm = OllamaModel(model="llama3")
-llm = LMStudioModel(model="mistral", base_url="http://localhost:1234/v1")
-llm = VLLMModel(model="meta-llama/Llama-3-8b", base_url="http://localhost:8000/v1")
+factory = builtin_model_factory()
+ollama = factory.create("ollama", model="llama3")
+lmstudio = factory.create("lmstudio", model="mistral")
+vllm = factory.create("vllm", model="meta-llama/Llama-3-8b")
 ```
 
-All local models share the same base constructor signature as `OpenAICompatibleModel`.
+LM Studio and vLLM use the canonical OpenAI-compatible adapter with local endpoint
+defaults. Ollama uses its native asynchronous adapter.
 
 </Accordion>
 
 <Accordion title="ModelFactory">
 
-Automatically selects and constructs a model from environment variables.
+Resolve environment configuration separately, then construct from an explicit factory.
 
 ```python
-from qitos.models import ModelFactory
+from qitos.config import ModelConfig, build_model
 
-llm = ModelFactory.from_env()
+config = ModelConfig.from_env()
+if config is None:
+    raise RuntimeError("No model provider configured")
+llm = build_model(config)
 ```
 
-Reads `QITOS_MODEL` (or `OPENAI_API_KEY` / `OPENAI_BASE_URL`) to pick the right backend.
+`ModelConfig.from_env()` reads provider environment variables; `build_model()` uses an
+isolated built-in factory unless one is supplied explicitly.
 
 Register a custom backend:
 
 ```python
-@ModelFactory.register("my_backend")
-class MyModel(Model):
-    ...
+from qitos.models import ModelFactory
+
+factory = ModelFactory()
+factory.register("my_backend", MyModel)  # your Model subclass
+llm = factory.create("my_backend", model="example")
 ```
 
 </Accordion>

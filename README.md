@@ -18,6 +18,91 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One async-native model runtime**: `Engine.arun()` and `Engine.astep()` now own the
+  model path from request through terminal response. OpenAI Responses, Anthropic
+  Messages, compatible Chat Completions, Gemini, LiteLLM, and Ollama implement the same
+  asynchronous stream contract; the former sync/async class hierarchy, `call_raw`,
+  import-time registration, and daemon-thread `AsyncEngine` bridge are gone.
+- **Same-spec qita comparisons**: compare views now verify recorded model, prompt,
+  tools, environment, context policy, budget, source revision, and experiment
+  provenance first. Mismatched or incomplete pairs are explicitly descriptive rather
+  than causal; matching pairs remain subject to provider and environment nondeterminism.
+- **Truthful typed model streams**: Chat, Responses, and Anthropic streams now retain
+  provider finish reasons, reasoning and tool-call deltas, completed tool calls, and
+  usage through one `ModelStreamChunk` contract. Incomplete streams fail instead of
+  fabricating completion, and Engine handlers no longer receive `on_end` after an error.
+- **Call-accurate qita tool statistics**: tool counts and failures now come from the
+  canonical action/result pairing instead of applying one step-level error to every
+  call. Exact lifecycle counts and unmatched trace evidence remain visible for audits.
+- **One bounded model-request lifecycle**: every Engine model call receives the run's
+  absolute deadline and immediate cancellation signal. Provider connection, stream-idle,
+  and QitOS-owned retry waits use live remaining time; cancellation closes the active
+  asynchronous stream and late responses cannot commit.
+- **One bounded tool-action lifecycle**: one absolute deadline now covers interceptor-
+  free admission, approval, permission checks, invocation retries, and backoff.
+  `ToolSpec.retry_policy` is the sole retry owner; validation and authorization run once,
+  HTTP client retries are disabled, and daemon action workers avoid unbounded concurrent
+  executor drain. Dead Action execution knobs and the duplicate interceptor middleware
+  have been removed.
+- **One class-tool execution contract**: class tools now expose only
+  `execute(args, runtime_context)`. `ToolRegistry` performs exact canonical-name lookup,
+  while `ActionExecutor` alone owns validation, permissions, timeout/retry handling,
+  invocation, and result normalization. Old `run`/`call` adapters, registry execution,
+  automatic registry name aliases, duck-typed fallbacks, and implicit concurrency
+  whitelists are gone; parallelism requires an explicit `concurrency_safe=True`
+  declaration.
+- **Truthful tool lifecycle results**: one canonical `ToolResult` projection now
+  preserves success, partial, running, error, skipped/denied, input/approval, timeout,
+  and cancellation across execution records, observations, history, traces, summaries,
+  and success metrics. Unknown and legacy alias statuses fail closed; domain outcomes
+  use a separate field instead of overloading execution status.
+- **Provider-consistent reasoning continuation**: model presets now resolve GPT-5.6
+  `max` without changing older OpenAI capability limits, forced compatible-tool calls
+  cannot send contradictory thinking controls, and official Responses streams preserve
+  encrypted reasoning items for stateless replay without exposing them in trace
+  summaries or visible answers.
+- **Run-scoped deadlines and bounded async shutdown**: relative runtime budgets and
+  caller-supplied monotonic deadlines now resolve to one effective deadline shared by
+  the Engine, tool admission, tool timeouts, retry backoff, and runtime waits. Async
+  cancellation requests cooperative Engine shutdown without letting an unresponsive
+  synchronous call keep the hosting event loop or CLI process alive indefinitely.
+- **One native tool-call lane**: when a model preset prefers provider-native tools,
+  typed calls now bypass text interpreters and parsers, API requests omit the duplicate
+  framework action contract, and every accepted, rejected, or malformed call commits one
+  ordered result with the original call id. Malformed arguments never execute a tool.
+- **Bounded child-agent lifecycle**: `AgentTool` snapshots parent history at launch,
+  admits child Engines only when a concurrency slot opens, records terminal state before
+  waking the parent, and uses bounded daemon workers so cooperative cancellation cannot
+  hold interpreter shutdown indefinitely. Its model contract still keeps dependent or
+  cheap mechanical work local.
+- **Environment-backed coding tools**: named Env capability groups now let the same
+  bounded workspace tools run against host, container, or remote providers. The compact
+  workspace profile exposes one lowercase surface (`read_file`, `write_file`,
+  `edit_file`, `glob`, `grep`, and related tools). Search uses fixed-argv `rg`, stable
+  bounded results, NUL-safe paths, and explicit hidden/ignored-file controls without
+  per-tool backend adapters.
+- **Managed public web fetch**: a provider-neutral `web_fetch` tool now accepts
+  host-injected providers. An explicitly configured Kimi managed-fetch adapter adds
+  public-initial-URL validation, bounded results, and provider failure categories; QitOS
+  does not guess a service URL from the selected model.
+- **Runtime input and idle wait**: background work can post a small event to an exact
+  Engine run. Explicit runtime waits sleep without model polling or step growth and
+  wake on input, cancellation, or the run deadline.
+- **Transactional OpenAI-compatible streams**: Engine calls use one explicit QitOS
+  retry budget with SDK retries disabled. Retryable mid-stream failures discard partial
+  text and tool calls before retrying within a 300-second recovery window by default,
+  and an event-idle timeout detects stalled streams
+  without cutting off healthy long responses.
+- **Readable tool evidence**: tools can now project a compact `model_summary`
+  into native tool-call history without discarding their full structured result
+  from reducers, traces, or replay.
+- **Transaction-safe context compaction**: complete provider inputs, including native
+  tool schemas, now force compaction at 80% of the provider-safe input budget. Three
+  bounded levels preserve complete tool exchanges, and failed or raced summaries never
+  mutate canonical history. The obsolete message-slicing compatibility option is gone;
+  recent retention is expressed only in complete rounds.
+- **Modern CyberGym tool turns**: authoritative per-step runtime state is now folded into the final real tool result instead of creating a trailing user turn, preserving native `assistant -> tool` chains for compatible providers.
+- **qita trajectory workbench**: Run pages now open in a diagnosis-first view with a Focus Navigator, Agent Behavior Story, and right-side Inspector. Each step follows `Input -> Thought -> Action Calls -> Environment Observation`; every action is paired with its complete parameters, status, latency, and model-visible result, while canonical raw and unmatched evidence stays auditable in the Inspector. Failed calls expand by default, successful calls fold, and long content is wrapped and never available only as a truncated preview. CyberGym budget stops and `submit_poc` verification failures are promoted as review targets. Persistent light/dark themes cover board, run, replay, and compare pages.
 - **Consistent immediate cancellation traces**: once the Engine observes an immediate cancellation, State, task/result objects, END events, and trace manifests now agree on `cancelled_immediate`; qita sees the manifest as `stopped` rather than a normal completion.
 - **No false completion for structured action text**: when a native-tool model emits malformed action fields as text instead of `tool_calls`, QitOS now keeps the parser recovery path rather than treating that text as a final answer; ordinary natural-language conclusions remain unchanged.
 - **Window-safe native tool history**: model requests now discard orphan tool results when a message window evicts their assistant declaration, preventing long-running parallel-tool agents from sending invalid `tool_call_id` chains while preserving complete rounds and existing recovery behavior.

@@ -1,25 +1,24 @@
-"""LiteLLM model adapter."""
+"""Asynchronous LiteLLM adapter for its OpenAI-compatible stream."""
 
 from __future__ import annotations
 
-import json
 import os
+from collections.abc import AsyncIterator
 from typing import Any, Dict, List, Optional
 
-from .base import Model, ModelFactory
+from .transport import (
+    ModelRetryPolicy,
+    effective_request_timeout,
+    transactional_stream_with_retry,
+)
+from .base import Model, ModelStreamChunk
+from .openai import ChatEventStream, _to_openai_messages
 
 
 class LiteLLMModel(Model):
-    """
-    LiteLLM-native model adapter.
+    """Use LiteLLM's native async completion transport without SDK retries."""
 
-    Environment variables:
-    - LITELLM_MODEL
-    - LITELLM_API_KEY (optional)
-    - LITELLM_API_BASE (optional)
-    - LITELLM_API_VERSION (optional)
-    - LITELLM_PROVIDER (optional)
-    """
+    provider_name = "litellm"
 
     def __init__(
         self,
@@ -29,11 +28,14 @@ class LiteLLMModel(Model):
         api_version: Optional[str] = None,
         custom_llm_provider: Optional[str] = None,
         system_prompt: Optional[str] = None,
-        temperature: float = 0.7,
+        temperature: float | None = 0.7,
         max_tokens: int = 2048,
-        timeout: int = 60,
+        timeout: float = 60.0,
         context_window: Optional[int] = None,
-    ):
+        max_attempts: int = 2,
+        stream_idle_timeout: float = 60.0,
+        retry_window_seconds: float = 300.0,
+    ) -> None:
         super().__init__(
             model=model,
             system_prompt=system_prompt,
@@ -45,131 +47,115 @@ class LiteLLMModel(Model):
         self.api_base = api_base or os.getenv("LITELLM_API_BASE")
         self.api_version = api_version or os.getenv("LITELLM_API_VERSION")
         self.custom_llm_provider = custom_llm_provider or os.getenv("LITELLM_PROVIDER")
-        self.timeout = timeout
+        if isinstance(timeout, bool) or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if isinstance(stream_idle_timeout, bool) or stream_idle_timeout <= 0:
+            raise ValueError("stream_idle_timeout must be positive")
+        self.timeout = float(timeout)
+        self.stream_idle_timeout = float(stream_idle_timeout)
+        self.retry_policy = ModelRetryPolicy(
+            max_attempts=max_attempts,
+            retry_window_seconds=retry_window_seconds,
+        )
 
-    def _call_api(self, messages: List[Dict[str, Any]], **call_kwargs: Any) -> str:
+    async def _open_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        request_kwargs: Dict[str, Any],
+        *,
+        deadline_monotonic: float | None,
+    ) -> AsyncIterator[ModelStreamChunk]:
         try:
             import litellm
-        except ImportError:
-            return (
-                "Error: LiteLLM is not installed. "
-                'Install optional model dependencies with `pip install "qitos[models]"`.'
-            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "LiteLLM support requires the qitos models extra"
+            ) from exc
 
-        request_kwargs: Dict[str, Any] = {
+        payload: Dict[str, Any] = {
+            **request_kwargs,
             "model": self.model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "timeout": self.timeout,
+            "messages": _to_openai_messages(messages),
+            "stream": True,
+            "num_retries": 0,
         }
+        payload.setdefault("max_tokens", self.max_tokens)
+        payload.setdefault("stream_options", {"include_usage": True})
+        payload.setdefault(
+            "timeout",
+            effective_request_timeout(self.timeout, deadline_monotonic),
+        )
+        if self.temperature is not None:
+            payload.setdefault("temperature", self.temperature)
         if self.api_key:
-            request_kwargs["api_key"] = self.api_key
+            payload.setdefault("api_key", self.api_key)
         if self.api_base:
-            request_kwargs["api_base"] = self.api_base
+            payload.setdefault("api_base", self.api_base)
         if self.api_version:
-            request_kwargs["api_version"] = self.api_version
+            payload.setdefault("api_version", self.api_version)
         if self.custom_llm_provider:
-            request_kwargs["custom_llm_provider"] = self.custom_llm_provider
-        request_kwargs.update(call_kwargs)
+            payload.setdefault("custom_llm_provider", self.custom_llm_provider)
 
-        try:
-            response = litellm.completion(**request_kwargs)
-            self._set_last_usage(self._usage_from_response(response))
-            return self._parse_response(response)
-        except Exception as exc:
-            return f"Error: {str(exc)}"
+        response = await litellm.acompletion(**payload)
+        if not hasattr(response, "__aiter__"):
+            raise TypeError("LiteLLM streaming response must be an async iterator")
+        return ChatEventStream(
+            response,
+            None,
+            provider=self.provider_name,
+            model=self.model,
+        )
 
-    def _parse_response(self, response: Any) -> str:
-        choice = self._get_choice(response)
-        if choice is None:
-            return ""
-        message = self._choice_message(choice)
-        if not message:
-            return ""
-        tool_calls = self._message_value(message, "tool_calls")
-        if tool_calls:
-            return self._format_tool_calls(tool_calls)
-        content = self._message_value(message, "content")
-        return str(content or "").strip()
+    async def stream(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        """Stream one committed LiteLLM transaction."""
 
-    def _usage_from_response(self, response: Any) -> Optional[Dict[str, Any]]:
-        usage = getattr(response, "usage", None)
-        if usage is None and isinstance(response, dict):
-            usage = response.get("usage")
-        if usage is None:
-            return None
-        if isinstance(usage, dict):
-            prompt_tokens = usage.get("prompt_tokens")
-            completion_tokens = usage.get("completion_tokens")
-            total_tokens = usage.get("total_tokens")
-        else:
-            prompt_tokens = getattr(usage, "prompt_tokens", None)
-            completion_tokens = getattr(usage, "completion_tokens", None)
-            total_tokens = getattr(usage, "total_tokens", None)
-        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
-            return None
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
+        request_kwargs = dict(kwargs)
+
+        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+            return await self._open_stream(
+                messages,
+                dict(request_kwargs),
+                deadline_monotonic=deadline_monotonic,
+            )
+
+        async for chunk in transactional_stream_with_retry(
+            create_stream,
+            policy=self.retry_policy,
+            connection_timeout_seconds=self.timeout,
+            event_idle_timeout_seconds=self.stream_idle_timeout,
+            deadline_monotonic=deadline_monotonic,
+            is_terminal=lambda item: item.done,
+        ):
+            yield chunk
+
+    def supports_tool_schema_delivery(
+        self, delivery: str, protocol: Any = None
+    ) -> bool:
+        _ = protocol
+        return str(delivery or "prompt_injection") in {
+            "prompt_injection",
+            "api_parameter",
+            "hybrid",
         }
 
-    def _get_choice(self, response: Any) -> Any:
-        if isinstance(response, dict):
-            choices = response.get("choices") or []
-            return choices[0] if choices else None
-        choices = getattr(response, "choices", None) or []
-        return choices[0] if choices else None
-
-    def _choice_message(self, choice: Any) -> Any:
-        if isinstance(choice, dict):
-            return choice.get("message")
-        return getattr(choice, "message", None)
-
-    def _message_value(self, message: Any, key: str) -> Any:
-        if isinstance(message, dict):
-            return message.get(key)
-        return getattr(message, key, None)
-
-    def _format_tool_calls(self, tool_calls: Any) -> str:
-        items = list(tool_calls or [])
-        parts: List[str] = []
-        for index, call in enumerate(items):
-            function = (
-                call.get("function")
-                if isinstance(call, dict)
-                else getattr(call, "function", None)
-            )
-            name = ""
-            raw_args: Any = {}
-            if isinstance(function, dict):
-                name = str(function.get("name", ""))
-                raw_args = function.get("arguments") or "{}"
-            elif function is not None:
-                name = str(getattr(function, "name", ""))
-                raw_args = getattr(function, "arguments", "{}")
-            try:
-                args = (
-                    json.loads(raw_args)
-                    if isinstance(raw_args, str)
-                    else dict(raw_args or {})
-                )
-            except Exception:
-                args = {"raw_args": raw_args}
-            prefix = f"Action {index + 1}: " if len(items) > 1 else "Action: "
-            line = f"{prefix}{name}"
-            if args:
-                args_str = ", ".join(
-                    f'{k}="{v}"' if isinstance(v, str) else f"{k}={v}"
-                    for k, v in args.items()
-                )
-                line += f"({args_str})"
-            parts.append(line)
-        return "\n".join(parts)
-
-
-ModelFactory.register("litellm")(LiteLLMModel)
+    def build_tool_schema_request_options(
+        self,
+        tool_schema_payload: Optional[List[Dict[str, Any]]],
+        *,
+        protocol: Any = None,
+        delivery: str = "prompt_injection",
+    ) -> Dict[str, Any]:
+        _ = protocol
+        if str(delivery or "prompt_injection") not in {"api_parameter", "hybrid"}:
+            return {}
+        tools = list(tool_schema_payload or [])
+        return {"tools": tools} if tools else {}
 
 
 __all__ = ["LiteLLMModel"]

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
 
+from examples._support import SequenceModel
 from examples.real.terminus_2 import Terminus2Agent
 from qitos.core import HistoryMessage, TerminalCapability
 from qitos.kit import (
@@ -93,22 +93,12 @@ class FakeTerminal(TerminalCapability):
         return self.ts
 
 
-class DummyModel:
-    def __init__(self, outputs: List[str]):
-        self.outputs = list(outputs)
-        self.calls: list[list[dict[str, str]]] = []
-        self.model = "dummy-terminus"
-
-    def __call__(self, messages):
-        self.calls.append(list(messages))
-        return self.outputs.pop(0)
-
-
 def test_send_terminal_keys_tool_uses_terminal_ops() -> None:
     terminal = FakeTerminal()
     tool = SendTerminalKeys()
-    result = tool.run(
-        "ls\n", duration_sec=0.25, runtime_context={"ops": {"terminal": terminal}}
+    result = tool.execute(
+        {"keystrokes": "ls\n", "duration_sec": 0.25},
+        runtime_context={"ops": {"terminal": terminal}},
     )
     assert result["status"] == "success"
     assert terminal.sent == ["ls\n"]
@@ -165,12 +155,12 @@ def test_terminus_json_parser_handles_actions_completion_and_feedback() -> None:
     assert complete.meta["task_complete_requested"] is True
 
     tool_act = parser.parse(
-        '{"analysis":"inventory repo","plan":"use audit tools","tools":[{"name":"audit_inventory","args":{}},{"name":"grep_files","args":{"pattern":"SECRET_KEY"}}]}'
+        '{"analysis":"inventory repo","plan":"use audit tools","tools":[{"name":"audit_inventory","args":{}},{"name":"grep","args":{"pattern":"SECRET_KEY"}}]}'
     )
     assert tool_act.mode == "act"
     assert [item["name"] for item in tool_act.actions] == [
         "audit_inventory",
-        "grep_files",
+        "grep",
     ]
 
     wrapped = parser.parse(
@@ -193,14 +183,14 @@ This should help.
         """Context before.
 {"analysis":"small","plan":"skip","commands":[{"keystrokes":"pwd\\n","duration":0.1}]}
 More notes.
-{"analysis":"inspect files","plan":"use tools","tools":[{"name":"audit_inventory","args":{}},{"name":"grep_files","args":{"pattern":"SECRET_KEY","path_glob":"**/*"}}]}
+{"analysis":"inspect files","plan":"use tools","tools":[{"name":"audit_inventory","args":{}},{"name":"grep","args":{"pattern":"SECRET_KEY","glob":"**/*"}}]}
 Context after.
 """
     )
     assert largest.mode == "act"
     assert [item["name"] for item in largest.actions] == [
         "audit_inventory",
-        "grep_files",
+        "grep",
     ]
     assert largest.meta["parser_diagnostics"]["extraction_mode"] == "extracted"
 
@@ -263,13 +253,14 @@ def test_token_budget_history_summarizes_older_messages() -> None:
 def test_terminus_agent_roundtrip_uses_parser_feedback_and_double_confirmation(
     tmp_path: Path,
 ) -> None:
-    llm = DummyModel(
-        outputs=[
+    llm = SequenceModel(
+        [
             "not valid json",
             '{"analysis":"Need to inspect files","plan":"Run ls","commands":[{"keystrokes":"ls\\n","duration":0.1}]}',
             '{"analysis":"The task looks complete","plan":"Finish","commands":[],"task_complete":true}',
             '{"analysis":"Confirmed completion","plan":"Finish","commands":[],"task_complete":true}',
-        ]
+        ],
+        model="dummy-terminus",
     )
     terminal = FakeTerminal()
     env = TmuxEnv(

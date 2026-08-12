@@ -46,17 +46,37 @@ def _tool_specs(tool_registry: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def _param_rows(spec: Dict[str, Any]) -> List[tuple[str, str]]:
+def _param_rows(spec: Dict[str, Any]) -> List[Dict[str, Any]]:
     schema = spec.get("input_schema") or {}
     props = schema.get("properties") if isinstance(schema, dict) else {}
-    rows: List[tuple[str, str]] = []
+    required = set(schema.get("required") or []) if isinstance(schema, dict) else set()
+    rows: List[Dict[str, Any]] = []
     if isinstance(props, dict):
         for key, value in props.items():
             if isinstance(value, dict):
-                rows.append((str(key), str(value.get("type") or "any")))
+                rows.append(
+                    {
+                        "name": str(key),
+                        "type": str(value.get("type") or "any"),
+                        "description": str(value.get("description") or ""),
+                        "required": key in required,
+                        "default": value.get("default"),
+                        "has_default": "default" in value,
+                        "enum": list(value.get("enum") or []),
+                    }
+                )
             else:
-                rows.append((str(key), "any"))
+                rows.append({"name": str(key), "type": "any", "description": "", "required": key in required, "has_default": False, "enum": []})
     return rows
+
+
+def _param_annotation(row: Dict[str, Any]) -> str:
+    notes = ["required" if row.get("required") else "optional"]
+    if row.get("enum"):
+        notes.append("one of " + " | ".join(str(item) for item in row["enum"]))
+    if row.get("has_default"):
+        notes.append(f"default={row.get('default')!r}")
+    return "; ".join(notes)
 
 
 def render_react_tool_schema(tool_registry: Any) -> str:
@@ -70,8 +90,9 @@ def render_react_tool_schema(tool_registry: Any) -> str:
         params = _param_rows(spec)
         if params:
             lines.append("  Parameters:")
-            for name, kind in params:
-                lines.append(f"  - {name}: {kind}")
+            for row in params:
+                detail = f" — {row['description']}" if row.get("description") else ""
+                lines.append(f"  - {row['name']}: {row['type']} ({_param_annotation(row)}){detail}")
     return "\n".join(lines).strip()
 
 
@@ -107,8 +128,11 @@ def render_xml_tool_schema(tool_registry: Any) -> str:
         params = _param_rows(spec)
         if params:
             lines.append("  <parameters>")
-            for name, kind in params:
-                lines.append(f'    <param name="{name}" type="{kind}" />')
+            for row in params:
+                lines.append(
+                    f'    <param name="{row["name"]}" type="{row["type"]}" '
+                    f'constraints="{_param_annotation(row)}">{row.get("description") or ""}</param>'
+                )
             lines.append("  </parameters>")
         lines.append("</tool>")
     return "\n".join(lines).strip()
@@ -123,8 +147,12 @@ def render_minimax_tool_schema(tool_registry: Any) -> str:
         lines.append(f'<invoke name="{spec["name"]}">')
         if description:
             lines.append(f"  <description>{description}</description>")
-        for name, kind in _param_rows(spec):
-            lines.append(f'  <parameter name="{name}" type="{kind}">value</parameter>')
+        for row in _param_rows(spec):
+            description = row.get("description") or "value"
+            lines.append(
+                f'  <parameter name="{row["name"]}" type="{row["type"]}" '
+                f'constraints="{_param_annotation(row)}">{description}</parameter>'
+            )
         lines.append("</invoke>")
     return "\n".join(lines).strip()
 
@@ -166,11 +194,32 @@ Action: tool_name(arg=value, ...)
 Final Answer: <answer>"""
 
 _JSON_CONTRACT = """Output contract:
-- Tool call:
+- Single tool call:
 {"thought":"...","action":{"name":"tool_name","args":{"key":"value"}}}
+
+- Multiple independent tool calls (use when actions have no data dependencies):
+{"thought":"...","actions":[{"name":"tool_name","args":{"key":"value"}},{"name":"tool_name","args":{"key":"value"}}]}
 
 - Final answer:
 {"thought":"...","final_answer":"..."}"""
+
+_JSON_MULTI_CONTRACT = """Output contract:
+- Single tool call:
+{"thought":"...","action":{"name":"tool_name","args":{"key":"value"}}}
+
+- Multiple independent tool calls (PREFERRED when actions have no dependencies):
+{"thought":"read two source files in parallel","actions":[{"name":"tool1","args":{"key":"value"}},{"name":"tool2","args":{"key":"value"}}]}
+
+- Final answer:
+{"thought":"...","final_answer":"..."}
+
+Rules for multiple tool calls:
+- Use the "actions" array when you need multiple independent operations in one step.
+- Only combine actions with NO data dependencies on each other.
+- Read-only tools (file reads, searches, inspections) can always be combined.
+- NEVER combine write actions (file writes, shell commands) with reads or with each other in the same step.
+- Limit each batch to at most 4 actions.
+- When you have only one tool to call, use the "action" object (not an array)."""
 
 _XML_CONTRACT = """Output contract:
 - Tool call:
@@ -295,17 +344,17 @@ Rules:
 - Examples:
 
 <tool_use>
-<tool_name>bash_v2</tool_name>
+<tool_name>run_command</tool_name>
 <arguments>{"command": "ls -la"}</arguments>
 </tool_use>
 
 <tool_use>
-<tool_name>glob_v2</tool_name>
+<tool_name>glob</tool_name>
 <arguments>{"pattern": "**/*.py"}</arguments>
 </tool_use>
 
 <tool_use>
-<tool_name>file_read_v2</tool_name>
+<tool_name>read_file</tool_name>
 <arguments>{"path": "/tmp/test.py"}</arguments>
 </tool_use>"""
 
@@ -328,12 +377,12 @@ Rules:
 - Examples:
 
 <|tool_calls_section_begin|>
-<|tool_call_begin|> functions.Bash:0 <|tool_call_argument_begin|> {"command": "ls -la"} <|tool_call_end|>
-<|tool_call_begin|> functions.Glob:1 <|tool_call_argument_begin|> {"pattern": "**/*.py"} <|tool_call_end|>
+<|tool_call_begin|> functions.run_command:0 <|tool_call_argument_begin|> {"command": "ls -la"} <|tool_call_end|>
+<|tool_call_begin|> functions.glob:1 <|tool_call_argument_begin|> {"pattern": "**/*.py"} <|tool_call_end|>
 <|tool_calls_section_end|>
 
 <|tool_calls_section_begin|>
-<|tool_call_begin|> functions.Read:0 <|tool_call_argument_begin|> {"file_path": "/tmp/test.py"} <|tool_call_end|>
+<|tool_call_begin|> functions.read_file:0 <|tool_call_argument_begin|> {"path": "/tmp/test.py"} <|tool_call_end|>
 <|tool_calls_section_end|>"""
 
 
@@ -369,6 +418,15 @@ def _json_prompt(base_prompt: str, tool_registry: Any) -> str:
         base_prompt,
         tool_registry,
         contract=_JSON_CONTRACT,
+        renderer=render_json_tool_schema,
+    )
+
+
+def _json_multi_prompt(base_prompt: str, tool_registry: Any) -> str:
+    return _compose_prompt(
+        base_prompt,
+        tool_registry,
+        contract=_JSON_MULTI_CONTRACT,
         renderer=render_json_tool_schema,
     )
 
@@ -461,6 +519,21 @@ def _protocol_table() -> Dict[str, ModelProtocol]:
             continuation_renderer=_render_continuation_message,
             tool_schema_delivery="hybrid",
             supports_native_tool_call_markup=True,
+            supports_multi_action=True,
+        ),
+        "json_decision_multi_v1": ModelProtocol(
+            id="json_decision_multi_v1",
+            display_name="JSON Decision (Multi-Action)",
+            parser_factory=JsonDecisionParser,
+            prompt_renderer=_json_multi_prompt,
+            contract_renderer=lambda _protocol: _render_simple_contract(_JSON_MULTI_CONTRACT),
+            tool_schema_renderer=render_json_tool_schema,
+            repair_renderer=_render_repair_message,
+            continuation_renderer=_render_continuation_message,
+            tool_schema_delivery="hybrid",
+            supports_native_tool_call_markup=True,
+            supports_multi_action=True,
+            fallback_protocols=("json_decision_v1", "xml_decision_v1", "react_text_v1"),
         ),
         "xml_decision_v1": ModelProtocol(
             id="xml_decision_v1",

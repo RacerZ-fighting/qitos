@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional
 
-from qitos.core.history import History, HistoryMessage
+from qitos.core.history import (
+    History,
+    HistoryMessage,
+    message_token_payloads,
+    select_recent_history,
+)
 
 
 class TokenBudgetSummaryHistory(History):
@@ -40,7 +46,7 @@ class TokenBudgetSummaryHistory(History):
             query.get("max_items", len(items) if items else self.hard_window)
         )
         if max_items > 0:
-            items = items[-max_items:]
+            items = select_recent_history(items, max_items)
 
         budget = int(query.get("max_tokens") or self.max_tokens)
         pending = str(query.get("pending_content") or "")
@@ -92,7 +98,7 @@ class TokenBudgetSummaryHistory(History):
             return items
 
         if len(items) <= self.keep_last:
-            result = items[-self.keep_last :]
+            result = select_recent_history(items, self.keep_last)
             events.append(
                 {
                     "stage": "context_history",
@@ -121,8 +127,8 @@ class TokenBudgetSummaryHistory(History):
             ]
             return result
 
-        recent = items[-self.keep_last :]
-        old = items[: -self.keep_last]
+        recent = select_recent_history(items, self.keep_last)
+        old = items[: len(items) - len(recent)]
         if not old:
             self._pending_runtime_events = events
             self._last_message_metadata = metadata
@@ -184,14 +190,19 @@ class TokenBudgetSummaryHistory(History):
     def evict(self) -> int:
         if self.hard_window <= 0 or len(self._messages) <= self.hard_window:
             return 0
-        removed = len(self._messages) - self.hard_window
-        self._messages = self._messages[-self.hard_window :]
+        retained = select_recent_history(self._messages, self.hard_window)
+        removed = len(self._messages) - len(retained)
+        self._messages = retained
         return removed
 
     def reset(self, run_id: Optional[str] = None) -> None:
         self._messages = []
         self._pending_runtime_events = []
         self._last_message_metadata = []
+
+    @property
+    def messages(self) -> List[HistoryMessage]:
+        return list(self._messages)
 
     def consume_runtime_events(self) -> List[Dict[str, Any]]:
         events = list(self._pending_runtime_events)
@@ -236,7 +247,7 @@ class TokenBudgetSummaryHistory(History):
         return self._heuristic_summary(messages)
 
     def _summary_prompt(self, messages: List[HistoryMessage]) -> str:
-        body = "\n".join(f"[{m.step_id}] {m.role}: {m.content}" for m in messages)
+        body = "\n".join(self._render_summary_message(message) for message in messages)
         return (
             "Summarize the following interaction history for a continuation model call. "
             "Keep key findings, mistakes, tool results, and remaining intent.\n\n"
@@ -244,11 +255,34 @@ class TokenBudgetSummaryHistory(History):
         )
 
     def _heuristic_summary(self, messages: List[HistoryMessage]) -> str:
-        lines = [f"[{m.step_id}] {m.role}: {m.content[:160]}" for m in messages[-12:]]
+        lines = [
+            self._render_summary_message(message)[:240]
+            for message in messages
+        ]
         return "Summary of earlier interaction:\n" + "\n".join(lines)
 
+    def _render_summary_message(self, message: HistoryMessage) -> str:
+        text = str(message.content or "")
+        if message.tool_calls:
+            calls = json.dumps(
+                message.tool_calls,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            text = f"{text}\ntool_calls={calls}".strip()
+        if message.tool_call_id:
+            text = f"tool_result_for={message.tool_call_id}\n{text}".strip()
+        return f"[{message.step_id}] {message.role}: {text}"
+
     def _estimate_tokens(self, messages: List[HistoryMessage]) -> int:
-        return sum(self._estimate_text_tokens(m.content) for m in messages)
+        return sum(
+            sum(
+                self._estimate_text_tokens(payload)
+                for payload in message_token_payloads(message)
+            )
+            for message in messages
+        )
 
     def _estimate_text_tokens(self, text: Any) -> int:
         s = str(text or "")

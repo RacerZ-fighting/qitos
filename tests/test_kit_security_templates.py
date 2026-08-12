@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import pytest
 
+from examples._support import SequenceModel
 from qitos.core.memory import MemoryRecord
 from qitos.kit import MemdirMemory
 from qitos.kit.agent import SecurityAuditAgent
@@ -75,18 +75,28 @@ def test_workspace_aware_mixin_path_guard_and_recent_files(tmp_path: Path) -> No
         helper.resolve_path("../outside.txt")
 
 
-class _StaticFinalModel:
-    def __call__(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
-        _ = messages
-        _ = kwargs
-        return "Final Answer: audit complete"
+def test_workspace_aware_mixin_allows_workspace_owned_symlink(tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    target = outside / "shared.txt"
+    target.write_text("shared\n", encoding="utf-8")
+    (tmp_path / "shared").symlink_to(outside, target_is_directory=True)
+    helper = WorkspaceAwareMixin(workspace_root=str(tmp_path))
+
+    assert helper.resolve_path("shared/shared.txt") == str(target)
+    assert helper.resolve_path(str(tmp_path / "shared" / "shared.txt")) == str(target)
+    with pytest.raises(PermissionError):
+        helper.resolve_path(str(outside / "shared.txt"))
 
 
 def test_security_audit_agent_template_runs_minimal_path(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "app.py").write_text("print('hello')\n", encoding="utf-8")
-    agent = SecurityAuditAgent(llm=_StaticFinalModel(), workspace_root=str(workspace))
+    agent = SecurityAuditAgent(
+        llm=SequenceModel(["Final Answer: audit complete"]),
+        workspace_root=str(workspace),
+    )
     result = agent.run(
         task="audit this repo",
         workspace=str(workspace),

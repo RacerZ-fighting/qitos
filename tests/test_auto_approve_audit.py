@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from typing import Any, Dict
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -40,14 +39,18 @@ class _AuditToolSet:
         needs_approval=True,
     )
     def approval_tool(self, command: str) -> Dict[str, Any]:
-        return {"status": "executed", "command": command}
+        return {
+            "status": "success",
+            "domain_outcome": "executed",
+            "command": command,
+        }
 
     @function_tool(
         name="safe_action",
         description="A safe tool without approval",
     )
     def normal_tool(self, value: str) -> Dict[str, Any]:
-        return {"status": "ok", "value": value}
+        return {"status": "success", "value": value}
 
 
 # --- Tests ---
@@ -63,7 +66,7 @@ class TestAutoApproveAudit:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=True)
 
-        action = Action(name="dangerous_action", args={"command": "echo hello"}, kind="tool")
+        action = Action(name="dangerous_action", args={"command": "echo hello"})
         result = executor._execute_one(action)
 
         assert result.status == ActionStatus.SUCCESS
@@ -77,7 +80,7 @@ class TestAutoApproveAudit:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=True)
 
-        action = Action(name="safe_action", args={"value": "test"}, kind="tool")
+        action = Action(name="safe_action", args={"value": "test"})
         result = executor._execute_one(action)
 
         assert result.status == ActionStatus.SUCCESS
@@ -91,7 +94,7 @@ class TestAutoApproveAudit:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=False)
 
-        action = Action(name="dangerous_action", args={"command": "rm -rf /"}, kind="tool")
+        action = Action(name="dangerous_action", args={"command": "rm -rf /"})
         with pytest.raises(EngineInterrupt):
             executor._execute_one(action)
 
@@ -102,7 +105,7 @@ class TestAutoApproveAudit:
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=False)
 
-        action = Action(name="safe_action", args={"value": "test"}, kind="tool")
+        action = Action(name="safe_action", args={"value": "test"})
         result = executor._execute_one(action)
 
         assert result.status == ActionStatus.SUCCESS
@@ -120,8 +123,8 @@ class TestAutoApproveAudit:
         )
 
         actions = [
-            Action(name="safe_action", args={"value": "first"}, kind="tool"),
-            Action(name="dangerous_action", args={"command": "echo hello"}, kind="tool"),
+            Action(name="safe_action", args={"value": "first"}),
+            Action(name="dangerous_action", args={"command": "echo hello"}),
         ]
         results = executor.execute(actions)
 

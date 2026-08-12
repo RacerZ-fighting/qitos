@@ -47,7 +47,6 @@ class ResearcherAgent(AgentModule[ResearcherState, dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         super().__init__(
@@ -74,7 +73,6 @@ class ReviewerAgent(AgentModule[ReviewerState, dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         super().__init__(
@@ -205,7 +203,6 @@ class CoderAgent(AgentModule[CoderState, dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         # Inject delegation tools

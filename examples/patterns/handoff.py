@@ -62,7 +62,6 @@ class TriageAgent(AgentModule[SharedState, dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         super().__init__(
@@ -138,7 +137,6 @@ class CoderAgent(AgentModule[SharedState, dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         super().__init__(

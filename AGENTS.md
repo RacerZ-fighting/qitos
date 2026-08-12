@@ -60,6 +60,11 @@ These are non-negotiable:
 
 - Keep a single mainline architecture. Do not introduce parallel architecture tracks.
 - Do not create `V1`, `V2`, `Legacy`, `Next`, or alias-based duplicate concepts in core APIs.
+- Before adding a framework capability, inspect the existing QitOS owner, callers, and
+  behavior tests. Extend or correct that implementation in place instead of adding a
+  wrapper, gateway, mirror type, second codec, or parallel runtime path.
+- A replacement is complete only when callers, tests, exports, and documentation use the
+  canonical implementation and the superseded mechanism is removed in the same change.
 - Keep stable contracts in `qitos.core`; put replaceable concrete implementations in `qitos.kit`.
 - Preserve the `AgentModule + Engine` story as the primary public mental model.
 - Prefer explicit contracts and hook points over hidden magic.
@@ -123,6 +128,16 @@ When introducing a new abstraction, ensure it earns its complexity.
 
 For every meaningful code change, you must do the relevant verification work.
 
+Run Python tools through `uv`; do not invoke bare `python`, `python3`, `pip`, or a
+virtual-environment interpreter path. QitOS owns its environment and checks. A parent
+repository's interpreter or acceptance gate must not be used as a substitute for the
+QitOS commands below. QitOS supports Python 3.10 and newer according to `setup.py`;
+use Python 3.11 for contributor checks, matching the repository's mypy target. Because
+QitOS still uses `setup.py` metadata rather than a PEP 621 `[project]` table, run uv in
+`--no-project` mode with QitOS editable and install only the checker needed by each
+command. This avoids both an incorrect workspace requirement and repeatedly resolving
+unrelated release tooling from the full `dev` extra.
+
 This includes, as applicable:
 - updating or adding tests,
 - running the relevant test suites,
@@ -133,21 +148,26 @@ This includes, as applicable:
 Default project validations:
 
 ```bash
-pytest -q
+uv run --no-project --python 3.11 \
+  --with-editable . \
+  --with 'pytest>=7' \
+  --with 'pytest-asyncio>=0.23' \
+  --with 'openai>=1.66.0' \
+  pytest -q
 ```
 
 Stable-surface static checks:
 
 ```bash
-flake8 qitos/core qitos/engine qitos/models qitos/trace
-mypy qitos/core qitos/engine qitos/models qitos/trace
+uv run --no-project --python 3.11 --with-editable . --with 'flake8>=6' flake8 qitos/core qitos/engine qitos/models qitos/trace
+uv run --no-project --python 3.11 --with-editable . --with 'mypy>=1' mypy qitos/core qitos/engine qitos/models qitos/trace
 ```
 
 Packaging checks when changing packaging, distribution, or release-facing behavior:
 
 ```bash
-python -m build
-python -m twine check dist/*
+uv build
+uv run --no-project --python 3.11 --with 'twine>=5.1.1' twine check dist/*
 ```
 
 Do not claim success without verification.
@@ -158,9 +178,19 @@ If you cannot run a check, explicitly say so and explain why.
 ## Tooling and contract rules
 
 - Class-based tools should implement `execute(args, runtime_context)`.
-- `run(...)` exists as a compatibility path, not as the preferred new contract.
+- `execute(args, runtime_context)` is the only class-based execution entry; do not add
+  `run`, `call`, callable fallbacks, name aliases, or normalized-name dispatch.
 - Function-style tools should continue to use the canonical decorator path.
-- Tool behavior should remain composable through `ToolRegistry`.
+- `ToolRegistry` owns registration and exact-name lookup; `ActionExecutor` owns
+  validation, permission checks, timeout handling, execution, and result normalization.
+- `ToolSpec.retry_policy` is the only tool retry control. Admission runs once; retry
+  attempts and backoff share one absolute action deadline. Do not add integer retry
+  fields, transport retry loops, retry interceptors, or action-level timeout overrides.
+- `ModelRetryPolicy` is the only OpenAI transport retry owner and every OpenAI SDK
+  client must use `max_retries=0`. Model attempts, streams, provider timeouts, and
+  backoff share the Engine's absolute request deadline; late results are discarded.
+- Parallel execution requires an explicit `ToolSpec.concurrency_safe=True`; read-only
+  metadata and historical tool names never imply concurrency safety.
 - Env-backed operations should consume env ops rather than assuming host filesystem/process access directly.
 
 ---

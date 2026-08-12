@@ -29,8 +29,6 @@ class FullCodingToolSet(CodingToolSet):
             enable_lsp=True,
             enable_tasks=True,
             enable_web=True,
-            expose_legacy_aliases=True,
-            expose_modern_names=False,
             profile="full",
             auto_approve=auto_approve,
         )

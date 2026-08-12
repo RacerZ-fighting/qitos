@@ -75,7 +75,23 @@ engine = Engine(
 
 ## 空模型响应
 
-模型调用完成后，Engine 会先记录规范化响应，并优先让 `AgentModule.interpret_model_response()` 将其解释为决策。如果该钩子返回 `None`，且响应既没有非空白文本也没有工具调用，Engine 会在进入 parser 之前将其归类为 `model_error`。默认恢复路径会重试一次；若连续第二次仍为空，运行会以 `unrecoverable_error` 停止，而不是继续生成 parser `wait` 并消耗剩余步数预算。
+模型调用完成后，Engine 会先记录规范化响应。当选定模型策略优先使用原生工具调用，
+且服务商返回了 `tool_calls` 时，这些调用具有唯一控制权：Engine 会跳过
+`AgentModule.interpret_model_response()` 与文本 parser，再按照服务商原始顺序为每个
+call id 提交一个终态工具结果。可执行调用与策略拒绝调用混合出现时也走同一个提交点，
+因此拒绝结果不会重复，也不会跑到更早的调用之前。
+若原生调用缺少名称或参数损坏，QitOS 不会再把 assistant 文本解释成另一项动作，而是
+保留 call id、跳过工具执行，并在对应的工具结果回合返回可恢复的协议错误。
+
+在该原生模式下使用 API 或 hybrid 工具 schema 交付时，QitOS 也不会再向 system
+prompt 注入框架自带的文本动作契约。Agent 自己编写的任务和最终结果说明保持不变；若
+API 交付不可用并实际回退到 prompt injection，文本契约仍会保留。
+
+对于不属于原生调用分支的响应，Engine 会优先让
+`AgentModule.interpret_model_response()` 将其解释为决策。如果该钩子返回 `None`，且
+响应既没有非空白文本也没有工具调用，Engine 会在进入 parser 之前将其归类为
+`model_error`。默认恢复路径会重试一次；若连续第二次仍为空，运行会以
+`unrecoverable_error` 停止，而不是继续生成 parser `wait` 并消耗剩余步数预算。
 
 `model_output` 事件和 `StepRecord.model_response` 仍会保留响应的 `finish_reason`、usage、model 与 provider 字段。该防护不会改变原生工具调用响应、显式 `Decision.wait`，也不会改变对非空但格式错误输出的 parser feedback 行为。
 
@@ -163,35 +179,32 @@ result = engine.run(task)
 
 这与直接写 `Engine(agent=agent, ...)` 等价，也是 `agent.run()` 在内部采用的路径。
 
-## AsyncEngine
+## 异步执行
 
-`AsyncEngine` 提供非阻塞的智能体执行能力。它封装了同样的 `Engine` 循环，但把阻塞调用放到线程池中执行，因此在 `asyncio` 事件循环中使用是安全的。
-
-```python
-from qitos import AsyncEngine
-
-async_engine = AsyncEngine(agent=agent, budget=RuntimeBudget(max_steps=20))
-```
-
-### `AsyncEngine.arun(task)`
-
-异步运行智能体循环，返回与 `Engine.run()` 相同的 `EngineResult`。
+`Engine` 只有一条异步原生执行路径。`arun()` 直接运行在调用方的事件循环上，
+模型 Provider 通过原生异步流返回结果，不使用工作线程桥接。
 
 ```python
-result = await async_engine.arun("分析数据")
+from qitos import Engine
+
+engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=20))
+result = await engine.arun("分析数据")
 print(result.state.final_result)
 ```
 
-### `AsyncEngine.arun_stream(task)`
+只在同步应用边界调用 `engine.run()`。如果当前已有事件循环，该方法会抛出
+`RuntimeError`，避免应用意外嵌套事件循环。
+
+### `Engine.arun_stream(task)`
 
 异步运行智能体循环，并在事件发生时产出结构化的 `EngineEvent` 对象——非常适合实时 UI 更新或将进度流式推送给客户端。
 
 ```python
-async for event in async_engine.arun_stream("分析数据"):
+async for event in engine.arun_stream("分析数据"):
     print(event.event_type, event.step_id, event.payload)
 ```
 
-事件在步骤边界（`step_start`、`step_end`）、阶段切换（`decide`、`act`、`reduce`、`critic`、`check_stop`）和多智能体事件（`handoff`、`delegate`、`fanout`）时产出。流总是以 `run_start` 开始、以 `run_end` 结束。
+事件在步骤边界（`step_start`、`step_end`）、阶段切换（`decide`、`act`、`reduce`、`critic`、`check_stop`）和多智能体事件（`handoff`、`delegate`、`fanout`）时产出。流包含一个 `run_start`，并以唯一的 `run_end` 结束。事件队列是有界的：持续背压时可丢弃中间事件，`dropped_event_count` 记录丢弃数量，`run_end` 的 payload 也会携带该数量并以终态优先级保留。
 
 ### `EngineEvent`
 
@@ -220,21 +233,19 @@ q1 = stream.subscribe()  # 消费者 1 的 asyncio.Queue
 q2 = stream.subscribe()  # 消费者 2 的 asyncio.Queue
 ```
 
-### 异步模型
+### 模型流
 
-当配置的模型实现了 `acall()`（来自 `AsyncModel`）时，`AsyncEngine` 可以在不阻塞事件循环的情况下调用它。内置的异步模型适配器：
+所有模型 Provider 都实现唯一的异步 `Model.stream()` 契约。Engine 消费 Provider 无关的
+流式 chunk，并在整个事务中保留取消和请求截止时间。
 
 ```python
-from qitos.models import AsyncOpenAICompatibleModel, AsyncOpenAIModel
+from qitos.models import OpenAICompatibleModel
 
-llm = AsyncOpenAICompatibleModel(
+llm = OpenAICompatibleModel(
     model="qwen-plus",
     api_key="...",
     base_url="https://...",
 )
-result = await llm.acall([{"role": "user", "content": "你好"}])
+engine = Engine(agent=MyAgent(llm=llm))
+result = await engine.arun("分析数据")
 ```
-
-<Tip>
-  `AsyncEngine.arun()` 与任何模型都兼容——同步模型会自动调度到线程池。当你需要真正的非阻塞 I/O（例如在高并发 Web 服务器中）时，才需要使用异步模型适配器。
-</Tip>

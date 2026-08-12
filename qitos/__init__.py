@@ -14,9 +14,10 @@ from .core.env import Env, EnvSpec
 from .core.errors import QitosRuntimeError, StopReason
 from .core.memory import Memory
 from .core.model_response import ModelResponse
-from .core.history import History, HistoryPolicy
+from .core.runtime_input import RuntimeInput
+from .core.history import History, HistoryPolicy, HistorySnapshot
 from .core.observation import Observation
-from .core.tool_result import ToolResult
+from .core.tool_result import ToolResult, ToolResultStatus
 from .core.state import StateSchema
 from .core.spec import BenchmarkRunResult, ExperimentSpec, RunSpec
 from .core.task import (
@@ -34,20 +35,25 @@ from .core.tool import (
     tool,
 )
 from .core.tool_registry import ToolRegistry
-from .core.agent_spec import AgentSpec, AgentRegistry, ContextStrategy, HandoffContext, StateAdapter
+from .core.agent_spec import (
+    AgentSpec,
+    AgentRegistry,
+    ContextStrategy,
+    HandoffContext,
+    StateAdapter,
+)
 from .engine.engine import Engine, EngineResult, StepSummary
-from .engine.async_engine import AsyncEngine
 from .engine.events import EngineEvent, EngineEventType, EventStream
 from .engine.states import ContextConfig
 
 __all__ = [
     "AgentModule",
     "Engine",
-    "AsyncEngine",
     "EngineEvent",
     "EngineEventType",
     "EventStream",
     "EngineResult",
+    "RuntimeInput",
     "StepSummary",
     "ContextConfig",
     "Task",
@@ -61,8 +67,10 @@ __all__ = [
     "ModelResponse",
     "History",
     "HistoryPolicy",
+    "HistorySnapshot",
     "Observation",
     "ToolResult",
+    "ToolResultStatus",
     "RunSpec",
     "ExperimentSpec",
     "BenchmarkRunResult",

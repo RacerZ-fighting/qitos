@@ -5,12 +5,12 @@ from .decision import Decision
 from .action import (
     Action,
     ActionResult,
-    ActionKind,
     ActionStatus,
     ActionExecutionPolicy,
 )
 from .errors import (
     ErrorCategory,
+    ModelTransportError,
     StopReason,
     RuntimeErrorInfo,
     QitosRuntimeError,
@@ -23,7 +23,8 @@ from .state import (
 )
 from .memory import Memory, MemoryRecord
 from .model_response import ModelResponse
-from .history import History, HistoryMessage, HistoryPolicy
+from .runtime_input import RuntimeInput
+from .history import History, HistoryMessage, HistoryPolicy, HistorySnapshot
 from .observation import Observation
 from .env import (
     Env,
@@ -57,7 +58,7 @@ from .multimodal import (
     ActionSpace,
     EnvironmentAdapter,
 )
-from .tool_result import ToolResult
+from .tool_result import ToolResult, ToolResultStatus
 from .tool import BaseTool, FunctionTool, RetryPolicy, ToolPermission, ToolPermissionSpec, ToolSpec, tool
 from .tool_schema import function_schema, type_to_json_schema, parse_docstring
 from .function_tool_decorator import function_tool
@@ -72,10 +73,10 @@ __all__ = [
     "Decision",
     "Action",
     "ActionResult",
-    "ActionKind",
     "ActionStatus",
     "ActionExecutionPolicy",
     "ErrorCategory",
+    "ModelTransportError",
     "StopReason",
     "RuntimeErrorInfo",
     "QitosRuntimeError",
@@ -86,9 +87,11 @@ __all__ = [
     "Memory",
     "MemoryRecord",
     "ModelResponse",
+    "RuntimeInput",
     "History",
     "HistoryMessage",
     "HistoryPolicy",
+    "HistorySnapshot",
     "Observation",
     "RunSpec",
     "ExperimentSpec",
@@ -119,6 +122,7 @@ __all__ = [
     "ActionSpace",
     "EnvironmentAdapter",
     "ToolResult",
+    "ToolResultStatus",
     "BaseTool",
     "FunctionTool",
     "RetryPolicy",

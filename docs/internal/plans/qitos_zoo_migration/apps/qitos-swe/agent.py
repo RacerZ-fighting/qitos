@@ -117,7 +117,6 @@ class QitOSSWEAgent(AgentModule[SWEState, Dict[str, Any], Action]):
                 enable_lsp=False,
                 enable_tasks=False,
                 enable_web=False,
-                expose_modern_names=False,
             )
         )
         self._workspace = workspace_root
