@@ -18,8 +18,8 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
-- **一致的 Shell 直接执行语义**：`CodingToolSet` 与独立的 `RunCommand` 现在都会在
-  命令分析后遵守 `auto_approve=True`，同时保留显式的破坏性命令保护。
+- **唯一的 Shell 准入边界**：`run_command` 通过常规工具准入后直接执行，不再在
+  handler 内重复做第二次权限判断。
 - **长工具输出可继续读取**：配置 `FileArtifactStore` 后，Engine 会先保存完整的超长
   结果，再生成有界模型预览。Reducer 与 trace 仍能读取 canonical
   `ToolResult.output`，checkpoint 保存模型实际看到的 replacement，Agent 可通过现有

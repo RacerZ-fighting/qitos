@@ -478,10 +478,10 @@ Profiles expose one exact lowercase tool surface. `glob` and `grep` use fixed-ar
 `rg`, respect ignore files by default, and accept separate `include_hidden` and
 `include_ignored` controls.
 
-`auto_approve=True` allows commands that the shell analyzer classifies for review and
-removes the tool-level approval marker. Commands classified as destructive remain
-blocked unless the call explicitly sets `allow_destructive=True`. The standalone
-`qitos.kit.tool.shell.RunCommand` accepts the same option.
+`run_command` executes a command after the normal tool-admission boundary. It does not
+repeat permission classification inside the handler or expose model-controlled
+`read_only` and `allow_destructive` switches. Applications that need command policy
+apply it through the executor before invoking the tool.
 
 **Typical usage**
 

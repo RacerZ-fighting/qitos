@@ -162,8 +162,8 @@ QitOS 把长时上下文管理当成一等能力，而不是隐形中间件。
 QitOS 的工具集帮你直接组合出一个工作环境，而不是一组松散工具。
 
 - `CodingToolSet`：文件、编辑、终端、任务、笔记本等编码环境
-- `CodingToolSet(auto_approve=True)` 与独立的 `RunCommand` 会直接执行需要复核的
-  Shell 语法，但仍阻止没有显式设置 `allow_destructive=True` 的破坏性命令
+- `run_command` 通过统一工具准入后直接执行，不在 handler 内重复权限判断，也不向模型
+  暴露 `read_only` 或 `allow_destructive` 开关
 - `TaskToolSet`：待办与进度跟踪
 - `SecurityAuditToolSet`：代码与配置安全审计
 - 其他更窄场景的捆绑包：`report_tools(...)`、`notebook_tools(...)`、`epub_tools(...)`

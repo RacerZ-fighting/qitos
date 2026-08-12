@@ -669,60 +669,6 @@ class CodingToolSet:
         self._task_counter += 1
         return f"task-{self._task_counter:03d}"
 
-    def _run_bash_command(
-        self,
-        command: str,
-        read_only: bool = False,
-        allow_destructive: bool = False,
-        run_in_background: bool = False,
-        allow_needs_review: bool = False,
-        runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        text = str(command or "").strip()
-        if not text:
-            return {"status": "error", "message": "Command cannot be empty"}
-
-        # Use BashCommandAnalyzer for safety classification
-        from qitos.kit.permission.bash_analyzer import BashCommandAnalyzer, CommandSafety
-
-        analyzer = BashCommandAnalyzer()
-        analysis = analyzer.analyze(text)
-
-        if not allow_destructive and analysis.safety == CommandSafety.UNSAFE:
-            return {
-                "status": "error",
-                "message": f"Destructive command blocked: {analysis.explanation}",
-                "error_category": "destructive_command",
-                "detected_patterns": analysis.detected_patterns,
-            }
-
-        if read_only and not analysis.is_read_only:
-            return {
-                "status": "error",
-                "message": "Command appears to write to the workspace in read-only mode",
-            }
-
-        python_inline_smoke = text.startswith(("python -c ", "python3 -c "))
-        if (
-            analysis.safety == CommandSafety.NEEDS_REVIEW
-            and not allow_destructive
-            and not allow_needs_review
-            and not self.auto_approve
-            and not python_inline_smoke
-        ):
-            return {
-                "status": "needs_approval",
-                "message": f"Command needs review: {analysis.explanation}",
-                "detected_patterns": analysis.detected_patterns,
-            }
-        try:
-            process_ops = self._process_ops(runtime_context)
-            if run_in_background:
-                return process_ops.start(text)
-            return process_ops.run(text, timeout=self.shell_timeout)
-        except Exception as e:
-            return {"status": "error", "message": str(e), "command": text}
-
     @function_tool(
         name="run_command",
         needs_approval=True,
@@ -733,8 +679,6 @@ class CodingToolSet:
     def run_command(
         self,
         command: str,
-        read_only: bool = False,
-        allow_destructive: bool = False,
         run_in_background: bool = False,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -742,18 +686,19 @@ class CodingToolSet:
         Execute one shell command inside the configured working directory.
 
         :param command: Shell command string to execute.
-        :param read_only: Reject commands that appear to mutate the workspace.
-        :param allow_destructive: Explicitly allow commands classified as destructive.
         :param run_in_background: Detach the command and return its task handle.
         :param runtime_context: Optional runtime context injected by the executor.
         """
-        return self._run_bash_command(
-            command=command,
-            read_only=read_only,
-            allow_destructive=allow_destructive,
-            run_in_background=run_in_background,
-            runtime_context=runtime_context,
-        )
+        text = str(command or "").strip()
+        if not text:
+            return {"status": "error", "message": "Command cannot be empty"}
+        try:
+            process_ops = self._process_ops(runtime_context)
+            if run_in_background:
+                return process_ops.start(text)
+            return process_ops.run(text, timeout=self.shell_timeout)
+        except Exception as exc:
+            return {"status": "error", "message": str(exc), "command": text}
 
     def _read_file_chunk(
         self,

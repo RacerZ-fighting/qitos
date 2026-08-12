@@ -300,25 +300,27 @@ def test_run_command_executes_in_workspace(tmp_path):
     assert str(tmp_path) in result["stdout"]
 
 
-def test_run_command_auto_approve_executes_reviewed_shell_syntax(tmp_path):
+def test_run_command_executes_compound_shell_syntax_after_admission(tmp_path):
     first = uuid4().hex
     second = uuid4().hex
-    tool = RunCommand(workspace_root=str(tmp_path), auto_approve=True)
+    tool = RunCommand(workspace_root=str(tmp_path))
 
     result = tool.execute({"command": f"printf {first} && printf {second}"})
 
-    assert tool.spec.needs_approval is False
     assert result["status"] == "success"
     assert result["stdout"] == first + second
 
 
-def test_run_command_auto_approve_keeps_destructive_guard(tmp_path):
-    tool = RunCommand(workspace_root=str(tmp_path), auto_approve=True)
+def test_run_command_does_not_repeat_permission_checks(tmp_path):
+    name = uuid4().hex
+    target = tmp_path / name
+    target.write_text(uuid4().hex, encoding="utf-8")
+    tool = RunCommand(workspace_root=str(tmp_path))
 
-    result = tool.execute({"command": "rm -rf ."})
+    result = tool.execute({"command": f"rm -rf {name}"})
 
-    assert result["status"] == "error"
-    assert result["error_category"] == "destructive_command"
+    assert result["status"] == "success"
+    assert not target.exists()
 
 
 def test_read_and_edit_file_preserve_line_endings(tmp_path):

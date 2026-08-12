@@ -19,8 +19,8 @@ How to update:
 
 ### Fixed
 
-- `CodingToolSet` and the atomic `RunCommand` now apply `auto_approve=True` to
-  shell syntax classified for review while retaining the destructive-command guard.
+- `run_command` now executes after the caller's normal tool admission instead of
+  applying a second command-permission decision inside the handler.
 - Resuming a terminal checkpoint now returns its persisted state without issuing
   another model request, executing tools, or writing a descendant checkpoint.
 
@@ -64,6 +64,8 @@ How to update:
 
 ### Changed
 
+- **Breaking:** Removed the `read_only` and `allow_destructive` model arguments from
+  `run_command`. Applications that need command admission enforce it before execution.
 - Oversized tool results now retain canonical output for reducers and traces while
   History, hooks, and model-visible observations share one durable bounded replacement.
   Checkpoint resume reuses that recorded replacement instead of truncating again.
