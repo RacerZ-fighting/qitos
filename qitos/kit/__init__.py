@@ -1,6 +1,7 @@
 """Curated practical building blocks for common QiTOS agent authoring."""
 
 import importlib
+from .artifact import FileArtifactStore
 from .critic import ReActSelfReflectionCritic
 from .env import (
     ContainerDesktopProvider,
@@ -106,6 +107,7 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "FileArtifactStore",
     "critic",
     "env",
     "evaluate",

@@ -18,6 +18,7 @@ from .core.runtime_input import RuntimeInput
 from .core.history import History, HistoryPolicy, HistorySnapshot
 from .core.observation import Observation
 from .core.tool_result import ToolResult, ToolResultStatus
+from .core.artifact import ArtifactRef, ArtifactStore, ArtifactStoreError
 from .core.state import StateSchema
 from .core.spec import BenchmarkRunResult, ExperimentSpec, RunSpec
 from .core.task import (
@@ -71,6 +72,9 @@ __all__ = [
     "Observation",
     "ToolResult",
     "ToolResultStatus",
+    "ArtifactRef",
+    "ArtifactStore",
+    "ArtifactStoreError",
     "RunSpec",
     "ExperimentSpec",
     "BenchmarkRunResult",

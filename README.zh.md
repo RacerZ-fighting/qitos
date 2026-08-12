@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **长工具输出可继续读取**：配置 `FileArtifactStore` 后，Engine 会先保存完整的超长
+  结果，再生成有界模型预览。Reducer 与 trace 仍能读取 canonical
+  `ToolResult.output`，checkpoint 保存模型实际看到的 replacement，Agent 可通过现有
+  `read_file` 按 workspace 相对路径继续分页读取。
 - **可恢复的异步 checkpoint**：Engine 会在安全边界等待唯一的 `CheckpointStore`，
   包括第一次 Provider 请求前保存的初始化输入快照，并保存原始任务、完整模型历史前缀、
   状态与 fork 链路。SQLite

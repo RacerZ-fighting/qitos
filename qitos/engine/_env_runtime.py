@@ -14,7 +14,6 @@ from ..core.observation import Observation
 from ..core.state import StateSchema
 from ..core.task import Task
 from ..core.tool_result import ToolResult
-from ._action_runtime import _ActionRuntime
 from .states import RuntimePhase
 
 if TYPE_CHECKING:
@@ -120,26 +119,7 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
 
     def _model_visible_tool_result_dict(self, item: Any) -> Any:
         result = ToolResult.from_value(item)
-        tool_name = str(
-            result.metadata.get("tool_name") or result.metadata.get("name") or ""
-        )
-        output = result.output
-        has_summary = isinstance(output, dict) and bool(
-            str(output.get("model_summary") or "").strip()
-        )
-        if not has_summary:
-            return item
-        if has_summary:
-            visible_output = _ActionRuntime._model_visible_tool_output(
-                tool_name, output
-            )
-            return ToolResult(
-                status=result.status,
-                output=visible_output,
-                error=result.error,
-                metadata={**dict(result.metadata), "model_visible": True},
-            ).to_dict()
-        return result.to_dict()
+        return result.to_model_dict()
 
     def validate_env_capabilities(self) -> List[Dict[str, Any]]:
         required = self.collect_required_ops()

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, TypeAlias, cast
+from typing import Any, Dict, Literal, Sequence, TypeAlias, cast
 
 from .action import ActionStatus
+from .artifact import ArtifactRef
 
 
 ToolResultStatus: TypeAlias = Literal[
@@ -35,6 +36,8 @@ class ToolResult:
     output: Any = None
     error: str | None = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    artifacts: tuple[ArtifactRef, ...] = ()
+    model_output: str | None = None
 
     def __post_init__(self) -> None:
         raw_status = str(self.status).strip()
@@ -60,13 +63,39 @@ class ToolResult:
         except Exception:
             return str(self.output)
 
+    @property
+    def model_visible_output(self) -> Any:
+        if self.model_output is not None:
+            return self.model_output
+        if isinstance(self.output, dict):
+            summary = self.output.get("model_summary")
+            if isinstance(summary, str) and summary.strip():
+                return summary.strip()
+        return self.output
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "status": str(self.status),
             "output": self.output,
             "error": self.error,
             "metadata": dict(self.metadata),
         }
+        if self.artifacts:
+            payload["artifacts"] = [item.to_dict() for item in self.artifacts]
+        if self.model_output is not None:
+            payload["model_output"] = self.model_output
+        return payload
+
+    def to_model_dict(self) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "status": str(self.status),
+            "output": self.model_visible_output,
+            "error": self.error,
+            "metadata": dict(self.metadata),
+        }
+        if self.artifacts:
+            payload["artifacts"] = [item.to_dict() for item in self.artifacts]
+        return payload
 
     @classmethod
     def from_value(cls, payload: Any) -> "ToolResult":
@@ -76,6 +105,8 @@ class ToolResult:
                 output=payload.output,
                 error=payload.error,
                 metadata=dict(payload.metadata),
+                artifacts=tuple(payload.artifacts),
+                model_output=payload.model_output,
             )
         if isinstance(payload, dict):
             if "status" not in payload:
@@ -93,13 +124,39 @@ class ToolResult:
             domain_payload = {
                 str(key): value
                 for key, value in payload.items()
-                if key not in {"status", "error", "metadata"}
+                if key
+                not in {
+                    "status",
+                    "error",
+                    "metadata",
+                    "artifacts",
+                    "model_output",
+                }
             }
             output = (
                 domain_payload["output"]
                 if set(domain_payload) == {"output"}
                 else domain_payload
             )
+            raw_artifacts = payload.get("artifacts", ())
+            if not isinstance(raw_artifacts, Sequence) or isinstance(
+                raw_artifacts, (str, bytes)
+            ):
+                raise ValueError("tool result artifacts must be a sequence")
+            artifacts = tuple(
+                item
+                if isinstance(item, ArtifactRef)
+                else ArtifactRef.from_dict(item)
+                for item in raw_artifacts
+                if isinstance(item, (ArtifactRef, dict))
+            )
+            if len(artifacts) != len(raw_artifacts):
+                raise ValueError("tool result artifacts must contain references")
+            raw_model_output = payload.get("model_output")
+            if raw_model_output is not None and not isinstance(
+                raw_model_output, str
+            ):
+                raise ValueError("tool result model_output must be text or null")
             return cls(
                 status=cast(ToolResultStatus, raw_status),
                 output=output,
@@ -109,6 +166,8 @@ class ToolResult:
                     if isinstance(payload.get("metadata"), dict)
                     else {}
                 ),
+                artifacts=artifacts,
+                model_output=raw_model_output,
             )
         if isinstance(payload, str):
             return cls(status="success", output=payload)

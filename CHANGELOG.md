@@ -19,6 +19,8 @@ How to update:
 
 ### Added
 
+- Added typed `ArtifactRef`/`ArtifactStore` contracts and a workspace-relative
+  `FileArtifactStore` for complete oversized tool outputs.
 - Added a qita same-spec comparison preflight that checks stable model, prompt, tool,
   environment, context, budget, source, run-spec, and experiment provenance before
   presenting outcome deltas as repeat-comparable.
@@ -55,6 +57,9 @@ How to update:
 
 ### Changed
 
+- Oversized tool results now retain canonical output for reducers and traces while
+  History, hooks, and model-visible observations share one durable bounded replacement.
+  Checkpoint resume reuses that recorded replacement instead of truncating again.
 - Fresh Engine runs now persist an `input` checkpoint after task, state, and history
   initialization but before the first provider request. Step checkpoints descend from
   that boundary, and resuming it retries step zero without creating a second input

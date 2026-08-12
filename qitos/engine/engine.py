@@ -26,6 +26,7 @@ from ..checkpoint.store import (
 )
 from ..core.agent_module import AgentModule
 from ..core.action import ActionExecutionPolicy
+from ..core.artifact import ArtifactStore
 from ..core.decision import Decision
 from ..core.errors import ErrorCategory, StopReason
 from ..core.env import Env, EnvObservation, EnvStepResult
@@ -238,6 +239,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         context_config: Optional[ContextConfig | Dict[str, Any]] = None,
         cache_backend: Optional[Any] = None,
         checkpoint_store: Optional[CheckpointStore] = None,
+        artifact_store: Optional[ArtifactStore] = None,
         permission_pipeline: Optional[Any] = None,
         read_before_write_enforcer: Optional[Any] = None,
         permission_interaction_callback: Optional[Any] = None,
@@ -380,6 +382,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         self._checkpoint_store = checkpoint_store
         self._last_checkpoint_id: Optional[CheckpointId] = None
+        self.artifact_store = artifact_store
 
         self._tracing_provider = tracing_provider
 

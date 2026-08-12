@@ -209,7 +209,7 @@ from qitos import ToolResult
 return ToolResult(
     status="partial",
     output={"preview": text, "omitted_chars": omitted},
-    metadata={"artifact_ref": artifact_ref},
+    artifacts=(artifact_ref,),
 )
 ```
 
@@ -234,6 +234,33 @@ Do not put values such as `usable`, `pending`, or `no_match` in the top-level `s
 field. Use `needs_input` for a user question and `needs_approval` for permission to
 execute. Background `running` and `partial` results remain non-successful operation
 states even when the executor successfully obtained the snapshot.
+
+### Durable long outputs
+
+Pass a file store to the Engine when tools can return output larger than the model
+budget:
+
+```python
+from qitos import Engine
+from qitos.kit import FileArtifactStore
+
+artifacts = FileArtifactStore(
+    ".agent/artifacts",
+    reference_root=".",
+)
+engine = Engine(agent, artifact_store=artifacts)
+```
+
+The Engine writes the complete output before it creates a bounded model replacement.
+`ToolResult.output` remains canonical for reducers and traces. The typed
+`ToolResult.artifacts` references the durable file, while `model_output` records the
+projection used by History and model-visible events. Checkpoint resume replays that
+exact History value instead of applying the current size threshold again.
+
+Keep the artifact directory inside the tool workspace and set `reference_root` to that
+workspace. The path shown to the model is then workspace-relative and the existing
+`read_file` tool can page through it. A separate artifact-reading wrapper is not
+required.
 
 ---
 

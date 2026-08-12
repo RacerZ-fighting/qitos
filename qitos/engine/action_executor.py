@@ -1157,6 +1157,8 @@ class ActionExecutor:
                     attempts=attempts,
                     latency_ms=latency,
                     metadata=result_metadata,
+                    artifacts=reported_result.artifacts,
+                    model_output=reported_result.model_output,
                 )
                 return result
             except EngineInterrupt:

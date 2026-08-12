@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, Dict, Generic, List, TypeVar, cast
 
-from ..core.action import Action, ActionStatus
+from ..core.action import Action
+from ..core.artifact import ArtifactRef, ArtifactStoreError
 from ..core.decision import Decision
 from ..core.tool_result import ToolResult
 from .states import RuntimePhase, StepRecord
@@ -21,17 +22,6 @@ ActionT = TypeVar("ActionT")
 class _ActionRuntime(Generic[StateT, ActionT]):
     def __init__(self, engine: Engine[Any, Any, Any]):
         self.engine = engine
-
-    @staticmethod
-    def _tool_output_for_budget(output: Any) -> tuple[Any, bool]:
-        has_summary = (
-            isinstance(output, dict)
-            and isinstance(output.get("model_summary"), str)
-            and bool(output["model_summary"].strip())
-        )
-        return (
-            (output["model_summary"].strip(), True) if has_summary else (output, False)
-        )
 
     def run_act(
         self, state: StateT, decision: Decision[ActionT], record: StepRecord
@@ -143,10 +133,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                         "tool_name": normalized_action.name,
                         "reason": block_reason,
                         "action_results": [
-                            self._model_visible_tool_result_dict(
-                                blocked_result,
-                                normalized_action.name,
-                            )
+                            blocked_result.to_model_dict()
                         ],
                     },
                 )
@@ -225,6 +212,11 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                     key=lambda pair: pair[0],
                 )
             ]
+            self._finalize_model_outputs(
+                actions,
+                blocked_only_results,
+                step_id=record.step_id,
+            )
             record.action_results = blocked_only_results
             record.tool_invocations = blocked_only_invocations
             for blocked_item in blocked_only_results:
@@ -237,7 +229,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                     phase=RuntimePhase.ACT,
                     state=state,
                     decision=decision,
-                    action_results=[r.to_dict() for r in blocked_only_results],
+                    action_results=[r.to_model_dict() for r in blocked_only_results],
                     record=record,
                 ),
             )
@@ -291,88 +283,22 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         if exec_stats:
             record.action_execution = exec_stats
         results: List[ToolResult] = []
-        max_chars = int(getattr(engine.context_config, "tool_result_max_chars", 0) or 0)
-        per_message_max = int(
-            getattr(engine.context_config, "tool_result_per_message_max_chars", 0) or 0
-        )
-        message_total_chars = 0
         for item in execution:
             result_metadata = {
                 "tool_name": item.name,
                 "latency_ms": item.latency_ms,
                 "attempts": item.attempts,
             }
-            if item.status in {
-                ActionStatus.SUCCESS,
-                ActionStatus.PARTIAL,
-                ActionStatus.RUNNING,
-            }:
-                output = item.output
-                # Truncate large tool results to prevent context overflow
-                if max_chars > 0 and output is not None:
-                    # Artifact-heavy tools may expose a bounded, human-readable
-                    # model projection while retaining their canonical structured
-                    # result for reducers and trace replay.  Budget and truncate
-                    # that projection, not the raw dict.  Converting the raw dict
-                    # to a truncated string here used to discard ``model_summary``
-                    # before _model_visible_tool_output() could select it, so
-                    # sufficiently large STATIC/GDB results leaked JSON into the
-                    # provider history while smaller results rendered correctly.
-                    visible_for_budget, has_model_summary = (
-                        self._tool_output_for_budget(output)
-                    )
-                    output_str = (
-                        visible_for_budget
-                        if isinstance(visible_for_budget, str)
-                        else json.dumps(
-                            visible_for_budget, ensure_ascii=False, default=str
-                        )
-                    )
-                    # Per-message aggregate budget: if total exceeds limit, apply stricter per-tool truncation
-                    effective_max = max_chars
-                    if (
-                        per_message_max > 0
-                        and message_total_chars + len(output_str) > per_message_max
-                    ):
-                        # Reduce per-tool limit to fit within aggregate budget
-                        remaining = max(0, per_message_max - message_total_chars)
-                        effective_max = min(max_chars, remaining)
-                    if len(output_str) > effective_max and not has_model_summary:
-                        head = int(effective_max * 0.7)
-                        tail = effective_max - head
-                        truncated = (
-                            output_str[:head]
-                            + f"\n... [truncated, {len(output_str)} chars total] ...\n"
-                            + output_str[-tail:]
-                        )
-                        output = truncated
-                        message_total_chars += (
-                            len(output) if isinstance(output, str) else 0
-                        )
-                    else:
-                        message_total_chars += len(output_str)
-                results.append(
-                    ToolResult(
-                        status=item.status.value,
-                        output=output,
-                        error=item.error,
-                        metadata=result_metadata,
-                    )
+            results.append(
+                ToolResult(
+                    status=item.status.value,
+                    output=item.output,
+                    error=item.error,
+                    metadata=result_metadata,
+                    artifacts=item.artifacts,
+                    model_output=item.model_output,
                 )
-            else:
-                results.append(
-                    ToolResult(
-                        status=item.status.value,
-                        # Executors may intentionally return a recoverable,
-                        # model-facing failure Card together with a non-success
-                        # status (unknown tools and backend failures do this).
-                        # Preserve it through provider history rather than
-                        # replacing it with ``None`` and an opaque JSON error.
-                        output=item.output,
-                        error=item.error,
-                        metadata=result_metadata,
-                    )
-                )
+            )
 
         # Merge blocked results and execution results back into original action order
         if blocked_indices:
@@ -420,6 +346,8 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         else:
             record.tool_invocations = exec_invocations
 
+        self._finalize_model_outputs(actions, results, step_id=record.step_id)
+
         # Optional agent-owned pre-history commit for model-visible state
         # receipts.  This is intentionally generic: an agent may canonicalize
         # a state-tool result before history/TUI serialization while the
@@ -461,11 +389,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 "stage": "action_results",
                 "tool_invocations": record.tool_invocations,
                 "action_results": [
-                    self._model_visible_tool_result_dict(
-                        item,
-                        actions[idx].name if idx < len(actions) else "",
-                    )
-                    for idx, item in enumerate(results)
+                    item.to_model_dict() for item in results
                 ],
             },
         )
@@ -476,18 +400,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 phase=RuntimePhase.ACT,
                 state=state,
                 decision=decision,
-                # Keep every human-visible surface on the exact same projection
-                # as native provider history.  ``record.action_results`` remains
-                # canonical so reducers and trace replay retain the structured
-                # machine contract; hooks drive tui.log and must not bypass a
-                # tool's model_summary (notably STATIC_* and gdb_debug).
-                action_results=[
-                    self._model_visible_tool_result_dict(
-                        item,
-                        actions[idx].name if idx < len(actions) else "",
-                    )
-                    for idx, item in enumerate(results)
-                ],
+                action_results=[item.to_model_dict() for item in results],
                 record=record,
             ),
         )
@@ -504,16 +417,6 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         if not self._history_tool_calls_enabled(record):
             return
         engine = self.engine
-        max_chars = max(
-            256,
-            int(
-                getattr(
-                    engine.context_config,
-                    "tool_result_max_chars",
-                    4000,
-                )
-            ),
-        )
         for idx, result in enumerate(results):
             payload = result.output
             if isinstance(payload, dict) and set(payload.keys()) == {"env"}:
@@ -522,7 +425,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             tool_call_id = actions[idx].action_id if idx < len(actions) else None
             if not tool_call_id:
                 tool_call_id = f"call_{record.step_id}_{idx}"
-            model_payload = self._model_visible_tool_output(tool_name, payload)
+            model_payload = result.model_visible_output
             serialized = self._serialize_for_tool_message(
                 model_payload,
                 result.error,
@@ -530,7 +433,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             )
             engine._history_append(
                 "tool",
-                serialized[:max_chars],
+                serialized,
                 record.step_id,
                 metadata={"source": "engine", "tool_name": tool_name},
                 tool_call_id=tool_call_id,
@@ -543,19 +446,9 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         error: str | None,
         status: str,
     ) -> str:
-        # ``output`` has already passed through ``_model_visible_tool_output``.
-        # When a tool supplies a model_summary, it is therefore the exact Card
-        # that provider history, TUI, and assembled messages must share.  Do
-        # not wrap that Card in {"error": ..., "output": ...}: JSON obscures
-        # the recovery instruction and made failed GREP/submit_poc calls look
-        # like an opaque error to the model.
         if isinstance(output, str):
             card = output.strip()
             if card:
-                # A tool-owned Card is the complete recovery contract.  Do
-                # not append a generic engine error: it makes the provider
-                # payload differ from the TUI Card and can turn a useful
-                # failure into noise merely because wording differs.
                 if status not in {"success", "error"}:
                     return f"[TOOL:{status}]\n\n{card}"
                 return card
@@ -570,7 +463,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         )
         try:
             return json.dumps(payload, ensure_ascii=False, default=str)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             return str(payload)
 
     @staticmethod
@@ -592,42 +485,128 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             return ""
         return str(reason or "").strip()
 
-    @staticmethod
-    def _model_visible_tool_output(tool_name: str, output: Any) -> Any:
-        """Project a bounded tool summary into native tool-call history.
+    def _finalize_model_outputs(
+        self,
+        actions: List[Action],
+        results: List[ToolResult],
+        *,
+        step_id: int,
+    ) -> None:
+        config = self.engine.context_config
+        max_chars = int(getattr(config, "tool_result_max_chars", 0) or 0)
+        if max_chars <= 0:
+            return
+        per_message_max = int(
+            getattr(config, "tool_result_per_message_max_chars", 0) or 0
+        )
+        message_chars = 0
+        for index, result in enumerate(results):
+            if isinstance(result.output, dict) and set(result.output) == {"env"}:
+                continue
+            serialized = self._serialize_for_tool_message(
+                result.model_visible_output,
+                result.error,
+                result.status,
+            )
+            effective_max = max_chars
+            if (
+                per_message_max > 0
+                and message_chars + len(serialized) > per_message_max
+            ):
+                effective_max = min(
+                    max_chars,
+                    max(256, per_message_max - message_chars),
+                )
+            if len(serialized) > effective_max:
+                action = actions[index] if index < len(actions) else None
+                artifact = self._persist_tool_output(
+                    result,
+                    tool_name=(action.name if action is not None else "tool"),
+                    tool_call_id=(
+                        action.action_id
+                        if action is not None and action.action_id
+                        else f"call_{step_id}_{index}"
+                    ),
+                    step_id=step_id,
+                )
+                if artifact is not None:
+                    result.artifacts = (*result.artifacts, artifact)
+                result.model_output = self._render_bounded_output(
+                    serialized,
+                    effective_max,
+                    artifact,
+                )
+                serialized = self._serialize_for_tool_message(
+                    result.model_output,
+                    result.error,
+                    result.status,
+                )
+            message_chars += len(serialized)
 
-        Reducers and trace writers retain the canonical structured result. A
-        tool may additionally provide ``model_summary`` when the raw result is
-        an artifact-heavy machine contract whose useful facts need a compact
-        model-facing representation. This is intentionally generic: it is not
-        a benchmark-specific rendering path.
-        """
-        if isinstance(output, dict) and isinstance(output.get("model_summary"), str):
-            summary = output["model_summary"].strip()
-            if summary:
-                return summary
-        return output
-
-    def _model_visible_tool_result_dict(
+    def _persist_tool_output(
         self,
         result: ToolResult,
+        *,
         tool_name: str,
-    ) -> Dict[str, Any]:
-        payload = result.to_dict()
-        has_summary = isinstance(result.output, dict) and bool(
-            str(result.output.get("model_summary") or "").strip()
+        tool_call_id: str,
+        step_id: int,
+    ) -> ArtifactRef | None:
+        store = self.engine.artifact_store
+        if store is None:
+            return None
+        media_type = (
+            "text/markdown" if isinstance(result.output, str) else "application/json"
         )
-        if not has_summary:
-            return payload
-        visible_output = self._model_visible_tool_output(tool_name, result.output)
-        visible = ToolResult(
-            status=result.status,
-            output=visible_output,
-            error=result.error,
-            metadata=dict(result.metadata),
-        ).to_dict()
-        visible["metadata"] = {
-            **dict(visible.get("metadata") or {}),
-            "model_visible": True,
-        }
-        return visible
+        artifact_id = ":".join(
+            (
+                self.engine.active_run_id or "run",
+                str(step_id),
+                tool_name,
+                tool_call_id,
+            )
+        )
+        try:
+            return store.write_text(
+                artifact_id=artifact_id,
+                content=result.text,
+                media_type=media_type,
+            )
+        except ArtifactStoreError as exc:
+            self.engine._emit(
+                step_id,
+                RuntimePhase.ACT,
+                payload={
+                    "stage": "artifact_persist_failed",
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "error": str(exc),
+                },
+            )
+            return None
+
+    @staticmethod
+    def _render_bounded_output(
+        content: str,
+        max_chars: int,
+        artifact: ArtifactRef | None,
+    ) -> str:
+        if artifact is None:
+            header = (
+                f"Tool output exceeded the model budget ({len(content)} characters). "
+                "The full output could not be persisted."
+            )
+        else:
+            header = (
+                f"Tool output exceeded the model budget ({len(content)} characters).\n"
+                f"Full output: {artifact.path}\n"
+                f"Artifact bytes: {artifact.size_bytes}"
+            )
+        prefix = f"{header}\n\nPreview:\n"
+        available = max(0, max_chars - len(prefix))
+        if available == 0:
+            return header
+        if len(content) <= available:
+            return prefix + content
+        marker = "\n…"
+        preview = content[: max(0, available - len(marker))].rstrip()
+        return prefix + preview + marker

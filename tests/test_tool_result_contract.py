@@ -4,7 +4,9 @@ from typing import Any
 
 import pytest
 
+from qitos import tool
 from qitos.core.action import Action, ActionStatus
+from qitos.core.artifact import ArtifactRef
 from qitos.core.tool import BaseTool, ToolSpec
 from qitos.core.tool_registry import ToolRegistry
 from qitos.core.tool_result import ToolResult
@@ -90,19 +92,46 @@ def test_tool_result_treats_a_dict_without_lifecycle_status_as_output() -> None:
     assert result.output == payload
 
 
-def test_tool_result_does_not_flatten_output_during_serialization() -> None:
+def test_tool_result_round_trip_preserves_domain_output() -> None:
     result = ToolResult(
         status="success",
         output={"path": "report.json", "content": "done"},
         metadata={"tool_name": "report"},
     )
 
-    assert result.to_dict() == {
-        "status": "success",
-        "output": {"path": "report.json", "content": "done"},
-        "error": None,
-        "metadata": {"tool_name": "report"},
-    }
+    restored = ToolResult.from_value(result.to_dict())
+
+    assert restored.status == result.status
+    assert restored.output == result.output
+    assert restored.error == result.error
+    assert restored.metadata == result.metadata
+
+
+def test_action_executor_preserves_typed_artifact_projection() -> None:
+    content = "evidence"
+    artifact = ArtifactRef(
+        artifact_id="run:step:call",
+        path="artifacts/evidence.md",
+        media_type="text/markdown",
+        size_bytes=len(content.encode("utf-8")),
+        sha256="a" * 64,
+    )
+
+    @tool(name="artifact_result")
+    def artifact_result() -> ToolResult:
+        return ToolResult(
+            output=content,
+            artifacts=(artifact,),
+            model_output=artifact.path,
+        )
+
+    result = ActionExecutor(ToolRegistry().register(artifact_result)).execute(
+        [Action(name="artifact_result")]
+    )[0]
+
+    assert result.output == content
+    assert result.artifacts == (artifact,)
+    assert result.model_output == artifact.path
 
 
 def test_tool_result_rejects_a_contradictory_success_error() -> None:

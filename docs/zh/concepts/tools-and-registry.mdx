@@ -200,7 +200,7 @@ from qitos import ToolResult
 return ToolResult(
     status="partial",
     output={"preview": text, "omitted_chars": omitted},
-    metadata={"artifact_ref": artifact_ref},
+    artifacts=(artifact_ref,),
 )
 ```
 
@@ -223,6 +223,30 @@ return {
 不要把 `usable`、`pending` 或 `no_match` 放进顶层 `status`。需要用户回答问题时用
 `needs_input`，需要执行审批时用 `needs_approval`。即使执行器成功取得了快照，后台
 `running` 和 `partial` 仍然不是操作成功终态。
+
+### 持久化长输出
+
+工具可能返回超过模型预算的内容时，为 Engine 配置文件 store：
+
+```python
+from qitos import Engine
+from qitos.kit import FileArtifactStore
+
+artifacts = FileArtifactStore(
+    ".agent/artifacts",
+    reference_root=".",
+)
+engine = Engine(agent, artifact_store=artifacts)
+```
+
+Engine 会先保存完整输出，再生成有界模型 replacement。`ToolResult.output` 继续作为
+Reducer 与 trace 的 canonical 结果；`ToolResult.artifacts` 保存类型化文件引用，
+`model_output` 则是 History 和模型可见事件使用的投影。Checkpoint resume 会重放当时
+保存的 History，不会用当前阈值再次截断。
+
+Artifact 目录应位于工具 workspace 内，并把 `reference_root` 指向该 workspace。
+模型看到的路径将是 workspace 相对路径，现有 `read_file` 工具可以直接分页读取，
+无需再增加 artifact 读取 wrapper。
 
 ---
 

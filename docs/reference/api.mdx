@@ -197,6 +197,7 @@ def __init__(
     recovery_handler: RecoveryHandler | None = None,
     recovery_policy: RecoveryPolicy | None = None,
     trace_writer: TraceWriter | None = None,
+    artifact_store: ArtifactStore | None = None,
     parser: Parser[ActionT] | None = None,
     stop_criteria: List[StopCriteria] | None = None,
     branch_selector: BranchSelector | None = None,
@@ -217,6 +218,7 @@ def __init__(
 | `recovery_handler` | `RecoveryHandler \| None` | `None` | Callable invoked on recoverable errors |
 | `recovery_policy` | `RecoveryPolicy \| None` | default policy | Controls retry behaviour on failures |
 | `trace_writer` | `TraceWriter \| None` | `None` | Writes structured trace (a structured log of all run events and steps) artifacts to disk |
+| `artifact_store` | `ArtifactStore \| None` | `None` | Persists complete oversized tool output before model projection |
 | `parser` | `Parser[ActionT] \| None` | `None` | Parser for raw model output |
 | `stop_criteria` | `List[StopCriteria] \| None` | `[FinalResultCriteria()]` | Ordered list of stop criteria |
 | `branch_selector` | `BranchSelector \| None` | `FirstCandidateSelector()` | Strategy for picking among branch candidates |

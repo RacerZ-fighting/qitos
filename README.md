@@ -18,6 +18,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Readable long tool outputs**: configure `FileArtifactStore` to save complete
+  oversized results before the Engine creates a bounded model preview. Canonical
+  `ToolResult.output` remains available to reducers and traces, checkpoints retain the
+  exact model replacement, and a workspace-relative artifact path can be paged with the
+  existing `read_file` tool.
 - **Recoverable async checkpoints**: Engine now awaits one `CheckpointStore` at safe
   boundaries, including an initialized input snapshot before the first provider
   request, and persists the original task, full model-history prefix, state, and fork

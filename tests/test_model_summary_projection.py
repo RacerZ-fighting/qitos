@@ -3,91 +3,20 @@ from typing import Any
 
 from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegistry, tool
 from qitos.core.tool_result import ToolResult
-from qitos.engine._action_runtime import _ActionRuntime
-from qitos.engine._env_runtime import _EnvRuntime
 from qitos.engine.hooks import EngineHook, HookContext
 from qitos.engine.states import RuntimeBudget
 
 
-def _summary_payload() -> dict[str, str]:
-    return {
-        "model_summary": "## STATIC_ROUTE · partial\n- answer: entry -> target",
-        "artifact_path": ".agent/evidence/static/raw.json",
-    }
+def test_tool_result_projects_summary_without_changing_canonical_output() -> None:
+    raw = {"evidence": list(range(100))}
+    summary = f"evidence items: {len(raw['evidence'])}"
+    result = ToolResult(output={**raw, "model_summary": summary})
 
+    visible = result.to_model_dict()
 
-def test_action_history_projects_model_summary_without_losing_raw_result() -> None:
-    runtime = _ActionRuntime.__new__(_ActionRuntime)
-    result = ToolResult(
-        output=_summary_payload(), metadata={"tool_name": "STATIC_ROUTE"}
-    )
-
-    assert runtime._model_visible_tool_output("STATIC_ROUTE", result.output) == result.output["model_summary"]
-    visible = runtime._model_visible_tool_result_dict(result, "STATIC_ROUTE")
-    assert visible["output"] == result.output["model_summary"]
-    assert "artifact_path" not in str(visible)
-    assert result.output["artifact_path"].endswith("raw.json")
-
-
-def test_large_raw_result_budgets_summary_before_truncation() -> None:
-    runtime = _ActionRuntime.__new__(_ActionRuntime)
-    payload = {
-        **_summary_payload(),
-        "findings": [{"body": "x" * 100_000}],
-    }
-    visible, has_summary = runtime._tool_output_for_budget(payload)
-    assert has_summary is True
-    assert visible == payload["model_summary"]
-    assert "artifact_path" not in visible
-
-
-def test_env_observation_projects_model_summary() -> None:
-    runtime = _EnvRuntime.__new__(_EnvRuntime)
-    result = ToolResult(
-        output=_summary_payload(), metadata={"tool_name": "gdb_debug"}
-    )
-    visible = runtime._model_visible_tool_result_dict(result)
-    assert visible["output"] == result.output["model_summary"]
-    assert "artifact_path" not in str(visible)
-
-
-def test_submit_uses_its_privacy_reviewed_model_summary() -> None:
-    runtime = _ActionRuntime.__new__(_ActionRuntime)
-    payload = {
-        "model_summary": "[submit_poc] a.bin\n\n! VUL TRIGGERED",
-        "status": "success",
-        "raw_output": "safe visible result",
-        "fixed_side_verdict": "private",
-    }
-    visible = runtime._model_visible_tool_output("submit_poc", payload)
-    assert visible == payload["model_summary"]
-    assert "fixed_side_verdict" not in visible
-
-
-def test_failed_tool_history_keeps_recoverable_card_not_json_wrapper() -> None:
-    runtime = _ActionRuntime.__new__(_ActionRuntime)
-    payload = {
-        "model_summary": (
-            "[GREP:invalid_cursor]\n\n"
-            "Code: `INVALID_CURSOR`\n"
-            "The cursor does not match this query or its snapshot is unavailable.\n\n"
-            "Retry: GREP(pattern=\"parse_record\", path=\"repo-vul/src\")"
-        ),
-        "status": "error",
-        "error_category": "invalid_cursor",
-    }
-    error = "The cursor does not match this query or its snapshot is unavailable."
-
-    model_output = runtime._model_visible_tool_output("GREP", payload)
-    history_content = runtime._serialize_for_tool_message(
-        model_output,
-        error,
-        "error",
-    )
-
-    assert history_content == payload["model_summary"]
-    assert not history_content.lstrip().startswith("{")
-    assert "Retry: GREP" in history_content
+    assert visible["output"] == summary
+    assert result.output == {**raw, "model_summary": summary}
+    assert len(str(visible["output"])) < len(result.text)
 
 
 @dataclass
@@ -96,17 +25,14 @@ class _ProjectionState(StateSchema):
 
 
 class _ProjectionAgent(AgentModule[_ProjectionState, dict[str, Any], Action]):
-    def __init__(self) -> None:
+    def __init__(self, raw_output: dict[str, Any], summary: str) -> None:
         registry = ToolRegistry()
 
-        @tool(name="gdb_debug")
-        def gdb_debug() -> dict[str, str]:
-            return {
-                "raw_artifact_path": ".agent/evidence/gdb/raw.txt",
-                "model_summary": "## gdb_debug · route_trace\n- Target hit: `True`",
-            }
+        @tool(name="inspect")
+        def inspect() -> dict[str, Any]:
+            return {**raw_output, "model_summary": summary}
 
-        registry.register(gdb_debug)
+        registry.register(inspect)
         super().__init__(tool_registry=registry)
 
     def init_state(self, task: str, **kwargs: Any) -> _ProjectionState:
@@ -114,11 +40,13 @@ class _ProjectionAgent(AgentModule[_ProjectionState, dict[str, Any], Action]):
         return _ProjectionState(task=task, max_steps=2)
 
     def decide(
-        self, state: _ProjectionState, observation: dict[str, Any]
+        self,
+        state: _ProjectionState,
+        observation: dict[str, Any],
     ) -> Decision[Action]:
         _ = observation
         if state.current_step == 0:
-            return Decision.act(actions=[Action(name="gdb_debug", args={})])
+            return Decision.act(actions=[Action(name="inspect", args={})])
         return Decision.final("done")
 
     def reduce(
@@ -140,15 +68,19 @@ class _AfterActCapture(EngineHook):
         self.results = list(ctx.action_results or [])
 
 
-def test_after_act_hook_uses_same_gdb_projection_as_provider_history() -> None:
+def test_after_act_hook_receives_the_model_projection() -> None:
+    raw_output = {"evidence": "x" * 1000}
+    summary = f"captured {len(raw_output['evidence'])} characters"
     hook = _AfterActCapture()
-    Engine(
-        agent=_ProjectionAgent(),
+    result = Engine(
+        agent=_ProjectionAgent(raw_output, summary),
         budget=RuntimeBudget(max_steps=2),
         hooks=[hook],
     ).run("task")
 
     assert len(hook.results) == 1
-    visible = hook.results[0]
-    assert visible["output"] == "## gdb_debug · route_trace\n- Target hit: `True`"
-    assert "raw_artifact_path" not in str(visible)
+    assert hook.results[0]["output"] == summary
+    assert result.records[0].action_results[0].output == {
+        **raw_output,
+        "model_summary": summary,
+    }

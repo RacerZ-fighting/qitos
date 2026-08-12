@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, FrozenSet, Optional
 
+from .artifact import ArtifactRef
+
 
 class ActionStatus(str, Enum):
     SUCCESS = "success"
@@ -51,6 +53,8 @@ class ActionResult:
     attempts: int = 1
     latency_ms: float = 0.0
     metadata: Dict[str, Any] = field(default_factory=dict)
+    artifacts: tuple[ArtifactRef, ...] = ()
+    model_output: str | None = None
 
 
 @dataclass
