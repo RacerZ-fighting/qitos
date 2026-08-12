@@ -18,6 +18,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Application-owned command environments**: host command capabilities and
+  `RunCommand` can now receive one explicit environment snapshot for shell, argv, and
+  background processes, while existing callers continue to inherit by default.
 - **Terminal resume traces close cleanly**: resuming an already terminal checkpoint
   creates no model or tool step and now finalizes its empty trace manifest.
 - **One shell admission boundary**: `run_command` now executes after normal tool

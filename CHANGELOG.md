@@ -28,6 +28,9 @@ How to update:
 
 ### Added
 
+- Added an optional explicit process-environment snapshot for host command
+  capabilities and `RunCommand`, applied consistently to shell, argv, and background
+  subprocess paths while preserving inherited-environment behavior by default.
 - Added typed `ArtifactRef`/`ArtifactStore` contracts and a workspace-relative
   `FileArtifactStore` for complete oversized tool outputs.
 - Added a qita same-spec comparison preflight that checks stable model, prompt, tool,

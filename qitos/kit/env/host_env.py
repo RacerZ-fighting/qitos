@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import stat as stat_module
+import subprocess
 import uuid
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 from qitos.core.action import Action
 from qitos.core.env import (
@@ -223,8 +224,14 @@ class HostFSCapability(FileSystemCapability):
 
 
 class HostCommandCapability(CommandCapability):
-    def __init__(self, cwd: str):
+    def __init__(
+        self,
+        cwd: str,
+        *,
+        env: Mapping[str, str] | None = None,
+    ):
         self.cwd = str(Path(cwd).resolve())
+        self._env = dict(env) if env is not None else None
 
     def run(self, command: str, timeout: int = 30) -> Dict[str, Any]:
         if not command or not command.strip():
@@ -237,6 +244,7 @@ class HostCommandCapability(CommandCapability):
                 text=True,
                 timeout=timeout,
                 cwd=self.cwd,
+                env=self._env,
             )
             return {
                 "status": "success" if r.returncode == 0 else "partial",
@@ -272,6 +280,7 @@ class HostCommandCapability(CommandCapability):
             capture_output=True,
             timeout=timeout,
             cwd=effective_cwd,
+            env=self._env,
             check=False,
         )
         return {
@@ -322,6 +331,7 @@ class HostCommandCapability(CommandCapability):
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env=self._env,
             )
         return {
             "status": "success",

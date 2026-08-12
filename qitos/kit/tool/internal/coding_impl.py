@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from copy import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -278,6 +279,7 @@ class CodingToolSet:
         include_http_tools: bool = False,
         auto_approve: bool = False,
         allow_local_fallback: bool = True,
+        process_env: Mapping[str, str] | None = None,
     ):
         self.workspace_root = os.path.abspath(workspace_root)
         self.shell_timeout = int(shell_timeout)
@@ -298,7 +300,7 @@ class CodingToolSet:
             HostFSCapability(self.workspace_root) if self.allow_local_fallback else None
         )
         self._local_process_ops = (
-            HostCommandCapability(self.workspace_root)
+            HostCommandCapability(self.workspace_root, env=process_env)
             if self.allow_local_fallback
             else None
         )

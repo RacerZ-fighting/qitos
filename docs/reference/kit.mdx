@@ -471,6 +471,7 @@ def __init__(
     include_http_tools: bool = False,
     auto_approve: bool = False,
     allow_local_fallback: bool = True,
+    process_env: Mapping[str, str] | None = None,
 )
 ```
 
@@ -482,6 +483,10 @@ Profiles expose one exact lowercase tool surface. `glob` and `grep` use fixed-ar
 repeat permission classification inside the handler or expose model-controlled
 `read_only` and `allow_destructive` switches. Applications that need command policy
 apply it through the executor before invoking the tool.
+
+`process_env` optionally supplies one complete application-owned environment snapshot
+for local shell, fixed-argv, and background subprocesses. Leave it unset to preserve
+normal inherited-environment behavior.
 
 **Typical usage**
 
