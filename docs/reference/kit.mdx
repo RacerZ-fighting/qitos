@@ -50,6 +50,8 @@ Use this page as a capability map for QitOS authoring.
 - `advanced_coding_tools(...)` for a Claude-style coding preset
 - `web_tools()` for web research and extraction
 - `task_tools(...)` for persistent task-board workflows
+- `SkillToolSet(...)` for read-only bundled Skill disclosure and optional
+  provider-backed Skill management
 - explicit `qitos.kit.tool.experimental.security_research` imports for security research workflows
 - `thinking_tools()` for explicit thought-recording flows
 - `notebook_tools(...)`, `report_tools(...)`, and `epub_tools(...)` for narrower scenarios
@@ -505,6 +507,34 @@ registry.register_toolset(
     )
 )
 ```
+
+</Accordion>
+
+<Accordion title="SkillToolSet">
+
+Expose a bounded catalog from application-owned, read-only Skill roots and load one
+selected `SKILL.md` without truncating its content. The same toolset retains QitOS's
+separate provider-backed search, install, and activation tools.
+
+```python
+from qitos import ToolRegistry
+from qitos.kit.tool import SkillToolSet
+
+skills = SkillToolSet(bundled_roots=["/opt/my-agent/skills"])
+
+# Applications that only allow bundled assets register exactly these two tools.
+registry = ToolRegistry()
+registry.register(skills.list_skills)
+registry.register(skills.load_skill)
+```
+
+Roots are scanned during construction and when `refresh_bundled_skills()` is called.
+Refresh validates every immediate child containing `SKILL.md`, rejects duplicate
+manifest names, and replaces the previous in-memory snapshot only after the entire
+catalog succeeds. `list_skills` returns stable name-sorted summaries with a bounded
+limit; `load_skill` requires one exact catalog name and returns the complete validated
+snapshot. These paths do not invoke a provider, install a package, or create a
+workspace registry.
 
 </Accordion>
 

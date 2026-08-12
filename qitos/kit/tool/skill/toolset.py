@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, List, Optional
 
 from qitos.core.function_tool_decorator import function_tool
-from qitos.kit.skill import SkillManager, SkillRegistry
+from qitos.kit.skill import SkillManager, SkillManifest, SkillRegistry
+
+
+_DEFAULT_BUNDLED_SKILL_LIMIT = 20
+_MAX_BUNDLED_SKILL_LIMIT = 100
+_MAX_BUNDLED_DESCRIPTION_CHARS = 500
 
 
 class SkillToolSet:
-    """Toolset for searching, installing, and activating skills."""
+    """Toolset for bundled Skill disclosure and provider-backed management."""
 
     name = ""
     version = "2.0"
@@ -21,11 +27,17 @@ class SkillToolSet:
         manager: Optional[SkillManager] = None,
         workspace_root: Optional[str] = None,
         default_provider: str = "skillhub",
+        bundled_roots: Optional[Iterable[str | Path]] = None,
     ):
         self.workspace_root = workspace_root
         self.registry = registry
         self._manager = manager
         self.default_provider = default_provider
+        self.bundled_roots = tuple(
+            Path(root).expanduser().resolve() for root in bundled_roots or ()
+        )
+        self._bundled_skills: dict[str, tuple[SkillManifest, Path, str]] = {}
+        self.refresh_bundled_skills()
 
     @property
     def manager(self) -> SkillManager:
@@ -38,7 +50,7 @@ class SkillToolSet:
         return self._manager
 
     def tools(self) -> List[Any]:
-        return [
+        tools = [
             self.check_skill_hub,
             self.install_skill_hub,
             self.search_skills,
@@ -47,6 +59,100 @@ class SkillToolSet:
             self.list_installed_skills,
             self.get_skill_info,
         ]
+        if self.bundled_roots:
+            tools.extend([self.list_skills, self.load_skill])
+        return tools
+
+    def refresh_bundled_skills(self) -> None:
+        """Reload configured read-only roots as one validated catalog snapshot."""
+
+        refreshed: dict[str, tuple[SkillManifest, Path, str]] = {}
+        for root in self.bundled_roots:
+            if not root.is_dir():
+                raise FileNotFoundError(
+                    f"Bundled skill root is not a directory: {root}"
+                )
+            for skill_dir in sorted(root.iterdir(), key=lambda path: path.name):
+                skill_path = skill_dir / "SKILL.md"
+                if not skill_dir.is_dir() or not skill_path.is_file():
+                    continue
+                content = skill_path.read_text(encoding="utf-8")
+                try:
+                    manifest = SkillManifest.from_string(
+                        content,
+                        source=str(skill_dir),
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid bundled skill at {skill_path}: {exc}"
+                    ) from exc
+                issues = manifest.validate()
+                if issues:
+                    raise ValueError(
+                        f"Invalid bundled skill at {skill_path}: {'; '.join(issues)}"
+                    )
+                if manifest.name in refreshed:
+                    previous_path = refreshed[manifest.name][1]
+                    raise ValueError(
+                        f"Duplicate bundled skill name {manifest.name!r}: "
+                        f"{previous_path} and {skill_path}"
+                    )
+                refreshed[manifest.name] = (manifest, skill_path, content)
+        self._bundled_skills = refreshed
+
+    @function_tool(name="list_skills", read_only=True, concurrency_safe=True)
+    def list_skills(
+        self,
+        limit: int = _DEFAULT_BUNDLED_SKILL_LIMIT,
+    ) -> dict[str, Any]:
+        """List bundled Skills available for full loading.
+
+        Use this bounded catalog before loading a Skill. Descriptions explain when a
+        Skill applies; source identifies the configured read-only asset.
+
+        :param limit: Maximum number of stable, name-sorted entries to return.
+        """
+
+        resolved_limit = int(limit)
+        if not 1 <= resolved_limit <= _MAX_BUNDLED_SKILL_LIMIT:
+            raise ValueError(f"limit must be between 1 and {_MAX_BUNDLED_SKILL_LIMIT}")
+        ordered = sorted(self._bundled_skills.items(), key=lambda item: item[0])
+        selected = ordered[:resolved_limit]
+        return {
+            "skills": [
+                {
+                    "name": name,
+                    "description": _bounded_description(manifest.description),
+                    "source": str(skill_path),
+                }
+                for name, (manifest, skill_path, _) in selected
+            ],
+            "returned_count": len(selected),
+            "total_count": len(ordered),
+            "truncated": len(selected) < len(ordered),
+        }
+
+    @function_tool(name="load_skill", read_only=True, concurrency_safe=True)
+    def load_skill(self, name: str) -> dict[str, Any]:
+        """Load one bundled Skill's complete validated `SKILL.md` snapshot.
+
+        Call `list_skills` first, then pass one exact returned name. The complete
+        content may describe workflows, tools, failure semantics, and relative
+        resources; loading it does not install software or grant permissions.
+
+        :param name: Exact bundled Skill name returned by `list_skills`.
+        """
+
+        try:
+            manifest, skill_path, content = self._bundled_skills[name]
+        except KeyError as exc:
+            raise ValueError(f"Bundled skill {name!r} was not found") from exc
+        return {
+            "name": manifest.name,
+            "description": manifest.description,
+            "source": str(skill_path),
+            "content": content,
+        }
 
     @function_tool(name="check_skill_hub", read_only=True)
     def check_skill_hub(self, runtime_context: Optional[dict[str, Any]] = None) -> str:
@@ -218,3 +324,9 @@ class SkillToolSet:
                 default_provider=self.default_provider,
             )
         return self._manager
+
+
+def _bounded_description(description: str) -> str:
+    if len(description) <= _MAX_BUNDLED_DESCRIPTION_CHARS:
+        return description
+    return description[: _MAX_BUNDLED_DESCRIPTION_CHARS - 3] + "..."

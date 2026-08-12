@@ -5,6 +5,8 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from qitos import Action, Decision, ToolRegistry
 from qitos.cli import main as qit_main
 from qitos.kit.skill import SkillHubProvider, SkillManager, SkillRegistry, SkilledAgent
@@ -222,3 +224,123 @@ def test_skill_toolset_and_qit_cli(tmp_path: Path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "github" in out
+
+
+def test_bundled_skill_tools_list_stably_and_load_complete_content(
+    tmp_path: Path,
+) -> None:
+    bundled_root = tmp_path / "bundled"
+    second_content = "Use the second workflow.\n\nKeep every evidence line."
+    _write_skill_dir(
+        bundled_root / "z-directory",
+        name="second-skill",
+        description="Second bundled workflow.",
+        instructions=second_content,
+    )
+    first_path = _write_skill_dir(
+        bundled_root / "a-directory",
+        name="first-skill",
+        description="First bundled workflow.",
+        instructions="Use the first workflow.",
+    )
+    workspace = tmp_path / "workspace"
+    toolset = SkillToolSet(
+        workspace_root=str(workspace),
+        bundled_roots=[bundled_root],
+    )
+
+    catalog = toolset.list_skills(limit=1)
+    loaded = toolset.load_skill(name="second-skill")
+
+    assert catalog["skills"] == [
+        {
+            "name": "first-skill",
+            "description": "First bundled workflow.",
+            "source": str(first_path / "SKILL.md"),
+        }
+    ]
+    assert catalog["returned_count"] == 1
+    assert catalog["total_count"] == 2
+    assert catalog["truncated"] is True
+    assert second_content in loaded["content"]
+    assert loaded["content"].startswith("---\nname: second-skill\n")
+    assert loaded["source"].endswith("z-directory/SKILL.md")
+    assert not workspace.exists()
+    tool_names = {tool.spec.name for tool in toolset.tools()}
+    assert "list_skills" in tool_names
+    assert "load_skill" in tool_names
+
+
+def test_bundled_skill_load_requires_an_exact_catalog_name(tmp_path: Path) -> None:
+    bundled_root = tmp_path / "bundled"
+    _write_skill_dir(
+        bundled_root / "skill",
+        name="exact-name",
+        description="Exact name workflow.",
+    )
+    toolset = SkillToolSet(bundled_roots=[bundled_root])
+
+    with pytest.raises(ValueError, match="was not found"):
+        toolset.load_skill(name="Exact-Name")
+
+
+def test_bundled_skill_catalog_bounds_descriptions_and_limit(tmp_path: Path) -> None:
+    bundled_root = tmp_path / "bundled"
+    _write_skill_dir(
+        bundled_root / "skill",
+        name="bounded-skill",
+        description="x" * 600,
+    )
+    toolset = SkillToolSet(bundled_roots=[bundled_root])
+
+    catalog = toolset.list_skills()
+
+    assert len(catalog["skills"][0]["description"]) == 500
+    assert catalog["skills"][0]["description"].endswith("...")
+    with pytest.raises(ValueError, match="limit must be between"):
+        toolset.list_skills(limit=101)
+
+
+def test_bundled_skill_refresh_rejects_duplicates_atomically(tmp_path: Path) -> None:
+    bundled_root = tmp_path / "bundled"
+    _write_skill_dir(
+        bundled_root / "first",
+        name="duplicate-name",
+        description="Original bundled workflow.",
+    )
+    toolset = SkillToolSet(bundled_roots=[bundled_root])
+    _write_skill_dir(
+        bundled_root / "second",
+        name="duplicate-name",
+        description="Conflicting bundled workflow.",
+    )
+
+    with pytest.raises(ValueError, match="Duplicate bundled skill name"):
+        toolset.refresh_bundled_skills()
+
+    assert toolset.list_skills()["total_count"] == 1
+    assert toolset.load_skill(name="duplicate-name")["description"] == (
+        "Original bundled workflow."
+    )
+
+
+def test_bundled_skill_refresh_rejects_invalid_manifests(tmp_path: Path) -> None:
+    bundled_root = tmp_path / "bundled"
+    invalid = bundled_root / "invalid"
+    invalid.mkdir(parents=True)
+    (invalid / "SKILL.md").write_text(
+        "---\nname: invalid-skill\ndescription: Invalid workflow.\n---\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Missing instructions content"):
+        SkillToolSet(bundled_roots=[bundled_root])
+
+
+def test_skill_toolset_without_bundled_roots_preserves_provider_tool_surface() -> None:
+    toolset = SkillToolSet()
+
+    names = {tool.spec.name for tool in toolset.tools()}
+
+    assert "list_skills" not in names
+    assert "load_skill" not in names

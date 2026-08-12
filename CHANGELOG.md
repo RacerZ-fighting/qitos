@@ -28,6 +28,9 @@ How to update:
 
 ### Added
 
+- Added read-only bundled Skill roots to `SkillToolSet`, with atomic validation,
+  stable bounded `list_skills` summaries, and exact-name full-content `load_skill`
+  disclosure independent of provider search and installation.
 - Added an optional explicit process-environment snapshot for host command
   capabilities and `RunCommand`, applied consistently to shell, argv, and background
   subprocess paths while preserving inherited-environment behavior by default.
