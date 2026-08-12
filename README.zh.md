@@ -18,6 +18,8 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **Terminal resume trace 正确收尾**：恢复已经终止的 checkpoint 不会执行模型或工具，
+  新配置的空 trace manifest 也会立即进入终态。
 - **唯一的 Shell 准入边界**：`run_command` 通过常规工具准入后直接执行，不再在
   handler 内重复做第二次权限判断。
 - **长工具输出可继续读取**：配置 `FileArtifactStore` 后，Engine 会先保存完整的超长

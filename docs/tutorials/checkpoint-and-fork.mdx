@@ -62,6 +62,11 @@ result = await engine.aresume_from_checkpoint(config)
 
 The Engine restores the state from the latest checkpoint and continues execution from where it left off.
 
+If the selected checkpoint is already terminal, the Engine returns its persisted state
+without another model request, tool call, or checkpoint. When the resumed Engine has a
+new `TraceWriter`, QitOS finalizes that empty trace with the persisted stop reason and
+result.
+
 ## Step 3: Forking a Checkpoint
 
 Forking creates a new branch from an existing checkpoint, allowing you to explore alternative paths without affecting the original run:

@@ -19,6 +19,8 @@ How to update:
 
 ### Fixed
 
+- Resuming a terminal checkpoint now finalizes a newly configured empty trace with
+  the persisted stop reason and result instead of leaving its manifest running.
 - `run_command` now executes after the caller's normal tool admission instead of
   applying a second command-permission decision inside the handler.
 - Resuming a terminal checkpoint now returns its persisted state without issuing

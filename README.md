@@ -18,6 +18,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Terminal resume traces close cleanly**: resuming an already terminal checkpoint
+  creates no model or tool step and now finalizes its empty trace manifest.
 - **One shell admission boundary**: `run_command` now executes after normal tool
   admission instead of applying a second permission decision inside its handler.
 - **Readable long tool outputs**: configure `FileArtifactStore` to save complete

@@ -1542,17 +1542,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             raise asyncio.CancelledError
 
         if self.trace_writer is not None:
-            if state.stop_reason == StopReason.UNRECOVERABLE_ERROR.value:
-                status = "failed"
-            elif state.stop_reason == StopReason.CANCELLED_IMMEDIATE.value:
-                status = "stopped"
-            else:
-                status = "completed"
             task_result = self._build_task_result(
                 state, task_obj=task_obj, started_at=started_at
             )
             self.trace_writer.finalize(
-                status=status,
+                status=self._trace_status(state.stop_reason),
                 summary={
                     "stop_reason": state.stop_reason,
                     "final_result": state.final_result,
@@ -2096,6 +2090,22 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         )
         state = state_type.from_dict(checkpoint.state_data)
         if state.stop_reason:
+            if self.trace_writer is not None:
+                task_obj = task if isinstance(task, Task) else None
+                self._hydrate_trace_metadata(task_obj=task_obj, task_text=task_text)
+                self.trace_writer.finalize(
+                    status=self._trace_status(state.stop_reason),
+                    summary={
+                        "stop_reason": state.stop_reason,
+                        "final_result": state.final_result,
+                        "steps": 0,
+                        "task_meta": self._task_meta(task_obj),
+                        "run_meta": self._run_meta(),
+                        "failure_report": build_failure_report(
+                            self.recovery_policy, state.stop_reason
+                        ),
+                    },
+                )
             return EngineResult(
                 state=state,
                 records=[],
@@ -2552,6 +2562,14 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
     def _sanitize_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self._trace_runtime.sanitize_payload(payload)
+
+    @staticmethod
+    def _trace_status(stop_reason: str | None) -> str:
+        if stop_reason == StopReason.UNRECOVERABLE_ERROR.value:
+            return "failed"
+        if stop_reason == StopReason.CANCELLED_IMMEDIATE.value:
+            return "stopped"
+        return "completed"
 
     def _notify_event(self, event: RuntimeEvent, state: StateT) -> None:
         self._trace_runtime.notify_event(event, state)

@@ -62,6 +62,10 @@ result = await engine.aresume_from_checkpoint(config)
 
 Engine 从最新检查点恢复状态，从中断处继续执行。
 
+如果选中的 checkpoint 已经进入终态，Engine 会直接返回持久化状态，不再发起模型请求、
+工具调用或新 checkpoint。若恢复用的 Engine 配置了新的 `TraceWriter`，QitOS 会用已保存的
+停止原因和结果正确结束这份空 trace。
+
 ## Step 3: 分叉检查点
 
 分叉从现有检查点创建新分支，允许你探索替代路径而不影响原始运行：

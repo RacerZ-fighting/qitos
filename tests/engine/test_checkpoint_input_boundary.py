@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -15,6 +17,7 @@ from qitos.engine import RuntimeBudget
 from qitos.kit.history import WindowHistory
 from qitos.kit.parser import ReActTextParser
 from qitos.models import Model, ModelStreamChunk
+from qitos.trace import TraceWriter
 
 
 @dataclass
@@ -245,7 +248,9 @@ async def test_input_checkpoint_survives_provider_failure_and_resume_retries_ste
 
 
 @pytest.mark.asyncio
-async def test_terminal_checkpoint_resume_does_not_execute_another_step() -> None:
+async def test_terminal_checkpoint_resume_does_not_execute_another_step(
+    tmp_path: Path,
+) -> None:
     store = InMemoryCheckpointStore()
     answer = uuid4().hex
     model = _FinalModel(answer)
@@ -257,11 +262,13 @@ async def test_terminal_checkpoint_resume_does_not_execute_another_step() -> Non
         ).arun("complete once")
         before = await store.list(CheckpointConfig(thread_id=completed.run_id))
         resumed_model = _FinalModel(uuid4().hex)
+        trace_id = f"resume-{uuid4().hex}"
 
         resumed = await Engine(
             _Agent(resumed_model),
             checkpoint_store=store,
             budget=RuntimeBudget(max_steps=3),
+            trace_writer=TraceWriter(str(tmp_path), trace_id),
         ).aresume_from_checkpoint(before[0].config)
 
         after = await store.list(CheckpointConfig(thread_id=completed.run_id))
@@ -271,5 +278,13 @@ async def test_terminal_checkpoint_resume_does_not_execute_another_step() -> Non
         assert resumed.events == []
         assert resumed_model.calls == 0
         assert [item.config for item in after] == [item.config for item in before]
+        manifest = json.loads(
+            (tmp_path / trace_id / "manifest.json").read_text(encoding="utf-8")
+        )
+        assert manifest["status"] == "completed"
+        assert manifest["event_count"] == 0
+        assert manifest["step_count"] == 0
+        assert manifest["summary"]["stop_reason"] == completed.state.stop_reason
+        assert manifest["summary"]["final_result"] == answer
     finally:
         await store.close()
