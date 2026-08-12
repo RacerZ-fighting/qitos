@@ -31,6 +31,26 @@ writes, directory operations, and listings. `CommandCapability.run_argv()` execu
 fixed arguments without shell interpolation, while `run()` remains the explicit shell
 command path.
 
+Host-backed command tools inherit the current process environment by default. An
+application that owns a stricter execution boundary can instead pass one complete,
+pre-filtered environment snapshot:
+
+```python
+from qitos.kit.tool.shell import RunCommand
+
+shell = RunCommand(
+    workspace_root="/workspace",
+    process_env={
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HTTPS_PROXY": "http://proxy.internal:8080",
+    },
+)
+```
+
+The same snapshot is used for shell commands, fixed-argument subprocesses, and
+background starts. QitOS does not merge, discover, or filter credentials in this
+mapping; the application that constructs the runtime owns that policy.
+
 ## Declaring tool requirements
 
 Use `environment_ops` for a tool that can consume a selected Env provider while
