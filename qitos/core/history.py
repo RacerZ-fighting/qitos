@@ -24,20 +24,12 @@ class HistoryMessage:
 
 @dataclass(frozen=True)
 class HistorySnapshot:
-    """Read-only history prefix used to seed another agent loop."""
+    """Transaction-complete model history snapshot."""
 
     messages: tuple[HistoryMessage, ...]
     source_revision: Optional[int] = None
 
     def __post_init__(self) -> None:
-        """Detach the snapshot from the mutable runtime history.
-
-        ``HistoryMessage`` intentionally remains mutable for provider-side
-        projections, but a checkpoint/resume boundary must not share its
-        nested tool-call, metadata, or native-item containers with the live
-        history.  Copying here keeps every history implementation on the same
-        ownership contract.
-        """
         object.__setattr__(
             self,
             "messages",
@@ -51,7 +43,7 @@ class HistorySnapshot:
         *,
         source_revision: Optional[int] = None,
     ) -> "HistorySnapshot":
-        """Build a snapshot from the largest complete transaction prefix."""
+        """Snapshot the largest complete transaction prefix."""
         return cls(
             messages=tuple(complete_history_prefix(messages)),
             source_revision=source_revision,

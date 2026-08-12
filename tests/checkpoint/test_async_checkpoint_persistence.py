@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import sqlite3
 import threading
 from typing import Callable
 
@@ -196,6 +198,181 @@ def test_history_snapshot_rejects_orphans_and_detaches_nested_values() -> None:
 
     assert HistorySnapshot.from_messages([orphan, call, result]).messages == ()
     assert HistorySnapshot.from_messages([call, orphan, result]).messages == ()
+
+
+@pytest.mark.asyncio
+async def test_store_returns_independent_values(store_factory) -> None:
+    store = store_factory()
+    try:
+        config = await store.put(
+            CheckpointConfig(thread_id="run-1"),
+            _checkpoint("cp-owned"),
+            {"source": "loop", "step": 1},
+        )
+        first = await store.get_tuple(config)
+        assert first is not None
+        assert first.checkpoint.history is not None
+        first.checkpoint.state_data["task"] = "mutated"
+        first.checkpoint.history.messages[1].native_items[0][
+            "encrypted_content"
+        ] = "mutated"
+        first.metadata["source"] = "mutated"
+
+        second = await store.get_tuple(config)
+        assert second is not None
+        assert second.checkpoint.state_data["task"] == "inspect"
+        assert second.checkpoint.history is not None
+        assert (
+            second.checkpoint.history.messages[1].native_items[0][
+                "encrypted_content"
+            ]
+            == "opaque-state"
+        )
+        assert second.metadata["source"] == "loop"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_state",
+    [
+        {"value": math.nan},
+        {"value": {"set"}},
+    ],
+)
+async def test_stores_reject_non_json_checkpoint_values(
+    store_factory, invalid_state
+) -> None:
+    store = store_factory()
+    checkpoint = _checkpoint("cp-invalid")
+    checkpoint.state_data = invalid_state
+    try:
+        with pytest.raises(ValueError):
+            await store.put(
+                CheckpointConfig(thread_id="run-1"), checkpoint, {"step": 1}
+            )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_stores_reject_invalid_metadata(store_factory) -> None:
+    store = store_factory()
+    try:
+        with pytest.raises(ValueError, match="unknown fields"):
+            await store.put(
+                CheckpointConfig(thread_id="run-1"),
+                _checkpoint("cp-unknown-meta"),
+                {"unknown": "field"},  # type: ignore[typeddict-unknown-key]
+            )
+        with pytest.raises(ValueError, match="JSON serializable"):
+            await store.put(
+                CheckpointConfig(thread_id="run-1"),
+                _checkpoint("cp-invalid-meta"),
+                {"parents": {"run-1": {"not-json"}}},  # type: ignore[typeddict-item]
+            )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_store_rejects_cross_event_loop_use(tmp_path) -> None:
+    store = SqliteCheckpointStore(str(tmp_path / "loop-owned.db"))
+    try:
+        await store.get(CheckpointConfig(thread_id="run-1"))
+
+        def use_from_another_loop() -> None:
+            asyncio.run(store.get(CheckpointConfig(thread_id="run-1")))
+
+        with pytest.raises(RuntimeError, match="across event loops"):
+            await asyncio.to_thread(use_from_another_loop)
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_store_migrates_v2_rows(tmp_path) -> None:
+    db_path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        """
+        CREATE TABLE checkpoints (
+            checkpoint_id TEXT PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            step INTEGER NOT NULL,
+            state_data TEXT NOT NULL,
+            state_versions TEXT NOT NULL DEFAULT '{}',
+            versions_seen TEXT NOT NULL DEFAULT '{}',
+            parent_id TEXT,
+            created_at TEXT NOT NULL,
+            schema_version TEXT NOT NULL DEFAULT 'v2'
+        );
+        CREATE TABLE checkpoint_metadata (
+            checkpoint_id TEXT PRIMARY KEY REFERENCES checkpoints(checkpoint_id),
+            source TEXT,
+            step_int INTEGER,
+            parents TEXT DEFAULT '{}',
+            run_id TEXT
+        );
+        INSERT INTO checkpoints (
+            checkpoint_id, thread_id, step, state_data, created_at
+        ) VALUES ('cp-legacy', 'run-1', 1, '{"task": "legacy"}', 'now');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteCheckpointStore(str(db_path))
+    try:
+        config = CheckpointConfig(
+            thread_id="run-1", checkpoint_id=CheckpointId("cp-legacy")
+        )
+        legacy = await store.get(config)
+        assert legacy is not None
+        assert legacy.state_data == {"task": "legacy"}
+        assert legacy.task_text == ""
+        assert legacy.history is None
+
+        replacement = _checkpoint("cp-legacy", step=2)
+        await store.put(
+            CheckpointConfig(thread_id="run-1"),
+            replacement,
+            {"source": "update", "step": 2},
+        )
+        updated = await store.get(config)
+        assert updated is not None
+        assert updated.step == 2
+        assert updated.history == replacement.history
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_rolls_back_checkpoint_when_metadata_write_fails(tmp_path) -> None:
+    db_path = tmp_path / "atomic.db"
+    store = SqliteCheckpointStore(str(db_path))
+    config = CheckpointConfig(thread_id="run-1")
+    try:
+        assert await store.get(config) is None
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TRIGGER reject_checkpoint_metadata
+            BEFORE INSERT ON checkpoint_metadata
+            BEGIN
+                SELECT RAISE(ABORT, 'metadata rejected');
+            END
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(sqlite3.IntegrityError, match="metadata rejected"):
+            await store.put(config, _checkpoint("cp-atomic"), {"step": 1})
+        assert await store.get(config) is None
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

@@ -24,7 +24,7 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   cancellation propagates; the old JSON manager, lossy durability thread, empty
   pending-write layer, and trace bridge are gone. `TraceWriter` commits each
   completed step's event range before its step marker, while cancellation remains
-  observable immediately.
+  observable immediately. Memory and SQLite stores use the same JSON boundary.
 - **One async-native model runtime**: `Engine.arun()` and `Engine.astep()` now own the
   model path from request through terminal response. OpenAI Responses, Anthropic
   Messages, compatible Chat Completions, Gemini, LiteLLM, and Ollama implement the same

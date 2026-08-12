@@ -68,6 +68,8 @@ How to update:
 - Checkpoint history snapshots now detach nested provider items and reject orphan or
   incomplete tool transactions before they reach durable storage. SQLite updates keep
   one checkpoint row per id and enforce thread-scoped reads, listing, and deletion.
+- Memory and SQLite checkpoint stores now share one JSON boundary, return independent
+  values, and reject cross-event-loop reuse.
 - **Breaking:** `AgentTool` now requires one explicit `invocation_factory` and uses only
   the canonical `execution_mode`. Removed the class registry, generic model/workspace
   construction, hidden worktree argument, `allow_background` alias, and the separate

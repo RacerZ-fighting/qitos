@@ -112,7 +112,8 @@ result = await engine.aresume_from_checkpoint(time_travel_config)
 `Engine.arun()` awaits `CheckpointStore.put()` after a complete step. A step is
 not considered durable until that write succeeds. SQLite work runs outside the
 event-loop thread, and cancellation waits for an active database call to settle
-before propagating.
+before propagating. Store instances belong to one event loop. Memory and SQLite
+stores accept the same JSON-serializable payloads.
 
 ## Step 6: Inspecting the Snapshot
 

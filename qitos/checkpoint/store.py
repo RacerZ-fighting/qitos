@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
@@ -20,6 +22,18 @@ from ..core.history import (
 
 CheckpointId = NewType("CheckpointId", str)
 """Unique identifier for a checkpoint (UUID-based)."""
+
+
+def _round_trip_json_object(value: Any, *, path: str) -> Dict[str, Any]:
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        result = json.loads(encoded)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{path} must be JSON serializable") from exc
+    if not isinstance(result, dict):
+        raise ValueError(f"{path} must be an object")
+    return result
+
 
 # ---------------------------------------------------------------------------
 # CheckpointConfig — addresses a checkpoint within a store
@@ -82,7 +96,7 @@ class Checkpoint:
         at this persistence boundary and returns no containers owned by the
         caller, so an in-flight write cannot observe later state mutations.
         """
-        return {
+        payload = {
             "id": self.id,
             "thread_id": self.thread_id,
             "step": self.step,
@@ -106,6 +120,7 @@ class Checkpoint:
             "created_at": self.created_at,
             "schema_version": self.schema_version,
         }
+        return _round_trip_json_object(payload, path="checkpoint")
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> Checkpoint:
@@ -117,6 +132,7 @@ class Checkpoint:
         """
         if not isinstance(payload, dict):
             raise ValueError("checkpoint payload must be an object")
+        payload = _round_trip_json_object(payload, path="checkpoint")
         checkpoint_id = payload.get("id")
         thread_id = payload.get("thread_id")
         step = payload.get("step")
@@ -218,7 +234,56 @@ class CheckpointTuple(NamedTuple):
 # ---------------------------------------------------------------------------
 
 class CheckpointStore(ABC):
-    """Single asynchronous owner for checkpoint persistence."""
+    """Single-event-loop asynchronous owner for checkpoint persistence."""
+
+    _owner_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _bind_owner_loop(self) -> None:
+        current = asyncio.get_running_loop()
+        if self._owner_loop is None:
+            self._owner_loop = current
+            return
+        if self._owner_loop is not current:
+            raise RuntimeError(
+                "checkpoint store instances cannot be shared across event loops"
+            )
+
+    def _validate_metadata(
+        self, metadata: CheckpointMetadata
+    ) -> CheckpointMetadata:
+        owned = _round_trip_json_object(metadata, path="checkpoint metadata")
+        unknown = sorted(set(owned) - {"source", "step", "parents", "run_id"})
+        if unknown:
+            raise ValueError(f"checkpoint metadata has unknown fields: {unknown}")
+        source = owned.get("source")
+        if source is not None and not isinstance(source, str):
+            raise ValueError("checkpoint metadata source must be a string")
+        step = owned.get("step")
+        if step is not None and (
+            not isinstance(step, int) or isinstance(step, bool)
+        ):
+            raise ValueError("checkpoint metadata step must be an integer")
+        parents = owned.get("parents")
+        if parents is not None and (
+            not isinstance(parents, dict)
+            or any(not isinstance(value, str) for value in parents.values())
+        ):
+            raise ValueError(
+                "checkpoint metadata parents must map strings to strings"
+            )
+        run_id = owned.get("run_id")
+        if run_id is not None and not isinstance(run_id, str):
+            raise ValueError("checkpoint metadata run_id must be a string")
+        validated: CheckpointMetadata = {}
+        if source is not None:
+            validated["source"] = source
+        if step is not None:
+            validated["step"] = step
+        if parents is not None:
+            validated["parents"] = dict(parents)
+        if run_id is not None:
+            validated["run_id"] = run_id
+        return validated
 
     @abstractmethod
     async def put(

@@ -6,7 +6,6 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import Callable
-from copy import deepcopy
 from typing import Any, List, Optional, TypeVar
 
 from .store import (
@@ -70,6 +69,7 @@ class SqliteCheckpointStore(CheckpointStore):
         self._closed = False
 
     async def _run(self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        self._bind_owner_loop()
         async with self._lock:
             if self._closed:
                 raise RuntimeError("checkpoint store is closed")
@@ -119,6 +119,7 @@ class SqliteCheckpointStore(CheckpointStore):
         return conn
 
     async def close(self) -> None:
+        self._bind_owner_loop()
         async with self._lock:
             if self._closed:
                 return
@@ -261,7 +262,7 @@ class SqliteCheckpointStore(CheckpointStore):
             raise ValueError("checkpoint thread_id does not match config")
         durable = checkpoint.to_dict()
         Checkpoint.from_dict(durable)
-        owned_metadata = deepcopy(metadata)
+        owned_metadata = self._validate_metadata(metadata)
 
         def operation(conn: sqlite3.Connection) -> CheckpointConfig:
             with conn:

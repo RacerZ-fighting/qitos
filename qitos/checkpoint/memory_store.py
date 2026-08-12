@@ -6,7 +6,6 @@ Dict-backed implementation of :class:`CheckpointStore`.
 from __future__ import annotations
 
 import asyncio
-from copy import deepcopy
 from typing import Dict, List, Optional
 
 from .store import (
@@ -57,10 +56,11 @@ class InMemoryCheckpointStore(CheckpointStore):
         checkpoint: Checkpoint,
         metadata: CheckpointMetadata,
     ) -> CheckpointConfig:
+        self._bind_owner_loop()
         if config.thread_id != checkpoint.thread_id:
             raise ValueError("checkpoint thread_id does not match config")
         owned_checkpoint = Checkpoint.from_dict(checkpoint.to_dict())
-        owned_metadata = deepcopy(metadata)
+        owned_metadata = self._validate_metadata(metadata)
         async with self._lock:
             existing = self._store.get(owned_checkpoint.id)
             if existing is not None and (
@@ -100,6 +100,7 @@ class InMemoryCheckpointStore(CheckpointStore):
     async def get_tuple(
         self, config: CheckpointConfig
     ) -> Optional[CheckpointTuple]:
+        self._bind_owner_loop()
         async with self._lock:
             cp_id = self._resolve_id(config)
             if cp_id is None:
@@ -107,7 +108,14 @@ class InMemoryCheckpointStore(CheckpointStore):
             entry = self._store.get(cp_id)
             if entry is not None and entry.checkpoint.thread_id != config.thread_id:
                 return None
-            return deepcopy(entry) if entry is not None else None
+            if entry is None:
+                return None
+            return CheckpointTuple(
+                config=entry.config,
+                checkpoint=Checkpoint.from_dict(entry.checkpoint.to_dict()),
+                metadata=self._validate_metadata(entry.metadata),
+                parent_config=entry.parent_config,
+            )
 
     async def list(
         self,
@@ -116,6 +124,7 @@ class InMemoryCheckpointStore(CheckpointStore):
         limit: Optional[int] = None,
         before: Optional[CheckpointConfig] = None,
     ) -> List[CheckpointTuple]:
+        self._bind_owner_loop()
         if limit is not None and limit < 0:
             raise ValueError("limit must be non-negative or None")
         async with self._lock:
@@ -139,13 +148,23 @@ class InMemoryCheckpointStore(CheckpointStore):
                     pass
             if limit is not None:
                 ids = ids[:limit]
-            return [
-                deepcopy(self._store[cp_id])
-                for cp_id in ids
-                if cp_id in self._store
-            ]
+            results: List[CheckpointTuple] = []
+            for checkpoint_id in ids:
+                entry = self._store.get(checkpoint_id)
+                if entry is None:
+                    continue
+                results.append(
+                    CheckpointTuple(
+                        config=entry.config,
+                        checkpoint=Checkpoint.from_dict(entry.checkpoint.to_dict()),
+                        metadata=self._validate_metadata(entry.metadata),
+                        parent_config=entry.parent_config,
+                    )
+                )
+            return results
 
     async def delete(self, config: CheckpointConfig) -> None:
+        self._bind_owner_loop()
         async with self._lock:
             cp_id = self._resolve_id(config)
             if cp_id is None:

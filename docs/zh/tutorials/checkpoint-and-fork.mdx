@@ -111,7 +111,8 @@ result = await engine.aresume_from_checkpoint(time_travel_config)
 
 `Engine.arun()` 会在完整 step 结束后等待 `CheckpointStore.put()`。写入成功前，
 该 step 不算持久化完成。SQLite 操作在线程外执行；取消发生时，会先等待正在执行的
-数据库调用稳定结束，再继续传播取消。
+数据库调用稳定结束，再继续传播取消。每个 store 实例只属于一个 event loop；内存与
+SQLite store 接受相同的 JSON 可序列化数据。
 
 ## Step 6: 检查快照
 
