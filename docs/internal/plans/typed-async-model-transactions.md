@@ -49,6 +49,7 @@ The existing QitOS model path will be improved to provide:
   committed or causing tool execution;
 - durable replay through the existing History, CheckpointStore, and TraceWriter
   owners, based only on data those production paths actually need;
+- terminal checkpoints return their persisted state without invoking a model or tool;
 - removal of superseded synchronous/async duplicates once all their callers are
   migrated in the same behavior slice.
 

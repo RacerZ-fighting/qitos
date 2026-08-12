@@ -26,7 +26,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Recoverable async checkpoints**: Engine now awaits one `CheckpointStore` at safe
   boundaries, including an initialized input snapshot before the first provider
   request, and persists the original task, full model-history prefix, state, and fork
-  lineage. SQLite work stays off the event loop and settles before
+  lineage. Resuming a terminal checkpoint returns that state without another model or
+  tool step. SQLite work stays off the event loop and settles before
   cancellation propagates; the old JSON manager, lossy durability thread, empty
   pending-write layer, and trace bridge are gone. `TraceWriter` commits each
   completed step's event range before its step marker, while cancellation remains

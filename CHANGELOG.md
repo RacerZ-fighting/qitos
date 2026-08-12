@@ -17,6 +17,11 @@ How to update:
 
 ## Unreleased
 
+### Fixed
+
+- Resuming a terminal checkpoint now returns its persisted state without issuing
+  another model request, executing tools, or writing a descendant checkpoint.
+
 ### Added
 
 - Added typed `ArtifactRef`/`ArtifactStore` contracts and a workspace-relative

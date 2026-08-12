@@ -2095,6 +2095,14 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             else type(self.agent.init_state(task_text))
         )
         state = state_type.from_dict(checkpoint.state_data)
+        if state.stop_reason:
+            return EngineResult(
+                state=state,
+                records=[],
+                events=[],
+                step_count=0,
+                run_id=checkpoint.thread_id,
+            )
         resume_step = checkpoint.step + 1
         if tuple_.metadata.get("source") == "input":
             resume_step = checkpoint.step

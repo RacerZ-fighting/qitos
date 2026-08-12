@@ -176,6 +176,7 @@ async def test_large_output_is_durable_readable_and_stable_on_resume(
         item
         for item in checkpoints
         if item.checkpoint.history is not None
+        and not item.checkpoint.state_data.get("stop_reason")
         and any(
             message.role == "tool"
             for message in item.checkpoint.history.messages

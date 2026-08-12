@@ -24,7 +24,7 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   `read_file` 按 workspace 相对路径继续分页读取。
 - **可恢复的异步 checkpoint**：Engine 会在安全边界等待唯一的 `CheckpointStore`，
   包括第一次 Provider 请求前保存的初始化输入快照，并保存原始任务、完整模型历史前缀、
-  状态与 fork 链路。SQLite
+  状态与 fork 链路。恢复 terminal checkpoint 时直接返回该状态，不再调用模型或工具。SQLite
   操作不会阻塞 event loop，取消传播前会先等待数据库调用稳定结束；旧 JSON manager、
   会丢数据的 durability 线程、空壳 pending-write 层和 trace 桥接均已删除。
   `TraceWriter` 会先提交完整 step 的事件范围，再写入 step 标记；取消等生命周期事件

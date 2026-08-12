@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -124,6 +125,24 @@ class _FailingModel(Model):
             yield ModelStreamChunk()
 
 
+class _FinalModel(Model):
+    def __init__(self, answer: str) -> None:
+        super().__init__(model="checkpoint-final-test", temperature=None)
+        self.answer = answer
+        self.calls = 0
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = messages, deadline_monotonic, kwargs
+        self.calls += 1
+        yield ModelStreamChunk(text=f"Final Answer: {self.answer}", done=True)
+
+
 @pytest.mark.asyncio
 async def test_input_checkpoint_is_visible_while_first_provider_request_blocks() -> None:
     store = InMemoryCheckpointStore()
@@ -221,5 +240,36 @@ async def test_input_checkpoint_survives_provider_failure_and_resume_retries_ste
             "input",
         ]
         assert checkpoints[0].checkpoint.parent_id == input_tuple.checkpoint.id
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_resume_does_not_execute_another_step() -> None:
+    store = InMemoryCheckpointStore()
+    answer = uuid4().hex
+    model = _FinalModel(answer)
+    try:
+        completed = await Engine(
+            _Agent(model),
+            checkpoint_store=store,
+            budget=RuntimeBudget(max_steps=3),
+        ).arun("complete once")
+        before = await store.list(CheckpointConfig(thread_id=completed.run_id))
+        resumed_model = _FinalModel(uuid4().hex)
+
+        resumed = await Engine(
+            _Agent(resumed_model),
+            checkpoint_store=store,
+            budget=RuntimeBudget(max_steps=3),
+        ).aresume_from_checkpoint(before[0].config)
+
+        after = await store.list(CheckpointConfig(thread_id=completed.run_id))
+        assert resumed.state.to_dict() == completed.state.to_dict()
+        assert resumed.run_id == completed.run_id
+        assert resumed.records == []
+        assert resumed.events == []
+        assert resumed_model.calls == 0
+        assert [item.config for item in after] == [item.config for item in before]
     finally:
         await store.close()
