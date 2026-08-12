@@ -1,11 +1,21 @@
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 import time
 from typing import Any
 
-from qitos import Action, AgentModule, Decision, Engine, Observation, StateSchema, ToolRegistry, tool
-from qitos.core.model_response import ModelResponse
+from qitos import (
+    Action,
+    AgentModule,
+    Decision,
+    Engine,
+    Observation,
+    StateSchema,
+    ToolRegistry,
+    tool,
+)
 from qitos.engine import RuntimeBudget
 from qitos.kit import ReActTextParser
+from qitos.models import Model, ModelStreamChunk
 from qitos.models._openai_responses import _to_responses_input
 
 
@@ -14,12 +24,14 @@ class _State(StateSchema):
     pass
 
 
-class _NativeToolModel:
-    model = "test-native"
-    max_tokens = 256
-    context_window = 8192
-
+class _NativeToolModel(Model):
     def __init__(self):
+        super().__init__(
+            model="test-native",
+            max_tokens=256,
+            context_window=8192,
+            temperature=None,
+        )
         self.calls = 0
         self.seen_messages: list[list[dict[str, Any]]] = []
         self.qitos_harness_metadata = {
@@ -28,29 +40,39 @@ class _NativeToolModel:
             "protocol": "react_text_v1",
         }
 
-    def call_raw(self, messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
-        _ = kwargs
-        self.seen_messages.append(list(messages))
-        if self.calls == 0:
-            self.calls += 1
-            return {
-                "choices": [
+    def _chunk_for_call(self, call_index: int) -> ModelStreamChunk:
+        if call_index == 0:
+            return ModelStreamChunk(
+                done=True,
+                tool_calls=[
                     {
-                        "message": {
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": "call_native_1",
-                                    "type": "function",
-                                    "function": {"name": "weird_tool", "arguments": "{}"},
-                                }
-                            ],
-                        }
+                        "id": "call_native_1",
+                        "type": "function",
+                        "function": {"name": "weird_tool", "arguments": "{}"},
                     }
-                ]
-            }
+                ],
+                finish_reason="tool_calls",
+                event_type="test.completed",
+            )
+        return ModelStreamChunk(
+            text="Final Answer: done",
+            done=True,
+            finish_reason="stop",
+            event_type="test.completed",
+        )
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = deadline_monotonic, kwargs
+        self.seen_messages.append(list(messages))
+        call_index = self.calls
         self.calls += 1
-        return {"choices": [{"message": {"content": "Final Answer: done"}}]}
+        yield self._chunk_for_call(call_index)
 
 
 class _NativeToolAgent(AgentModule[_State, Observation, Action]):
@@ -62,33 +84,50 @@ class _NativeToolAgent(AgentModule[_State, Observation, Action]):
             return {"payload": {1, 2}}
 
         registry.register(weird_tool)
-        super().__init__(tool_registry=registry, llm=llm, model_parser=ReActTextParser())
+        super().__init__(
+            tool_registry=registry, llm=llm, model_parser=ReActTextParser()
+        )
 
     def init_state(self, task: str, **kwargs: Any) -> _State:
         return _State(task=task, max_steps=3)
 
-    def decide(self, state: _State, observation: Observation) -> Decision[Action] | None:
+    def decide(
+        self, state: _State, observation: Observation
+    ) -> Decision[Action] | None:
         _ = state
         _ = observation
         return None
 
-    def reduce(self, state: _State, observation: Observation, decision: Decision[Action]) -> _State:
+    def reduce(
+        self, state: _State, observation: Observation, decision: Decision[Action]
+    ) -> _State:
         _ = observation
         _ = decision
         return state
 
 
-class _HarnessAwareModel:
+class _HarnessAwareModel(Model):
     def __init__(self):
+        super().__init__(model="harness-aware", temperature=None)
         self.qitos_harness_metadata = {
             "parser": "ReActTextParser",
             "protocol": "react_text_v1",
         }
 
-    def __call__(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
-        _ = messages
-        _ = kwargs
-        return "Final Answer: auto harness parser worked"
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = messages, deadline_monotonic, kwargs
+        yield ModelStreamChunk(
+            text="Final Answer: auto harness parser worked",
+            done=True,
+            finish_reason="stop",
+            event_type="test.completed",
+        )
 
 
 class _HarnessAgent(AgentModule[_State, Observation, Action]):
@@ -99,12 +138,16 @@ class _HarnessAgent(AgentModule[_State, Observation, Action]):
         _ = kwargs
         return _State(task=task, max_steps=2)
 
-    def decide(self, state: _State, observation: Observation) -> Decision[Action] | None:
+    def decide(
+        self, state: _State, observation: Observation
+    ) -> Decision[Action] | None:
         _ = state
         _ = observation
         return None
 
-    def reduce(self, state: _State, observation: Observation, decision: Decision[Action]) -> _State:
+    def reduce(
+        self, state: _State, observation: Observation, decision: Decision[Action]
+    ) -> _State:
         _ = observation
         _ = decision
         return state
@@ -129,34 +172,24 @@ def test_native_tool_chain_preserves_tool_call_history_and_non_json_result() -> 
 
 def test_native_tool_timeout_remains_timed_out_in_result_trace_and_history() -> None:
     class _SlowToolModel(_NativeToolModel):
-        def call_raw(
-            self, messages: list[dict[str, Any]], **kwargs: Any
-        ) -> dict[str, Any]:
-            _ = kwargs
-            self.seen_messages.append(list(messages))
-            if self.calls == 0:
-                self.calls += 1
-                return {
-                    "choices": [
+        def _chunk_for_call(self, call_index: int) -> ModelStreamChunk:
+            if call_index == 0:
+                return ModelStreamChunk(
+                    done=True,
+                    tool_calls=[
                         {
-                            "message": {
-                                "content": None,
-                                "tool_calls": [
-                                    {
-                                        "id": "call_slow_1",
-                                        "type": "function",
-                                        "function": {
-                                            "name": "slow_tool",
-                                            "arguments": "{}",
-                                        },
-                                    }
-                                ],
-                            }
+                            "id": "call_slow_1",
+                            "type": "function",
+                            "function": {
+                                "name": "slow_tool",
+                                "arguments": "{}",
+                            },
                         }
-                    ]
-                }
-            self.calls += 1
-            return {"choices": [{"message": {"content": "Final Answer: done"}}]}
+                    ],
+                    finish_reason="tool_calls",
+                    event_type="test.completed",
+                )
+            return super()._chunk_for_call(call_index)
 
     class _SlowToolAgent(AgentModule[_State, Observation, Action]):
         def __init__(self, llm: Any) -> None:
@@ -214,19 +247,14 @@ def test_native_tool_timeout_remains_timed_out_in_result_trace_and_history() -> 
     )
 
     tool_messages = [
-        message
-        for message in llm.seen_messages[1]
-        if message.get("role") == "tool"
+        message for message in llm.seen_messages[1] if message.get("role") == "tool"
     ]
     assert len(tool_messages) == 1
     assert "timed_out" in str(tool_messages[0].get("content", ""))
 
 
 def test_default_history_window_never_sends_orphan_parallel_tool_results() -> None:
-    class _VariableNativeToolModel:
-        model = "test-variable-native"
-        max_tokens = 256
-        context_window = 8192
+    class _VariableNativeToolModel(Model):
         qitos_harness_metadata = {
             "tool_policy": {"native_tool_call_preferred": True},
             "parser": "ReActTextParser",
@@ -234,13 +262,23 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
         }
 
         def __init__(self) -> None:
+            super().__init__(
+                model="test-variable-native",
+                max_tokens=256,
+                context_window=8192,
+                temperature=None,
+            )
             self.calls = 0
             self.orphan_ids_by_call: list[list[str]] = []
 
-        def call_raw(
-            self, messages: list[dict[str, Any]], **kwargs: Any
-        ) -> dict[str, Any]:
-            _ = kwargs
+        async def stream(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            deadline_monotonic: float | None = None,
+            **kwargs: Any,
+        ) -> AsyncIterator[ModelStreamChunk]:
+            _ = deadline_monotonic, kwargs
             assistant_ids = {
                 str(tool_call["id"])
                 for message in messages
@@ -258,37 +296,31 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
             call_index = self.calls
             self.calls += 1
             if call_index >= 8:
-                return {
-                    "choices": [
-                        {"message": {"content": "Final Answer: done"}}
-                    ]
-                }
+                yield ModelStreamChunk(
+                    text="Final Answer: done",
+                    done=True,
+                    finish_reason="stop",
+                    event_type="test.completed",
+                )
+                return
 
             tool_call_count = 3 if call_index == 0 else 1
-            return {
-                "choices": [
+            yield ModelStreamChunk(
+                done=True,
+                tool_calls=[
                     {
-                        "message": {
-                            "content": None,
-                            "tool_calls": [
-                                {
-                                    "id": f"call_{call_index}_{offset}",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "probe",
-                                        "arguments": (
-                                            '{"value": %d}'
-                                            % (call_index * 10 + offset)
-                                        ),
-                                    },
-                                }
-                                for offset in range(tool_call_count)
-                            ],
+                        "id": f"call_{call_index}_{offset}",
+                        "type": "function",
+                        "function": {
+                            "name": "probe",
+                            "arguments": ('{"value": %d}' % (call_index * 10 + offset)),
                         },
-                        "finish_reason": "tool_calls",
                     }
-                ]
-            }
+                    for offset in range(tool_call_count)
+                ],
+                finish_reason="tool_calls",
+                event_type="test.completed",
+            )
 
     class _VariableNativeToolAgent(AgentModule[_State, Observation, Action]):
         def __init__(self, llm: Any):
@@ -350,15 +382,10 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
 
 def test_responses_native_items_survive_engine_tool_round() -> None:
     class _ResponsesNativeModel(_NativeToolModel):
-        def call_raw(
-            self, messages: list[dict[str, Any]], **kwargs: Any
-        ) -> ModelResponse:
-            _ = kwargs
-            self.seen_messages.append(list(messages))
-            if self.calls == 0:
-                self.calls += 1
-                return ModelResponse(
-                    text="",
+        def _chunk_for_call(self, call_index: int) -> ModelStreamChunk:
+            if call_index == 0:
+                return ModelStreamChunk(
+                    done=True,
                     tool_calls=[
                         {
                             "id": "call_native_1",
@@ -383,9 +410,10 @@ def test_responses_native_items_survive_engine_tool_round() -> None:
                             "arguments": "{}",
                         },
                     ],
+                    finish_reason="tool_calls",
+                    event_type="test.completed",
                 )
-            self.calls += 1
-            return ModelResponse(text="Final Answer: done")
+            return super()._chunk_for_call(call_index)
 
     llm = _ResponsesNativeModel()
     result = Engine(

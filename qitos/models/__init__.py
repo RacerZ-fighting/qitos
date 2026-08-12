@@ -1,73 +1,85 @@
-"""
-QitOS Models Module
+"""Canonical QitOS model providers and explicit factory composition."""
 
-统一的大模型调用接口。
+from __future__ import annotations
 
-提供多种模型支持：
-- OpenAI (GPT-4, GPT-3.5)
-- Anthropic (Claude native Messages API)
-- Google Gemini (native generateContent API)
-- LiteLLM
-- OpenAI 兼容 (Azure, 通义千问, 智谱 AI 等)
-- 本地模型 (Ollama, LM Studio, vLLM)
+import os
+from typing import Any
 
-Usage:
-    # OpenAI
-    from qitos.models import OpenAIModel
-    llm = OpenAIModel(model="gpt-4")
-
-    # Ollama
-    from qitos.models import OllamaModel
-    llm = OllamaModel(model="llama3")
-
-    # 从环境变量自动选择
-    from qitos.models import ModelFactory
-    llm = ModelFactory.from_env()
-"""
-
-from .base import Model, AsyncModel, ModelFactory, ModelStreamChunk
+from .anthropic import AnthropicModel
+from .base import Model, ModelFactory, ModelStreamChunk
 from .context_registry import infer_context_window
+from .gemini import GeminiModel
+from .litellm import LiteLLMModel
+from .local import OllamaModel
+from .openai import AzureOpenAIModel, OpenAICompatibleModel, OpenAIModel
 from .profile_registry import (
     ModelProfile,
     infer_default_protocol,
     infer_model_profile,
     known_model_profiles,
 )
-from .anthropic import AnthropicModel
-from .gemini import GeminiModel
-from .litellm import LiteLLMModel
-from .openai import (
-    OpenAIModel,
-    OpenAICompatibleModel,
-    AzureOpenAIModel,
-    AsyncOpenAIModel,
-    AsyncOpenAICompatibleModel,
-)
-from .local import OllamaModel, OllamaGenerateModel, LMStudioModel, VLLMModel
+
+
+def _local_openai_model(
+    *,
+    default_base_url: str,
+    default_api_key: str,
+    **kwargs: Any,
+) -> Model:
+    params = dict(kwargs)
+    params.setdefault("base_url", default_base_url)
+    params.setdefault("api_key", default_api_key)
+    params.setdefault("api_mode", "chat_completions")
+    return OpenAICompatibleModel(**params)
+
+
+def builtin_model_factory() -> ModelFactory:
+    """Build an isolated factory containing QitOS's shipped providers."""
+
+    factory = ModelFactory()
+    factory.register("openai", OpenAIModel)
+    factory.register("openai-compatible", OpenAICompatibleModel)
+    factory.register("azure", AzureOpenAIModel)
+    factory.register("anthropic", AnthropicModel)
+    factory.register("gemini", GeminiModel)
+    factory.register("litellm", LiteLLMModel)
+    factory.register("ollama", OllamaModel)
+    factory.register(
+        "lmstudio",
+        lambda **kwargs: _local_openai_model(
+            default_base_url=os.getenv(
+                "LM_STUDIO_BASE_URL", "http://localhost:1234/v1"
+            ),
+            default_api_key="lm-studio",
+            **kwargs,
+        ),
+    )
+    factory.register(
+        "vllm",
+        lambda **kwargs: _local_openai_model(
+            default_base_url=os.getenv("VLLM_BASE_URL", "http://localhost:8000/v1"),
+            default_api_key="vllm",
+            **kwargs,
+        ),
+    )
+    return factory
+
 
 __all__ = [
-    # 基类
-    "Model",
-    "AsyncModel",
-    "ModelFactory",
-    "ModelStreamChunk",
-    "infer_context_window",
-    "ModelProfile",
-    "infer_model_profile",
-    "infer_default_protocol",
-    "known_model_profiles",
-    # OpenAI
-    "OpenAIModel",
-    "OpenAICompatibleModel",
-    "AzureOpenAIModel",
-    "AsyncOpenAIModel",
-    "AsyncOpenAICompatibleModel",
     "AnthropicModel",
+    "AzureOpenAIModel",
     "GeminiModel",
     "LiteLLMModel",
-    # 本地模型
+    "Model",
+    "ModelFactory",
+    "ModelProfile",
+    "ModelStreamChunk",
     "OllamaModel",
-    "OllamaGenerateModel",
-    "LMStudioModel",
-    "VLLMModel",
+    "OpenAICompatibleModel",
+    "OpenAIModel",
+    "builtin_model_factory",
+    "infer_context_window",
+    "infer_default_protocol",
+    "infer_model_profile",
+    "known_model_profiles",
 ]

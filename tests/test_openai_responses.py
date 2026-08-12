@@ -1,73 +1,65 @@
+"""OpenAI Responses and Chat Completions adapter contract tests."""
+
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import Any, Dict, List
+import asyncio
+import base64
+import sys
+import time
+from collections.abc import AsyncIterator
+from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 
-from qitos.core.errors import ModelTransportError
+from qitos.core import ModelTransportError
 from qitos.core.model_response import ModelResponse
-from qitos.models import _openai_responses as responses_module
-from qitos.models.openai import (
-    AsyncOpenAICompatibleModel,
-    OpenAICompatibleModel,
-    OpenAIModel,
-    _count_openai_request_tokens,
+from qitos.models._openai_responses import (
+    _model_response_from_responses,
+    _to_responses_input,
+    _to_responses_tool_choice,
+    _to_responses_tools,
 )
+from qitos.models.openai import OpenAICompatibleModel, OpenAIModel
 
 
-def _response_with_function_calls() -> SimpleNamespace:
-    return SimpleNamespace(
-        id="resp_29",
-        model="gpt-5",
-        status="completed",
-        previous_response_id=None,
-        output_text="",
-        output=[
-            SimpleNamespace(
-                type="reasoning",
-                id="rs_1",
-                status="completed",
-                summary=[{"type": "summary_text", "text": "Need a tool."}],
-                encrypted_content="opaque-private-state",
-            ),
-            SimpleNamespace(
-                type="function_call",
-                id="fc_1",
-                call_id="call_1",
-                name="add",
-                arguments='{"a":1,"b":2}',
-                status="completed",
-            ),
-            SimpleNamespace(
-                type="function_call",
-                id="fc_2",
-                call_id="call_2",
-                name="lookup",
-                arguments='{"key":"x"}',
-                status="completed",
-            ),
-        ],
-        usage=SimpleNamespace(
-            input_tokens=11,
-            output_tokens=7,
-            total_tokens=18,
-            input_tokens_details=SimpleNamespace(cached_tokens=2),
-            output_tokens_details=SimpleNamespace(reasoning_tokens=3),
-        ),
-    )
+class _AsyncListStream(AsyncIterator[Any]):
+    def __init__(self, items: list[Any], *, failure: Exception | None = None) -> None:
+        self._items = iter(items)
+        self._failure = failure
+        self.closed = False
+
+    def __aiter__(self) -> _AsyncListStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._items)
+        except StopIteration:
+            if self._failure is not None:
+                failure, self._failure = self._failure, None
+                raise failure
+            raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
-def test_model_response_summary_redacts_opaque_native_reasoning_state() -> None:
+async def _collect(
+    model: Any, messages: list[dict[str, Any]], **kwargs: Any
+) -> list[Any]:
+    return [chunk async for chunk in model.stream(messages, **kwargs)]
+
+
+def test_model_response_summary_redacts_opaque_reasoning_state() -> None:
     response = ModelResponse(
-        text="",
+        text="answer",
         native_items=[
             {
                 "type": "reasoning",
                 "id": "rs_1",
-                "status": "completed",
-                "summary": [{"type": "summary_text", "text": "Need a tool."}],
-                "encrypted_content": "opaque-private-state",
+                "encrypted_content": "opaque-secret",
+                "summary": [{"type": "summary_text", "text": "safe"}],
             }
         ],
     )
@@ -78,778 +70,684 @@ def test_model_response_summary_redacts_opaque_native_reasoning_state() -> None:
         {
             "type": "reasoning",
             "id": "rs_1",
-            "status": "completed",
-            "summary": [{"type": "summary_text", "text": "Need a tool."}],
+            "summary": [{"type": "summary_text", "text": "safe"}],
         }
     ]
 
 
-def test_responses_input_replays_native_items_and_tool_outputs() -> None:
+def test_responses_input_replays_native_items_without_mirror_duplicates() -> None:
     messages = [
-        {"role": "user", "content": "calculate"},
+        {"role": "user", "content": "question"},
         {
             "role": "assistant",
-            "content": None,
+            "content": "answer",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+                }
+            ],
             "native_items": [
-                {"type": "reasoning", "id": "rs_1", "status": "completed"},
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque",
+                },
                 {
                     "type": "function_call",
                     "id": "fc_1",
                     "call_id": "call_1",
-                    "name": "add",
-                    "arguments": '{"a":1,"b":2}',
-                    "status": "completed",
+                    "name": "lookup",
+                    "arguments": '{"q":"x"}',
                 },
             ],
         },
         {
             "role": "tool",
             "tool_call_id": "call_1",
-            "name": "add",
-            "content": "3",
-        },
-    ]
-
-    payload = responses_module._to_responses_input(messages)
-
-    assert payload == [
-        {"role": "user", "content": "calculate"},
-        {"type": "reasoning", "id": "rs_1", "status": "completed"},
-        {
-            "type": "function_call",
-            "id": "fc_1",
-            "call_id": "call_1",
-            "name": "add",
-            "arguments": '{"a":1,"b":2}',
-            "status": "completed",
-        },
-        {"type": "function_call_output", "call_id": "call_1", "output": "3"},
-    ]
-
-
-def test_responses_input_keeps_text_and_generic_tool_transaction() -> None:
-    messages = [
-        {
-            "role": "assistant",
-            "content": "I will verify that now.",
-            "tool_calls": [
-                {
-                    "id": "call_lookup",
-                    "type": "function",
-                    "function": {
-                        "name": "lookup",
-                        "arguments": '{"key":"target"}',
-                    },
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "call_lookup",
-            "name": "lookup",
-            "content": "verified",
-        },
-    ]
-
-    assert responses_module._to_responses_input(messages) == [
-        {"role": "assistant", "content": "I will verify that now."},
-        {
-            "type": "function_call",
-            "call_id": "call_lookup",
-            "name": "lookup",
-            "arguments": '{"key":"target"}',
-        },
-        {
-            "type": "function_call_output",
-            "call_id": "call_lookup",
-            "output": "verified",
-        },
-    ]
-
-
-def test_responses_input_deduplicates_generic_native_mirrors() -> None:
-    messages = [
-        {
-            "role": "assistant",
-            "content": "checking",
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "lookup", "arguments": "{}"},
-                }
-            ],
+            "content": "result",
             "native_items": [
                 {
-                    "type": "function_call",
+                    "type": "function_call_output",
                     "call_id": "call_1",
-                    "name": "lookup",
-                    "arguments": "{}",
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "lookup",
-                    "arguments": "{}",
-                },
-            ],
-        }
-    ]
-
-    payload = responses_module._to_responses_input(messages)
-
-    assert payload[0] == {"role": "assistant", "content": "checking"}
-    assert sum(item.get("type") == "function_call" for item in payload) == 1
-
-
-def test_responses_request_count_uses_normalized_wire_options_without_duplicate_calls() -> (
-    None
-):
-    class _RecordingAdapter:
-        api_mode = "responses"
-
-        def __init__(self) -> None:
-            self.payloads: list[Any] = []
-
-        def count_tokens(self, payload: Any) -> int:
-            self.payloads.append(payload)
-            return len(str(payload))
-
-    adapter = _RecordingAdapter()
-    messages = [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "lookup", "arguments": "{}"},
+                    "output": "result",
                 }
             ],
-            "native_items": [
-                {
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "lookup",
-                    "arguments": "{}",
-                }
-            ],
-        }
-    ]
-
-    count = _count_openai_request_tokens(
-        adapter,  # type: ignore[arg-type]
-        messages,
-        {
-            "tools": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "lookup",
-                        "parameters": {"type": "object"},
-                    },
-                }
-            ],
-            "response_format": {"type": "json_object"},
         },
+    ]
+
+    payload = _to_responses_input(messages)
+
+    assert payload[0] == {"role": "user", "content": "question"}
+    assert [item["type"] for item in payload[1:]] == [
+        "message",
+        "reasoning",
+        "function_call",
+        "function_call_output",
+    ]
+    assert sum(item.get("call_id") == "call_1" for item in payload) == 2
+
+
+def test_responses_tools_and_forced_choice_use_native_shape() -> None:
+    tools = _to_responses_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"q": {"type": "string"}},
+                    },
+                    "strict": True,
+                },
+            }
+        ]
     )
 
-    assert isinstance(count, int) and count > 0
-    message_payload, wire_options = adapter.payloads
-    wire_messages = message_payload["input"]
-    assert sum(item.get("type") == "function_call" for item in wire_messages) == 1
-    assert wire_options["tools"][0]["name"] == "lookup"
-    assert "function" not in wire_options["tools"][0]
-    assert wire_options["text"]["format"]["type"] == "json_object"
-
-
-def test_responses_tools_flatten_chat_function_schema() -> None:
-    tools = [
+    assert tools == [
         {
             "type": "function",
-            "function": {
-                "name": "add",
-                "description": "Add numbers",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"a": {"type": "integer"}},
-                },
-                "strict": True,
-            },
-        },
-        {"type": "web_search_preview"},
-    ]
-
-    assert responses_module._to_responses_tools(tools) == [
-        {
-            "type": "function",
-            "name": "add",
-            "description": "Add numbers",
+            "name": "lookup",
+            "description": "Look up a value",
             "parameters": {
                 "type": "object",
-                "properties": {"a": {"type": "integer"}},
+                "properties": {"q": {"type": "string"}},
             },
             "strict": True,
-        },
-        {"type": "web_search_preview"},
+        }
     ]
+    assert _to_responses_tool_choice(
+        {"type": "function", "function": {"name": "lookup"}}
+    ) == {"type": "function", "name": "lookup"}
 
 
-def test_responses_tool_choice_flattens_forced_function() -> None:
-    assert responses_module._to_responses_tool_choice(
-        {"type": "function", "function": {"name": "add"}}
-    ) == {"type": "function", "name": "add"}
-    assert responses_module._to_responses_tool_choice("required") == "required"
-
-
-def test_responses_normalization_preserves_order_and_uses_call_id() -> None:
-    normalized = responses_module._model_response_from_responses(
-        _response_with_function_calls(),
+def test_responses_normalization_preserves_order_ids_and_usage() -> None:
+    normalized = _model_response_from_responses(
+        {
+            "id": "resp_1",
+            "status": "completed",
+            "model": "gpt-test",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque",
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": '{"q":"x"}',
+                    "status": "completed",
+                },
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+        },
         provider="openai",
     )
 
+    assert normalized.text == "answer"
+    assert [item["type"] for item in normalized.native_items or []] == [
+        "reasoning",
+        "message",
+        "function_call",
+    ]
     assert normalized.tool_calls == [
         {
             "id": "call_1",
             "type": "function",
-            "function": {"name": "add", "arguments": '{"a":1,"b":2}'},
+            "function": {"name": "lookup", "arguments": '{"q":"x"}'},
             "metadata": {"response_item_id": "fc_1", "status": "completed"},
-        },
-        {
-            "id": "call_2",
-            "type": "function",
-            "function": {"name": "lookup", "arguments": '{"key":"x"}'},
-            "metadata": {"response_item_id": "fc_2", "status": "completed"},
-        },
+        }
     ]
     assert normalized.usage == {
-        "prompt_tokens": 11,
-        "completion_tokens": 7,
-        "total_tokens": 18,
-        "input_tokens_details": {"cached_tokens": 2},
-        "output_tokens_details": {"reasoning_tokens": 3},
-    }
-    assert [item["type"] for item in normalized.native_items or []] == [
-        "reasoning",
-        "function_call",
-        "function_call",
-    ]
-
-
-def test_responses_text_output_normalizes_without_tool_calls() -> None:
-    response = SimpleNamespace(
-        id="resp_text",
-        model="gpt-5",
-        status="completed",
-        previous_response_id=None,
-        output_text="hello from responses",
-        output=[
-            SimpleNamespace(
-                type="message",
-                id="msg_1",
-                role="assistant",
-                status="completed",
-                content=[
-                    SimpleNamespace(
-                        type="output_text",
-                        text="hello from responses",
-                        annotations=[],
-                    )
-                ],
-            )
-        ],
-        usage=None,
-    )
-
-    normalized = responses_module._model_response_from_responses(
-        response, provider="openai"
-    )
-
-    assert normalized.text == "hello from responses"
-    assert normalized.tool_calls is None
-    assert normalized.native_items and normalized.native_items[0]["type"] == "message"
-
-
-def test_responses_normalization_accepts_mapping_contract() -> None:
-    normalized = responses_module._model_response_from_responses(
-        {
-            "id": "resp_mapping",
-            "model": "compatible-model",
-            "status": "completed",
-            "output_text": "",
-            "output": [
-                {
-                    "type": "function_call",
-                    "id": "fc_mapping",
-                    "call_id": "call_mapping",
-                    "name": "lookup",
-                    "arguments": '{"key":"value"}',
-                    "status": "completed",
-                }
-            ],
-            "usage": {
-                "input_tokens": 4,
-                "output_tokens": 2,
-                "total_tokens": 6,
-            },
-        },
-        provider="openai-compatible",
-    )
-
-    assert normalized.model_name == "compatible-model"
-    assert normalized.tool_calls and normalized.tool_calls[0]["id"] == "call_mapping"
-    assert normalized.usage == {
-        "prompt_tokens": 4,
-        "completion_tokens": 2,
-        "total_tokens": 6,
+        "prompt_tokens": 5,
+        "completion_tokens": 3,
+        "total_tokens": 8,
     }
 
 
-def test_responses_missing_call_id_is_preserved_but_not_executed() -> None:
-    response = SimpleNamespace(
-        id="resp_invalid",
-        model="gpt-5",
-        status="completed",
-        previous_response_id=None,
-        output_text="",
-        output=[
-            SimpleNamespace(
-                type="function_call",
-                id="fc_invalid",
-                call_id=None,
-                name="add",
-                arguments="{}",
-                status="completed",
-            )
-        ],
-        usage=None,
-    )
-
-    normalized = responses_module._model_response_from_responses(
-        response, provider="openai"
-    )
-
-    assert normalized.tool_calls is None
-    assert normalized.native_items and normalized.native_items[0]["id"] == "fc_invalid"
-
-
-def test_api_mode_defaults_to_chat_and_rejects_unknown_values() -> None:
-    model = OpenAIModel(model="gpt-4o-mini", api_key="test-key")
-    assert model.api_mode == "chat_completions"
-
-    with pytest.raises(ValueError, match="api_mode"):
-        OpenAIModel(model="gpt-4o-mini", api_key="test-key", api_mode="auto")
-
-
-def test_sync_responses_transport_uses_responses_endpoint(
+@pytest.mark.asyncio
+async def test_openai_defaults_to_responses_and_streams_one_complete_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    response = _response_with_function_calls()
-    calls: List[Dict[str, Any]] = []
-
-    class _Responses:
-        def create(self, **kwargs: Any) -> Any:
-            calls.append(kwargs)
-            return response
-
-    fake_client = SimpleNamespace(
-        responses=_Responses(),
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(
-                create=lambda **kwargs: pytest.fail("Chat endpoint must not be called")
-            )
-        ),
+    captured: dict[str, Any] = {}
+    events = _AsyncListStream(
+        [
+            {
+                "type": "response.output_text.delta",
+                "delta": "answer",
+                "sequence_number": 1,
+            },
+            {
+                "type": "response.function_call_arguments.delta",
+                "delta": '{"q":',
+                "item_id": "fc_1",
+                "output_index": 1,
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": '{"q":"x"}',
+                    "status": "completed",
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "model": "gpt-test",
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": "msg_1",
+                            "content": [{"type": "output_text", "text": "answer"}],
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 5,
+                        "output_tokens": 3,
+                        "total_tokens": 8,
+                    },
+                },
+            },
+        ]
     )
-    monkeypatch.setattr("openai.OpenAI", lambda **kwargs: fake_client)
-    model = OpenAICompatibleModel(
-        model="gpt-5",
-        api_key="test-key",
-        base_url="https://example.test/v1",
-        api_mode="responses",
-        max_tokens=321,
-    )
 
-    result = model.call_raw(
-        [{"role": "user", "content": "calculate"}],
-        response_format={"type": "json_object"},
+    class Client:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["client"] = kwargs
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            captured["request"] = kwargs
+            return events
+
+        async def aclose(self) -> None:
+            captured["client_closed"] = True
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="test-key", model="gpt-test", max_attempts=1)
+    chunks = await _collect(
+        model,
+        [{"role": "user", "content": "question"}],
         tools=[
             {
                 "type": "function",
                 "function": {
-                    "name": "add",
-                    "description": "Add",
-                    "parameters": {"type": "object", "properties": {}},
+                    "name": "lookup",
+                    "parameters": {"type": "object"},
                 },
             }
         ],
     )
 
-    assert isinstance(result, ModelResponse)
-    assert calls == [
-        {
-            "model": "gpt-5",
-            "input": [{"role": "user", "content": "calculate"}],
-            "temperature": 0.7,
-            "max_output_tokens": 321,
-            "timeout": 120.0,
-            "text": {"format": {"type": "json_object"}},
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "add",
-                    "description": "Add",
-                    "parameters": {"type": "object", "properties": {}},
-                }
-            ],
-        }
+    assert model.api_mode == "responses"
+    assert captured["client"]["max_retries"] == 0
+    assert captured["request"]["stream"] is True
+    assert captured["request"]["input"] == [{"role": "user", "content": "question"}]
+    assert "reasoning.encrypted_content" in captured["request"]["include"]
+    assert captured["request"]["tools"] == [
+        {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
     ]
-
-
-def test_official_openai_model_uses_responses_endpoint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: List[Dict[str, Any]] = []
-
-    class _Responses:
-        def create(self, **kwargs: Any) -> Any:
-            calls.append(kwargs)
-            return _response_with_function_calls()
-
-    fake_client = SimpleNamespace(responses=_Responses())
-    monkeypatch.setattr("openai.OpenAI", lambda **kwargs: fake_client)
-    model = OpenAIModel(
-        model="gpt-5",
-        api_key="test-key",
-        api_mode="responses",
-    )
-
-    result = model.call_raw(
-        [{"role": "user", "content": "calculate"}],
-        include=["file_search_call.results"],
-    )
-
-    assert isinstance(result, ModelResponse)
-    assert result.provider == "openai"
-    assert calls[0]["input"] == [{"role": "user", "content": "calculate"}]
-    assert calls[0]["include"] == [
-        "file_search_call.results",
-        "reasoning.encrypted_content",
-    ]
-
-
-def test_responses_mode_never_falls_back_to_chat(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(
-                create=lambda **kwargs: pytest.fail("Chat endpoint must not be called")
-            )
-        )
-    )
-    monkeypatch.setattr("openai.OpenAI", lambda **kwargs: fake_client)
-    model = OpenAICompatibleModel(
-        model="gpt-5",
-        api_key="test-key",
-        base_url="https://example.test/v1",
-        api_mode="responses",
-    )
-
-    with pytest.raises(RuntimeError, match="openai>=1.66.0"):
-        model.call_raw([{"role": "user", "content": "go"}])
-
-
-def test_responses_stream_emits_typed_text_and_completed_tool_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    completed_response = _response_with_function_calls()
-    reasoning_event_item = completed_response.output[0]
-    completed_response.output[0] = SimpleNamespace(
-        type="reasoning",
-        id="rs_1",
-        status="completed",
-        summary=[{"type": "summary_text", "text": "Need a tool."}],
-    )
-    events = iter(
-        [
-            SimpleNamespace(
-                type="response.output_text.delta",
-                delta="answer ",
-                sequence_number=1,
-                output_index=0,
-                item_id="msg_1",
-            ),
-            SimpleNamespace(
-                type="response.output_text.delta",
-                delta="text",
-                sequence_number=2,
-                output_index=0,
-                item_id="msg_1",
-            ),
-            SimpleNamespace(
-                type="response.function_call_arguments.delta",
-                delta='{"a":',
-                sequence_number=3,
-                output_index=1,
-                item_id="fc_1",
-            ),
-            SimpleNamespace(
-                type="response.output_item.done",
-                item=reasoning_event_item,
-                sequence_number=4,
-                output_index=0,
-            ),
-            SimpleNamespace(
-                type="response.output_item.done",
-                item=completed_response.output[1],
-                sequence_number=5,
-                output_index=1,
-            ),
-            SimpleNamespace(
-                type="response.completed",
-                response=completed_response,
-                sequence_number=6,
-            ),
-        ]
-    )
-
-    class _Responses:
-        def create(self, **kwargs: Any) -> Any:
-            assert kwargs["stream"] is True
-            return events
-
-    fake_client = SimpleNamespace(responses=_Responses())
-    monkeypatch.setattr("openai.OpenAI", lambda **kwargs: fake_client)
-    model = OpenAICompatibleModel(
-        model="gpt-5",
-        api_key="test-key",
-        base_url="https://example.test/v1",
-        api_mode="responses",
-    )
-
-    chunks = list(model.stream([{"role": "user", "content": "go"}]))
-
-    assert [chunk.text for chunk in chunks if chunk.text] == ["answer ", "text"]
-    assert chunks[0].event_type == "response.output_text.delta"
-    argument_delta = [
-        chunk
+    assert "".join(chunk.text for chunk in chunks) == "answer"
+    assert [
+        chunk.event_metadata["arguments_delta"]
         for chunk in chunks
         if chunk.event_type == "response.function_call_arguments.delta"
+    ] == ['{"q":']
+    terminal = chunks[-1]
+    assert terminal.done is True
+    assert terminal.tool_calls == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"q":"x"}'},
+            "metadata": {"response_item_id": "fc_1", "status": "completed"},
+        }
     ]
-    assert argument_delta[0].event_metadata["delta"] == '{"a":'
-    completed_item = [
-        chunk for chunk in chunks if chunk.event_type == "response.output_item.done"
-    ]
-    completed_function = next(
-        chunk
-        for chunk in completed_item
-        if chunk.native_items[0].get("type") == "function_call"
-    )
-    assert completed_function.native_items[0]["call_id"] == "call_1"
-    assert chunks[-1].done is True
-    assert chunks[-1].finish_reason == "completed"
-    assert chunks[-1].tool_calls
-    assert chunks[-1].tool_calls[0]["id"] == "call_1"
-    assert chunks[-1].native_items
-    final_reasoning = next(
-        item for item in chunks[-1].native_items if item["type"] == "reasoning"
-    )
-    assert final_reasoning["encrypted_content"] == "opaque-private-state"
-    replay = responses_module._to_responses_input(
+    assert terminal.usage == {
+        "prompt_tokens": 5,
+        "completion_tokens": 3,
+        "total_tokens": 8,
+    }
+    assert events.closed is True
+    assert captured["client_closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_responses_incomplete_is_a_terminal_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _AsyncListStream(
         [
+            {"type": "response.output_text.delta", "delta": "partial"},
             {
-                "role": "assistant",
-                "content": None,
-                "native_items": chunks[-1].native_items,
-            }
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_1",
+                    "status": "incomplete",
+                    "model": "gpt-test",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "partial"}],
+                        }
+                    ],
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                },
+            },
         ]
     )
-    assert (
-        next(item for item in replay if item["type"] == "reasoning") == final_reasoning
-    )
-    assert chunks[-1].usage["prompt_tokens"] == 11
 
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
 
-def test_responses_stream_rejects_missing_completed_event(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    function_item = _response_with_function_calls().output[1]
+        async def create(self, **_: Any) -> Any:
+            return events
 
-    class _Responses:
-        def create(self, **kwargs: Any) -> Any:
-            return iter(
-                [
-                    SimpleNamespace(
-                        type="response.output_item.done",
-                        item=function_item,
-                        sequence_number=1,
-                        output_index=0,
-                    )
-                ]
-            )
+        async def aclose(self) -> None:
+            return None
 
-    monkeypatch.setattr(
-        "openai.OpenAI",
-        lambda **kwargs: SimpleNamespace(responses=_Responses()),
-    )
-    model = OpenAICompatibleModel(
-        model="compatible-model",
-        api_key="test-key",
-        base_url="https://example.test/v1",
-        api_mode="responses",
-    )
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
 
-    with pytest.raises(ModelTransportError, match="before response.completed"):
-        list(model.stream([{"role": "user", "content": "go"}]))
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    chunks = await _collect(model, [{"role": "user", "content": "question"}])
 
-
-def test_async_responses_transport_uses_shared_normalization(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import asyncio
-
-    calls: List[Dict[str, Any]] = []
-
-    class _Responses:
-        async def create(self, **kwargs: Any) -> Any:
-            calls.append(kwargs)
-            return _response_with_function_calls()
-
-    fake_client = SimpleNamespace(responses=_Responses())
-    monkeypatch.setattr("openai.AsyncOpenAI", lambda **kwargs: fake_client)
-    model = AsyncOpenAICompatibleModel(
-        model="gpt-5",
-        api_key="test-key",
-        base_url="https://example.test/v1",
-        api_mode="responses",
-    )
-
-    response = asyncio.run(model.acall_raw([{"role": "user", "content": "calculate"}]))
-
-    assert isinstance(response, ModelResponse)
-    assert response.tool_calls and response.tool_calls[0]["id"] == "call_1"
-    assert calls[0]["input"] == [{"role": "user", "content": "calculate"}]
-
-
-def test_async_responses_stream_preserves_typed_events(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import asyncio
-
-    completed_response = _response_with_function_calls()
-
-    class _Events:
-        def __init__(self) -> None:
-            self._events = iter(
-                [
-                    SimpleNamespace(
-                        type="response.output_text.delta",
-                        delta="async text",
-                        sequence_number=1,
-                    ),
-                    SimpleNamespace(
-                        type="response.completed",
-                        response=completed_response,
-                        sequence_number=2,
-                    ),
-                ]
-            )
-
-        def __aiter__(self) -> "_Events":
-            return self
-
-        async def __anext__(self) -> Any:
-            try:
-                return next(self._events)
-            except StopIteration as exc:
-                raise StopAsyncIteration from exc
-
-    class _Responses:
-        async def create(self, **kwargs: Any) -> Any:
-            assert kwargs["stream"] is True
-            return _Events()
-
-    monkeypatch.setattr(
-        "openai.AsyncOpenAI",
-        lambda **kwargs: SimpleNamespace(responses=_Responses()),
-    )
-    model = AsyncOpenAICompatibleModel(
-        model="gpt-5",
-        api_key="test-key",
-        base_url="https://example.test/v1",
-        api_mode="responses",
-    )
-
-    async def _collect() -> List[Any]:
-        return [
-            chunk
-            async for chunk in model.astream([{"role": "user", "content": "calculate"}])
-        ]
-
-    chunks = asyncio.run(_collect())
-
-    assert chunks[0].text == "async text"
-    assert chunks[0].event_type == "response.output_text.delta"
+    assert "".join(chunk.text for chunk in chunks) == "partial"
     assert chunks[-1].done is True
-    assert chunks[-1].finish_reason == "completed"
-    assert chunks[-1].tool_calls and chunks[-1].tool_calls[0]["id"] == "call_1"
+    assert chunks[-1].finish_reason == "max_output_tokens"
+    assert chunks[-1].event_metadata["status"] == "incomplete"
 
 
-def test_async_responses_stream_retries_idle_before_first_event_and_closes(
+@pytest.mark.asyncio
+async def test_responses_mode_never_falls_back_to_chat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import asyncio
+    chat_called = False
 
-    attempts = 0
-    closes = 0
-    client_kwargs: Dict[str, Any] = {}
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            async def chat_create(**__: Any) -> Any:
+                nonlocal chat_called
+                chat_called = True
+                return _AsyncListStream([])
 
-    class _IdleEvents:
-        def __aiter__(self) -> "_IdleEvents":
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=chat_create))
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    with pytest.raises(RuntimeError, match="POST /v1/responses"):
+        await _collect(model, [{"role": "user", "content": "question"}])
+
+    assert chat_called is False
+
+
+@pytest.mark.asyncio
+async def test_responses_missing_terminal_fails_and_closes_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _AsyncListStream(
+        [{"type": "response.output_text.delta", "delta": "partial"}]
+    )
+    closed: dict[str, bool] = {}
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **_: Any) -> Any:
+            return events
+
+        async def aclose(self) -> None:
+            closed["client"] = True
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    with pytest.raises(ModelTransportError, match="before response.completed"):
+        await _collect(model, [{"role": "user", "content": "question"}])
+
+    assert events.closed is True
+    assert closed["client"] is True
+
+
+@pytest.mark.asyncio
+async def test_chat_compatibility_streams_reasoning_parallel_tool_calls_and_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    events = _AsyncListStream(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="answer",
+                            reasoning_content="check",
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id="call_1",
+                                    type="function",
+                                    function=SimpleNamespace(
+                                        name="first", arguments='{"x":'
+                                    ),
+                                ),
+                                SimpleNamespace(
+                                    index=1,
+                                    id="call_2",
+                                    type="function",
+                                    function=SimpleNamespace(
+                                        name="second", arguments='{"y":'
+                                    ),
+                                ),
+                            ],
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="",
+                            reasoning_content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id=None,
+                                    type=None,
+                                    function=SimpleNamespace(name=None, arguments="1}"),
+                                ),
+                                SimpleNamespace(
+                                    index=1,
+                                    id=None,
+                                    type=None,
+                                    function=SimpleNamespace(name=None, arguments="2}"),
+                                ),
+                            ],
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+                usage=SimpleNamespace(
+                    prompt_tokens=6,
+                    completion_tokens=4,
+                    total_tokens=10,
+                    prompt_tokens_details=SimpleNamespace(cached_tokens=2),
+                ),
+            ),
+        ]
+    )
+
+    class Client:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["client"] = kwargs
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        async def create(self, **kwargs: Any) -> Any:
+            captured["request"] = kwargs
+            return events
+
+        async def aclose(self) -> None:
+            captured["client_closed"] = True
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAICompatibleModel(
+        model="compatible-test",
+        api_key="key",
+        base_url="https://example.test/v1",
+        max_attempts=1,
+    )
+    chunks = await _collect(model, [{"role": "user", "content": "question"}])
+
+    assert model.api_mode == "chat_completions"
+    assert captured["client"]["max_retries"] == 0
+    assert captured["request"]["stream"] is True
+    assert "".join(chunk.text for chunk in chunks) == "answer"
+    assert "".join(chunk.reasoning_content or "" for chunk in chunks) == "check"
+    assert chunks[-1].tool_calls == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "first", "arguments": '{"x":1}'},
+        },
+        {
+            "id": "call_2",
+            "type": "function",
+            "function": {"name": "second", "arguments": '{"y":2}'},
+        },
+    ]
+    assert chunks[-1].usage == {
+        "prompt_tokens": 6,
+        "completion_tokens": 4,
+        "total_tokens": 10,
+        "cached_tokens": 2,
+    }
+    assert events.closed is True
+    assert captured["client_closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_chat_request_timeout_is_clamped_to_absolute_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    events = _AsyncListStream(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="ok", reasoning_content=None, tool_calls=None
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+        ]
+    )
+
+    class Client:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["client"] = kwargs
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        async def create(self, **kwargs: Any) -> Any:
+            captured["request"] = kwargs
+            return events
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAICompatibleModel(
+        model="compatible-test",
+        api_key="key",
+        base_url="https://example.test/v1",
+        timeout=120,
+        max_attempts=1,
+    )
+    deadline = time.monotonic() + 1.0
+    await _collect(
+        model,
+        [{"role": "user", "content": "question"}],
+        deadline_monotonic=deadline,
+    )
+
+    assert 0 < float(captured["client"]["timeout"]) <= 1.0
+    assert 0 < float(captured["request"]["timeout"]) <= 1.0
+
+
+@pytest.mark.asyncio
+async def test_chat_cancellation_closes_stream_and_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    closed: dict[str, bool] = {}
+
+    class BlockingStream(AsyncIterator[Any]):
+        def __aiter__(self) -> BlockingStream:
             return self
 
         async def __anext__(self) -> Any:
-            await asyncio.Event().wait()
+            entered.set()
+            await release.wait()
             raise StopAsyncIteration
 
-        async def close(self) -> None:
-            nonlocal closes
-            closes += 1
+        async def aclose(self) -> None:
+            closed["stream"] = True
 
-    class _Responses:
-        async def create(self, **kwargs: Any) -> Any:
-            nonlocal attempts
-            attempts += 1
-            return _IdleEvents()
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
-    async def _no_sleep(_: float) -> None:
-        return None
+        async def create(self, **_: Any) -> Any:
+            return BlockingStream()
 
-    def _client(**kwargs: Any) -> Any:
-        client_kwargs.update(kwargs)
-        return SimpleNamespace(responses=_Responses())
+        async def aclose(self) -> None:
+            closed["client"] = True
 
-    monkeypatch.setattr("openai.AsyncOpenAI", _client)
-    monkeypatch.setattr("qitos.models._request_runtime.asyncio.sleep", _no_sleep)
-    model = AsyncOpenAICompatibleModel(
-        model="gpt-5",
-        api_key="test-key",
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAICompatibleModel(
+        model="compatible-test",
+        api_key="key",
         base_url="https://example.test/v1",
-        api_mode="responses",
-        timeout=1,
-        stream_idle_timeout=0.001,
         max_attempts=2,
     )
+    task = asyncio.create_task(
+        _collect(model, [{"role": "user", "content": "question"}])
+    )
+    await entered.wait()
+    task.cancel()
 
-    async def _collect() -> None:
-        async for _ in model.astream([{"role": "user", "content": "go"}]):
-            pass
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
-    with pytest.raises(ModelTransportError) as exc_info:
-        asyncio.run(_collect())
+    assert closed == {"stream": True, "client": True}
 
-    assert exc_info.value.attempts == 2
-    assert attempts == 2
-    assert closes == 2
-    assert client_kwargs["max_retries"] == 0
+
+@pytest.mark.asyncio
+async def test_chat_formats_multimodal_file_content(
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    png_path = tmp_path / "shot.png"
+    png_path.write_bytes(
+        base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wn2gbcAAAAASUVORK5CYII="
+        )
+    )
+    events = _AsyncListStream(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="ok", reasoning_content=None, tool_calls=None
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+        ]
+    )
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        async def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return events
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAICompatibleModel(
+        model="vision-test",
+        api_key="key",
+        base_url="https://example.test/v1",
+        max_attempts=1,
+    )
+    await _collect(
+        model,
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Inspect."},
+                    {"type": "image_file", "path": str(png_path), "detail": "high"},
+                ],
+            }
+        ],
+    )
+
+    content = captured["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "Inspect."}
+    assert content[1]["image_url"]["detail"] == "high"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_api_mode_rejects_unknown_values() -> None:
+    with pytest.raises(ValueError, match="Unsupported api_mode"):
+        OpenAICompatibleModel(
+            model="test",
+            api_key="key",
+            base_url="https://example.test/v1",
+            api_mode="automatic-fallback",
+        )

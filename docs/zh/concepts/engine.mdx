@@ -179,38 +179,32 @@ result = engine.run(task)
 
 这与直接写 `Engine(agent=agent, ...)` 等价，也是 `agent.run()` 在内部采用的路径。
 
-## AsyncEngine
+## 异步执行
 
-`AsyncEngine` 提供非阻塞的智能体执行能力。它把同一个 `Engine` 循环放到 daemon
-工作线程中，并协作式传递取消请求，因此无响应的同步调用不会无限占住事件循环或进程
-退出。截止时间到达并不声称 Python 已强杀正在执行的同步调用；调用可以在有界清理宽限期
-内结束。
+`Engine` 只有一条异步原生执行路径。`arun()` 直接运行在调用方的事件循环上，
+模型 Provider 通过原生异步流返回结果，不使用工作线程桥接。
 
 ```python
-from qitos import AsyncEngine
+from qitos import Engine
 
-async_engine = AsyncEngine(agent=agent, budget=RuntimeBudget(max_steps=20))
-```
-
-### `AsyncEngine.arun(task)`
-
-异步运行智能体循环，返回与 `Engine.run()` 相同的 `EngineResult`。
-
-```python
-result = await async_engine.arun("分析数据")
+engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=20))
+result = await engine.arun("分析数据")
 print(result.state.final_result)
 ```
 
-### `AsyncEngine.arun_stream(task)`
+只在同步应用边界调用 `engine.run()`。如果当前已有事件循环，该方法会抛出
+`RuntimeError`，避免应用意外嵌套事件循环。
+
+### `Engine.arun_stream(task)`
 
 异步运行智能体循环，并在事件发生时产出结构化的 `EngineEvent` 对象——非常适合实时 UI 更新或将进度流式推送给客户端。
 
 ```python
-async for event in async_engine.arun_stream("分析数据"):
+async for event in engine.arun_stream("分析数据"):
     print(event.event_type, event.step_id, event.payload)
 ```
 
-事件在步骤边界（`step_start`、`step_end`）、阶段切换（`decide`、`act`、`reduce`、`critic`、`check_stop`）和多智能体事件（`handoff`、`delegate`、`fanout`）时产出。流总是以 `run_start` 开始、以唯一一个 `run_end` 结束。事件队列是有界的：持续背压时可丢弃中间事件，`dropped_event_count` 记录丢弃数量，`run_end` 的 payload 也会携带该数量并以终态优先级保留。
+事件在步骤边界（`step_start`、`step_end`）、阶段切换（`decide`、`act`、`reduce`、`critic`、`check_stop`）和多智能体事件（`handoff`、`delegate`、`fanout`）时产出。流包含一个 `run_start`，并以唯一的 `run_end` 结束。事件队列是有界的：持续背压时可丢弃中间事件，`dropped_event_count` 记录丢弃数量，`run_end` 的 payload 也会携带该数量并以终态优先级保留。
 
 ### `EngineEvent`
 
@@ -239,22 +233,19 @@ q1 = stream.subscribe()  # 消费者 1 的 asyncio.Queue
 q2 = stream.subscribe()  # 消费者 2 的 asyncio.Queue
 ```
 
-### 异步模型
+### 模型流
 
-当配置的模型实现了 `acall()`（来自 `AsyncModel`）时，`AsyncEngine` 可以在不阻塞事件循环的情况下调用它。内置的异步模型适配器：
+所有模型 Provider 都实现唯一的异步 `Model.stream()` 契约。Engine 消费 Provider 无关的
+流式 chunk，并在整个事务中保留取消和请求截止时间。
 
 ```python
-from qitos.models import AsyncOpenAICompatibleModel, AsyncOpenAIModel
+from qitos.models import OpenAICompatibleModel
 
-llm = AsyncOpenAICompatibleModel(
+llm = OpenAICompatibleModel(
     model="qwen-plus",
     api_key="...",
     base_url="https://...",
 )
-result = await llm.acall([{"role": "user", "content": "你好"}])
+engine = Engine(agent=MyAgent(llm=llm))
+result = await engine.arun("分析数据")
 ```
-
-<Tip>
-  `AsyncEngine.arun()` 与任何模型都兼容——同步 Engine 会运行在 daemon 工作线程中。
-  需要 provider 原生取消或高并发时，再使用异步模型适配器。
-</Tip>

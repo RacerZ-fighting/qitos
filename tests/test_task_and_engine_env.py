@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
+from examples._support import SequenceModel
+
 from qitos import (
     Action,
     AgentModule,
@@ -172,7 +174,7 @@ def test_engine_respects_max_tokens_budget():
         def __init__(self):
             super().__init__(tool_registry=ToolRegistry())
             self.model_parser = ReActTextParser()
-            self.llm = lambda messages: "Action: noop()"
+            self.llm = SequenceModel(["Action: noop()"] * 3)
 
         def init_state(self, task: str, **kwargs: Any) -> _LLMState:
             return _LLMState(task=task, max_steps=10)

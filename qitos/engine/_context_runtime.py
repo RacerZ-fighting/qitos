@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict
-from typing import Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
-from ._protocol import _EngineProtocol
 from .states import ContextConfig, ContextTelemetry
+
+if TYPE_CHECKING:
+    from .engine import Engine
 
 
 class ContextOverflowError(RuntimeError):
@@ -25,7 +27,7 @@ class DecisionContextConfigurationError(RuntimeError):
 class _ContextRuntime:
     _REACTIVE_COMPACT_FACTORS = (0.70, 0.50, 0.35)
 
-    def __init__(self, engine: _EngineProtocol):
+    def __init__(self, engine: Engine[Any, Any, Any]):
         self.engine = engine
         self.config = ContextConfig()
         self.reset()
@@ -166,9 +168,7 @@ class _ContextRuntime:
         content_block_tokens, content_block_mode = self.count_tokens(
             list(user_content_blocks or []), llm
         )
-        request_tokens, request_mode = self._count_request_input(
-            request_options, llm
-        )
+        request_tokens, request_mode = self._count_request_input(request_options, llm)
         telemetry = ContextTelemetry(
             context_window=budget["context_window"],
             available_input_budget=budget["available_input_budget"],
@@ -227,8 +227,7 @@ class _ContextRuntime:
         pending_tokens = int(telemetry.prepared_tokens)
         history_allowance = max(
             1,
-            total_trigger
-            - self._fixed_anchor_tokens(telemetry, include_prepared=True),
+            total_trigger - self._fixed_anchor_tokens(telemetry, include_prepared=True),
         )
         attempt = int(self.reactive_compact_attempts)
         if attempt > 0:
@@ -312,9 +311,7 @@ class _ContextRuntime:
         system_tokens, system_mode = self.count_tokens(system_messages, llm)
         anchor_tokens, anchor_mode = self.count_tokens(anchor_messages, llm)
         history_tokens, history_mode = self.count_tokens(history_messages, llm)
-        request_tokens, request_mode = self._count_request_input(
-            request_options, llm
-        )
+        request_tokens, request_mode = self._count_request_input(request_options, llm)
         input_tokens, input_mode = self._count_assembled_request(
             llm=llm,
             messages=messages,
@@ -362,7 +359,8 @@ class _ContextRuntime:
             budget = telemetry.available_input_budget
             telemetry.occupancy_ratio = (
                 min(1.0, float(planned) / float(budget))
-                if isinstance(budget, int) and budget > 0 else 0.0
+                if isinstance(budget, int) and budget > 0
+                else 0.0
             )
             telemetry.counting_mode = "provider_tokenize"
         return telemetry
@@ -373,8 +371,8 @@ class _ContextRuntime:
         llm: Any,
         telemetry: ContextTelemetry,
         raw_output: Any,
+        usage: Dict[str, Any] | None = None,
     ) -> ContextTelemetry:
-        usage = self._extract_usage(llm)
         if usage is not None:
             prompt_tokens = usage.get("prompt_tokens")
             completion_tokens = usage.get("completion_tokens")
@@ -382,14 +380,17 @@ class _ContextRuntime:
             if isinstance(prompt_tokens, int) and prompt_tokens >= 0:
                 telemetry.provider_prompt_tokens = int(prompt_tokens)
                 if telemetry.planned_prompt_tokens is not None:
-                    telemetry.token_estimate_error = int(prompt_tokens) - int(telemetry.planned_prompt_tokens)
+                    telemetry.token_estimate_error = int(prompt_tokens) - int(
+                        telemetry.planned_prompt_tokens
+                    )
                 # The provider owns the final prompt measurement.  This is
                 # what TUI, trace and cumulative utilization must display.
                 telemetry.input_tokens_total = int(prompt_tokens)
                 budget = telemetry.available_input_budget
                 telemetry.occupancy_ratio = (
                     min(1.0, float(prompt_tokens) / float(budget))
-                    if isinstance(budget, int) and budget > 0 else 0.0
+                    if isinstance(budget, int) and budget > 0
+                    else 0.0
                 )
                 telemetry.counting_mode = "provider_usage"
                 telemetry.meter_source = "provider_usage"
@@ -405,9 +406,9 @@ class _ContextRuntime:
                 telemetry.provider_total_tokens = int(total_tokens)
                 step_total = int(total_tokens)
             else:
-                step_total = int(telemetry.provider_prompt_tokens or telemetry.input_tokens_total) + int(
-                    telemetry.output_tokens
-                )
+                step_total = int(
+                    telemetry.provider_prompt_tokens or telemetry.input_tokens_total
+                ) + int(telemetry.output_tokens)
         else:
             telemetry.output_tokens = self.count_tokens(raw_output, llm)[0]
             step_total = int(telemetry.input_tokens_total) + int(
@@ -481,16 +482,12 @@ class _ContextRuntime:
             "context": self.telemetry_dict(telemetry),
         }
 
-    def force_compaction_event(
-        self, telemetry: ContextTelemetry
-    ) -> Dict[str, Any]:
+    def force_compaction_event(self, telemetry: ContextTelemetry) -> Dict[str, Any]:
         budget = telemetry.hard_input_budget or telemetry.available_input_budget
         threshold = (
             max(
                 1,
-                math.ceil(
-                    budget * min(1.0, float(self.config.compact_ratio))
-                ),
+                math.ceil(budget * min(1.0, float(self.config.compact_ratio))),
             )
             if isinstance(budget, int) and budget > 0
             else None
@@ -687,23 +684,10 @@ class _ContextRuntime:
             except Exception:
                 pass
         message_tokens, message_mode = self.count_tokens(messages, llm)
-        option_tokens, option_mode = self._count_request_input(
-            request_options, llm
-        )
+        option_tokens, option_mode = self._count_request_input(request_options, llm)
         return message_tokens + option_tokens, self._merge_counting_mode(
             [message_mode, option_mode]
         )
-
-    def _extract_usage(self, llm: Any) -> Optional[Dict[str, Any]]:
-        extractor = getattr(llm, "extract_usage", None)
-        if callable(extractor):
-            try:
-                usage = extractor()
-                if isinstance(usage, dict):
-                    return usage
-            except Exception:
-                return None
-        return None
 
     def _merge_counting_mode(self, modes: Iterable[str]) -> str:
         cleaned = [str(m) for m in modes if m and str(m) != "disabled"]

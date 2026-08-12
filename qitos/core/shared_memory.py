@@ -7,7 +7,6 @@ that multiple agents can read from and write to during a multi-agent run.
 from __future__ import annotations
 
 import json
-import os
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -90,7 +89,9 @@ class FileSharedMemory(SharedMemory):
             return {}
 
     def _write_all(self, data: Dict[str, Any]) -> None:
-        self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self._path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     def write(self, key: str, value: Any) -> None:
         with self._lock:
@@ -167,9 +168,7 @@ class SharedMemoryNamespace:
 
     def write(self, key: str, value: Any) -> None:
         if self._read_only:
-            raise PermissionError(
-                f"Namespace '{self._namespace}' is read-only"
-            )
+            raise PermissionError(f"Namespace '{self._namespace}' is read-only")
         self._memory.write(self._prefix(key), value)
 
     def read(self, key: str) -> Optional[Any]:
@@ -177,24 +176,18 @@ class SharedMemoryNamespace:
 
     def delete(self, key: str) -> bool:
         if self._read_only:
-            raise PermissionError(
-                f"Namespace '{self._namespace}' is read-only"
-            )
+            raise PermissionError(f"Namespace '{self._namespace}' is read-only")
         return self._memory.delete(self._prefix(key))
 
     def list_keys(self) -> List[str]:
         prefix = f"{self._namespace}:"
         return [
-            k[len(prefix):]
-            for k in self._memory.list_keys()
-            if k.startswith(prefix)
+            k[len(prefix) :] for k in self._memory.list_keys() if k.startswith(prefix)
         ]
 
     def clear(self) -> None:
         if self._read_only:
-            raise PermissionError(
-                f"Namespace '{self._namespace}' is read-only"
-            )
+            raise PermissionError(f"Namespace '{self._namespace}' is read-only")
         for key in self.list_keys():
             self._memory.delete(self._prefix(key))
 

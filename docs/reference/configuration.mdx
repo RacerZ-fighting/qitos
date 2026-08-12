@@ -86,8 +86,8 @@ transport implementation and accept the following controls:
 | `stream_idle_timeout` | `60` | Maximum seconds without progress on a model stream |
 | `retry_window_seconds` | `300` | Total recovery window after the first retryable failure |
 
-Synchronous calls and model streams activate this policy. QitOS creates the
-corresponding OpenAI-compatible SDK client with `max_retries=0` and remains the only
+Model streams activate this policy. QitOS creates the corresponding OpenAI-compatible
+async SDK client with `max_retries=0`, while `ModelRetryPolicy` remains the only
 retry owner. It retries recognized connection failures, timeouts, 408, 409, 429, and
 5xx responses and honors bounded
 `Retry-After`, `retry-after-ms`, and `x-should-retry` hints. Local validation errors
@@ -96,9 +96,8 @@ and ordinary 4xx responses fail immediately.
 When an Engine run has a relative or absolute runtime limit, it binds one logical
 model-request deadline. Every attempt recalculates its provider timeout from live
 remaining time, retry backoff observes both deadline and cancellation, and no new
-attempt starts after either becomes terminal. A synchronous provider that cannot be
-interrupted is detached on a daemon worker; its late response is discarded and cannot
-update history, actions, or final state.
+attempt starts after either becomes terminal. Provider cancellation propagates through
+the async stream instead of detaching work onto a daemon thread.
 
 The Engine uses a transactional stream for OpenAI-compatible models: text and tool-call
 deltas stay private until a terminal event completes the attempt. A retryable failure
@@ -106,9 +105,8 @@ after partial output closes that stream, discards its buffered deltas, and retri
 both the `max_attempts` budget and `retry_window_seconds`, measured from the first
 retryable failure. A healthy long response may run beyond `timeout` while events
 continue only when no earlier Engine deadline applies; `stream_idle_timeout` detects a
-stalled response. Direct callers of the public
-live `stream()` / `astream()` APIs still receive deltas immediately, so those APIs retry
-only before output becomes observable.
+stalled response. Direct callers use the same `stream()` transaction and therefore see
+only chunks from a completed attempt.
 
 All model stream paths use `ModelStreamChunk` as the normalized contract. Its terminal
 chunk retains the provider's actual `finish_reason`; text, reasoning, typed event
@@ -121,9 +119,9 @@ optionally implement `on_chunk(chunk)` and `on_error(exc)` without changing the 
 protocol.
 
 ```python
-from qitos.models import AsyncOpenAICompatibleModel
+from qitos.models import OpenAICompatibleModel
 
-llm = AsyncOpenAICompatibleModel(
+llm = OpenAICompatibleModel(
     model="compatible-model",
     base_url="https://provider.example/v1",
     api_mode="responses",
@@ -252,8 +250,8 @@ the outer absolute deadline is retained.
 |----------|----------|-------------|
 | `OPENAI_API_KEY` | Yes (for OpenAI / compatible APIs) | API key sent in the `Authorization` header. Used by `OpenAIModel` and `OpenAICompatibleModel` |
 | `OPENAI_BASE_URL` | Yes (for compatible APIs) | Base URL of the API endpoint. Required by `OpenAICompatibleModel`; optional for `OpenAIModel` (defaults to `https://api.openai.com/v1`) |
-| `QITOS_API_KEY` | No | Alternative API key variable. Recognized by `ModelFactory.from_env()` as a fallback when `OPENAI_API_KEY` is not set |
-| `QITOS_MODEL` | No | Default model identifier. Read by `ModelFactory.from_env()` to select the model when none is specified in code |
+| `QITOS_API_KEY` | No | Compatibility API key read by `ModelConfig.from_env()` when `OPENAI_API_KEY` is not set |
+| `QITOS_MODEL` | No | Default model identifier read by `ModelConfig.from_env()` |
 | `AZURE_OPENAI_API_KEY` | Only for Azure | API key for Azure OpenAI. Used by `AzureOpenAIModel` |
 | `AZURE_OPENAI_ENDPOINT` | Only for Azure | Endpoint URL for Azure OpenAI |
 | `AZURE_OPENAI_DEPLOYMENT` | No | Deployment name for Azure OpenAI |

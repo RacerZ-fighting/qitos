@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **模型运行时只保留一条原生异步路径**：`Engine.arun()` 与 `Engine.astep()` 统一负责
+  从模型请求到终态响应的完整过程。OpenAI Responses、Anthropic Messages、兼容 Chat
+  Completions、Gemini、LiteLLM 与 Ollama 都实现同一个异步流契约；旧的同步/异步类层级、
+  `call_raw`、导入时注册和 daemon-thread `AsyncEngine` 桥接已经删除。
 - **qita 同规格对比预检**：compare 页面会先核对模型、提示词、工具、环境、
   上下文策略、预算、源码版本与实验来源。配置不同或来源信息不完整的结果会明确标为
   只能描述、不能用于因果判断；配置一致也不会掩盖供应商或外部环境的非确定性。

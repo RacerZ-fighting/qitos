@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
-from ..events import EngineEvent, EngineEventType
+from ..events import EngineEvent
 
 
 @dataclass
@@ -27,7 +27,7 @@ class StreamTransformer(ABC):
     """Base class for stream transformers.
 
     Subclasses override ``transform()`` to convert EngineEvents into
-    application-specific output. The AsyncEngine calls each transformer
+    application-specific output. The Engine calls each transformer
     in order for every event.
 
     A transformer can:

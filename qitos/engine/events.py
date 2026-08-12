@@ -34,7 +34,7 @@ class EngineEventType(str, Enum):
 
 @dataclass
 class EngineEvent:
-    """Structured event emitted by Engine/AsyncEngine during execution."""
+    """Structured event emitted by Engine during execution."""
 
     event_type: EngineEventType
     step_id: int = 0
@@ -43,9 +43,7 @@ class EngineEvent:
     ok: bool = True
     payload: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
-    ts: str = field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat()
-    )
+    ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -220,4 +218,141 @@ class EventStream:
         return q
 
 
-__all__ = ["EngineEvent", "EngineEventType", "EventStream"]
+class EngineEventHook:
+    """Project Engine hooks and runtime events into one async event stream."""
+
+    def __init__(self, stream: EventStream) -> None:
+        self._stream = stream
+
+    def on_run_start(self, task: str, state: Any, engine: Any) -> None:
+        _ = state, engine
+        self._stream.emit(
+            EngineEvent(
+                event_type=EngineEventType.RUN_START,
+                payload={"task": task},
+            )
+        )
+
+    def on_run_end(self, result: Any, engine: Any) -> None:
+        _ = engine
+        state = getattr(result, "state", None)
+        self._stream.emit(
+            EngineEvent(
+                event_type=EngineEventType.RUN_END,
+                step_id=int(getattr(result, "step_count", 0) or 0),
+                payload={
+                    "step_count": getattr(result, "step_count", 0),
+                    "runtime_seconds": getattr(result, "runtime_seconds", 0.0),
+                    "total_tokens": getattr(result, "total_tokens", 0),
+                    "stop_reason": getattr(state, "stop_reason", None),
+                },
+            )
+        )
+
+    def on_before_step(self, ctx: Any, engine: Any) -> None:
+        _ = engine
+        record = getattr(ctx, "record", None)
+        phase = getattr(ctx, "phase", None)
+        self._stream.emit(
+            EngineEvent(
+                event_type=EngineEventType.STEP_START,
+                step_id=int(getattr(ctx, "step_id", 0) or 0),
+                agent_id=getattr(record, "agent_id", None),
+                phase=phase,
+                payload={"phase": phase.value if phase else None},
+            )
+        )
+
+    def on_after_step(self, ctx: Any, engine: Any) -> None:
+        _ = engine
+        record = getattr(ctx, "record", None)
+        phase = getattr(ctx, "phase", None)
+        self._stream.emit(
+            EngineEvent(
+                event_type=EngineEventType.STEP_END,
+                step_id=int(getattr(ctx, "step_id", 0) or 0),
+                agent_id=getattr(record, "agent_id", None),
+                phase=phase,
+                payload={
+                    "phase": phase.value if phase else None,
+                    "stop_reason": getattr(ctx, "stop_reason", None),
+                },
+            )
+        )
+
+    def on_before_decide(self, ctx: Any, engine: Any) -> None:
+        _ = engine
+        self._stream.emit(
+            EngineEvent(
+                event_type=EngineEventType.DECIDE,
+                step_id=int(getattr(ctx, "step_id", 0) or 0),
+                phase=RuntimePhase.DECIDE,
+                payload={"stage": "start"},
+            )
+        )
+
+    def on_after_decide(self, ctx: Any, engine: Any) -> None:
+        _ = engine
+        decision = getattr(ctx, "decision", None)
+        self._stream.emit(
+            EngineEvent(
+                event_type=EngineEventType.DECIDE,
+                step_id=int(getattr(ctx, "step_id", 0) or 0),
+                phase=RuntimePhase.DECIDE,
+                payload={"stage": "end", "mode": getattr(decision, "mode", None)},
+            )
+        )
+
+    def on_before_act(self, ctx: Any, engine: Any) -> None:
+        _ = engine
+        self._stream.emit(
+            EngineEvent(
+                event_type=EngineEventType.ACT,
+                step_id=int(getattr(ctx, "step_id", 0) or 0),
+                phase=RuntimePhase.ACT,
+                payload={"stage": "start"},
+            )
+        )
+
+    def on_after_act(self, ctx: Any, engine: Any) -> None:
+        _ = engine
+        self._stream.emit(
+            EngineEvent(
+                event_type=EngineEventType.ACT,
+                step_id=int(getattr(ctx, "step_id", 0) or 0),
+                phase=RuntimePhase.ACT,
+                payload={"stage": "end"},
+            )
+        )
+
+    def on_event(
+        self,
+        event: Any,
+        state: Any,
+        record: Any,
+        engine: Any,
+    ) -> None:
+        _ = state, engine
+        phase = getattr(event, "phase", None)
+        phase_value = phase.value if phase else ""
+        event_type = EngineEventType.PHASE_END
+        if "HANDOFF" in phase_value:
+            event_type = EngineEventType.HANDOFF
+        elif "DELEGATE" in phase_value:
+            event_type = EngineEventType.DELEGATE
+        elif "FANOUT" in phase_value:
+            event_type = EngineEventType.FANOUT
+        self._stream.emit(
+            EngineEvent(
+                event_type=event_type,
+                step_id=int(getattr(event, "step_id", 0) or 0),
+                agent_id=getattr(record, "agent_id", None),
+                phase=phase,
+                ok=bool(getattr(event, "ok", True)),
+                payload=getattr(event, "payload", {}) or {},
+                error=getattr(event, "error", None),
+            )
+        )
+
+
+__all__ = ["EngineEvent", "EngineEventHook", "EngineEventType", "EventStream"]

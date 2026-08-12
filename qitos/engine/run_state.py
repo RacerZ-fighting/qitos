@@ -12,9 +12,9 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, cast
 
-from ..core.state import StateSchema, StateMigrationError
+from ..core.state import StateMigrationError
 
 # ---------------------------------------------------------------------------
 # Schema versioning
@@ -32,6 +32,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(SCHEMA_VERSION_SUMMARIES)
 # ---------------------------------------------------------------------------
 # RunState — serializable snapshot of an Engine run
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class RunState:
@@ -60,11 +61,13 @@ class RunState:
 
     # ---- serialization metadata ----
 
-    _serialization_meta: Dict[str, Any] = field(default_factory=lambda: {
-        "original_type": "none",
-        "serialized_via": "none",
-        "requires_deserializer": False,
-    })
+    _serialization_meta: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "original_type": "none",
+            "serialized_via": "none",
+            "requires_deserializer": False,
+        }
+    )
 
     # ---- construction from EngineResult ----
 
@@ -92,11 +95,15 @@ class RunState:
 
         records = []
         for r in getattr(result, "records", []):
-            records.append(asdict(r) if hasattr(r, "__dataclass_fields__") else {})
+            records.append(
+                asdict(cast(Any, r)) if hasattr(r, "__dataclass_fields__") else {}
+            )
 
         events = []
         for e in getattr(result, "events", []):
-            events.append(asdict(e) if hasattr(e, "__dataclass_fields__") else {})
+            events.append(
+                asdict(cast(Any, e)) if hasattr(e, "__dataclass_fields__") else {}
+            )
 
         return cls(
             agent_name=agent_name,
@@ -107,9 +114,11 @@ class RunState:
             records=records,
             events=events,
             checkpoint_id=checkpoint_id,
-            budget=asdict(getattr(result, "budget", {}))
-            if hasattr(getattr(result, "budget", None), "__dataclass_fields__")
-            else {},
+            budget=(
+                asdict(cast(Any, getattr(result, "budget", {})))
+                if hasattr(getattr(result, "budget", None), "__dataclass_fields__")
+                else {}
+            ),
             token_usage=getattr(result, "total_tokens", 0),
             _serialization_meta={
                 "original_type": "state_dataclass" if state_type else "none",

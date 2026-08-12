@@ -24,14 +24,12 @@ Quick return values:
 
 from __future__ import annotations
 
-import functools
-import inspect
 from typing import Any, Callable, Optional, TypeVar, overload
 
 from .critic import Critic
 from .critic_result import CriticResult
 
-F = TypeVar("F", bound=Callable)
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 def _coerce_return(value: Any) -> CriticResult:
@@ -59,18 +57,15 @@ class _FunctionCritic(Critic):
 
     def __init__(
         self,
-        func: Callable,
+        func: Callable[..., Any],
         name: Optional[str] = None,
         score: float = 1.0,
     ):
         self._func = func
         self._name = name or getattr(func, "__name__", "critic")
         self._default_score = score
-        functools.update_wrapper(self, func, updated=())
 
-    def evaluate(
-        self, state: Any, decision: Any, results: list[Any]
-    ) -> CriticResult:
+    def evaluate(self, state: Any, decision: Any, results: list[Any]) -> CriticResult:
         raw = self._func(state, decision, results)
         result = _coerce_return(raw)
         # Apply default score only if caller didn't set one explicitly
@@ -83,11 +78,23 @@ class _FunctionCritic(Critic):
 
 
 @overload
-def critic(__func_or_none__: None = None, **kwargs: Any) -> Callable[[F], _FunctionCritic]: ...
+def critic(
+    __func_or_none__: None = None,
+    *,
+    name: Optional[str] = None,
+    score: float = 1.0,
+) -> Callable[[F], _FunctionCritic]:  # noqa: E704
+    ...
 
 
 @overload
-def critic(__func_or_none__: F, **kwargs: Any) -> _FunctionCritic: ...
+def critic(
+    __func_or_none__: F,
+    *,
+    name: Optional[str] = None,
+    score: float = 1.0,
+) -> _FunctionCritic:  # noqa: E704
+    ...
 
 
 def critic(

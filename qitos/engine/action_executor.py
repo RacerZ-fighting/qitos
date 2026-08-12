@@ -29,15 +29,17 @@ from .interrupt import EngineInterrupt
 from .states import RuntimeEvent, RuntimePhase
 
 if TYPE_CHECKING:
-    from ._protocol import _EngineProtocol
     from .cancellation import CancelToken
+    from .engine import Engine
 
 
 # Terminal states that count as a failure for fail_fast purposes.
-_FAILED_STATUSES = frozenset({
-    ActionStatus.ERROR,
-    ActionStatus.TIMED_OUT,
-})
+_FAILED_STATUSES = frozenset(
+    {
+        ActionStatus.ERROR,
+        ActionStatus.TIMED_OUT,
+    }
+)
 
 
 class _ConcurrencyTracker:
@@ -87,7 +89,7 @@ class ActionExecutor:
         trace_writer: Any = None,
         delegate_depth: int = 0,
         shared_memory: Any = None,
-        engine: Optional[_EngineProtocol] = None,
+        engine: Optional[Engine[Any, Any, Any]] = None,
         permission_pipeline: Any = None,
         read_before_write_enforcer: Any = None,
         permission_interaction_callback: Optional[Any] = None,
@@ -317,9 +319,11 @@ class ActionExecutor:
         self.last_execution_stats["segments"] = len(segments)
 
         return [
-            r
-            if r is not None
-            else self._error_result(actions[i], "concurrent_execution_failed")
+            (
+                r
+                if r is not None
+                else self._error_result(actions[i], "concurrent_execution_failed")
+            )
             for i, r in enumerate(results)
         ]
 
@@ -383,9 +387,7 @@ class ActionExecutor:
                     break
                 done, pending = wait(
                     pending,
-                    timeout=(
-                        0.05 if remaining is None else min(0.05, remaining)
-                    ),
+                    timeout=(0.05 if remaining is None else min(0.05, remaining)),
                     return_when=FIRST_COMPLETED,
                 )
                 if not done:
@@ -522,7 +524,9 @@ class ActionExecutor:
         return None, "none", None
 
     @staticmethod
-    def _remaining_action_seconds(deadline_monotonic: Optional[float]) -> Optional[float]:
+    def _remaining_action_seconds(
+        deadline_monotonic: Optional[float],
+    ) -> Optional[float]:
         if deadline_monotonic is None:
             return None
         return max(0.0, deadline_monotonic - time.monotonic())
@@ -665,9 +669,7 @@ class ActionExecutor:
                             timeout_s=timeout_s,
                             worker_still_running=future.running(),
                         )
-                    wait_seconds = (
-                        0.05 if remaining is None else min(0.05, remaining)
-                    )
+                    wait_seconds = 0.05 if remaining is None else min(0.05, remaining)
                     try:
                         return future.result(timeout=wait_seconds)
                     except FuturesTimeoutError:
@@ -975,9 +977,7 @@ class ActionExecutor:
                 )
 
         effective_args = dict(
-            action.args
-            if permission.updated_args is None
-            else permission.updated_args
+            action.args if permission.updated_args is None else permission.updated_args
         )
         try:
             validation = self._validate(tool, effective_args, runtime_context)
@@ -1075,9 +1075,7 @@ class ActionExecutor:
                     tool,
                     effective_args,
                     runtime_context=runtime_context,
-                    timeout_s=self._remaining_action_seconds(
-                        action_deadline_monotonic
-                    ),
+                    timeout_s=self._remaining_action_seconds(action_deadline_monotonic),
                 )
                 stop_result = self._action_stop_result(
                     action=action,
@@ -1381,7 +1379,9 @@ class ActionExecutor:
         extra_metadata: Optional[Dict[str, Any]] = None,
     ) -> ActionResult:
         if output is None:
-            code = str((extra_metadata or {}).get("error_code") or "TOOL_EXECUTION_ERROR")
+            code = str(
+                (extra_metadata or {}).get("error_code") or "TOOL_EXECUTION_ERROR"
+            )
             output = "\n".join(
                 [
                     "[TOOL:error]",
@@ -1463,9 +1463,9 @@ class ActionExecutor:
 
         return {
             "env": env,
-            "environment_attestation": dict(
-                getattr(env, "attestation", {}) or {}
-            ) if env is not None else {},
+            "environment_attestation": (
+                dict(getattr(env, "attestation", {}) or {}) if env is not None else {}
+            ),
             "state": state,
             "ops": self._resolve_ops(required_ops, env)
             | self._resolve_environment_ops(environment_ops, env),
@@ -1484,7 +1484,11 @@ class ActionExecutor:
             "agent_cancelled": self._is_cancelled,
             "trace_writer": self.trace_writer,
             "shared_memory": self.shared_memory,
-            "agent": getattr(self._engine, "agent", None) if self._engine is not None else None,
+            "agent": (
+                getattr(self._engine, "agent", None)
+                if self._engine is not None
+                else None
+            ),
         }
 
     def _resolve_tool(self, name: str) -> Optional[BaseTool]:
@@ -1636,6 +1640,7 @@ class ActionExecutor:
         if not hooks:
             return
         from .hooks import ToolHookContext
+
         ctx = ToolHookContext(
             task="",
             step_id=0,

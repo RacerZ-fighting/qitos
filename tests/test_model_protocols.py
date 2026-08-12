@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,7 +10,7 @@ from qitos.engine import Engine
 from qitos.harness import build_model_for_preset
 from qitos.kit import MiniMaxToolCallParser
 from qitos.kit.parser import ReActTextParser
-from qitos.models import ModelStreamChunk
+from qitos.models import Model, ModelStreamChunk
 from qitos.models.profile_registry import infer_default_protocol, infer_model_profile
 from qitos.protocols import ModelProtocol, get_protocol
 
@@ -25,7 +26,9 @@ def test_tool_registry_renders_minimax_schema() -> None:
     registry = ToolRegistry()
 
     @tool(name="send_terminal_keys")
-    def send_terminal_keys(keystrokes: str, duration_sec: float = 0.1) -> dict[str, Any]:
+    def send_terminal_keys(
+        keystrokes: str, duration_sec: float = 0.1
+    ) -> dict[str, Any]:
         """
         Send keystrokes to the terminal.
 
@@ -37,8 +40,8 @@ def test_tool_registry_renders_minimax_schema() -> None:
 
     registry.register(send_terminal_keys)
     rendered = registry.get_tool_descriptions(protocol="minimax_tool_call_v1")
-    assert "<invoke name=\"send_terminal_keys\">" in rendered
-    assert "<parameter name=\"keystrokes\"" in rendered
+    assert '<invoke name="send_terminal_keys">' in rendered
+    assert '<parameter name="keystrokes"' in rendered
 
 
 def test_minimax_parser_handles_wrapped_tool_call() -> None:
@@ -81,15 +84,54 @@ class _ProtocolState(StateSchema):
     last_rationale: str = ""
 
 
-class _DummyModel:
+class _DummyModel(Model):
     def __init__(self, model: str, output: str):
-        self.model = model
+        super().__init__(model=model, temperature=None)
         self.output = output
-        self.calls: list[list[dict[str, str]]] = []
+        self.calls: list[list[dict[str, Any]]] = []
+        self.request_options: list[dict[str, Any]] = []
 
-    def __call__(self, messages):
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = deadline_monotonic
         self.calls.append(list(messages))
-        return self.output
+        self.request_options.append(dict(kwargs))
+        yield ModelStreamChunk(text=self.output, event_type="text.delta")
+        yield ModelStreamChunk(
+            done=True,
+            event_type="test.completed",
+            finish_reason="stop",
+        )
+
+
+class _ApiModel(_DummyModel):
+    def __init__(self) -> None:
+        super().__init__(model="custom-api-model", output="Final Answer: ok")
+
+    def supports_tool_schema_delivery(
+        self, delivery: str, protocol: Any = None
+    ) -> bool:
+        _ = protocol
+        return delivery == "api_parameter"
+
+    def build_tool_schema_request_options(
+        self,
+        tool_schema_payload: list[dict[str, Any]] | None,
+        *,
+        protocol: Any = None,
+        delivery: str = "prompt_injection",
+    ) -> dict[str, Any]:
+        _ = protocol
+        return {
+            "tools": list(tool_schema_payload or []),
+            "tool_choice": "auto",
+            "delivery": delivery,
+        }
 
 
 class _ProtocolAgent(AgentModule[_ProtocolState, dict[str, Any], dict[str, Any]]):
@@ -103,7 +145,9 @@ class _ProtocolAgent(AgentModule[_ProtocolState, dict[str, Any], dict[str, Any]]
 
     def build_system_prompt(self, state: _ProtocolState) -> str | None:
         _ = state
-        return self.compose_system_prompt("Return one completion or tool action.", protocol=self.active_protocol())
+        return self.compose_system_prompt(
+            "Return one completion or tool action.", protocol=self.active_protocol()
+        )
 
     def reduce(
         self,
@@ -229,16 +273,21 @@ def test_preset_model_protocol_delivers_tools_to_direct_engine_model_call() -> N
     llm = _build_kimi_k3_model()
     calls: list[dict[str, Any]] = []
 
-    def transactional_stream(messages: list[dict[str, Any]], **kwargs: Any):
-        _ = messages
+    async def stream(
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = messages, deadline_monotonic
         calls.append(dict(kwargs))
         yield ModelStreamChunk(
             text='{"thought":"done","final_answer":"ok"}',
-            done=False,
+            event_type="text.delta",
         )
-        yield ModelStreamChunk(text="", done=True)
+        yield ModelStreamChunk(done=True, event_type="test.completed")
 
-    llm.transactional_stream = transactional_stream
+    llm.stream = stream
     agent = _ProtocolAgent(llm=llm)
 
     @tool(name="lookup")
@@ -307,17 +356,9 @@ def test_default_prompt_builder_supplies_contract_and_tool_schema() -> None:
 
     registry.register(lookup)
 
-    class _CaptureModel:
-        model = "gpt-4o-mini"
-
-        def __init__(self) -> None:
-            self.calls: list[list[dict[str, str]]] = []
-
-        def __call__(self, messages):
-            self.calls.append(list(messages))
-            return '{"thought":"done","final_answer":"ok"}'
-
-    class _DefaultPromptAgent(AgentModule[_ProtocolState, dict[str, Any], dict[str, Any]]):
+    class _DefaultPromptAgent(
+        AgentModule[_ProtocolState, dict[str, Any], dict[str, Any]]
+    ):
         name = "default_prompt_agent"
 
         def __init__(self, llm: Any) -> None:
@@ -341,7 +382,10 @@ def test_default_prompt_builder_supplies_contract_and_tool_schema() -> None:
             state.stop_reason = "success"
             return state
 
-    llm = _CaptureModel()
+    llm = _DummyModel(
+        model="gpt-4o-mini",
+        output='{"thought":"done","final_answer":"ok"}',
+    )
     result = Engine(agent=_DefaultPromptAgent(llm=llm)).run("help")
     assert result.state.final_result == "ok"
     system_message = llm.calls[0][0]["content"]
@@ -377,35 +421,13 @@ def test_api_parameter_tool_schema_delivery_reaches_supported_model() -> None:
         continuation_renderer=lambda text: text,
     )
 
-    class _ApiModel:
-        model = "custom-api-model"
-
-        def __init__(self) -> None:
-            self.calls: list[tuple[list[dict[str, str]], dict[str, Any]]] = []
-
-        def supports_tool_schema_delivery(self, delivery: str, protocol: Any = None) -> bool:
-            _ = protocol
-            return delivery == "api_parameter"
-
-        def build_tool_schema_request_options(
-            self,
-            tool_schema_payload: list[dict[str, Any]] | None,
-            *,
-            protocol: Any = None,
-            delivery: str = "prompt_injection",
-        ) -> dict[str, Any]:
-            _ = protocol
-            return {"tools": list(tool_schema_payload or []), "tool_choice": "auto", "delivery": delivery}
-
-        def __call__(self, messages, **kwargs):
-            self.calls.append((list(messages), dict(kwargs)))
-            return "Final Answer: ok"
-
     class _ApiAgent(AgentModule[_ProtocolState, dict[str, Any], dict[str, Any]]):
         name = "api_protocol_agent"
 
         def __init__(self, llm: Any) -> None:
-            super().__init__(tool_registry=registry, llm=llm, model_protocol=custom_protocol)
+            super().__init__(
+                tool_registry=registry, llm=llm, model_protocol=custom_protocol
+            )
 
         def init_state(self, task: str, **kwargs: Any) -> _ProtocolState:
             return _ProtocolState(task=task, max_steps=int(kwargs.get("max_steps", 2)))
@@ -424,7 +446,7 @@ def test_api_parameter_tool_schema_delivery_reaches_supported_model() -> None:
     llm = _ApiModel()
     result = Engine(agent=_ApiAgent(llm=llm)).run("help")
     assert result.state.final_result == "ok"
-    _messages, kwargs = llm.calls[0]
+    kwargs = llm.request_options[0]
     assert kwargs["tool_choice"] == "auto"
     assert kwargs["delivery"] == "api_parameter"
     assert kwargs["tools"][0]["function"]["name"] == "lookup"
@@ -448,7 +470,7 @@ def test_desktop_xml_protocol_parser_roundtrip() -> None:
     assert protocol is not None
     parser = protocol.parser_factory()
     decision = parser.parse(
-        "<decision mode=\"act\"><think>The button is clearly visible.</think><plan>Click the CTA.</plan><action name=\"click\"><arg name=\"x\">640</arg><arg name=\"y\">420</arg></action></decision>"
+        '<decision mode="act"><think>The button is clearly visible.</think><plan>Click the CTA.</plan><action name="click"><arg name="x">640</arg><arg name="y">420</arg></action></decision>'
     )
     assert decision.mode == "act"
     assert decision.actions[0]["name"] == "click"
@@ -481,40 +503,9 @@ def test_manual_build_system_prompt_keeps_api_parameter_tool_schema() -> None:
         continuation_renderer=lambda text: text,
     )
 
-    class _ApiModel:
-        model = "custom-api-model"
-
-        def __init__(self) -> None:
-            self.calls: list[tuple[list[dict[str, str]], dict[str, Any]]] = []
-            self.qitos_harness_metadata = {
-                "tool_policy": {"native_tool_call_preferred": True}
-            }
-
-        def supports_tool_schema_delivery(
-            self, delivery: str, protocol: Any = None
-        ) -> bool:
-            _ = protocol
-            return delivery == "api_parameter"
-
-        def build_tool_schema_request_options(
-            self,
-            tool_schema_payload: list[dict[str, Any]] | None,
-            *,
-            protocol: Any = None,
-            delivery: str = "prompt_injection",
-        ) -> dict[str, Any]:
-            _ = protocol
-            return {
-                "tools": list(tool_schema_payload or []),
-                "tool_choice": "auto",
-                "delivery": delivery,
-            }
-
-        def __call__(self, messages, **kwargs):
-            self.calls.append((list(messages), dict(kwargs)))
-            return "Final Answer: ok"
-
-    class _ManualPromptAgent(AgentModule[_ProtocolState, dict[str, Any], dict[str, Any]]):
+    class _ManualPromptAgent(
+        AgentModule[_ProtocolState, dict[str, Any], dict[str, Any]]
+    ):
         name = "manual_prompt_agent"
 
         def __init__(self, llm: Any) -> None:
@@ -541,9 +532,11 @@ def test_manual_build_system_prompt_keeps_api_parameter_tool_schema() -> None:
             return state
 
     llm = _ApiModel()
+    llm.qitos_harness_metadata = {"tool_policy": {"native_tool_call_preferred": True}}
     result = Engine(agent=_ManualPromptAgent(llm=llm)).run("help")
     assert result.state.final_result == "ok"
-    messages, kwargs = llm.calls[0]
+    messages = llm.calls[0]
+    kwargs = llm.request_options[0]
     assert messages[0]["content"].startswith("Use the handwritten system prompt.")
     assert "Output contract:" not in messages[0]["content"]
     assert "output_contract" not in result.records[0].prompt_metadata["sections_used"]

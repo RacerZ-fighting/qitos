@@ -1,6 +1,6 @@
 """Stream transformer protocol and built-in transformers.
 
-StreamTransformers customize the output of AsyncEngine.arun_stream()
+StreamTransformers customize the output of Engine.arun_stream()
 by filtering, projecting, or converting EngineEvents into different
 output formats.
 

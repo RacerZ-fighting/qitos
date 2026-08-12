@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Generic, List, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, TypeVar, cast
 
 from ..core.action import Action, ActionStatus
 from ..core.decision import Decision
 from ..core.tool_result import ToolResult
-from ._protocol import _EngineProtocol
 from .states import RuntimePhase, StepRecord
+
+if TYPE_CHECKING:
+    from .engine import Engine
 
 
 StateT = TypeVar("StateT")
@@ -17,7 +19,7 @@ ActionT = TypeVar("ActionT")
 
 
 class _ActionRuntime(Generic[StateT, ActionT]):
-    def __init__(self, engine: _EngineProtocol):
+    def __init__(self, engine: Engine[Any, Any, Any]):
         self.engine = engine
 
     @staticmethod
@@ -27,7 +29,9 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             and isinstance(output.get("model_summary"), str)
             and bool(output["model_summary"].strip())
         )
-        return (output["model_summary"].strip(), True) if has_summary else (output, False)
+        return (
+            (output["model_summary"].strip(), True) if has_summary else (output, False)
+        )
 
     def run_act(
         self, state: StateT, decision: Decision[ActionT], record: StepRecord
@@ -95,26 +99,32 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 )
                 blocked_indices.add(i)
                 blocked_results.append((i, blocked_result))
-                blocked_invocations.append((i, {
-                    "tool_name": normalized_action.name,
-                    "action_id": normalized_action.action_id,
-                    "args": dict(normalized_action.args or {}),
-                    "toolset_name": None,
-                    "toolset_version": None,
-                    "source": "agent_action_gate",
-                    "attempts": 0,
-                    "latency_ms": 0,
-                    "status": "denied",
-                    "error_category": "action_blocked",
-                    "error": "action_blocked",
-                }))
+                blocked_invocations.append(
+                    (
+                        i,
+                        {
+                            "tool_name": normalized_action.name,
+                            "action_id": normalized_action.action_id,
+                            "args": dict(normalized_action.args or {}),
+                            "toolset_name": None,
+                            "toolset_version": None,
+                            "source": "agent_action_gate",
+                            "attempts": 0,
+                            "latency_ms": 0,
+                            "status": "denied",
+                            "error_category": "action_blocked",
+                            "error": "action_blocked",
+                        },
+                    )
+                )
                 if not self._history_tool_calls_enabled(record):
                     # When a custom MessageBuilder is active, avoid injecting
                     # synthetic user messages for blocked actions.  The
                     # block_reason is already carried in the ToolResult.
-                    _has_custom_builder = getattr(
-                        getattr(engine, 'agent', None), 'message_builder', None
-                    ) is not None
+                    _has_custom_builder = (
+                        getattr(getattr(engine, "agent", None), "message_builder", None)
+                        is not None
+                    )
                     if not _has_custom_builder:
                         engine._history_append(
                             "user",
@@ -161,19 +171,24 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                     )
                     blocked_indices.add(i)
                     blocked_results.append((i, loop_tool_result))
-                    blocked_invocations.append((i, {
-                        "tool_name": normalized_action.name,
-                        "action_id": normalized_action.action_id,
-                        "args": dict(normalized_action.args or {}),
-                        "toolset_name": None,
-                        "toolset_version": None,
-                        "source": "loop_detector",
-                        "attempts": 0,
-                        "latency_ms": 0,
-                        "status": "denied",
-                        "error_category": "tool_call_loop_detected",
-                        "error": "tool_call_loop_detected",
-                    }))
+                    blocked_invocations.append(
+                        (
+                            i,
+                            {
+                                "tool_name": normalized_action.name,
+                                "action_id": normalized_action.action_id,
+                                "args": dict(normalized_action.args or {}),
+                                "toolset_name": None,
+                                "toolset_version": None,
+                                "source": "loop_detector",
+                                "attempts": 0,
+                                "latency_ms": 0,
+                                "status": "denied",
+                                "error_category": "tool_call_loop_detected",
+                                "error": "tool_call_loop_detected",
+                            },
+                        )
+                    )
                     engine._emit(
                         record.step_id,
                         RuntimePhase.ACT,
@@ -200,7 +215,8 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         # If all actions were blocked, return immediately
         if len(blocked_indices) == len(actions):
             blocked_only_results = [
-                result for _, result in sorted(blocked_results, key=lambda pair: pair[0])
+                result
+                for _, result in sorted(blocked_results, key=lambda pair: pair[0])
             ]
             blocked_only_invocations = [
                 invocation
@@ -211,8 +227,8 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             ]
             record.action_results = blocked_only_results
             record.tool_invocations = blocked_only_invocations
-            for item in blocked_only_results:
-                engine._memory_append("action_result", item, record.step_id)
+            for blocked_item in blocked_only_results:
+                engine._memory_append("action_result", blocked_item, record.step_id)
             self._commit_tool_result_history(actions, blocked_only_results, record)
             engine._dispatch_hook(
                 "on_after_act",
@@ -228,16 +244,30 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             return [r.to_dict() for r in blocked_only_results]
 
         # Execute non-blocked actions
-        executable_actions = [a for i, a in enumerate(actions) if i not in blocked_indices]
-        executable_indices = [i for i in range(len(actions)) if i not in blocked_indices]
-        execution = engine.executor.execute(executable_actions, env=engine.env, state=state)
+        executable_actions = [
+            a for i, a in enumerate(actions) if i not in blocked_indices
+        ]
+        executable_indices = [
+            i for i in range(len(actions)) if i not in blocked_indices
+        ]
+        execution = engine.executor.execute(
+            executable_actions, env=engine.env, state=state
+        )
         exec_stats = dict(getattr(engine.executor, "last_execution_stats", {}) or {})
         # Build tool_invocations from execution results (executable only)
         exec_invocations = [
             {
                 "tool_name": item.name,
-                "action_id": executable_actions[index].action_id if index < len(executable_actions) else "",
-                "args": dict(executable_actions[index].args or {}) if index < len(executable_actions) else {},
+                "action_id": (
+                    executable_actions[index].action_id
+                    if index < len(executable_actions)
+                    else ""
+                ),
+                "args": (
+                    dict(executable_actions[index].args or {})
+                    if index < len(executable_actions)
+                    else {}
+                ),
                 "toolset_name": item.metadata.get("toolset_name"),
                 "toolset_version": item.metadata.get("toolset_version"),
                 "source": item.metadata.get("source"),
@@ -262,7 +292,9 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             record.action_execution = exec_stats
         results: List[ToolResult] = []
         max_chars = int(getattr(engine.context_config, "tool_result_max_chars", 0) or 0)
-        per_message_max = int(getattr(engine.context_config, "tool_result_per_message_max_chars", 0) or 0)
+        per_message_max = int(
+            getattr(engine.context_config, "tool_result_per_message_max_chars", 0) or 0
+        )
         message_total_chars = 0
         for item in execution:
             result_metadata = {
@@ -286,24 +318,37 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                     # before _model_visible_tool_output() could select it, so
                     # sufficiently large STATIC/GDB results leaked JSON into the
                     # provider history while smaller results rendered correctly.
-                    visible_for_budget, has_model_summary = self._tool_output_for_budget(output)
+                    visible_for_budget, has_model_summary = (
+                        self._tool_output_for_budget(output)
+                    )
                     output_str = (
                         visible_for_budget
                         if isinstance(visible_for_budget, str)
-                        else json.dumps(visible_for_budget, ensure_ascii=False, default=str)
+                        else json.dumps(
+                            visible_for_budget, ensure_ascii=False, default=str
+                        )
                     )
                     # Per-message aggregate budget: if total exceeds limit, apply stricter per-tool truncation
                     effective_max = max_chars
-                    if per_message_max > 0 and message_total_chars + len(output_str) > per_message_max:
+                    if (
+                        per_message_max > 0
+                        and message_total_chars + len(output_str) > per_message_max
+                    ):
                         # Reduce per-tool limit to fit within aggregate budget
                         remaining = max(0, per_message_max - message_total_chars)
                         effective_max = min(max_chars, remaining)
                     if len(output_str) > effective_max and not has_model_summary:
                         head = int(effective_max * 0.7)
                         tail = effective_max - head
-                        truncated = output_str[:head] + f"\n... [truncated, {len(output_str)} chars total] ...\n" + output_str[-tail:]
+                        truncated = (
+                            output_str[:head]
+                            + f"\n... [truncated, {len(output_str)} chars total] ...\n"
+                            + output_str[-tail:]
+                        )
                         output = truncated
-                        message_total_chars += len(output) if isinstance(output, str) else 0
+                        message_total_chars += (
+                            len(output) if isinstance(output, str) else 0
+                        )
                     else:
                         message_total_chars += len(output_str)
                 results.append(
@@ -336,8 +381,12 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             for exec_i, orig_i in enumerate(executable_indices):
                 if exec_i < len(results):
                     exec_result_by_orig_idx[orig_i] = results[exec_i]
-            blocked_result_by_orig_idx: Dict[int, ToolResult] = {idx: r for idx, r in blocked_results}
-            blocked_inv_by_orig_idx: Dict[int, Dict[str, Any]] = {idx: inv for idx, inv in blocked_invocations}
+            blocked_result_by_orig_idx: Dict[int, ToolResult] = {
+                idx: r for idx, r in blocked_results
+            }
+            blocked_inv_by_orig_idx: Dict[int, Dict[str, Any]] = {
+                idx: inv for idx, inv in blocked_invocations
+            }
             exec_inv_by_orig_idx: Dict[int, Dict[str, Any]] = {}
             for exec_i, orig_i in enumerate(executable_indices):
                 if exec_i < len(exec_invocations):
@@ -347,10 +396,24 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             merged_invocations: List[Dict[str, Any]] = []
             for i in range(len(actions)):
                 if i in blocked_indices:
-                    merged_results.append(blocked_result_by_orig_idx.get(i, ToolResult(status="error", output=None, error="action_blocked")))
+                    merged_results.append(
+                        blocked_result_by_orig_idx.get(
+                            i,
+                            ToolResult(
+                                status="error", output=None, error="action_blocked"
+                            ),
+                        )
+                    )
                     merged_invocations.append(blocked_inv_by_orig_idx.get(i, {}))
                 else:
-                    merged_results.append(exec_result_by_orig_idx.get(i, ToolResult(status="error", output=None, error="execution_failed")))
+                    merged_results.append(
+                        exec_result_by_orig_idx.get(
+                            i,
+                            ToolResult(
+                                status="error", output=None, error="execution_failed"
+                            ),
+                        )
+                    )
                     merged_invocations.append(exec_inv_by_orig_idx.get(i, {}))
             results = merged_results
             record.tool_invocations = merged_invocations
@@ -362,7 +425,9 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         # a state-tool result before history/TUI serialization while the
         # normal reduce pass remains responsible for trace projection.  It is
         # executed once in original tool-call order.
-        commit_results = getattr(getattr(engine, "agent", None), "commit_action_results", None)
+        commit_results = getattr(
+            getattr(engine, "agent", None), "commit_action_results", None
+        )
         if callable(commit_results):
             commit_results(state, actions, results, step_id=record.step_id)
 
@@ -380,8 +445,8 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                     )
                 )
         record.action_results = results
-        for item in results:
-            engine._memory_append("action_result", item, record.step_id)
+        for result_item in results:
+            engine._memory_append("action_result", result_item, record.step_id)
         if engine._tool_loop_detector is not None:
             for normalized_action in executable_actions:
                 engine._tool_loop_detector.record(
@@ -527,7 +592,8 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             return ""
         return str(reason or "").strip()
 
-    def _model_visible_tool_output(self, tool_name: str, output: Any) -> Any:
+    @staticmethod
+    def _model_visible_tool_output(tool_name: str, output: Any) -> Any:
         """Project a bounded tool summary into native tool-call history.
 
         Reducers and trace writers retain the canonical structured result. A

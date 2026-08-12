@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
 
 _logger = logging.getLogger("qitos.engine._env_runtime")
 
@@ -15,8 +15,10 @@ from ..core.state import StateSchema
 from ..core.task import Task
 from ..core.tool_result import ToolResult
 from ._action_runtime import _ActionRuntime
-from ._protocol import _EngineProtocol
 from .states import RuntimePhase
+
+if TYPE_CHECKING:
+    from .engine import Engine
 
 
 StateT = TypeVar("StateT", bound=StateSchema)
@@ -25,7 +27,7 @@ ActionT = TypeVar("ActionT")
 
 
 class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
-    def __init__(self, engine: _EngineProtocol):
+    def __init__(self, engine: Engine[StateT, ObservationT, ActionT]):
         self.engine = engine
 
     def build_env_view(
@@ -84,11 +86,12 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             state=state.to_dict(),
             decision=(
                 decision.to_dict()
-                if hasattr(decision, "to_dict")
-                and isinstance(decision.to_dict(), dict)
+                if hasattr(decision, "to_dict") and isinstance(decision.to_dict(), dict)
                 else {}
             ),
-            action_results=[ToolResult.from_value(item) for item in list(action_results)],
+            action_results=[
+                ToolResult.from_value(item) for item in list(action_results)
+            ],
             env=(
                 dict(env_view.get("env", {}))
                 if isinstance(env_view.get("env", {}), dict)
@@ -117,13 +120,19 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
 
     def _model_visible_tool_result_dict(self, item: Any) -> Any:
         result = ToolResult.from_value(item)
-        tool_name = str(result.metadata.get("tool_name") or result.metadata.get("name") or "")
+        tool_name = str(
+            result.metadata.get("tool_name") or result.metadata.get("name") or ""
+        )
         output = result.output
-        has_summary = isinstance(output, dict) and bool(str(output.get("model_summary") or "").strip())
+        has_summary = isinstance(output, dict) and bool(
+            str(output.get("model_summary") or "").strip()
+        )
         if not has_summary:
             return item
         if has_summary:
-            visible_output = _ActionRuntime._model_visible_tool_output(self, tool_name, output)
+            visible_output = _ActionRuntime._model_visible_tool_output(
+                tool_name, output
+            )
             return ToolResult(
                 status=result.status,
                 output=visible_output,

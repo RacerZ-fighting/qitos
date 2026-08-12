@@ -18,6 +18,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One async-native model runtime**: `Engine.arun()` and `Engine.astep()` now own the
+  model path from request through terminal response. OpenAI Responses, Anthropic
+  Messages, compatible Chat Completions, Gemini, LiteLLM, and Ollama implement the same
+  asynchronous stream contract; the former sync/async class hierarchy, `call_raw`,
+  import-time registration, and daemon-thread `AsyncEngine` bridge are gone.
 - **Same-spec qita comparisons**: compare views now verify recorded model, prompt,
   tools, environment, context policy, budget, source revision, and experiment
   provenance first. Mismatched or incomplete pairs are explicitly descriptive rather
@@ -29,10 +34,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Call-accurate qita tool statistics**: tool counts and failures now come from the
   canonical action/result pairing instead of applying one step-level error to every
   call. Exact lifecycle counts and unmatched trace evidence remain visible for audits.
-- **One bounded model-request lifecycle**: every Engine model call now receives the
-  run's absolute deadline and immediate cancellation signal. Provider timeouts and
-  QitOS-owned retry backoff use live remaining time, SDK retries stay disabled, late
-  responses are discarded, and blocked synchronous providers cannot retain process exit.
+- **One bounded model-request lifecycle**: every Engine model call receives the run's
+  absolute deadline and immediate cancellation signal. Provider connection, stream-idle,
+  and QitOS-owned retry waits use live remaining time; cancellation closes the active
+  asynchronous stream and late responses cannot commit.
 - **One bounded tool-action lifecycle**: one absolute deadline now covers interceptor-
   free admission, approval, permission checks, invocation retries, and backoff.
   `ToolSpec.retry_policy` is the sole retry owner; validation and authorization run once,

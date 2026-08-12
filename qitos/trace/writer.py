@@ -7,7 +7,7 @@ import json
 import os
 from dataclasses import asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, IO, List, Optional
+from typing import Any, Dict, IO, List, Optional, cast
 
 from qitos.tracing.config import _redact_dict
 
@@ -199,7 +199,9 @@ def runtime_event_to_trace(run_id: str, event: Any) -> TraceEvent:
     )
 
 
-def runtime_step_to_trace(step: Any, *, event_start_idx: int = -1, event_end_idx: int = -1) -> TraceStep:
+def runtime_step_to_trace(
+    step: Any, *, event_start_idx: int = -1, event_end_idx: int = -1
+) -> TraceStep:
     """Convert a StepRecord to a lightweight TraceStep.
 
     Heavy data (observation, decision, model_response, actions, etc.) is
@@ -233,15 +235,11 @@ def runtime_step_to_trace(step: Any, *, event_start_idx: int = -1, event_end_idx
         visual_asset_count=int(getattr(step, "visual_asset_count", 0) or 0),
         has_screenshot=bool(getattr(step, "has_screenshot", False)),
         has_dom=bool(getattr(step, "has_dom", False)),
-        has_accessibility_tree=bool(
-            getattr(step, "has_accessibility_tree", False)
-        ),
+        has_accessibility_tree=bool(getattr(step, "has_accessibility_tree", False)),
         model_input_modalities=_normalize(
             list(getattr(step, "model_input_modalities", []) or [])
         ),
-        model_input_visual_count=int(
-            getattr(step, "model_input_visual_count", 0) or 0
-        ),
+        model_input_visual_count=int(getattr(step, "model_input_visual_count", 0) or 0),
         # Keep provider identity as a compact index; full response text and
         # raw output remain event-only to avoid duplicating heavy payloads.
         model_response=_normalize(model_response),
@@ -250,8 +248,12 @@ def runtime_step_to_trace(step: Any, *, event_start_idx: int = -1, event_end_idx
 
 
 def _normalize(value: Any) -> Any:
-    if value is not None and dataclasses.is_dataclass(value):
-        return {k: _normalize(v) for k, v in asdict(value).items()}
+    if (
+        value is not None
+        and not isinstance(value, type)
+        and dataclasses.is_dataclass(value)
+    ):
+        return {k: _normalize(v) for k, v in asdict(cast(Any, value)).items()}
     if isinstance(value, dict):
         return {str(k): _normalize(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

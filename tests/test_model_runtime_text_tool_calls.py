@@ -1,4 +1,5 @@
 import json
+from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -20,6 +21,52 @@ from qitos.kit.parser import (
     ToolUseXmlParser,
     XmlDecisionParser,
 )
+from qitos.models import Model, ModelStreamChunk
+
+
+class _ResponseSequenceModel(Model):
+    """Publish scripted completed responses through the canonical async API."""
+
+    def __init__(
+        self,
+        responses: list[ModelResponse],
+        *,
+        model: str = "test-model",
+        provider: str = "test-provider",
+        harness_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(model=model, temperature=None)
+        self.provider_name = provider
+        self.responses = list(responses)
+        self.calls = 0
+        self.seen_messages: list[list[dict[str, Any]]] = []
+        if harness_metadata is not None:
+            self.qitos_harness_metadata = harness_metadata
+
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = deadline_monotonic, kwargs
+        self.calls += 1
+        self.seen_messages.append([dict(message) for message in messages])
+        if not self.responses:
+            raise AssertionError("no scripted model response remains")
+        response = self.responses.pop(0)
+        yield ModelStreamChunk(
+            text=response.text,
+            done=True,
+            usage=response.usage,
+            tool_calls=response.tool_calls,
+            native_items=response.native_items,
+            finish_reason=response.finish_reason,
+            reasoning_content=response.reasoning_content,
+            event_metadata=dict(response.metadata or {}),
+            event_type="test.completed",
+        )
 
 
 class _HistoryCapture(History):
@@ -96,7 +143,8 @@ class _RuntimeContextBuilder:
             return MessageBuildResult(messages=messages)
         messages.append({"role": "user", "content": request.state.task})
         messages.extend(
-            message for message in request.history
+            message
+            for message in request.history
             if message.get("role") in {"assistant", "tool"}
         )
         return MessageBuildResult(
@@ -106,124 +154,16 @@ class _RuntimeContextBuilder:
         )
 
 
-def test_extract_response_text_preserves_object_message_content_when_tool_calls_exist():
-    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
-    runtime = engine._model_runtime
-    raw = SimpleNamespace(
-        message=SimpleNamespace(
-            content="Conclusion: likely 1-byte trigger. Next: write and submit.",
-            tool_calls=[
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "add", "arguments": '{"a": 20, "b": 22}'},
-                }
-            ],
-        )
-    )
-
-    text = runtime._extract_response_text(raw)
-
-    assert text == "Conclusion: likely 1-byte trigger. Next: write and submit."
-
-
-def test_extract_response_text_keeps_reasoning_separate_when_content_is_empty():
-    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
-    runtime = engine._model_runtime
-    raw = SimpleNamespace(
-        message=SimpleNamespace(
-            content=None,
-            reasoning_content="Conclusion: the checksum logic is the trigger. Next: write a candidate.",
-            tool_calls=[
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {"name": "add", "arguments": '{"a": 20, "b": 22}'},
-                }
-            ],
-        )
-    )
-
-    assert runtime._extract_response_text(raw) == ""
-    assert runtime._extract_reasoning_content(raw) == (
-        "Conclusion: the checksum logic is the trigger. Next: write a candidate."
-    )
-
-
-def test_extract_response_text_empty_for_tool_calls_without_content_or_reasoning():
-    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
-    runtime = engine._model_runtime
-    raw = SimpleNamespace(
-        choices=[
-            SimpleNamespace(
-                finish_reason="tool_calls",
-                message=SimpleNamespace(
-                    content=None,
-                    tool_calls=[
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "add", "arguments": '{"a": 20, "b": 22}'},
-                        }
-                    ],
-                ),
-            )
-        ]
-    )
-
-    text = runtime._extract_response_text(raw)
-
-    assert text == ""
-
-
-def test_extract_response_text_returns_empty_for_null_message_without_tool_calls():
-    engine = Engine(agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1))
-    runtime = engine._model_runtime
-    object_raw = SimpleNamespace(
-        choices=[
-            SimpleNamespace(
-                message=SimpleNamespace(content=None, tool_calls=None),
-                finish_reason="stop",
-            )
-        ]
-    )
-    dict_raw = {
-        "choices": [
-            {
-                "message": {"content": None, "tool_calls": None},
-                "finish_reason": "stop",
-            }
-        ]
-    }
-
-    assert runtime._extract_response_text(object_raw) == ""
-    assert runtime._extract_response_text(dict_raw) == ""
-
-
 def test_empty_model_response_uses_bounded_model_recovery():
-    class _EmptyResponseModel:
-        model = "empty-response-model"
-        provider = "deterministic-fake"
-
-        def __init__(self):
-            self.calls = 0
-
-        def call_raw(self, messages):
-            _ = messages
-            self.calls += 1
-            return {
-                "choices": [
-                    {
-                        "message": {"content": None, "tool_calls": None},
-                        "finish_reason": "length",
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 100,
-                    "completion_tokens": 8192,
-                    "total_tokens": 8292,
-                },
-            }
+    empty_response = ModelResponse(
+        text="",
+        finish_reason="length",
+        usage={
+            "prompt_tokens": 100,
+            "completion_tokens": 8192,
+            "total_tokens": 8292,
+        },
+    )
 
     class _TrackingJsonParser(JsonDecisionParser):
         def __init__(self):
@@ -247,7 +187,11 @@ def test_empty_model_response_uses_bounded_model_recovery():
             _ = state, observation
             return None
 
-    model = _EmptyResponseModel()
+    model = _ResponseSequenceModel(
+        [empty_response, empty_response],
+        model="empty-response-model",
+        provider="deterministic-fake",
+    )
     parser = _TrackingJsonParser()
     policy = RecoveryPolicy()
     result = Engine(
@@ -289,19 +233,10 @@ def test_empty_model_response_uses_bounded_model_recovery():
 
 
 def test_agent_interpretation_can_handle_empty_model_response():
-    class _EmptyResponseModel:
-        model = "empty-response-model"
-
-        def call_raw(self, messages):
-            _ = messages
-            return {
-                "choices": [
-                    {
-                        "message": {"content": None, "tool_calls": None},
-                        "finish_reason": "stop",
-                    }
-                ]
-            }
+    model = _ResponseSequenceModel(
+        [ModelResponse(text="", finish_reason="stop")],
+        model="empty-response-model",
+    )
 
     class _NeverParser:
         def parse(self, raw_output, context=None):
@@ -310,7 +245,7 @@ def test_agent_interpretation_can_handle_empty_model_response():
 
     class _InterpretingAgent(_ToolCallAgent):
         def __init__(self):
-            super().__init__(llm=_EmptyResponseModel())
+            super().__init__(llm=model)
             self.model_parser = _NeverParser()
 
         def decide(self, state: _State, observation: dict):
@@ -328,9 +263,9 @@ def test_agent_interpretation_can_handle_empty_model_response():
             state.set_stop("final", decision.final_answer)
             return state
 
-    result = Engine(
-        agent=_InterpretingAgent(), budget=RuntimeBudget(max_steps=1)
-    ).run("handle provider metadata")
+    result = Engine(agent=_InterpretingAgent(), budget=RuntimeBudget(max_steps=1)).run(
+        "handle provider metadata"
+    )
 
     assert result.state.stop_reason == "final"
     assert result.state.final_result == "handled by agent"
@@ -338,29 +273,28 @@ def test_agent_interpretation_can_handle_empty_model_response():
 
 
 def test_native_tool_call_history_keeps_assistant_text_and_tool_calls():
-    class _ObjectResponseModel:
-        model = "demo-model"
-        qitos_harness_metadata = {
-            "tool_policy": {"native_tool_call_preferred": True}
-        }
-
-        def __call__(self, messages):
-            _ = messages
-            return SimpleNamespace(
-                message=SimpleNamespace(
-                    content="Conclusion: likely 1-byte trigger. Next: use add.",
-                    tool_calls=[
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "add", "arguments": '{"a": 20, "b": 22}'},
-                        }
-                    ],
-                ),
+    model = _ResponseSequenceModel(
+        [
+            ModelResponse(
+                text="Conclusion: likely 1-byte trigger. Next: use add.",
                 finish_reason="tool_calls",
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "add",
+                            "arguments": '{"a": 20, "b": 22}',
+                        },
+                    }
+                ],
             )
+        ],
+        model="demo-model",
+        harness_metadata={"tool_policy": {"native_tool_call_preferred": True}},
+    )
 
-    agent = _ToolCallAgent(llm=_ObjectResponseModel())
+    agent = _ToolCallAgent(llm=model)
     result = Engine(agent=agent, budget=RuntimeBudget(max_steps=2)).run("compute")
 
     assert result.state.final_result == "done"
@@ -374,19 +308,12 @@ def test_native_tool_call_history_keeps_assistant_text_and_tool_calls():
 
 def test_native_tool_calls_bypass_agent_text_interpreter():
     interpreted: list[ModelResponse] = []
-
-    class _NativeResponseModel:
-        model = "native-model"
-        qitos_harness_metadata = {
-            "tool_policy": {"native_tool_call_preferred": True}
-        }
-
-        def __call__(self, messages):
-            _ = messages
-            return {
-                "content": "I will calculate this with the add tool.",
-                "finish_reason": "tool_calls",
-                "tool_calls": [
+    model = _ResponseSequenceModel(
+        [
+            ModelResponse(
+                text="I will calculate this with the add tool.",
+                finish_reason="tool_calls",
+                tool_calls=[
                     {
                         "id": "call_native_add",
                         "type": "function",
@@ -396,7 +323,11 @@ def test_native_tool_calls_bypass_agent_text_interpreter():
                         },
                     }
                 ],
-            }
+            )
+        ],
+        model="native-model",
+        harness_metadata={"tool_policy": {"native_tool_call_preferred": True}},
+    )
 
     class _InterpretingAgent(_ToolCallAgent):
         def interpret_model_response(self, state, observation, response):
@@ -404,7 +335,7 @@ def test_native_tool_calls_bypass_agent_text_interpreter():
             interpreted.append(response)
             return Decision.final("incorrect interpreter final")
 
-    agent = _InterpretingAgent(llm=_NativeResponseModel())
+    agent = _InterpretingAgent(llm=model)
     result = Engine(agent=agent, budget=RuntimeBudget(max_steps=2)).run("compute")
 
     assert interpreted == []
@@ -420,19 +351,12 @@ def test_native_tool_calls_bypass_agent_text_interpreter():
 
 def test_mixed_native_tool_batch_commits_each_result_once_in_call_order():
     blocked_tool_executed = False
-
-    class _MixedToolModel:
-        model = "native-model"
-        qitos_harness_metadata = {
-            "tool_policy": {"native_tool_call_preferred": True}
-        }
-
-        def __call__(self, messages):
-            _ = messages
-            return {
-                "content": None,
-                "finish_reason": "tool_calls",
-                "tool_calls": [
+    model = _ResponseSequenceModel(
+        [
+            ModelResponse(
+                text="",
+                finish_reason="tool_calls",
+                tool_calls=[
                     {
                         "id": "call_add",
                         "type": "function",
@@ -450,11 +374,15 @@ def test_mixed_native_tool_batch_commits_each_result_once_in_call_order():
                         },
                     },
                 ],
-            }
+            )
+        ],
+        model="native-model",
+        harness_metadata={"tool_policy": {"native_tool_call_preferred": True}},
+    )
 
     class _MixedToolAgent(_ToolCallAgent):
         def __init__(self):
-            super().__init__(llm=_MixedToolModel())
+            super().__init__(llm=model)
 
             @tool(name="blocked_tool")
             def blocked_tool() -> str:
@@ -487,70 +415,57 @@ def test_mixed_native_tool_batch_commits_each_result_once_in_call_order():
 
 
 def test_parser_tool_actions_use_the_same_assistant_tool_result_history_chain():
-    class _ParserToolModel:
-        model = "parser-model"
-
-        def __init__(self):
-            self.calls = 0
-            self.seen_messages = []
-
-        def call_raw(self, messages, **kwargs):
-            _ = kwargs
-            self.seen_messages.append(list(messages))
-            self.calls += 1
-            if self.calls == 1:
-                return "Thought: calculate first\nAction: add(a=20, b=22)"
-            return "Final Answer: done"
+    model = _ResponseSequenceModel(
+        [
+            ModelResponse(text="Thought: calculate first\nAction: add(a=20, b=22)"),
+            ModelResponse(text="Final Answer: done"),
+        ],
+        model="parser-model",
+    )
 
     class _ParserToolAgent(_ToolCallAgent):
         def decide(self, state, observation):
             _ = state, observation
             return None
 
-    model = _ParserToolModel()
     agent = _ParserToolAgent(model)
     result = Engine(agent=agent, budget=RuntimeBudget(max_steps=3)).run("compute")
 
     assert result.state.final_result == "done"
     assert len(model.seen_messages) >= 2
     history = model.seen_messages[1]
-    assistant = next(message for message in history if message.get("role") == "assistant")
+    assistant = next(
+        message for message in history if message.get("role") == "assistant"
+    )
     tool_result = next(message for message in history if message.get("role") == "tool")
     assert assistant["tool_calls"][0]["id"] == tool_result["tool_call_id"]
     assert assistant["tool_calls"][0]["function"]["name"] == "add"
 
 
 def test_message_builder_merges_runtime_context_into_last_real_tool_result():
-    class _Model:
-        model = "demo-model"
-
-        def __init__(self):
-            self.calls = 0
-            self.seen_messages = []
-            self.qitos_harness_metadata = {
-                "tool_policy": {"native_tool_call_preferred": True}
-            }
-
-        def call_raw(self, messages, **kwargs):
-            _ = kwargs
-            self.calls += 1
-            self.seen_messages.append(list(messages))
-            if self.calls == 1:
-                return {
-                    "tool_calls": [
-                        {
-                            "id": "call_first",
-                            "type": "function",
-                            "function": {"name": "add", "arguments": '{"a": 1, "b": 2}'},
-                        },
-                        {
-                            "id": "call_last",
-                            "type": "function",
-                            "function": {"name": "add", "arguments": '{"a": 20, "b": 22}'},
-                        },
-                    ]
-                }
-            return "Final Answer: done"
+    model = _ResponseSequenceModel(
+        [
+            ModelResponse(
+                text="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    {
+                        "id": "call_first",
+                        "type": "function",
+                        "function": {"name": "add", "arguments": '{"a": 1, "b": 2}'},
+                    },
+                    {
+                        "id": "call_last",
+                        "type": "function",
+                        "function": {"name": "add", "arguments": '{"a": 20, "b": 22}'},
+                    },
+                ],
+            ),
+            ModelResponse(text="Final Answer: done"),
+        ],
+        model="demo-model",
+        harness_metadata={"tool_policy": {"native_tool_call_preferred": True}},
+    )
 
     class _Agent(_ToolCallAgent):
         def __init__(self, llm):
@@ -561,14 +476,17 @@ def test_message_builder_merges_runtime_context_into_last_real_tool_result():
             _ = state, observation
             return None
 
-    model = _Model()
     agent = _Agent(model)
     result = Engine(agent=agent, budget=RuntimeBudget(max_steps=3)).run("compute")
 
     assert result.state.final_result == "done"
     second = model.seen_messages[1]
     assert [message["role"] for message in second] == [
-        "system", "user", "assistant", "tool", "tool"
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "tool",
     ]
     first_tool, last_tool = second[-2:]
     assert first_tool["tool_call_id"] == "call_first"
@@ -583,30 +501,25 @@ def test_message_builder_merges_runtime_context_into_last_real_tool_result():
     )
 
 
-def test_message_builder_can_request_legacy_runtime_user_delivery():
-    class _Model:
-        model = "demo-model"
-
-        def __init__(self):
-            self.calls = 0
-            self.seen_messages = []
-            self.qitos_harness_metadata = {
-                "tool_policy": {"native_tool_call_preferred": True}
-            }
-
-        def call_raw(self, messages, **kwargs):
-            _ = kwargs
-            self.calls += 1
-            self.seen_messages.append(list(messages))
-            if self.calls == 1:
-                return {
-                    "tool_calls": [{
+def test_message_builder_can_request_runtime_user_delivery():
+    model = _ResponseSequenceModel(
+        [
+            ModelResponse(
+                text="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    {
                         "id": "call_1",
                         "type": "function",
                         "function": {"name": "add", "arguments": '{"a": 20, "b": 22}'},
-                    }]
-                }
-            return "Final Answer: done"
+                    }
+                ],
+            ),
+            ModelResponse(text="Final Answer: done"),
+        ],
+        model="demo-model",
+        harness_metadata={"tool_policy": {"native_tool_call_preferred": True}},
+    )
 
     class _Agent(_ToolCallAgent):
         def __init__(self, llm):
@@ -617,8 +530,9 @@ def test_message_builder_can_request_legacy_runtime_user_delivery():
             _ = state, observation
             return None
 
-    model = _Model()
-    result = Engine(agent=_Agent(model), budget=RuntimeBudget(max_steps=3)).run("compute")
+    result = Engine(agent=_Agent(model), budget=RuntimeBudget(max_steps=3)).run(
+        "compute"
+    )
 
     assert result.state.final_result == "done"
     second = model.seen_messages[1]
@@ -627,30 +541,28 @@ def test_message_builder_can_request_legacy_runtime_user_delivery():
     assert "<RUNTIME_CONTEXT" not in second[-2]["content"]
 
 
-def test_message_builder_falls_back_to_user_without_a_real_tool_result():
-    class _Model:
-        model = "demo-model"
-
-        def __init__(self):
-            self.seen_messages = []
-
-        def call_raw(self, messages, **kwargs):
-            _ = kwargs
-            self.seen_messages.append(list(messages))
-            return "Final Answer: done"
+@pytest.mark.asyncio
+async def test_message_builder_falls_back_to_user_without_a_real_tool_result():
+    model = _ResponseSequenceModel(
+        [ModelResponse(text="Final Answer: done")],
+        model="demo-model",
+    )
 
     class _Agent(_ToolCallAgent):
         def __init__(self, llm):
             super().__init__(llm)
             self.message_builder = _RuntimeContextBuilder()
 
-    model = _Model()
     agent = _Agent(model)
     engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=2))
     state = agent.init_state("compute")
     state.current_step = 1
 
-    engine._model_runtime._run_llm_decide(state, {}, StepRecord(step_id=1))
+    await engine._model_runtime._run_llm_decide(
+        state,
+        {},
+        StepRecord(step_id=1),
+    )
 
     request = model.seen_messages[0]
     assert [message["role"] for message in request] == ["system", "user", "user"]
@@ -662,7 +574,13 @@ def test_runtime_context_merge_rejects_nontext_tool_content_and_detects_multimod
         agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1)
     )._model_runtime
     merged, target = runtime._merge_runtime_context_into_last_tool(
-        [{"role": "tool", "tool_call_id": "call_1", "content": [{"type": "text", "text": "ok"}]}],
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "content": [{"type": "text", "text": "ok"}],
+            }
+        ],
         "state",
     )
 
@@ -902,45 +820,8 @@ def test_prompt_meter_supports_legacy_and_request_option_signatures() -> None:
     assert current.seen_options == kwargs["request_options"]
 
 
-def test_model_call_does_not_silently_drop_unsupported_request_options() -> None:
-    class _StrictModel:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def call_raw(self, messages: list[dict[str, Any]]) -> str:
-            _ = messages
-            self.calls += 1
-            return "Final Answer: incorrectly retried without tools"
-
-    model = _StrictModel()
-    runtime = Engine(
-        agent=_ToolCallAgent(llm=model),
-        budget=RuntimeBudget(max_steps=1),
-    )._model_runtime
-
-    with pytest.raises(TypeError):
-        runtime._call_llm(
-            model,
-            [{"role": "user", "content": "use the offered tool"}],
-            {"tools": [{"type": "function", "function": {"name": "add"}}]},
-        )
-
-    assert model.calls == 0
-
-
 def test_default_model_token_count_includes_native_protocol_payloads() -> None:
-    from qitos.models.base import Model
-
-    class _TokenModel(Model):
-        def _call_api(
-            self,
-            messages: list[dict[str, Any]],
-            **kwargs: Any,
-        ) -> str:
-            _ = messages, kwargs
-            return ""
-
-    model = _TokenModel(model="token-test")
+    model = _ResponseSequenceModel([], model="token-test")
     plain = [{"role": "assistant", "content": "continue"}]
     native = [
         {
@@ -1049,9 +930,7 @@ def test_native_tool_chain_places_interruption_before_later_user_message() -> No
     }
     later_user = {"role": "user", "content": "continue"}
 
-    projected = engine._model_runtime._ensure_chain_consistency(
-        [assistant, later_user]
-    )
+    projected = engine._model_runtime._ensure_chain_consistency([assistant, later_user])
 
     assert [message["role"] for message in projected] == [
         "assistant",
@@ -1077,13 +956,7 @@ def _native_text_engine(*, parser=None, protocol="react_text_v1"):
 @pytest.mark.parametrize(
     "response_text",
     [
-        (
-            "thought: inspect the workspace\n"
-            "action:\n"
-            "name: add\n"
-            "args:\n"
-            "command: pwd"
-        ),
+        ("thought: inspect the workspace\naction:\nname: add\nargs:\ncommand: pwd"),
         '{"thought":"inspect","action":{"name":"add","args":{"a":1',
         "{thought: inspect, action: {name: add, args: {a: 1",
         '{"tool":"add"',
@@ -1144,9 +1017,7 @@ def test_native_text_structured_final_parse_error_stays_in_recovery():
 def test_native_text_plain_natural_language_still_becomes_final():
     engine = _native_text_engine()
     record = StepRecord(step_id=0)
-    response_text = (
-        "The requested action is complete; the tool named add returned 42."
-    )
+    response_text = "The requested action is complete; the tool named add returned 42."
 
     decision = engine._model_runtime.normalize_decision(
         ModelResponse(
@@ -1188,9 +1059,7 @@ def test_native_text_ambiguous_labels_still_become_final(response_text):
 
 
 def test_native_text_tool_use_parser_heuristic_wait_keeps_legacy_final_fallback():
-    engine = _native_text_engine(
-        parser=ToolUseXmlParser(), protocol="tool_use_xml_v1"
-    )
+    engine = _native_text_engine(parser=ToolUseXmlParser(), protocol="tool_use_xml_v1")
     record = StepRecord(step_id=0)
     response_text = "All requested checks passed successfully."
 
@@ -1258,9 +1127,7 @@ def test_native_text_valid_react_final_still_uses_parser():
         ),
     ],
 )
-def test_native_text_explicit_parser_wait_stays_wait(
-    parser, protocol, response_text
-):
+def test_native_text_explicit_parser_wait_stays_wait(parser, protocol, response_text):
     engine = _native_text_engine(parser=parser, protocol=protocol)
     record = StepRecord(step_id=0)
 
@@ -1290,7 +1157,7 @@ def test_native_text_explicit_parser_wait_stays_wait(
         (
             ToolUseXmlParser(),
             "tool_use_xml_v1",
-            "<tool_use><tool_name>add</tool_name><arguments>{\"a\": 1}",
+            '<tool_use><tool_name>add</tool_name><arguments>{"a": 1}',
         ),
     ],
 )
@@ -1331,51 +1198,34 @@ def test_structured_action_intent_recognizes_native_protocol_markers(response_te
 
 def test_native_text_parse_recovery_runs_tool_then_finishes():
     malformed = (
-        "thought: inspect the workspace\n"
-        "action:\n"
-        "name: add\n"
-        "args:\n"
-        "a: 20\n"
-        "b: 22"
+        "thought: inspect the workspace\naction:\nname: add\nargs:\na: 20\nb: 22"
     )
 
-    class _RecoveryModel:
-        model = "native-text-recovery-model"
-        qitos_harness_metadata = {
+    model = _ResponseSequenceModel(
+        [
+            ModelResponse(text=malformed, finish_reason="stop"),
+            ModelResponse(
+                text="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    {
+                        "id": "call_add",
+                        "type": "function",
+                        "function": {
+                            "name": "add",
+                            "arguments": '{"a": 20, "b": 22}',
+                        },
+                    }
+                ],
+            ),
+            ModelResponse(text="Final Answer: done", finish_reason="stop"),
+        ],
+        model="native-text-recovery-model",
+        harness_metadata={
             "tool_policy": {"native_tool_call_preferred": True},
             "protocol": "react_text_v1",
-        }
-
-        def __init__(self):
-            self.calls = 0
-
-        def call_raw(self, messages):
-            _ = messages
-            self.calls += 1
-            if self.calls == 1:
-                return ModelResponse(
-                    text=malformed, finish_reason="stop", tool_calls=None
-                )
-            if self.calls == 2:
-                return ModelResponse(
-                    text="",
-                    finish_reason="tool_calls",
-                    tool_calls=[
-                        {
-                            "id": "call_add",
-                            "type": "function",
-                            "function": {
-                                "name": "add",
-                                "arguments": '{"a": 20, "b": 22}',
-                            },
-                        }
-                    ],
-                )
-            return ModelResponse(
-                text="Final Answer: done",
-                finish_reason="stop",
-                tool_calls=None,
-            )
+        },
+    )
 
     class _RecoveryAgent(_ToolCallAgent):
         def init_state(self, task: str, **kwargs):
@@ -1386,7 +1236,6 @@ def test_native_text_parse_recovery_runs_tool_then_finishes():
             _ = state, observation
             return None
 
-    model = _RecoveryModel()
     result = Engine(
         agent=_RecoveryAgent(llm=model), budget=RuntimeBudget(max_steps=4)
     ).run("recover malformed action")

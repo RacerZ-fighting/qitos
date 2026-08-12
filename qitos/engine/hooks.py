@@ -17,7 +17,7 @@ class HookContext:
     task: str
     step_id: int
     phase: RuntimePhase
-    state: StateSchema
+    state: Optional[StateSchema]
     env_view: Optional[Dict[str, Any]] = None
     observation: Any = None
     decision: Any = None

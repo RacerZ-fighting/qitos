@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
 
+from examples._support import SequenceModel
 from examples.real.terminus_2 import Terminus2Agent
 from qitos.core import HistoryMessage, TerminalCapability
 from qitos.kit import (
@@ -91,17 +91,6 @@ class FakeTerminal(TerminalCapability):
 
     def get_timestamp(self) -> float | None:
         return self.ts
-
-
-class DummyModel:
-    def __init__(self, outputs: List[str]):
-        self.outputs = list(outputs)
-        self.calls: list[list[dict[str, str]]] = []
-        self.model = "dummy-terminus"
-
-    def __call__(self, messages):
-        self.calls.append(list(messages))
-        return self.outputs.pop(0)
 
 
 def test_send_terminal_keys_tool_uses_terminal_ops() -> None:
@@ -264,13 +253,14 @@ def test_token_budget_history_summarizes_older_messages() -> None:
 def test_terminus_agent_roundtrip_uses_parser_feedback_and_double_confirmation(
     tmp_path: Path,
 ) -> None:
-    llm = DummyModel(
-        outputs=[
+    llm = SequenceModel(
+        [
             "not valid json",
             '{"analysis":"Need to inspect files","plan":"Run ls","commands":[{"keystrokes":"ls\\n","duration":0.1}]}',
             '{"analysis":"The task looks complete","plan":"Finish","commands":[],"task_complete":true}',
             '{"analysis":"Confirmed completion","plan":"Finish","commands":[],"task_complete":true}',
-        ]
+        ],
+        model="dummy-terminus",
     )
     terminal = FakeTerminal()
     env = TmuxEnv(

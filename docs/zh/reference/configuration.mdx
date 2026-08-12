@@ -49,7 +49,7 @@ Reasoning item 被视为不透明的续接状态。追踪摘要只保留安全�
 ### Reasoning 强度与续接
 
 `build_model_for_preset(...)` 接受统一的 `reasoning_effort`：`low`、`medium`、
-`high`、`xhigh` 或 `max`。QitOS 会根据所选模型族只解析一次，并让同步、异步和
+`high`、`xhigh` 或 `max`。QitOS 会根据所选模型族只解析一次，并让异步
 流式请求共用解析后的请求默认值。不受支持的级别会映射到最接近的已声明级别；
 例如 GPT-5.6 会保留 `max`，较旧的 OpenAI policy 则上限为 `xhigh`。
 
@@ -60,12 +60,11 @@ Kimi 等兼容供应商不会收到这个 OpenAI 专属的 `include` 值。兼�
 
 ### 模型重试与 Engine deadline
 
-`OpenAIModel`、`OpenAICompatibleModel` 及其异步版本共用同一传输实现。
+`OpenAIModel` 和 `OpenAICompatibleModel` 共用同一异步传输实现。
 OpenAI SDK 的内置重试固定关闭，`ModelRetryPolicy` 是唯一重试 owner。Engine 会把
 相对或绝对运行时限制绑定成一次逻辑模型请求的 deadline；每次 attempt 都按实时剩余
-时间收紧 provider timeout，backoff 同时响应 deadline 与立即取消。无法中断的同步
-provider 会留在 daemon worker 中，其迟到结果会被丢弃，不能写入 history、action 或
-final state。
+时间收紧 provider timeout，backoff 同时响应 deadline 与立即取消。Provider 取消会沿异步流向下传播，
+不再把工作分离到 daemon 线程。
 
 所有模型流都使用 `ModelStreamChunk` 作为统一契约。终态 chunk 会保留供应商实际的
 `finish_reason`，文本、reasoning、类型化事件元数据、完整工具调用、原生 item 与 usage
@@ -174,7 +173,7 @@ class RuntimeBudget:
 |---|---|
 | `OPENAI_API_KEY` | OpenAI / OpenAI 兼容 API 密钥 |
 | `OPENAI_BASE_URL` | OpenAI 兼容端点基础 URL |
-| `QITOS_API_KEY` | `ModelFactory.from_env()` 可识别的备用密钥 |
+| `QITOS_API_KEY` | `ModelConfig.from_env()` 在未设置 `OPENAI_API_KEY` 时读取的兼容密钥 |
 | `QITOS_MODEL` | 默认模型 ID |
 | `AZURE_OPENAI_API_KEY` | Azure OpenAI 密钥 |
 | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI 端点 |

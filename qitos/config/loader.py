@@ -23,7 +23,62 @@ class ModelConfig:
     temperature: float = 0.7
     max_tokens: int = 2048
     context_window: Optional[int] = None
-    api_mode: str = "chat_completions"
+    api_mode: str = ""
+
+    @classmethod
+    def from_env(cls) -> Optional[ModelConfig]:
+        """Load the existing QitOS provider environment into typed config."""
+
+        provider = (
+            (os.getenv("QITOS_MODEL_PROVIDER") or os.getenv("MODEL_PROVIDER") or "")
+            .strip()
+            .lower()
+        )
+        if not provider:
+            if os.getenv("OPENAI_API_KEY") or os.getenv("QITOS_API_KEY"):
+                provider = "openai"
+            elif os.getenv("ANTHROPIC_API_KEY"):
+                provider = "anthropic"
+            elif os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+                provider = "gemini"
+            elif os.getenv("LITELLM_MODEL"):
+                provider = "litellm"
+            elif os.getenv("OLLAMA_HOST") or os.getenv("OLLAMA_BASE_URL"):
+                provider = "ollama"
+            elif os.getenv("LM_STUDIO_BASE_URL"):
+                provider = "lmstudio"
+            else:
+                return None
+
+        model: str = os.getenv("QITOS_MODEL", "")
+        api_key: str = ""
+        base_url: str = ""
+        if provider == "openai":
+            api_key = os.getenv("OPENAI_API_KEY") or os.getenv("QITOS_API_KEY") or ""
+            base_url = os.getenv("OPENAI_BASE_URL", "")
+        elif provider == "anthropic":
+            api_key = os.getenv("ANTHROPIC_API_KEY", "")
+            base_url = os.getenv("ANTHROPIC_BASE_URL", "")
+        elif provider in {"gemini", "google"}:
+            api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+            base_url = os.getenv("GEMINI_BASE_URL", "")
+        elif provider == "litellm":
+            model = model or os.getenv("LITELLM_MODEL", "")
+            api_key = os.getenv("LITELLM_API_KEY", "")
+            base_url = os.getenv("LITELLM_API_BASE", "")
+        elif provider == "ollama":
+            base_url = os.getenv("OLLAMA_BASE_URL") or os.getenv("OLLAMA_HOST") or ""
+        elif provider == "lmstudio":
+            base_url = os.getenv("LM_STUDIO_BASE_URL", "")
+        elif provider == "vllm":
+            base_url = os.getenv("VLLM_BASE_URL", "")
+
+        return cls(
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -116,7 +171,9 @@ def load_agent_config(path: str | Path) -> AgentConfig:
         raw = yaml.safe_load(f)
 
     if not isinstance(raw, dict):
-        raise ValueError(f"Config file must contain a YAML mapping, got {type(raw).__name__}")
+        raise ValueError(
+            f"Config file must contain a YAML mapping, got {type(raw).__name__}"
+        )
 
     raw = resolve_env_vars(raw)
     return _parse_agent_config(raw)
@@ -134,7 +191,7 @@ def _parse_agent_config(raw: Dict[str, Any]) -> AgentConfig:
             temperature=float(model_raw.get("temperature", 0.7)),
             max_tokens=int(model_raw.get("max_tokens", 2048)),
             context_window=model_raw.get("context_window"),
-            api_mode=str(model_raw.get("api_mode", "chat_completions")),
+            api_mode=str(model_raw.get("api_mode", "")),
         )
     else:
         model_config = ModelConfig()
@@ -168,4 +225,10 @@ def _parse_agent_config(raw: Dict[str, Any]) -> AgentConfig:
     )
 
 
-__all__ = ["AgentConfig", "ModelConfig", "DatasetItem", "load_agent_config", "resolve_env_vars"]
+__all__ = [
+    "AgentConfig",
+    "ModelConfig",
+    "DatasetItem",
+    "load_agent_config",
+    "resolve_env_vars",
+]

@@ -1,32 +1,29 @@
-"""CachedModel — transparent LLM response caching wrapper."""
+"""Cache complete model stream transactions."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-import pickle
+import logging
+from collections.abc import AsyncIterator
+from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
-from ..models.base import Model
+from ..core.errors import ModelTransportError
+from ..models.base import Model, ModelStreamChunk
 from .backends import CacheBackend
 
 
+_logger = logging.getLogger(__name__)
+
+
 class CachedModel(Model):
-    """Wraps any Model instance and delegates calls through a cache.
+    """Cache only complete provider-neutral model transactions.
 
-    Usage::
-
-        from qitos.cache import CachedModel, InMemoryCache
-
-        cache = InMemoryCache()
-        llm = OpenAICompatibleModel(model="qwen-plus", ...)
-        cached_llm = CachedModel(llm, cache)
-        # Now pass cached_llm to your agent instead of llm
-
-    Cache key is sha256(model_name + sorted(messages_json + kwargs_json)).
-    ``__call__`` results (str) are cached as JSON; ``call_raw`` results
-    (provider-native objects) are cached as pickle with a silent fallback
-    on serialization failure.
+    Cache serialization lives here because this is the sole durable owner of
+    cached model chunks. Provider SDK objects are forbidden at the Model
+    boundary and are never pickled.
     """
 
     def __init__(
@@ -35,85 +32,103 @@ class CachedModel(Model):
         backend: CacheBackend,
         enabled: bool = True,
         ttl: Optional[float] = None,
-    ):
+    ) -> None:
+        super().__init__(
+            model=wrapped.model,
+            system_prompt=wrapped.system_prompt,
+            temperature=wrapped.temperature,
+            max_tokens=wrapped.max_tokens,
+            context_window=wrapped.context_window,
+        )
         self._wrapped = wrapped
         self._backend = backend
         self._enabled = enabled
         self._ttl = ttl
-        # Forward identity attributes
-        self.model = wrapped.model
-        self.system_prompt = getattr(wrapped, "system_prompt", None)
-        self.temperature = getattr(wrapped, "temperature", 0.7)
-        self.max_tokens = getattr(wrapped, "max_tokens", 2048)
-        self.context_window = getattr(wrapped, "context_window", 128000)
-        self._last_usage: Optional[Dict[str, Any]] = None
-        # Cache stats
+        self.provider_name = wrapped.provider_name
         self._hits = 0
         self._misses = 0
 
-    def _cache_key(self, messages: List[Dict[str, Any]], kwargs: Dict[str, Any]) -> str:
+    def _cache_key(
+        self,
+        messages: List[Dict[str, Any]],
+        kwargs: Dict[str, Any],
+    ) -> str:
         canonical = json.dumps(
             {
+                "provider": self._wrapped.provider_name,
                 "model": self._wrapped.model,
                 "messages": messages,
                 "kwargs": _json_safe(kwargs),
             },
             sort_keys=True,
             ensure_ascii=False,
+            separators=(",", ":"),
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    def __call__(self, messages: List[Dict[str, Any]], **kwargs: Any) -> str:
+    async def stream(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        """Yield a cached complete stream or commit one successful miss."""
+
         if not self._enabled:
-            result = self._wrapped(messages, **kwargs)
-            self._set_last_usage(self._wrapped.extract_usage())
-            return result
+            async for chunk in self._wrapped.stream(
+                messages,
+                deadline_monotonic=deadline_monotonic,
+                **kwargs,
+            ):
+                yield chunk
+            return
 
-        key = self._cache_key(messages, kwargs)
-        hit = self._backend.get(key)
-        if hit is not None:
-            self._hits += 1
-            self._set_last_usage(None)
-            return json.loads(hit)
-
-        self._misses += 1
-        result = self._wrapped(messages, **kwargs)
-        self._set_last_usage(self._wrapped.extract_usage())
-        try:
-            self._backend.set(
-                key, json.dumps(result, ensure_ascii=False).encode("utf-8"),
-                ttl=self._ttl,
-            )
-        except (TypeError, ValueError, OSError):
-            pass
-        return result
-
-    def call_raw(self, messages: List[Dict[str, Any]], **kwargs: Any) -> Any:
-        if not self._enabled:
-            result = self._wrapped.call_raw(messages, **kwargs)
-            self._set_last_usage(self._wrapped.extract_usage())
-            return result
-
-        key = self._cache_key(messages, kwargs)
-        hit = self._backend.get(key)
-        if hit is not None:
-            self._hits += 1
+        key = self._cache_key(messages, dict(kwargs))
+        cached = await asyncio.to_thread(self._backend.get, key)
+        if cached is not None:
             try:
-                return pickle.loads(hit)
-            except (pickle.UnpicklingError, EOFError):
-                pass  # Fall through to re-fetch
+                cached_chunks = _decode_chunks(cached)
+            except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                try:
+                    await asyncio.to_thread(self._backend.delete, key)
+                except OSError:
+                    _logger.debug(
+                        "invalid model cache entry could not be deleted", exc_info=True
+                    )
+            else:
+                self._hits += 1
+                for chunk in cached_chunks:
+                    yield chunk
+                return
 
         self._misses += 1
-        result = self._wrapped.call_raw(messages, **kwargs)
-        self._set_last_usage(self._wrapped.extract_usage())
+        committed_chunks: List[ModelStreamChunk] = []
+        async for chunk in self._wrapped.stream(
+            messages,
+            deadline_monotonic=deadline_monotonic,
+            **kwargs,
+        ):
+            committed_chunks.append(chunk)
+        _validate_complete_chunks(committed_chunks)
         try:
-            self._backend.set(key, pickle.dumps(result), ttl=self._ttl)
-        except (pickle.PicklingError, OSError):
-            pass
-        return result
+            encoded = json.dumps(
+                [asdict(chunk) for chunk in committed_chunks],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            _logger.debug("model stream is not JSON-cacheable", exc_info=True)
+        else:
+            try:
+                await asyncio.to_thread(self._backend.set, key, encoded, self._ttl)
+            except OSError:
+                _logger.debug("model cache write failed", exc_info=True)
+        for chunk in committed_chunks:
+            yield chunk
 
-    def _call_api(self, messages: List[Dict[str, Any]], **kwargs: Any) -> str:
-        return self(messages, **kwargs)
+    async def close(self) -> None:
+        await self._wrapped.close()
 
     def supports_tool_schema_delivery(
         self, delivery: str, protocol: Any = None
@@ -128,7 +143,9 @@ class CachedModel(Model):
         delivery: str = "prompt_injection",
     ) -> Dict[str, Any]:
         return self._wrapped.build_tool_schema_request_options(
-            tool_schema_payload, protocol=protocol, delivery=delivery
+            tool_schema_payload,
+            protocol=protocol,
+            delivery=delivery,
         )
 
     def supports_multimodal_input(self) -> bool:
@@ -137,18 +154,42 @@ class CachedModel(Model):
     def count_tokens(self, messages_or_text: Any) -> Optional[int]:
         return self._wrapped.count_tokens(messages_or_text)
 
+    def count_request_tokens(
+        self,
+        messages: List[Dict[str, Any]],
+        request_options: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        return self._wrapped.count_request_tokens(messages, request_options)
+
     @property
     def stats(self) -> Dict[str, int]:
         return {"hits": self._hits, "misses": self._misses}
 
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._wrapped, name)
+
+def _validate_complete_chunks(chunks: List[ModelStreamChunk]) -> None:
+    terminal_indexes = [index for index, chunk in enumerate(chunks) if chunk.done]
+    if terminal_indexes != [len(chunks) - 1]:
+        raise ModelTransportError(
+            "cached model transaction must end with exactly one terminal chunk",
+            attempts=1,
+            retryable=False,
+        )
+
+
+def _decode_chunks(payload: bytes) -> List[ModelStreamChunk]:
+    raw = json.loads(payload.decode("utf-8"))
+    if not isinstance(raw, list):
+        raise TypeError("cached model transaction must be a list")
+    chunks = [ModelStreamChunk(**item) for item in raw if isinstance(item, dict)]
+    if len(chunks) != len(raw):
+        raise TypeError("cached model transaction contains a non-object chunk")
+    _validate_complete_chunks(chunks)
+    return chunks
 
 
 def _json_safe(obj: Any) -> Any:
-    """Make an object JSON-serializable by converting non-serializable values."""
     if isinstance(obj, dict):
-        return {str(k): _json_safe(v) for k, v in obj.items()}
+        return {str(key): _json_safe(value) for key, value in obj.items()}
     if isinstance(obj, (list, tuple)):
         return [_json_safe(item) for item in obj]
     if isinstance(obj, (str, int, float, bool, type(None))):

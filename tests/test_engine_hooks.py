@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Any
 
+from examples._support import SequenceModel
 from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegistry
 from qitos.engine import RuntimeBudget
 from qitos.engine.hooks import EngineHook
@@ -17,11 +18,10 @@ class _S(StateSchema):
 class _LLMAgent(AgentModule[_S, dict[str, Any], Action]):
     def __init__(self):
         super().__init__(
-            tool_registry=ToolRegistry(), llm=self._llm, model_parser=ReActTextParser()
+            tool_registry=ToolRegistry(),
+            llm=SequenceModel(["Final Answer: ok", "Final Answer: ok"]),
+            model_parser=ReActTextParser(),
         )
-
-    def _llm(self, messages):
-        return "Final Answer: ok"
 
     def init_state(self, task: str, **kwargs: Any) -> _S:
         return _S(task=task, max_steps=2)

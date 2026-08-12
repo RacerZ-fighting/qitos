@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
 
 from ..core.decision import Decision
 from ..core.errors import (
@@ -17,9 +17,11 @@ from ._context_runtime import (
     ContextOverflowError,
     DecisionContextConfigurationError,
 )
-from ._protocol import _EngineProtocol
 from .critic_result import CriticResult
 from .states import RuntimePhase, StepRecord
+
+if TYPE_CHECKING:
+    from .engine import Engine
 
 
 StateT = TypeVar("StateT", bound=StateSchema)
@@ -28,7 +30,7 @@ ActionT = TypeVar("ActionT")
 
 
 class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
-    def __init__(self, engine: _EngineProtocol):
+    def __init__(self, engine: Engine[StateT, ObservationT, ActionT]):
         self.engine = engine
 
     def run_reduce(
@@ -89,7 +91,13 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
         - reason: str | None
         """
         engine = self.engine
-        empty = {"action": "continue", "modified_prompt": None, "instruction_patch": None, "state_patch": None, "reason": None}
+        empty = {
+            "action": "continue",
+            "modified_prompt": None,
+            "instruction_patch": None,
+            "state_patch": None,
+            "reason": None,
+        }
         if not engine.critics:
             return empty
         engine._dispatch_hook(
@@ -147,7 +155,13 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
                         payload={"critic_outputs": outputs, "result": "stop"},
                     ),
                 )
-                return {"action": "stop", "modified_prompt": None, "instruction_patch": None, "state_patch": None, "reason": output.get("reason")}
+                return {
+                    "action": "stop",
+                    "modified_prompt": None,
+                    "instruction_patch": None,
+                    "state_patch": None,
+                    "reason": output.get("reason"),
+                }
             if action == "retry":
                 engine._emit(
                     record.step_id,
@@ -424,8 +438,15 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
     def _is_api_context_overflow(exc: Exception) -> bool:
         """Check if an exception is an API-level context overflow error."""
         msg = str(exc).lower()
-        return any(kw in msg for kw in (
-            "context_length_exceeded", "context length", "prompt too long",
-            "maximum context", "too many tokens", "reduce the length",
-            "input is too long",
-        ))
+        return any(
+            kw in msg
+            for kw in (
+                "context_length_exceeded",
+                "context length",
+                "prompt too long",
+                "maximum context",
+                "too many tokens",
+                "reduce the length",
+                "input is too long",
+            )
+        )

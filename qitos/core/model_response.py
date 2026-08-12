@@ -1,4 +1,4 @@
-"""Normalized model response container used by the Engine runtime."""
+"""Completed provider-neutral model transaction used by the Engine."""
 
 from __future__ import annotations
 
@@ -9,10 +9,7 @@ from typing import Any, Dict, List, Optional, cast
 
 def _sanitize(value: Any) -> Any:
     if value is not None and dataclasses.is_dataclass(value):
-        return {
-            str(k): _sanitize(v)
-            for k, v in asdict(cast(Any, value)).items()
-        }
+        return {str(k): _sanitize(v) for k, v in asdict(cast(Any, value)).items()}
     if isinstance(value, dict):
         return {str(k): _sanitize(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -37,10 +34,9 @@ def _sanitize_native_item(value: Any) -> Any:
     return _sanitize(value)
 
 
-@dataclass
+@dataclass(slots=True)
 class ModelResponse:
     text: str
-    raw: Any = None
     usage: Optional[Dict[str, Any]] = None
     finish_reason: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
@@ -49,6 +45,18 @@ class ModelResponse:
     metadata: Dict[str, Any] = field(default_factory=dict)
     reasoning_content: Optional[str] = None
     native_items: Optional[List[Dict[str, Any]]] = None
+
+    def __post_init__(self) -> None:
+        """Reject responses that still carry provider SDK objects."""
+
+        if not isinstance(self.text, str):
+            raise TypeError("ModelResponse.text must be a string")
+        if self.usage is not None and not isinstance(self.usage, dict):
+            raise TypeError("ModelResponse.usage must be a dictionary or None")
+        if self.tool_calls is not None and not isinstance(self.tool_calls, list):
+            raise TypeError("ModelResponse.tool_calls must be a list or None")
+        if self.native_items is not None and not isinstance(self.native_items, list):
+            raise TypeError("ModelResponse.native_items must be a list or None")
 
     def to_summary_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {

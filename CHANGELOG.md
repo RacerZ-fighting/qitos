@@ -35,16 +35,19 @@ How to update:
 - Added run-scoped `RuntimeInput` delivery and explicit idle wait/wakeup. Background
   work can wake an Engine at the next model-safe boundary without polling, advancing
   steps while idle, or fabricating a second tool result.
-- Added a bounded transport policy for synchronous OpenAI-compatible calls and async
-  Responses streams, with one visible retry owner, provider retry-hint handling, typed
-  exhaustion errors, and stream event-idle timeouts.
+- Added a bounded asynchronous model transport policy with one retry owner,
+  provider retry-hint handling, typed exhaustion errors, absolute deadlines, and
+  stream event-idle timeouts.
 - Added generic `model_summary` projection for native tool-call history and
   model-visible observations. Tools can now retain full structured evidence
   for reducers and replay while supplying a bounded readable result to models.
 - Added transient runtime-context delivery to `MessageBuildResult`. Custom
   agents can fold authoritative controller state into the final real tool
   result without persisting a synthetic user turn.
-- Added opt-in OpenAI Responses API support for synchronous, asynchronous, and typed streaming calls, including structured output-item preservation, `call_id` tool-result correlation, stateless tool-round replay, and privacy-safe trace summaries. Chat Completions remains the default.
+- Added first-class OpenAI Responses API support alongside Anthropic Messages and the
+  compatible Chat Completions channel, including structured output-item preservation,
+  `call_id` tool-result correlation, stateless tool-round replay, and privacy-safe trace
+  summaries.
 - Added `AgentSpec.tool_name` so delegate workers can expose task-oriented model-facing tool names while keeping the registry agent name stable.
 - Added qita's trajectory analysis workbench with diagnosis-first run pages, derived failure insights, focus navigation, critical-step guidance, an inspector panel, and expandable full-content evidence views for long thoughts, observations, parser diagnostics, actions, and critic outputs.
 - Added qita `step_interactions`, a derived action-observation view that pairs each action with its complete arguments, invocation metadata, model-visible result, and canonical raw result while separating environment-only and unmatched evidence.
@@ -57,11 +60,11 @@ How to update:
   construction, hidden worktree argument, `allow_background` alias, and the separate
   `CodingToolSet.agent_spawn` loop; applications own fresh child Engine construction.
 
-- Model calls now run under one Engine-scoped absolute request deadline. Provider
-  timeouts and retry backoff are clamped to live remaining time, immediate cancellation
-  stops waiting, and uncooperative synchronous calls remain on bounded daemon workers.
-  Official sync/async OpenAI models are thin specializations of the canonical
-  OpenAI-compatible adapter instead of maintaining separate transports.
+- Model calls now use one async-native Engine path and one Engine-scoped absolute
+  request deadline. Provider connection, stream-idle, and retry waits are clamped to
+  live remaining time; immediate cancellation propagates through the active task and
+  closes the provider stream. Official providers implement the same asynchronous model
+  contract instead of maintaining synchronous and asynchronous transports.
 - Tool actions now have one absolute budget covering admission, invocation retries, and
   backoff. `ToolSpec.retry_policy` is the only tool retry owner, validation and
   permission checks run once, HTTP transport retries are disabled, and bounded daemon
@@ -81,9 +84,10 @@ How to update:
   uses `.70/.50/.35` history budgets without mutating canonical history. Responses
   text/tool payloads and generic/native mirrors now keep one complete, accurately
   counted call/result transaction.
-- Async Engine runs now use a daemon worker with cooperative cancellation, and the two
-  duplicated stream cleanup paths share one lifecycle implementation. Early consumer
-  close requests Engine cancellation; normal completion still propagates Engine errors.
+- `Engine.arun()` and `Engine.astep()` are now the canonical execution paths. The
+  synchronous `run()` and `step()` entry points only bridge at the process boundary and
+  reject calls from an active event loop; the daemon-thread `AsyncEngine` bridge has
+  been removed.
 - Background `AgentTool` runs now snapshot parent history at launch but defer model,
   Engine, and trace construction until an execution slot opens. A bounded daemon pool,
   repeatable bounded close, canonical cancellation stops, and terminal-before-wakeup
@@ -94,10 +98,10 @@ How to update:
   delegated in one response for concurrent execution, while dependent steps and cheap
   mechanical variants remain in the parent. Explicit tool guidance is no longer replaced
   by the `execute()` implementation docstring during initialization.
-- OpenAI-compatible Engine calls now use transactional streaming by default. Retryable
-  mid-stream failures discard partial text and tool calls before retrying within the
-  existing QitOS-owned attempt budget and a configurable 300-second recovery window,
-  while active streams use an idle deadline instead of the ordinary request timeout.
+- Model calls now use transactional streaming. Retryable mid-stream failures discard
+  the failed attempt's partial text and tool calls before retrying within the
+  QitOS-owned attempt budget and absolute request deadline; active streams use a
+  bounded event-idle timeout.
 - OpenAI-compatible clients now disable OpenAI SDK retries on paths where QitOS owns the
   retry budget, preventing multiplicative retry delays.
 - Raised the optional OpenAI SDK floor to `openai>=1.66.0` and taught compact history to preserve active Responses function-call rounds atomically.
@@ -170,6 +174,12 @@ How to update:
 
 ### Removed
 
+- Removed `AsyncEngine`, `AsyncModel`, synchronous provider calls, `call_raw`, provider
+  import-time registration, global model registries, and the parallel sync/async model
+  class hierarchy. Model construction is explicit and instance-scoped.
+- Removed the duplicate LM Studio and vLLM transports. Compatible endpoints configure
+  the canonical OpenAI-compatible adapter; Ollama and Azure keep the transport behavior
+  required by their native asynchronous clients.
 - Removed the legacy official OpenAI sync/async request implementations, including their
   hard-coded three-attempt loop, implicit SDK retries, and error-as-success strings.
 - Removed provider-failure-as-model-text paths from the Anthropic, Gemini, LiteLLM,
@@ -195,6 +205,9 @@ How to update:
 
 ### Breaking
 
+- Model implementations must provide the asynchronous `Model.stream(...)` contract.
+  Applications in an event loop must call `Engine.arun()` or `Engine.astep()`; the
+  synchronous wrappers no longer emulate async execution with worker threads.
 - Direct class-tool callers must pass an argument dictionary to `execute(...)`.
   Registry callers must resolve an exact canonical name with `get()` or execute through
   `Engine`/`ActionExecutor`. Tools run in parallel only when their spec explicitly sets

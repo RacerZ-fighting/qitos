@@ -238,6 +238,30 @@ Execute the agent loop for `task`. Resets run state, initialises the env, calls 
 ---
 
 ```python
+async def arun(self, task: str | Task, **kwargs: Any) -> EngineResult[StateT]
+```
+
+Execute the same loop on the caller's event loop. Provider requests and model streams remain async throughout the transaction.
+
+---
+
+```python
+async def arun_stream(self, task: str | Task, **kwargs: Any) -> AsyncIterator[EngineEvent]
+```
+
+Execute the loop and yield `EngineEvent` objects in real time. The stream includes one `run_start` event and ends with one `run_end` event.
+
+---
+
+```python
+def cancel(self, mode: str = "immediate") -> None
+```
+
+Request cancellation of the active run. Use `mode="after_step"` to let the current step reach its safe boundary.
+
+---
+
+```python
 def register_hook(self, hook: Any) -> None
 ```
 
@@ -261,65 +285,9 @@ Remove all registered hooks.
 
 </Accordion>
 
-<Accordion title="AsyncEngine">
-
-`AsyncEngine` provides non-blocking execution for agent workflows. It wraps the same
-`Engine` loop on a daemon worker thread and propagates cancellation cooperatively, so an
-unresponsive synchronous call cannot own event-loop or interpreter shutdown.
-
-```python
-class AsyncEngine(Generic[StateT, ObservationT, ActionT])
-```
-
-**Constructor**
-
-```python
-def __init__(
-    self,
-    agent: AgentModule[StateT, ObservationT, ActionT],
-    **engine_kwargs: Any,
-)
-```
-
-All keyword arguments are forwarded to the internal `Engine` constructor (same parameters as `Engine.__init__`).
-
-**Methods**
-
-```python
-async def arun(self, task: str | Task, **kwargs: Any) -> EngineResult[StateT]
-```
-
-Execute the agent loop asynchronously. Returns the same `EngineResult` as `Engine.run()`.
-
----
-
-```python
-async def arun_stream(self, task: str | Task, **kwargs: Any) -> AsyncIterator[EngineEvent]
-```
-
-Execute the agent loop and yield `EngineEvent` objects in real time. The stream begins with `run_start` and ends with `run_end`.
-
----
-
-```python
-def run(self, task: str | Task, **kwargs: Any) -> EngineResult[StateT]
-```
-
-Synchronous fallback — delegates to the underlying `Engine.run()`.
-
-**Properties**
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `engine` | `Engine` | The underlying sync Engine instance |
-| `agent` | `AgentModule` | Same as `engine.agent` |
-| `event_stream` | `EventStream \| None` | Active event stream during `arun_stream()`, otherwise `None` |
-
-</Accordion>
-
 <Accordion title="EngineEvent, EngineEventType, EventStream">
 
-`EngineEvent` is the structured event emitted by `AsyncEngine.arun_stream()`.
+`EngineEvent` is the structured event emitted by `Engine.arun_stream()`.
 
 ```python
 class EngineEventType(str, Enum):

@@ -1,20 +1,20 @@
-"""Tests for LLM Cache: backends, CachedModel, and Engine integration."""
+"""Behavior tests for model transaction caching and cache backends."""
 
-import json
-import tempfile
+from __future__ import annotations
+
+import threading
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from qitos import AgentModule, Decision, Action, Engine, StateSchema, ToolRegistry, tool
-from qitos.cache import CacheBackend, InMemoryCache, DiskCache, CachedModel
+from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegistry, tool
+from qitos.cache import CachedModel, DiskCache, InMemoryCache
 from qitos.engine import RuntimeBudget
-
-
-# --- Fixtures ---
+from qitos.models import Model, ModelStreamChunk
 
 
 @dataclass
@@ -23,7 +23,7 @@ class DemoState(StateSchema):
 
 
 class DemoAgent(AgentModule[DemoState, dict[str, Any], Action]):
-    def __init__(self, answer: str = "42", with_llm: bool = False):
+    def __init__(self, answer: str = "42", with_llm: bool = False) -> None:
         registry = ToolRegistry()
 
         @tool(name="add")
@@ -37,9 +37,11 @@ class DemoAgent(AgentModule[DemoState, dict[str, Any], Action]):
             self.llm = _StubModel(answer=answer)
 
     def init_state(self, task: str, **kwargs: Any) -> DemoState:
+        _ = kwargs
         return DemoState(task=task, max_steps=3)
 
     def decide(self, state: DemoState, observation: dict[str, Any]) -> Decision[Action]:
+        _ = observation
         if state.current_step == 0:
             return Decision.act(
                 actions=[Action(name="add", args={"a": 1, "b": 2})],
@@ -53,246 +55,238 @@ class DemoAgent(AgentModule[DemoState, dict[str, Any], Action]):
         observation: dict[str, Any],
         decision: Decision[Action],
     ) -> DemoState:
+        _ = observation, decision
         return state
 
 
-class _StubModel:
-    """Sync model that counts calls and returns a fixed answer."""
-
-    def __init__(self, answer: str = "done", model: str = "stub"):
-        self.model = model
+class _StubModel(Model):
+    def __init__(self, answer: str = "done", model: str = "stub") -> None:
+        super().__init__(model=model)
         self.answer = answer
-        self._last_usage = None
         self.call_count = 0
-        self.call_raw_count = 0
 
-    def __call__(self, messages, **kwargs):
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = messages, deadline_monotonic, kwargs
         self.call_count += 1
-        return f"Final Answer: {self.answer}"
+        yield ModelStreamChunk(
+            text=f"Final Answer: {self.answer}",
+            reasoning_content="checked",
+            event_type="text.delta",
+        )
+        yield ModelStreamChunk(
+            done=True,
+            usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            native_items=[{"type": "message", "id": "msg_1"}],
+            event_type="model.completed",
+            event_metadata={"provider": "stub", "model": self.model},
+            finish_reason="stop",
+        )
 
-    def call_raw(self, messages, **kwargs):
-        self.call_raw_count += 1
-        return self(messages, **kwargs)
 
-    def extract_usage(self, response=None):
-        return self._last_usage
-
-
-# --- InMemoryCache tests ---
+async def _collect(
+    model: Model,
+    messages: list[dict[str, Any]],
+    **kwargs: Any,
+) -> list[ModelStreamChunk]:
+    return [chunk async for chunk in model.stream(messages, **kwargs)]
 
 
 class TestInMemoryCache:
-    def test_get_set(self):
+    def test_get_set_delete_and_clear(self) -> None:
         cache = InMemoryCache()
-        cache.set("key1", b"value1")
-        assert cache.get("key1") == b"value1"
-
-    def test_get_missing(self):
-        cache = InMemoryCache()
-        assert cache.get("nonexistent") is None
-
-    def test_delete(self):
-        cache = InMemoryCache()
-        cache.set("key1", b"value1")
-        cache.delete("key1")
-        assert cache.get("key1") is None
-
-    def test_clear(self):
-        cache = InMemoryCache()
-        cache.set("key1", b"value1")
-        cache.set("key2", b"value2")
+        cache.set("one", b"1")
+        cache.set("two", b"2")
+        assert cache.get("one") == b"1"
+        assert cache.contains("two") is True
+        cache.delete("one")
+        assert cache.get("one") is None
         cache.clear()
-        assert cache.get("key1") is None
-        assert cache.get("key2") is None
+        assert cache.get("two") is None
 
-    def test_contains(self):
+    def test_ttl_expiry(self) -> None:
         cache = InMemoryCache()
-        cache.set("key1", b"value1")
-        assert cache.contains("key1")
-        assert not cache.contains("key2")
-
-    def test_ttl_expiry(self):
-        cache = InMemoryCache()
-        cache.set("key1", b"value1", ttl=0.01)
+        cache.set("key", b"value", ttl=0.01)
         time.sleep(0.02)
-        assert cache.get("key1") is None
+        assert cache.get("key") is None
 
-    def test_max_entries_lru(self):
+    def test_lru_evicts_oldest_entry(self) -> None:
         cache = InMemoryCache(max_entries=2)
         cache.set("a", b"1")
         cache.set("b", b"2")
-        cache.set("c", b"3")  # evicts "a"
+        cache.set("c", b"3")
         assert cache.get("a") is None
         assert cache.get("b") == b"2"
         assert cache.get("c") == b"3"
 
-    def test_overwrite(self):
-        cache = InMemoryCache()
-        cache.set("key1", b"old")
-        cache.set("key1", b"new")
-        assert cache.get("key1") == b"new"
-
-
-# --- DiskCache tests ---
-
 
 class TestDiskCache:
-    def test_get_set(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache = DiskCache(tmpdir)
-            cache.set("key1", b"value1")
-            assert cache.get("key1") == b"value1"
+    def test_round_trip_delete_clear_and_new_instance(self, tmp_path: Path) -> None:
+        cache = DiskCache(str(tmp_path))
+        cache.set("one", b"1")
+        cache.set("two", b"2")
+        assert DiskCache(str(tmp_path)).get("one") == b"1"
+        cache.delete("one")
+        assert cache.get("one") is None
+        cache.clear()
+        assert cache.get("two") is None
 
-    def test_get_missing(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache = DiskCache(tmpdir)
-            assert cache.get("nonexistent") is None
-
-    def test_delete(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache = DiskCache(tmpdir)
-            cache.set("key1", b"value1")
-            cache.delete("key1")
-            assert cache.get("key1") is None
-
-    def test_clear(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache = DiskCache(tmpdir)
-            cache.set("key1", b"value1")
-            cache.set("key2", b"value2")
-            cache.clear()
-            assert cache.get("key1") is None
-            assert cache.get("key2") is None
-
-    def test_contains(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache = DiskCache(tmpdir)
-            cache.set("key1", b"value1")
-            assert cache.contains("key1")
-
-    def test_ttl_expiry(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache = DiskCache(tmpdir)
-            cache.set("key1", b"value1", ttl=0.01)
-            time.sleep(0.02)
-            assert cache.get("key1") is None
-
-    def test_persistence(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            cache1 = DiskCache(tmpdir)
-            cache1.set("key1", b"value1")
-            # New instance pointing to same dir
-            cache2 = DiskCache(tmpdir)
-            assert cache2.get("key1") == b"value1"
-
-
-# --- CachedModel tests ---
+    def test_ttl_expiry(self, tmp_path: Path) -> None:
+        cache = DiskCache(str(tmp_path))
+        cache.set("key", b"value", ttl=0.01)
+        time.sleep(0.02)
+        assert cache.get("key") is None
 
 
 class TestCachedModel:
-    def test_cache_hit_call(self):
-        model = _StubModel(answer="hello")
-        cache = InMemoryCache()
-        cached = CachedModel(model, cache)
-
+    @pytest.mark.asyncio
+    async def test_complete_transaction_is_cached_without_provider_objects(
+        self,
+    ) -> None:
+        wrapped = _StubModel(answer="hello")
+        cached = CachedModel(wrapped, InMemoryCache())
         messages = [{"role": "user", "content": "test"}]
-        result1 = cached(messages)
-        result2 = cached(messages)
 
-        assert result1 == "Final Answer: hello"
-        assert result2 == "Final Answer: hello"
-        assert model.call_count == 1  # only called once; second was cache hit
-        assert cached.stats["hits"] == 1
-        assert cached.stats["misses"] == 1
+        first = await _collect(cached, messages)
+        second = await _collect(cached, messages)
 
-    def test_cache_miss_different_messages(self):
-        model = _StubModel(answer="hello")
-        cache = InMemoryCache()
-        cached = CachedModel(model, cache)
+        assert first == second
+        assert wrapped.call_count == 1
+        assert second[-1].usage == {
+            "prompt_tokens": 2,
+            "completion_tokens": 1,
+            "total_tokens": 3,
+        }
+        assert second[-1].native_items == [{"type": "message", "id": "msg_1"}]
+        assert cached.stats == {"hits": 1, "misses": 1}
 
-        cached([{"role": "user", "content": "msg1"}])
-        cached([{"role": "user", "content": "msg2"}])
+    @pytest.mark.asyncio
+    async def test_different_requests_are_independent_misses(self) -> None:
+        wrapped = _StubModel()
+        cached = CachedModel(wrapped, InMemoryCache())
 
-        assert model.call_count == 2
-        assert cached.stats["misses"] == 2
+        await _collect(cached, [{"role": "user", "content": "one"}])
+        await _collect(cached, [{"role": "user", "content": "two"}])
 
-    def test_cache_key_deterministic(self):
-        model = _StubModel()
-        cache = InMemoryCache()
-        cached = CachedModel(model, cache)
+        assert wrapped.call_count == 2
+        assert cached.stats == {"hits": 0, "misses": 2}
 
+    def test_key_is_deterministic_and_includes_provider(self) -> None:
+        first = CachedModel(_StubModel(), InMemoryCache())
+        second_model = _StubModel()
+        second_model.provider_name = "different"
+        second = CachedModel(second_model, InMemoryCache())
         messages = [{"role": "user", "content": "test"}]
-        key1 = cached._cache_key(messages, {})
-        key2 = cached._cache_key(messages, {})
-        assert key1 == key2
 
-    def test_enabled_false_bypasses(self):
-        model = _StubModel(answer="hello")
-        cache = InMemoryCache()
-        cached = CachedModel(model, cache, enabled=False)
+        assert first._cache_key(messages, {}) == first._cache_key(messages, {})
+        assert first._cache_key(messages, {}) != second._cache_key(messages, {})
 
+    @pytest.mark.asyncio
+    async def test_disabled_cache_bypasses_backend(self) -> None:
+        wrapped = _StubModel()
+        cached = CachedModel(wrapped, InMemoryCache(), enabled=False)
         messages = [{"role": "user", "content": "test"}]
-        cached(messages)
-        cached(messages)
 
-        assert model.call_count == 2  # both calls went through
-        assert cached.stats["hits"] == 0
+        await _collect(cached, messages)
+        await _collect(cached, messages)
 
-    def test_forwards_attributes(self):
-        model = _StubModel()
-        cache = InMemoryCache()
-        cached = CachedModel(model, cache)
+        assert wrapped.call_count == 2
+        assert cached.stats == {"hits": 0, "misses": 0}
+
+    @pytest.mark.asyncio
+    async def test_failed_transaction_is_not_published_or_cached(self) -> None:
+        class FailOnceModel(_StubModel):
+            async def stream(
+                self,
+                messages: list[dict[str, Any]],
+                *,
+                deadline_monotonic: float | None = None,
+                **kwargs: Any,
+            ) -> AsyncIterator[ModelStreamChunk]:
+                self.call_count += 1
+                if self.call_count == 1:
+                    yield ModelStreamChunk(text="discarded")
+                    raise TimeoutError("stream failed")
+                async for chunk in super().stream(
+                    messages,
+                    deadline_monotonic=deadline_monotonic,
+                    **kwargs,
+                ):
+                    yield chunk
+
+        wrapped = FailOnceModel(answer="recovered")
+        backend = InMemoryCache()
+        cached = CachedModel(wrapped, backend)
+        messages = [{"role": "user", "content": "test"}]
+
+        with pytest.raises(TimeoutError, match="stream failed"):
+            await _collect(cached, messages)
+        assert backend.get(cached._cache_key(messages, {})) is None
+
+        chunks = await _collect(cached, messages)
+        assert "".join(chunk.text for chunk in chunks) == "Final Answer: recovered"
+        assert cached.stats == {"hits": 0, "misses": 2}
+
+    @pytest.mark.asyncio
+    async def test_backend_io_runs_off_the_event_loop_thread(self) -> None:
+        event_loop_thread = threading.get_ident()
+        observed: dict[str, int] = {}
+
+        class RecordingBackend(InMemoryCache):
+            def get(self, key: str) -> bytes | None:
+                observed["get"] = threading.get_ident()
+                return super().get(key)
+
+            def set(self, key: str, value: bytes, ttl: float | None = None) -> None:
+                observed["set"] = threading.get_ident()
+                super().set(key, value, ttl)
+
+        cached = CachedModel(_StubModel(), RecordingBackend())
+        await _collect(cached, [{"role": "user", "content": "test"}])
+
+        assert observed["get"] != event_loop_thread
+        assert observed["set"] != event_loop_thread
+
+    def test_forwards_stable_model_capabilities(self) -> None:
+        wrapped = _StubModel()
+        cached = CachedModel(wrapped, InMemoryCache())
 
         assert cached.model == "stub"
         assert cached.temperature == 0.7
         assert cached.max_tokens == 2048
-
-    def test_call_raw_cache_hit(self):
-        model = _StubModel(answer="raw_result")
-        cache = InMemoryCache()
-        cached = CachedModel(model, cache)
-
-        messages = [{"role": "user", "content": "test"}]
-        cached.call_raw(messages)
-        cached.call_raw(messages)
-
-        assert model.call_raw_count == 1  # second was cache hit
-
-    def test_stats(self):
-        model = _StubModel()
-        cache = InMemoryCache()
-        cached = CachedModel(model, cache)
-
-        messages = [{"role": "user", "content": "test"}]
-        cached(messages)  # miss
-        cached(messages)  # hit
-
-        assert cached.stats == {"hits": 1, "misses": 1}
-
-
-# --- Engine integration ---
+        assert cached.count_tokens("one two") == wrapped.count_tokens("one two")
 
 
 class TestEngineCacheIntegration:
-    def test_engine_auto_wraps_model(self):
-        agent = DemoAgent(answer="cached_result", with_llm=True)
-        cache = InMemoryCache()
-        engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=5), cache_backend=cache)
-
-        # The agent's llm should have been wrapped
-        from qitos.cache import CachedModel
+    def test_engine_wraps_the_canonical_model(self) -> None:
+        agent = DemoAgent(answer="cached", with_llm=True)
+        engine = Engine(
+            agent=agent,
+            budget=RuntimeBudget(max_steps=5),
+            cache_backend=InMemoryCache(),
+        )
 
         assert isinstance(engine.agent.llm, CachedModel)
 
-    def test_engine_no_cache_when_none(self):
-        agent = DemoAgent()
+    def test_engine_without_cache_does_not_wrap(self) -> None:
+        agent = DemoAgent(with_llm=True)
+        model = agent.llm
         engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=5))
 
         assert engine.cache_backend is None
+        assert engine.agent.llm is model
 
-    def test_engine_with_cache_produces_result(self):
+    def test_engine_with_cache_preserves_non_model_agent_behavior(self) -> None:
         agent = DemoAgent(answer="from_cache")
-        cache = InMemoryCache()
-        engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=5), cache_backend=cache)
-        result = engine.run("test task")
+        result = Engine(
+            agent=agent,
+            budget=RuntimeBudget(max_steps=5),
+            cache_backend=InMemoryCache(),
+        ).run("test task")
+
         assert result.state.final_result == "from_cache"

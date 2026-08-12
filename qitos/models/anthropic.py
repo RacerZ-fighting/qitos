@@ -1,45 +1,347 @@
-"""
-Native Anthropic Messages API model implementation.
-
-This adapter talks to Anthropic's `/v1/messages` endpoint directly instead of
-going through an OpenAI-compatible proxy.
-"""
+"""Native asynchronous Anthropic Messages provider."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-from typing import Any, Dict, Iterator, List, Optional
-
-import requests
+from collections.abc import AsyncIterator
+from typing import Any, Dict, List, Optional, cast
 
 from ..core.errors import ModelTransportError
-from .base import Model, ModelFactory, ModelStreamChunk
-from ._request_runtime import effective_request_timeout
+from ..core.multimodal import content_to_text, normalize_content_block
+from .transport import (
+    ModelRetryPolicy,
+    close_async_resource,
+    effective_request_timeout,
+    transactional_stream_with_retry,
+)
+from .base import Model, ModelStreamChunk
+
+
+_ANTHROPIC_BLOCK_TYPES = {
+    "text",
+    "thinking",
+    "redacted_thinking",
+    "tool_use",
+    "tool_result",
+}
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _native_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return _native_value(model_dump(exclude_none=True))
+    if isinstance(value, dict):
+        return {str(key): _native_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_native_value(item) for item in value]
+    values = getattr(value, "__dict__", None)
+    if isinstance(values, dict):
+        return {
+            str(key): _native_value(item)
+            for key, item in values.items()
+            if not str(key).startswith("_") and item is not None
+        }
+    raise TypeError(f"unsupported Anthropic value: {type(value).__name__}")
+
+
+def _anthropic_tools(
+    tool_schema_payload: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    tools: List[Dict[str, Any]] = []
+    for item in list(tool_schema_payload or []):
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        parameters = function.get("parameters")
+        if not name or not isinstance(parameters, dict):
+            continue
+        tool: Dict[str, Any] = {
+            "name": name,
+            "input_schema": dict(parameters),
+        }
+        description = function.get("description")
+        if description:
+            tool["description"] = str(description)
+        tools.append(tool)
+    return tools
+
+
+def _anthropic_tool_choice(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "auto":
+            return {"type": "auto"}
+        if normalized == "required":
+            return {"type": "any"}
+        if normalized == "none":
+            return {"type": "none"}
+        return value
+    if not isinstance(value, dict):
+        return value
+    function = value.get("function")
+    if value.get("type") == "function" and isinstance(function, dict):
+        name = str(function.get("name") or "").strip()
+        if name:
+            return {"type": "tool", "name": name}
+    return value
+
+
+class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
+    """Normalize and own one connected Anthropic message stream."""
+
+    def __init__(self, events: Any, client: Any, *, provider: str, model: str) -> None:
+        self._events = events
+        self._client = client
+        self._iterator = events.__aiter__()
+        self._provider = provider
+        self._model = model
+        self._blocks: Dict[int, Dict[str, Any]] = {}
+        self._input_json: Dict[int, str] = {}
+        self._usage: Dict[str, Any] = {}
+        self._message_id: str | None = None
+        self._finish_reason: str | None = None
+        self._finished = False
+        self._closed = False
+
+    def __aiter__(self) -> _AnthropicEventStream:
+        return self
+
+    async def __anext__(self) -> ModelStreamChunk:
+        if self._finished:
+            raise StopAsyncIteration
+        while True:
+            try:
+                event = await self._iterator.__anext__()
+            except StopAsyncIteration as exc:
+                raise ModelTransportError(
+                    "Anthropic stream ended before message_stop",
+                    attempts=1,
+                    retryable=True,
+                ) from exc
+
+            event_type = str(_field(event, "type", "") or "")
+            raw_index = _field(event, "index", 0)
+            index = raw_index if isinstance(raw_index, int) else 0
+
+            if event_type == "message_start":
+                message = _field(event, "message", {})
+                message_id = _field(message, "id")
+                if message_id is not None:
+                    self._message_id = str(message_id)
+                self._record_usage(_field(message, "usage"))
+                continue
+
+            if event_type == "content_block_start":
+                block = _native_value(_field(event, "content_block", {}))
+                if isinstance(block, dict):
+                    self._blocks[index] = dict(block)
+                    if block.get("type") == "tool_use":
+                        self._input_json[index] = ""
+                        return ModelStreamChunk(
+                            event_type="tool_call.start",
+                            event_metadata={
+                                "index": index,
+                                "call_id": block.get("id"),
+                                "name": block.get("name"),
+                            },
+                        )
+                continue
+
+            if event_type == "content_block_delta":
+                delta = _field(event, "delta", {})
+                delta_type = str(_field(delta, "type", "") or "")
+                block = self._blocks.setdefault(index, {})
+                if delta_type == "text_delta":
+                    text = str(_field(delta, "text", "") or "")
+                    block["text"] = str(block.get("text") or "") + text
+                    if text:
+                        return ModelStreamChunk(
+                            text=text,
+                            event_type="text.delta",
+                            event_metadata={"index": index},
+                        )
+                    continue
+                if delta_type == "thinking_delta":
+                    thinking = str(_field(delta, "thinking", "") or "")
+                    block["thinking"] = str(block.get("thinking") or "") + thinking
+                    if thinking:
+                        return ModelStreamChunk(
+                            reasoning_content=thinking,
+                            event_type="reasoning.delta",
+                            event_metadata={"index": index},
+                        )
+                    continue
+                if delta_type == "signature_delta":
+                    signature = str(_field(delta, "signature", "") or "")
+                    block["signature"] = str(block.get("signature") or "") + signature
+                    continue
+                if delta_type == "input_json_delta":
+                    arguments = str(_field(delta, "partial_json", "") or "")
+                    self._input_json[index] = (
+                        self._input_json.get(index, "") + arguments
+                    )
+                    return ModelStreamChunk(
+                        event_type="tool_call.delta",
+                        event_metadata={
+                            "index": index,
+                            "call_id": block.get("id"),
+                            "name": block.get("name"),
+                            "arguments_delta": arguments,
+                        },
+                    )
+                continue
+
+            if event_type == "content_block_stop":
+                self._finish_block(index)
+                continue
+
+            if event_type == "message_delta":
+                delta = _field(event, "delta", {})
+                stop_reason = _field(delta, "stop_reason")
+                if stop_reason is not None:
+                    self._finish_reason = str(stop_reason)
+                self._record_usage(_field(event, "usage"))
+                continue
+
+            if event_type == "message_stop":
+                for block_index in list(self._blocks):
+                    self._finish_block(block_index)
+                self._finished = True
+                return self._terminal_chunk()
+
+            if event_type == "error":
+                raise ModelTransportError(
+                    f"Anthropic stream failed: {_field(event, 'error')}",
+                    attempts=1,
+                    retryable=False,
+                )
+
+    def _finish_block(self, index: int) -> None:
+        block = self._blocks.get(index)
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            return
+        raw_arguments = self._input_json.get(index, "")
+        if not raw_arguments:
+            block.setdefault("input", {})
+            return
+        try:
+            parsed = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            block["input"] = {"_raw": raw_arguments}
+        else:
+            block["input"] = parsed
+
+    def _record_usage(self, usage: Any) -> None:
+        if usage is None:
+            return
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ):
+            value = _field(usage, key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                self._usage[key] = value
+
+    def _normalized_usage(self) -> Optional[Dict[str, Any]]:
+        if not self._usage:
+            return None
+        input_tokens = int(self._usage.get("input_tokens", 0))
+        cache_creation = int(self._usage.get("cache_creation_input_tokens", 0))
+        cache_read = int(self._usage.get("cache_read_input_tokens", 0))
+        output_tokens = int(self._usage.get("output_tokens", 0))
+        prompt_tokens = input_tokens + cache_creation + cache_read
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": prompt_tokens + output_tokens,
+            "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read,
+        }
+
+    def _terminal_chunk(self) -> ModelStreamChunk:
+        native_items = [self._blocks[index] for index in sorted(self._blocks)]
+        tool_calls: List[Dict[str, Any]] = []
+        for block in native_items:
+            if block.get("type") != "tool_use":
+                continue
+            call_id = str(block.get("id") or "").strip()
+            name = str(block.get("name") or "").strip()
+            if not call_id or not name:
+                continue
+            tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(
+                            block.get("input", {}),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    },
+                }
+            )
+        return ModelStreamChunk(
+            done=True,
+            usage=self._normalized_usage(),
+            tool_calls=tool_calls or None,
+            native_items=native_items or None,
+            event_type="message.stop",
+            event_metadata={
+                "provider": self._provider,
+                "model": self._model,
+                "api_mode": "anthropic_messages",
+                "id": self._message_id,
+            },
+            finish_reason=self._finish_reason,
+        )
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._finished = True
+        await close_async_resource(self._events)
+        await close_async_resource(self._client)
 
 
 class AnthropicModel(Model):
-    """
-    Anthropic Messages API model.
+    """Anthropic Messages provider using the official asynchronous SDK."""
 
-    Environment variables:
-    - ANTHROPIC_API_KEY
-    - ANTHROPIC_BASE_URL (optional, default https://api.anthropic.com)
-    - ANTHROPIC_API_VERSION (optional, default 2023-06-01)
-    """
+    provider_name = "anthropic"
 
     def __init__(
         self,
-        model: str = "claude-3-5-sonnet-latest",
+        model: str = "claude-sonnet-4-5",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        api_version: str = "2023-06-01",
         system_prompt: Optional[str] = None,
-        temperature: float = 0.7,
+        temperature: float | None = 0.7,
         max_tokens: int = 4096,
-        timeout: int = 60,
+        timeout: float = 120.0,
         context_window: Optional[int] = None,
-    ):
+        max_attempts: int = 2,
+        stream_idle_timeout: float = 60.0,
+        retry_window_seconds: float = 300.0,
+    ) -> None:
         super().__init__(
             model=model,
             system_prompt=system_prompt,
@@ -48,320 +350,242 @@ class AnthropicModel(Model):
             context_window=context_window,
         )
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        resolved_base_url = base_url or os.getenv(
-            "ANTHROPIC_BASE_URL", "https://api.anthropic.com"
-        )
-        self.base_url = str(resolved_base_url).rstrip("/")
-        self.api_version = api_version or os.getenv(
-            "ANTHROPIC_API_VERSION", "2023-06-01"
-        )
-        self.timeout = timeout
         if not self.api_key:
-            raise ValueError(
-                "ANTHROPIC_API_KEY not set. Please set it or pass api_key."
-            )
-
-    def _call_api(self, messages: List[Dict[str, Any]], **kwargs: Any) -> str:
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": self.api_version,
-            "content-type": "application/json",
-        }
-        _ = kwargs
-        payload: Dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "messages": self._anthropic_messages(messages),
-        }
-        system_text = self._system_text(messages)
-        if system_text:
-            payload["system"] = system_text
-
-        response = requests.post(
-            f"{self.base_url}/v1/messages",
-            headers=headers,
-            json=payload,
-            timeout=effective_request_timeout(self.timeout),
+            raise ValueError("ANTHROPIC_API_KEY must be configured")
+        self.base_url = (
+            base_url or os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
+        ).rstrip("/")
+        if isinstance(timeout, bool) or timeout <= 0:
+            raise ValueError("timeout must be positive")
+        if isinstance(stream_idle_timeout, bool) or stream_idle_timeout <= 0:
+            raise ValueError("stream_idle_timeout must be positive")
+        self.timeout = float(timeout)
+        self.stream_idle_timeout = float(stream_idle_timeout)
+        self.retry_policy = ModelRetryPolicy(
+            max_attempts=max_attempts,
+            retry_window_seconds=retry_window_seconds,
         )
-        response.raise_for_status()
-        result = response.json()
-        self._set_last_usage(self._usage_from_response(result))
-        return self._parse_response(result)
 
     def _system_text(self, messages: List[Dict[str, Any]]) -> str:
         parts: List[str] = []
         if self.system_prompt:
             parts.append(str(self.system_prompt))
-        for msg in messages:
-            if str(msg.get("role", "")) == "system":
-                content = str(msg.get("content", "")).strip()
-                if content:
-                    parts.append(content)
+        for message in messages:
+            if str(message.get("role") or "") != "system":
+                continue
+            content = content_to_text(message.get("content")).strip()
+            if content:
+                parts.append(content)
         return "\n\n".join(parts).strip()
 
     def _anthropic_messages(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         converted: List[Dict[str, Any]] = []
-        for msg in messages:
-            role = str(msg.get("role", ""))
+        for message in messages:
+            role = str(message.get("role") or "user")
             if role == "system":
                 continue
+            if role == "tool":
+                call_id = str(message.get("tool_call_id") or "").strip()
+                if not call_id:
+                    continue
+                content: List[Dict[str, Any]] = [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": content_to_text(message.get("content")),
+                    }
+                ]
+                self._append_message(converted, "user", content)
+                continue
+
             mapped_role = "assistant" if role == "assistant" else "user"
-            converted.append(
-                {
-                    "role": mapped_role,
-                    "content": str(msg.get("content", "")),
+            native = [
+                dict(item)
+                for item in list(message.get("native_items") or [])
+                if isinstance(item, dict)
+                and str(item.get("type") or "") in _ANTHROPIC_BLOCK_TYPES
+                and str(item.get("type") or "") != "tool_result"
+            ]
+            blocks = native or self._content_blocks(message.get("content"))
+            if mapped_role == "assistant":
+                native_call_ids = {
+                    str(item.get("id") or "")
+                    for item in native
+                    if item.get("type") == "tool_use"
                 }
-            )
+                for call in list(message.get("tool_calls") or []):
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    call_id = str(call.get("id") or "").strip()
+                    name = str(function.get("name") or "").strip()
+                    if not call_id or not name or call_id in native_call_ids:
+                        continue
+                    raw_arguments = function.get("arguments") or "{}"
+                    try:
+                        arguments = (
+                            json.loads(raw_arguments)
+                            if isinstance(raw_arguments, str)
+                            else dict(raw_arguments)
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        arguments = {"_raw": str(raw_arguments)}
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": arguments,
+                        }
+                    )
+            if not blocks:
+                blocks = [{"type": "text", "text": ""}]
+            self._append_message(converted, mapped_role, blocks)
         return converted
 
-    def _parse_response(self, response: Dict[str, Any]) -> str:
-        blocks = list(response.get("content") or [])
-        text_parts: List[str] = []
-        tool_parts: List[str] = []
-        for block in blocks:
-            if not isinstance(block, dict):
-                continue
-            kind = str(block.get("type", "")).strip()
-            if kind == "text":
-                text = str(block.get("text", "")).strip()
-                if text:
-                    text_parts.append(text)
-            elif kind == "tool_use":
-                name = str(block.get("name", "")).strip()
-                args = block.get("input", {})
-                if name:
-                    if not isinstance(args, dict):
-                        args = {"input": args}
-                    tool_parts.append(self.format_action(name, args))
-        if tool_parts:
-            return "\n".join(tool_parts)
-        return "\n".join(text_parts).strip()
+    @staticmethod
+    def _append_message(
+        messages: List[Dict[str, Any]],
+        role: str,
+        content: List[Dict[str, Any]],
+    ) -> None:
+        if messages and messages[-1].get("role") == role:
+            previous = messages[-1].get("content")
+            if isinstance(previous, list):
+                previous.extend(content)
+                return
+        messages.append({"role": role, "content": content})
 
-    def _usage_from_response(
-        self, response: Dict[str, Any]
-    ) -> Optional[Dict[str, Any]]:
-        usage = response.get("usage")
-        if not isinstance(usage, dict):
-            return None
-        input_tokens = usage.get("input_tokens")
-        cache_creation = usage.get("cache_creation_input_tokens")
-        cache_read = usage.get("cache_read_input_tokens")
-        output_tokens = usage.get("output_tokens")
-        prompt_total = 0
-        has_prompt = False
-        for value in (input_tokens, cache_creation, cache_read):
-            if isinstance(value, int):
-                prompt_total += value
-                has_prompt = True
-        total_tokens = None
-        if has_prompt or isinstance(output_tokens, int):
-            total_tokens = prompt_total + int(output_tokens or 0)
-        return {
-            "prompt_tokens": prompt_total if has_prompt else input_tokens,
-            "completion_tokens": output_tokens,
-            "total_tokens": total_tokens,
-        }
-
-    def stream(self, messages: List[Dict[str, Any]], **kwargs: Any) -> Iterator[ModelStreamChunk]:
-        """Stream Anthropic Messages API response as chunks using SSE."""
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": self.api_version,
-            "content-type": "application/json",
-        }
-        payload: Dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": self.max_tokens,
-            "temperature": self.temperature,
-            "messages": self._anthropic_messages(messages),
-            "stream": True,
-        }
-        system_text = self._system_text(messages)
-        if system_text:
-            payload["system"] = system_text
-        payload.update(kwargs)
-
-        self._last_usage = None
-        response = requests.post(
-            f"{self.base_url}/v1/messages",
-            headers=headers,
-            json=payload,
-            timeout=effective_request_timeout(self.timeout),
-            stream=True,
-        )
-        response.raise_for_status()
-
-        usage_data: Dict[str, Any] = {}
-        tool_calls_by_index: Dict[int, Dict[str, Any]] = {}
-        terminal_seen = False
-
-        def terminal_usage() -> Optional[Dict[str, Any]]:
-            prompt_tokens = usage_data.get("prompt_tokens")
-            completion_tokens = usage_data.get("completion_tokens")
-            if isinstance(prompt_tokens, int) and isinstance(completion_tokens, int):
-                usage_data["total_tokens"] = prompt_tokens + completion_tokens
-            return dict(usage_data) if usage_data else None
-
-        def completed_tool_calls() -> Optional[List[Dict[str, Any]]]:
-            calls: List[Dict[str, Any]] = []
-            for index in sorted(tool_calls_by_index):
-                call = tool_calls_by_index[index]
-                if call.get("id") and call.get("function", {}).get("name"):
-                    function = call["function"]
-                    if not function.get("arguments"):
-                        function["arguments"] = "{}"
-                    calls.append(call)
-            return calls or None
-
-        try:
-            for line in response.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                data_str = line[6:]
-                if data_str.strip() == "[DONE]":
-                    break
-
-                try:
-                    event = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
-                event_type = event.get("type", "")
-                raw_index = event.get("index")
-                index = raw_index if isinstance(raw_index, int) else 0
-
-                if event_type == "content_block_start":
-                    block = event.get("content_block", {})
-                    if block.get("type") != "tool_use":
-                        continue
-                    initial_input = block.get("input")
-                    arguments = (
-                        json.dumps(initial_input, ensure_ascii=False)
-                        if initial_input
-                        else ""
-                    )
-                    tool_calls_by_index[index] = {
-                        "id": block.get("id"),
-                        "type": "function",
-                        "function": {
-                            "name": str(block.get("name") or ""),
-                            "arguments": arguments,
+    @staticmethod
+    def _content_blocks(content: Any) -> List[Dict[str, Any]]:
+        if not isinstance(content, list):
+            return [{"type": "text", "text": content_to_text(content)}]
+        blocks: List[Dict[str, Any]] = []
+        for raw in content:
+            block = normalize_content_block(raw)
+            block_type = str(block.get("type") or "text")
+            if block_type == "text":
+                blocks.append({"type": "text", "text": str(block.get("text") or "")})
+            elif block_type == "image_base64":
+                blocks.append(
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": str(block.get("mime_type") or "image/png"),
+                            "data": str(block.get("data") or ""),
                         },
                     }
-                    yield ModelStreamChunk(
-                        text="",
-                        event_type="tool_call.start",
-                        event_metadata={
-                            "index": index,
-                            "call_id": block.get("id"),
-                            "name": block.get("name"),
-                        },
-                    )
+                )
+            else:
+                blocks.append({"type": "text", "text": content_to_text([block])})
+        return blocks
 
-                elif event_type == "content_block_delta":
-                    delta = event.get("delta", {})
-                    delta_type = delta.get("type")
-                    if delta_type == "text_delta":
-                        text = str(delta.get("text") or "")
-                        if text:
-                            yield ModelStreamChunk(
-                                text=text,
-                                event_type="text.delta",
-                                event_metadata={"index": index},
-                            )
-                    elif delta_type == "thinking_delta":
-                        reasoning = str(delta.get("thinking") or "")
-                        if reasoning:
-                            yield ModelStreamChunk(
-                                text="",
-                                reasoning_content=reasoning,
-                                event_type="reasoning.delta",
-                                event_metadata={"index": index},
-                            )
-                    elif delta_type == "input_json_delta":
-                        arguments = str(delta.get("partial_json") or "")
-                        call = tool_calls_by_index.get(index)
-                        if call is not None and arguments:
-                            function = call["function"]
-                            function["arguments"] = (
-                                str(function.get("arguments") or "") + arguments
-                            )
-                        metadata: Dict[str, Any] = {
-                            "index": index,
-                            "arguments_delta": arguments,
-                        }
-                        if call is not None:
-                            metadata["call_id"] = call.get("id")
-                            metadata["name"] = call["function"].get("name")
-                        yield ModelStreamChunk(
-                            text="",
-                            event_type="tool_call.delta",
-                            event_metadata=metadata,
-                        )
+    async def _open_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        request_kwargs: Dict[str, Any],
+        *,
+        deadline_monotonic: float | None,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        try:
+            import anthropic
+        except ImportError as exc:
+            raise RuntimeError(
+                "Anthropic support requires the qitos models extra"
+            ) from exc
 
-                elif event_type == "message_delta":
-                    msg_usage = event.get("usage", {})
-                    if isinstance(msg_usage, dict):
-                        output_tokens = msg_usage.get("output_tokens")
-                        if output_tokens is not None:
-                            usage_data["completion_tokens"] = output_tokens
-                    stop_reason = event.get("delta", {}).get("stop_reason")
-                    if stop_reason:
-                        terminal_seen = True
-                        yield ModelStreamChunk(
-                            text="",
-                            done=True,
-                            usage=terminal_usage(),
-                            tool_calls=completed_tool_calls(),
-                            event_type="message.stop",
-                            finish_reason=str(stop_reason),
-                        )
-                        break
+        timeout = effective_request_timeout(self.timeout, deadline_monotonic)
+        client = anthropic.AsyncAnthropic(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=timeout,
+            max_retries=0,
+        )
+        payload: Dict[str, Any] = {
+            **request_kwargs,
+            "model": self.model,
+            "messages": cast(Any, self._anthropic_messages(messages)),
+            "stream": True,
+            "timeout": timeout,
+        }
+        payload.setdefault("max_tokens", self.max_tokens)
+        if self.temperature is not None:
+            payload.setdefault("temperature", self.temperature)
+        system = self._system_text(messages)
+        if system:
+            payload.setdefault("system", system)
+        if "tool_choice" in payload:
+            payload["tool_choice"] = _anthropic_tool_choice(payload["tool_choice"])
+        try:
+            events = await client.messages.create(**payload)
+        except (asyncio.CancelledError, Exception):
+            await close_async_resource(client)
+            raise
+        return _AnthropicEventStream(
+            events,
+            client,
+            provider=self.provider_name,
+            model=self.model,
+        )
 
-                elif event_type == "message_start":
-                    msg_usage = event.get("message", {}).get("usage", {})
-                    if isinstance(msg_usage, dict):
-                        input_tokens = msg_usage.get("input_tokens")
-                        if input_tokens is not None:
-                            usage_data["prompt_tokens"] = input_tokens
+    async def stream(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        """Stream one committed Anthropic Messages transaction."""
 
-                elif event_type == "message_stop":
-                    terminal_seen = True
-                    yield ModelStreamChunk(
-                        text="",
-                        done=True,
-                        usage=terminal_usage(),
-                        tool_calls=completed_tool_calls(),
-                        event_type="message.stop",
-                    )
-                    break
+        request_kwargs = dict(kwargs)
 
-                elif event_type == "error":
-                    raise ModelTransportError(
-                        f"Anthropic stream failed: {event.get('error')}",
-                        attempts=1,
-                        retryable=False,
-                    )
-        finally:
-            close = getattr(response, "close", None)
-            if callable(close):
-                close()
-
-        if not terminal_seen:
-            raise ModelTransportError(
-                "Anthropic stream ended before message_stop",
-                attempts=1,
-                retryable=True,
+        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+            return await self._open_stream(
+                messages,
+                dict(request_kwargs),
+                deadline_monotonic=deadline_monotonic,
             )
-        final_usage = terminal_usage()
-        if final_usage:
-            self._set_last_usage(final_usage)
 
+        async for chunk in transactional_stream_with_retry(
+            create_stream,
+            policy=self.retry_policy,
+            connection_timeout_seconds=self.timeout,
+            event_idle_timeout_seconds=self.stream_idle_timeout,
+            deadline_monotonic=deadline_monotonic,
+            is_terminal=lambda item: item.done,
+        ):
+            yield chunk
 
-ModelFactory.register("anthropic")(AnthropicModel)
+    def supports_tool_schema_delivery(
+        self, delivery: str, protocol: Any = None
+    ) -> bool:
+        _ = protocol
+        return str(delivery or "prompt_injection") in {
+            "prompt_injection",
+            "api_parameter",
+            "hybrid",
+        }
+
+    def build_tool_schema_request_options(
+        self,
+        tool_schema_payload: Optional[List[Dict[str, Any]]],
+        *,
+        protocol: Any = None,
+        delivery: str = "prompt_injection",
+    ) -> Dict[str, Any]:
+        _ = protocol
+        if str(delivery or "prompt_injection") not in {"api_parameter", "hybrid"}:
+            return {}
+        tools = _anthropic_tools(tool_schema_payload)
+        return {"tools": tools} if tools else {}
+
+    def supports_multimodal_input(self) -> bool:
+        return True
 
 
 __all__ = ["AnthropicModel"]

@@ -49,7 +49,7 @@ execution. Parser-only final-text compatibility remains for a later explicit-lan
   action deadline across admission, attempts, backoff, and concurrent drain.
 - [x] Clamp model attempts and provider transport timeouts to remaining time.
 - [x] Preserve action status and attempts through ToolResult, history, hooks, and trace.
-- [x] Make async stream shutdown request Engine cancellation and guarantee a terminal
+- [x] Make async-native stream shutdown request Engine cancellation and guarantee a terminal
   stream event even when the bounded event queue is full.
 - [x] Audit OpenAI model adapters so the provider transport has one retry owner.
 - [x] Preserve provider finish reasons and typed reasoning/tool-call stream events
@@ -58,13 +58,13 @@ execution. Parser-only final-text compatibility remains for a later explicit-lan
 Done when deterministic tests cover cancellation before admission, queued actions,
 running actions, partial streams, provider retry, tool retry, and queue saturation.
 
-Progress (2026-08-08): Engine runs now resolve relative and absolute limits into one
+Progress (2026-08-12): Engine runs now resolve relative and absolute limits into one
 effective monotonic deadline. Tools receive live deadline/cancellation accessors; tool
 admission, timeout, retry backoff, and runtime wait all use the same remaining-time
-calculation. Async Engine execution no longer relies on asyncio's non-daemon default
-executor, duplicated stream cleanup is removed, early stream close requests cooperative
-cancellation, and full event queues retain a terminal marker. End-to-end child/process
-cleanup remains a separate follow-up.
+calculation. `Engine.arun()` and `Engine.astep()` are the canonical execution paths;
+early stream close requests cooperative cancellation, duplicated stream cleanup is
+removed, and full event queues retain a terminal marker. End-to-end child/process cleanup
+remains a separate follow-up.
 
 Progress (2026-08-08): one fail-closed `ToolResult` classifier now preserves executor
 timeout, cancellation, denial, input/approval, partial, and background states through
@@ -77,15 +77,15 @@ middleware were removed. Admission runs once, explicit invocation retries share 
 tool/runtime deadline, HTTP transport retries stay disabled, and bounded daemon action
 workers detach blocked admission or concurrent work instead of waiting indefinitely.
 
-Progress (2026-08-08): one Engine-scoped model-request deadline now governs provider
-timeouts, QitOS-owned retry backoff, synchronous and asynchronous streams, and immediate
-cancellation. Official OpenAI adapters share the compatible transport with SDK retries
-disabled; blocked synchronous calls detach on daemon workers, streams close on every
-exit path, and late output cannot update callbacks, history, actions, or final state.
+Progress (2026-08-12): one Engine-scoped model-request deadline now governs provider
+connection, stream-idle, and retry waits plus immediate cancellation. Official providers
+implement one asynchronous stream contract with SDK retries disabled where QitOS owns
+the budget; streams close on every exit path, and late output cannot update callbacks,
+history, actions, or final state.
 
-Progress (2026-08-08): Chat, Responses, and Anthropic streams now retain their real
+Progress (2026-08-12): Chat, Responses, and Anthropic streams now retain their real
 finish reason, reasoning/tool-call deltas, completed calls, and usage through one
-`ModelStreamChunk`. Async Chat reuses the canonical accumulator, incomplete streams no
+`ModelStreamChunk`. Providers reuse the canonical accumulator, incomplete streams no
 longer fabricate completion, and rich handlers receive optional normalized chunk/error
 callbacks without changing the required stream-handler protocol.
 
@@ -96,8 +96,8 @@ callbacks without changing the required stream-handler protocol.
 - [x] Preserve opaque provider continuation/reasoning items needed by the next request.
 - [x] Bound tool projections and record truncation/compaction metadata without rewriting
   retained messages.
-- [x] Resolve reasoning effort through one provider capability path for sync, async, and
-  streaming requests.
+- [x] Resolve reasoning effort through one provider capability path for all streaming
+  requests.
 
 Progress (2026-08-08): provider presets resolve one reasoning request default for all
 OpenAI-compatible invocation paths. GPT-5.6 keeps `max`; forced Chat tool calls remove

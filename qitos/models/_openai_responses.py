@@ -1,21 +1,32 @@
-"""OpenAI Responses API protocol conversion and transport helpers."""
+"""OpenAI Responses request projection and stream normalization."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, cast
+from typing import Any, AsyncIterator, Dict, List, Optional, cast
 
 from ..core.errors import ModelTransportError
 from ..core.model_response import ModelResponse
-from ._openai_retry import _close_stream, _close_sync_stream
+from .transport import close_async_resource
 from .base import Model, ModelStreamChunk
+
 
 OPENAI_API_MODES = {"chat_completions", "responses"}
 _RESPONSES_REQUIREMENT = (
-    "api_mode='responses' requires openai>=1.66.0 and an endpoint "
-    "that implements POST /v1/responses"
+    "api_mode='responses' requires an OpenAI client and endpoint that "
+    "implement POST /v1/responses"
 )
 _OPAQUE_REASONING_INCLUDE = "reasoning.encrypted_content"
+_RESPONSES_ITEM_TYPES = {
+    "message",
+    "reasoning",
+    "function_call",
+    "function_call_output",
+    "computer_call",
+    "computer_call_output",
+    "web_search_call",
+    "file_search_call",
+}
 
 
 def _normalize_api_mode(value: Any) -> str:
@@ -27,7 +38,8 @@ def _normalize_api_mode(value: Any) -> str:
 
 
 def _native_value(value: Any) -> Any:
-    """Convert SDK models and simple objects to JSON-compatible native values."""
+    """Convert SDK values to builtins at the provider boundary."""
+
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if is_dataclass(value):
@@ -46,7 +58,7 @@ def _native_value(value: Any) -> Any:
             for key, item in values.items()
             if not str(key).startswith("_") and item is not None
         }
-    return value
+    raise TypeError(f"unsupported provider value: {type(value).__name__}")
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -56,7 +68,8 @@ def _field(value: Any, name: str, default: Any = None) -> Any:
 
 
 def _to_responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Convert canonical QitOS history to Responses API input items."""
+    """Project QitOS history into ordered Responses input items."""
+
     items: List[Dict[str, Any]] = []
     for raw_message in messages:
         if not isinstance(raw_message, dict):
@@ -66,18 +79,20 @@ def _to_responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         native_call_ids: set[str] = set()
         native_output_ids: set[str] = set()
         has_native_message = False
-        seen_native_transactions: set[tuple[str, str]] = set()
+        seen_transactions: set[tuple[str, str]] = set()
         for raw_item in raw_message.get("native_items") or []:
             native_item = _native_value(raw_item)
             if not isinstance(native_item, dict):
                 continue
             item_type = str(native_item.get("type") or "").strip()
+            if item_type not in _RESPONSES_ITEM_TYPES:
+                continue
             call_id = str(native_item.get("call_id") or "").strip()
             if item_type in {"function_call", "function_call_output"} and call_id:
-                transaction_key = (item_type, call_id)
-                if transaction_key in seen_native_transactions:
+                transaction = (item_type, call_id)
+                if transaction in seen_transactions:
                     continue
-                seen_native_transactions.add(transaction_key)
+                seen_transactions.add(transaction)
                 if item_type == "function_call":
                     native_call_ids.add(call_id)
                 else:
@@ -103,10 +118,14 @@ def _to_responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         content = raw_message.get("content")
         emitted_content = content is not None and not has_native_message
         if emitted_content:
-            message = {"role": role, "content": content}
-            items.append(cast(Dict[str, Any], _native_value(message)))
-
+            items.append(
+                cast(
+                    Dict[str, Any],
+                    _native_value({"role": role, "content": content}),
+                )
+            )
         items.extend(native_items)
+
         emitted_call = False
         if role == "assistant":
             for tool_call in raw_message.get("tool_calls") or []:
@@ -152,7 +171,9 @@ def _to_responses_tools(
                     payload[key] = _native_value(function[key])
             normalized.append(payload)
         else:
-            normalized.append(cast(Dict[str, Any], _native_value(tool)))
+            value = _native_value(tool)
+            if isinstance(value, dict):
+                normalized.append(value)
     return normalized or None
 
 
@@ -252,21 +273,29 @@ def _model_response_from_responses(
             }
         )
     status = _field(response, "status")
+    incomplete_details = _native_value(_field(response, "incomplete_details"))
+    incomplete_reason = (
+        str(incomplete_details.get("reason"))
+        if isinstance(incomplete_details, dict) and incomplete_details.get("reason")
+        else None
+    )
     metadata = {
         key: value
         for key, value in {
             "id": _field(response, "id"),
             "status": status,
             "previous_response_id": _field(response, "previous_response_id"),
+            "incomplete_details": incomplete_details,
             "api_mode": "responses",
         }.items()
         if value is not None
     }
     return ModelResponse(
         text=_response_output_text(response, native_items),
-        raw=response,
         usage=_responses_usage(response),
-        finish_reason=str(status) if status is not None else None,
+        finish_reason=(
+            incomplete_reason or (str(status) if status is not None else None)
+        ),
         tool_calls=tool_calls or None,
         model_name=(
             str(_field(response, "model"))
@@ -292,17 +321,18 @@ def _request_payload(
     kwargs: Dict[str, Any],
     *,
     provider: str,
-    stream: bool = False,
 ) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "model": adapter.model,
-        "input": cast(Any, _to_responses_input(messages)),
-        "temperature": adapter.temperature,
-        "max_output_tokens": adapter.max_tokens,
-    }
-    if stream:
-        payload["stream"] = True
-    payload.update(_normalize_request_kwargs(kwargs))
+    payload: Dict[str, Any] = _normalize_request_kwargs(kwargs)
+    payload.update(
+        {
+            "model": adapter.model,
+            "input": cast(Any, _to_responses_input(messages)),
+            "stream": True,
+        }
+    )
+    payload.setdefault("max_output_tokens", adapter.max_tokens)
+    if adapter.temperature is not None:
+        payload.setdefault("temperature", adapter.temperature)
     family = str(getattr(adapter, "qitos_family_preset", "") or "").casefold()
     if provider.casefold() == "openai" or family == "openai":
         configured = payload.get("include")
@@ -318,106 +348,12 @@ def _request_payload(
     return payload
 
 
-def _responses_completion(
-    adapter: Model,
-    client: Any,
-    messages: List[Dict[str, Any]],
-    *,
-    provider: str,
-    **kwargs: Any,
-) -> ModelResponse:
-    response = _responses_create(client)(
-        **_request_payload(adapter, messages, kwargs, provider=provider)
-    )
-    normalized = _model_response_from_responses(response, provider=provider)
-    adapter._set_last_usage(normalized.usage)
-    return normalized
-
-
-async def _async_responses_completion(
-    adapter: Model,
-    client: Any,
-    messages: List[Dict[str, Any]],
-    *,
-    provider: str,
-    **kwargs: Any,
-) -> ModelResponse:
-    response = await _responses_create(client)(
-        **_request_payload(adapter, messages, kwargs, provider=provider)
-    )
-    normalized = _model_response_from_responses(response, provider=provider)
-    adapter._set_last_usage(normalized.usage)
-    return normalized
-
-
 def _event_metadata(event: Any) -> Dict[str, Any]:
     return {
         key: value
         for key in ("sequence_number", "output_index", "content_index", "item_id")
         if (value := _field(event, key)) is not None
     }
-
-
-def _event_chunk(
-    event: Any,
-) -> tuple[Optional[ModelStreamChunk], Optional[Dict[str, Any]], Any]:
-    event_type = str(_field(event, "type", "") or "")
-    metadata = _event_metadata(event)
-    if event_type == "response.output_text.delta":
-        delta = str(_field(event, "delta", "") or "")
-        return (
-            (
-                ModelStreamChunk(
-                    text=delta,
-                    event_type=event_type,
-                    event_metadata=metadata,
-                )
-                if delta
-                else None
-            ),
-            None,
-            None,
-        )
-    if event_type in {
-        "response.function_call_arguments.delta",
-        "response.function_call_arguments.done",
-    }:
-        metadata["delta"] = str(_field(event, "delta", "") or "")
-        arguments = _field(event, "arguments")
-        if arguments is not None:
-            metadata["arguments"] = str(arguments)
-        return (
-            ModelStreamChunk(
-                text="",
-                event_type=event_type,
-                event_metadata=metadata,
-            ),
-            None,
-            None,
-        )
-    if event_type == "response.output_item.done":
-        item = _native_value(_field(event, "item"))
-        if isinstance(item, dict):
-            native_item = dict(item)
-            return (
-                ModelStreamChunk(
-                    text="",
-                    native_items=[native_item],
-                    event_type=event_type,
-                    event_metadata=metadata,
-                ),
-                native_item,
-                None,
-            )
-    if event_type == "response.completed":
-        return None, None, _field(event, "response")
-    if event_type in {"response.failed", "error"}:
-        raise ModelTransportError(
-            f"model stream failed: {_field(event, 'error')}",
-            attempts=1,
-            retryable=False,
-        )
-    return None, None, None
 
 
 def _native_item_identity(item: Dict[str, Any]) -> tuple[str, str] | None:
@@ -435,7 +371,6 @@ def _merge_completed_output(
     response: Any,
     completed_items: List[Dict[str, Any]],
 ) -> Any:
-    """Overlay final output onto event items without dropping opaque fields."""
     if not completed_items:
         return response
     payload = _native_value(response)
@@ -471,122 +406,134 @@ def _merge_completed_output(
     return payload
 
 
-def _final_stream_chunk(
-    adapter: Model,
-    response: Any,
-    completed_items: List[Dict[str, Any]],
-    *,
-    provider: str,
-) -> ModelStreamChunk:
-    normalized = _model_response_from_responses(
-        _merge_completed_output(response, completed_items),
-        provider=provider,
-    )
-    adapter._set_last_usage(normalized.usage)
-    return ModelStreamChunk(
-        text="",
-        done=True,
-        usage=normalized.usage,
-        tool_calls=normalized.tool_calls,
-        native_items=normalized.native_items,
-        event_type="response.completed",
-        event_metadata=dict(normalized.metadata),
-        finish_reason=normalized.finish_reason,
-    )
+class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
+    """Own and normalize one already-connected Responses stream."""
+
+    def __init__(self, events: Any, *, provider: str) -> None:
+        self._events = events
+        self._iterator = events.__aiter__()
+        self._provider = provider
+        self._completed_items: List[Dict[str, Any]] = []
+        self._finished = False
+
+    def __aiter__(self) -> _ResponsesEventStream:
+        return self
+
+    async def __anext__(self) -> ModelStreamChunk:
+        if self._finished:
+            raise StopAsyncIteration
+        while True:
+            try:
+                event = await self._iterator.__anext__()
+            except StopAsyncIteration as exc:
+                raise ModelTransportError(
+                    "model stream ended before response.completed",
+                    attempts=1,
+                    retryable=True,
+                ) from exc
+            event_type = str(_field(event, "type", "") or "")
+            metadata = _event_metadata(event)
+            if event_type == "response.output_text.delta":
+                delta = str(_field(event, "delta", "") or "")
+                if delta:
+                    return ModelStreamChunk(
+                        text=delta,
+                        event_type=event_type,
+                        event_metadata=metadata,
+                    )
+                continue
+            if event_type in {
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_text.delta",
+            }:
+                delta = str(_field(event, "delta", "") or "")
+                if delta:
+                    return ModelStreamChunk(
+                        reasoning_content=delta,
+                        event_type=event_type,
+                        event_metadata=metadata,
+                    )
+                continue
+            if event_type in {
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+            }:
+                metadata["arguments_delta"] = str(_field(event, "delta", "") or "")
+                arguments = _field(event, "arguments")
+                if arguments is not None:
+                    metadata["arguments"] = str(arguments)
+                return ModelStreamChunk(
+                    event_type=event_type,
+                    event_metadata=metadata,
+                )
+            if event_type == "response.output_item.done":
+                item = _native_value(_field(event, "item"))
+                if isinstance(item, dict):
+                    native_item = dict(item)
+                    self._completed_items.append(native_item)
+                    return ModelStreamChunk(
+                        native_items=[native_item],
+                        event_type=event_type,
+                        event_metadata=metadata,
+                    )
+                continue
+            if event_type in {"response.completed", "response.incomplete"}:
+                response = _merge_completed_output(
+                    _field(event, "response"),
+                    self._completed_items,
+                )
+                normalized = _model_response_from_responses(
+                    response,
+                    provider=self._provider,
+                )
+                self._finished = True
+                return ModelStreamChunk(
+                    done=True,
+                    usage=normalized.usage,
+                    tool_calls=normalized.tool_calls,
+                    native_items=normalized.native_items,
+                    event_type=event_type,
+                    event_metadata=dict(normalized.metadata),
+                    finish_reason=normalized.finish_reason,
+                )
+            if event_type in {"response.failed", "error"}:
+                error = _field(event, "error") or _field(event, "response")
+                raise ModelTransportError(
+                    f"model stream failed: {error}",
+                    attempts=1,
+                    retryable=False,
+                )
+
+    async def aclose(self) -> None:
+        self._finished = True
+        await close_async_resource(self._events)
 
 
-def _responses_stream(
+async def _open_responses_stream(
     adapter: Model,
     client: Any,
     messages: List[Dict[str, Any]],
     *,
     provider: str,
-    **kwargs: Any,
-) -> Iterator[ModelStreamChunk]:
-    events = _responses_create(client)(
+    request_kwargs: Dict[str, Any],
+) -> AsyncIterator[ModelStreamChunk]:
+    """Establish one Responses stream and return its owning iterator."""
+
+    events = await _responses_create(client)(
         **_request_payload(
             adapter,
             messages,
-            kwargs,
+            request_kwargs,
             provider=provider,
-            stream=True,
         )
     )
-    completed_items: List[Dict[str, Any]] = []
-    completed_response: Any = None
-    try:
-        for event in events:
-            chunk, item, response = _event_chunk(event)
-            if isinstance(item, dict):
-                completed_items.append(item)
-            if response is not None:
-                completed_response = response
-            if chunk is not None:
-                yield chunk
-                if chunk.done:
-                    return
-        if completed_response is None:
-            raise ModelTransportError(
-                "model stream ended before response.completed",
-                attempts=1,
-                retryable=True,
-            )
-        yield _final_stream_chunk(
-            adapter, completed_response, completed_items, provider=provider
-        )
-    finally:
-        _close_sync_stream(events)
-
-
-async def _async_responses_stream(
-    adapter: Model,
-    client: Any,
-    messages: List[Dict[str, Any]],
-    *,
-    provider: str,
-    **kwargs: Any,
-) -> AsyncIterator[ModelStreamChunk]:
-    payload = _request_payload(
-        adapter,
-        messages,
-        kwargs,
-        provider=provider,
-        stream=True,
-    )
-    events = await _responses_create(client)(**payload)
-    completed_items: List[Dict[str, Any]] = []
-    completed_response: Any = None
-    try:
-        async for event in events:
-            chunk, item, response = _event_chunk(event)
-            if isinstance(item, dict):
-                completed_items.append(item)
-            if response is not None:
-                completed_response = response
-            if chunk is not None:
-                yield chunk
-                if chunk.done:
-                    return
-        if completed_response is None:
-            raise ModelTransportError(
-                "model stream ended before response.completed",
-                attempts=1,
-                retryable=True,
-            )
-        yield _final_stream_chunk(
-            adapter, completed_response, completed_items, provider=provider
-        )
-    finally:
-        await _close_stream(events)
+    return _ResponsesEventStream(events, provider=provider)
 
 
 __all__ = [
-    "_async_responses_completion",
-    "_async_responses_stream",
     "_model_response_from_responses",
     "_normalize_api_mode",
-    "_responses_completion",
-    "_responses_stream",
+    "_open_responses_stream",
     "_to_responses_input",
     "_to_responses_tool_choice",
     "_to_responses_tools",

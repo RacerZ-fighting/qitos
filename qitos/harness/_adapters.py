@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..models.context_registry import infer_context_window
-from ..models.openai import AsyncOpenAICompatibleModel, OpenAICompatibleModel
+from ..models.openai import OpenAICompatibleModel
 from ._types import ContextPolicy, FamilyPreset, ModelAdapter
 
 
@@ -28,7 +28,10 @@ def _coerce_int(value: object, default: int) -> int:
 
 
 def resolve_context_window(
-    model_name: str | None, *, context_policy: ContextPolicy, explicit: int | None = None
+    model_name: str | None,
+    *,
+    context_policy: ContextPolicy,
+    explicit: int | None = None,
 ) -> int:
     if isinstance(explicit, int) and explicit > 0:
         return int(explicit)
@@ -53,9 +56,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
         context_policy = kwargs["context_policy"]
         raw_temperature = kwargs.get("temperature")
         temperature = (
-            _coerce_float(raw_temperature, 0.2)
-            if raw_temperature is not None
-            else None
+            _coerce_float(raw_temperature, 0.2) if raw_temperature is not None else None
         )
         max_tokens = _coerce_int(kwargs.get("max_tokens"), 2048)
         timeout = _coerce_int(kwargs.get("timeout"), 120)
@@ -66,18 +67,13 @@ class OpenAICompatibleAdapter(ModelAdapter):
         max_attempts = _coerce_int(kwargs.get("max_attempts"), 2)
         stream_idle_timeout = _coerce_float(kwargs.get("stream_idle_timeout"), 60.0)
         retry_window_seconds = _coerce_float(kwargs.get("retry_window_seconds"), 300.0)
-        model_class = (
-            AsyncOpenAICompatibleModel
-            if kwargs.get("async_model") is True
-            else OpenAICompatibleModel
-        )
         if not isinstance(preset, FamilyPreset):
             raise TypeError("preset must be a FamilyPreset")
         if not isinstance(model_name, str):
             raise TypeError("model_name must be a string")
         if not isinstance(context_policy, ContextPolicy):
             raise TypeError("context_policy must be a ContextPolicy")
-        llm = model_class(
+        llm = OpenAICompatibleModel(
             model=model_name,
             api_key=str(api_key) if api_key is not None else None,
             base_url=str(base_url) if base_url is not None else None,
@@ -94,7 +90,11 @@ class OpenAICompatibleAdapter(ModelAdapter):
                     else None
                 ),
             ),
-            default_request_kwargs=dict(default_request_kwargs) if isinstance(default_request_kwargs, dict) else None,
+            default_request_kwargs=(
+                dict(default_request_kwargs)
+                if isinstance(default_request_kwargs, dict)
+                else None
+            ),
             api_mode=api_mode,
             max_attempts=max_attempts,
             stream_idle_timeout=stream_idle_timeout,

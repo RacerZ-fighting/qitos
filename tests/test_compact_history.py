@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
 
+from examples._support import SequenceModel
 from qitos import (
     Action,
     AgentModule,
@@ -25,6 +27,7 @@ from qitos.core.history import (
 )
 from qitos.kit.history import CompactHistory, MessageGrouper
 from qitos.kit.parser import ReActTextParser
+from qitos.models import Model, ModelStreamChunk
 
 
 def test_message_grouper_prefers_step_rounds() -> None:
@@ -153,12 +156,8 @@ def test_recent_history_never_splits_generic_tool_transaction() -> None:
                 {"id": "call_2", "function": {"name": "read"}},
             ],
         ),
-        HistoryMessage(
-            role="tool", content="one", step_id=1, tool_call_id="call_1"
-        ),
-        HistoryMessage(
-            role="tool", content="two", step_id=1, tool_call_id="call_2"
-        ),
+        HistoryMessage(role="tool", content="one", step_id=1, tool_call_id="call_1"),
+        HistoryMessage(role="tool", content="two", step_id=1, tool_call_id="call_2"),
     ]
 
     selected = select_recent_history(messages, max_items=1)
@@ -166,7 +165,9 @@ def test_recent_history_never_splits_generic_tool_transaction() -> None:
     assert selected == messages
 
 
-def test_recent_history_drops_whole_older_transaction_instead_of_orphaning_result() -> None:
+def test_recent_history_drops_whole_older_transaction_instead_of_orphaning_result() -> (
+    None
+):
     messages = [
         HistoryMessage(
             role="assistant",
@@ -174,9 +175,7 @@ def test_recent_history_drops_whole_older_transaction_instead_of_orphaning_resul
             step_id=1,
             tool_calls=[{"id": "call_1", "function": {"name": "lookup"}}],
         ),
-        HistoryMessage(
-            role="tool", content="result", step_id=1, tool_call_id="call_1"
-        ),
+        HistoryMessage(role="tool", content="result", step_id=1, tool_call_id="call_1"),
         HistoryMessage(role="user", content="continue", step_id=2),
     ]
 
@@ -193,9 +192,7 @@ def test_recent_history_merges_cross_step_result_with_declaring_call() -> None:
             step_id=1,
             tool_calls=[{"id": "call_1", "function": {"name": "lookup"}}],
         ),
-        HistoryMessage(
-            role="tool", content="result", step_id=2, tool_call_id="call_1"
-        ),
+        HistoryMessage(role="tool", content="result", step_id=2, tool_call_id="call_1"),
     ]
 
     assert select_recent_history(messages, max_items=1) == messages
@@ -277,9 +274,7 @@ def test_snapshot_stops_before_second_unanswered_use_of_same_call_id() -> None:
         tool_calls=[{"id": "shell_1", "function": {"name": "shell"}}],
     )
 
-    snapshot = HistorySnapshot.from_messages(
-        [parent_call, parent_result, child_call]
-    )
+    snapshot = HistorySnapshot.from_messages([parent_call, parent_result, child_call])
 
     assert snapshot.messages == (parent_call, parent_result)
 
@@ -405,8 +400,7 @@ def test_microcompaction_runs_before_force_summary_threshold() -> None:
     assert "summary_compact_applied" not in stages
     assert not any(message.metadata.get("summary") for message in retrieved)
     assert any(
-        message.metadata.get("compaction_mode") == "micro"
-        for message in retrieved
+        message.metadata.get("compaction_mode") == "micro" for message in retrieved
     )
 
 
@@ -423,9 +417,7 @@ def test_hard_compaction_resummarizes_all_but_latest_complete_round() -> None:
         ),
     )
     history.append(HistoryMessage(role="user", content="old " * 120, step_id=0))
-    history.append(
-        HistoryMessage(role="assistant", content="middle " * 120, step_id=1)
-    )
+    history.append(HistoryMessage(role="assistant", content="middle " * 120, step_id=1))
     latest = HistoryMessage(role="user", content="latest", step_id=2)
     history.append(latest)
 
@@ -467,9 +459,7 @@ def test_summary_compactor_persists_summary_without_drafting_scratchpad() -> Non
     summary = SummaryCompactor(
         CompactConfig(),
         llm=_TaggedSummaryLLM(),
-    ).summarize(
-        [HistoryMessage(role="user", content="continue the task", step_id=1)]
-    )
+    ).summarize([HistoryMessage(role="user", content="continue the task", step_id=1)])
 
     assert summary == "durable continuation state"
     assert "scratchpad" not in summary
@@ -535,8 +525,7 @@ def test_auto_compaction_summarizes_before_applying_message_count_windows() -> N
 
     assert retrieved[0].metadata.get("summary") is True
     covered = {
-        int(token.split("_")[1])
-        for token in re.findall(r"ITEM_\d\d", llm.prompts[-1])
+        int(token.split("_")[1]) for token in re.findall(r"ITEM_\d\d", llm.prompts[-1])
     }
     assert covered == set(range(33))
 
@@ -553,12 +542,10 @@ def test_summary_input_elides_long_older_messages_without_dropping_them() -> Non
     history.retrieve(query={"max_tokens": 200})
 
     first_covered = {
-        int(token.split("_")[1])
-        for token in re.findall(r"ITEM_\d\d", llm.prompts[0])
+        int(token.split("_")[1]) for token in re.findall(r"ITEM_\d\d", llm.prompts[0])
     }
     hard_covered = {
-        int(token.split("_")[1])
-        for token in re.findall(r"ITEM_\d\d", llm.prompts[-1])
+        int(token.split("_")[1]) for token in re.findall(r"ITEM_\d\d", llm.prompts[-1])
     }
     assert first_covered == set(range(33))
     assert hard_covered == set(range(34))
@@ -796,7 +783,9 @@ def test_compact_ratio_moves_the_compaction_trigger() -> None:
     assert runtime.begin_reactive_compaction() is None
 
 
-def test_context_budget_counts_tool_schemas_and_forces_at_exactly_eighty_percent() -> None:
+def test_context_budget_counts_tool_schemas_and_forces_at_exactly_eighty_percent() -> (
+    None
+):
     from qitos.engine._context_runtime import _ContextRuntime
     from qitos.engine.states import ContextConfig, ContextTelemetry
 
@@ -989,13 +978,16 @@ class CompactDemoAgent(AgentModule[CompactDemoState, dict[str, Any], Action]):
 def test_force_compaction_does_not_commit_staged_prompt_history() -> None:
     from qitos.engine.states import ContextConfig
 
-    class _ThresholdModel:
-        model = "threshold-model"
-        context_window = 100
+    class _ThresholdModel(Model):
         max_input_tokens = 100
-        max_tokens = 0
 
         def __init__(self) -> None:
+            super().__init__(
+                model="threshold-model",
+                context_window=100,
+                max_tokens=0,
+                temperature=None,
+            )
             self.calls = 0
 
         def count_tokens(self, payload: Any) -> int:
@@ -1009,10 +1001,19 @@ def test_force_compaction_does_not_commit_staged_prompt_history() -> None:
             _ = messages, request_options
             return 80
 
-        def __call__(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
-            _ = messages, kwargs
+        async def stream(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            deadline_monotonic: float | None = None,
+            **kwargs: Any,
+        ) -> AsyncIterator[ModelStreamChunk]:
+            _ = messages, deadline_monotonic, kwargs
             self.calls += 1
-            raise AssertionError("the provider must not be called at the force threshold")
+            raise AssertionError(
+                "the provider must not be called at the force threshold"
+            )
+            yield ModelStreamChunk()  # pragma: no cover
 
     model = _ThresholdModel()
     history = CompactHistory()
@@ -1033,30 +1034,29 @@ def test_force_compaction_does_not_commit_staged_prompt_history() -> None:
     assert model.calls == 0
     assert history.messages == []
     assert result.state.stop_reason == "context_overflow"
-    assert sum(
-        event.payload.get("stage") == "context_force_compaction"
-        for event in result.events
-    ) == 4
+    assert (
+        sum(
+            event.payload.get("stage") == "context_force_compaction"
+            for event in result.events
+        )
+        == 4
+    )
 
 
 def test_engine_surfaces_compact_events_and_history_metadata() -> None:
-    calls: list[list[dict[str, str]]] = []
-
-    class _DummyModel:
-        model = "dummy-compact"
-
-        def __call__(self, messages):
-            calls.append(list(messages))
-            if len(calls) == 1:
-                return "Action: add(a=20, b=22)"
-            if len(calls) == 2:
-                return "Action: add(a=1, b=1)"
-            return "Final Answer: 42"
+    model = SequenceModel(
+        [
+            "Action: add(a=20, b=22)",
+            "Action: add(a=1, b=1)",
+            "Final Answer: 42",
+        ],
+        model="dummy-compact",
+    )
 
     class LLMCompactAgent(CompactDemoAgent):
         def __init__(self):
             super().__init__()
-            self.llm = _DummyModel()
+            self.llm = model
             self.model_parser = ReActTextParser()
             self.history = CompactHistory(
                 max_tokens=110, keep_last_rounds=1, hard_window=24
@@ -1082,7 +1082,7 @@ def test_engine_surfaces_compact_events_and_history_metadata() -> None:
     ).run("compute")
 
     assert result.state.final_result == "42"
-    assert len(calls) == 3
+    assert len(model.calls) == 3
     compact_stages = [
         (event.payload.get("context") or {}).get("stage")
         for event in result.events
@@ -1142,23 +1142,19 @@ def test_engine_falls_back_to_bounded_canonical_history_when_compaction_fails() 
         def messages(self) -> list[HistoryMessage]:
             return list(self._messages)
 
-    seen: list[list[dict[str, Any]]] = []
-
-    class _FinalModel:
-        model = "history-fallback"
-
-        def __call__(self, messages: list[dict[str, Any]]) -> str:
-            seen.append(list(messages))
-            return "Final Answer: recovered"
+    model = SequenceModel(
+        ["Final Answer: recovered"],
+        model="history-fallback",
+    )
 
     agent = CompactDemoAgent()
-    agent.llm = _FinalModel()
+    agent.llm = model
     agent.model_parser = ReActTextParser()
     agent.history = _FailingHistory()
 
     result = Engine(agent=agent, budget=RuntimeBudget(max_steps=1)).run("compute")
 
-    assert "canonical context must survive" in str(seen[0])
+    assert "canonical context must survive" in str(model.calls[0])
     assert any(
         event.payload.get("stage") == "context_history"
         and (event.payload.get("context") or {}).get("stage")
@@ -1169,6 +1165,7 @@ def test_engine_falls_back_to_bounded_canonical_history_when_compaction_fails() 
 
 def test_native_tool_history_preserves_incomplete_tail_as_an_atomic_round() -> None:
     from qitos.engine._model_runtime import _ModelRuntime
+
     runtime = object.__new__(_ModelRuntime)
     history = [
         {"role": "assistant", "_step_id": 1, "tool_calls": [{"id": "a"}, {"id": "b"}]},

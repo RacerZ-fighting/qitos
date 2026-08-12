@@ -63,8 +63,7 @@ The exact call graph is verified before code changes. The initial owner map is:
 - completed model result: `qitos/core/model_response.py`;
 - model/provider base and construction: `qitos/models/base.py` and existing
   provider modules;
-- timeout and retry behavior: `qitos/models/_request_runtime.py` and
-  `qitos/models/_openai_retry.py`;
+- timeout, retry, and transport resource lifecycle: `qitos/models/transport.py`;
 - Engine model execution: `qitos/engine/_model_runtime.py`, `engine.py`, and
   `async_engine.py`;
 - durable state: `qitos/core/history.py`, `qitos/checkpoint/store.py`, and

@@ -1080,35 +1080,43 @@ Reads `OPENAI_API_KEY` and `OPENAI_BASE_URL` from the environment by default.
 <Accordion title="Local models">
 
 ```python
-from qitos.models import OllamaModel, LMStudioModel, VLLMModel
+from qitos.models import builtin_model_factory
 
-llm = OllamaModel(model="llama3")
-llm = LMStudioModel(model="mistral", base_url="http://localhost:1234/v1")
-llm = VLLMModel(model="meta-llama/Llama-3-8b", base_url="http://localhost:8000/v1")
+factory = builtin_model_factory()
+ollama = factory.create("ollama", model="llama3")
+lmstudio = factory.create("lmstudio", model="mistral")
+vllm = factory.create("vllm", model="meta-llama/Llama-3-8b")
 ```
 
-All local models share the same base constructor signature as `OpenAICompatibleModel`.
+LM Studio and vLLM use the canonical OpenAI-compatible adapter with local endpoint
+defaults. Ollama uses its native asynchronous adapter.
 
 </Accordion>
 
 <Accordion title="ModelFactory">
 
-Automatically selects and constructs a model from environment variables.
+Resolve environment configuration separately, then construct from an explicit factory.
 
 ```python
-from qitos.models import ModelFactory
+from qitos.config import ModelConfig, build_model
 
-llm = ModelFactory.from_env()
+config = ModelConfig.from_env()
+if config is None:
+    raise RuntimeError("No model provider configured")
+llm = build_model(config)
 ```
 
-Reads `QITOS_MODEL` (or `OPENAI_API_KEY` / `OPENAI_BASE_URL`) to pick the right backend.
+`ModelConfig.from_env()` reads provider environment variables; `build_model()` uses an
+isolated built-in factory unless one is supplied explicitly.
 
 Register a custom backend:
 
 ```python
-@ModelFactory.register("my_backend")
-class MyModel(Model):
-    ...
+from qitos.models import ModelFactory
+
+factory = ModelFactory()
+factory.register("my_backend", MyModel)  # your Model subclass
+llm = factory.create("my_backend", model="example")
 ```
 
 </Accordion>

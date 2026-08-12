@@ -6,7 +6,7 @@ Covers:
 3. Async handlers are awaited; timeouts change the terminal state.
 4. fail_fast does not mislabel already-completed actions and blocks unstarted ones.
 5. Public ``action_execution_policy`` entry point survives handoff.
-6. Public ``Engine.cancel()`` / ``AsyncEngine.cancel()``.
+6. Public ``Engine.cancel()``.
 7. Traces record policy, concurrency peak, ordering, terminal states.
 """
 
@@ -166,9 +166,7 @@ class AsyncTool(BaseTool):
         delay: float = 0.0,
         timeout_s: float | None = None,
     ) -> None:
-        super().__init__(
-            ToolSpec(name=name, description=name, timeout_s=timeout_s)
-        )
+        super().__init__(ToolSpec(name=name, description=name, timeout_s=timeout_s))
         self._delay = delay
 
     async def execute(self, args: Dict[str, Any], runtime_context: Any = None) -> Any:
@@ -197,9 +195,7 @@ def test_tool_spec_timeout_is_enforced():
 
 
 def test_async_tool_timeout_is_enforced():
-    executor = _executor(
-        {"async_tool": AsyncTool(delay=0.5, timeout_s=0.01)}
-    )
+    executor = _executor({"async_tool": AsyncTool(delay=0.5, timeout_s=0.01)})
     result = executor.execute([Action(name="async_tool")])[0]
 
     assert result.status == ActionStatus.TIMED_OUT
@@ -207,9 +203,7 @@ def test_async_tool_timeout_is_enforced():
 
 def test_timeout_does_not_claim_thread_was_killed():
     rec = _Recorder()
-    tools = {
-        "slow": TimelineTool("slow", rec, delay=0.3, timeout_s=0.01)
-    }
+    tools = {"slow": TimelineTool("slow", rec, delay=0.3, timeout_s=0.01)}
     result = _executor(tools).execute([Action(name="slow")])[0]
 
     assert result.metadata.get("worker_still_running") is True
@@ -223,7 +217,9 @@ def test_timeout_does_not_claim_thread_was_killed():
 def test_fail_fast_does_not_mislabel_completed_action():
     rec = _Recorder()
     tools = {
-        "running_safe": TimelineTool("running_safe", rec, concurrency_safe=True, delay=0.15),
+        "running_safe": TimelineTool(
+            "running_safe", rec, concurrency_safe=True, delay=0.15
+        ),
         "failing_safe": TimelineTool(
             "failing_safe", rec, concurrency_safe=True, delay=0.01, boom=True
         ),
@@ -249,7 +245,9 @@ def test_fail_fast_disabled_runs_everything():
     rec = _Recorder()
     tools = {
         "safe_a": TimelineTool("safe_a", rec, concurrency_safe=True, delay=0.01),
-        "failing": TimelineTool("failing", rec, concurrency_safe=True, delay=0.01, boom=True),
+        "failing": TimelineTool(
+            "failing", rec, concurrency_safe=True, delay=0.01, boom=True
+        ),
         "exclusive": TimelineTool("exclusive", rec, delay=0.01),
     }
     results = _executor(tools, mode="parallel", fail_fast=False).execute(
@@ -319,7 +317,7 @@ def test_execution_records_policy_and_concurrency_peak():
 
 
 # ---------------------------------------------------------------------------
-# 7. Engine / AsyncEngine public API
+# 7. Engine public API
 # ---------------------------------------------------------------------------
 
 
@@ -392,27 +390,3 @@ def test_engine_exposes_public_cancel():
     # Idempotent
     engine.cancel()
     assert engine._cancel_token.is_cancel_requested
-
-
-def test_async_engine_exposes_public_cancel():
-    from qitos.core.agent_module import AgentModule
-    from qitos.core.state import StateSchema
-    from qitos.engine.async_engine import AsyncEngine
-
-    class _Agent(AgentModule):
-        name = "cancel_agent"
-
-        def init_state(self, task: str, **kwargs: Any) -> StateSchema:
-            return StateSchema(task=task)
-
-        def reduce(self, state, observation, decision):
-            return state
-
-    async_engine = AsyncEngine(
-        agent=_Agent(),
-        action_execution_policy=ActionExecutionPolicy(mode="parallel"),
-    )
-    assert async_engine.engine.executor.policy.mode == "parallel"
-
-    async_engine.cancel()
-    assert async_engine.engine._cancel_token.is_cancel_requested

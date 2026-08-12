@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import hashlib
 import inspect
@@ -9,11 +10,10 @@ import json
 import logging
 import os
 import re
-import time
 from collections import Counter
-from concurrent.futures import TimeoutError as FuturesTimeoutError
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, Dict, Generic, List, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar, cast
 
 from ..core._json_repair import escape_json_string_control_chars
 from ..core.action import Action
@@ -21,7 +21,6 @@ from ..core.decision import Decision
 from ..core.errors import (
     ErrorCategory,
     ModelExecutionError,
-    ModelRequestCancelled,
     ModelRequestDeadlineExceeded,
     ModelTransportError,
     ParseExecutionError,
@@ -48,7 +47,7 @@ from ..core.multimodal import (
 )
 from ..core.observation import Observation
 from ..harness._types import native_tool_calls_preferred
-from ..models._request_runtime import ensure_request_active, model_request_runtime
+from ..models.base import Model, ModelStreamChunk
 from ..protocols import get_protocol, resolve_protocol_chain
 from ..core.state import StateSchema
 from ._context_runtime import (
@@ -56,8 +55,6 @@ from ._context_runtime import (
     ContextOverflowError,
     DecisionContextConfigurationError,
 )
-from ._daemon_pool import DaemonTaskPool
-from ._protocol import _EngineProtocol
 from .streaming import to_stream_handler
 from .parser import (
     build_parser_diagnostics,
@@ -66,6 +63,9 @@ from .parser import (
     parser_name,
 )
 from .states import RuntimePhase, StepRecord
+
+if TYPE_CHECKING:
+    from .engine import Engine
 
 
 _logger = logging.getLogger("qitos.engine._model_runtime")
@@ -157,12 +157,12 @@ def _wrap_runtime_context(content: str) -> str:
         return str(content or "")
     safe_content = _escape_runtime_context_content(content)
     return (
-        '<RUNTIME_CONTEXT\n'
+        "<RUNTIME_CONTEXT\n"
         '  source="agent_runtime_controller"\n'
         '  kind="authoritative_state"\n'
         '  task_continuation="true">\n'
-        f'{safe_content}\n'
-        '</RUNTIME_CONTEXT>'
+        f"{safe_content}\n"
+        "</RUNTIME_CONTEXT>"
     )
 
 
@@ -175,14 +175,16 @@ _RUNTIME_CONTEXT_IN_TOOL_NOTICE = (
 
 
 class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
-    def __init__(self, engine: _EngineProtocol):
+    def __init__(self, engine: Engine[StateT, ObservationT, ActionT]):
         self.engine = engine
-        self.stream_callback: Optional[Any] = None  # Callable[[str], None] or StreamHandler
+        self.stream_callback: Optional[Any] = (
+            None  # Callable[[str], None] or StreamHandler
+        )
         # Incremental sidecar tracking (Fix 1A)
         self._last_message_count: int = 0
         self._last_full_step: int = -1
 
-    def run_decide(
+    async def run_decide(
         self, state: StateT, observation: ObservationT, record: StepRecord
     ) -> Decision[ActionT]:
         engine = self.engine
@@ -207,10 +209,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         )
         engine._memory_append("state", state.to_dict(), record.step_id)
         engine._emit(record.step_id, RuntimePhase.DECIDE, payload={"stage": "start"})
-        raw_decision = engine.agent.decide(state, observation)
+        raw_decision: Decision[ActionT] | ModelResponse | None = engine.agent.decide(
+            state, observation
+        )
         model_response: ModelResponse | None = None
         if raw_decision is None:
-            model_response = self._run_llm_decide(
+            model_response = await self._run_llm_decide(
                 state=state, observation=observation, record=record
             )
             native_tool_calls_are_authoritative = (
@@ -260,7 +264,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             # A final/wait response has no tool result to pair with, but its
             # real assistant text is still useful audit history (and preserves
             # the generic QitOS history contract).
-            content: Any = model_response.text if str(model_response.text or "").strip() else None
+            content: Any = (
+                model_response.text if str(model_response.text or "").strip() else None
+            )
             if content is not None:
                 engine._history_append(
                     "assistant",
@@ -331,7 +337,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             )
         )
 
-    def _run_llm_decide(
+    async def _run_llm_decide(
         self, state: StateT, observation: ObservationT, record: StepRecord
     ) -> ModelResponse:
         engine = self.engine
@@ -341,7 +347,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         setattr(engine.agent, "_runtime_observation", observation)
         setattr(engine.agent, "_runtime_step_id", record.step_id)
         setattr(engine.agent, "_runtime_protocol", protocol)
-        setattr(engine.agent, "_runtime_protocol_source", engine._resolved_protocol_source)
+        setattr(
+            engine.agent, "_runtime_protocol_source", engine._resolved_protocol_source
+        )
         try:
             prompt_bundle = engine.agent.build_prompt_bundle(state)
             system_prompt = prompt_bundle.system_prompt
@@ -374,14 +382,19 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         )
         context_runtime = engine._context_runtime
         # Apply critic patches if present
-        effective_system_prompt = system_prompt if isinstance(system_prompt, str) else ""
-        if getattr(engine, "_critic_modified_prompt", None) is not None:
-            effective_system_prompt = engine._critic_modified_prompt
+        effective_system_prompt = (
+            system_prompt if isinstance(system_prompt, str) else ""
+        )
+        modified_prompt = engine._critic_modified_prompt
+        if modified_prompt is not None:
+            effective_system_prompt = modified_prompt
             engine._critic_modified_prompt = None  # Consume once
-        if getattr(engine, "_critic_instruction_patch", None) is not None:
-            patch = engine._critic_instruction_patch
+        instruction_patch = engine._critic_instruction_patch
+        if instruction_patch is not None:
             engine._critic_instruction_patch = None  # Consume once
-            effective_system_prompt = effective_system_prompt + "\n\n" + patch
+            effective_system_prompt = (
+                effective_system_prompt + "\n\n" + instruction_patch
+            )
         request_options = self._build_model_request_options(
             prompt_bundle=prompt_bundle,
             protocol=protocol,
@@ -457,20 +470,17 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             if roles:
                 allowed_roles = {str(role) for role in roles}
                 fallback = [
-                    message for message in fallback
-                    if message.role in allowed_roles
+                    message for message in fallback if message.role in allowed_roles
                 ]
             step_min = query.get("step_min") if isinstance(query, dict) else None
             step_max = query.get("step_max") if isinstance(query, dict) else None
             if step_min is not None:
                 fallback = [
-                    message for message in fallback
-                    if message.step_id >= int(step_min)
+                    message for message in fallback if message.step_id >= int(step_min)
                 ]
             if step_max is not None:
                 fallback = [
-                    message for message in fallback
-                    if message.step_id <= int(step_max)
+                    message for message in fallback if message.step_id <= int(step_max)
                 ]
             max_items = int(query.get("max_items") or 0)
             if max_items > 0:
@@ -510,7 +520,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         )
         # --- Custom MessageBuilder support ---
         from ..core.message_builder import MessageBuilder as _MessageBuilderProto
-        custom_builder = getattr(engine.agent, 'message_builder', None)
+
+        custom_builder = getattr(engine.agent, "message_builder", None)
         runtime_context_delivery: Dict[str, Any] = {
             "requested": "none",
             "effective": "none",
@@ -528,7 +539,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         # The default builder has no separate transient context, but the
         # final sidecar uses one common schema for both builder modes.
         runtime_context = ""
-        if custom_builder is not None and isinstance(custom_builder, _MessageBuilderProto):
+        if custom_builder is not None and isinstance(
+            custom_builder, _MessageBuilderProto
+        ):
             configured_rounds = int(
                 getattr(engine.context_config, "conversation_max_rounds", 16)
             )
@@ -537,6 +550,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     history, max_rounds=configured_rounds
                 )
             from ..core.message_builder import MessageBuildRequest as _MBReq
+
             build_req = _MBReq(
                 step_id=record.step_id,
                 state=state,
@@ -551,9 +565,11 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             runtime_context = str(
                 getattr(build_result, "runtime_context", "") or ""
             ).strip()
-            requested_delivery = str(
-                getattr(build_result, "runtime_context_delivery", "none") or "none"
-            ).strip().lower()
+            requested_delivery = (
+                str(getattr(build_result, "runtime_context_delivery", "none") or "none")
+                .strip()
+                .lower()
+            )
             if requested_delivery not in {"none", "merge_tool", "user"}:
                 _logger.warning(
                     "Unknown MessageBuildResult runtime-context delivery %r; ignoring it",
@@ -588,9 +604,13 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                             "content": wrapped_runtime_context,
                         }
                     else:
-                        runtime_context_delivery["fallback_reason"] = "no_text_tool_result"
+                        runtime_context_delivery["fallback_reason"] = (
+                            "no_text_tool_result"
+                        )
                 elif requested_delivery == "merge_tool":
-                    runtime_context_delivery["fallback_reason"] = "multimodal_user_content"
+                    runtime_context_delivery["fallback_reason"] = (
+                        "multimodal_user_content"
+                    )
 
                 if runtime_context_delivery["effective"] != "merge_tool":
                     current_user = self._build_current_user_message(
@@ -611,7 +631,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             # --- Default message construction (original logic) ---
             injection_prefixes: List[str] = []
             if self._native_tool_call_preferred():
-                if os.environ.get("CYBERGYM_DISABLE_HISTORY_TRIM", "").strip().lower() not in {
+                if os.environ.get(
+                    "CYBERGYM_DISABLE_HISTORY_TRIM", ""
+                ).strip().lower() not in {
                     "1",
                     "true",
                     "yes",
@@ -686,10 +708,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             "authoritative_context": "",
         }
         if decision_context_required:
-            llm_messages, decision_context_recovery = self._normalize_decision_context_packet(
-                messages=llm_messages,
-                authoritative_source=decision_context_source,
-                delivery=runtime_context_delivery,
+            llm_messages, decision_context_recovery = (
+                self._normalize_decision_context_packet(
+                    messages=llm_messages,
+                    authoritative_source=decision_context_source,
+                    delivery=runtime_context_delivery,
+                )
             )
         pre_context = context_runtime.finalize_assembled_input(
             llm=engine.agent.llm,
@@ -699,7 +723,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             compact_events=compact_events,
         )
         prompt_meter = getattr(engine.agent, "prompt_meter", None)
-        if prompt_meter is not None and callable(getattr(prompt_meter, "measure", None)):
+        if prompt_meter is not None and callable(
+            getattr(prompt_meter, "measure", None)
+        ):
             try:
                 meter_result = _measure_prompt(
                     prompt_meter,
@@ -715,9 +741,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     "meter_error": f"{type(exc).__name__}: {exc}",
                 }
             pre_context = context_runtime.apply_prompt_meter(pre_context, meter_result)
-            if bool(getattr(prompt_meter, "required", False)) and str(
-                meter_result.get("status") or ""
-            ) != "ready":
+            if (
+                bool(getattr(prompt_meter, "required", False))
+                and str(meter_result.get("status") or "") != "ready"
+            ):
                 raise ContextOverflowError("required prompt meter is unavailable")
         # Historical blocks are an audit signal only.  They are stripped from
         # the projected provider packet by the normalizer and never make a
@@ -755,7 +782,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     "after_count": decision_context_recovery.get("after_count"),
                     "delivery": runtime_context_delivery.get("effective"),
                     "authoritative_context_hash": hashlib.sha256(
-                        str(decision_context_recovery.get("authoritative_context") or "").encode("utf-8")
+                        str(
+                            decision_context_recovery.get("authoritative_context") or ""
+                        ).encode("utf-8")
                     ).hexdigest(),
                 },
             )
@@ -790,7 +819,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 f"budget={pre_context.available_input_budget} "
                 f"ratio={engine.context_config.compact_ratio}"
             )
-        model_input_digest = self._model_input_digest(state, record.step_id, llm_messages)
+        model_input_digest = self._model_input_digest(
+            state, record.step_id, llm_messages
+        )
         tool_schema_digest = self._tool_schema_digest(request_options.get("tools"))
         model_input_digest["tool_schema"] = tool_schema_digest
         self._write_assembled_messages_sidecar(state, record.step_id, llm_messages)
@@ -832,24 +863,35 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 "history_messages_meta": history_metadata,
                 "message_count": len(llm_messages),
                 "messages_summary": [
-                    {"role": m.get("role"), "content_len": len(str(m.get("content", "")))}
+                    {
+                        "role": m.get("role"),
+                        "content_len": len(str(m.get("content", ""))),
+                    }
                     for m in llm_messages
                 ],
                 "model_input_digest": model_input_digest,
                 "tool_schema_digest": tool_schema_digest,
                 "context": dict(record.context),
-                "state_stats": self._state_stats(observation, record.context, state=state),
+                "state_stats": self._state_stats(
+                    observation, record.context, state=state
+                ),
                 "prompt": dict(record.prompt_metadata),
                 "runtime_context_delivery": dict(runtime_context_delivery),
                 "runtime_context_display": runtime_context_display,
             },
         )
-        raw_decision = self._call_llm(engine.agent.llm, llm_messages, request_options)
-        response = self._normalize_model_response(raw_decision)
+        response = self._normalize_model_response(
+            await self._call_llm(
+                engine.agent.llm,
+                llm_messages,
+                request_options,
+            )
+        )
         post_context = context_runtime.finalize_output(
             llm=engine.agent.llm,
             telemetry=pre_context,
             raw_output=response.text,
+            usage=response.usage,
         )
         if pending_system_history is not None:
             engine._history_append(
@@ -914,9 +956,11 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 {
                     "id": item.get("id"),
                     "type": item.get("type", "function"),
-                    "function": dict(item.get("function", {}))
-                    if isinstance(item.get("function", {}), dict)
-                    else {},
+                    "function": (
+                        dict(item.get("function", {}))
+                        if isinstance(item.get("function", {}), dict)
+                        else {}
+                    ),
                 }
                 for item in list(response.tool_calls or [])
                 if isinstance(item, dict)
@@ -991,7 +1035,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         messages: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
         try:
-            serialized = json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str)
+            serialized = json.dumps(
+                messages, ensure_ascii=False, sort_keys=True, default=str
+            )
         except Exception:
             serialized = json.dumps([str(m) for m in messages], ensure_ascii=False)
 
@@ -1033,7 +1079,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             if message.get("role") == "system"
         )
         sections = {
-            "contract": "# CyberGym Agent Contract" in system_text or "Core Rules" in system_text,
+            "contract": "# CyberGym Agent Contract" in system_text
+            or "Core Rules" in system_text,
             "runtime_context": "<runtime_context>" in system_text,
             "exploration_prompt": "# Exploration Phase" in system_text,
             "construction_prompt": "# Construction Phase" in system_text,
@@ -1046,7 +1093,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             trace_root = str(metadata.get("trace_run_dir") or "").strip()
             if trace_root:
                 sidecar_path = str(
-                    Path(trace_root) / "agent_steps" / f"step-{int(step_id):04d}" / "assembled_messages.json"
+                    Path(trace_root)
+                    / "agent_steps"
+                    / f"step-{int(step_id):04d}"
+                    / "assembled_messages.json"
                 )
         except Exception:
             sidecar_path = ""
@@ -1055,7 +1105,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             "message_count": len(messages),
             "role_counts": role_counts,
             "tool_call_count": tool_call_count,
-            "messages_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16],
+            "messages_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest()[
+                :16
+            ],
             "sections": sections,
             "messages": message_summaries,
             "recent_history": message_summaries[-8:],
@@ -1074,7 +1126,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         try:
             metadata = dict(getattr(state, "metadata", {}) or {})
             trace_root = str(
-                metadata.get("trace_run_dir") or getattr(state, "workspace_root", "") or ""
+                metadata.get("trace_run_dir")
+                or getattr(state, "workspace_root", "")
+                or ""
             ).strip()
             if not trace_root:
                 return
@@ -1091,7 +1145,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         "before_count": recovery.get("before_count"),
                         "after_count": recovery.get("after_count"),
                         "authoritative_context_hash": hashlib.sha256(
-                            str(recovery.get("authoritative_context") or "").encode("utf-8")
+                            str(recovery.get("authoritative_context") or "").encode(
+                                "utf-8"
+                            )
                         ).hexdigest(),
                     },
                     ensure_ascii=False,
@@ -1143,10 +1199,13 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
     @staticmethod
     def _tool_schema_digest(tools: Any) -> Dict[str, Any]:
         payload = list(tools or []) if isinstance(tools, list) else []
-        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+        serialized = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, default=str
+        )
         names = [
             str((item.get("function") or {}).get("name") or "")
-            for item in payload if isinstance(item, dict)
+            for item in payload
+            if isinstance(item, dict)
         ]
         return {
             "tool_count": len(payload),
@@ -1176,8 +1235,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             step_dir = Path(trace_root) / "agent_steps" / f"step-{int(step_id):04d}"
             step_dir.mkdir(parents=True, exist_ok=True)
             tools = list(request_options.get("tools") or [])
-            message_json = json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str)
-            tools_json = json.dumps(tools, ensure_ascii=False, sort_keys=True, default=str)
+            message_json = json.dumps(
+                messages, ensure_ascii=False, sort_keys=True, default=str
+            )
+            tools_json = json.dumps(
+                tools, ensure_ascii=False, sort_keys=True, default=str
+            )
             combined = message_json + "\n" + tools_json
             decision_context_blocks = self._decision_context_blocks(messages)
             bundle = {
@@ -1186,25 +1249,44 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 "prompt_metadata": dict(getattr(prompt_bundle, "metadata", {}) or {}),
                 "protocol": str(getattr(protocol, "id", "") or ""),
                 "tool_delivery": str(
-                    dict(getattr(prompt_bundle, "metadata", {}) or {}).get("tool_schema_delivery") or ""
+                    dict(getattr(prompt_bundle, "metadata", {}) or {}).get(
+                        "tool_schema_delivery"
+                    )
+                    or ""
                 ),
                 "pre_merge_runtime_context": str(runtime_context or ""),
                 "runtime_context_delivery": dict(runtime_context_delivery or {}),
                 "context": dict(context or {}),
-                "messages_hash": hashlib.sha256(message_json.encode("utf-8")).hexdigest()[:16],
-                "schema_hash": hashlib.sha256(tools_json.encode("utf-8")).hexdigest()[:16],
-                "combined_hash": hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16],
+                "messages_hash": hashlib.sha256(
+                    message_json.encode("utf-8")
+                ).hexdigest()[:16],
+                "schema_hash": hashlib.sha256(tools_json.encode("utf-8")).hexdigest()[
+                    :16
+                ],
+                "combined_hash": hashlib.sha256(combined.encode("utf-8")).hexdigest()[
+                    :16
+                ],
                 "decision_context_block_count": len(decision_context_blocks),
                 "decision_context_sha256": (
-                    hashlib.sha256(decision_context_blocks[0].encode("utf-8")).hexdigest()
+                    hashlib.sha256(
+                        decision_context_blocks[0].encode("utf-8")
+                    ).hexdigest()
                     if len(decision_context_blocks) == 1
                     else ""
                 ),
                 "decision_context_recovery": {
-                    "rebuilt": bool((decision_context_recovery or {}).get("rebuild_required")),
-                    "reason": str((decision_context_recovery or {}).get("reason") or ""),
-                    "before_count": int((decision_context_recovery or {}).get("before_count") or 0),
-                    "after_count": int((decision_context_recovery or {}).get("after_count") or 0),
+                    "rebuilt": bool(
+                        (decision_context_recovery or {}).get("rebuild_required")
+                    ),
+                    "reason": str(
+                        (decision_context_recovery or {}).get("reason") or ""
+                    ),
+                    "before_count": int(
+                        (decision_context_recovery or {}).get("before_count") or 0
+                    ),
+                    "after_count": int(
+                        (decision_context_recovery or {}).get("after_count") or 0
+                    ),
                 },
             }
             (step_dir / "model_input_bundle.json").write_text(
@@ -1246,10 +1328,13 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             if callable(build_options):
                 try:
                     options.update(
-                        build_options(payload, protocol=protocol, delivery=delivery) or {}
+                        build_options(payload, protocol=protocol, delivery=delivery)
+                        or {}
                     )
                 except Exception:
-                    _logger.debug("build_tool_schema_request_options failed", exc_info=True)
+                    _logger.debug(
+                        "build_tool_schema_request_options failed", exc_info=True
+                    )
 
         # Merge default_request_kwargs from the model instance
         # (e.g. chat_template_kwargs for thinking mode)
@@ -1260,99 +1345,19 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
 
         return options
 
-    def _call_llm(
-        self, llm: Any, messages: List[Dict[str, Any]], request_options: Dict[str, Any]
-    ) -> Any:
-        engine = self.engine
-        deadline = getattr(engine, "runtime_deadline_monotonic", None)
-
-        def cancelled() -> bool:
-            token = getattr(engine, "_cancel_token", None)
-            if token is None or not bool(getattr(token, "is_cancel_requested", False)):
-                return False
-            mode = getattr(token, "mode", None)
-            return getattr(mode, "value", mode) == "immediate"
-
-        def invoke() -> Any:
-            with model_request_runtime(
-                deadline_monotonic=deadline,
-                cancelled=cancelled,
-            ):
-                return self._call_llm_unbounded(llm, messages, request_options)
-
-        pool = DaemonTaskPool(
-            1,
-            thread_name_prefix="qitos-model",
-            propagate_context=True,
-        )
-        future = pool.submit(invoke)
-        try:
-            while True:
-                if cancelled():
-                    raise ModelRequestCancelled("model request cancelled")
-                remaining = None if deadline is None else deadline - time.monotonic()
-                if remaining is not None and remaining <= 0:
-                    raise ModelRequestDeadlineExceeded("model request deadline expired")
-                wait_seconds = 0.05 if remaining is None else min(0.05, remaining)
-                try:
-                    result = future.result(timeout=wait_seconds)
-                except FuturesTimeoutError:
-                    continue
-                if cancelled():
-                    raise ModelRequestCancelled("model request cancelled")
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise ModelRequestDeadlineExceeded("model request deadline expired")
-                return result
-        finally:
-            pool.shutdown(wait_for_workers=False, cancel_futures=True)
-
-    def _call_llm_unbounded(
-        self, llm: Any, messages: List[Dict[str, Any]], request_options: Dict[str, Any]
-    ) -> Any:
-        transactional_stream = getattr(llm, "transactional_stream", None)
-        supports_transactional_stream = getattr(
-            llm, "supports_transactional_stream", None
-        )
-        if (
-            callable(transactional_stream)
-            and supports_transactional_stream is not False
-        ):
-            return self._call_llm_streaming(
-                llm,
-                messages,
-                request_options,
-                stream_fn=transactional_stream,
-            )
-
-        if self.stream_callback is not None:
-            stream_fn = getattr(llm, "stream", None)
-            if callable(stream_fn):
-                return self._call_llm_streaming(
-                    llm, messages, request_options, stream_fn=stream_fn
-                )
-
-        call_raw = getattr(llm, "call_raw", None)
-        if callable(call_raw):
-            if not request_options:
-                return call_raw(messages)
-            return call_raw(messages, **request_options)
-        if not request_options:
-            return llm(messages)
-        return llm(messages, **request_options)
-
-    def _call_llm_streaming(
+    async def _call_llm(
         self,
         llm: Any,
         messages: List[Dict[str, Any]],
         request_options: Dict[str, Any],
-        *,
-        stream_fn: Any,
-    ) -> Any:
-        """Stream LLM response, forwarding text deltas via callback.
+    ) -> ModelResponse:
+        """Consume the one canonical model stream into a completed response."""
 
-        Returns a synthetic dict that mimics the structure _normalize_model_response
-        expects: {"text": ..., "usage": ..., "finish_reason": ..., "tool_calls": ...}.
-        """
+        if not isinstance(llm, Model):
+            raise TypeError(
+                "Agent.llm must implement the asynchronous qitos.models.Model "
+                "stream contract"
+            )
         handler = to_stream_handler(self.stream_callback)
         accumulated_text: List[str] = []
         accumulated_reasoning: List[str] = []
@@ -1360,27 +1365,45 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         final_tool_calls: Optional[List[Dict[str, Any]]] = None
         final_native_items: Optional[List[Dict[str, Any]]] = None
         final_finish_reason: Optional[str] = None
+        final_metadata: Dict[str, Any] = {}
         started = False
         terminal_seen = False
         stream_error: Exception | None = None
+        stream_iter: AsyncIterator[ModelStreamChunk] = llm.stream(
+            messages,
+            deadline_monotonic=getattr(self.engine, "runtime_deadline_monotonic", None),
+            **request_options,
+        )
 
-        if not request_options:
-            stream_iter = stream_fn(messages)
-        else:
-            stream_iter = stream_fn(messages, **request_options)
-
+        iterator = stream_iter.__aiter__()
         try:
-            for chunk in stream_iter:
-                ensure_request_active()
-                # Handle ModelStreamChunk objects
-                text = getattr(chunk, "text", None)
-                reasoning = getattr(chunk, "reasoning_content", None)
-                done = getattr(chunk, "done", False)
-                usage = getattr(chunk, "usage", None)
-                tool_calls = getattr(chunk, "tool_calls", None)
-                native_items = getattr(chunk, "native_items", None)
-                event_type = getattr(chunk, "event_type", None)
-                finish_reason = getattr(chunk, "finish_reason", None)
+            while True:
+                remaining = self.engine.remaining_runtime_seconds()
+                if remaining is not None and remaining <= 0:
+                    raise ModelRequestDeadlineExceeded("model request deadline expired")
+                try:
+                    next_chunk = iterator.__anext__()
+                    chunk = (
+                        await asyncio.wait_for(next_chunk, timeout=remaining)
+                        if remaining is not None
+                        else await next_chunk
+                    )
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as exc:
+                    raise ModelRequestDeadlineExceeded(
+                        "model request deadline expired"
+                    ) from exc
+                if not isinstance(chunk, ModelStreamChunk):
+                    raise TypeError("Model.stream() must yield ModelStreamChunk values")
+                text = chunk.text
+                reasoning = chunk.reasoning_content
+                done = chunk.done
+                usage = chunk.usage
+                tool_calls = chunk.tool_calls
+                native_items = chunk.native_items
+                event_type = chunk.event_type
+                finish_reason = chunk.finish_reason
 
                 observable = bool(
                     text
@@ -1418,6 +1441,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     accumulated_reasoning.append(str(reasoning))
 
                 if done:
+                    if terminal_seen:
+                        raise ModelTransportError(
+                            "model stream emitted more than one terminal chunk",
+                            attempts=1,
+                            retryable=False,
+                        )
                     terminal_seen = True
                     if usage is not None and isinstance(usage, dict):
                         final_usage = usage
@@ -1427,12 +1456,15 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         final_native_items = native_items
                     if finish_reason is not None:
                         final_finish_reason = str(finish_reason)
+                    final_metadata = dict(chunk.event_metadata)
             if not terminal_seen:
                 raise ModelTransportError(
                     "model stream ended before a terminal chunk",
                     attempts=1,
                     retryable=True,
                 )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             stream_error = exc
             if handler is not None:
@@ -1444,10 +1476,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         pass
             raise
         finally:
-            close = getattr(stream_iter, "close", None)
+            close = getattr(stream_iter, "aclose", None)
             if callable(close):
                 try:
-                    close()
+                    await close()
+                except asyncio.CancelledError:
+                    raise
                 except Exception:
                     _logger.debug("model stream close failed", exc_info=True)
             if (
@@ -1457,32 +1491,23 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 and stream_error is None
             ):
                 try:
-                    ensure_request_active()
                     handler.on_end()
-                except (ModelRequestCancelled, ModelRequestDeadlineExceeded):
-                    pass
                 except Exception:
                     pass
-        if final_usage is None:
-            last_usage = getattr(llm, "_last_usage", None)
-            if isinstance(last_usage, dict) and last_usage:
-                final_usage = last_usage
 
-        # Return a synthetic response that _normalize_model_response can process
-        full_text = "".join(accumulated_text)
-        result: Dict[str, Any] = {
-            "text": full_text,
-            "usage": final_usage or {},
-            "finish_reason": final_finish_reason,
-        }
-        if final_tool_calls:
-            result["tool_calls"] = final_tool_calls
-        if final_native_items:
-            result["native_items"] = final_native_items
-        if accumulated_reasoning:
-            result["reasoning_content"] = "".join(accumulated_reasoning)
-        ensure_request_active()
-        return result
+        return ModelResponse(
+            text="".join(accumulated_text),
+            usage=final_usage,
+            finish_reason=final_finish_reason,
+            tool_calls=final_tool_calls,
+            model_name=llm.model,
+            provider=llm.provider_name,
+            metadata=final_metadata,
+            reasoning_content=(
+                "".join(accumulated_reasoning) if accumulated_reasoning else None
+            ),
+            native_items=final_native_items,
+        )
 
     def _build_current_user_message(
         self,
@@ -1508,9 +1533,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         record.model_input_visual_count = sum(
             1 for block in content_blocks if str(block.get("type") or "text") != "text"
         )
-        if (
-            record.model_input_visual_count > 0
-            and not self._llm_supports_multimodal(getattr(self.engine.agent, "llm", None))
+        if record.model_input_visual_count > 0 and not self._llm_supports_multimodal(
+            getattr(self.engine.agent, "llm", None)
         ):
             raise ValueError(
                 "Configured model adapter does not support multimodal input content blocks."
@@ -1652,8 +1676,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     metadata=metadata,
                 )
             ]
-        data_value = screenshot.get("data_url") or screenshot.get("data") or screenshot.get(
-            "base64"
+        data_value = (
+            screenshot.get("data_url")
+            or screenshot.get("data")
+            or screenshot.get("base64")
         )
         if data_value:
             return [
@@ -1724,7 +1750,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         return None
 
     def _state_stats(
-        self, observation: ObservationT, context: Dict[str, Any],
+        self,
+        observation: ObservationT,
+        context: Dict[str, Any],
         state: Any = None,
     ) -> Dict[str, Any]:
         stats: Dict[str, Any] = {}
@@ -1808,7 +1836,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 if isinstance(allowed_tools_text, str) and allowed_tools_text.strip():
                     stats["allowed_tools"] = allowed_tools_text
                 suggested_sinks_text = metadata.get("_tui_suggested_sinks")
-                if isinstance(suggested_sinks_text, str) and suggested_sinks_text.strip():
+                if (
+                    isinstance(suggested_sinks_text, str)
+                    and suggested_sinks_text.strip()
+                ):
                     stats["suggested_sinks"] = suggested_sinks_text
         return stats
 
@@ -1834,9 +1865,13 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             return ""
         lines: List[str] = []
         confirmed = sum(1 for g in gates if getattr(g, "status", "") == "confirmed")
-        open_g = sum(1 for g in gates if getattr(g, "status", "") in ("inferred", "unknown"))
+        open_g = sum(
+            1 for g in gates if getattr(g, "status", "") in ("inferred", "unknown")
+        )
         refuted = sum(1 for g in gates if getattr(g, "status", "") == "refuted")
-        lines.append(f"Chain Gates: {confirmed} confirmed / {open_g} open / {refuted} refuted")
+        lines.append(
+            f"Chain Gates: {confirmed} confirmed / {open_g} open / {refuted} refuted"
+        )
         if nodes:
             sorted_nodes = sorted(nodes, key=lambda n: getattr(n, "order", 0))
             for n in sorted_nodes[:10]:
@@ -1844,7 +1879,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 func = getattr(n, "function", "?")
                 loc = getattr(n, "location", "")
                 status = getattr(n, "status", "?")
-                lines.append(f"  [{getattr(n, 'order', 0)}] [{status}] {role} {func} ({loc})")
+                lines.append(
+                    f"  [{getattr(n, 'order', 0)}] [{status}] {role} {func} ({loc})"
+                )
         for g in gates:
             status = getattr(g, "status", "")
             desc = getattr(g, "description", "")
@@ -1946,7 +1983,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             and str(response.text or "").strip()
         )
 
-        if is_native_text_response:
+        if is_native_text_response and response is not None:
             # Still try the parser chain first — if the model happened to
             # produce valid structured output (JSON with a final_answer, or
             # ReAct "Final Answer:" label), let the parser extract it.
@@ -1963,9 +2000,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 # heuristic for plain text. Preserve the historical final
                 # fallback unless parsing actually failed on action-shaped text.
                 parser_error = bool(parse_outcome.meta.get("parser_error"))
-                if not parser_error and self._looks_like_explicit_wait(
-                    parser_input
-                ):
+                if not parser_error and self._looks_like_explicit_wait(parser_input):
                     return parse_outcome
                 rejection_reason: str | None = None
                 if parser_error:
@@ -2045,14 +2080,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         field_pattern = (
             r"actions?|tools?|tool[_-]?calls?|calls?|commands?|name|args|arguments"
         )
-        json_carrier_pattern = (
-            r"actions?|tools?|tool[_-]?calls?|calls?|commands?"
-        )
+        json_carrier_pattern = r"actions?|tools?|tool[_-]?calls?|calls?|commands?"
         if re.search(
             rf"(?i)[\"']({json_carrier_pattern})[\"']\s*:", source
-        ) or re.search(
-            rf"(?i)[{{,]\s*({json_carrier_pattern})\s*:", source
-        ):
+        ) or re.search(rf"(?i)[{{,]\s*({json_carrier_pattern})\s*:", source):
             return True
 
         structured_fields: set[str] = set()
@@ -2100,8 +2131,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             return False
         return bool(
             re.search(
-                r"(?i)(?:[\"']mode[\"']|(?:^|[\{,])\s*mode)"
-                r"\s*[:=]\s*[\"']?final\b",
+                r"(?i)(?:[\"']mode[\"']|(?:^|[\{,])\s*mode)" r"\s*[:=]\s*[\"']?final\b",
                 source,
             )
             or re.search(
@@ -2150,10 +2180,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         "parser": parser_name(parser),
                         "contract": parser_contract(parser),
                         "protocol": getattr(protocol, "id", None),
-                        "result": "success"
-                        if normalized is None
-                        or normalized.get("severity") != "error"
-                        else "error",
+                        "result": (
+                            "success"
+                            if normalized is None
+                            or normalized.get("severity") != "error"
+                            else "error"
+                        ),
                         "fallback_used": fallback_used,
                     }
                 )
@@ -2204,9 +2236,16 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 last_diagnostics["parser_attempts"] = list(parser_attempts)
                 continue
         if last_diagnostics is not None:
-            selected_parser = parser_name(candidates[-1]["parser"]) if candidates else "unknown_parser"
+            selected_parser = (
+                parser_name(candidates[-1]["parser"])
+                if candidates
+                else "unknown_parser"
+            )
             last_diagnostics.setdefault("selected_parser", selected_parser)
-            last_diagnostics.setdefault("fallback_used", any(item.get("fallback_used") for item in parser_attempts))
+            last_diagnostics.setdefault(
+                "fallback_used",
+                any(item.get("fallback_used") for item in parser_attempts),
+            )
             last_diagnostics.setdefault("parser_attempts", parser_attempts)
             self._record_parser_observability(
                 step=step,
@@ -2217,7 +2256,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 diagnostics=last_diagnostics,
                 protocol=candidates[-1].get("protocol") if candidates else None,
                 parser_attempts=parser_attempts,
-                fallback_used=any(item.get("fallback_used") for item in parser_attempts),
+                fallback_used=any(
+                    item.get("fallback_used") for item in parser_attempts
+                ),
             )
             if last_exception is not None:
                 info = RuntimeErrorInfo(
@@ -2396,84 +2437,14 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             )
             record.decision_source = "parser"
 
-    def _extract_reasoning_content(self, raw_output: Any) -> Optional[str]:
-        """Extract reasoning_content from API response if present.
+    def _normalize_model_response(self, response: ModelResponse) -> ModelResponse:
+        """Apply Engine-only text tool-call salvage to a completed response."""
 
-        Some providers (DeepSeek, QwQ, etc.) return a separate
-        ``reasoning_content`` field alongside ``content`` and ``tool_calls``.
-        This field carries the model's chain-of-thought and should be
-        displayed in the TUI as the agent's "thought".
-        """
-        direct = (
-            raw_output.get("reasoning_content")
-            if isinstance(raw_output, dict)
-            else getattr(raw_output, "reasoning_content", None)
-        )
-        if isinstance(direct, str) and direct.strip():
-            return direct
-
-        # Navigate to the message object
-        message = None
-        if isinstance(raw_output, dict):
-            choices = raw_output.get("choices")
-            if isinstance(choices, list) and choices:
-                msg = choices[0].get("message") if isinstance(choices[0], dict) else None
-                if isinstance(msg, dict):
-                    message = msg
-        if message is None:
-            choices = getattr(raw_output, "choices", None)
-            if isinstance(choices, list) and choices:
-                message = getattr(choices[0], "message", None)
-        if message is None:
-            message = getattr(raw_output, "message", None)
-
-        if message is not None:
-            # dict-style message
-            if isinstance(message, dict):
-                rc = message.get("reasoning_content")
-                if isinstance(rc, str) and rc.strip():
-                    return rc
-            # object-style message
-            rc = getattr(message, "reasoning_content", None)
-            if isinstance(rc, str) and rc.strip():
-                return rc
-        return None
-
-    def _normalize_model_response(self, raw_output: Any) -> ModelResponse:
-        if isinstance(raw_output, ModelResponse):
-            response = raw_output
-        else:
-            response = ModelResponse(
-                text=self._extract_response_text(raw_output),
-                raw=raw_output,
-                usage=self._extract_response_usage(raw_output),
-                finish_reason=self._extract_finish_reason(raw_output),
-                tool_calls=self._extract_tool_calls(raw_output),
-                native_items=self._extract_native_items(raw_output),
-                model_name=self._extract_model_name(raw_output),
-                provider=self._extract_provider(raw_output),
-                metadata=self._extract_response_metadata(raw_output),
-                reasoning_content=self._extract_reasoning_content(raw_output),
-            )
+        if not isinstance(response, ModelResponse):
+            raise TypeError("model response must be a ModelResponse")
         llm = getattr(self.engine.agent, "llm", None)
-        usage = response.usage
-        if usage is None and llm is not None and hasattr(llm, "extract_usage"):
-            try:
-                extracted = llm.extract_usage(raw_output)
-                if isinstance(extracted, dict):
-                    usage = extracted
-            except Exception:
-                usage = None
-        model_name = (
-            response.model_name
-            or getattr(llm, "model", None)
-            or getattr(llm, "model_name", None)
-        )
-        provider = (
-            response.provider
-            or getattr(llm, "provider", None)
-            or (llm.__class__.__name__ if llm is not None else None)
-        )
+        model_name = response.model_name or getattr(llm, "model", None)
+        provider = response.provider or getattr(llm, "provider_name", None)
         metadata = dict(response.metadata or {})
         text = str(response.text or "")
         tool_calls = (
@@ -2491,8 +2462,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     text = ""
         return ModelResponse(
             text=text,
-            raw=response.raw,
-            usage=dict(usage) if isinstance(usage, dict) else None,
+            usage=(dict(response.usage) if isinstance(response.usage, dict) else None),
             finish_reason=response.finish_reason,
             tool_calls=tool_calls,
             model_name=str(model_name) if model_name is not None else None,
@@ -2501,19 +2471,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             reasoning_content=response.reasoning_content,
             native_items=response.native_items,
         )
-
-    def _extract_native_items(
-        self, raw_output: Any
-    ) -> List[Dict[str, Any]] | None:
-        native_items = (
-            raw_output.get("native_items")
-            if isinstance(raw_output, dict)
-            else getattr(raw_output, "native_items", None)
-        )
-        if not isinstance(native_items, list):
-            return None
-        normalized = [dict(item) for item in native_items if isinstance(item, dict)]
-        return normalized or None
 
     def _extract_text_tool_call_markup(self, text: str) -> List[Dict[str, Any]] | None:
         """Salvage GLM-style textual tool-call markup into native tool calls."""
@@ -2571,208 +2528,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         ).strip()
         return not remainder
 
-    def _extract_response_text(self, raw_output: Any) -> str:
-        """Extract text content from a model response.
-
-        Returns the ``content`` field even when ``tool_calls`` are present,
-        because the model may produce both (e.g. a brief explanation
-        alongside tool calls).  ``reasoning_content`` is extracted
-        separately by ``_extract_reasoning_content``.
-        """
-        if raw_output is None:
-            return ""
-        if isinstance(raw_output, str):
-            return raw_output
-        if isinstance(raw_output, dict):
-            for key in ("text", "content", "output_text"):
-                value = raw_output.get(key)
-                if isinstance(value, str):
-                    return value
-            content = raw_output.get("content")
-            if isinstance(content, list):
-                parts: List[str] = []
-                for item in content:
-                    if isinstance(item, str):
-                        parts.append(item)
-                    elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                        parts.append(str(item.get("text")))
-                    elif hasattr(item, "text") and isinstance(
-                        getattr(item, "text", None), str
-                    ):
-                        parts.append(str(getattr(item, "text")))
-                if parts:
-                    return "\n".join(parts)
-            tool_calls = raw_output.get("tool_calls")
-            if isinstance(tool_calls, list) and tool_calls:
-                return ""
-            choices = raw_output.get("choices")
-            if isinstance(choices, list) and choices:
-                return self._extract_response_text(choices[0])
-            message = raw_output.get("message")
-            if isinstance(message, dict):
-                return self._extract_response_text(message)
-            if any(
-                key in raw_output
-                for key in ("content", "tool_calls", "reasoning_content")
-            ):
-                return ""
-            return str(raw_output)
-        choices = getattr(raw_output, "choices", None)
-        if isinstance(choices, list) and choices:
-            return self._extract_response_text(choices[0])
-        message = getattr(raw_output, "message", None)
-        if message is not None:
-            content = getattr(message, "content", None)
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                parts: List[str] = []
-                for item in content:
-                    if isinstance(item, str):
-                        parts.append(item)
-                    elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                        parts.append(str(item.get("text")))
-                    elif hasattr(item, "text") and isinstance(
-                        getattr(item, "text", None), str
-                    ):
-                        parts.append(str(getattr(item, "text")))
-                if parts:
-                    return "\n".join(parts)
-            text = getattr(message, "text", None)
-            if isinstance(text, str):
-                return text
-            tool_calls = getattr(message, "tool_calls", None)
-            if isinstance(tool_calls, list) and tool_calls:
-                return ""
-            if any(
-                hasattr(message, key)
-                for key in ("content", "tool_calls", "reasoning_content", "text")
-            ):
-                return ""
-        for key in ("text", "content", "output_text"):
-            value = getattr(raw_output, key, None)
-            if isinstance(value, str):
-                return value
-        tool_calls = getattr(raw_output, "tool_calls", None)
-        if isinstance(tool_calls, list) and tool_calls:
-            return ""
-        return str(raw_output)
-
-    def _extract_response_usage(self, raw_output: Any) -> Dict[str, Any] | None:
-        usage = (
-            raw_output.get("usage")
-            if isinstance(raw_output, dict)
-            else getattr(raw_output, "usage", None)
-        )
-        if isinstance(usage, dict):
-            return dict(usage)
-        if usage is None:
-            return None
-        prompt_tokens = getattr(usage, "prompt_tokens", None)
-        completion_tokens = getattr(usage, "completion_tokens", None)
-        total_tokens = getattr(usage, "total_tokens", None)
-        if prompt_tokens is None and completion_tokens is None and total_tokens is None:
-            return None
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-        }
-
-    def _extract_finish_reason(self, raw_output: Any) -> str | None:
-        if isinstance(raw_output, dict):
-            finish_reason = raw_output.get("finish_reason")
-            if finish_reason is not None:
-                return str(finish_reason)
-            choices = raw_output.get("choices")
-            if isinstance(choices, list) and choices:
-                return self._extract_finish_reason(choices[0])
-            return None
-        finish_reason = getattr(raw_output, "finish_reason", None)
-        if finish_reason is not None:
-            return str(finish_reason)
-        choices = getattr(raw_output, "choices", None)
-        if isinstance(choices, list) and choices:
-            return self._extract_finish_reason(choices[0])
-        return None
-
-    def _extract_tool_calls(self, raw_output: Any) -> List[Dict[str, Any]] | None:
-        if isinstance(raw_output, dict):
-            tool_calls = raw_output.get("tool_calls")
-            if isinstance(tool_calls, list):
-                return [self._normalize_tool_call(item) for item in tool_calls]
-            choices = raw_output.get("choices")
-            if isinstance(choices, list) and choices:
-                return self._extract_tool_calls(choices[0])
-            message = raw_output.get("message")
-            if isinstance(message, dict):
-                return self._extract_tool_calls(message)
-            return None
-        tool_calls = getattr(raw_output, "tool_calls", None)
-        if isinstance(tool_calls, list):
-            return [self._normalize_tool_call(item) for item in tool_calls]
-        message = getattr(raw_output, "message", None)
-        if message is not None:
-            inner = getattr(message, "tool_calls", None)
-            if isinstance(inner, list):
-                return [self._normalize_tool_call(item) for item in inner]
-        choices = getattr(raw_output, "choices", None)
-        if isinstance(choices, list) and choices:
-            return self._extract_tool_calls(choices[0])
-        return None
-
-    def _normalize_tool_call(self, tool_call: Any) -> Dict[str, Any]:
-        if isinstance(tool_call, dict):
-            payload = dict(tool_call)
-            function = payload.get("function")
-            if isinstance(function, dict):
-                payload["function"] = dict(function)
-            return payload
-        function = getattr(tool_call, "function", None)
-        normalized: Dict[str, Any] = {
-            "id": getattr(tool_call, "id", None),
-            "type": getattr(tool_call, "type", None),
-        }
-        if function is not None:
-            normalized["function"] = {
-                "name": getattr(function, "name", None),
-                "arguments": getattr(function, "arguments", None),
-            }
-        return normalized
-
-    def _extract_model_name(self, raw_output: Any) -> str | None:
-        if isinstance(raw_output, dict):
-            for key in ("model_name", "model"):
-                value = raw_output.get(key)
-                if value is not None:
-                    return str(value)
-            return None
-        for key in ("model_name", "model"):
-            value = getattr(raw_output, key, None)
-            if value is not None:
-                return str(value)
-        return None
-
-    def _extract_provider(self, raw_output: Any) -> str | None:
-        if isinstance(raw_output, dict):
-            value = raw_output.get("provider")
-            return str(value) if value is not None else None
-        value = getattr(raw_output, "provider", None)
-        return str(value) if value is not None else None
-
-    def _extract_response_metadata(self, raw_output: Any) -> Dict[str, Any]:
-        metadata: Dict[str, Any] = {}
-        if isinstance(raw_output, dict):
-            for key in ("id", "response_id", "created"):
-                if key in raw_output:
-                    metadata[key] = raw_output.get(key)
-            return metadata
-        for key in ("id", "response_id", "created"):
-            value = getattr(raw_output, key, None)
-            if value is not None:
-                metadata[key] = value
-        return metadata
-
     def _decision_from_native_tool_calls(
         self,
         *,
@@ -2780,7 +2535,11 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         step: int,
         record: StepRecord | None,
     ) -> Decision[ActionT] | None:
-        if response is None or not isinstance(response.tool_calls, list) or not response.tool_calls:
+        if (
+            response is None
+            or not isinstance(response.tool_calls, list)
+            or not response.tool_calls
+        ):
             return None
         if not self._native_tool_call_preferred():
             if record is not None and not record.decision_source:
@@ -2869,9 +2628,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             for message in group
         }
         return [
-            message
-            for index, message in enumerate(history)
-            if index in keep_indices
+            message for index, message in enumerate(history) if index in keep_indices
         ]
 
     def _tool_transaction_parity(
@@ -3174,6 +2931,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         return Action(
             name=name or "<invalid-native-tool-call>",
             args=args,
-            action_id=(str(tool_call.get("id")) if tool_call.get("id") is not None else None),
+            action_id=(
+                str(tool_call.get("id")) if tool_call.get("id") is not None else None
+            ),
             metadata=metadata,
         )

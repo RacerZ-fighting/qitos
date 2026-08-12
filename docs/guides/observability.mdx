@@ -261,14 +261,14 @@ es.addEventListener('run_end', e => {
 
 The qita run detail page includes a **live stream** button that connects to the SSE endpoint and logs events to the browser console. This is useful for debugging and understanding the event flow of a completed run.
 
-### Streaming with AsyncEngine
+### Streaming with Engine
 
-For live runs, use `AsyncEngine.arun_stream()` to consume events programmatically:
+For live runs, use `Engine.arun_stream()` to consume events programmatically:
 
 ```python
-from qitos import AsyncEngine
+from qitos import Engine
 
-engine = AsyncEngine(agent=agent, budget=RuntimeBudget(max_steps=10))
+engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=10))
 
 async for event in engine.arun_stream("analyze the data"):
     if event.event_type == "step_end":

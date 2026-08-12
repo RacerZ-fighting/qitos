@@ -23,7 +23,9 @@ from ._types import (
 )
 
 
-def resolve_family_preset(identifier: str | None = None, *, family_id: str | None = None) -> FamilyPreset:
+def resolve_family_preset(
+    identifier: str | None = None, *, family_id: str | None = None
+) -> FamilyPreset:
     target = family_id if family_id is not None else identifier
     return resolve_builtin_preset(target)
 
@@ -73,7 +75,6 @@ def build_model_for_preset(
     max_attempts: int = 2,
     stream_idle_timeout: float = 60.0,
     retry_window_seconds: float = 300.0,
-    async_model: bool = False,
     reasoning_effort: ReasoningEffort | str | None = ReasoningEffort.HIGH,
 ) -> Any:
     harness = build_harness_policy(
@@ -113,20 +114,23 @@ def build_model_for_preset(
         max_attempts=max_attempts,
         stream_idle_timeout=stream_idle_timeout,
         retry_window_seconds=retry_window_seconds,
-        async_model=async_model,
     )
     metadata = dict(getattr(llm, "qitos_harness_metadata", {}) or {})
     metadata.update(harness.to_dict())
     metadata.setdefault(
         "decision_lane_preference",
-        "native_tool_calls"
-        if harness.tool_policy.native_tool_call_preferred
-        else "parser",
+        (
+            "native_tool_calls"
+            if harness.tool_policy.native_tool_call_preferred
+            else "parser"
+        ),
     )
     metadata.setdefault(
         "native_tool_call_preferred", harness.tool_policy.native_tool_call_preferred
     )
-    metadata.setdefault("effective_tool_delivery", harness.protocol.tool_schema_delivery)
+    metadata.setdefault(
+        "effective_tool_delivery", harness.protocol.tool_schema_delivery
+    )
     metadata["reasoning"] = reasoning.to_dict()
     setattr(llm, "qitos_harness_metadata", metadata)
     setattr(llm, "qitos_family_preset", harness.family_preset.id)

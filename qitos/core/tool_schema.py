@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import inspect
 import re
-from typing import Any, Dict, List, Optional, Tuple, get_type_hints
-
-try:
-    from typing import get_args, get_origin, Literal, Annotated
-except ImportError:
-    from typing_extensions import get_args, get_origin, Literal, Annotated  # type: ignore[assignment]
+from typing import (
+    Annotated,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 
 def function_schema(func: Any) -> Dict[str, Any]:
@@ -81,7 +86,11 @@ def parse_docstring(docstring: str) -> Dict[str, str]:
     args_start = match.end()
     # Find the next section (e.g. Returns:, Raises:, or end of docstring)
     next_section = re.search(r"^\w+:\s*\n", docstring[args_start:], re.MULTILINE)
-    args_block = docstring[args_start: args_start + next_section.start()] if next_section else docstring[args_start:]
+    args_block = (
+        docstring[args_start : args_start + next_section.start()]
+        if next_section
+        else docstring[args_start:]
+    )
 
     # Parse each parameter line — supports:
     #   name: description
@@ -154,6 +163,7 @@ def type_to_json_schema(annotation: Any) -> Dict[str, Any]:
 
     # Handle Union[X, None] explicitly (same as Optional but written differently)
     import typing
+
     if origin is getattr(typing, "Union", None):
         args = get_args(annotation)
         if args:

@@ -507,9 +507,9 @@ def _parse_param_descriptions(docstring: str) -> Dict[str, str]:
         )
         if args_match:
             for line in args_match.group(1).splitlines():
-                m = re.match(r"\s+(\w+)\s*:\s*(.*)", line)
-                if m:
-                    param_descs[m.group(1)] = m.group(2).strip()
+                google_match = re.match(r"\s+(\w+)\s*:\s*(.*)", line)
+                if google_match:
+                    param_descs[google_match.group(1)] = google_match.group(2).strip()
     return param_descs
 
 
@@ -526,7 +526,12 @@ def _strip_param_docs(docstring: str) -> str:
     skip = False
     for line in lines:
         stripped = line.lstrip()
-        if stripped.startswith(":param ") or stripped.startswith(":type ") or stripped.startswith(":return") or stripped.startswith(":raises "):
+        if (
+            stripped.startswith(":param ")
+            or stripped.startswith(":type ")
+            or stripped.startswith(":return")
+            or stripped.startswith(":raises ")
+        ):
             skip = True
             continue
         if skip and stripped.startswith(":"):
@@ -656,7 +661,11 @@ def _type_to_json(annotation: Any) -> str:
     from .tool_schema import type_to_json_schema
 
     schema = type_to_json_schema(annotation)
-    if isinstance(schema, dict) and "type" in schema and isinstance(schema["type"], str):
+    if (
+        isinstance(schema, dict)
+        and "type" in schema
+        and isinstance(schema["type"], str)
+    ):
         return schema["type"]
     return "object"
 

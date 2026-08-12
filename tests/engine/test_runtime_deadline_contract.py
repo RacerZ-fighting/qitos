@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from qitos import AgentModule, Decision, Engine, StateSchema, ToolRegistry
 from qitos.core.action import Action, ActionResult, ActionStatus
-from qitos.core.errors import ModelTransportError
+from qitos.core.errors import ModelRequestDeadlineExceeded, ModelTransportError
 from qitos.core.tool import (
     BaseTool,
     RetryPolicy,
@@ -21,7 +25,7 @@ from qitos.core.tool import (
 from qitos.engine.action_executor import ActionExecutor
 from qitos.engine.cancellation import CancelToken
 from qitos.engine.states import RuntimeBudget
-from qitos.models.base import ModelStreamChunk
+from qitos.models.base import Model, ModelStreamChunk
 
 
 class _RuntimeEngine:
@@ -405,18 +409,27 @@ def test_absolute_deadline_clamps_relative_runtime_budget() -> None:
     assert result.state.stop_reason == "budget_time"
 
 
-class _BlockingModel:
+class _BlockingModel(Model):
     def __init__(self) -> None:
-        self.entered = threading.Event()
-        self.release = threading.Event()
-        self.worker_daemon: bool | None = None
+        super().__init__(model="blocking-test-model", temperature=None)
+        self.entered = asyncio.Event()
+        self.closed = asyncio.Event()
 
-    def __call__(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
-        _ = messages, kwargs
-        self.worker_daemon = threading.current_thread().daemon
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = messages, deadline_monotonic, kwargs
         self.entered.set()
-        self.release.wait(timeout=1.0)
-        return "Final Answer: late result"
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.closed.set()
+        if False:  # pragma: no cover - preserve async-generator typing
+            yield ModelStreamChunk()
 
 
 @dataclass
@@ -425,7 +438,7 @@ class _ModelDeadlineState(StateSchema):
 
 
 class _ModelDeadlineAgent(AgentModule[_ModelDeadlineState, dict[str, Any], Any]):
-    def __init__(self, model: _BlockingModel) -> None:
+    def __init__(self, model: Model) -> None:
         super().__init__(tool_registry=ToolRegistry(), llm=model)
 
     def init_state(self, task: str, **kwargs: Any) -> _ModelDeadlineState:
@@ -442,65 +455,56 @@ class _ModelDeadlineAgent(AgentModule[_ModelDeadlineState, dict[str, Any], Any])
         return state
 
 
-def test_model_request_deadline_detaches_blocking_provider_and_discards_late_result() -> (
-    None
-):
-    model = _BlockingModel()
-    engine = Engine(
-        _ModelDeadlineAgent(model),
-        budget=RuntimeBudget(
-            max_steps=3,
-            deadline_monotonic=time.monotonic() + 0.03,
-        ),
-    )
-    started = time.monotonic()
-
-    result = engine.run("block")
-    model.release.set()
-
-    assert time.monotonic() - started < 0.2
-    assert model.entered.is_set()
-    assert model.worker_daemon is True
-    assert result.state.stop_reason == "budget_time"
-    assert result.state.final_result is None
-
-
-def test_immediate_cancel_stops_waiting_for_blocking_model() -> None:
+@pytest.mark.asyncio
+async def test_model_request_deadline_cancels_provider_and_closes_stream() -> None:
     model = _BlockingModel()
     engine = Engine(_ModelDeadlineAgent(model), budget=RuntimeBudget(max_steps=3))
-    results: list[Any] = []
-    thread = threading.Thread(target=lambda: results.append(engine.run("block")))
+    engine._runtime_deadline_monotonic = time.monotonic() + 0.03
 
-    thread.start()
-    assert model.entered.wait(timeout=0.2)
+    with pytest.raises(ModelRequestDeadlineExceeded):
+        await asyncio.wait_for(
+            engine._model_runtime._call_llm(model, [], {}),
+            timeout=1.0,
+        )
+
+    assert model.entered.is_set()
+    assert model.closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_immediate_cancel_stops_waiting_for_async_model() -> None:
+    model = _BlockingModel()
+    engine = Engine(_ModelDeadlineAgent(model), budget=RuntimeBudget(max_steps=3))
+    run_task = asyncio.create_task(engine.arun("block"))
+
+    await asyncio.wait_for(model.entered.wait(), timeout=0.2)
     engine.cancel("immediate")
-    thread.join(timeout=0.2)
-    model.release.set()
 
-    assert not thread.is_alive()
-    assert results[0].state.stop_reason == "cancelled_immediate"
-    assert results[0].state.final_result is None
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+    assert model.closed.is_set()
 
 
-class _BlockingStreamModel:
+class _BlockingStreamModel(Model):
     def __init__(self) -> None:
-        self.entered = threading.Event()
-        self.release = threading.Event()
-        self.finished = threading.Event()
+        super().__init__(model="blocking-stream-model", temperature=None)
+        self.entered = asyncio.Event()
+        self.finished = asyncio.Event()
 
-    def stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
-        _ = messages, kwargs
+    async def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[ModelStreamChunk]:
+        _ = messages, deadline_monotonic, kwargs
         try:
             yield ModelStreamChunk(text="before deadline")
             self.entered.set()
-            self.release.wait(timeout=1.0)
-            yield ModelStreamChunk(text="late", done=True)
+            await asyncio.Event().wait()
         finally:
             self.finished.set()
-
-    def __call__(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
-        _ = messages, kwargs
-        return "Final Answer: fallback"
 
 
 class _RecordingStreamHandler:
@@ -517,7 +521,8 @@ class _RecordingStreamHandler:
         self.events.append(("end", None))
 
 
-def test_model_stream_discards_callbacks_after_deadline() -> None:
+@pytest.mark.asyncio
+async def test_model_stream_stops_callbacks_after_deadline() -> None:
     model = _BlockingStreamModel()
     handler = _RecordingStreamHandler()
     engine = Engine(
@@ -529,9 +534,8 @@ def test_model_stream_discards_callbacks_after_deadline() -> None:
     )
     engine.stream_callback = handler
 
-    result = engine.run("stream")
-    model.release.set()
-    assert model.finished.wait(timeout=0.2)
+    result = await engine.arun("stream")
+    await asyncio.wait_for(model.finished.wait(), timeout=0.2)
 
     assert result.state.stop_reason == "budget_time"
     assert handler.events == [
@@ -541,9 +545,18 @@ def test_model_stream_discards_callbacks_after_deadline() -> None:
 
 
 def test_model_stream_reports_error_without_normal_end() -> None:
-    class _BrokenStreamModel:
-        def transactional_stream(self, messages: list[dict[str, Any]], **kwargs: Any):
-            _ = messages, kwargs
+    class _BrokenStreamModel(Model):
+        def __init__(self) -> None:
+            super().__init__(model="broken-stream-model", temperature=None)
+
+        async def stream(
+            self,
+            messages: list[dict[str, Any]],
+            *,
+            deadline_monotonic: float | None = None,
+            **kwargs: Any,
+        ) -> AsyncIterator[ModelStreamChunk]:
+            _ = messages, deadline_monotonic, kwargs
             yield ModelStreamChunk(text="partial")
             raise ModelTransportError(
                 "stream broke",

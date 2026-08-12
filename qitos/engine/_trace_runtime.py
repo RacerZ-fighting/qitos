@@ -8,16 +8,18 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Generic, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, TypeVar
 
 from ..core.errors import StopReason
 from ..core.spec import ExperimentSpec, RunSpec
 from ..core.state import StateSchema
 from ..core.task import Task, TaskCriterionResult, TaskResult, TaskValidationIssue
 from ..trace import runtime_event_to_trace, runtime_step_to_trace
-from ._protocol import _EngineProtocol
 from .hooks import HookContext
 from .states import RuntimeEvent, RuntimePhase, StepRecord
+
+if TYPE_CHECKING:
+    from .engine import Engine
 
 _logger = logging.getLogger("qitos.engine._trace_runtime")
 
@@ -26,7 +28,7 @@ StateT = TypeVar("StateT", bound=StateSchema)
 
 
 class _TraceRuntime(Generic[StateT]):
-    def __init__(self, engine: _EngineProtocol):
+    def __init__(self, engine: Engine[StateT, Any, Any]):
         self.engine = engine
         self.parser_error_count = 0
         self.parser_warning_count = 0
@@ -254,6 +256,8 @@ class _TraceRuntime(Generic[StateT]):
 
     def run_meta(self) -> Dict[str, Any]:
         engine = self.engine
+        run_spec = getattr(engine, "run_spec", None)
+        experiment_spec = getattr(engine, "experiment_spec", None)
         llm = getattr(engine.agent, "llm", None)
         model_name = getattr(llm, "model", None) if llm is not None else None
         harness_meta = (
@@ -261,7 +265,9 @@ class _TraceRuntime(Generic[StateT]):
             if llm is not None
             else {}
         )
-        protocol = engine.resolve_protocol() if hasattr(engine, "resolve_protocol") else None
+        protocol = (
+            engine.resolve_protocol() if hasattr(engine, "resolve_protocol") else None
+        )
         parser_name = (
             engine.parser.__class__.__name__
             if engine.parser is not None
@@ -288,7 +294,11 @@ class _TraceRuntime(Generic[StateT]):
             "model_name": model_name,
             "model_family": (
                 harness_meta.get("family_preset")
-                or (RunSpec.infer(model_name=model_name).model_family if model_name else None)
+                or (
+                    RunSpec.infer(model_name=model_name).model_family
+                    if model_name
+                    else None
+                )
             ),
             "protocol": getattr(protocol, "id", None) if protocol is not None else None,
             "protocol_resolution_source": getattr(
@@ -310,14 +320,10 @@ class _TraceRuntime(Generic[StateT]):
             "context": engine._context_runtime.run_meta(llm),
             "prompt": dict(getattr(engine, "_last_prompt_metadata", {}) or {}),
             "harness": harness_meta,
-            "run_spec": (
-                engine.run_spec.to_dict()
-                if isinstance(getattr(engine, "run_spec", None), RunSpec)
-                else None
-            ),
+            "run_spec": (run_spec.to_dict() if isinstance(run_spec, RunSpec) else None),
             "experiment_spec": (
-                engine.experiment_spec.to_dict()
-                if isinstance(getattr(engine, "experiment_spec", None), ExperimentSpec)
+                experiment_spec.to_dict()
+                if isinstance(experiment_spec, ExperimentSpec)
                 else None
             ),
         }

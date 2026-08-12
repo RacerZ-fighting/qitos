@@ -233,39 +233,33 @@ result = engine.run(task)
 
 This is equivalent to `Engine(agent=agent, ...)` and is what `agent.run()` calls internally.
 
-## AsyncEngine
+## Async execution
 
-`AsyncEngine` provides non-blocking execution for agent workflows. It wraps the same
-`Engine` loop on a daemon worker thread, making it safe to use inside `asyncio` event
-loops without letting an unresponsive synchronous call own loop or process shutdown.
-Cancellation is cooperative: the Engine is asked to stop and may finish during the
-caller's bounded cleanup grace period.
+`Engine` has one async-native execution path. `arun()` runs on the caller's event loop,
+and model providers stream without a worker-thread bridge.
 
 ```python
-from qitos import AsyncEngine
+from qitos import Engine
 
-async_engine = AsyncEngine(agent=agent, budget=RuntimeBudget(max_steps=20))
-```
-
-### `AsyncEngine.arun(task)`
-
-Run the agent loop asynchronously. Returns the same `EngineResult` as `Engine.run()`.
-
-```python
-result = await async_engine.arun("analyze the data")
+engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=20))
+result = await engine.arun("analyze the data")
 print(result.state.final_result)
 ```
 
-### `AsyncEngine.arun_stream(task)`
+Call synchronous `engine.run()` only at a synchronous application boundary. It raises
+`RuntimeError` inside an active event loop so the application cannot accidentally nest
+event loops.
+
+### `Engine.arun_stream(task)`
 
 Run the agent loop and yield structured `EngineEvent` objects as they occur — ideal for real-time UI updates or streaming progress to a client.
 
 ```python
-async for event in async_engine.arun_stream("analyze the data"):
+async for event in engine.arun_stream("analyze the data"):
     print(event.event_type, event.step_id, event.payload)
 ```
 
-Events are emitted at step boundaries (`step_start`, `step_end`), phase transitions (`decide`, `act`, `reduce`, `critic`, `check_stop`), and multi-agent events (`handoff`, `delegate`, `fanout`). The stream always begins with `run_start` and ends with exactly one `run_end`. Event queues are bounded: intermediate deliveries may be dropped under sustained backpressure, `dropped_event_count` records that loss, and the `run_end` payload includes the count while retaining terminal priority.
+Events are emitted at step boundaries (`step_start`, `step_end`), phase transitions (`decide`, `act`, `reduce`, `critic`, `check_stop`), and multi-agent events (`handoff`, `delegate`, `fanout`). The stream includes one `run_start` and ends with exactly one `run_end`. Event queues are bounded: intermediate deliveries may be dropped under sustained backpressure, `dropped_event_count` records that loss, and the `run_end` payload includes the count while retaining terminal priority.
 
 ### `EngineEvent`
 
@@ -294,23 +288,20 @@ q1 = stream.subscribe()  # asyncio.Queue for consumer 1
 q2 = stream.subscribe()  # asyncio.Queue for consumer 2
 ```
 
-### Async models
+### Model streams
 
-When the configured model implements `acall()` (from `AsyncModel`), `AsyncEngine` can invoke it without blocking the event loop. Built-in async model adapters:
+All model providers implement the canonical async `Model.stream()` contract. The Engine
+consumes provider-neutral stream chunks and preserves cancellation and request deadlines
+throughout the transaction.
 
 ```python
-from qitos.models import AsyncOpenAICompatibleModel, AsyncOpenAIModel
+from qitos.models import OpenAICompatibleModel
 
-llm = AsyncOpenAICompatibleModel(
+llm = OpenAICompatibleModel(
     model="qwen-plus",
     api_key="...",
     base_url="https://...",
 )
-result = await llm.acall([{"role": "user", "content": "Hello"}])
+engine = Engine(agent=MyAgent(llm=llm))
+result = await engine.arun("analyze the data")
 ```
-
-<Tip>
-  `AsyncEngine.arun()` works with any model — the synchronous Engine runs on a daemon
-  worker. Use async model adapters when you need provider-native cancellation or high
-  concurrency rather than only non-blocking host shutdown.
-</Tip>

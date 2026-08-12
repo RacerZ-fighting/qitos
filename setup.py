@@ -65,7 +65,13 @@ setup(
         "pyyaml>=6.0",
     ],
     extras_require={
-        "models": ["openai>=1.66.0", "litellm>=1.52.0"],
+        "models": [
+            "anthropic>=0.69.0",
+            "google-genai>=1.47.0",
+            "litellm>=1.52.0",
+            "ollama>=0.6.0",
+            "openai>=1.66.0",
+        ],
         "yaml": ["pyyaml>=6.0"],
         "benchmarks": ["datasets>=2.20.0", "huggingface_hub>=0.24.0"],
         "wandb": ["wandb>=0.16.0"],
@@ -85,6 +91,9 @@ setup(
             "pip-audit>=2.7.0",
         ],
         "all": [
+            "anthropic>=0.69.0",
+            "google-genai>=1.47.0",
+            "ollama>=0.6.0",
             "openai>=1.66.0",
             "litellm>=1.52.0",
             "pyyaml>=6.0",
