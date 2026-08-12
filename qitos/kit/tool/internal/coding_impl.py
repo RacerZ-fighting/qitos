@@ -707,6 +707,7 @@ class CodingToolSet:
             analysis.safety == CommandSafety.NEEDS_REVIEW
             and not allow_destructive
             and not allow_needs_review
+            and not self.auto_approve
             and not python_inline_smoke
         ):
             return {

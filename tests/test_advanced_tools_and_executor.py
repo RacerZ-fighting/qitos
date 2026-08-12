@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import threading
 import time
+from uuid import uuid4
 
 from qitos import Action, StateSchema, ToolPermissionContext, ToolPermissionRule, ToolRegistry
 from qitos.core.action import ActionExecutionPolicy, ActionStatus
@@ -297,6 +298,27 @@ def test_run_command_executes_in_workspace(tmp_path):
     result = tool.execute({"command": "pwd"})
     assert result["status"] == "success"
     assert str(tmp_path) in result["stdout"]
+
+
+def test_run_command_auto_approve_executes_reviewed_shell_syntax(tmp_path):
+    first = uuid4().hex
+    second = uuid4().hex
+    tool = RunCommand(workspace_root=str(tmp_path), auto_approve=True)
+
+    result = tool.execute({"command": f"printf {first} && printf {second}"})
+
+    assert tool.spec.needs_approval is False
+    assert result["status"] == "success"
+    assert result["stdout"] == first + second
+
+
+def test_run_command_auto_approve_keeps_destructive_guard(tmp_path):
+    tool = RunCommand(workspace_root=str(tmp_path), auto_approve=True)
+
+    result = tool.execute({"command": "rm -rf ."})
+
+    assert result["status"] == "error"
+    assert result["error_category"] == "destructive_command"
 
 
 def test_read_and_edit_file_preserve_line_endings(tmp_path):

@@ -18,6 +18,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Consistent direct shell execution**: `CodingToolSet` and atomic `RunCommand`
+  now honor `auto_approve=True` after shell analysis while retaining the explicit
+  destructive-command guard.
 - **Readable long tool outputs**: configure `FileArtifactStore` to save complete
   oversized results before the Engine creates a bounded model preview. Canonical
   `ToolResult.output` remains available to reducers and traces, checkpoints retain the

@@ -19,6 +19,8 @@ How to update:
 
 ### Fixed
 
+- `CodingToolSet` and the atomic `RunCommand` now apply `auto_approve=True` to
+  shell syntax classified for review while retaining the destructive-command guard.
 - Resuming a terminal checkpoint now returns its persisted state without issuing
   another model request, executing tools, or writing a descendant checkpoint.
 
