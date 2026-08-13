@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
@@ -371,7 +372,7 @@ class _ContextRuntime:
         llm: Any,
         telemetry: ContextTelemetry,
         raw_output: Any,
-        usage: Dict[str, Any] | None = None,
+        usage: Mapping[str, Any] | None = None,
     ) -> ContextTelemetry:
         if usage is not None:
             prompt_tokens = usage.get("prompt_tokens")

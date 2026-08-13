@@ -11,7 +11,7 @@ import logging
 import os
 import re
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar, cast
 
@@ -1361,7 +1361,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         handler = to_stream_handler(self.stream_callback)
         accumulated_text: List[str] = []
         accumulated_reasoning: List[str] = []
-        final_usage: Optional[Dict[str, Any]] = None
+        final_usage: Mapping[str, Any] | None = None
         final_tool_calls: Optional[List[Dict[str, Any]]] = None
         final_native_items: Optional[List[Dict[str, Any]]] = None
         final_finish_reason: Optional[str] = None
@@ -1448,7 +1448,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                             retryable=False,
                         )
                     terminal_seen = True
-                    if usage is not None and isinstance(usage, dict):
+                    if usage is not None and isinstance(usage, Mapping):
                         final_usage = usage
                     if tool_calls is not None and isinstance(tool_calls, list):
                         final_tool_calls = tool_calls
@@ -2462,7 +2462,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     text = ""
         return ModelResponse(
             text=text,
-            usage=(dict(response.usage) if isinstance(response.usage, dict) else None),
+            usage=response.usage,
             finish_reason=response.finish_reason,
             tool_calls=tool_calls,
             model_name=str(model_name) if model_name is not None else None,

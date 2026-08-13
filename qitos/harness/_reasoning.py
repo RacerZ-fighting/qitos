@@ -76,6 +76,10 @@ _KIMI_K3_POLICY = ReasoningPolicy(
     ),
     wire_format="openai_effort",
 )
+_KIMI_K3_ANTHROPIC_POLICY = ReasoningPolicy(
+    supported_efforts=_KIMI_K3_POLICY.supported_efforts,
+    wire_format="kimi_anthropic_thinking",
+)
 _OPENAI_REASONING_POLICY = ReasoningPolicy(
     supported_efforts=(
         ReasoningEffort.LOW,
@@ -86,7 +90,10 @@ _OPENAI_REASONING_POLICY = ReasoningPolicy(
     wire_format="openai_effort",
 )
 _OPENAI_GPT_56_REASONING_POLICY = ReasoningPolicy(
-    supported_efforts=(*_OPENAI_REASONING_POLICY.supported_efforts, ReasoningEffort.MAX),
+    supported_efforts=(
+        *_OPENAI_REASONING_POLICY.supported_efforts,
+        ReasoningEffort.MAX,
+    ),
     wire_format="openai_effort",
 )
 _GLM_52_POLICY = ReasoningPolicy(
@@ -139,7 +146,7 @@ def resolve_reasoning(
 ) -> ReasoningResolution:
     """Resolve reasoning intent without sending unsupported provider fields."""
     effort = parse_reasoning_effort(requested)
-    policy = _policy_for_model(family_id, model_name)
+    policy = _policy_for_model(family_id, model_name, api_mode=api_mode)
     resolved = policy.resolve(effort)
     request_options = _request_options(
         policy.wire_format,
@@ -165,12 +172,19 @@ def resolve_reasoning(
     )
 
 
-def _policy_for_model(family_id: str, model_name: str) -> ReasoningPolicy:
+def _policy_for_model(
+    family_id: str,
+    model_name: str,
+    *,
+    api_mode: str,
+) -> ReasoningPolicy:
     family = family_id.strip().lower()
     model = model_name.strip().lower()
     if family == "anthropic" and "-4-5" in model:
         return _ANTHROPIC_45_POLICY
     if family == "kimi" and "k3" in model:
+        if api_mode.strip().lower() in {"messages", "anthropic_messages"}:
+            return _KIMI_K3_ANTHROPIC_POLICY
         return _KIMI_K3_POLICY
     if family == "kimi" and "k2" in model:
         return _THINKING_OBJECT_POLICY
@@ -217,6 +231,11 @@ def _request_options(
             visible_reserve = max(1_024, max_output_tokens // 4)
             budget = min(budget, max_output_tokens - visible_reserve)
         return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+    if wire_format == "kimi_anthropic_thinking":
+        return {
+            "thinking": {"type": "enabled"},
+            "output_config": {"effort": effort.value},
+        }
     return {}
 
 

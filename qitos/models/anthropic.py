@@ -9,6 +9,11 @@ from collections.abc import AsyncIterator
 from typing import Any, Dict, List, Optional, cast
 
 from ..core.errors import ModelTransportError
+from ..core.model_capabilities import (
+    ModelAPI,
+    ModelCapabilities,
+    ReasoningCapability,
+)
 from ..core.multimodal import content_to_text, normalize_content_block
 from .transport import (
     ModelRetryPolicy,
@@ -16,8 +21,10 @@ from .transport import (
     effective_request_timeout,
     transactional_stream_with_retry,
 )
-from .base import Model, ModelStreamChunk
-
+from .base import (
+    Model,
+    ModelStreamChunk,
+)
 
 _ANTHROPIC_BLOCK_TYPES = {
     "text",
@@ -367,6 +374,7 @@ class AnthropicModel(Model):
         max_attempts: int = 2,
         stream_idle_timeout: float = 60.0,
         retry_window_seconds: float = 300.0,
+        provider_name: str | None = None,
     ) -> None:
         super().__init__(
             model=model,
@@ -374,6 +382,7 @@ class AnthropicModel(Model):
             temperature=temperature,
             max_tokens=max_tokens,
             context_window=context_window,
+            provider_name=provider_name,
         )
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
@@ -391,6 +400,20 @@ class AnthropicModel(Model):
         self.retry_policy = ModelRetryPolicy(
             max_attempts=max_attempts,
             retry_window_seconds=retry_window_seconds,
+        )
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        """Return behavior covered by the native Messages adapter contracts."""
+
+        return ModelCapabilities(
+            api=ModelAPI.ANTHROPIC_MESSAGES,
+            native_tool_calls=True,
+            reasoning=(ReasoningCapability.THINKING,),
+            opaque_replay=True,
+            usage=True,
+            prompt_cache_usage=True,
+            multimodal_input=True,
         )
 
     def _system_text(self, messages: List[Dict[str, Any]]) -> str:

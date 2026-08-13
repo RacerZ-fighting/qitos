@@ -100,6 +100,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
             max_attempts=max_attempts,
             stream_idle_timeout=stream_idle_timeout,
             retry_window_seconds=retry_window_seconds,
+            provider_name=preset.id,
         )
         setattr(
             llm,
@@ -132,23 +133,17 @@ class AnthropicAdapter(ModelAdapter):
 
         raw_temperature = kwargs.get("temperature")
         temperature = (
-            _coerce_float(raw_temperature, 0.7)
-            if raw_temperature is not None
-            else None
+            _coerce_float(raw_temperature, 0.7) if raw_temperature is not None else None
         )
         context_window = kwargs.get("context_window")
         default_request_kwargs = kwargs.get("default_request_kwargs")
         llm = AnthropicModel(
             model=model_name,
             api_key=(
-                str(kwargs["api_key"])
-                if kwargs.get("api_key") is not None
-                else None
+                str(kwargs["api_key"]) if kwargs.get("api_key") is not None else None
             ),
             base_url=(
-                str(kwargs["base_url"])
-                if kwargs.get("base_url") is not None
-                else None
+                str(kwargs["base_url"]) if kwargs.get("base_url") is not None else None
             ),
             system_prompt=(
                 str(kwargs["system_prompt"])
@@ -173,12 +168,11 @@ class AnthropicAdapter(ModelAdapter):
                 else None
             ),
             max_attempts=_coerce_int(kwargs.get("max_attempts"), 2),
-            stream_idle_timeout=_coerce_float(
-                kwargs.get("stream_idle_timeout"), 60.0
-            ),
+            stream_idle_timeout=_coerce_float(kwargs.get("stream_idle_timeout"), 60.0),
             retry_window_seconds=_coerce_float(
                 kwargs.get("retry_window_seconds"), 300.0
             ),
+            provider_name=preset.id,
         )
         setattr(
             llm,

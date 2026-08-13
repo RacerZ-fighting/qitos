@@ -36,10 +36,11 @@ def build_harness_policy(
     family_id: str | None = None,
     protocol: Any = None,
     tool_delivery: str | None = None,
+    adapter_kind: str | None = None,
     resolution_source: str = "family_preset",
 ) -> HarnessPolicy:
     preset = resolve_family_preset(model_name, family_id=family_id)
-    adapter = adapter_for_kind(preset.adapter_kind)
+    adapter = adapter_for_kind(adapter_kind or preset.adapter_kind)
     protocol_obj = build_protocol_for_preset(
         preset=preset,
         protocol=protocol,
@@ -65,6 +66,7 @@ def build_model_for_preset(
     base_url: str | None = None,
     protocol: Any = None,
     tool_delivery: str | None = None,
+    adapter_kind: str | None = None,
     temperature: float | None = 0.2,
     max_tokens: int = 2048,
     timeout: int = 120,
@@ -82,6 +84,10 @@ def build_model_for_preset(
         family_id=family_id,
         protocol=protocol,
         tool_delivery=tool_delivery,
+        adapter_kind=adapter_kind,
+        resolution_source=(
+            "explicit_adapter" if adapter_kind is not None else "family_preset"
+        ),
     )
     reasoning = resolve_reasoning(
         family_id=harness.family_preset.id,
@@ -92,7 +98,11 @@ def build_model_for_preset(
     )
     # Merge preset recommendations, caller options, then the resolved reasoning
     # contract. Explicit reasoning intent is authoritative for its wire fields.
-    preset_kwargs = harness.family_preset.recommended_request_kwargs
+    preset_kwargs = (
+        harness.family_preset.recommended_request_kwargs
+        if harness.adapter.kind == harness.family_preset.adapter_kind
+        else None
+    )
     effective_kwargs = _merge_request_options(
         preset_kwargs,
         default_request_kwargs,

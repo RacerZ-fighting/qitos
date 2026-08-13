@@ -19,6 +19,13 @@ How to update:
 
 ### Fixed
 
+- A family preset can now select a different explicit wire adapter without carrying
+  request defaults from the preset's original adapter. This lets Kimi K3 use either
+  compatible Chat Completions or Anthropic Messages while preserving the Kimi family
+  identity and mapping Messages reasoning to `thinking` plus `output_config.effort`.
+- Local trace events now retain the completed model transaction's provider, model,
+  finish reason, typed usage, and usage source while recursively redacting nested
+  credential fields.
 - Anthropic presets now build the native Messages adapter, preserve default request
   options through every construction path, and map Claude 4.5 reasoning effort to a
   bounded manual thinking budget that reaches the provider payload. Presets prefer
@@ -35,6 +42,13 @@ How to update:
 
 ### Added
 
+- Added immutable `ModelCapabilities` snapshots for configured adapters. OpenAI
+  Responses, Anthropic Messages, and compatible Chat Completions now report only
+  tested transport facts such as native tools, reasoning replay, usage/cache
+  reporting, and multimodal input; continuation and hosted tools remain disabled
+  until their runtime contracts are complete. Completed model transactions now
+  normalize token counts into typed `ModelUsage` while retaining the lossless
+  provider usage mapping for cache, trace, and compatibility consumers.
 - `AgentModule.mcp_servers` now forms a complete opt-in Engine lifecycle: an empty
   list is inert, while configured servers connect after preflight, expose bounded
   `mcp__server__tool` names for the first model turn, and close at run end.

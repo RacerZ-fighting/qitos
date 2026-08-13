@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Dict
+from typing import AbstractSet, Any, Dict
 
 from .models import SpanData
 
@@ -76,17 +76,22 @@ class RedactingSpanData(SpanData):
         return self._span_data.type
 
 
-def _redact_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+def _redact_dict(
+    data: Dict[str, Any],
+    *,
+    fields: AbstractSet[str] = _REDACTED_FIELDS,
+) -> Dict[str, Any]:
     """Return a copy of *data* with redacted fields replaced."""
     redacted: Dict[str, Any] = {}
     for key, value in data.items():
-        if key in _REDACTED_FIELDS:
+        if key in fields:
             redacted[key] = _REDACTED_MARKER
         elif isinstance(value, dict):
-            redacted[key] = _redact_dict(value)
+            redacted[key] = _redact_dict(value, fields=fields)
         elif isinstance(value, list):
             redacted[key] = [
-                _redact_dict(v) if isinstance(v, dict) else v for v in value
+                _redact_dict(v, fields=fields) if isinstance(v, dict) else v
+                for v in value
             ]
         else:
             redacted[key] = value

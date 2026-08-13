@@ -31,8 +31,12 @@ def test_resolve_family_preset_for_gold_families() -> None:
 
 
 def test_profile_registry_is_derived_from_presets() -> None:
-    assert infer_model_profile("GLM-5.1-sii").default_protocol == "json_decision_multi_v1"
-    assert infer_model_profile("moonshot-v1-128k").default_protocol == "json_decision_v1"
+    assert (
+        infer_model_profile("GLM-5.1-sii").default_protocol == "json_decision_multi_v1"
+    )
+    assert (
+        infer_model_profile("moonshot-v1-128k").default_protocol == "json_decision_v1"
+    )
     assert infer_model_profile("gpt-oss-120b").default_protocol == "json_decision_v1"
     assert infer_model_profile("gemma-4-31b-it").default_protocol == "json_decision_v1"
     assert infer_default_protocol("MiniMax-M2.5") == "minimax_tool_call_v1"
@@ -81,6 +85,7 @@ def test_build_model_for_preset_attaches_harness_metadata() -> None:
     assert metadata["decision_lane_preference"] == "native_tool_calls"
     assert metadata["effective_tool_delivery"] == "api_parameter"
     assert llm.timeout == 120
+    assert llm.provider_name == "qwen"
 
 
 def test_build_model_for_glm_preset_attaches_native_tool_call_metadata() -> None:
@@ -178,7 +183,9 @@ def test_same_claude_code_agent_switches_across_gold_families(tmp_path: Path) ->
 
 def test_harness_metadata_reaches_trace_manifest(tmp_path: Path) -> None:
     harness = build_harness_policy(family_id="kimi")
-    llm = SequenceModel(['{"thought":"done","final_answer":"ok"}'], model="moonshot-v1-128k")
+    llm = SequenceModel(
+        ['{"thought":"done","final_answer":"ok"}'], model="moonshot-v1-128k"
+    )
     setattr(
         llm,
         "qitos_harness_metadata",
@@ -214,7 +221,10 @@ def test_harness_metadata_reaches_trace_manifest(tmp_path: Path) -> None:
     assert manifest["model_family"] == "kimi"
     assert manifest["prompt_protocol"] == "json_decision_v1"
     assert manifest["run_spec"]["metadata"]["family_preset"] == "kimi"
-    assert manifest["run_spec"]["metadata"]["harness_policy"]["protocol"] == "json_decision_v1"
+    assert (
+        manifest["run_spec"]["metadata"]["harness_policy"]["protocol"]
+        == "json_decision_v1"
+    )
     assert manifest["summary"]["run_meta"]["budget"] == {
         "max_steps": 2,
         "max_runtime_seconds": None,

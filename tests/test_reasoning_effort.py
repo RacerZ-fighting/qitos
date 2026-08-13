@@ -267,6 +267,59 @@ def test_anthropic_manual_thinking_preserves_visible_output_room() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("requested", "sent"),
+    [
+        ("low", "low"),
+        ("medium", "high"),
+        ("high", "high"),
+        ("xhigh", "max"),
+        ("max", "max"),
+    ],
+)
+def test_kimi_reasoning_maps_to_anthropic_compatible_fields(
+    requested: str,
+    sent: str,
+) -> None:
+    resolution = resolve_reasoning(
+        family_id="kimi",
+        model_name="kimi-k3",
+        api_mode="messages",
+        requested=requested,
+    )
+
+    assert resolution.resolved.value == sent
+    assert resolution.request_options == {
+        "thinking": {"type": "enabled"},
+        "output_config": {"effort": sent},
+    }
+    assert resolution.effective_budget_tokens is None
+
+
+def test_kimi_preset_can_use_anthropic_compatible_transport() -> None:
+    model = build_model_for_preset(
+        family_id="kimi",
+        model_name="kimi-k3",
+        api_key="test-key",
+        base_url="https://example.test",
+        api_mode="messages",
+        adapter_kind="anthropic",
+        reasoning_effort="medium",
+        max_attempts=1,
+    )
+
+    assert isinstance(model, AnthropicModel)
+    assert model.provider_name == "kimi"
+    assert model.default_request_kwargs == {
+        "thinking": {"type": "enabled"},
+        "output_config": {"effort": "high"},
+    }
+    assert model.qitos_harness_metadata["family_preset"] == "kimi"
+    assert model.qitos_harness_metadata["adapter_kind"] == "anthropic"
+    assert model.qitos_harness_metadata["resolution_source"] == "explicit_adapter"
+    assert model.qitos_harness_metadata["native_tool_call_preferred"] is True
+
+
 def test_anthropic_preset_builds_native_messages_model() -> None:
     model = build_model_for_preset(
         family_id="anthropic",
@@ -275,9 +328,7 @@ def test_anthropic_preset_builds_native_messages_model() -> None:
         reasoning_effort="medium",
         max_tokens=8_192,
         max_attempts=1,
-        default_request_kwargs={
-            "thinking": {"type": "disabled", "budget_tokens": 999}
-        },
+        default_request_kwargs={"thinking": {"type": "disabled", "budget_tokens": 999}},
     )
 
     assert isinstance(model, AnthropicModel)
@@ -286,10 +337,7 @@ def test_anthropic_preset_builds_native_messages_model() -> None:
     }
     assert model.qitos_harness_metadata["adapter_kind"] == "anthropic"
     assert model.qitos_harness_metadata["reasoning"]["resolved"] == "medium"
-    assert (
-        model.qitos_harness_metadata["reasoning"]["effective_budget_tokens"]
-        == 2_048
-    )
+    assert model.qitos_harness_metadata["reasoning"]["effective_budget_tokens"] == 2_048
     assert model.qitos_harness_metadata["native_tool_call_preferred"] is True
     assert model.qitos_harness_metadata["effective_tool_delivery"] == "api_parameter"
     assert model.qitos_protocol.tool_schema_delivery == "api_parameter"

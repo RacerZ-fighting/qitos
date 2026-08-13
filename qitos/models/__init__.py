@@ -5,8 +5,17 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from ..core.model_capabilities import (
+    ModelAPI,
+    ModelCapabilities,
+    ReasoningCapability,
+)
 from .anthropic import AnthropicModel
-from .base import Model, ModelFactory, ModelStreamChunk
+from .base import (
+    Model,
+    ModelFactory,
+    ModelStreamChunk,
+)
 from .context_registry import infer_context_window
 from .gemini import GeminiModel
 from .litellm import LiteLLMModel
@@ -71,9 +80,12 @@ __all__ = [
     "GeminiModel",
     "LiteLLMModel",
     "Model",
+    "ModelAPI",
+    "ModelCapabilities",
     "ModelFactory",
     "ModelProfile",
     "ModelStreamChunk",
+    "ReasoningCapability",
     "OllamaModel",
     "OpenAICompatibleModel",
     "OpenAIModel",

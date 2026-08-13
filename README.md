@@ -18,6 +18,15 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Truthful model capability snapshots**: configured adapters expose immutable
+  `ModelCapabilities`. Responses, Anthropic Messages, and compatible Chat report
+  tested native-tool, reasoning/replay, usage/cache, and multimodal behavior without
+  claiming unfinished continuation or hosted-tool support. Their terminal token
+  counts are normalized into typed `ModelUsage` without discarding provider details.
+- **Family and wire can be selected independently**: one Kimi family configuration can
+  use compatible Chat Completions or Anthropic Messages without leaking wire-specific
+  request defaults across adapters. Local traces retain model identity, finish state,
+  typed usage, and usage source while nested credentials remain redacted.
 - **Async-safe context fallback**: synchronous `CompactHistory.retrieve()` no longer
   invokes an async `Model` as a callable. It uses a bounded heuristic summary and
   records that mode, preventing context compaction from failing merely because the

@@ -1,4 +1,5 @@
 """Tests for config security — API key masking and tracing redaction."""
+
 from __future__ import annotations
 
 import json
@@ -37,8 +38,17 @@ def test_model_config_preserves_other_fields():
 
 def test_redacted_fields_includes_sensitive_names():
     """_REDACTED_FIELDS includes common sensitive field names."""
-    expected = {"api_key", "authorization", "token", "secret", "password",
-                "access_token", "refresh_token", "private_key", "credentials"}
+    expected = {
+        "api_key",
+        "authorization",
+        "token",
+        "secret",
+        "password",
+        "access_token",
+        "refresh_token",
+        "private_key",
+        "credentials",
+    }
     assert expected.issubset(_REDACTED_FIELDS)
 
 
@@ -120,16 +130,47 @@ def test_trace_writer_redacts_sensitive_manifest_and_events(tmp_path):
     assert "sk-raw-secret" not in manifest_text
     assert "raw-token" not in manifest_text
     assert "Bearer raw-secret" not in event_text
-    assert (
-        manifest["run_spec"]["environment"]["api_key"]
-        == _REDACTED_MARKER
-    )
-    assert (
-        manifest["run_spec"]["environment"]["nested"]["token"]
-        == _REDACTED_MARKER
-    )
+    assert manifest["run_spec"]["environment"]["api_key"] == _REDACTED_MARKER
+    assert manifest["run_spec"]["environment"]["nested"]["token"] == _REDACTED_MARKER
     assert event["payload"]["authorization"] == _REDACTED_MARKER
     assert event["payload"]["safe"] == "visible"
+
+
+def test_trace_writer_retains_model_transaction_facts(tmp_path):
+    """Trace persistence keeps model identity and usage while redacting secrets."""
+    writer = TraceWriter(
+        output_dir=str(tmp_path),
+        run_id="model-transaction",
+        strict_validate=False,
+    )
+    writer.write_event(
+        TraceEvent(
+            run_id="model-transaction",
+            step_id=0,
+            phase="DECIDE",
+            payload={
+                "stage": "model_output",
+                "model_response": {
+                    "provider": "demo-provider",
+                    "model_name": "demo-model",
+                    "finish_reason": "stop",
+                    "usage": {"total_tokens": 7},
+                    "usage_source": "provider",
+                    "metadata": {"api_key": "raw-secret"},
+                },
+            },
+        )
+    )
+    writer.finalize(status="failed", summary={})
+
+    event = json.loads((tmp_path / "model-transaction" / "events.jsonl").read_text())
+    response = event["payload"]["model_response"]
+    assert response["provider"] == "demo-provider"
+    assert response["model_name"] == "demo-model"
+    assert response["finish_reason"] == "stop"
+    assert response["usage"] == {"total_tokens": 7}
+    assert response["usage_source"] == "provider"
+    assert response["metadata"]["api_key"] == _REDACTED_MARKER
 
 
 def test_benchmark_result_writer_redacts_sensitive_metadata(tmp_path):

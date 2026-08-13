@@ -18,6 +18,14 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **真实的模型能力快照**：模型 adapter 现在暴露不可变的 `ModelCapabilities`。
+  Responses、Anthropic Messages 与兼容 Chat 只声明已经通过测试的原生工具、
+  reasoning/replay、usage/cache 与多模态能力，不提前宣称尚未闭环的 continuation
+  或 hosted tool；终态 token 用量会收敛为类型化 `ModelUsage`，同时保留 Provider
+  原始明细。
+- **模型家族与 wire 可独立选择**：同一 Kimi 家族配置可使用兼容 Chat Completions
+  或 Anthropic Messages，且不会把一种 adapter 的请求默认值泄漏到另一种 wire。
+  本地 trace 会保留模型身份、终态、类型化 usage 及其来源，同时继续遮蔽嵌套凭据。
 - **上下文压缩不再错调异步模型**：同步 `CompactHistory.retrieve()` 遇到 QitOS
   异步 `Model` 时会使用有界 heuristic summary 并记录实际模式，不再把异步模型当
   普通函数调用，也不引入 sync/async event-loop 桥。
