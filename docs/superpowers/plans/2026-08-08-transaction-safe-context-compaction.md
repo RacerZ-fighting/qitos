@@ -22,6 +22,9 @@ or depend on those projects.
 - [x] Reuse bounded summary checkpoints only when their exact source remains a prefix.
 - [x] Use `.70/.50/.35` transaction-safe projections for bounded reactive recovery.
 - [x] Emit budget source, occupancy, compaction level, source version, and digest telemetry.
+- [x] Exercise one multi-turn Run through compaction, cancellation, committed-boundary
+      fork, and resume while preserving canonical ToolCall/ToolResult parity and the
+      continuation rules for each branch.
 - [x] Run the repository's focused tests and changed-surface lint gate; record the
       repository's unrelated collection and static-analysis baselines separately.
 
