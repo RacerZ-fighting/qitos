@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **同一个异步 turn 事务**：完整 Run 与交互式 step 现在共用一份不可变 turn
+  事务。Parser、Critic 与 handoff 作为组合策略接入，不再各自占据或复制 Agent loop；
+  Tool、Mailbox、MCP 与 Child 始终运行在调用方 event loop，取消会先等待已启动 handler
+  清理并按输入顺序写完 terminal 结果。
 - **Session Journal 只有一个 owner**：每个 Run 现在使用进程安全的 JSONL writer lease
   和明确的终止生命周期。replay 始终先验证 canonical JSONL；可丢弃的 SQLite 读取投影只有
   在与 JSONL 一致时才会保留，并会在过期或损坏后重建。payload 在 append 前先通过唯一的

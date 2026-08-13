@@ -30,6 +30,11 @@ description: "Engine 是执行内核，负责驱动智能体循环、执行动�
 8. **check_stop**：检查产品完成策略、预算、`agent.should_stop()` 和自定义条件。
 9. **commit**：完整事务就绪后才推进 Journal、trace 和安全快照。
 
+`Engine.arun()` 与 `Engine.astep()` 现在共用同一个 turn 事务实现。外层 Engine 只负责
+Run 初始化、安全点准入、预算/取消检查和资源清理，不再维护第二份 step 流程。Provider
+传输与请求投影留在 model runtime，响应到 `Decision` 的解析由独立 decision runtime
+组合进入；Critic 与 handoff 是事务外围的可选控制策略，不是另一条 Agent loop。
+
 ## 构造函数
 
 ```python

@@ -34,6 +34,13 @@ safe-point input → capture turn → decide → act → reduce → critics → 
 9. **commit** — Journal state, trace records, and safe snapshots advance only after the
    complete transaction is ready.
 
+`Engine.arun()` and `Engine.astep()` both delegate this sequence to the same turn
+transaction. The outer Engine owns Run setup, safe-point admission, budget/cancellation
+checks, and cleanup; it does not maintain a second step implementation. Provider
+transport and request projection remain in the model runtime, while response-to-
+`Decision` parsing is a composed decision runtime. Critics and handoff are optional
+control policies around the transaction rather than alternate Agent loops.
+
 ## Constructor
 
 ```python

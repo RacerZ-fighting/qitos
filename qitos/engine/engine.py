@@ -12,7 +12,7 @@ import traceback
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar, cast
+from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
 from uuid import uuid4
 
 _logger = logging.getLogger("qitos.engine")
@@ -63,12 +63,14 @@ from ..models.profile_registry import infer_default_protocol, infer_model_profil
 from ._action_runtime import _ActionRuntime
 from ._context_runtime import _ContextRuntime
 from ._control_runtime import _ControlRuntime
+from ._decision_runtime import _DecisionRuntime
 from ._env_runtime import _EnvRuntime
 from ._loop_detector import ToolCallLoopDetector
 from ._model_runtime import _ModelRuntime
 from ._handoff_runtime import _HandoffRuntime
 from ._journal_runtime import _JournalRuntime, history_message_to_dict
 from ._trace_runtime import _TraceRuntime
+from ._turn_runtime import _TurnRuntime
 from .action_executor import ActionExecutor
 from .cancellation import CancelMode, CancelToken
 from .branching import BranchSelector, FirstCandidateSelector
@@ -385,6 +387,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._model_runtime: _ModelRuntime[StateT, ObservationT, ActionT] = (
             _ModelRuntime(self)
         )
+        self._decision_runtime: _DecisionRuntime[StateT, ObservationT, ActionT] = (
+            _DecisionRuntime(self, self._model_runtime)
+        )
         self._action_runtime: _ActionRuntime[StateT, ActionT] = _ActionRuntime(self)
         self._journal_runtime: _JournalRuntime[StateT, ActionT] = _JournalRuntime(self)
         self._env_runtime: _EnvRuntime[StateT, ObservationT, ActionT] = _EnvRuntime(
@@ -392,6 +397,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         )
         self._control_runtime: _ControlRuntime[StateT, ObservationT, ActionT] = (
             _ControlRuntime(self)
+        )
+        self._turn_runtime: _TurnRuntime[StateT, ObservationT, ActionT] = (
+            _TurnRuntime(self)
         )
         self._trace_runtime: _TraceRuntime[StateT] = _TraceRuntime(self)
         self._handoff_runtime: _HandoffRuntime[StateT, ObservationT, ActionT] = (
@@ -756,197 +764,22 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         state: StateT,
         observation: ObservationT,
     ) -> StepResult:
-        """Execute a single decide → act → reduce step.
+        """Execute one canonical immutable turn on the caller's event loop.
 
-        Returns a :class:`StepResult` with the decision, action results,
-        new observation, and stop status.
-
-        The caller can inspect ``result.stop`` to decide whether to
-        continue the loop.
+        Interactive callers own step advancement; full runs use the same turn
+        runtime with transactional advancement and persistence enabled.
         """
-        from .interrupt import (
-            EngineInterrupt,
-            InterruptInfo,
-            _reset_interrupt_context,
+
+        self._drain_runtime_events(state.current_step)
+        execution = await self._turn_runtime.execute(
+            state,
+            observation,
+            task=self._active_task or state.task,
+            started_at=time.monotonic(),
+            step_id=state.current_step,
+            managed_run=False,
         )
-
-        _reset_interrupt_context()
-        step_id = state.current_step
-        started_at = time.monotonic()
-        turn = self._capture_turn(state, step_id)
-        record = StepRecord(step_id=step_id, agent_id=self.agent.name)
-        self.records.append(record)
-
-        # DECIDE
-        try:
-            decision = await self._run_decide(state, observation, record, turn)
-        except EngineInterrupt as ei:
-            # Save checkpoint and report interrupt
-            cp_id = await self._save_interrupt_checkpoint(step_id, state, ei)
-            info = InterruptInfo(
-                interrupt_id=ei.interrupt_id,
-                checkpoint_id=cp_id,
-                value=ei.value,
-            )
-            self._emit(
-                step_id,
-                RuntimePhase.INTERRUPT,
-                ok=True,
-                payload={"interrupt_id": ei.interrupt_id},
-            )
-            self._finalize_step(record, state)
-            return StepResult(
-                step_id=step_id,
-                decision=None,
-                record=record,
-                observation=observation,
-                action_results=[],
-                stop=True,
-                stop_reason=StopReason.INTERRUPT,
-                interrupt_info=info,
-            )
-        except Exception as exc:
-            failed_phase = self._infer_failed_phase(record)
-            if self._recover(state, failed_phase, exc):
-                self._finalize_step(record, state)
-                return StepResult(
-                    step_id=step_id,
-                    decision=None,
-                    record=record,
-                    observation=observation,
-                    action_results=[],
-                    stop=False,
-                    recovered=True,
-                )
-            self._finalize_step(record, state)
-            return StepResult(
-                step_id=step_id,
-                decision=None,
-                record=record,
-                observation=observation,
-                action_results=[],
-                stop=True,
-                stop_reason=StopReason.UNRECOVERABLE_ERROR,
-                error=exc,
-            )
-
-        # Handle non-act modes directly
-        if decision.mode in ("final", "wait", "handoff"):
-            if decision.mode == "final":
-                new_observation = self._build_observation_after_action(
-                    state, step_id, started_at, decision, []
-                )
-                record.observation = new_observation
-                self._memory_append("observation", new_observation, record.step_id)
-                self._run_reduce(state, new_observation, decision, record)
-                stop = self._run_check_stop(state, decision, step_id, started_at)
-                self._finalize_step(record, state)
-                return StepResult(
-                    step_id=step_id,
-                    decision=decision,
-                    record=record,
-                    observation=new_observation,
-                    action_results=[],
-                    stop=stop,
-                    stop_reason=(
-                        StopReason(state.stop_reason)
-                        if stop and state.stop_reason
-                        else None
-                    ),
-                )
-            self._finalize_step(record, state)
-            return StepResult(
-                step_id=step_id,
-                decision=decision,
-                record=record,
-                observation=observation,
-                action_results=[],
-                stop=(decision.mode == "final"),
-                stop_reason=StopReason.FINAL if decision.mode == "final" else None,
-            )
-
-        # ACT
-        try:
-            action_results = await self._run_act(state, decision, record, turn)
-        except Exception as exc:
-            failed_phase = self._infer_failed_phase(record)
-            if self._recover(state, failed_phase, exc):
-                self._finalize_step(record, state)
-                return StepResult(
-                    step_id=step_id,
-                    decision=decision,
-                    record=record,
-                    observation=observation,
-                    action_results=[],
-                    stop=False,
-                    recovered=True,
-                )
-            self._finalize_step(record, state)
-            return StepResult(
-                step_id=step_id,
-                decision=decision,
-                record=record,
-                observation=observation,
-                action_results=[],
-                stop=True,
-                stop_reason=StopReason.UNRECOVERABLE_ERROR,
-                error=exc,
-            )
-
-        # REDUCE
-        new_observation = self._build_observation_after_action(
-            state, step_id, started_at, decision, action_results
-        )
-        record.observation = new_observation
-        self._memory_append("observation", new_observation, record.step_id)
-        try:
-            self._run_reduce(state, new_observation, decision, record)
-        except EngineInterrupt as ei:
-            cp_id = await self._save_interrupt_checkpoint(step_id, state, ei)
-            info = InterruptInfo(
-                interrupt_id=ei.interrupt_id,
-                checkpoint_id=cp_id,
-                value=ei.value,
-            )
-            self._emit(
-                step_id,
-                RuntimePhase.INTERRUPT,
-                ok=True,
-                payload={"interrupt_id": ei.interrupt_id},
-            )
-            self._finalize_step(record, state)
-            return StepResult(
-                step_id=step_id,
-                decision=decision,
-                record=record,
-                observation=new_observation,
-                action_results=action_results,
-                stop=True,
-                stop_reason=StopReason.INTERRUPT,
-                interrupt_info=info,
-            )
-
-        # CHECK STOP
-        stop = self._run_check_stop(state, decision, step_id, started_at)
-        self._finalize_step(record, state)
-
-        stop_reason = None
-        if stop:
-            stop_reason = (
-                StopReason(state.stop_reason)
-                if state.stop_reason
-                else StopReason.MAX_STEPS
-            )
-
-        return StepResult(
-            step_id=step_id,
-            decision=decision,
-            record=record,
-            observation=new_observation,
-            action_results=action_results,
-            stop=stop,
-            stop_reason=stop_reason,
-        )
+        return execution.step
 
     def step(
         self,
@@ -1283,24 +1116,23 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         source="input",
                     )
             while True:
-                # -- Cancellation check --
-                if self._cancel_token.is_cancel_requested:
-                    if self._cancel_token.mode == CancelMode.IMMEDIATE:
-                        state.set_stop(StopReason.CANCELLED_IMMEDIATE)
-                        self._emit(
-                            step_id,
-                            RuntimePhase.END,
-                            ok=False,
-                            payload={"stop_reason": state.stop_reason},
-                        )
-                        await self._journal_interrupt_run(
-                            step_id=step_id,
-                            reason=StopReason.CANCELLED_IMMEDIATE.value,
-                        )
-                        journal_interrupted = True
-                        break
-                    # after_step: break after this iteration's step completes
-                    # (checked again at end of loop body below)
+                if (
+                    self._cancel_token.is_cancel_requested
+                    and self._cancel_token.mode == CancelMode.IMMEDIATE
+                ):
+                    state.set_stop(StopReason.CANCELLED_IMMEDIATE)
+                    self._emit(
+                        step_id,
+                        RuntimePhase.END,
+                        ok=False,
+                        payload={"stop_reason": state.stop_reason},
+                    )
+                    await self._journal_interrupt_run(
+                        step_id=step_id,
+                        reason=StopReason.CANCELLED_IMMEDIATE.value,
+                    )
+                    journal_interrupted = True
+                    break
 
                 if self._budget_exhausted(step_id, state):
                     self._emit(
@@ -1311,528 +1143,39 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     )
                     break
 
+                # External input is accepted only here. The turn runtime then
+                # captures one immutable provider/tool/config view and commits
+                # one complete transaction before control returns.
                 self._drain_runtime_events(step_id)
-
-                # Safe point: external input has been projected and the exact
-                # model/history/tool/config view is now frozen for this turn.
-                turn = self._capture_turn(state, step_id)
-
-                self.validation_gate.before_phase(state, RuntimePhase.DECIDE.value)
-
-                record = StepRecord(step_id=step_id, agent_id=self.agent.name)
-                self.records.append(record)
-                record.transaction_id = f"step-{step_id}-{uuid4().hex[:12]}"
-                step_before = state.to_dict()
-                if self.journal is not None:
-                    state = type(state).from_dict(step_before)
-                    step_before = state.to_dict()
-
-                self._dispatch_hook(
-                    "on_before_step",
-                    HookContext(
-                        task=task_text,
-                        step_id=step_id,
-                        phase=RuntimePhase.DECIDE,
-                        state=state,
-                        observation=current_observation,
-                        record=record,
-                    ),
+                execution = await self._turn_runtime.execute(
+                    state,
+                    current_observation,
+                    task=task_text,
+                    started_at=started_at,
+                    step_id=step_id,
                 )
-                try:
-                    decision = await self._run_decide(
-                        state,
-                        current_observation,
-                        record,
-                        turn,
-                    )
-                    await self._journal_model_completed(record, decision)
-                except Exception as exc:
-                    if isinstance(exc, JournalError):
-                        raise
-                    failed_phase = self._infer_failed_phase(record)
-                    if not self._recover(state, failed_phase, exc):
-                        self._finalize_step(record, state)
-                        self._emit(
-                            step_id,
-                            RuntimePhase.END,
-                            ok=False,
-                            payload={"stop_reason": state.stop_reason},
-                        )
-                        await self._journal_interrupt_run(
-                            step_id=step_id,
-                            reason=state.stop_reason or "unrecoverable_error",
-                        )
-                        journal_interrupted = True
-                        break
-                    self._finalize_step(record, state)
-                    current_observation = self._build_initial_observation(
-                        state, step_id + 1, started_at
-                    )
-                    state.advance_step()
-                    await self._journal_snapshot_state(
-                        state,
-                        step_id=step_id,
-                        reason="recovery",
-                        record_id=f"{record.transaction_id}:recovery",
-                    )
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.RECOVER,
-                            state=state,
-                            record=record,
-                            stop_reason=state.stop_reason,
-                            journal_position=self._last_journal_position,
-                        ),
-                    )
-                    step_id += 1
-                    continue
-
-                # Handoff: swap agent within the same loop, skip act/reduce/critic
-                if decision.mode == "handoff":
-                    if self.agent_registry is None:
-                        raise ValueError("handoff requires agent_registry on Engine")
-                    target_name = decision.meta.get("handoff_target", "")
-                    # Loop detection: reject if target already in history (cycle)
-                    if target_name in self._handoff_history:
-                        from ..core.errors import QitosRuntimeError, RuntimeErrorInfo
-
-                        raise QitosRuntimeError(
-                            RuntimeErrorInfo(
-                                category=ErrorCategory.SYSTEM,
-                                message=(
-                                    f"Handoff loop detected: agent '{target_name}' already visited "
-                                    f"in this run (history: {' -> '.join(self._handoff_history)})"
-                                ),
-                                phase="handoff",
-                                step_id=step_id,
-                                recoverable=False,
-                            )
-                        )
-                    # Max handoff count guard
-                    max_handoffs = self.context_config.max_handoffs
-                    if len(self._handoff_history) >= max_handoffs:
-                        from ..core.errors import QitosRuntimeError, RuntimeErrorInfo
-
-                        raise QitosRuntimeError(
-                            RuntimeErrorInfo(
-                                category=ErrorCategory.SYSTEM,
-                                message=f"Maximum handoff count ({max_handoffs}) exceeded",
-                                phase="handoff",
-                                step_id=step_id,
-                                recoverable=False,
-                            )
-                        )
-                    current_agent_name = self.agent.name
-                    self._handoff_history.append(current_agent_name)
-                    handoff_result = self._handoff_runtime.execute_handoff(
-                        state,
-                        decision,
-                        record,
-                    )
-                    self._finalize_step(record, state)
-                    # Store handoff context in state.metadata for the new agent
-                    state.metadata["last_handoff"] = {
-                        "from": handoff_result.from_agent,
-                        "to": handoff_result.to_agent,
-                    }
-                    # Increment handoff_count in trace metadata
-                    if self.trace_writer is not None:
-                        hc = self.trace_writer.metadata.get("handoff_count", 0) or 0
-                        self.trace_writer.metadata["handoff_count"] = hc + 1
-                    # Observation after handoff carries handoff info for reduce()
-                    current_observation = cast(
-                        ObservationT,
-                        {
-                            "action_results": [
-                                {
-                                    "handoff": True,
-                                    "from": handoff_result.from_agent,
-                                    "to": handoff_result.to_agent,
-                                }
-                            ],
-                        },
-                    )
-                    state.advance_step()
-                    if self.journal is not None:
-                        await self._journal_commit_step(
-                            record,
-                            before=step_before,
-                            state=state,
-                            terminal=False,
-                        )
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.HANDOFF_END,
-                            state=state,
-                            record=record,
-                            journal_position=self._last_journal_position,
-                        ),
-                    )
-                    step_id += 1
-                    continue
-
-                # Runtime wait: block without spending model calls or steps until
-                # an external event, cancellation, or the run deadline wakes us.
-                if (
-                    decision.mode == "wait"
-                    and decision.meta.get("runtime_wait") is True
-                    and not bool(decision.meta.get("task_complete_requested"))
-                    and not bool(decision.meta.get("parser_error"))
-                ):
-                    self._emit(
-                        step_id,
-                        RuntimePhase.DECIDE,
-                        payload={"stage": "runtime_wait_start"},
-                    )
-                    wait_outcome = await self._wait_for_runtime_event()
-                    self._emit(
-                        step_id,
-                        RuntimePhase.DECIDE,
-                        payload={
-                            "stage": "runtime_wait_end",
-                            "outcome": wait_outcome,
-                        },
-                    )
-                    self._finalize_step(record, state)
-                    if wait_outcome == "event":
-                        current_observation = self._build_initial_observation(
-                            state, step_id + 1, started_at
-                        )
-                        state.advance_step()
-                        if self.journal is not None:
-                            await self._journal_commit_step(
-                                record,
-                                before=step_before,
-                                state=state,
-                                terminal=False,
-                            )
-                        self._dispatch_hook(
-                            "on_after_step",
-                            HookContext(
-                                task=task_text,
-                                step_id=step_id,
-                                phase=RuntimePhase.CHECK_STOP,
-                                state=state,
-                                record=record,
-                                journal_position=self._last_journal_position,
-                            ),
-                        )
-                        step_id += 1
-                        continue
-                    if wait_outcome in {"cancelled", "timeout"}:
-                        if self.journal is not None:
-                            await self._journal_commit_step(
-                                record,
-                                before=step_before,
-                                state=state,
-                                terminal=False,
-                            )
-                        self._dispatch_hook(
-                            "on_after_step",
-                            HookContext(
-                                task=task_text,
-                                step_id=step_id,
-                                phase=RuntimePhase.CHECK_STOP,
-                                state=state,
-                                record=record,
-                                journal_position=self._last_journal_position,
-                            ),
-                        )
-                        continue
-                    raise RuntimeError("runtime inbox closed while Engine was waiting")
-
-                # Ordinary parser/search wait: preserve the existing immediate
-                # repair-loop behavior instead of treating every wait as idle.
-                if (
-                    decision.mode == "wait"
-                    and not bool(decision.meta.get("task_complete_requested"))
-                    and not bool(decision.meta.get("parser_error"))
-                ):
-                    self._finalize_step(record, state)
-                    current_observation = self._build_initial_observation(
-                        state, step_id + 1, started_at
-                    )
-                    state.advance_step()
-                    if self.journal is not None:
-                        await self._journal_commit_step(
-                            record,
-                            before=step_before,
-                            state=state,
-                            terminal=False,
-                        )
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.CHECK_STOP,
-                            state=state,
-                            record=record,
-                            journal_position=self._last_journal_position,
-                        ),
-                    )
-                    step_id += 1
-                    continue
-
-                # Final decisions still flow through reduce, critics, and
-                # check-stop so hooks, memory, checkpoints, and agent-specific
-                # finalization all see the same lifecycle as action steps.
-                if decision.mode == "final" or (
-                    decision.mode == "wait"
-                    and (
-                        bool(decision.meta.get("task_complete_requested"))
-                        or bool(decision.meta.get("parser_error"))
-                    )
-                ):
-                    try:
-                        action_results: list[Any] = []
-                        observation = self._build_observation_after_action(
-                            state=state,
-                            step_id=step_id,
-                            started_at=started_at,
-                            decision=decision,
-                            action_results=action_results,
-                        )
-                        record.observation = observation
-                        self._memory_append("observation", observation, record.step_id)
-                        self._run_reduce(state, observation, decision, record)
-                    except Exception as exc:
-                        if self.journal is not None:
-                            raise
-                        failed_phase = self._infer_failed_phase(record)
-                        if not self._recover(state, failed_phase, exc):
-                            self._finalize_step(record, state)
-                            self._emit(
-                                step_id,
-                                RuntimePhase.END,
-                                ok=False,
-                                payload={"stop_reason": state.stop_reason},
-                            )
-                            await self._journal_interrupt_run(
-                                step_id=step_id,
-                                reason=state.stop_reason or "unrecoverable_error",
-                            )
-                            journal_interrupted = True
-                            break
-                        self._finalize_step(record, state)
-                        current_observation = self._build_initial_observation(
-                            state, step_id + 1, started_at
-                        )
-                        state.advance_step()
-                        if self.journal is not None:
-                            await self._journal_commit_step(
-                                record,
-                                before=step_before,
-                                state=state,
-                                terminal=False,
-                            )
-                        self._dispatch_hook(
-                            "on_after_step",
-                            HookContext(
-                                task=task_text,
-                                step_id=step_id,
-                                phase=RuntimePhase.RECOVER,
-                                state=state,
-                                record=record,
-                                stop_reason=state.stop_reason,
-                                journal_position=self._last_journal_position,
-                            ),
-                        )
-                        step_id += 1
-                        continue
-                else:
-                    try:
-                        action_results = await self._run_act(
-                            state, decision, record, turn
-                        )
-                        current_task = asyncio.current_task()
-                        if (
-                            current_task is not None
-                            and current_task.cancelling()
-                            and not self._cancel_token.is_cancel_requested
-                        ):
-                            # The executor has drained started handlers and
-                            # persisted terminal results. Re-surface a caller
-                            # Task.cancel() before reducer/step commit so
-                            # recovery restarts only pure state projection.
-                            raise asyncio.CancelledError
-                        observation = self._build_observation_after_action(
-                            state=state,
-                            step_id=step_id,
-                            started_at=started_at,
-                            decision=decision,
-                            action_results=action_results,
-                        )
-                        record.observation = observation
-                        self._memory_append("observation", observation, record.step_id)
-                        self._run_reduce(state, observation, decision, record)
-                    except Exception as exc:
-                        if self.journal is not None:
-                            raise
-                        failed_phase = self._infer_failed_phase(record)
-                        if not self._recover(state, failed_phase, exc):
-                            self._finalize_step(record, state)
-                            self._emit(
-                                step_id,
-                                RuntimePhase.END,
-                                ok=False,
-                                payload={"stop_reason": state.stop_reason},
-                            )
-                            await self._journal_interrupt_run(
-                                step_id=step_id,
-                                reason=state.stop_reason or "unrecoverable_error",
-                            )
-                            journal_interrupted = True
-                            break
-                        self._finalize_step(record, state)
-                        current_observation = self._build_initial_observation(
-                            state, step_id + 1, started_at
-                        )
-                        state.advance_step()
-                        if self.journal is not None:
-                            await self._journal_commit_step(
-                                record,
-                                before=step_before,
-                                state=state,
-                                terminal=False,
-                            )
-                        self._dispatch_hook(
-                            "on_after_step",
-                            HookContext(
-                                task=task_text,
-                                step_id=step_id,
-                                phase=RuntimePhase.RECOVER,
-                                state=state,
-                                record=record,
-                                stop_reason=state.stop_reason,
-                                journal_position=self._last_journal_position,
-                            ),
-                        )
-                        step_id += 1
-                        continue
-
-                critic_result = self._apply_critics(state, record)
-                # Support both legacy str return and new dict return
-                if isinstance(critic_result, str):
-                    critic_result = {
-                        "action": critic_result,
-                        "modified_prompt": None,
-                        "instruction_patch": None,
-                        "state_patch": None,
-                    }
-                critic_action = critic_result["action"]
-                if critic_action == "stop":
-                    state.set_stop(StopReason.CRITIC_STOP)
-                    self._finalize_step(record, state)
-                    if self.journal is not None:
-                        await self._journal_commit_step(
-                            record,
-                            before=step_before,
-                            state=state,
-                            terminal=True,
-                        )
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.CRITIC,
-                            state=state,
-                            record=record,
-                            stop_reason=state.stop_reason,
-                            journal_position=self._last_journal_position,
-                        ),
-                    )
-                    self._emit(
-                        step_id,
-                        RuntimePhase.END,
-                        payload={"stop_reason": state.stop_reason},
-                    )
-                    break
-                if critic_action == "retry":
-                    # Apply patches from critic if provided
-                    self._apply_critic_patches(state, critic_result)
-                    self._finalize_step(record, state)
-                    current_observation = observation
-                    state.advance_step()
-                    if self.journal is not None:
-                        await self._journal_commit_step(
-                            record,
-                            before=step_before,
-                            state=state,
-                            terminal=False,
-                        )
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.CRITIC,
-                            state=state,
-                            record=record,
-                            journal_position=self._last_journal_position,
-                        ),
-                    )
-                    step_id += 1
-                    continue
-
-                stop = self._run_check_stop(state, record.decision, step_id, started_at)
-
-                self.validation_gate.after_phase(state, RuntimePhase.CHECK_STOP.value)
-                self._finalize_step(record, state)
-                if not stop:
-                    state.advance_step()
-                if self.journal is not None:
-                    await self._journal_commit_step(
-                        record,
-                        before=step_before,
-                        state=state,
-                        terminal=stop,
-                    )
-                else:
-                    await self._save_checkpoint(step_id, state, task_text)
-                self._dispatch_hook(
-                    "on_after_step",
-                    HookContext(
-                        task=task_text,
-                        step_id=step_id,
-                        phase=RuntimePhase.CHECK_STOP,
-                        state=state,
-                        record=record,
-                        stop_reason=state.stop_reason,
-                        journal_position=self._last_journal_position,
-                    ),
+                state = execution.state
+                current_observation = execution.observation
+                step_id = execution.next_step_id
+                journal_interrupted = (
+                    journal_interrupted or execution.journal_interrupted
                 )
 
-                if stop:
-                    self._emit(
-                        step_id,
-                        RuntimePhase.END,
-                        payload={"stop_reason": state.stop_reason},
-                    )
+                if execution.stop:
                     break
 
-                current_observation = observation
-                step_id += 1
-
-                # -- after_step cancellation: break after step completes --
                 if (
-                    self._cancel_token.is_cancel_requested
+                    execution.check_after_step_cancel
+                    and self._cancel_token.is_cancel_requested
                     and self._cancel_token.mode == CancelMode.AFTER_STEP
                 ):
                     await self._journal_interrupt_run(
-                        step_id=step_id - 1,
+                        step_id=execution.step.step_id,
                         reason="cancelled_after_step",
                     )
                     journal_interrupted = True
                     self._emit(
-                        step_id - 1,
+                        execution.step.step_id,
                         RuntimePhase.END,
                         ok=False,
                         payload={"stop_reason": "cancelled_after_step"},
@@ -2201,7 +1544,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         observation: ObservationT,
         branch_decision: Decision[ActionT],
     ) -> Decision[ActionT]:
-        return self._model_runtime.select_branch(state, observation, branch_decision)
+        return self._decision_runtime.select_branch(
+            state, observation, branch_decision
+        )
 
     async def _run_act(
         self,
@@ -2301,7 +1646,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         )
 
     def _normalize_decision(self, raw_decision: Any, step: int) -> Decision[ActionT]:
-        return self._model_runtime.normalize_decision(raw_decision, step)
+        return self._decision_runtime.normalize_decision(raw_decision, step)
 
     def _compute_state_diff(
         self, before: Dict[str, Any], after: Dict[str, Any]

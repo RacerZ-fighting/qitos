@@ -167,6 +167,10 @@ How to update:
 - Journal replay now always parses and validates canonical JSONL before consulting the
   disposable SQLite projection. A projection is retained only when its record digests
   match the validated JSONL; drift rebuilds the projection and can never override replay.
+- `Engine.arun()` and `Engine.astep()` now share one immutable turn transaction instead
+  of duplicating decide/act/reduce behavior. Run lifecycle stays in Engine, parser and
+  compatibility interpretation live in a composed decision runtime, and optional
+  critic/handoff policies no longer occupy the outer loop.
 - The canonical action path is now async from Engine through Tool, Mailbox, MCP, and
   Child execution. Blocking host and Docker commands use asyncio subprocesses with
   process-group cleanup; explicitly concurrency-safe calls remain parallel and commit
