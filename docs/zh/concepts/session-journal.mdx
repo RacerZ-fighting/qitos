@@ -1,0 +1,51 @@
+---
+title: Session Journal
+description: 持久化完整模型与工具事务，并支持恢复和分叉。
+---
+
+QitOS 可以为每个 Run 保存一份 append-only JSONL Journal。启用后，它是模型历史、工具事务、
+状态恢复、resume 和 fork 的唯一真源。同一个 Engine 不得同时配置 checkpoint store。
+
+## 工具事务顺序
+
+Engine 按以下顺序写入：
+
+1. `model.completed`
+2. `tool.started`
+3. 执行 Handler
+4. 生成唯一 canonical `ToolResult`
+5. `tool.terminal`
+6. 将结果归约到 working state
+7. `step.committed`
+
+`tool.started` 是持久化执行许可；写入失败时不能执行 Handler。Finalizer 生成的 terminal result
+只持久化一次，History 和 Reducer 使用同一个值。
+
+恢复时，如果只有 `tool.started` 而没有 `tool.terminal`，Engine 会补写一个“副作用未知”的明确
+error 终态，绝不重放 Handler。没有获得 `tool.started` 的调用会补成“无副作用”的 cancelled 终态。
+如果 terminal 已完整而 `step.committed` 缺失，恢复只重跑纯 Reducer。
+
+## 状态提交
+
+`step.committed` 保存带前后摘要的确定性 JSON Patch 子集。该记录 durable 之前，Engine 只暴露上
+一个提交态。初始、周期和终态 snapshot 只用于加速 replay，不是第二份真源。
+
+JSONL writer 会等待每条记录 durable 后返回。Darwin 使用 `F_FULLFSYNC`，其他 POSIX 系统优先
+使用 `fdatasync`。
+
+```python
+from qitos import Engine
+from qitos.kit.journal import JsonlSessionJournal
+
+journal = JsonlSessionJournal(".qitos/sessions")
+result = await Engine(agent=agent, journal=journal).arun("inspect the project")
+
+resumed = await Engine(
+    agent=agent,
+    journal=JsonlSessionJournal(".qitos/sessions"),
+).aresume_from_journal(result.run_id)
+```
+
+Fork 只接受 committed `JournalPosition`。Child Journal 拥有独立的继承前缀，不会修改 Parent。
+
+后台任务、Mailbox、Child 生命周期和交互输入目前还不能从 Journal 恢复。

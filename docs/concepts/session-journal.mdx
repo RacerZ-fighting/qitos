@@ -1,0 +1,58 @@
+---
+title: Session journal
+description: Persist complete model and tool transactions for resume and fork.
+---
+
+QitOS can persist one append-only JSONL journal per Run. When configured, the journal
+is the canonical source for model history, tool transactions, state recovery, resume,
+and fork. Do not configure a checkpoint store on the same Engine.
+
+## Tool transaction order
+
+The Engine writes each tool transaction in this order:
+
+1. `model.completed`
+2. `tool.started`
+3. execute the handler
+4. finalize the canonical `ToolResult`
+5. `tool.terminal`
+6. reduce that result into working state
+7. `step.committed`
+
+`tool.started` is a durable execution permit. If it cannot be written, the handler is
+not invoked. The finalized terminal result is persisted once and is the same value used
+by History and reducers.
+
+If recovery finds `tool.started` without `tool.terminal`, it writes an explicit error
+terminal with unknown side effects and never runs the handler again. A call that never
+received `tool.started` is closed as cancelled with no side effect. If all terminal
+results exist but `step.committed` does not, recovery only reruns pure reducers.
+
+## State commits
+
+`step.committed` publishes a deterministic JSON Patch subset with before and after
+digests. Until that record is durable, the Engine exposes only the previous committed
+state. Full snapshots are written initially, at the configured interval, and at terminal
+boundaries. They accelerate replay but are not a second source of truth.
+
+The JSONL writer waits for durable acknowledgement for every record. Darwin uses
+`F_FULLFSYNC`. Other POSIX systems prefer `fdatasync` when available.
+
+```python
+from qitos import Engine
+from qitos.kit.journal import JsonlSessionJournal
+
+journal = JsonlSessionJournal(".qitos/sessions")
+result = await Engine(agent=agent, journal=journal).arun("inspect the project")
+
+resumed = await Engine(
+    agent=agent,
+    journal=JsonlSessionJournal(".qitos/sessions"),
+).aresume_from_journal(result.run_id)
+```
+
+Forking accepts only a committed `JournalPosition`. The child journal owns an
+independent inherited prefix and can resume without changing its parent.
+
+Background jobs, mailbox delivery, child-agent lifecycle, and interactive input events
+are not yet journal-recoverable contracts.

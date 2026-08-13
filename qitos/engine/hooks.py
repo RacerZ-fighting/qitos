@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
+from ..core.journal import JournalPosition
 from ..core.state import StateSchema
 from .states import RuntimeEvent, RuntimePhase, StepRecord
 
@@ -29,6 +30,7 @@ class HookContext:
     stop_reason: Optional[str] = None
     run_id: str = ""
     ts: str = ""
+    journal_position: Optional[JournalPosition] = None
 
 
 @dataclass

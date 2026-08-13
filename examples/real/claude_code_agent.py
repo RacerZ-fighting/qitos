@@ -11,7 +11,7 @@ import argparse
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from qitos import (
     Action,
@@ -138,16 +138,17 @@ class ClaudeCodeAgent(AgentModule[ClaudeCodeState, dict[str, Any], Action]):
             lines.extend(state.scratchpad[-10:])
         return "\n".join(lines)
 
-    def commit_action_results(
+    def reduce_action_result(
         self,
         state: ClaudeCodeState,
-        actions: Sequence[Action],
-        results: Sequence[ToolResult],
+        action: Action,
+        result: ToolResult,
         *,
         step_id: int,
-    ) -> None:
+    ) -> ClaudeCodeState:
         _ = step_id
-        state.work_plan = reduce_work_plan(state.work_plan, actions, results)
+        state.work_plan = reduce_work_plan(state.work_plan, [action], [result])
+        return state
 
     def reduce(
         self,

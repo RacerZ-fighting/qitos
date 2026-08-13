@@ -64,6 +64,7 @@
                 "pages": [
                   "concepts/agent-module",
                   "concepts/engine",
+                  "concepts/session-journal",
                   "concepts/state-and-task",
                   "concepts/tools-and-registry",
                   "concepts/family-presets",
@@ -190,6 +191,7 @@
                 "pages": [
                   "zh/concepts/agent-module",
                   "zh/concepts/engine",
+                  "zh/concepts/session-journal",
                   "zh/concepts/state-and-task",
                   "zh/concepts/tools-and-registry",
                   "zh/concepts/family-presets",

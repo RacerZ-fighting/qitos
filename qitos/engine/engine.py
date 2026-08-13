@@ -24,8 +24,8 @@ from ..checkpoint.store import (
     CheckpointMetadata,
     CheckpointStore,
 )
-from ..core.agent_module import AgentModule
-from ..core.action import ActionExecutionPolicy
+from ..core.agent_module import AgentModule, CanonicalActionResult
+from ..core.action import Action, ActionExecutionPolicy
 from ..core.artifact import ArtifactStore
 from ..core.decision import Decision
 from ..core.errors import ErrorCategory, StopReason
@@ -35,6 +35,12 @@ from ..core.history import (
     HistoryMessage,
     HistoryPolicy,
     HistorySnapshot,
+)
+from ..core.journal import (
+    JournalError,
+    JournalPosition,
+    JournalRecordType,
+    SessionJournal,
 )
 from ..core.memory import Memory, MemoryRecord
 from ..core.runtime_input import RuntimeInput
@@ -52,6 +58,7 @@ from ._env_runtime import _EnvRuntime
 from ._loop_detector import ToolCallLoopDetector
 from ._model_runtime import _ModelRuntime
 from ._handoff_runtime import _HandoffRuntime
+from ._journal_runtime import _JournalRuntime, history_message_to_dict
 from ._trace_runtime import _TraceRuntime
 from .action_executor import ActionExecutor
 from .cancellation import CancelMode, CancelToken
@@ -247,7 +254,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         tracing_provider: Optional[Any] = None,
         auto_approve: bool = False,
         action_execution_policy: Optional[ActionExecutionPolicy] = None,
+        journal: SessionJournal | None = None,
+        state_snapshot_interval: int = 16,
     ):
+        if journal is not None and checkpoint_store is not None:
+            raise ValueError(
+                "journal and checkpoint_store are alternative persistence owners"
+            )
         self.agent = agent
         self.agent_registry = agent_registry
         self._delegate_depth = delegate_depth
@@ -348,6 +361,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             _ModelRuntime(self)
         )
         self._action_runtime: _ActionRuntime[StateT, ActionT] = _ActionRuntime(self)
+        self._journal_runtime: _JournalRuntime[StateT, ActionT] = _JournalRuntime(self)
         self._env_runtime: _EnvRuntime[StateT, ObservationT, ActionT] = _EnvRuntime(
             self
         )
@@ -383,6 +397,14 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._checkpoint_store = checkpoint_store
         self._last_checkpoint_id: Optional[CheckpointId] = None
         self.artifact_store = artifact_store
+        self.journal = journal
+        if state_snapshot_interval <= 0:
+            raise ValueError("state_snapshot_interval must be positive")
+        self._state_snapshot_interval = int(state_snapshot_interval)
+        self._journal_pending_history: list[dict[str, Any]] = []
+        self._journal_terminal_record_ids: dict[str, list[str]] = {}
+        self._canonical_action_results: list[CanonicalActionResult] = []
+        self._last_journal_position: JournalPosition | None = None
 
         self._tracing_provider = tracing_provider
 
@@ -717,7 +739,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         # ACT
         try:
-            action_results = self._run_act(state, decision, record)
+            action_results = await self._run_act(state, decision, record)
         except Exception as exc:
             failed_phase = self._infer_failed_phase(record)
             if self._recover(state, failed_phase, exc):
@@ -831,15 +853,25 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         observation = self._build_initial_observation(state, step_id, time.monotonic())
         return state, observation
 
-    def execute_actions(
+    async def aexecute_actions(
         self, state: StateT, decision: Decision[ActionT], record: StepRecord
     ) -> List[Any]:
-        """Public alias for ``_run_act()`` — execute a decision's actions.
+        """Execute a decision's actions without blocking the event loop.
 
         Useful for REPLs that want to handle DECIDE themselves but delegate
         ACT execution to the engine.
         """
-        return self._run_act(state, decision, record)
+        return await self._run_act(state, decision, record)
+
+    def execute_actions(
+        self, state: StateT, decision: Decision[ActionT], record: StepRecord
+    ) -> List[Any]:
+        """Execute actions from a synchronous application boundary."""
+
+        return self._run_sync(
+            self.aexecute_actions(state, decision, record),
+            operation="execute_actions",
+        )
 
     def rebuild_observation(self, state: StateT) -> ObservationT:
         """Build a fresh observation for the current state.
@@ -869,6 +901,12 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     def last_checkpoint_id(self) -> Optional[CheckpointId]:
         """Return the latest successfully committed checkpoint id, if any."""
         return self._last_checkpoint_id
+
+    @property
+    def last_journal_position(self) -> JournalPosition | None:
+        """Return the latest durably appended journal position, if configured."""
+
+        return self._last_journal_position
 
     @property
     def tracing_provider(self) -> Any:
@@ -914,8 +952,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         _resume_step = kwargs.pop("_resume_step", None)
         _resume_run_id = kwargs.pop("_resume_run_id", None)
         _resume_checkpoint_id = kwargs.pop("_resume_checkpoint_id", None)
+        _resume_journal = bool(kwargs.pop("_resume_journal", False))
+        _resume_canonical_results = tuple(
+            kwargs.pop("_resume_canonical_results", ())
+        )
 
         self._reset_run_state()
+        self._canonical_action_results = list(_resume_canonical_results)
         memory = self._memory()
         if memory is not None:
             try:
@@ -990,6 +1033,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         except Exception as exc:
             self._report_runtime_exception("SETUP_ENV", 0, exc, emit=False)
             raise
+        if self.journal is not None and not _resume_journal:
+            await self._journal_initialize(task_obj, task_text, state)
+            self._active_state = type(state).from_dict(state.to_dict())
+        elif self.journal is not None:
+            self._active_state = type(state).from_dict(state.to_dict())
         self._runtime_inbox.open(self._active_run_id)
         harness_diagnostics = self._harness_mismatch_diagnostics()
         self._emit(
@@ -1056,6 +1104,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 run_id=self._active_run_id,
                 _cancel_token=self._cancel_token,
             )
+            if self.journal is not None:
+                await self._journal_finish_run(state)
             self._runtime_inbox.close(self._active_run_id)
             self._notify_run_end(result)
             self._clear_active_context()
@@ -1071,6 +1121,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         step_id = _resume_step if _resume_step is not None else 0
         cancelled = False
+        journal_interrupted = False
         try:
             # MCP discovery happens after preflight but before the first model
             # turn. Empty configuration creates no thread or connection.
@@ -1080,12 +1131,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 state, step_id, started_at
             )
             if _resume_state is None and _resume_step is None:
-                await self._save_checkpoint(
-                    step_id,
-                    state,
-                    task_text,
-                    source="input",
-                )
+                if self.journal is None:
+                    await self._save_checkpoint(
+                        step_id,
+                        state,
+                        task_text,
+                        source="input",
+                    )
             while True:
                 # -- Cancellation check --
                 if self._cancel_token.is_cancel_requested:
@@ -1097,6 +1149,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                             ok=False,
                             payload={"stop_reason": state.stop_reason},
                         )
+                        await self._journal_interrupt_run(
+                            step_id=step_id,
+                            reason=StopReason.CANCELLED_IMMEDIATE.value,
+                        )
+                        journal_interrupted = True
                         break
                     # after_step: break after this iteration's step completes
                     # (checked again at end of loop body below)
@@ -1116,6 +1173,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
                 record = StepRecord(step_id=step_id, agent_id=self.agent.name)
                 self.records.append(record)
+                record.transaction_id = f"step-{step_id}-{uuid4().hex[:12]}"
+                step_before = state.to_dict()
+                if self.journal is not None:
+                    state = type(state).from_dict(step_before)
+                    step_before = state.to_dict()
 
                 self._dispatch_hook(
                     "on_before_step",
@@ -1134,7 +1196,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         current_observation,
                         record,
                     )
+                    await self._journal_model_completed(record, decision)
                 except Exception as exc:
+                    if isinstance(exc, JournalError):
+                        raise
                     failed_phase = self._infer_failed_phase(record)
                     if not self._recover(state, failed_phase, exc):
                         self._finalize_step(record, state)
@@ -1144,8 +1209,23 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                             ok=False,
                             payload={"stop_reason": state.stop_reason},
                         )
+                        await self._journal_interrupt_run(
+                            step_id=step_id,
+                            reason=state.stop_reason or "unrecoverable_error",
+                        )
+                        journal_interrupted = True
                         break
                     self._finalize_step(record, state)
+                    current_observation = self._build_initial_observation(
+                        state, step_id + 1, started_at
+                    )
+                    state.advance_step()
+                    await self._journal_snapshot_state(
+                        state,
+                        step_id=step_id,
+                        reason="recovery",
+                        record_id=f"{record.transaction_id}:recovery",
+                    )
                     self._dispatch_hook(
                         "on_after_step",
                         HookContext(
@@ -1155,12 +1235,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                             state=state,
                             record=record,
                             stop_reason=state.stop_reason,
+                            journal_position=self._last_journal_position,
                         ),
                     )
-                    current_observation = self._build_initial_observation(
-                        state, step_id + 1, started_at
-                    )
-                    state.advance_step()
                     step_id += 1
                     continue
 
@@ -1207,16 +1284,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         record,
                     )
                     self._finalize_step(record, state)
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.HANDOFF_END,
-                            state=state,
-                            record=record,
-                        ),
-                    )
                     # Store handoff context in state.metadata for the new agent
                     state.metadata["last_handoff"] = {
                         "from": handoff_result.from_agent,
@@ -1240,6 +1307,24 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         },
                     )
                     state.advance_step()
+                    if self.journal is not None:
+                        await self._journal_commit_step(
+                            record,
+                            before=step_before,
+                            state=state,
+                            terminal=False,
+                        )
+                    self._dispatch_hook(
+                        "on_after_step",
+                        HookContext(
+                            task=task_text,
+                            step_id=step_id,
+                            phase=RuntimePhase.HANDOFF_END,
+                            state=state,
+                            record=record,
+                            journal_position=self._last_journal_position,
+                        ),
+                    )
                     step_id += 1
                     continue
 
@@ -1266,24 +1351,50 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         },
                     )
                     self._finalize_step(record, state)
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.CHECK_STOP,
-                            state=state,
-                            record=record,
-                        ),
-                    )
                     if wait_outcome == "event":
                         current_observation = self._build_initial_observation(
                             state, step_id + 1, started_at
                         )
                         state.advance_step()
+                        if self.journal is not None:
+                            await self._journal_commit_step(
+                                record,
+                                before=step_before,
+                                state=state,
+                                terminal=False,
+                            )
+                        self._dispatch_hook(
+                            "on_after_step",
+                            HookContext(
+                                task=task_text,
+                                step_id=step_id,
+                                phase=RuntimePhase.CHECK_STOP,
+                                state=state,
+                                record=record,
+                                journal_position=self._last_journal_position,
+                            ),
+                        )
                         step_id += 1
                         continue
                     if wait_outcome in {"cancelled", "timeout"}:
+                        if self.journal is not None:
+                            await self._journal_commit_step(
+                                record,
+                                before=step_before,
+                                state=state,
+                                terminal=False,
+                            )
+                        self._dispatch_hook(
+                            "on_after_step",
+                            HookContext(
+                                task=task_text,
+                                step_id=step_id,
+                                phase=RuntimePhase.CHECK_STOP,
+                                state=state,
+                                record=record,
+                                journal_position=self._last_journal_position,
+                            ),
+                        )
                         continue
                     raise RuntimeError("runtime inbox closed while Engine was waiting")
 
@@ -1295,6 +1406,17 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     and not bool(decision.meta.get("parser_error"))
                 ):
                     self._finalize_step(record, state)
+                    current_observation = self._build_initial_observation(
+                        state, step_id + 1, started_at
+                    )
+                    state.advance_step()
+                    if self.journal is not None:
+                        await self._journal_commit_step(
+                            record,
+                            before=step_before,
+                            state=state,
+                            terminal=False,
+                        )
                     self._dispatch_hook(
                         "on_after_step",
                         HookContext(
@@ -1303,12 +1425,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                             phase=RuntimePhase.CHECK_STOP,
                             state=state,
                             record=record,
+                            journal_position=self._last_journal_position,
                         ),
                     )
-                    current_observation = self._build_initial_observation(
-                        state, step_id + 1, started_at
-                    )
-                    state.advance_step()
                     step_id += 1
                     continue
 
@@ -1338,6 +1457,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         if isinstance(fr, str) and fr and state.stop_reason is None:
                             state.set_stop("final", fr)
                     except Exception as exc:
+                        if isinstance(exc, JournalError):
+                            raise
                         failed_phase = self._infer_failed_phase(record)
                         if not self._recover(state, failed_phase, exc):
                             self._finalize_step(record, state)
@@ -1347,8 +1468,24 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                                 ok=False,
                                 payload={"stop_reason": state.stop_reason},
                             )
+                            await self._journal_interrupt_run(
+                                step_id=step_id,
+                                reason=state.stop_reason or "unrecoverable_error",
+                            )
+                            journal_interrupted = True
                             break
                         self._finalize_step(record, state)
+                        current_observation = self._build_initial_observation(
+                            state, step_id + 1, started_at
+                        )
+                        state.advance_step()
+                        if self.journal is not None:
+                            await self._journal_commit_step(
+                                record,
+                                before=step_before,
+                                state=state,
+                                terminal=False,
+                            )
                         self._dispatch_hook(
                             "on_after_step",
                             HookContext(
@@ -1358,17 +1495,14 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                                 state=state,
                                 record=record,
                                 stop_reason=state.stop_reason,
+                                journal_position=self._last_journal_position,
                             ),
                         )
-                        current_observation = self._build_initial_observation(
-                            state, step_id + 1, started_at
-                        )
-                        state.advance_step()
                         step_id += 1
                         continue
                 else:
                     try:
-                        action_results = self._run_act(state, decision, record)
+                        action_results = await self._run_act(state, decision, record)
                         observation = self._build_observation_after_action(
                             state=state,
                             step_id=step_id,
@@ -1385,6 +1519,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         if isinstance(fr, str) and fr and state.stop_reason is None:
                             state.set_stop("final", fr)
                     except Exception as exc:
+                        if isinstance(exc, JournalError):
+                            raise
                         failed_phase = self._infer_failed_phase(record)
                         if not self._recover(state, failed_phase, exc):
                             self._finalize_step(record, state)
@@ -1394,8 +1530,24 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                                 ok=False,
                                 payload={"stop_reason": state.stop_reason},
                             )
+                            await self._journal_interrupt_run(
+                                step_id=step_id,
+                                reason=state.stop_reason or "unrecoverable_error",
+                            )
+                            journal_interrupted = True
                             break
                         self._finalize_step(record, state)
+                        current_observation = self._build_initial_observation(
+                            state, step_id + 1, started_at
+                        )
+                        state.advance_step()
+                        if self.journal is not None:
+                            await self._journal_commit_step(
+                                record,
+                                before=step_before,
+                                state=state,
+                                terminal=False,
+                            )
                         self._dispatch_hook(
                             "on_after_step",
                             HookContext(
@@ -1405,12 +1557,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                                 state=state,
                                 record=record,
                                 stop_reason=state.stop_reason,
+                                journal_position=self._last_journal_position,
                             ),
                         )
-                        current_observation = self._build_initial_observation(
-                            state, step_id + 1, started_at
-                        )
-                        state.advance_step()
                         step_id += 1
                         continue
 
@@ -1427,6 +1576,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 if critic_action == "stop":
                     state.set_stop(StopReason.CRITIC_STOP)
                     self._finalize_step(record, state)
+                    if self.journal is not None:
+                        await self._journal_commit_step(
+                            record,
+                            before=step_before,
+                            state=state,
+                            terminal=True,
+                        )
                     self._dispatch_hook(
                         "on_after_step",
                         HookContext(
@@ -1436,6 +1592,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                             state=state,
                             record=record,
                             stop_reason=state.stop_reason,
+                            journal_position=self._last_journal_position,
                         ),
                     )
                     self._emit(
@@ -1448,6 +1605,15 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     # Apply patches from critic if provided
                     self._apply_critic_patches(state, critic_result)
                     self._finalize_step(record, state)
+                    current_observation = observation
+                    state.advance_step()
+                    if self.journal is not None:
+                        await self._journal_commit_step(
+                            record,
+                            before=step_before,
+                            state=state,
+                            terminal=False,
+                        )
                     self._dispatch_hook(
                         "on_after_step",
                         HookContext(
@@ -1456,10 +1622,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                             phase=RuntimePhase.CRITIC,
                             state=state,
                             record=record,
+                            journal_position=self._last_journal_position,
                         ),
                     )
-                    current_observation = observation
-                    state.advance_step()
                     step_id += 1
                     continue
 
@@ -1467,7 +1632,17 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
                 self.validation_gate.after_phase(state, RuntimePhase.CHECK_STOP.value)
                 self._finalize_step(record, state)
-                await self._save_checkpoint(step_id, state, task_text)
+                if not stop:
+                    state.advance_step()
+                if self.journal is not None:
+                    await self._journal_commit_step(
+                        record,
+                        before=step_before,
+                        state=state,
+                        terminal=stop,
+                    )
+                else:
+                    await self._save_checkpoint(step_id, state, task_text)
                 self._dispatch_hook(
                     "on_after_step",
                     HookContext(
@@ -1477,6 +1652,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         state=state,
                         record=record,
                         stop_reason=state.stop_reason,
+                        journal_position=self._last_journal_position,
                     ),
                 )
 
@@ -1489,7 +1665,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     break
 
                 current_observation = observation
-                state.advance_step()
                 step_id += 1
 
                 # -- after_step cancellation: break after step completes --
@@ -1497,6 +1672,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     self._cancel_token.is_cancel_requested
                     and self._cancel_token.mode == CancelMode.AFTER_STEP
                 ):
+                    await self._journal_interrupt_run(
+                        step_id=step_id - 1,
+                        reason="cancelled_after_step",
+                    )
+                    journal_interrupted = True
                     self._emit(
                         step_id - 1,
                         RuntimePhase.END,
@@ -1515,6 +1695,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 ok=False,
                 payload={"stop_reason": state.stop_reason},
             )
+            await self._journal_interrupt_run(
+                step_id=step_id,
+                reason=StopReason.CANCELLED_IMMEDIATE.value,
+            )
+            journal_interrupted = True
         finally:
             self._runtime_inbox.close(self._active_run_id)
             self._teardown_env()
@@ -1576,6 +1761,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         # Extract structured traces from records and events.
         _critic_traces = self._extract_critic_traces()
         _handoff_traces = self._extract_handoff_traces()
+
+        if self.journal is not None and not journal_interrupted:
+            await self._journal_finish_run(state)
 
         result = EngineResult(
             state=state,
@@ -1822,10 +2010,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     ) -> Decision[ActionT]:
         return self._model_runtime.select_branch(state, observation, branch_decision)
 
-    def _run_act(
+    async def _run_act(
         self, state: StateT, decision: Decision[ActionT], record: StepRecord
     ) -> List[Any]:
-        return self._action_runtime.run_act(state, decision, record)
+        return await self._action_runtime.run_act(state, decision, record)
 
     def _run_reduce(
         self,
@@ -2024,6 +2212,88 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     def _finalize_step(self, record: StepRecord, state: StateT) -> None:
         self._trace_runtime.finalize_step(record, state)
 
+    async def _journal_initialize(
+        self,
+        task_obj: Task | None,
+        task_text: str,
+        state: StateT,
+    ) -> None:
+        await self._journal_runtime.initialize(task_obj, task_text, state)
+
+    async def _journal_model_completed(
+        self,
+        record: StepRecord,
+        decision: Decision[ActionT],
+    ) -> None:
+        await self._journal_runtime.model_completed(record, decision)
+
+    async def _journal_tool_starts(
+        self,
+        indexed_actions: List[tuple[int, Action]],
+        record: StepRecord,
+    ) -> None:
+        await self._journal_runtime.tool_starts(indexed_actions, record)
+
+    async def _finalize_action_results(
+        self,
+        state: StateT,
+        actions: List[Action],
+        results: List[ToolResult],
+        *,
+        record: StepRecord,
+    ) -> List[ToolResult]:
+        return await self._journal_runtime.finalize_action_results(
+            state,
+            actions,
+            results,
+            record=record,
+        )
+
+    def _reduce_action_results(
+        self,
+        state: StateT,
+        actions: List[Action],
+        results: List[ToolResult],
+        step_id: int,
+    ) -> None:
+        self._journal_runtime.reduce_action_results(state, actions, results, step_id)
+
+    async def _journal_commit_step(
+        self,
+        record: StepRecord,
+        *,
+        before: Dict[str, Any],
+        state: StateT,
+        terminal: bool,
+    ) -> None:
+        await self._journal_runtime.commit_step(
+            record,
+            before=before,
+            state=state,
+            terminal=terminal,
+        )
+
+    async def _journal_snapshot_state(
+        self,
+        state: StateT,
+        *,
+        step_id: int,
+        reason: str,
+        record_id: str,
+    ) -> None:
+        await self._journal_runtime.snapshot_state(
+            state,
+            step_id=step_id,
+            reason=reason,
+            record_id=record_id,
+        )
+
+    async def _journal_interrupt_run(self, *, step_id: int, reason: str) -> None:
+        await self._journal_runtime.interrupt_run(step_id=step_id, reason=reason)
+
+    async def _journal_finish_run(self, state: StateT) -> None:
+        await self._journal_runtime.finish_run(state)
+
     async def _save_checkpoint(
         self,
         step_id: int,
@@ -2063,6 +2333,126 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         config = CheckpointConfig(thread_id=self._active_run_id)
         await self._checkpoint_store.put(config, checkpoint, metadata)
         self._last_checkpoint_id = checkpoint.id
+
+    async def aresume_from_journal(self, run_id: str) -> EngineResult[StateT]:
+        """Resume one Run from its canonical journal."""
+
+        journal = self.journal
+        if journal is None:
+            raise RuntimeError("No journal configured; cannot resume.")
+        if journal.run_id:
+            if journal.run_id != run_id:
+                raise JournalError("journal is already open for another Run")
+        else:
+            await journal.open(run_id)
+        replay = self._journal_runtime.replay(await journal.replay())
+        for recovery in replay["recovered_terminals"]:
+            self._last_journal_position = await journal.append(
+                JournalRecordType.TOOL_TERMINAL,
+                recovery["payload"],
+                record_id=recovery["record_id"],
+            )
+        if replay["recovered_terminals"]:
+            replay = self._journal_runtime.replay(await journal.replay())
+        task_text = replay["task"]
+        task_data = replay["task_data"]
+        task: str | Task = (
+            Task.from_dict(task_data) if isinstance(task_data, dict) else task_text
+        )
+        state_type = type(self.agent.init_state(task_text))
+        state = self.agent.restore_state(state_type.from_dict(replay["state"]))
+        history = HistorySnapshot.from_messages(replay["history"])
+        for recovery in replay["recovered_steps"]:
+            self._last_journal_position = await journal.append(
+                JournalRecordType.STEP_COMMITTED,
+                recovery["payload"],
+                record_id=recovery["record_id"],
+            )
+        if state.stop_reason and not replay["completed"]:
+            self._active_run_id = run_id
+            if not replay["terminal_snapshot_current"]:
+                await self._journal_runtime.snapshot_state(
+                    state,
+                    step_id=int(state.current_step),
+                    reason="terminal",
+                    record_id=f"{run_id}:snapshot:terminal",
+                )
+            await self._journal_finish_run(state)
+            replay["completed"] = True
+        if replay["completed"]:
+            self._active_run_id = run_id
+            self._active_task = task_text
+            self._active_task_obj = task if isinstance(task, Task) else None
+            self._active_state = state
+            replayed_records = await journal.replay()
+            self._last_journal_position = replayed_records[-1].position
+            self._reset_history(history)
+            self._hydrate_trace_metadata(
+                task_obj=self._active_task_obj,
+                task_text=task_text,
+            )
+            self._notify_run_start(task_text, state)
+            result = EngineResult(
+                state=state,
+                records=replay["records"],
+                events=[],
+                step_count=len(replay["records"]),
+                run_id=run_id,
+            )
+            self._notify_run_end(result)
+            if self.trace_writer is not None:
+                self.trace_writer.finalize(
+                    status=self._trace_status(state.stop_reason),
+                    summary={
+                        "stop_reason": state.stop_reason,
+                        "final_result": state.final_result,
+                        "steps": 0,
+                        "task_meta": self._task_meta(self._active_task_obj),
+                        "run_meta": self._run_meta(),
+                        "failure_report": build_failure_report(
+                            self.recovery_policy, state.stop_reason
+                        ),
+                    },
+                )
+            self._clear_active_context()
+            return result
+        return await self.arun(
+            task,
+            history_snapshot=history,
+            _resume_state=state,
+            _resume_step=state.current_step,
+            _resume_run_id=run_id,
+            _resume_journal=True,
+            _resume_canonical_results=replay["canonical_results"],
+        )
+
+    def resume_from_journal(self, run_id: str) -> EngineResult[StateT]:
+        """Resume a journal Run from a synchronous application boundary."""
+
+        return self._run_sync(
+            self.aresume_from_journal(run_id),
+            operation="resume_from_journal",
+        )
+
+    async def afork_journal(
+        self,
+        run_id: str,
+        position: JournalPosition,
+        *,
+        new_run_id: str | None = None,
+    ) -> SessionJournal:
+        """Fork a Run at one committed journal boundary."""
+
+        journal = self.journal
+        if journal is None:
+            raise RuntimeError("No journal configured; cannot fork.")
+        if journal.run_id:
+            if journal.run_id != run_id:
+                raise JournalError("journal is already open for another Run")
+        else:
+            await journal.open(run_id)
+        child_run_id = str(new_run_id or f"run_{uuid4().hex[:12]}")
+        return await journal.fork(position, child_run_id)
 
     async def aresume_from_checkpoint(
         self,
@@ -2299,23 +2689,24 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         native_items: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         history = self._history()
-        history.append(
-            HistoryMessage(
-                role=role,
-                content=content,
-                step_id=step_id,
-                reasoning_content=reasoning_content,
-                metadata=metadata or {},
-                tool_calls=[
-                    dict(x) for x in list(tool_calls or []) if isinstance(x, dict)
-                ],
-                tool_call_id=tool_call_id,
-                name=name,
-                native_items=[
-                    dict(x) for x in list(native_items or []) if isinstance(x, dict)
-                ],
-            )
+        message = HistoryMessage(
+            role=role,
+            content=content,
+            step_id=step_id,
+            reasoning_content=reasoning_content,
+            metadata=metadata or {},
+            tool_calls=[
+                dict(x) for x in list(tool_calls or []) if isinstance(x, dict)
+            ],
+            tool_call_id=tool_call_id,
+            name=name,
+            native_items=[
+                dict(x) for x in list(native_items or []) if isinstance(x, dict)
+            ],
         )
+        history.append(message)
+        if self.journal is not None:
+            self._journal_pending_history.append(history_message_to_dict(message))
 
     def _normalize_history_messages(self, payload: Any) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = []
@@ -2492,9 +2883,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._env_runtime.teardown_env()
 
     def _run_env_step(
-        self, decision: Decision[ActionT], action_results: List[Any]
+        self,
+        decision: Decision[ActionT],
+        action_results: List[Any],
+        *,
+        state: StateT | None = None,
     ) -> Optional[EnvStepResult]:
-        return self._env_runtime.run_env_step(decision, action_results)
+        return self._env_runtime.run_env_step(decision, action_results, state=state)
 
     def _env_payload(self) -> Dict[str, Any]:
         return self._env_runtime.env_payload()
@@ -2603,6 +2998,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_prompt_metadata = {}
         self._runtime_deadline_monotonic = None
         self._last_checkpoint_id = None
+        self._canonical_action_results = []
+        self._journal_pending_history = []
+        self._journal_terminal_record_ids = {}
+        self._last_journal_position = None
         if self._tool_loop_detector is not None:
             self._tool_loop_detector.reset()
         self._handoff_history = []

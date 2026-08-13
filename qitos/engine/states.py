@@ -133,6 +133,7 @@ class RuntimeEvent:
 @dataclass
 class StepRecord:
     step_id: int
+    transaction_id: str = ""
     phase_events: List[RuntimeEvent] = field(default_factory=list)
     observation: Any = None
     decision: Any = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING, Any, Dict, Generic, List, TypeVar, cast
 
@@ -23,7 +24,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
     def __init__(self, engine: Engine[Any, Any, Any]):
         self.engine = engine
 
-    def run_act(
+    async def run_act(
         self, state: StateT, decision: Decision[ActionT], record: StepRecord
     ) -> List[Any]:
         engine = self.engine
@@ -217,11 +218,20 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 blocked_only_results,
                 step_id=record.step_id,
             )
+            blocked_only_results = await engine._finalize_action_results(
+                state,
+                actions,
+                blocked_only_results,
+                record=record,
+            )
             record.action_results = blocked_only_results
             record.tool_invocations = blocked_only_invocations
             for blocked_item in blocked_only_results:
                 engine._memory_append("action_result", blocked_item, record.step_id)
             self._commit_tool_result_history(actions, blocked_only_results, record)
+            engine._reduce_action_results(
+                state, actions, blocked_only_results, record.step_id
+            )
             engine._dispatch_hook(
                 "on_after_act",
                 engine._hook_context(
@@ -242,8 +252,18 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         executable_indices = [
             i for i in range(len(actions)) if i not in blocked_indices
         ]
-        execution = engine.executor.execute(
-            executable_actions, env=engine.env, state=state
+        await engine._journal_tool_starts(
+            [
+                (original_index, actions[original_index])
+                for original_index in executable_indices
+            ],
+            record,
+        )
+        execution = await asyncio.to_thread(
+            engine.executor.execute,
+            executable_actions,
+            env=engine.env,
+            state=state,
         )
         exec_stats = dict(getattr(engine.executor, "last_execution_stats", {}) or {})
         # Build tool_invocations from execution results (executable only)
@@ -348,21 +368,18 @@ class _ActionRuntime(Generic[StateT, ActionT]):
 
         self._finalize_model_outputs(actions, results, step_id=record.step_id)
 
-        # Optional agent-owned pre-history commit for model-visible state
-        # receipts.  This is intentionally generic: an agent may canonicalize
-        # a state-tool result before history/TUI serialization while the
-        # normal reduce pass remains responsible for trace projection.  It is
-        # executed once in original tool-call order.
-        commit_results = getattr(
-            getattr(engine, "agent", None), "commit_action_results", None
+        results = await engine._finalize_action_results(
+            state,
+            actions,
+            results,
+            record=record,
         )
-        if callable(commit_results):
-            commit_results(state, actions, results, step_id=record.step_id)
 
         if engine.env is not None:
             env_result = engine._run_env_step(
                 decision=decision,
                 action_results=[item.to_dict() for item in results],
+                state=state,
             )
             if env_result is not None:
                 results.append(
@@ -382,6 +399,9 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 )
 
         self._commit_tool_result_history(actions, results, record)
+        engine._reduce_action_results(
+            state, actions, results[: len(actions)], record.step_id
+        )
         engine._emit(
             record.step_id,
             RuntimePhase.ACT,

@@ -1,6 +1,6 @@
 """Core modules for QitOS Framework."""
 
-from .agent_module import AgentModule
+from .agent_module import ActionResultContext, AgentModule, CanonicalActionResult
 from .decision import Decision
 from .action import (
     Action,
@@ -26,6 +26,14 @@ from .model_response import ModelResponse
 from .runtime_input import RuntimeInput
 from .history import History, HistoryMessage, HistoryPolicy, HistorySnapshot
 from .observation import Observation
+from .journal import (
+    JournalCorruptionError,
+    JournalError,
+    JournalPosition,
+    JournalRecord,
+    JournalRecordType,
+    SessionJournal,
+)
 from .env import (
     Env,
     EnvSpec,
@@ -86,7 +94,9 @@ from .agent_spec import AgentSpec, AgentRegistry, ContextStrategy, HandoffContex
 from .shared_memory import SharedMemory, InMemorySharedMemory, FileSharedMemory, SharedMemoryNamespace, SharedMemoryManager
 
 __all__ = [
+    "ActionResultContext",
     "AgentModule",
+    "CanonicalActionResult",
     "Decision",
     "Action",
     "ActionResult",
@@ -110,6 +120,12 @@ __all__ = [
     "HistoryPolicy",
     "HistorySnapshot",
     "Observation",
+    "JournalCorruptionError",
+    "JournalError",
+    "JournalPosition",
+    "JournalRecord",
+    "JournalRecordType",
+    "SessionJournal",
     "RunSpec",
     "ExperimentSpec",
     "BenchmarkRunResult",
