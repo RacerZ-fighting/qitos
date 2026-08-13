@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
+from ..core.model_response import ModelUsageSource, normalize_model_usage
 from .states import ContextConfig, ContextTelemetry
 
 if TYPE_CHECKING:
@@ -374,51 +375,57 @@ class _ContextRuntime:
         raw_output: Any,
         usage: Mapping[str, Any] | None = None,
     ) -> ContextTelemetry:
-        if usage is not None:
-            prompt_tokens = usage.get("prompt_tokens")
-            completion_tokens = usage.get("completion_tokens")
-            total_tokens = usage.get("total_tokens")
-            if isinstance(prompt_tokens, int) and prompt_tokens >= 0:
-                telemetry.provider_prompt_tokens = int(prompt_tokens)
-                if telemetry.planned_prompt_tokens is not None:
-                    telemetry.token_estimate_error = int(prompt_tokens) - int(
-                        telemetry.planned_prompt_tokens
-                    )
-                # The provider owns the final prompt measurement.  This is
-                # what TUI, trace and cumulative utilization must display.
-                telemetry.input_tokens_total = int(prompt_tokens)
+        normalized_usage = normalize_model_usage(usage)
+        if normalized_usage is not None:
+            prompt_tokens = normalized_usage.input_tokens
+            completion_tokens = normalized_usage.output_tokens
+            total_tokens = normalized_usage.total_tokens
+            telemetry.usage_source = normalized_usage.source.value
+            if normalized_usage.source is ModelUsageSource.PROVIDER:
+                telemetry.counting_mode = "provider_usage"
+                telemetry.meter_source = "provider_usage"
+            else:
+                telemetry.counting_mode = "usage_estimate"
+                telemetry.meter_source = "usage_estimate"
+            if prompt_tokens is not None:
+                telemetry.input_tokens_total = prompt_tokens
+                if normalized_usage.source is ModelUsageSource.PROVIDER:
+                    telemetry.provider_prompt_tokens = prompt_tokens
+                    if telemetry.planned_prompt_tokens is not None:
+                        telemetry.token_estimate_error = prompt_tokens - int(
+                            telemetry.planned_prompt_tokens
+                        )
                 budget = telemetry.available_input_budget
                 telemetry.occupancy_ratio = (
                     min(1.0, float(prompt_tokens) / float(budget))
                     if isinstance(budget, int) and budget > 0
                     else 0.0
                 )
-                telemetry.counting_mode = "provider_usage"
-                telemetry.meter_source = "provider_usage"
-            cached = usage.get("cached_tokens")
-            if isinstance(cached, int) and cached >= 0:
-                telemetry.cached_tokens = cached
-            if isinstance(completion_tokens, int) and completion_tokens >= 0:
-                telemetry.provider_completion_tokens = int(completion_tokens)
-                telemetry.output_tokens = int(completion_tokens)
+            telemetry.cached_tokens = normalized_usage.cache_read_tokens
+            telemetry.cache_write_tokens = normalized_usage.cache_write_tokens
+            telemetry.reasoning_tokens = normalized_usage.reasoning_tokens
+            if completion_tokens is not None:
+                if normalized_usage.source is ModelUsageSource.PROVIDER:
+                    telemetry.provider_completion_tokens = completion_tokens
+                telemetry.output_tokens = completion_tokens
             else:
                 telemetry.output_tokens = self.count_tokens(raw_output, llm)[0]
-            if isinstance(total_tokens, int) and total_tokens >= 0:
-                telemetry.provider_total_tokens = int(total_tokens)
-                step_total = int(total_tokens)
+            if total_tokens is not None:
+                if normalized_usage.source is ModelUsageSource.PROVIDER:
+                    telemetry.provider_total_tokens = total_tokens
+                step_total = total_tokens
             else:
-                step_total = int(
-                    telemetry.provider_prompt_tokens or telemetry.input_tokens_total
-                ) + int(telemetry.output_tokens)
+                step_total = int(telemetry.input_tokens_total) + int(
+                    telemetry.output_tokens
+                )
         else:
+            telemetry.usage_source = "absent"
             telemetry.output_tokens = self.count_tokens(raw_output, llm)[0]
             step_total = int(telemetry.input_tokens_total) + int(
                 telemetry.output_tokens
             )
 
-        self.prompt_tokens_total += int(
-            telemetry.provider_prompt_tokens or telemetry.input_tokens_total
-        )
+        self.prompt_tokens_total += int(telemetry.input_tokens_total)
         self.completion_tokens_total += int(telemetry.output_tokens)
         self.tokens_total += int(step_total)
         self.peak_input_tokens = max(
@@ -546,6 +553,9 @@ class _ContextRuntime:
             "provider_total_tokens": telemetry.provider_total_tokens,
             "planned_prompt_tokens": telemetry.planned_prompt_tokens,
             "cached_tokens": telemetry.cached_tokens,
+            "cache_write_tokens": telemetry.cache_write_tokens,
+            "reasoning_tokens": telemetry.reasoning_tokens,
+            "usage_source": telemetry.usage_source,
             "meter_source": telemetry.meter_source,
             "meter_status": telemetry.meter_status,
             "meter_error": telemetry.meter_error,

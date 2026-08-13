@@ -53,7 +53,8 @@ Terminal chunks and completed responses expose token counts through `ModelUsage`
 usage = terminal_chunk.usage
 if usage is not None:
     print(usage.input_tokens, usage.output_tokens, usage.total_tokens)
-    print(usage.cache_read_tokens, usage.reasoning_tokens)
+    print(usage.cache_read_tokens, usage.cache_write_tokens)
+    print(usage.reasoning_tokens)
     print(usage.source.value)  # provider or estimate
     provider_usage = usage.to_dict()
 ```
@@ -61,6 +62,11 @@ if usage is not None:
 Unknown counts remain `None`; QitOS does not turn missing provider facts into zero.
 `to_dict()` returns the complete provider-neutral/provider-specific mapping retained
 for compatibility, cache, trace, and later cost attribution.
+
+Engine context telemetry records `usage_source` as `provider`, `estimate`, or
+`absent`. Provider zeroes are authoritative. Cache-read, cache-write, and reasoning
+counts are observable subsets and are not added again to cumulative input/output
+totals.
 
 ## Select a family and wire independently
 
