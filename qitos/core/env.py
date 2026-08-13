@@ -83,6 +83,38 @@ class TextFileChunk:
     has_more: bool
     truncated: bool
     line_ending: Literal["lf", "crlf", "mixed"] = "lf"
+    content_sha256: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AtomicFileWrite:
+    """Result of one atomic capability-scoped file replacement."""
+
+    path: str
+    size_bytes: int
+    content_sha256: str
+    previous_sha256: str | None
+    created: bool
+
+
+class FileRevisionConflictError(RuntimeError):
+    """The file changed after the caller captured its expected revision."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        expected_sha256: str,
+        current_sha256: str | None,
+    ) -> None:
+        self.path = path
+        self.expected_sha256 = expected_sha256
+        self.current_sha256 = current_sha256
+        current = current_sha256 if current_sha256 is not None else "missing"
+        super().__init__(
+            f"file revision conflict for {path}: expected "
+            f"{expected_sha256}, current {current}"
+        )
 
 
 class Env(ABC):
@@ -185,6 +217,21 @@ class FileSystemCapability(ABC):
     @abstractmethod
     def write_text(self, path: str, content: str) -> None:
         """Write UTF-8 text to file path."""
+
+    @abstractmethod
+    def write_text_atomic(
+        self,
+        path: str,
+        content: str,
+        *,
+        expected_sha256: str | None = None,
+    ) -> AtomicFileWrite:
+        """Atomically replace UTF-8 text after an optional revision check.
+
+        Implementations serialize mutations to the same canonical path within
+        one capability instance. A supplied SHA-256 value is compared with the
+        complete current file immediately before replacement.
+        """
 
     @abstractmethod
     def write_bytes(self, path: str, content: bytes) -> None:

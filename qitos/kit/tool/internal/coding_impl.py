@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -15,7 +16,12 @@ from urllib.parse import urlparse
 
 import httpx
 
-from qitos.core.env import CommandCapability, FileSystemCapability
+from qitos.core.env import (
+    AtomicFileWrite,
+    CommandCapability,
+    FileRevisionConflictError,
+    FileSystemCapability,
+)
 from qitos.core.function_tool_decorator import function_tool
 from qitos.core.process import ProcessHandle
 from qitos.kit.env.host_env import HostCommandCapability, HostFSCapability
@@ -465,7 +471,7 @@ class CodingToolSet:
         self,
         path: str,
         runtime_context: Optional[Dict[str, Any]],
-    ) -> tuple[str, str, float]:
+    ) -> tuple[str, str, float, str]:
         file_ops = self._file_ops(runtime_context)
         raw = file_ops.read_bytes(path)
         modified_at = file_ops.stat(path).modified_at
@@ -473,6 +479,7 @@ class CodingToolSet:
             raw.decode("utf-8", errors="strict"),
             _detect_line_ending(raw),
             float(modified_at or 0.0),
+            hashlib.sha256(raw).hexdigest(),
         )
 
     def _write_text_file(
@@ -481,11 +488,17 @@ class CodingToolSet:
         content: str,
         line_ending: str,
         runtime_context: Optional[Dict[str, Any]],
-    ) -> None:
+        *,
+        expected_sha256: str | None = None,
+    ) -> AtomicFileWrite:
         normalized = (
             content.replace("\r\n", "\n").replace("\r", "\n").replace("\n", line_ending)
         )
-        self._file_ops(runtime_context).write_text(path, normalized)
+        return self._file_ops(runtime_context).write_text_atomic(
+            path,
+            normalized,
+            expected_sha256=expected_sha256,
+        )
 
     async def _run_rg_files(
         self,
@@ -981,6 +994,7 @@ class CodingToolSet:
                 "limit": chunk.line_count,
                 "total_lines": chunk.total_lines,
                 "size_bytes": chunk.size_bytes,
+                "content_sha256": chunk.content_sha256,
                 "has_more": chunk.has_more,
                 "truncated": chunk.truncated,
             }
@@ -1090,6 +1104,7 @@ class CodingToolSet:
         self,
         path: str,
         content: str,
+        expected_sha256: Optional[str] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -1097,11 +1112,27 @@ class CodingToolSet:
 
         :param path: Path relative to the workspace root.
         :param content: Full text content to write into the file.
+        :param expected_sha256: Optional complete-file revision required before replace.
         :param runtime_context: Optional runtime context injected by the executor.
         """
         try:
-            self._write_text_file(path, str(content), "\n", runtime_context)
-            return {"status": "success", "path": path, "size": len(content)}
+            write = self._write_text_file(
+                path,
+                str(content),
+                "\n",
+                runtime_context,
+                expected_sha256=expected_sha256,
+            )
+            return {
+                "status": "success",
+                "path": path,
+                "size": write.size_bytes,
+                "content_sha256": write.content_sha256,
+                "previous_sha256": write.previous_sha256,
+                "created": write.created,
+            }
+        except FileRevisionConflictError as exc:
+            return self._revision_conflict_result(exc)
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
 
@@ -1118,6 +1149,7 @@ class CodingToolSet:
         new_text: str,
         replace_all: bool = False,
         expected_mtime: Optional[float] = None,
+        expected_sha256: Optional[str] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Replace exact text in one workspace file.
@@ -1127,13 +1159,14 @@ class CodingToolSet:
         :param new_text: Replacement text.
         :param replace_all: Replace every occurrence instead of requiring uniqueness.
         :param expected_mtime: Optional optimistic concurrency check.
+        :param expected_sha256: Optional complete-file revision required before edit.
         :param runtime_context: Optional runtime context injected by the executor.
         """
         try:
             file_ops = self._file_ops(runtime_context)
             if not file_ops.stat(path).is_file:
                 return {"status": "error", "message": f"Not a file: {path}"}
-            old_content, line_ending, current_mtime = self._read_text_file(
+            old_content, line_ending, current_mtime, current_sha256 = self._read_text_file(
                 path,
                 runtime_context,
             )
@@ -1178,7 +1211,13 @@ class CodingToolSet:
                 new_text,
                 -1 if replace_all else 1,
             )
-            self._write_text_file(path, new_content, line_ending, runtime_context)
+            write = self._write_text_file(
+                path,
+                new_content,
+                line_ending,
+                runtime_context,
+                expected_sha256=expected_sha256 or current_sha256,
+            )
             return {
                 "status": "success",
                 "path": path,
@@ -1191,7 +1230,11 @@ class CodingToolSet:
                 "line_ending": line_ending,
                 "expected_mtime": expected_mtime,
                 "current_mtime": file_ops.stat(path).modified_at,
+                "previous_sha256": write.previous_sha256,
+                "content_sha256": write.content_sha256,
             }
+        except FileRevisionConflictError as exc:
+            return self._revision_conflict_result(exc)
         except FileNotFoundError:
             return {
                 "status": "error",
@@ -1200,6 +1243,17 @@ class CodingToolSet:
             }
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
+
+    @staticmethod
+    def _revision_conflict_result(exc: FileRevisionConflictError) -> Dict[str, Any]:
+        return {
+            "status": "error",
+            "error_category": "file_revision_conflict",
+            "message": str(exc),
+            "path": exc.path,
+            "expected_sha256": exc.expected_sha256,
+            "current_sha256": exc.current_sha256,
+        }
 
     @function_tool(
         name="make_directory",

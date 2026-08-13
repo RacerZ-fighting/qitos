@@ -28,10 +28,14 @@ remote session, or host resource must close it after the Engine finishes; compos
 The stable filesystem and process contracts live in `qitos.core.env` and
 `qitos.core.process`.
 `FileSystemCapability` supplies root-scoped metadata, bounded text and binary reads,
-writes, directory operations, and listings. `CommandCapability.run_argv()` executes
-fixed arguments without shell interpolation, while `run()` remains the explicit shell
-command compatibility path. Runtime code uses `arun()` and `arun_argv()` so subprocess
-I/O, deadlines, and cancellation stay on the caller's event loop.
+atomic text replacement, directory operations, and listings. A bounded text read
+includes the SHA-256 revision of the complete file. `write_text_atomic()` can require
+that revision before replacing the target and returns both the previous and committed
+revision. Implementations serialize mutations to one canonical path within the same
+environment instance. `CommandCapability.run_argv()` executes fixed arguments without
+shell interpolation, while `run()` remains the explicit shell command compatibility
+path. Runtime code uses `arun()` and `arun_argv()` so subprocess I/O, deadlines, and
+cancellation stay on the caller's event loop.
 
 Host background commands use one Run-owned supervisor. `astart()` returns an opaque
 `ProcessHandle`; `apoll()` and `aread()` return immutable snapshots; `awrite()`,
@@ -132,10 +136,14 @@ instead of touching the Controller filesystem.
 - bounded `hex_view` for binary inspection; and
 - `list_files`, `list_tree`, and `make_directory`.
 
-Reads are line- and byte-bounded, edits fail on missing or ambiguous text unless
-`replace_all` is explicit, and search distinguishes no matches from process errors.
-Tools that return QitOS's structured `{ "status": "error", ... }` contract now produce
-an `ActionStatus.ERROR`; an error payload is never recorded as a successful action.
+Reads are line- and byte-bounded and return `content_sha256`. `write_file` accepts that
+value as `expected_sha256`. Exact edits fail on missing or ambiguous text unless
+`replace_all` is explicit, and they automatically use the revision read before the
+edit as a compare-and-swap guard. A concurrent change therefore returns
+`file_revision_conflict` without replacing the newer file. Search distinguishes no
+matches from process errors. Tools that return QitOS's structured
+`{ "status": "error", ... }` contract produce an `ActionStatus.ERROR`; an error payload
+is never recorded as a successful action.
 
 This profile deliberately excludes controller-local notebook, LSP, worktree, cron,
 browser, and arbitrary HTTP helpers. Applications may compose those separately when

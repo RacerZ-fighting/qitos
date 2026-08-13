@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -158,6 +159,7 @@ async def test_coding_tools_use_selected_environment_instead_of_local_fallback(
     )
 
     assert read["content"] == "remote value"
+    assert read["content_sha256"] == hashlib.sha256(b"remote value\n").hexdigest()
     assert glob["files"] == ["src/a.py"]
     assert grep["matches"] == [
         {"path": "src/a.py", "line": 1, "text": "remote value"}
@@ -169,6 +171,45 @@ async def test_coding_tools_use_selected_environment_instead_of_local_fallback(
     assert not (local / "src" / "new.txt").exists()
     assert all(call[0][0] == "rg" for call in process.calls)
     assert all(call[1] == "src" for call in process.calls)
+
+
+@pytest.mark.asyncio
+async def test_canonical_write_uses_read_revision_as_compare_and_swap(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "demo.txt"
+    target.write_text("first\n", encoding="utf-8")
+    process = _RecordingProcess()
+    context = _tool_context(tmp_path, process)
+    tools = CodingToolSet(workspace_root=str(tmp_path), include_notebook=False)
+
+    read = await tools.read_file.execute(
+        {"path": "demo.txt"},
+        runtime_context=context,
+    )
+    replaced = await tools.write_file.execute(
+        {
+            "path": "demo.txt",
+            "content": "second\n",
+            "expected_sha256": read["content_sha256"],
+        },
+        runtime_context=context,
+    )
+    stale = await tools.write_file.execute(
+        {
+            "path": "demo.txt",
+            "content": "stale\n",
+            "expected_sha256": read["content_sha256"],
+        },
+        runtime_context=context,
+    )
+
+    assert replaced["status"] == "success"
+    assert replaced["previous_sha256"] == read["content_sha256"]
+    assert stale["status"] == "error"
+    assert stale["error_category"] == "file_revision_conflict"
+    assert stale["current_sha256"] == replaced["content_sha256"]
+    assert target.read_text(encoding="utf-8") == "second\n"
 
 
 @pytest.mark.asyncio

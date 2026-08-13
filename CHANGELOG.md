@@ -19,12 +19,19 @@ How to update:
 
 ### Changed
 
+- Canonical `write_file` and `edit_file` now commit through the selected environment's
+  atomic replacement operation. Reads expose a complete-file SHA-256 revision;
+  explicit and implicit compare-and-swap guards turn concurrent changes into a stable
+  `file_revision_conflict` result instead of a lost update.
 - Child invocation factories now receive the already-journaled `ChildHandle` in their
   runtime context, so product runtimes can correlate independent Child sessions and
   traces without deriving identity from mutable task data.
 
 ### Breaking
 
+- Custom `FileSystemCapability` implementations must provide `write_text_atomic()`.
+  The method owns same-path mutation ordering, optional SHA-256 preconditions, and the
+  final replace boundary; `write_text()` remains the unconditional convenience path.
 - `AgentRequest`, `AgentInvocation`, and `AgentResult` have been replaced by the
   immutable core `ChildLaunchRequest`, `ChildInvocation`, `ChildHandle`, `ChildResult`,
   `ChildStatus`, and `AgentConclusion` contracts. `AgentTool` now accepts a complete

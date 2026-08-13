@@ -74,10 +74,12 @@ from .journal import (
     ToolTransaction,
 )
 from .env import (
+    AtomicFileWrite,
     Env,
     EnvSpec,
     EnvObservation,
     EnvStepResult,
+    FileRevisionConflictError,
     FileSystemCapability,
     CommandCapability,
     TerminalCapability,
@@ -211,6 +213,8 @@ __all__ = [
     "EnvSpec",
     "EnvObservation",
     "EnvStepResult",
+    "AtomicFileWrite",
+    "FileRevisionConflictError",
     "FileSystemCapability",
     "CommandCapability",
     "TerminalCapability",

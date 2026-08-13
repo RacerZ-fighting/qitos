@@ -18,6 +18,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Revision-safe atomic file tools**: bounded reads now return a SHA-256 revision for
+  the complete UTF-8 file. Host and Docker filesystem capabilities replace files
+  atomically, serialize same-path mutations per environment, and support compare-and-
+  swap writes. `edit_file` automatically guards the revision it read, so concurrent
+  edits fail explicitly instead of silently overwriting one another.
 - **Run-owned managed processes**: host background commands now use one asyncio
   supervisor with opaque typed handles, incremental bounded output, complete UTF-8
   logs, stdin/PTY interaction, process-group cleanup, and exactly one terminal state.
