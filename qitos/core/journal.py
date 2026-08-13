@@ -249,6 +249,36 @@ def _has_canonical_json_shape(value: Any) -> bool:
     return False
 
 
+def resolve_inherited_record(record: JournalRecord) -> JournalRecord:
+    """Resolve an inherited record to its canonical origin.
+
+    Forks embed their complete parent prefix, so a fork of a fork may contain
+    multiple wrappers. Each wrapper must describe the record it embeds exactly;
+    recovery fails closed instead of accepting an ambiguous lineage.
+    """
+
+    current = record
+    for _ in range(64):
+        if current.type is not JournalRecordType.INHERITED:
+            return current
+        raw_record = current.payload.get("record")
+        if not isinstance(raw_record, Mapping):
+            raise JournalCorruptionError(
+                "journal.inherited is missing its origin record"
+            )
+        embedded = JournalRecord.from_dict(raw_record)
+        if (
+            current.payload.get("origin_run_id") != embedded.run_id
+            or current.payload.get("origin_seq") != embedded.seq
+            or current.payload.get("origin_record_id") != embedded.record_id
+        ):
+            raise JournalCorruptionError(
+                "journal.inherited origin identity does not match its record"
+            )
+        current = embedded
+    raise JournalCorruptionError("journal.inherited nesting is too deep")
+
+
 class SessionJournal(Protocol):
     """Durable single-Run journal used by the Engine."""
 
@@ -309,4 +339,5 @@ __all__ = [
     "JournalUnsupportedVersionError",
     "SessionJournal",
     "ToolTransaction",
+    "resolve_inherited_record",
 ]

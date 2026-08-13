@@ -66,9 +66,17 @@ no Run state. Complete JSONL records with invalid semantics raise
 `JournalUnsupportedVersionError` with upgrade or migration guidance. Both fail closed;
 only an unterminated syntactically torn tail is truncated during recovery.
 
+`JsonlRunCatalog` is the read-only side of this boundary. It can inspect or list Runs
+while their writer lease remains active, and it can validate ancestor and direct-child
+lineage without constructing an Agent. A catalog read uses the current complete JSONL
+prefix; SQLite remains a disposable index and never supplies canonical records. The
+catalog never takes a writer lease, repairs a torn tail, or rebuilds either artifact.
+`RunStatus.RESUMABLE` means only that no durable `run.completed` exists; it does not
+claim that an Engine process is currently active.
+
 ```python
 from qitos import Engine
-from qitos.kit.journal import JsonlSessionJournal
+from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 
 journal = JsonlSessionJournal(".qitos/sessions")
 result = await Engine(agent=agent, journal=journal).arun("inspect the project")
@@ -77,14 +85,21 @@ resumed = await Engine(
     agent=agent,
     journal=JsonlSessionJournal(".qitos/sessions"),
 ).aresume_from_journal(result.run_id)
+
+catalog = JsonlRunCatalog(".qitos/sessions")
+handle = await catalog.inspect_run(result.run_id)
+all_runs = await catalog.list_runs()
+ancestors = await catalog.lineage(result.run_id)
 ```
 
 Forking accepts only a committed `JournalPosition`. The child journal owns an
-independent inherited prefix and can resume without changing its parent. Forking
-closes the source journal and returns the child open; the caller that receives that
-child owns its lifecycle until an Engine run consumes it or `close()` is called. If the
-source cannot close after the child is created, QitOS closes the unreturned child before
-propagating the source error, so no hidden writer lease remains.
+ independent inherited prefix and can resume without its ancestors. An inherited local
+ commit is itself a valid boundary, so forked Runs may be forked again. Direct
+ `SessionJournal.fork()` leaves both journals open; `Engine.afork_journal()` closes its
+ source and transfers the open child to the caller. If the source cannot close after the
+ child is created, QitOS closes the unreturned child before propagating the source error,
+ so no hidden writer lease remains. Every returned open journal remains owned by its
+ caller until an Engine consumes it or `close()` is called.
 
 ## Committed tool lookup
 

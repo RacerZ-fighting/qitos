@@ -22,6 +22,7 @@ from ...core.journal import (
     JournalRecordRef,
     JournalRecordType,
     ToolTransaction,
+    resolve_inherited_record,
 )
 from ...core.action import Action
 from ...core.tool_result import ToolResult
@@ -30,13 +31,14 @@ from ._sqlite_index import (
     JournalIndexError,
     SqliteJournalIndex,
 )
+from ._paths import INDEX_FILENAME, JOURNAL_FILENAME, journal_path, validate_run_id
+from ._reader import read_journal_records
 from ._writer_lease import JournalWriterLease
 
 FileSync = Callable[[int, str], None]
 DirectorySync = Callable[[Path], None]
 
 _logger = logging.getLogger(__name__)
-_INDEX_FILENAME = "journal.index.sqlite3"
 
 
 class JsonlSessionJournal:
@@ -77,7 +79,7 @@ class JsonlSessionJournal:
     def index_path(self) -> Path:
         """Return the disposable projection path for the current Run."""
 
-        return self.path.parent / _INDEX_FILENAME
+        return self.path.parent / INDEX_FILENAME
 
     @property
     def closed(self) -> bool:
@@ -92,12 +94,12 @@ class JsonlSessionJournal:
         await self.close()
 
     async def create(self, run_id: str, metadata: Mapping[str, Any]) -> JournalPosition:
-        _validate_run_id(run_id)
+        validate_run_id(run_id)
         async with self._lock:
             self._ensure_can_open()
             await asyncio.to_thread(self._create_sync, run_id)
             self._run_id = run_id
-            self._path = self.root / run_id / "journal.jsonl"
+            self._path = journal_path(self.root, run_id)
             self._records = []
             self._rebuild_tool_transaction_index(())
             try:
@@ -120,17 +122,17 @@ class JsonlSessionJournal:
     def _create_sync(self, run_id: str) -> None:
         run_dir = self.root / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
-        path = run_dir / "journal.jsonl"
+        path = run_dir / JOURNAL_FILENAME
         with path.open("xb"):
             pass
         self._sync_directory(run_dir)
         self._sync_directory(run_dir.parent)
 
     async def open(self, run_id: str) -> None:
-        _validate_run_id(run_id)
+        validate_run_id(run_id)
         async with self._lock:
             self._ensure_can_open()
-            path = self.root / run_id / "journal.jsonl"
+            path = journal_path(self.root, run_id)
             self._run_id = run_id
             self._path = path
             try:
@@ -240,7 +242,7 @@ class JsonlSessionJournal:
             self._index_tool_transaction_record_locked(record)
 
     def _index_tool_transaction_record_locked(self, record: JournalRecord) -> None:
-        effective = _origin_record(record)
+        effective = resolve_inherited_record(record)
         if effective.type is JournalRecordType.TOOL_TERMINAL:
             reference = JournalRecordRef(effective.run_id, effective.record_id)
             existing = self._terminal_records.get(reference)
@@ -292,7 +294,7 @@ class JsonlSessionJournal:
             source = self._records[parent_position.seq - 1]
             if source.record_id != parent_position.record_id:
                 raise ValueError("fork position does not match the journal")
-            if source.type not in {
+            if resolve_inherited_record(source).type not in {
                 JournalRecordType.STEP_COMMITTED,
                 JournalRecordType.STATE_SNAPSHOT,
             }:
@@ -308,7 +310,9 @@ class JsonlSessionJournal:
             sync_directory=self._sync_directory,
         )
         try:
-            await child.create(new_run_id, {"forked_from": self._run_id})
+            child_metadata = copy.deepcopy(self._records[0].payload)
+            child_metadata["forked_from"] = self._run_id
+            await child.create(new_run_id, child_metadata)
             await child.append(
                 JournalRecordType.RUN_FORKED,
                 {
@@ -398,7 +402,7 @@ class JsonlSessionJournal:
         path: Path,
         run_id: str,
     ) -> tuple[list[JournalRecord], SqliteJournalIndex | None]:
-        index_path = path.parent / _INDEX_FILENAME
+        index_path = path.parent / INDEX_FILENAME
         records = self._load_and_repair(path, run_id)
         try:
             sqlite_index = SqliteJournalIndex.load_if_current(
@@ -437,7 +441,7 @@ class JsonlSessionJournal:
         try:
             self._sqlite_index = await asyncio.to_thread(
                 SqliteJournalIndex.rebuild,
-                path.parent / _INDEX_FILENAME,
+                path.parent / INDEX_FILENAME,
                 path,
                 self._run_id,
                 self._records,
@@ -476,60 +480,13 @@ class JsonlSessionJournal:
             self._sqlite_index = None
 
     def _load_and_repair(self, path: Path, run_id: str) -> list[JournalRecord]:
-        try:
-            raw = path.read_bytes()
-        except OSError as exc:
-            raise JournalError(f"failed to read journal for {run_id}") from exc
-        if not raw:
-            raise JournalCorruptionError("journal is empty")
-        ends_with_newline = raw.endswith(b"\n")
-        chunks = raw.splitlines()
-        records: list[JournalRecord] = []
-        record_ids: set[str] = set()
-        repair_offset: int | None = None
-        consumed = 0
-        for index, chunk in enumerate(chunks, start=1):
-            line_end = consumed + len(chunk) + 1
-            is_last = index == len(chunks)
-            try:
-                value = json.loads(chunk)
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                if is_last and not ends_with_newline:
-                    repair_offset = consumed
-                    break
-                raise JournalCorruptionError(f"journal corruption at line {index}") from exc
-            if not isinstance(value, dict):
-                raise JournalCorruptionError(
-                    f"journal corruption at line {index}: record must be an object"
-                )
-            try:
-                record = JournalRecord.from_dict(value)
-            except JournalCorruptionError as exc:
-                raise JournalCorruptionError(
-                    f"journal corruption at line {index}: {exc}"
-                ) from exc
-            if record.run_id != run_id:
-                raise JournalCorruptionError(f"journal run_id mismatch at line {index}")
-            if record.seq != index:
-                raise JournalCorruptionError(f"journal seq mismatch at line {index}")
-            if record.record_id in record_ids:
-                raise JournalCorruptionError(f"duplicate record_id at line {index}")
-            records.append(record)
-            record_ids.add(record.record_id)
-            consumed = line_end
-        if repair_offset is not None:
-            with path.open("r+b") as stream:
-                stream.truncate(repair_offset)
-                stream.flush()
-                self._sync_file(stream.fileno(), _file_sync_mode())
-        elif not ends_with_newline:
-            with path.open("ab", buffering=0) as stream:
-                stream.write(b"\n")
-                stream.flush()
-                self._sync_file(stream.fileno(), _file_sync_mode())
-        if not records or records[0].type is not JournalRecordType.RUN_STARTED:
-            raise JournalCorruptionError("journal does not begin with run.started")
-        return records
+        return read_journal_records(
+            path,
+            run_id,
+            repair_tail=True,
+            sync_file=self._sync_file,
+            sync_mode=_file_sync_mode(),
+        )
 
 
 def _encode_record(record: JournalRecord) -> bytes:
@@ -548,20 +505,6 @@ def _encode_record(record: JournalRecord) -> bytes:
 
 def _clone_record(record: JournalRecord) -> JournalRecord:
     return JournalRecord.from_dict(record.to_dict())
-
-
-def _origin_record(record: JournalRecord) -> JournalRecord:
-    current = record
-    for _ in range(64):
-        if current.type is not JournalRecordType.INHERITED:
-            return current
-        raw_record = current.payload.get("record")
-        if not isinstance(raw_record, Mapping):
-            raise JournalCorruptionError(
-                "journal.inherited is missing its origin record"
-            )
-        current = JournalRecord.from_dict(raw_record)
-    raise JournalCorruptionError("journal.inherited nesting is too deep")
 
 
 def _tool_transaction(
@@ -597,13 +540,6 @@ def _tool_transaction(
         action=action,
         result=result,
     )
-
-
-def _validate_run_id(run_id: str) -> None:
-    if not isinstance(run_id, str) or not run_id or run_id in {".", ".."}:
-        raise ValueError("run_id must be non-empty")
-    if "/" in run_id or "\\" in run_id or "\x00" in run_id:
-        raise ValueError("run_id contains a path separator")
 
 
 def _file_sync_mode() -> str:

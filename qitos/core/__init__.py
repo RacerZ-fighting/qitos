@@ -73,7 +73,9 @@ from .journal import (
     JournalUnsupportedVersionError,
     SessionJournal,
     ToolTransaction,
+    resolve_inherited_record,
 )
+from .run import RunCatalog, RunHandle, RunNotFoundError, RunStatus
 from .env import (
     AtomicFileWrite,
     Env,
@@ -208,6 +210,11 @@ __all__ = [
     "JournalUnsupportedVersionError",
     "SessionJournal",
     "ToolTransaction",
+    "resolve_inherited_record",
+    "RunCatalog",
+    "RunHandle",
+    "RunNotFoundError",
+    "RunStatus",
     "RunSpec",
     "ExperimentSpec",
     "BenchmarkRunResult",
