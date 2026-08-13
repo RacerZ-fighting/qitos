@@ -47,6 +47,13 @@ QitOS replays the provider's ordered output items and
 `previous_response_id` state is required. Active native tool rounds remain
 atomic during history compaction.
 
+The typed stream preserves request lifecycle, item, content, refusal, reasoning,
+function-argument, and terminal events. Text or reasoning present only in completed
+output is emitted once at the terminal boundary. Interleaved function arguments are
+tracked by item identity. An `incomplete` response retains its native evidence and
+finish reason but never exposes a function call for execution; malformed or
+contradictory terminal lifecycle events raise `ModelTransportError`.
+
 <Warning>
 OpenAI-compatible providers may implement only part of `/v1/responses`.
 QitOS never silently falls back to Chat Completions after a Responses request

@@ -19,6 +19,10 @@ How to update:
 
 ### Fixed
 
+- Responses streams now preserve lifecycle/item events and refusals, backfill text or
+  reasoning that appears only in terminal output, and keep interleaved function-call
+  argument state separate. Incomplete responses cannot publish executable tool calls;
+  malformed or conflicting terminal events fail explicitly.
 - Engine context telemetry now preserves a provider-reported zero input count,
   distinguishes provider usage from local estimates and absent usage, and projects
   cache-read, cache-write, and reasoning counts without adding those subset counts to
