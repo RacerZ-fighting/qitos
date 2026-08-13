@@ -271,6 +271,17 @@ def test_unknown_model_declared_protocol_falls_back_to_model_profile() -> None:
 
 def test_preset_model_protocol_delivers_tools_to_direct_engine_model_call() -> None:
     llm = _build_kimi_k3_model()
+    llm.default_request_kwargs = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "stale_tool",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+    }
     calls: list[dict[str, Any]] = []
 
     async def stream(

@@ -6,14 +6,23 @@ import dataclasses
 import json
 import os
 import threading
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, IO, List, Optional, cast
 
-from qitos.tracing.config import _redact_dict
+from qitos.tracing.config import _REDACTED_FIELDS, _redact_dict
 
 from .events import TraceEvent, TraceStep
 from .schema import TraceSchemaValidator
+
+_TRACE_REDACTED_FIELDS = _REDACTED_FIELDS - {"model_response"}
+
+
+def _redact_trace_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Redact secrets while retaining the canonical model transaction."""
+
+    return _redact_dict(data, fields=_TRACE_REDACTED_FIELDS)
 
 
 class _BufferedJsonlWriter:
@@ -96,7 +105,10 @@ class TraceWriter:
         events have no step transaction and remain immediately observable.
         """
         with self._lock:
-            line = json.dumps(_redact_dict(event.to_dict()), ensure_ascii=False) + "\n"
+            line = (
+                json.dumps(_redact_trace_dict(event.to_dict()), ensure_ascii=False)
+                + "\n"
+            )
             self._events_writer.append(line)
             # Lifecycle events are the observable record for cancellation and
             # failure paths; do not leave them waiting for the batch threshold.
@@ -121,11 +133,13 @@ class TraceWriter:
             if any(event.step_id != step.step_id for event in events):
                 raise ValueError("trace transaction mixes step ids")
             event_lines = [
-                json.dumps(_redact_dict(event.to_dict()), ensure_ascii=False) + "\n"
+                json.dumps(_redact_trace_dict(event.to_dict()), ensure_ascii=False)
+                + "\n"
                 for event in events
             ]
             step_line = (
-                json.dumps(_redact_dict(step.to_dict()), ensure_ascii=False) + "\n"
+                json.dumps(_redact_trace_dict(step.to_dict()), ensure_ascii=False)
+                + "\n"
             )
             for line in event_lines:
                 self._events_writer.append(line)
@@ -193,7 +207,7 @@ class TraceWriter:
             "provenance": self.metadata.get("provenance", {}),
         }
         with open(self.manifest_path, "w", encoding="utf-8") as f:
-            json.dump(_redact_dict(payload), f, ensure_ascii=False, indent=2)
+            json.dump(_redact_trace_dict(payload), f, ensure_ascii=False, indent=2)
 
     def _summary_totals(self, summary: Dict[str, Any]) -> tuple[int, float, float]:
         task_result = summary.get("task_result")
@@ -296,14 +310,14 @@ def runtime_step_to_trace(
 
 
 def _normalize(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(k): _normalize(v) for k, v in value.items()}
     if (
         value is not None
         and not isinstance(value, type)
         and dataclasses.is_dataclass(value)
     ):
         return {k: _normalize(v) for k, v in asdict(cast(Any, value)).items()}
-    if isinstance(value, dict):
-        return {str(k): _normalize(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_normalize(v) for v in value]
     if isinstance(value, (str, int, float, bool)) or value is None:

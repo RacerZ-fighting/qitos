@@ -230,6 +230,11 @@ async def test_openai_defaults_to_responses_and_streams_one_complete_transaction
     events = _AsyncListStream(
         [
             {
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "check evidence",
+                "sequence_number": 0,
+            },
+            {
                 "type": "response.output_text.delta",
                 "delta": "answer",
                 "sequence_number": 1,
@@ -314,6 +319,10 @@ async def test_openai_defaults_to_responses_and_streams_one_complete_transaction
         {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
     ]
     assert "".join(chunk.text for chunk in chunks) == "answer"
+    assert (
+        "".join(chunk.reasoning_content or "" for chunk in chunks)
+        == "check evidence"
+    )
     assert [
         chunk.event_metadata["arguments_delta"]
         for chunk in chunks
@@ -444,6 +453,61 @@ async def test_responses_missing_terminal_fails_and_closes_resources(
 
     assert events.closed is True
     assert closed["client"] is True
+
+
+@pytest.mark.asyncio
+async def test_responses_cancellation_closes_stream_and_client_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    attempts = 0
+    closed: dict[str, bool] = {}
+
+    class BlockingStream(AsyncIterator[Any]):
+        def __aiter__(self) -> BlockingStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            entered.set()
+            await release.wait()
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            closed["stream"] = True
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **_: Any) -> Any:
+            nonlocal attempts
+            attempts += 1
+            return BlockingStream()
+
+        async def aclose(self) -> None:
+            closed["client"] = True
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(
+        api_key="key",
+        model="gpt-test",
+        max_attempts=3,
+    )
+    task = asyncio.create_task(
+        _collect(model, [{"role": "user", "content": "question"}])
+    )
+    await entered.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert attempts == 1
+    assert closed == {"stream": True, "client": True}
 
 
 @pytest.mark.asyncio

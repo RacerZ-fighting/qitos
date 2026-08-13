@@ -7,13 +7,13 @@ import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator
-from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
 from ..core.errors import ModelTransportError
+from ..core.model_capabilities import ModelCapabilities
+from ..core.model_response import ModelUsage, ModelUsageSource
 from ..models.base import Model, ModelStreamChunk
 from .backends import CacheBackend
-
 
 _logger = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ class CachedModel(Model):
         _validate_complete_chunks(committed_chunks)
         try:
             encoded = json.dumps(
-                [asdict(chunk) for chunk in committed_chunks],
+                [_encode_chunk(chunk) for chunk in committed_chunks],
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -129,6 +129,10 @@ class CachedModel(Model):
 
     async def close(self) -> None:
         await self._wrapped.close()
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return self._wrapped.capabilities
 
     def supports_tool_schema_delivery(
         self, delivery: str, protocol: Any = None
@@ -180,11 +184,40 @@ def _decode_chunks(payload: bytes) -> List[ModelStreamChunk]:
     raw = json.loads(payload.decode("utf-8"))
     if not isinstance(raw, list):
         raise TypeError("cached model transaction must be a list")
-    chunks = [ModelStreamChunk(**item) for item in raw if isinstance(item, dict)]
+    chunks = [_decode_chunk(item) for item in raw if isinstance(item, dict)]
     if len(chunks) != len(raw):
         raise TypeError("cached model transaction contains a non-object chunk")
     _validate_complete_chunks(chunks)
     return chunks
+
+
+def _encode_chunk(chunk: ModelStreamChunk) -> Dict[str, Any]:
+    usage = chunk.usage
+    return {
+        "text": chunk.text,
+        "done": chunk.done,
+        "usage": usage.to_dict() if isinstance(usage, ModelUsage) else usage,
+        "usage_source": usage.source.value if isinstance(usage, ModelUsage) else None,
+        "tool_calls": chunk.tool_calls,
+        "native_items": chunk.native_items,
+        "event_type": chunk.event_type,
+        "event_metadata": chunk.event_metadata,
+        "reasoning_content": chunk.reasoning_content,
+        "finish_reason": chunk.finish_reason,
+    }
+
+
+def _decode_chunk(item: Dict[str, Any]) -> ModelStreamChunk:
+    values = dict(item)
+    source_value = values.pop("usage_source", None)
+    usage = values.get("usage")
+    if isinstance(usage, dict) and source_value is not None:
+        try:
+            source = ModelUsageSource(str(source_value))
+        except ValueError as exc:
+            raise ValueError("cached model usage source is invalid") from exc
+        values["usage"] = ModelUsage.from_mapping(usage, source=source)
+    return ModelStreamChunk(**values)
 
 
 def _json_safe(obj: Any) -> Any:

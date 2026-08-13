@@ -19,6 +19,17 @@ How to update:
 
 ### Fixed
 
+- A family preset can now select a different explicit wire adapter without carrying
+  request defaults from the preset's original adapter. This lets Kimi K3 use either
+  compatible Chat Completions or Anthropic Messages while preserving the Kimi family
+  identity and mapping Messages reasoning to `thinking` plus `output_config.effort`.
+- Local trace events now retain the completed model transaction's provider, model,
+  finish reason, typed usage, and usage source while recursively redacting nested
+  credential fields.
+- Anthropic presets now build the native Messages adapter, preserve default request
+  options through every construction path, and map Claude 4.5 reasoning effort to a
+  bounded manual thinking budget that reaches the provider payload. Presets prefer
+  native API tool schemas and typed tool calls instead of duplicate prompt injection.
 - MCP tools now execute on the transport's owning event loop and are removed from
   shared registries during Engine cleanup, preventing cross-loop failures and stale
   registrations when an Agent or registry is reused.
@@ -31,6 +42,13 @@ How to update:
 
 ### Added
 
+- Added immutable `ModelCapabilities` snapshots for configured adapters. OpenAI
+  Responses, Anthropic Messages, and compatible Chat Completions now report only
+  tested transport facts such as native tools, reasoning replay, usage/cache
+  reporting, and multimodal input; continuation and hosted tools remain disabled
+  until their runtime contracts are complete. Completed model transactions now
+  normalize token counts into typed `ModelUsage` while retaining the lossless
+  provider usage mapping for cache, trace, and compatibility consumers.
 - `AgentModule.mcp_servers` now forms a complete opt-in Engine lifecycle: an empty
   list is inert, while configured servers connect after preflight, expose bounded
   `mcp__server__tool` names for the first model turn, and close at run end.
@@ -86,6 +104,14 @@ How to update:
 
 ### Changed
 
+- Model transports now publish non-terminal text, reasoning, and tool-call deltas
+  immediately. Retries remain available before the first provider event, but an
+  observable attempt is never replayed; its terminal chunk is committed only after
+  provider EOF confirms that no late event follows it.
+- Synchronous history retrieval no longer calls the async `Model` contract as a
+  function during compaction. It uses the bounded heuristic projection and records
+  `summarizer_mode=heuristic_async_model`; explicit synchronous summarizers keep their
+  existing failure and circuit-breaker semantics.
 - **Breaking:** Removed the `read_only` and `allow_destructive` model arguments from
   `run_command`. Applications that need command admission enforce it before execution.
 - Oversized tool results now retain canonical output for reducers and traces while
@@ -153,10 +179,10 @@ How to update:
   delegated in one response for concurrent execution, while dependent steps and cheap
   mechanical variants remain in the parent. Explicit tool guidance is no longer replaced
   by the `execute()` implementation docstring during initialization.
-- Model calls now use transactional streaming. Retryable mid-stream failures discard
-  the failed attempt's partial text and tool calls before retrying within the
-  QitOS-owned attempt budget and absolute request deadline; active streams use a
-  bounded event-idle timeout.
+- Model calls use one live streaming transaction. Connection and pre-event failures
+  may retry within the QitOS-owned attempt budget and absolute request deadline;
+  observable attempts are never replayed, and active streams use a bounded event-idle
+  timeout.
 - OpenAI-compatible clients now disable OpenAI SDK retries on paths where QitOS owns the
   retry budget, preventing multiplicative retry delays.
 - Raised the optional OpenAI SDK floor to `openai>=1.66.0` and taught compact history to preserve active Responses function-call rounds atomically.

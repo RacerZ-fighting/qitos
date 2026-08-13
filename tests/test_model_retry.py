@@ -79,7 +79,7 @@ def test_retry_policy_rejects_invalid_budgets(kwargs: dict[str, Any]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_attempt_is_discarded_before_success_is_published(
+async def test_failure_before_first_event_retries_then_publishes_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attempts: list[_AttemptStream] = []
@@ -92,23 +92,21 @@ async def test_failed_attempt_is_discarded_before_success_is_published(
     async def create_stream() -> AsyncIterator[ModelStreamChunk]:
         failed = not attempts
         stream = _AttemptStream(
-            [
-                ModelStreamChunk(
-                    text="discarded" if failed else "committed",
-                    event_type="text.delta",
-                ),
-                *(
-                    []
-                    if failed
-                    else [
-                        ModelStreamChunk(
-                            done=True,
-                            event_type="model.completed",
-                            finish_reason="stop",
-                        )
-                    ]
-                ),
-            ],
+            (
+                []
+                if failed
+                else [
+                    ModelStreamChunk(
+                        text="committed",
+                        event_type="text.delta",
+                    ),
+                    ModelStreamChunk(
+                        done=True,
+                        event_type="model.completed",
+                        finish_reason="stop",
+                    ),
+                ]
+            ),
             failure=TimeoutError("stalled") if failed else None,
         )
         attempts.append(stream)
@@ -123,7 +121,7 @@ async def test_failed_attempt_is_discarded_before_success_is_published(
 
 
 @pytest.mark.asyncio
-async def test_incomplete_stream_retries_and_never_publishes_partial_output(
+async def test_empty_incomplete_stream_retries_without_publishing_output(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attempts = 0
@@ -136,7 +134,7 @@ async def test_incomplete_stream_retries_and_never_publishes_partial_output(
     async def create_stream() -> AsyncIterator[ModelStreamChunk]:
         nonlocal attempts
         attempts += 1
-        return _AttemptStream([ModelStreamChunk(text=f"attempt-{attempts}")])
+        return _AttemptStream([])
 
     with pytest.raises(ModelTransportError) as exc_info:
         await _collect(create_stream, policy=ModelRetryPolicy(max_attempts=2))
@@ -144,6 +142,90 @@ async def test_incomplete_stream_retries_and_never_publishes_partial_output(
     assert attempts == 2
     assert exc_info.value.attempts == 2
     assert exc_info.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_failure_after_first_event_is_not_retried_or_duplicated() -> None:
+    attempts = 0
+    published: list[ModelStreamChunk] = []
+
+    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+        nonlocal attempts
+        attempts += 1
+        return _AttemptStream(
+            [ModelStreamChunk(text="visible", event_type="text.delta")],
+            failure=TimeoutError("stalled"),
+        )
+
+    with pytest.raises(ModelTransportError) as exc_info:
+        async for chunk in transactional_stream_with_retry(
+            create_stream,
+            policy=ModelRetryPolicy(max_attempts=3),
+            connection_timeout_seconds=1.0,
+            event_idle_timeout_seconds=1.0,
+            deadline_monotonic=None,
+            is_terminal=lambda item: item.done,
+        ):
+            published.append(chunk)
+
+    assert [chunk.text for chunk in published] == ["visible"]
+    assert attempts == 1
+    assert exc_info.value.attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_nonterminal_event_is_visible_before_provider_terminal() -> None:
+    release_terminal = asyncio.Event()
+    terminal_wait_started = asyncio.Event()
+
+    class BlockingTerminalStream(AsyncIterator[ModelStreamChunk]):
+        def __init__(self) -> None:
+            self._index = 0
+            self.closed = False
+
+        def __aiter__(self) -> BlockingTerminalStream:
+            return self
+
+        async def __anext__(self) -> ModelStreamChunk:
+            if self._index == 0:
+                self._index += 1
+                return ModelStreamChunk(text="live", event_type="text.delta")
+            if self._index == 1:
+                self._index += 1
+                terminal_wait_started.set()
+                await release_terminal.wait()
+                return ModelStreamChunk(done=True, finish_reason="stop")
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    provider_stream = BlockingTerminalStream()
+
+    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+        return provider_stream
+
+    stream = transactional_stream_with_retry(
+        create_stream,
+        policy=ModelRetryPolicy(max_attempts=1),
+        connection_timeout_seconds=1.0,
+        event_idle_timeout_seconds=1.0,
+        deadline_monotonic=None,
+        is_terminal=lambda item: item.done,
+    )
+    iterator = stream.__aiter__()
+
+    first = await asyncio.wait_for(iterator.__anext__(), timeout=0.1)
+    assert first.text == "live"
+
+    terminal_task = asyncio.create_task(iterator.__anext__())
+    await asyncio.wait_for(terminal_wait_started.wait(), timeout=0.1)
+    assert terminal_task.done() is False
+    release_terminal.set()
+    terminal = await asyncio.wait_for(terminal_task, timeout=0.1)
+
+    assert terminal.done is True
+    assert provider_stream.closed is True
 
 
 @pytest.mark.asyncio
@@ -178,10 +260,20 @@ async def test_event_after_terminal_is_rejected() -> None:
     async def create_stream() -> AsyncIterator[ModelStreamChunk]:
         return stream
 
+    published: list[ModelStreamChunk] = []
     with pytest.raises(ModelTransportError) as exc_info:
-        await _collect(create_stream, policy=ModelRetryPolicy(max_attempts=1))
+        async for chunk in transactional_stream_with_retry(
+            create_stream,
+            policy=ModelRetryPolicy(max_attempts=1),
+            connection_timeout_seconds=1.0,
+            event_idle_timeout_seconds=1.0,
+            deadline_monotonic=None,
+            is_terminal=lambda item: item.done,
+        ):
+            published.append(chunk)
 
     assert "after its terminal" in str(exc_info.value)
+    assert published == []
     assert stream.closed is True
 
 

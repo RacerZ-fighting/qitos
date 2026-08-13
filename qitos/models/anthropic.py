@@ -9,6 +9,11 @@ from collections.abc import AsyncIterator
 from typing import Any, Dict, List, Optional, cast
 
 from ..core.errors import ModelTransportError
+from ..core.model_capabilities import (
+    ModelAPI,
+    ModelCapabilities,
+    ReasoningCapability,
+)
 from ..core.multimodal import content_to_text, normalize_content_block
 from .transport import (
     ModelRetryPolicy,
@@ -16,8 +21,10 @@ from .transport import (
     effective_request_timeout,
     transactional_stream_with_retry,
 )
-from .base import Model, ModelStreamChunk
-
+from .base import (
+    Model,
+    ModelStreamChunk,
+)
 
 _ANTHROPIC_BLOCK_TYPES = {
     "text",
@@ -99,6 +106,31 @@ def _anthropic_tool_choice(value: Any) -> Any:
         if name:
             return {"type": "tool", "name": name}
     return value
+
+
+def _merge_anthropic_request_kwargs(
+    defaults: Dict[str, Any], overrides: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Merge request defaults without sharing nested provider options."""
+
+    merged = dict(defaults)
+    for key, value in overrides.items():
+        if key in {"thinking", "output_config"} and isinstance(value, dict):
+            current = merged.get(key)
+            if (
+                key == "thinking"
+                and isinstance(current, dict)
+                and value.get("type") is not None
+                and value.get("type") != current.get("type")
+            ):
+                merged[key] = dict(value)
+                continue
+            nested = dict(merged.get(key) or {})
+            nested.update(value)
+            merged[key] = nested
+        else:
+            merged[key] = value
+    return merged
 
 
 class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
@@ -338,9 +370,11 @@ class AnthropicModel(Model):
         max_tokens: int = 4096,
         timeout: float = 120.0,
         context_window: Optional[int] = None,
+        default_request_kwargs: Optional[Dict[str, Any]] = None,
         max_attempts: int = 2,
         stream_idle_timeout: float = 60.0,
         retry_window_seconds: float = 300.0,
+        provider_name: str | None = None,
     ) -> None:
         super().__init__(
             model=model,
@@ -348,6 +382,7 @@ class AnthropicModel(Model):
             temperature=temperature,
             max_tokens=max_tokens,
             context_window=context_window,
+            provider_name=provider_name,
         )
         self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
@@ -361,9 +396,24 @@ class AnthropicModel(Model):
             raise ValueError("stream_idle_timeout must be positive")
         self.timeout = float(timeout)
         self.stream_idle_timeout = float(stream_idle_timeout)
+        self.default_request_kwargs = dict(default_request_kwargs or {})
         self.retry_policy = ModelRetryPolicy(
             max_attempts=max_attempts,
             retry_window_seconds=retry_window_seconds,
+        )
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        """Return behavior covered by the native Messages adapter contracts."""
+
+        return ModelCapabilities(
+            api=ModelAPI.ANTHROPIC_MESSAGES,
+            native_tool_calls=True,
+            reasoning=(ReasoningCapability.THINKING,),
+            opaque_replay=True,
+            usage=True,
+            prompt_cache_usage=True,
+            multimodal_input=True,
         )
 
     def _system_text(self, messages: List[Dict[str, Any]]) -> str:
@@ -514,7 +564,14 @@ class AnthropicModel(Model):
             "timeout": timeout,
         }
         payload.setdefault("max_tokens", self.max_tokens)
-        if self.temperature is not None:
+        thinking = payload.get("thinking")
+        thinking_enabled = isinstance(thinking, dict) and str(
+            thinking.get("type") or ""
+        ) not in {"", "disabled"}
+        if thinking_enabled:
+            # Anthropic thinking uses the provider's default sampling behavior.
+            payload.pop("temperature", None)
+        elif self.temperature is not None:
             payload.setdefault("temperature", self.temperature)
         system = self._system_text(messages)
         if system:
@@ -542,7 +599,10 @@ class AnthropicModel(Model):
     ) -> AsyncIterator[ModelStreamChunk]:
         """Stream one committed Anthropic Messages transaction."""
 
-        request_kwargs = dict(kwargs)
+        request_kwargs = _merge_anthropic_request_kwargs(
+            self.default_request_kwargs,
+            dict(kwargs),
+        )
 
         async def create_stream() -> AsyncIterator[ModelStreamChunk]:
             return await self._open_stream(

@@ -44,6 +44,12 @@ Responses 模式支持同步、异步和类型化流式调用。工具循环期�
 不同 OpenAI 兼容端点可能只实现 `/v1/responses` 的一部分。Responses 请求失败后，QitOS 不会静默回退到 Chat Completions；不支持 Responses 的端点应显式使用 `chat_completions`。
 </Warning>
 
+`CompactHistory.retrieve()` 仍是同步 history 契约。若配置的 `llm` 是 QitOS
+异步原生 `Model`，压缩会改用有界 heuristic summary，不会调用异步模型或创建
+event-loop 桥；summary metadata 与 context event 会记录
+`summarizer_mode="heuristic_async_model"`。显式传入的同步 summarizer 仍可使用，
+其失败继续遵循现有的有界 circuit 语义。
+
 Reasoning item 被视为不透明的续接状态。追踪摘要只保留安全的 item 描述与供应商允许的摘要，并排除加密 reasoning 续接内容。
 
 ### Reasoning 强度与续接
@@ -52,6 +58,15 @@ Reasoning item 被视为不透明的续接状态。追踪摘要只保留安全�
 `high`、`xhigh` 或 `max`。QitOS 会根据所选模型族只解析一次，并让异步
 流式请求共用解析后的请求默认值。不受支持的级别会映射到最接近的已声明级别；
 例如 GPT-5.6 会保留 `max`，较旧的 OpenAI policy 则上限为 `xhigh`。
+
+Anthropic 家族预设会构造原生 Messages adapter。Claude 4.5 模型把同一组强度
+映射到 1,024 至 16,384 token 的手动 thinking budget，并确保它小于
+`max_tokens`，同时至少为可见答案保留 1,024 token 和总输出上限的四分之一。
+每次调用仍可用 `thinking` 覆盖模型默认值；thinking 启用时，QitOS
+不会发送 `temperature`，让供应商使用兼容的采样行为。Harness metadata 会通过
+`reasoning.effective_budget_tokens` 记录裁剪后的实际值。预设通过原生 Messages API
+交付当前 turn 的 tool schema，并优先使用类型化 `tool_use`，而不是文本解析；过期的
+`default_request_kwargs.tools` 不能覆盖本轮工具投影。
 
 对于官方 OpenAI Responses 请求，QitOS 会请求 `reasoning.encrypted_content`，
 保留 output-item 事件先于最终响应送达的字段，并在下一轮工具调用中按顺序原样重放。
@@ -65,6 +80,11 @@ OpenAI SDK 的内置重试固定关闭，`ModelRetryPolicy` 是唯一重试 owne
 相对或绝对运行时限制绑定成一次逻辑模型请求的 deadline；每次 attempt 都按实时剩余
 时间收紧 provider timeout，backoff 同时响应 deadline 与立即取消。Provider 取消会沿异步流向下传播，
 不再把工作分离到 daemon 线程。
+
+非终态的文本、reasoning 与工具调用分片会在到达后立即发布。连接失败或首个 provider
+event 之前的断流可以在 attempt 与恢复窗口内重试；一旦已经收到 event，本次 attempt
+不会重放，后续失败会关闭流并直接报错，避免重复可见输出或工具调用。terminal chunk
+会保留到 provider EOF，确认没有终态后的迟到 event 再提交。
 
 所有模型流都使用 `ModelStreamChunk` 作为统一契约。终态 chunk 会保留供应商实际的
 `finish_reason`，文本、reasoning、类型化事件元数据、完整工具调用、原生 item 与 usage

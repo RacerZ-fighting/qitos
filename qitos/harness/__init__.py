@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._adapters import OpenAICompatibleAdapter, adapter_for_kind
+from ._adapters import AnthropicAdapter, OpenAICompatibleAdapter, adapter_for_kind
 from ._presets import known_family_presets, resolve_builtin_preset
 from ._reasoning import (
     ReasoningEffort,
@@ -36,10 +36,11 @@ def build_harness_policy(
     family_id: str | None = None,
     protocol: Any = None,
     tool_delivery: str | None = None,
+    adapter_kind: str | None = None,
     resolution_source: str = "family_preset",
 ) -> HarnessPolicy:
     preset = resolve_family_preset(model_name, family_id=family_id)
-    adapter = adapter_for_kind(preset.adapter_kind)
+    adapter = adapter_for_kind(adapter_kind or preset.adapter_kind)
     protocol_obj = build_protocol_for_preset(
         preset=preset,
         protocol=protocol,
@@ -65,6 +66,7 @@ def build_model_for_preset(
     base_url: str | None = None,
     protocol: Any = None,
     tool_delivery: str | None = None,
+    adapter_kind: str | None = None,
     temperature: float | None = 0.2,
     max_tokens: int = 2048,
     timeout: int = 120,
@@ -82,16 +84,25 @@ def build_model_for_preset(
         family_id=family_id,
         protocol=protocol,
         tool_delivery=tool_delivery,
+        adapter_kind=adapter_kind,
+        resolution_source=(
+            "explicit_adapter" if adapter_kind is not None else "family_preset"
+        ),
     )
     reasoning = resolve_reasoning(
         family_id=harness.family_preset.id,
         model_name=model_name,
         api_mode=api_mode,
         requested=reasoning_effort,
+        max_output_tokens=max_tokens,
     )
     # Merge preset recommendations, caller options, then the resolved reasoning
     # contract. Explicit reasoning intent is authoritative for its wire fields.
-    preset_kwargs = harness.family_preset.recommended_request_kwargs
+    preset_kwargs = (
+        harness.family_preset.recommended_request_kwargs
+        if harness.adapter.kind == harness.family_preset.adapter_kind
+        else None
+    )
     effective_kwargs = _merge_request_options(
         preset_kwargs,
         default_request_kwargs,
@@ -134,7 +145,10 @@ def build_model_for_preset(
     metadata["reasoning"] = reasoning.to_dict()
     setattr(llm, "qitos_harness_metadata", metadata)
     setattr(llm, "qitos_family_preset", harness.family_preset.id)
-    setattr(llm, "qitos_protocol", harness.protocol.id)
+    # Keep the resolved protocol object rather than only its registry id. Preset
+    # delivery overrides (for example Anthropic's native API tools on ReAct) are
+    # part of the effective turn contract and would be lost by an id round-trip.
+    setattr(llm, "qitos_protocol", harness.protocol)
     return llm
 
 
@@ -146,7 +160,21 @@ def _merge_request_options(
         if not option:
             continue
         for key, value in option.items():
-            if key in {"extra_body", "reasoning"} and isinstance(value, dict):
+            if key in {
+                "extra_body",
+                "reasoning",
+                "thinking",
+                "output_config",
+            } and isinstance(value, dict):
+                current = merged.get(key)
+                if (
+                    key == "thinking"
+                    and isinstance(current, dict)
+                    and value.get("type") is not None
+                    and value.get("type") != current.get("type")
+                ):
+                    merged[key] = dict(value)
+                    continue
                 nested = dict(merged.get(key) or {})
                 nested.update(value)
                 merged[key] = nested
@@ -157,6 +185,7 @@ def _merge_request_options(
 
 __all__ = [
     "ModelAdapter",
+    "AnthropicAdapter",
     "OpenAICompatibleAdapter",
     "ToolPolicy",
     "ContextPolicy",

@@ -18,6 +18,24 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **真实的模型能力快照**：模型 adapter 现在暴露不可变的 `ModelCapabilities`。
+  Responses、Anthropic Messages 与兼容 Chat 只声明已经通过测试的原生工具、
+  reasoning/replay、usage/cache 与多模态能力，不提前宣称尚未闭环的 continuation
+  或 hosted tool；终态 token 用量会收敛为类型化 `ModelUsage`，同时保留 Provider
+  原始明细。
+- **模型家族与 wire 可独立选择**：同一 Kimi 家族配置可使用兼容 Chat Completions
+  或 Anthropic Messages，且不会把一种 adapter 的请求默认值泄漏到另一种 wire。
+  本地 trace 会保留模型身份、终态、类型化 usage 及其来源，同时继续遮蔽嵌套凭据。
+- **上下文压缩不再错调异步模型**：同步 `CompactHistory.retrieve()` 遇到 QitOS
+  异步 `Model` 时会使用有界 heuristic summary 并记录实际模式，不再把异步模型当
+  普通函数调用，也不引入 sync/async event-loop 桥。
+- **模型 delta 真实实时可见**：文本、reasoning 与工具调用分片到达后立即发布。
+  只有首个 provider event 之前的失败可以重试，因此不会重复展示输出或重复工具调用；
+  terminal chunk 仍会等到 provider EOF 后才提交，保留成功事务边界。
+- **Anthropic 原生预设与 reasoning**：Anthropic 家族预设现在直接构造官方
+  Messages adapter。Claude 4.5 的 reasoning 强度会映射为受输出上限约束的手动
+  thinking budget，请求默认值会真实进入 wire payload，thinking 请求也不会再发送
+  不兼容的 temperature 覆盖；预设默认使用原生 API tool schema。
 - **Run-scoped MCP 工具**：通过 `AgentModule.mcp_servers` 传入显式 MCP server 后，
   Engine 会完成连接、发现、暴露 `mcp__server__tool` 名称、在 transport 所属 event
   loop 上执行调用，并在 run 结束时注销工具和关闭连接；默认空配置没有启动成本。
@@ -70,9 +88,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   跳过文本解释器和 parser，API 请求不再附加重复的框架动作契约；每个获准或被拒绝
   的调用都只按原始 call id 与顺序提交一次结果。参数损坏的调用也会返回配对错误，
   不会执行工具。
-- **OpenAI-compatible 事务式流重试**：Engine 由 QitOS 统一持有模型传输重试
-  预算，并关闭 SDK 内部重试。可重试的中途断流会丢弃本轮部分文本与工具调用后
-  在默认 300 秒恢复窗口内继续重试；事件空闲超时能识别卡住的流，又不会截断持续有输出的长响应。
+- **OpenAI-compatible 实时流与有界重试**：Engine 由 QitOS 统一持有模型传输
+  重试预算，并关闭 SDK 内部重试。连接和首事件前失败可在默认 300 秒恢复窗口内
+  重试；首个 provider event 之后保持实时发布，失败时直接停止而不重放。事件空闲
+  超时能识别卡住的流，又不会截断持续有输出的长响应。
 - **qita 轨迹分析工作台**：run 页面现在默认进入失败诊断视图，用 Focus Navigator、Agent Behavior Story 和右侧 Inspector 引导用户先看关键证据。每步按照 `Input -> Thought -> Action Calls -> Environment Observation` 展示；每个 action 都和自己的完整参数、状态、耗时及 model-visible result 成对出现，canonical raw 与无法配对的证据仍可在 Inspector 审计。异常调用默认展开、成功调用默认折叠，长正文自动折行且绝不会只有截断预览。CyberGym 的预算耗尽和 `submit_poc` 验证失败会被提升为重点复盘信号；Light/Dark 主题覆盖 board、run、replay 与 compare 页面。
 - **立即取消状态保持一致**：Engine 识别立即取消后，State、任务/运行结果、END event 与 trace manifest 现在都会记录 `cancelled_immediate`；qita 会将该 manifest 视为 `stopped`，不再误判为正常完成。
 - **结构化动作文本不再假完成**：当原生工具模型没有返回 `tool_calls`、却以文本输出了格式错误的动作字段时，QitOS 现在会保留 parser 恢复路径，而不会把动作文本当成最终答案；普通自然语言结论的行为保持不变。

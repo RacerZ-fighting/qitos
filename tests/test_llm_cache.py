@@ -13,6 +13,7 @@ import pytest
 
 from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegistry, tool
 from qitos.cache import CachedModel, DiskCache, InMemoryCache
+from qitos.core import ModelUsage, ModelUsageSource
 from qitos.engine import RuntimeBudget
 from qitos.models import Model, ModelStreamChunk
 
@@ -162,6 +163,8 @@ class TestCachedModel:
             "completion_tokens": 1,
             "total_tokens": 3,
         }
+        assert isinstance(second[-1].usage, ModelUsage)
+        assert second[-1].usage.source is ModelUsageSource.PROVIDER
         assert second[-1].native_items == [{"type": "message", "id": "msg_1"}]
         assert cached.stats == {"hits": 1, "misses": 1}
 
@@ -259,6 +262,7 @@ class TestCachedModel:
         assert cached.model == "stub"
         assert cached.temperature == 0.7
         assert cached.max_tokens == 2048
+        assert cached.capabilities == wrapped.capabilities
         assert cached.count_tokens("one two") == wrapped.count_tokens("one two")
 
 

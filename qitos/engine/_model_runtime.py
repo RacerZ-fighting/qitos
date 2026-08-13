@@ -11,7 +11,7 @@ import logging
 import os
 import re
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar, cast
 
@@ -1322,7 +1322,14 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         llm = getattr(self.engine.agent, "llm", None)
         options: Dict[str, Any] = {}
 
-        # Build tool schema options
+        # Model defaults are the baseline. Turn-owned tool projection is applied
+        # afterwards so stale or user-supplied defaults cannot replace the exact
+        # tool exposure frozen for this request.
+        if llm is not None:
+            default_kwargs = getattr(llm, "default_request_kwargs", None)
+            if isinstance(default_kwargs, dict) and default_kwargs:
+                options.update(default_kwargs)
+
         if llm is not None and delivery in {"api_parameter", "hybrid"}:
             build_options = getattr(llm, "build_tool_schema_request_options", None)
             if callable(build_options):
@@ -1335,13 +1342,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     _logger.debug(
                         "build_tool_schema_request_options failed", exc_info=True
                     )
-
-        # Merge default_request_kwargs from the model instance
-        # (e.g. chat_template_kwargs for thinking mode)
-        if llm is not None:
-            default_kwargs = getattr(llm, "default_request_kwargs", None)
-            if isinstance(default_kwargs, dict) and default_kwargs:
-                options.update(default_kwargs)
 
         return options
 
@@ -1361,7 +1361,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         handler = to_stream_handler(self.stream_callback)
         accumulated_text: List[str] = []
         accumulated_reasoning: List[str] = []
-        final_usage: Optional[Dict[str, Any]] = None
+        final_usage: Mapping[str, Any] | None = None
         final_tool_calls: Optional[List[Dict[str, Any]]] = None
         final_native_items: Optional[List[Dict[str, Any]]] = None
         final_finish_reason: Optional[str] = None
@@ -1448,7 +1448,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                             retryable=False,
                         )
                     terminal_seen = True
-                    if usage is not None and isinstance(usage, dict):
+                    if usage is not None and isinstance(usage, Mapping):
                         final_usage = usage
                     if tool_calls is not None and isinstance(tool_calls, list):
                         final_tool_calls = tool_calls
@@ -2462,7 +2462,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     text = ""
         return ModelResponse(
             text=text,
-            usage=(dict(response.usage) if isinstance(response.usage, dict) else None),
+            usage=response.usage,
             finish_reason=response.finish_reason,
             tool_calls=tool_calls,
             model_name=str(model_name) if model_name is not None else None,

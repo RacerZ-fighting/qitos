@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..models.anthropic import AnthropicModel
 from ..models.context_registry import infer_context_window
 from ..models.openai import OpenAICompatibleModel
 from ._types import ContextPolicy, FamilyPreset, ModelAdapter
@@ -99,6 +100,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
             max_attempts=max_attempts,
             stream_idle_timeout=stream_idle_timeout,
             retry_window_seconds=retry_window_seconds,
+            provider_name=preset.id,
         )
         setattr(
             llm,
@@ -113,8 +115,82 @@ class OpenAICompatibleAdapter(ModelAdapter):
         return llm
 
 
+class AnthropicAdapter(ModelAdapter):
+    """Build the native Anthropic Messages provider for Anthropic presets."""
+
+    kind = "anthropic"
+
+    def build_model(self, **kwargs: object) -> AnthropicModel:
+        preset = kwargs["preset"]
+        model_name = kwargs["model_name"]
+        context_policy = kwargs["context_policy"]
+        if not isinstance(preset, FamilyPreset):
+            raise TypeError("preset must be a FamilyPreset")
+        if not isinstance(model_name, str):
+            raise TypeError("model_name must be a string")
+        if not isinstance(context_policy, ContextPolicy):
+            raise TypeError("context_policy must be a ContextPolicy")
+
+        raw_temperature = kwargs.get("temperature")
+        temperature = (
+            _coerce_float(raw_temperature, 0.7) if raw_temperature is not None else None
+        )
+        context_window = kwargs.get("context_window")
+        default_request_kwargs = kwargs.get("default_request_kwargs")
+        llm = AnthropicModel(
+            model=model_name,
+            api_key=(
+                str(kwargs["api_key"]) if kwargs.get("api_key") is not None else None
+            ),
+            base_url=(
+                str(kwargs["base_url"]) if kwargs.get("base_url") is not None else None
+            ),
+            system_prompt=(
+                str(kwargs["system_prompt"])
+                if kwargs.get("system_prompt") is not None
+                else None
+            ),
+            temperature=temperature,
+            max_tokens=_coerce_int(kwargs.get("max_tokens"), 2048),
+            timeout=_coerce_int(kwargs.get("timeout"), 120),
+            context_window=resolve_context_window(
+                model_name,
+                context_policy=context_policy,
+                explicit=(
+                    _coerce_int(context_window, 0)
+                    if context_window is not None
+                    else None
+                ),
+            ),
+            default_request_kwargs=(
+                dict(default_request_kwargs)
+                if isinstance(default_request_kwargs, dict)
+                else None
+            ),
+            max_attempts=_coerce_int(kwargs.get("max_attempts"), 2),
+            stream_idle_timeout=_coerce_float(kwargs.get("stream_idle_timeout"), 60.0),
+            retry_window_seconds=_coerce_float(
+                kwargs.get("retry_window_seconds"), 300.0
+            ),
+            provider_name=preset.id,
+        )
+        setattr(
+            llm,
+            "qitos_harness_metadata",
+            {
+                "family_preset": preset.id,
+                "context_policy": context_policy.to_dict(),
+                "adapter_kind": self.kind,
+                "api_mode": "messages",
+            },
+        )
+        return llm
+
+
 def adapter_for_kind(kind: str) -> ModelAdapter:
     normalized = str(kind or "").strip().lower()
     if normalized == "openai-compatible":
         return OpenAICompatibleAdapter()
+    if normalized == "anthropic":
+        return AnthropicAdapter()
     raise ValueError(f"Unknown harness adapter kind: {kind}")

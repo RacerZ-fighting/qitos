@@ -9,7 +9,9 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from ..core.model_capabilities import ModelCapabilities
 from ..core.multimodal import normalize_messages
+from ..core.model_response import ModelUsage, normalize_model_usage
 from .context_registry import infer_context_window
 
 
@@ -25,13 +27,16 @@ class ModelStreamChunk:
 
     text: str = ""
     done: bool = False
-    usage: Optional[Dict[str, Any]] = None
+    usage: ModelUsage | Mapping[str, Any] | None = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     native_items: Optional[List[Dict[str, Any]]] = None
     event_type: Optional[str] = None
     event_metadata: Dict[str, Any] = field(default_factory=dict)
     reasoning_content: Optional[str] = None
     finish_reason: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.usage = normalize_model_usage(self.usage)
 
     @property
     def is_final(self) -> bool:
@@ -57,12 +62,17 @@ class Model(ABC):
         temperature: float | None = 0.7,
         max_tokens: int = 2048,
         context_window: Optional[int] = None,
+        provider_name: str | None = None,
     ) -> None:
         self.model = model
         self.system_prompt = system_prompt
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.context_window = self._resolve_context_window(context_window)
+        if provider_name is not None:
+            if not isinstance(provider_name, str) or not provider_name.strip():
+                raise ValueError("provider_name must be a non-empty string")
+            self.provider_name = provider_name.strip()
 
     @abstractmethod
     async def stream(
@@ -87,6 +97,12 @@ class Model(ABC):
         Current adapters own clients per request, so the default lifecycle has
         no persistent resource to close.
         """
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        """Return conservative transport facts for this adapter."""
+
+        return ModelCapabilities(multimodal_input=self.supports_multimodal_input())
 
     async def __aenter__(self) -> Model:
         return self

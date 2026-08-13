@@ -54,6 +54,13 @@ fails. Select `chat_completions` explicitly for endpoints that do not support
 Responses.
 </Warning>
 
+`CompactHistory.retrieve()` remains a synchronous history contract. When its configured
+`llm` is an async-native QitOS `Model`, compaction uses the bounded heuristic summary
+instead of calling that model or creating an event-loop bridge. Summary metadata and
+context events record `summarizer_mode="heuristic_async_model"`. Applications may still
+provide an explicit synchronous summary callable; its errors remain visible and use the
+existing bounded failure circuit.
+
 Reasoning items are treated as opaque continuation state. Trace summaries keep
 safe item descriptors and provider-authorized summaries, but omit encrypted
 reasoning continuation payloads.
@@ -66,6 +73,16 @@ selected model-family policy and shares the resulting request defaults across sy
 async, and streaming calls. Unsupported values map to the nearest advertised level;
 for example, GPT-5.6 preserves `max`, while the older OpenAI policy caps it at
 `xhigh`.
+
+The Anthropic family preset builds the native Messages adapter. Claude 4.5 models map
+the same effort levels to manual thinking budgets from 1,024 to 16,384 tokens, clamped
+to preserve at least 1,024 tokens and one quarter of `max_tokens` for the visible
+answer. Per-call `thinking` options can override the model defaults. When thinking is
+enabled, QitOS omits `temperature` so the provider uses its compatible
+sampling behavior. Harness metadata reports the clamped value as
+`reasoning.effective_budget_tokens`. The preset delivers the current turn's tool
+schemas through the native Messages API and prefers typed `tool_use` calls over text
+parsing; stale `default_request_kwargs.tools` cannot replace that turn projection.
 
 For official OpenAI Responses requests, QitOS asks for
 `reasoning.encrypted_content`, preserves fields delivered by output-item events, and
@@ -99,14 +116,15 @@ remaining time, retry backoff observes both deadline and cancellation, and no ne
 attempt starts after either becomes terminal. Provider cancellation propagates through
 the async stream instead of detaching work onto a daemon thread.
 
-The Engine uses a transactional stream for OpenAI-compatible models: text and tool-call
-deltas stay private until a terminal event completes the attempt. A retryable failure
-after partial output closes that stream, discards its buffered deltas, and retries within
+The Engine publishes non-terminal text, reasoning, and tool-call deltas immediately.
+Connection failures and stream failures before the first provider event may retry within
 both the `max_attempts` budget and `retry_window_seconds`, measured from the first
-retryable failure. A healthy long response may run beyond `timeout` while events
+retryable failure. Once an event has arrived, QitOS never replays that attempt: a later
+failure closes the stream and surfaces the error, so visible output and tool-call deltas
+cannot be duplicated. The terminal chunk is held until provider EOF confirms that no
+late event follows it. A healthy long response may run beyond `timeout` while events
 continue only when no earlier Engine deadline applies; `stream_idle_timeout` detects a
-stalled response. Direct callers use the same `stream()` transaction and therefore see
-only chunks from a completed attempt.
+stalled response. Direct callers use the same live `stream()` contract.
 
 All model stream paths use `ModelStreamChunk` as the normalized contract. Its terminal
 chunk retains the provider's actual `finish_reason`; text, reasoning, typed event

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from collections.abc import AsyncIterator
 from types import ModuleType, SimpleNamespace
@@ -79,6 +80,17 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
             {
                 "type": "content_block_start",
                 "index": 1,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "answer"},
+            },
+            {"type": "content_block_stop", "index": 1},
+            {
+                "type": "content_block_start",
+                "index": 2,
                 "content_block": {
                     "type": "tool_use",
                     "id": "toolu_1",
@@ -88,10 +100,10 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
             },
             {
                 "type": "content_block_delta",
-                "index": 1,
+                "index": 2,
                 "delta": {"type": "input_json_delta", "partial_json": '{"q":"x"}'},
             },
-            {"type": "content_block_stop", "index": 1},
+            {"type": "content_block_stop", "index": 2},
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": "tool_use"},
@@ -136,6 +148,7 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
     assert (
         "".join(chunk.reasoning_content or "" for chunk in chunks) == "check evidence"
     )
+    assert "".join(chunk.text for chunk in chunks) == "answer"
     terminal = chunks[-1]
     assert terminal.done is True
     assert terminal.finish_reason == "tool_use"
@@ -148,6 +161,7 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
     ]
     assert terminal.native_items == [
         {"type": "thinking", "thinking": "check evidence", "signature": "sig_1"},
+        {"type": "text", "text": "answer"},
         {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}},
     ]
     assert terminal.usage == {
@@ -179,6 +193,146 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
     assert replay[1]["content"] == [
         {"type": "tool_result", "tool_use_id": "toolu_1", "content": "result"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_request_defaults_reach_payload_and_allow_call_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.messages = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            return _AsyncListStream(
+                [
+                    {
+                        "type": "message_start",
+                        "message": {"id": "msg_1", "usage": {}},
+                    },
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn"},
+                        "usage": {"output_tokens": 1},
+                    },
+                    {"type": "message_stop"},
+                ]
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("anthropic")
+    fake.AsyncAnthropic = Client
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    defaults = {
+        "thinking": {"type": "enabled", "budget_tokens": 2_048},
+        "output_config": {"effort": "medium"},
+    }
+    model = AnthropicModel(
+        api_key="test-key",
+        model="claude-sonnet-4-5",
+        temperature=0.7,
+        default_request_kwargs=defaults,
+        max_attempts=1,
+    )
+
+    await _collect(model, [{"role": "user", "content": "answer"}])
+    await _collect(
+        model,
+        [{"role": "user", "content": "answer"}],
+        thinking={"budget_tokens": 4_096},
+        output_config={"effort": "low"},
+    )
+    await _collect(
+        model,
+        [{"role": "user", "content": "answer"}],
+        thinking={"type": "disabled"},
+    )
+    await _collect(
+        model,
+        [{"role": "user", "content": "answer"}],
+        thinking={"type": "adaptive"},
+    )
+
+    assert requests[0]["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 2_048,
+    }
+    assert requests[0]["output_config"] == {"effort": "medium"}
+    assert "temperature" not in requests[0]
+    assert requests[1]["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 4_096,
+    }
+    assert requests[1]["output_config"] == {"effort": "low"}
+    assert requests[2]["thinking"] == {"type": "disabled"}
+    assert requests[2]["temperature"] == 0.7
+    assert requests[3]["thinking"] == {"type": "adaptive"}
+    assert "temperature" not in requests[3]
+    assert defaults == {
+        "thinking": {"type": "enabled", "budget_tokens": 2_048},
+        "output_config": {"effort": "medium"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_anthropic_cancellation_closes_stream_and_client_without_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    attempts = 0
+    closed: dict[str, bool] = {}
+
+    class BlockingStream(AsyncIterator[Any]):
+        def __aiter__(self) -> BlockingStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            entered.set()
+            await release.wait()
+            raise StopAsyncIteration
+
+        async def aclose(self) -> None:
+            closed["stream"] = True
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.messages = SimpleNamespace(create=self.create)
+
+        async def create(self, **_: Any) -> Any:
+            nonlocal attempts
+            attempts += 1
+            return BlockingStream()
+
+        async def aclose(self) -> None:
+            closed["client"] = True
+
+    fake = ModuleType("anthropic")
+    fake.AsyncAnthropic = Client
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    model = AnthropicModel(
+        api_key="test-key",
+        model="claude-test",
+        max_attempts=3,
+    )
+    task = asyncio.create_task(
+        _collect(model, [{"role": "user", "content": "answer"}])
+    )
+    await entered.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert attempts == 1
+    assert closed == {"stream": True, "client": True}
 
 
 @pytest.mark.asyncio

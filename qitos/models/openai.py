@@ -12,6 +12,11 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, cast
 
 from ..core.errors import ModelTransportError
+from ..core.model_capabilities import (
+    ModelAPI,
+    ModelCapabilities,
+    ReasoningCapability,
+)
 from ..core.multimodal import (
     content_to_text,
     ensure_data_url,
@@ -32,8 +37,10 @@ from .transport import (
     effective_request_timeout,
     transactional_stream_with_retry,
 )
-from .base import Model, ModelStreamChunk
-
+from .base import (
+    Model,
+    ModelStreamChunk,
+)
 
 GLM_TOKENIZER_ENV_VARS = ("QITOS_GLM_TOKENIZER_PATH", "GLM_TOKENIZER_PATH")
 
@@ -504,6 +511,7 @@ class OpenAICompatibleModel(Model):
         max_attempts: int = 2,
         stream_idle_timeout: float = 60.0,
         retry_window_seconds: float = 300.0,
+        provider_name: str | None = None,
     ) -> None:
         super().__init__(
             model=model,
@@ -511,6 +519,7 @@ class OpenAICompatibleModel(Model):
             temperature=temperature,
             max_tokens=max_tokens,
             context_window=context_window,
+            provider_name=provider_name,
         )
         self.api_key = api_key or os.getenv("OPENAI_API_KEY") or "dummy-key"
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL", "")
@@ -531,6 +540,32 @@ class OpenAICompatibleModel(Model):
 
     def _request_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         return _merge_request_kwargs(self.default_request_kwargs, kwargs)
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        """Return tested Responses or compatibility-channel behavior."""
+
+        if self.api_mode == "responses":
+            return ModelCapabilities(
+                api=ModelAPI.RESPONSES,
+                native_tool_calls=True,
+                reasoning=(
+                    ReasoningCapability.SUMMARY,
+                    ReasoningCapability.OPAQUE_REPLAY,
+                ),
+                opaque_replay=True,
+                usage=True,
+                prompt_cache_usage=True,
+                multimodal_input=True,
+            )
+        return ModelCapabilities(
+            api=ModelAPI.CHAT_COMPLETIONS,
+            native_tool_calls=True,
+            reasoning=(ReasoningCapability.SUMMARY,),
+            usage=True,
+            prompt_cache_usage=True,
+            multimodal_input=True,
+        )
 
     def _attempt_request_kwargs(
         self,

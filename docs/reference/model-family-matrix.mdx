@@ -11,7 +11,7 @@ description: "The built-in QitOS v0.4 family presets and their default harness p
 | `gpt-oss` | OpenAI-compatible | `json_decision_v1` | `react_text_v1` | `api_parameter` | 128k | `gpt-oss-120b`, `gpt-oss-20b` |
 | Gemma 4 | OpenAI-compatible | `json_decision_v1` | `react_text_v1` | `prompt_injection` | 128k | `gemma-4-31b-it`, `gemma-4-26b-a4b-it` |
 | OpenAI | OpenAI-compatible | `json_decision_v1` | `react_text_v1` | `api_parameter` | 128k | `gpt-4.1`, `gpt-4o` |
-| Anthropic | OpenAI-compatible | `react_text_v1` | `json_decision_v1` | `prompt_injection` | 200k | `claude-sonnet-4-5` |
+| Anthropic | Native Messages | `react_text_v1` | `json_decision_v1` | `api_parameter` | 200k | `claude-sonnet-4-5` |
 | Gemini | OpenAI-compatible | `xml_decision_v1` | `json_decision_v1 → react_text_v1` | `prompt_injection` | 1M | `gemini-2.5-pro` |
 | DeepSeek | OpenAI-compatible | `json_decision_v1` | `tool_use_xml_v1 → react_text_v1` | `api_parameter` | 128k | `ds-v4-pro`, `ds-v4-flash`, `deepseek-chat` |
 | GLM | OpenAI-compatible | `json_decision_v1` | `xml_decision_v1 → react_text_v1` | `api_parameter` | 200k | `GLM-5.1-sii`, `zai-org/GLM-5.1-FP8` |
@@ -20,7 +20,71 @@ description: "The built-in QitOS v0.4 family presets and their default harness p
 
 The first five families (Qwen, Kimi, MiniMax, `gpt-oss`, Gemma 4) are the **gold presets** — the most thoroughly tested configurations that the QitOS team validates on every release. When you are getting started or running a benchmark comparison, prefer a gold preset.
 
-The remaining five (OpenAI, Anthropic, Gemini, DeepSeek, GLM) are **compatibility presets**. They provide correct protocol and context defaults for their families but may evolve as dedicated adapters are added.
+The remaining families are **supported presets** with different maturity levels.
+Anthropic uses its native Messages adapter. OpenAI, Gemini, DeepSeek, and GLM retain
+compatibility transports and may evolve as dedicated adapters are added.
+
+## Inspect runtime capabilities
+
+The family matrix describes preset policy. A configured adapter separately exposes an
+immutable `model.capabilities` snapshot describing behavior that its transport tests
+currently prove:
+
+```python
+from qitos.models import OpenAIModel
+
+model = OpenAIModel(api_key="...", model="gpt-5")
+capabilities = model.capabilities
+
+print(capabilities.api.value)       # responses
+print(capabilities.native_tool_calls)
+print(capabilities.reasoning)
+```
+
+OpenAI Responses, Anthropic Messages, and compatible Chat Completions report their
+native-tool, reasoning/replay, usage/cache, and multimodal behavior. A false value is
+intentional: for example, Responses continuation and provider-hosted tools are not
+claimed until QitOS has a complete request, persistence, and recovery contract for
+them. Unknown/custom adapters inherit conservative `legacy` capabilities.
+
+Terminal chunks and completed responses expose token counts through `ModelUsage`:
+
+```python
+usage = terminal_chunk.usage
+if usage is not None:
+    print(usage.input_tokens, usage.output_tokens, usage.total_tokens)
+    print(usage.cache_read_tokens, usage.reasoning_tokens)
+    print(usage.source.value)  # provider or estimate
+    provider_usage = usage.to_dict()
+```
+
+Unknown counts remain `None`; QitOS does not turn missing provider facts into zero.
+`to_dict()` returns the complete provider-neutral/provider-specific mapping retained
+for compatibility, cache, trace, and later cost attribution.
+
+## Select a family and wire independently
+
+Family policy and SDK wire format are separate choices. For example, Kimi remains the
+model family while the Anthropic adapter supplies Messages transport semantics:
+
+```python
+from qitos.harness import build_model_for_preset
+
+model = build_model_for_preset(
+    family_id="kimi",
+    model_name="kimi-k3",
+    adapter_kind="anthropic",
+    api_mode="messages",
+    api_key="...",
+    base_url="https://api.kimi.com/coding",
+)
+```
+
+An explicit adapter override keeps family-level reasoning policy and provider identity,
+but QitOS does not copy request kwargs that were recommended only for the preset's
+default adapter. Kimi K3 Messages therefore emits `thinking` and
+`output_config.effort`, while Chat-only options such as `parallel_tool_calls` stay off
+the Anthropic wire.
 
 ## Use the matrix correctly
 
@@ -32,6 +96,7 @@ If you need to override one part, do it explicitly:
 
 - override the protocol with `build_model_for_preset(protocol=...)`
 - override the tool delivery with `build_model_for_preset(tool_delivery=...)`
+- override the wire adapter with `build_model_for_preset(adapter_kind=...)`
 - extend a preset with `preset.override()` — see [Family presets](/concepts/family-presets)
 
 Do not silently fork the whole example.
