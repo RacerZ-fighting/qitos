@@ -34,6 +34,7 @@ from .core.process import (
     ProcessPersistenceError,
     ProcessSnapshot,
     ProcessStatus,
+    ProcessTerminalNotifier,
 )
 from .core.history import History, HistoryPolicy, HistorySnapshot
 from .core.observation import Observation
@@ -101,6 +102,7 @@ __all__ = [
     "ProcessPersistenceError",
     "ProcessSnapshot",
     "ProcessStatus",
+    "ProcessTerminalNotifier",
     "StepSummary",
     "ContextConfig",
     "Task",

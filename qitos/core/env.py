@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence
 
-from .process import ProcessHandle, ProcessSnapshot
+from .process import ProcessHandle, ProcessSnapshot, ProcessTerminalNotifier
 
 if TYPE_CHECKING:
     from .journal import SessionJournal
@@ -299,10 +299,15 @@ class CommandCapability(ABC):
         cwd: str | None = None,
         tty: bool = False,
         journal: SessionJournal | None = None,
+        terminal_notifier: ProcessTerminalNotifier | None = None,
     ) -> ProcessSnapshot:
-        """Start one Run-owned background command when supported."""
+        """Start one Run-owned background command when supported.
 
-        _ = command, owner_run_id, cwd, tty, journal
+        A terminal notifier runs only after the process terminal fact is durable.
+        It may enqueue a safe-point input, but it does not own Agent state.
+        """
+
+        _ = command, owner_run_id, cwd, tty, journal, terminal_notifier
         raise NotImplementedError("managed background commands are not supported")
 
     async def apoll(self, handle: ProcessHandle) -> ProcessSnapshot:

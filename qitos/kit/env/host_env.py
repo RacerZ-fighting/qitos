@@ -26,7 +26,11 @@ from qitos.core.env import (
     TextFileChunk,
 )
 from qitos.core.journal import SessionJournal
-from qitos.core.process import ProcessHandle, ProcessSnapshot
+from qitos.core.process import (
+    ProcessHandle,
+    ProcessSnapshot,
+    ProcessTerminalNotifier,
+)
 from qitos.kit.env._async_process import run_process
 from qitos.kit.env._file_mutation import (
     FileMutationQueue,
@@ -534,6 +538,7 @@ class HostCommandCapability(CommandCapability):
         cwd: str | None = None,
         tty: bool = False,
         journal: SessionJournal | None = None,
+        terminal_notifier: ProcessTerminalNotifier | None = None,
     ) -> ProcessSnapshot:
         effective_cwd = self._resolve_cwd(cwd)
         return await self._managed_runtime().start(
@@ -542,6 +547,7 @@ class HostCommandCapability(CommandCapability):
             cwd=effective_cwd,
             tty=tty,
             journal=journal,
+            terminal_notifier=terminal_notifier,
         )
 
     async def apoll(self, handle: ProcessHandle) -> ProcessSnapshot:

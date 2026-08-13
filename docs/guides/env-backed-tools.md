@@ -77,6 +77,14 @@ the Journal, so no process reader or watcher remains detached from the Run. On r
 snapshot; it never reattaches to or replays the command. Fork Journal records are
 historical context only and grant no process ownership to the child Run.
 
+`CommandCapability.astart()` also accepts an optional async terminal notifier. The Host
+watcher invokes it only after output collection and the `process.terminal` append have
+completed. `CodingToolSet` binds that notifier to the active Engine's durable
+`RuntimeInput` mailbox and posts one stable `process.completed` event containing the
+bounded terminal snapshot. The watcher never calls the model or mutates Agent state;
+delivery happens at the next turn safe point. A closed or failed mailbox leaves the
+terminal snapshot queryable through the process controls.
+
 Register `CodingToolSet(profile="shell")` to expose the shared managed lifecycle to a
 model. `run_command(..., run_in_background=True)` returns a process id, and
 `process_list`, `process_read`, `process_write`, `process_wait`, and

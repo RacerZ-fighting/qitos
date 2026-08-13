@@ -57,6 +57,7 @@ from .process import (
     ProcessPersistenceError,
     ProcessSnapshot,
     ProcessStatus,
+    ProcessTerminalNotifier,
 )
 from .history import History, HistoryMessage, HistoryPolicy, HistorySnapshot
 from .observation import Observation
@@ -190,6 +191,7 @@ __all__ = [
     "ProcessPersistenceError",
     "ProcessSnapshot",
     "ProcessStatus",
+    "ProcessTerminalNotifier",
     "History",
     "HistoryMessage",
     "HistoryPolicy",

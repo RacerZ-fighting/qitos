@@ -292,17 +292,54 @@ async def test_terminal_record_failure_is_reported_during_runtime_cleanup(
     journal = _TerminalFailingJournal(tmp_path / "journal")
     await journal.create("run-1", {})
     runtime = ManagedHostProcessRuntime(str(tmp_path))
+    notifications = []
+
+    async def notify(snapshot):
+        notifications.append(snapshot)
+        return True
+
     await runtime.start(
         _python_command("import time; time.sleep(60)"),
         owner_run_id="run-1",
         cwd=str(tmp_path),
         journal=journal,
+        terminal_notifier=notify,
     )
 
     with pytest.raises(ProcessPersistenceError, match="terminal"):
         await runtime.close()
 
+    assert notifications == []
     await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_terminal_notification_keeps_snapshot_queryable(
+    tmp_path: Path,
+) -> None:
+    runtime = ManagedHostProcessRuntime(str(tmp_path))
+    notified = asyncio.Event()
+
+    async def reject(snapshot):
+        assert snapshot.terminal is True
+        notified.set()
+        raise RuntimeError("mailbox closed")
+
+    started = await runtime.start(
+        _python_command("print('done')"),
+        owner_run_id="run-1",
+        cwd=str(tmp_path),
+        terminal_notifier=reject,
+    )
+    terminal = await runtime.wait(
+        started.handle,
+        deadline_monotonic=asyncio.get_running_loop().time() + 2.0,
+    )
+
+    await asyncio.wait_for(notified.wait(), timeout=1)
+    assert terminal.status is ProcessStatus.EXITED
+    assert (await runtime.poll(started.handle)) == terminal
+    await runtime.close()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="stdlib PTY support is POSIX-only")

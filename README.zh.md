@@ -22,6 +22,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   revision。Host 与 Docker 文件能力通过原子替换提交内容，并在每个 environment 内按
   相同路径串行化 mutation；`write_file` 支持 compare-and-swap，`edit_file` 默认校验
   它刚读到的 revision，因此并发修改会明确报冲突，不会静默覆盖。
+- **后台进程完成后安全唤醒 Agent**：Host watcher 会先收完输出并持久化
+  `process.terminal`，再通过既有 durable Mailbox 提交唯一的 `process.completed` 输入。
+  活跃 Agent 只在下一 turn safe point 读取该事件；Mailbox 已关闭或拒绝时，terminal
+  snapshot 仍可由进程控制工具查询。
 - **带判别类型的模型流事件**：每个 Provider 事件现在都会明确声明它是文本、reasoning、
   ToolCall 增量、原生输出项、usage、生命周期、成功终态还是失败终态。含混的
   `ModelStreamChunk` 字段集合已经删除；Engine 把 `FAILED` 视为错误，只提交
