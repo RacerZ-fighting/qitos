@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
@@ -52,7 +52,18 @@ def test_model_request_durable_snapshot_redacts_credentials_and_round_trips() ->
     assert restored.messages == request.messages
 
 
-def test_model_continuation_is_bound_to_run_provider_model_and_protocol() -> None:
+@pytest.mark.parametrize(
+    "identity_change",
+    [
+        {"run_id": "forked-run"},
+        {"provider": "anthropic"},
+        {"model": "gpt-other"},
+        {"protocol": "chat_completions"},
+    ],
+)
+def test_model_continuation_is_bound_to_stable_request_identity(
+    identity_change: dict[str, str],
+) -> None:
     request = _request()
     continuation = ModelContinuation(
         run_id=request.run_id,
@@ -66,7 +77,7 @@ def test_model_continuation_is_bound_to_run_provider_model_and_protocol() -> Non
     )
 
     assert continuation.belongs_to(request) is True
-    assert continuation.belongs_to(_request(run_id="forked-run")) is False
+    assert continuation.belongs_to(replace(request, **identity_change)) is False
 
 
 def test_model_request_rejects_non_json_provider_state() -> None:

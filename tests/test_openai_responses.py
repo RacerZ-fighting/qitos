@@ -758,9 +758,34 @@ async def test_responses_continuation_sends_only_verified_canonical_delta(
     monkeypatch.setitem(sys.modules, "openai", fake)
 
     model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    prior_messages: list[dict[str, Any]] = []
+    for index in range(32):
+        prior_messages.extend(
+            [
+                {"role": "user", "content": f"question-{index}"},
+                {
+                    "role": "assistant",
+                    "content": f"answer-{index}",
+                    "native_items": [
+                        {
+                            "type": "message",
+                            "id": f"history-{index}",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": f"answer-{index}",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ]
+        )
+    prior_messages.append({"role": "user", "content": "question"})
     first_request = _request_for(
         model,
-        [{"role": "user", "content": "question"}],
+        prior_messages,
     )
     first = [chunk async for chunk in model.stream(first_request)]
     continuation = first[-1].continuation
@@ -769,7 +794,7 @@ async def test_responses_continuation_sends_only_verified_canonical_delta(
     second_request = _request_for(
         model,
         [
-            {"role": "user", "content": "question"},
+            *prior_messages,
             {
                 "role": "assistant",
                 "content": "first",
@@ -781,11 +806,81 @@ async def test_responses_continuation_sends_only_verified_canonical_delta(
     )
     second = [chunk async for chunk in model.stream(second_request)]
 
+    assert requests[0]["input"] == _to_responses_input(prior_messages)
     assert requests[1]["previous_response_id"] == "resp_1"
     assert requests[1]["input"] == [{"role": "user", "content": "follow up"}]
     assert second[-1].event_metadata["continuation_applied"] is True
     assert second[-1].continuation is not None
     assert second[-1].continuation.response_id == "resp_2"
+
+
+@pytest.mark.parametrize(
+    ("current_messages", "current_options", "expected_reason"),
+    [
+        (
+            [{"role": "user", "content": "compacted summary"}],
+            {},
+            "canonical_prefix_changed",
+        ),
+        (
+            [{"role": "user", "content": "original evidence"}],
+            {"max_output_tokens": 4096},
+            "request_settings_changed",
+        ),
+    ],
+)
+def test_responses_continuation_rejects_context_or_settings_drift(
+    current_messages: list[dict[str, Any]],
+    current_options: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    from qitos.core.model_request import ModelContinuation, model_json_digest
+    from qitos.models._openai_responses import (
+        _apply_continuation,
+        _continuation_settings,
+        _request_payload,
+    )
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    original_messages = [{"role": "user", "content": "original evidence"}]
+    original_request = _request_for(model, original_messages)
+    original_payload = _request_payload(
+        model,
+        original_messages,
+        {},
+        provider="openai",
+    )
+    continuation = ModelContinuation(
+        run_id=original_request.run_id,
+        provider=original_request.provider,
+        model=original_request.model,
+        protocol=original_request.protocol,
+        response_id="resp-original",
+        prefix_items=len(original_payload["input"]),
+        prefix_digest=model_json_digest(original_payload["input"]),
+        settings_digest=model_json_digest(
+            _continuation_settings(original_payload)
+        ),
+    )
+    request = _request_for(
+        model,
+        current_messages,
+        continuation=continuation,
+        **current_options,
+    )
+    current_payload = _request_payload(
+        model,
+        request.message_dicts(),
+        request.option_dict(),
+        provider="openai",
+    )
+
+    outbound, applied, reason = _apply_continuation(request, current_payload)
+
+    assert applied is False
+    assert reason == expected_reason
+    assert outbound == current_payload
+    assert "previous_response_id" not in outbound
 
 
 @pytest.mark.asyncio

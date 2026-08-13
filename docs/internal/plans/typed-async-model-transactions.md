@@ -212,7 +212,7 @@ git diff --check
 - [x] Replace `messages + **kwargs` dispatch with one immutable request value.
 - [x] Persist and validate Responses continuation with full-request fallback.
 - [x] Replace ambiguous stream chunks with discriminated typed events.
-- [ ] Prove long-history projection, resume, fork, Provider switch, and invalid-handle behavior.
+- [x] Prove long-history projection, resume, fork, Provider switch, and invalid-handle behavior.
 - [ ] Run the complete QitOS gate and merge the feature branch into `main`.
 
 Run from PentestAgent only after the QitOS commit and gitlink update:
