@@ -190,6 +190,8 @@ decision without treating the mutable registry as that decision's source of trut
 For tools that need shared state or lifecycle management, subclass `BaseTool` directly:
 
 ```python
+import asyncio
+
 from qitos.core.tool import BaseTool, ToolSpec, ToolPermission
 
 
@@ -208,9 +210,12 @@ class DatabaseTool(BaseTool):
             )
         )
 
-    def execute(self, args: dict, runtime_context: dict | None = None) -> list:
+    async def execute(self, args: dict, runtime_context: dict | None = None) -> list:
         _ = runtime_context
         sql = str(args["sql"])
+        return await asyncio.to_thread(self._query, sql)
+
+    def _query(self, sql: str) -> list:
         import sqlite3
         with sqlite3.connect(self.db_path) as conn:
             return conn.execute(sql).fetchall()
@@ -239,12 +244,23 @@ express. It runs only after schema validation succeeds. Either validation layer 
 return a terminal error without executing the handler; schema failures use
 `error_category="invalid_tool_arguments"`, `attempts=0`, and `executed=false`.
 
-Class-based tools have one execution entry: `execute(args, runtime_context)`. The
+Class-based tools have one asynchronous execution entry:
+`await execute(args, runtime_context)`. The
 registry resolves only the exact registered name and does not execute tools itself.
 There are no `run`/`call` adapters, short aliases, separator aliases, or case repair.
 Use `ActionExecutor` (normally through `Engine`) when permission, timeout, retry, and
 result handling must apply. `read_only=True` describes effects; only an explicit
 `concurrency_safe=True` permits parallel execution.
+
+At turn capture, QitOS deep-copies the Tool definition while retaining the registered
+handler as the single lifecycle owner. This keeps schema, timeout, permission, and
+concurrency metadata stable for the turn without duplicating stateful handler counters,
+background tasks, clients, or cleanup responsibility.
+
+Synchronous decorated callables remain compatible and run outside the event loop.
+Prefer `async def` for network, subprocess, Mailbox, MCP, Child, and other waiting work.
+If cancellation reaches a synchronous compatibility call, QitOS waits for it to finish
+before declaring the side effect terminal.
 
 <Note>
 For most practical coding agents, prefer preset toolsets such as `CodingToolSet` or the registry builders in `qitos.kit.toolset` rather than hand-registering every file and shell tool yourself.

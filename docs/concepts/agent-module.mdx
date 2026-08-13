@@ -27,9 +27,10 @@ class MyAgent(AgentModule[MyState, dict[str, Any], Action]):
     ...
 ```
 
-## The six hooks
+## Core hooks
 
-`AgentModule` defines six hooks. Two are **required** (`init_state` and `reduce`). The rest are **optional** and have sensible defaults.
+Two hooks are **required** (`init_state` and `reduce`). The remaining hooks are
+optional and keep the minimal path small.
 
 ### `init_state` (required)
 
@@ -81,6 +82,11 @@ def prepare(self, state: StateT) -> str:
     return f"Task: {state.task}\nStep: {state.current_step}/{state.max_steps}"
 ```
 
+Engine calls `prepare_turn(state, observation, turn)` after it freezes the current
+`TurnSnapshot`. The default delegates to `prepare(state)`. Override `prepare_turn` only
+when prompt projection needs the explicit protocol, History, Tool, capability, or
+remaining-budget view; do not read temporary attributes from the Agent instance.
+
 ### Custom message builders
 
 Agents that need an exact provider message shape can expose a `message_builder`
@@ -121,6 +127,36 @@ An additional stop condition checked each step after `reduce`. Return `True` to 
 def should_stop(self, state: StateT) -> bool:
     return state.final_result is not None
 ```
+
+### `assess_completion` (optional)
+
+A model-proposed final answer is a proposal, not an unconditional state mutation.
+Override `assess_completion(state, decision)` when product state decides whether the
+objective is actually complete:
+
+```python
+from qitos.core import CompletionAssessment
+
+def assess_completion(self, state, decision):
+    if state.blocker:
+        return CompletionAssessment.blocked("external prerequisite")
+    if not state.verified:
+        return CompletionAssessment.continue_run(
+            "Verify the result before concluding.",
+            reason="verification_missing",
+        )
+    return CompletionAssessment.completed("verified")
+```
+
+The default accepts the proposal. Accepted and blocked answers use distinct stop
+reasons. A rejected proposal appends the feedback to canonical History and starts a new
+turn without retaining `final_result`.
+
+### `build_tool_exposure` (optional)
+
+Return a `ToolExposure` that freezes the exact definitions available to one turn. The
+same exposure drives model schema projection and Tool dispatch. Registry or policy
+changes made during the request can affect only the following turn.
 
 ## Minimal example
 

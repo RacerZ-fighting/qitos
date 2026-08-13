@@ -179,6 +179,8 @@ revision、精确工具名、Schema 摘要和应用选择元数据。journal rep
 如果工具需要维护共享状态或生命周期逻辑，可以直接继承 `BaseTool`：
 
 ```python
+import asyncio
+
 from qitos.core.tool import BaseTool, ToolSpec, ToolPermission
 
 
@@ -197,9 +199,12 @@ class DatabaseTool(BaseTool):
             )
         )
 
-    def execute(self, args: dict, runtime_context: dict | None = None) -> list:
+    async def execute(self, args: dict, runtime_context: dict | None = None) -> list:
         _ = runtime_context
         sql = str(args["sql"])
+        return await asyncio.to_thread(self._query, sql)
+
+    def _query(self, sql: str) -> list:
         import sqlite3
         with sqlite3.connect(self.db_path) as conn:
             return conn.execute(sql).fetchall()
@@ -225,11 +230,15 @@ required 字段、错误类型、非法枚举值和 JSON Schema 边界都会被�
 校验通过后才会运行。任一校验层失败都不会执行 handler；Schema 失败会生成
 `error_category="invalid_tool_arguments"`、`attempts=0`、`executed=false` 的终态结果。
 
-类式工具只有一个执行入口：`execute(args, runtime_context)`。注册表只接受精确的
+类式工具只有一个异步执行入口：`await execute(args, runtime_context)`。注册表只接受精确的
 已注册名称，本身不负责执行；不存在 `run`/`call` 适配、短名称别名、分隔符别名或
 大小写修复。需要权限、超时、重试和结果归一化时，应通过 `Engine` 使用
 `ActionExecutor`。`read_only=True` 只描述副作用；只有显式
 `concurrency_safe=True` 才允许并行。
+
+冻结 turn 时，QitOS 深拷贝 Tool 定义，但保留注册 handler 作为唯一生命周期 owner，因此
+schema、timeout、权限和并发元数据不会在本轮漂移，也不会复制有状态计数器、后台 Task、
+客户端或清理责任。同步装饰器 callable 仍可兼容，但等待型工作应优先写成 `async def`。
 
 <Note>
   对于实际编码智能体，通常优先使用 `CodingToolSet` 或 `qitos.kit.toolset` 中的预设构建器，而不是手工把文件、Shell、Web 工具逐个注册。

@@ -14,16 +14,21 @@ description: "Engine 是执行内核，负责驱动智能体循环、执行动�
 每一步都遵循固定顺序：
 
 ```
-prepare → decide → act → reduce → critics → check_stop → trace
+安全点输入 → 捕获 turn → decide → act → reduce → critics → check_stop → commit
 ```
 
-1. **prepare**：`agent.prepare(state)` 把状态格式化成模型可直接消费的提示词文本。
-2. **decide**：先调用 `agent.decide(state, observation)`；若返回 `None`，再走 Engine 的默认模型调用路径。
-3. **act**：把 `Decision.actions` 中的工具调用交给 `ToolRegistry` 执行。
-4. **reduce**：`agent.reduce(state, observation, decision)` 用新的观测结果更新状态。
-5. **评估器**：所有已注册的 `Critic` 在此步后评估当前结果，必要时可停止或重试。
-6. **check_stop**：检查预算、`FinalResultCriteria`、`agent.should_stop()` 以及自定义 `StopCriteria`。
-7. **追踪记录**：把本步的步骤记录与运行时事件写入 `TraceWriter`。
+1. **安全点输入**：只在下一次模型事务之前投影排队的外部事件。
+2. **捕获 turn**：创建不可变 `TurnSnapshot`，固定本轮的模型、协议、完整 History、
+   Tool exposure、运行能力、绝对 deadline、定价和剩余预算。
+3. **prepare**：`agent.prepare_turn(state, observation, turn)` 生成模型输入；默认转调
+   `prepare(state)`。
+4. **decide**：先调用 `agent.decide(state, observation)`；若返回 `None`，再进入异步 Provider 路径。
+5. **act**：只通过冻结 Tool exposure 准入和等待调用；并发安全调用可并行，terminal
+   结果仍按输入顺序提交。
+6. **reduce**：`agent.reduce(state, observation, decision)` 用新的观测结果更新状态。
+7. **评估器**：所有已注册的 `Critic` 在此步后评估当前结果，必要时可停止或重试。
+8. **check_stop**：检查产品完成策略、预算、`agent.should_stop()` 和自定义条件。
+9. **commit**：完整事务就绪后才推进 Journal、trace 和安全快照。
 
 ## 构造函数
 
@@ -150,7 +155,9 @@ engine.clear_hooks()
 
 ## 预算耗尽
 
-当步数、墙钟时间或令牌预算耗尽时，Engine 会把 `state.stop_reason` 设置为对应值，并写出 `END` 事件。运行会优雅结束，仍然返回 `EngineResult`，你可以通过检查 `state.stop_reason` 判断是否发生了预算耗尽。
+当步数、墙钟时间、令牌或费用预算耗尽时，Engine 会把 `state.stop_reason` 设置为
+对应值，并写出 `END` 事件。`RuntimeBudget` 也统一限制 Tool 并发和 Child 数量。
+费用限制必须配合显式 `ModelPricing`，不会根据模型名称猜价。
 
 ```python
 from qitos.engine.states import RuntimeBudget
@@ -161,6 +168,9 @@ engine = Engine(
         max_steps=30,
         max_runtime_seconds=120.0,
         max_tokens=50_000,
+        max_cost_usd=2.0,
+        max_tool_concurrency=4,
+        max_children=4,
     ),
 )
 ```
@@ -183,6 +193,10 @@ result = engine.run(task)
 
 `Engine` 只有一条异步原生执行路径。`arun()` 直接运行在调用方的事件循环上，
 模型 Provider 通过原生异步流返回结果，不使用工作线程桥接。
+
+类式 Tool 实现 `async execute(...)`。原生 subprocess、Managed Web、MCP、Mailbox 和 Child
+路径不创建临时 event loop。旧同步装饰器 Tool 只通过隔离兼容边界执行；取消会等待它抵达
+已知副作用边界后再发布 terminal。
 
 ```python
 from qitos import Engine
