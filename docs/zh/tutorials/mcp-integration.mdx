@@ -3,9 +3,34 @@ title: "MCP 集成"
 description: "将外部 MCP 服务器桥接到 QitOS，转化为 FunctionTool 实例，支持工具过滤与异步生命周期管理。"
 ---
 
-Model Context Protocol（MCP）是一个开放标准，用于将 AI 系统连接到外部工具和数据源。QitOS 提供了内置桥接功能：发现 MCP 服务器上的工具，将其 JSON Schema 转换为 QitOS `ToolSpec` 对象，并封装为 `FunctionTool`——因此 MCP 工具与原生 QitOS 工具的使用方式完全一致。
+Model Context Protocol（MCP）是一个开放标准，用于将 AI 系统连接到外部工具和数据源。QitOS 可以在一次 `Engine.arun()` 中完整持有 MCP 生命周期：preflight 后连接、第一轮模型请求前发现工具、在 transport 所属 event loop 上执行调用，并在运行结束时移除工具和关闭服务器。
 
-## Step 1: 连接 MCP 服务器
+## 推荐：由 Engine 持有生命周期
+
+把显式构造的 server 传给 `AgentModule`，同时给 Agent 配置 `ToolRegistry`：
+
+```python
+from qitos import Engine, ToolRegistry
+from qitos.mcp import MCPServerStdio
+
+server = MCPServerStdio(
+    command="npx",
+    args=["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+    name="filesystem",
+)
+agent = MyAgent(
+    tool_registry=ToolRegistry(),
+    mcp_servers=[server],
+)
+
+result = await Engine(agent).arun("检查 workspace")
+```
+
+模型看到的是 `mcp__filesystem__read_file` 这类 provider-safe 名称；QitOS 仍保留服务器与工具的原始名称来发起协议调用。模型可见名称会经过字符清理、冲突消解，并限制为 64 个字符。注册只在当前 run 生效，因此后续 Engine 可以复用同一个 registry。
+
+`mcp_servers=[]` 是正常默认值，不会创建 MCP event loop、子进程或 HTTP client。配置发现、catalog 和审批策略仍由应用层决定。
+
+## Transport 选项
 
 QitOS 内置两种传输实现。对于以命令行进程方式运行的本地 MCP 服务器，使用 `MCPServerStdio`：
 
@@ -41,9 +66,9 @@ for tool in tools:
 
 `list_tools()` 返回的每个 `MCPToolInfo` 包含 `name`、`description` 和 `input_schema`。
 
-## Step 2: 将 MCP 工具桥接到 QitOS
+## 底层桥接
 
-`mcp_server_to_function_tools` 函数将已连接的 MCP 服务器上的每个工具转换为 `FunctionTool` 实例：
+`mcp_server_to_function_tools` 函数将已连接的 MCP 服务器上的每个工具转换为 `FunctionTool` 实例。它适合自行持有连接与 transport event loop 的应用；普通 Agent 应优先使用上面的 Engine 路径。
 
 ```python
 from qitos.mcp import MCPServerStdio, mcp_server_to_function_tools
@@ -76,7 +101,7 @@ for tool in fs_tools:
     registry.register(tool)
 ```
 
-## Step 3: 过滤工具
+## 在应用自管桥接中筛选工具
 
 MCP 服务器通常暴露很多工具，但你的智能体可能只需要其中一部分。`ToolFilter` 控制哪些工具会被桥接：
 
@@ -120,7 +145,7 @@ tool_filter = ToolFilter(
 3. 如果设置了 `blocked_tool_names`，集合中的名称被排除。
 4. 否则名称通过（无过滤）。
 
-## Step 4: 异步生命周期
+## 应用自管的异步生命周期
 
 MCP 服务器连接持有资源（子进程、HTTP 客户端），必须进行清理。务必将 `connect()` 与 `cleanup()` 配对使用：
 
@@ -151,36 +176,7 @@ finally:
 
 `MCPServerStdio.cleanup()` 终止子进程（先 `SIGTERM`，5 秒超时后 `SIGKILL`）。`MCPServerStreamableHttp.cleanup()` 关闭 HTTP 客户端会话。
 
-完整的智能体集成模式示例：
-
-```python
-from qitos import ToolRegistry
-from qitos.mcp import MCPServerStdio, mcp_server_to_function_tools, ToolFilter
-
-async def build_registry_with_mcp():
-    server = MCPServerStdio(
-        command="npx",
-        args=["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
-    )
-    await server.connect()
-
-    try:
-        mcp_tools = await mcp_server_to_function_tools(
-            server,
-            tool_filter=ToolFilter(allowed_tool_names={"read_file", "list_directory"}),
-            name_prefix="fs",
-        )
-
-        registry = ToolRegistry()
-        for tool in mcp_tools:
-            registry.register(tool)
-        return registry, server
-    except Exception:
-        await server.cleanup()
-        raise
-```
-
-当智能体会话结束时，记得调用 `await server.cleanup()`。
+桥接后的函数会把调用提交回执行 discovery 的 event loop；执行工具时不能阻塞该 loop。由 Engine 持有时使用独立的 run-scoped MCP transport loop，因此没有这个限制。
 
 ## 下一步
 

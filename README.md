@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Run-scoped MCP tools**: pass explicit MCP server instances through
+  `AgentModule.mcp_servers` and Engine will connect, discover, expose
+  `mcp__server__tool` names, execute calls on the transport's owning event loop, and
+  unregister and close everything at run end. The empty default has no startup cost.
 - **Progressive bundled Skills**: applications can point `SkillToolSet` at read-only
   asset roots, expose a bounded catalog, load one exact `SKILL.md` in full, persist its
   content revision, and page linked UTF-8 resources without invoking a provider or

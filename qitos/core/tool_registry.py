@@ -117,6 +117,18 @@ class ToolRegistry:
     def get(self, name: str) -> Optional[BaseTool]:
         return self._tools.get(name)
 
+    def unregister(self, name: str) -> BaseTool:
+        """Remove one exact registered tool and return it.
+
+        Dynamic tool providers use this to keep their run-scoped registrations
+        from leaking into a reused registry. Unknown names fail explicitly.
+        """
+        if name not in self._tools:
+            raise ValueError(f"Tool '{name}' not found")
+        tool = self._tools.pop(name)
+        self._origins.pop(name, None)
+        return tool
+
     def suggest(self, name: str, limit: int = 3) -> List[str]:
         needle = str(name or "").strip()
         if not needle:

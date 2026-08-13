@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **Run-scoped MCP 工具**：通过 `AgentModule.mcp_servers` 传入显式 MCP server 后，
+  Engine 会完成连接、发现、暴露 `mcp__server__tool` 名称、在 transport 所属 event
+  loop 上执行调用，并在 run 结束时注销工具和关闭连接；默认空配置没有启动成本。
 - **渐进式 bundled Skill**：应用可以给 `SkillToolSet` 配置只读资源根目录，先暴露
   有界目录，再按精确名称加载完整 `SKILL.md`。加载结果带可持久化的内容 revision；
   `read_skill_resource` 通过受 Skill 根目录约束、绑定内容哈希的游标按需读取 UTF-8

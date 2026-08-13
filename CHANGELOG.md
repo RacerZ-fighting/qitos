@@ -19,6 +19,9 @@ How to update:
 
 ### Fixed
 
+- MCP tools now execute on the transport's owning event loop and are removed from
+  shared registries during Engine cleanup, preventing cross-loop failures and stale
+  registrations when an Agent or registry is reused.
 - Resuming a terminal checkpoint now finalizes a newly configured empty trace with
   the persisted stop reason and result instead of leaving its manifest running.
 - `run_command` now executes after the caller's normal tool admission instead of
@@ -28,6 +31,9 @@ How to update:
 
 ### Added
 
+- `AgentModule.mcp_servers` now forms a complete opt-in Engine lifecycle: an empty
+  list is inert, while configured servers connect after preflight, expose bounded
+  `mcp__server__tool` names for the first model turn, and close at run end.
 - Added read-only bundled Skill roots to `SkillToolSet`, with atomic validation,
   stable bounded `list_skills` summaries, and exact-name full-content `load_skill`
   disclosure independent of provider search and installation.
