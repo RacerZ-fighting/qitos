@@ -46,6 +46,7 @@ class _Agent(AgentModule[_State, dict[str, Any], Any]):
 
 def test_turn_snapshot_freezes_history_tools_model_and_budget() -> None:
     first_model = _UsageModel()
+    first_model.qitos_protocol = "react_text_v1"
     pricing = ModelPricing(1.0, 2.0)
     agent = _Agent(llm=first_model)
     engine = Engine(
@@ -66,6 +67,7 @@ def test_turn_snapshot_freezes_history_tools_model_and_budget() -> None:
     agent.tool_registry.register(later)
     engine._history_append("user", "after", 1)
     second_model = _UsageModel()
+    second_model.qitos_protocol = "json_decision_v1"
     agent.llm = second_model
     engine.budget.max_tool_concurrency = 1
     engine.model_pricing = ModelPricing(3.0, 4.0)
@@ -73,6 +75,8 @@ def test_turn_snapshot_freezes_history_tools_model_and_budget() -> None:
 
     assert first.model is first_model
     assert second.model is second_model
+    assert first.protocol.id == "react_text_v1"
+    assert second.protocol.id == "json_decision_v1"
     assert first.tools.list_tools() == ["original"]
     assert second.tools.list_tools() == ["later", "original"]
     assert [item.content for item in first.history.messages] == ["before"]

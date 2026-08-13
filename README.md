@@ -34,7 +34,7 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   critic/handoff policies compose around it instead of adding another loop. Engine,
   Tool, Mailbox, MCP, and Child calls stay on the caller's event loop; cancellation
   drains started handlers and journals one ordered terminal result per call before it
-  propagates.
+  propagates. Model changes re-resolve inferred protocol only for the next turn.
 - **Product-owned completion and bounded Runs**: `AgentModule.assess_completion()` can
   accept a final answer, request another evidence-gathering turn, or classify a concrete
   blocker. Runtime and Task budgets now cover steps, time, tokens, cost, Tool

@@ -121,7 +121,8 @@ repair and search backtracking.
 
 ## Protocol resolution
 
-`Engine` resolves the model protocol once per run using the following precedence:
+`Engine` resolves the model protocol while capturing each immutable turn, using the
+following precedence:
 
 1. The `protocol` passed directly to `Engine`.
 2. `agent.model_protocol`.
@@ -131,6 +132,9 @@ repair and search backtracking.
 6. The framework default, `react_text_v1`.
 
 The model-level declarations in step 4 are attached by `build_model_for_preset(...)`. This means direct construction such as `Engine(agent=agent)` preserves an explicitly selected family preset even when the provider model name is an alias that QitOS cannot infer. Unknown model-level protocol identifiers are ignored so the existing model-name and framework fallbacks remain available. Traces record `model_qitos_protocol` or `model_harness_metadata` as the resolution source when either declaration is selected.
+
+The selected protocol stays fixed for that turn. Configuration or model changes made
+while it runs are resolved only when the next turn snapshot is captured.
 
 ## Empty model responses
 

@@ -639,8 +639,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         return self._runtime_inbox.post(run_id, event)
 
     def resolve_protocol(self) -> Any:
-        if self._resolved_protocol is not None:
-            return self._resolved_protocol
+        """Resolve the protocol from the configuration visible to this turn."""
+
         explicit = self.protocol
         if explicit is not None:
             self._resolved_protocol = get_protocol(explicit)
