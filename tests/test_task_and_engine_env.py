@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from typing import Any, Dict, List
 
 import pytest
@@ -146,6 +146,13 @@ def test_task_budget_overrides_engine_budget():
 def test_task_budget_rejects_non_positive_limits(field, value):
     with pytest.raises(ValueError, match=field):
         TaskBudget(**{field: value})
+
+
+def test_task_budget_is_an_immutable_run_input():
+    budget = TaskBudget(max_steps=2, max_tool_concurrency=1)
+
+    with pytest.raises(FrozenInstanceError):
+        budget.max_steps = 3  # type: ignore[misc]
 
 
 def test_agent_run_accepts_task_object():

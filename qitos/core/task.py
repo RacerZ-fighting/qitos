@@ -64,7 +64,7 @@ class TaskResource:
     metadata: Dict[str, Any] = dc_field(default_factory=dict)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class TaskBudget:
     """Task-level budget contract."""
 
