@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
@@ -17,9 +17,11 @@ from ...core.child import (
     ChildHandle,
     ChildInvocation,
     ChildLaunchRequest,
+    ChildPersistenceError,
     ChildResult,
     ChildStatus,
 )
+from ...core.journal import JournalRecordType, SessionJournal
 from ...core.runtime_input import RuntimeInput
 from ...core.tool_result import ToolResult
 
@@ -42,6 +44,7 @@ class _OwnedChild:
     runtime_context: dict[str, Any]
     cancel_event: asyncio.Event
     terminal_event: asyncio.Event
+    journal: SessionJournal | None = None
     task: asyncio.Task[ChildResult] | None = None
     engine: ChildEngine | None = None
     result: ChildResult | None = None
@@ -67,6 +70,7 @@ class ChildSupervisor:
         self._children_started = 0
         self._closed = False
         self._children: dict[ChildHandle, _OwnedChild] = {}
+        self._recovered_runs: set[str] = set()
 
     async def launch(
         self,
@@ -88,6 +92,7 @@ class ChildSupervisor:
             raise TypeError("max_children must be an integer")
         if max_children < 0:
             raise ValueError("max_children must be non-negative")
+        journal = self._journal(runtime_context)
         async with self._admission_lock:
             if self._closed:
                 raise RuntimeError("child supervisor is closed")
@@ -106,28 +111,53 @@ class ChildSupervisor:
                 runtime_context=dict(runtime_context),
                 cancel_event=asyncio.Event(),
                 terminal_event=asyncio.Event(),
+                journal=journal,
             )
             self._children[handle] = owned
-            if background:
+            owned.task = asyncio.current_task()
+
+        try:
+            await self._persist_started(owned)
+        except BaseException:
+            async with self._admission_lock:
+                self._children.pop(handle, None)
+                self._children_started -= 1
+            raise
+
+        async with self._admission_lock:
+            if self._closed:
+                cancelled = True
+            elif background:
                 owned.task = asyncio.create_task(
                     self._supervise_background(owned),
                     name=f"qitos-{handle.child_id}",
                 )
                 return self._current_result(owned)
-            owned.task = asyncio.current_task()
+            else:
+                cancelled = False
+        if cancelled:
+            result = self._cancelled_result(
+                owned,
+                error="Child supervisor closed before child start.",
+            )
+            await self._store_terminal(owned, result)
+            owned.task = None
+            owned.runtime_context.clear()
+            return self._current_result(owned)
 
         try:
             result = await self._run_request(owned)
         except asyncio.CancelledError:
             self._cancel_engine(owned)
-            self._set_terminal(owned, self._cancelled_result(owned))
+            await self._store_terminal(owned, self._cancelled_result(owned))
             raise
+        else:
+            await self._store_terminal(owned, result)
+            return self._current_result(owned)
         finally:
             owned.task = None
             owned.engine = None
             owned.runtime_context.clear()
-        self._set_terminal(owned, result)
-        return result
 
     def result(self, handle: ChildHandle) -> ChildResult | None:
         """Return one owned child's immutable current state."""
@@ -160,6 +190,96 @@ class ChildSupervisor:
         except TimeoutError:
             return self._current_result(owned)
         return self._current_result(owned)
+
+    async def recover(
+        self,
+        *,
+        parent_run_id: str,
+        journal: SessionJournal,
+    ) -> tuple[ChildResult, ...]:
+        """Recover terminal facts and close interrupted children without replay."""
+
+        normalized_parent = str(parent_run_id or "").strip()
+        if not normalized_parent:
+            raise ValueError("parent_run_id must be a non-empty string")
+        if normalized_parent in self._recovered_runs:
+            return self._results_for_parent(normalized_parent)
+        records = await journal.replay()
+        started: dict[ChildHandle, ChildLaunchRequest] = {}
+        terminal: dict[ChildHandle, ChildResult] = {}
+        try:
+            for record in records:
+                if record.run_id != normalized_parent:
+                    continue
+                if record.type is JournalRecordType.CHILD_STARTED:
+                    raw_handle = record.payload.get("handle")
+                    raw_request = record.payload.get("request")
+                    if not isinstance(raw_handle, Mapping) or not isinstance(
+                        raw_request, Mapping
+                    ):
+                        raise ValueError("child.started payload is invalid")
+                    handle = ChildHandle.from_dict(raw_handle)
+                    request = ChildLaunchRequest.from_dict(raw_request)
+                    if handle.parent_run_id != normalized_parent:
+                        raise ValueError("child.started parent is inconsistent")
+                    started[handle] = request
+                elif record.type is JournalRecordType.CHILD_TERMINAL:
+                    result = ChildResult.from_dict(record.payload)
+                    if result.handle.parent_run_id != normalized_parent:
+                        raise ValueError("child.terminal parent is inconsistent")
+                    if not result.ready:
+                        raise ValueError("child.terminal contains a live status")
+                    terminal[result.handle] = result
+        except (TypeError, ValueError) as exc:
+            raise ChildPersistenceError(
+                "child lifecycle journal records are invalid"
+            ) from exc
+
+        recovered = dict(terminal)
+        for handle, request in started.items():
+            if handle in recovered:
+                continue
+            result = ChildResult(
+                handle=handle,
+                request=request,
+                status=ChildStatus.INTERRUPTED,
+                conclusion=AgentConclusion(
+                    failure_paths=(
+                        "The parent process exited before the child terminal record.",
+                    )
+                ),
+                error="Child side effects may be incomplete; the Engine was not replayed.",
+            )
+            try:
+                await journal.append(
+                    JournalRecordType.CHILD_TERMINAL,
+                    result.to_dict(),
+                    record_id=self._terminal_record_id(handle),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise ChildPersistenceError(
+                    "failed to persist interrupted child terminal record"
+                ) from exc
+            recovered[handle] = result
+
+        async with self._admission_lock:
+            for handle, result in recovered.items():
+                owned = self._children.get(handle)
+                if owned is None:
+                    owned = _OwnedChild(
+                        handle=handle,
+                        request=result.request,
+                        runtime_context={},
+                        cancel_event=asyncio.Event(),
+                        terminal_event=asyncio.Event(),
+                    )
+                    self._children[handle] = owned
+                self._set_terminal(owned, result)
+            self._children_started = max(self._children_started, len(started))
+            self._recovered_runs.add(normalized_parent)
+        return self._results_for_parent(normalized_parent)
 
     async def interrupt(
         self,
@@ -262,6 +382,7 @@ class ChildSupervisor:
         self._children_started = 0
         self._closed = False
         self._children.clear()
+        self._recovered_runs.clear()
 
     async def aclose(self, *, wait_seconds: float = 5.0) -> int:
         """Cancel and drain every owned Task, including terminal event delivery."""
@@ -310,9 +431,12 @@ class ChildSupervisor:
             result = self._cancelled_result(owned)
         except Exception as exc:  # pragma: no cover - defensive boundary
             result = self._failed_result(owned, exc)
-        self._set_terminal(owned, result)
         try:
-            await self._post_completion_event(owned, result)
+            persisted = await self._store_terminal(owned, result)
+            result = self._current_result(owned)
+            if persisted:
+                await self._post_completion_event(owned, result)
+            return result
         except asyncio.CancelledError:
             raise
         finally:
@@ -413,6 +537,52 @@ class ChildSupervisor:
         owned.result = result
         owned.terminal_event.set()
 
+    async def _persist_started(self, owned: _OwnedChild) -> None:
+        if owned.journal is None:
+            return
+        try:
+            await owned.journal.append(
+                JournalRecordType.CHILD_STARTED,
+                {
+                    "handle": owned.handle.to_dict(),
+                    "request": owned.request.to_dict(),
+                },
+                record_id=(
+                    f"{owned.handle.parent_run_id}:child:"
+                    f"{owned.handle.child_id}:started"
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ChildPersistenceError(
+                "failed to persist child.started; child was not executed"
+            ) from exc
+
+    async def _store_terminal(
+        self,
+        owned: _OwnedChild,
+        result: ChildResult,
+    ) -> bool:
+        if owned.journal is not None:
+            try:
+                await owned.journal.append(
+                    JournalRecordType.CHILD_TERMINAL,
+                    result.to_dict(),
+                    record_id=self._terminal_record_id(owned.handle),
+                )
+            except asyncio.CancelledError:
+                self._set_terminal(owned, self._persistence_failed_result(result))
+                raise
+            except Exception as exc:
+                self._set_terminal(
+                    owned,
+                    self._persistence_failed_result(result, cause=exc),
+                )
+                return False
+        self._set_terminal(owned, result)
+        return True
+
     def _current_result(self, owned: _OwnedChild) -> ChildResult:
         if owned.result is not None:
             return owned.result
@@ -481,6 +651,49 @@ class ChildSupervisor:
         if not isinstance(handle, ChildHandle):
             raise TypeError("handle must be a ChildHandle")
         return self._children.get(handle)
+
+    def _results_for_parent(self, parent_run_id: str) -> tuple[ChildResult, ...]:
+        return tuple(
+            self._current_result(owned)
+            for owned in self._children.values()
+            if owned.handle.parent_run_id == parent_run_id
+        )
+
+    @staticmethod
+    def _journal(runtime_context: Mapping[str, Any]) -> SessionJournal | None:
+        journal = runtime_context.get("journal")
+        if journal is None:
+            return None
+        if not callable(getattr(journal, "append", None)) or not callable(
+            getattr(journal, "replay", None)
+        ):
+            raise TypeError("runtime_context journal must implement SessionJournal")
+        return journal
+
+    @staticmethod
+    def _terminal_record_id(handle: ChildHandle) -> str:
+        return (
+            f"{handle.parent_run_id}:child:{handle.child_id}:terminal"
+        )
+
+    @staticmethod
+    def _persistence_failed_result(
+        result: ChildResult,
+        *,
+        cause: BaseException | None = None,
+    ) -> ChildResult:
+        error = "Child reached terminal state but its terminal record was not persisted."
+        if cause is not None and str(cause):
+            error = f"{error} {cause}"
+        return replace(
+            result,
+            status=ChildStatus.FAILED,
+            conclusion=replace(
+                result.conclusion,
+                failure_paths=result.conclusion.failure_paths + (error,),
+            ),
+            error=error,
+        )
 
     @staticmethod
     def _cancel_engine(owned: _OwnedChild) -> None:

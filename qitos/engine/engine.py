@@ -1064,6 +1064,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     "state": state,
                     "trace_writer": self.trace_writer,
                     "task": task_obj or task_text,
+                    "run_id": self._active_run_id,
+                    "journal": self.journal,
+                    "resume_journal": _resume_journal,
                 }
             )
         except Exception as exc:

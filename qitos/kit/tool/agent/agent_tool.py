@@ -239,6 +239,14 @@ class AgentTool(BaseTool):
 
     async def asetup(self, context: dict[str, Any] | None = None) -> None:
         self.setup(context)
+        payload = context or {}
+        journal = payload.get("journal")
+        parent_run_id = str(payload.get("run_id") or "").strip()
+        if payload.get("resume_journal") is True and journal is not None:
+            await self._supervisor.recover(
+                parent_run_id=parent_run_id,
+                journal=journal,
+            )
 
     async def aclose(self, *, wait_seconds: float = 5.0) -> int:
         return await self._supervisor.aclose(wait_seconds=wait_seconds)

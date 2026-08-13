@@ -197,7 +197,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Typed child-agent lifecycle**: immutable launch, handle, status, result, budget, and
   conclusion contracts separate persisted Child identity from live Engines. A Run-owned
   async supervisor handles admission, wait, interrupt, terminal state, parent delivery,
-  and teardown; `AgentTool` is now a thin model-facing launch projection.
+  and teardown; durable started/terminal records prevent recovery from replaying a Child,
+  and forks cannot control inherited handles. `AgentTool` is now a thin model-facing
+  launch projection.
 - **Environment-backed coding tools**: named Env capability groups now let the same
   bounded workspace tools run against host, container, or remote providers. The compact
   workspace profile exposes one lowercase surface (`read_file`, `write_file`,

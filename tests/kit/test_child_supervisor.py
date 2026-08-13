@@ -8,15 +8,53 @@ from types import SimpleNamespace
 import pytest
 
 from qitos.core.child import (
+    ChildHandle,
     ChildInvocation,
     ChildLaunchRequest,
+    ChildPersistenceError,
     ChildStatus,
 )
+from qitos.core.journal import JournalError, JournalRecordType
 from qitos.kit.child import ChildSupervisor
+from qitos.kit.journal import JsonlSessionJournal
 
 
 def _request(task: str = "inspect") -> ChildLaunchRequest:
     return ChildLaunchRequest(task=task, description=f"{task} task")
+
+
+class _CompletingEngine:
+    active_run_id = "child-run"
+
+    async def arun(self, task: str, **kwargs: object) -> object:
+        assert kwargs == {}
+        return SimpleNamespace(
+            state=SimpleNamespace(final_result=f"done:{task}", stop_reason="completed"),
+            records=[],
+            step_count=1,
+            total_tokens=2,
+            run_id=self.active_run_id,
+        )
+
+    def cancel(self, mode: str) -> None:
+        _ = mode
+
+
+class _FailingChildJournal(JsonlSessionJournal):
+    def __init__(self, *args: object, fail_type: JournalRecordType) -> None:
+        super().__init__(*args)
+        self._fail_type = fail_type
+
+    async def append(
+        self,
+        record_type: JournalRecordType,
+        payload,
+        *,
+        record_id: str,
+    ):
+        if record_type is self._fail_type:
+            raise JournalError(f"injected {record_type.value} failure")
+        return await super().append(record_type, payload, record_id=record_id)
 
 
 @pytest.mark.asyncio
@@ -188,3 +226,183 @@ async def test_close_terminalizes_child_cancelled_before_task_start() -> None:
     assert terminal is not None
     assert terminal.status is ChildStatus.CANCELLED
     assert factory_called is False
+
+
+@pytest.mark.asyncio
+async def test_child_lifecycle_journals_started_before_terminal(tmp_path) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: ChildInvocation(
+            engine=_CompletingEngine(),
+            task=request.task,
+        )
+    )
+
+    result = await supervisor.launch(
+        _request(),
+        {"journal": journal},
+        parent_run_id="parent-run",
+        background=False,
+    )
+
+    child_records = [
+        record
+        for record in await journal.replay()
+        if record.type
+        in {JournalRecordType.CHILD_STARTED, JournalRecordType.CHILD_TERMINAL}
+    ]
+    assert [record.type for record in child_records] == [
+        JournalRecordType.CHILD_STARTED,
+        JournalRecordType.CHILD_TERMINAL,
+    ]
+    assert child_records[0].payload["handle"] == result.handle.to_dict()
+    assert child_records[1].payload == result.to_dict()
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_started_record_failure_never_constructs_child(tmp_path) -> None:
+    factory_called = False
+    journal = _FailingChildJournal(
+        tmp_path / "journal",
+        fail_type=JournalRecordType.CHILD_STARTED,
+    )
+    await journal.create("parent-run", {})
+
+    def invocation_factory(request, _context):
+        nonlocal factory_called
+        factory_called = True
+        return ChildInvocation(engine=_CompletingEngine(), task=request.task)
+
+    supervisor = ChildSupervisor(invocation_factory=invocation_factory)
+
+    with pytest.raises(ChildPersistenceError, match="was not executed"):
+        await supervisor.launch(
+            _request(),
+            {"journal": journal},
+            parent_run_id="parent-run",
+            background=False,
+        )
+
+    assert factory_called is False
+    assert supervisor.active_count == 0
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_record_failure_is_visible_and_not_delivered(tmp_path) -> None:
+    delivered = False
+    journal = _FailingChildJournal(
+        tmp_path / "journal",
+        fail_type=JournalRecordType.CHILD_TERMINAL,
+    )
+    await journal.create("parent-run", {})
+
+    async def post_runtime_event(_event: object) -> bool:
+        nonlocal delivered
+        delivered = True
+        return True
+
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: ChildInvocation(
+            engine=_CompletingEngine(),
+            task=request.task,
+        )
+    )
+    launched = await supervisor.launch(
+        _request(),
+        {"journal": journal, "post_runtime_event": post_runtime_event},
+        parent_run_id="parent-run",
+        background=True,
+    )
+    terminal = await supervisor.wait(launched.handle, timeout_seconds=1)
+
+    assert terminal is not None
+    assert terminal.status is ChildStatus.FAILED
+    assert "not persisted" in str(terminal.error)
+    assert terminal.conclusion.summary == "done:inspect"
+    assert delivered is False
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_terminalizes_started_child_without_replay(tmp_path) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+    request = _request()
+
+    def invocation_factory(_request, _context):
+        raise AssertionError("recovery replayed the child")
+
+    supervisor = ChildSupervisor(invocation_factory=invocation_factory)
+
+    handle = ChildHandle(child_id="child-interrupted", parent_run_id="parent-run")
+    await journal.append(
+        JournalRecordType.CHILD_STARTED,
+        {"handle": handle.to_dict(), "request": request.to_dict()},
+        record_id="parent-run:child:child-interrupted:started",
+    )
+
+    recovered = await supervisor.recover(parent_run_id="parent-run", journal=journal)
+
+    assert len(recovered) == 1
+    assert recovered[0].status is ChildStatus.INTERRUPTED
+    assert recovered[0].handle == handle
+    terminal_records = [
+        record
+        for record in await journal.replay()
+        if record.type is JournalRecordType.CHILD_TERMINAL
+    ]
+    assert len(terminal_records) == 1
+    assert ChildStatus(terminal_records[0].payload["status"]) is ChildStatus.INTERRUPTED
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_fork_does_not_inherit_authority_over_parent_child(tmp_path) -> None:
+    parent = JsonlSessionJournal(tmp_path / "journal")
+    await parent.create("parent-run", {})
+    request = _request()
+    handle = ChildHandle(child_id="child-parent", parent_run_id="parent-run")
+    await parent.append(
+        JournalRecordType.CHILD_STARTED,
+        {"handle": handle.to_dict(), "request": request.to_dict()},
+        record_id="parent-run:child:child-parent:started",
+    )
+    position = await parent.append(
+        JournalRecordType.STEP_COMMITTED,
+        {
+            "step_id": 0,
+            "consumed_terminal_ids": [],
+            "state_delta": [],
+            "before_digest": "same",
+            "after_digest": "same",
+        },
+        record_id="parent-run:step:0",
+    )
+    child_journal = await parent.fork(position, "fork-run")
+
+    def invocation_factory(_request, _context):
+        raise AssertionError("fork recovery replayed the parent child")
+
+    supervisor = ChildSupervisor(invocation_factory=invocation_factory)
+
+    recovered = await supervisor.recover(
+        parent_run_id="fork-run",
+        journal=child_journal,
+    )
+
+    assert recovered == ()
+    assert supervisor.result(handle) is None
+    assert not any(
+        record.type is JournalRecordType.CHILD_TERMINAL
+        for record in await child_journal.replay()
+    )
+    await supervisor.aclose()
+    await child_journal.close()
+    await parent.close()

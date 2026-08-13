@@ -85,4 +85,8 @@ if transaction is not None:
 origin reference 解析继承结果，不把 ToolResult 复制到第二个存储。未知、未提交或改写成 Child
 run id 的引用都返回 `None`。
 
-后台任务、Mailbox、Child 生命周期和交互输入目前还不能从 Journal 恢复。
+Run Mailbox 使用 `runtime_input.posted` 持久化尚未被模型事务消费的输入。后台进程和 Child
+分别使用自己的生命周期记录：Child 在构造 Engine 前写入 `child.started`，在通知 Parent 前写入
+`child.terminal`。Resume 会恢复终态，并把缺少 terminal 的 started Child 补成 `interrupted`，
+不会重新连接或重放 Child Engine；Fork 只继承审计事实，不获得 Parent Handle 的控制权。终态
+Child 的 follow-up 恢复仍由应用层 Session 负责。

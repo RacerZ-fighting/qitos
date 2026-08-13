@@ -50,6 +50,8 @@ class JournalRecordType(str, Enum):
     TOOL_TERMINAL = "tool.terminal"
     PROCESS_STARTED = "process.started"
     PROCESS_TERMINAL = "process.terminal"
+    CHILD_STARTED = "child.started"
+    CHILD_TERMINAL = "child.terminal"
     RUNTIME_INPUT_POSTED = "runtime_input.posted"
     STEP_COMMITTED = "step.committed"
     STATE_SNAPSHOT = "state.snapshot"

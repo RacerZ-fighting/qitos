@@ -99,6 +99,10 @@ How to update:
   concurrency limit, supports non-destructive wait and bounded interrupt, stores
   terminal results before parent delivery, and continues to own delivery tasks until
   shutdown drains them. `AgentTool` is now only the model-facing launch projection.
+- Child supervision now journals `child.started` before constructing an Engine and
+  `child.terminal` before parent delivery. Recovery marks a started child without a
+  terminal as `interrupted` and never replays it; forked Runs do not acquire authority
+  over inherited parent handles.
 - Added canonical Child Agent contracts that keep persisted launch intent, stable
   identity, lifecycle status, bounded conclusions, evidence references, and live Engine
   ownership separate. The contracts round-trip without serializing a runnable Agent.

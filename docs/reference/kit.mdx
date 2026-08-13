@@ -752,6 +752,10 @@ recent tool evidence instead of silently dropping useful work.
 The Engine supplies an async `runtime_context["post_runtime_event"]` callback. Child
 supervision stores its terminal result before awaiting that callback; on Journal-backed
 parents, successful delivery is durable before the parent wakes.
+It also appends `child.started` before constructing the child Engine and
+`child.terminal` before delivery. Resume converts a started child without a terminal
+record to `interrupted` without replaying the Engine. Fork recovery ignores inherited
+parent lifecycle records, so a fork cannot query or interrupt the parent's live Child.
 
 `active_background_count`, `child_result(handle)`, `wait_child(handle)`,
 `interrupt_child(handle)`, `cancel_child(handle)`,

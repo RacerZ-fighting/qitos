@@ -15,6 +15,10 @@ from .task import TaskBudget
 DEFAULT_CHILD_MAX_STEPS = 200
 
 
+class ChildPersistenceError(RuntimeError):
+    """Raised when a Child lifecycle fact cannot be durably recorded."""
+
+
 class ChildStatus(str, Enum):
     """Stable lifecycle state for one child handle."""
 
@@ -414,6 +418,7 @@ __all__ = [
     "ChildHandle",
     "ChildInvocation",
     "ChildLaunchRequest",
+    "ChildPersistenceError",
     "ChildResult",
     "ChildRunResult",
     "ChildStateView",

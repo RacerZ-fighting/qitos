@@ -22,6 +22,7 @@ from .core.child import (
     AgentConclusion,
     ChildHandle,
     ChildLaunchRequest,
+    ChildPersistenceError,
     ChildResult,
     ChildStatus,
 )
@@ -90,6 +91,7 @@ __all__ = [
     "AgentConclusion",
     "ChildHandle",
     "ChildLaunchRequest",
+    "ChildPersistenceError",
     "ChildResult",
     "ChildStatus",
     "ProcessError",
