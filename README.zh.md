@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **来源明确的 token 统计**：Engine context telemetry 现在区分 Provider 实测、
+  本地估算与缺失 usage。Provider 返回的零值不会被本地估算覆盖；cache read/write
+  与 reasoning 子项保持可见，同时不会被重复计入累计总量。
 - **真实的模型能力快照**：模型 adapter 现在暴露不可变的 `ModelCapabilities`。
   Responses、Anthropic Messages 与兼容 Chat 只声明已经通过测试的原生工具、
   reasoning/replay、usage/cache 与多模态能力，不提前宣称尚未闭环的 continuation

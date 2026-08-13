@@ -19,6 +19,10 @@ How to update:
 
 ### Fixed
 
+- Engine context telemetry now preserves a provider-reported zero input count,
+  distinguishes provider usage from local estimates and absent usage, and projects
+  cache-read, cache-write, and reasoning counts without adding those subset counts to
+  cumulative totals.
 - A family preset can now select a different explicit wire adapter without carrying
   request defaults from the preset's original adapter. This lets Kimi K3 use either
   compatible Chat Completions or Anthropic Messages while preserving the Kimi family

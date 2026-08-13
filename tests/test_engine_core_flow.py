@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 from examples._support import SequenceModel
 from qitos import (
@@ -15,6 +16,7 @@ from qitos import (
     tool,
 )
 from qitos.core.history import History, HistoryMessage
+from qitos.core.model_response import ModelUsage, ModelUsageSource
 from qitos.kit.memory import WindowMemory
 from qitos.kit.env import ScreenshotEnv
 from qitos.kit.history import CompactHistory, WindowHistory
@@ -846,6 +848,7 @@ def test_engine_records_context_telemetry_and_defaults_to_compact_runtime_histor
     assert result.records
     assert result.records[0].context.get("input_tokens_total", 0) > 0
     assert result.records[0].context.get("context_window") == 4096
+    assert result.records[0].context["usage_source"] == "absent"
 
 
 def test_engine_prefers_provider_usage_for_context_totals():
@@ -859,6 +862,9 @@ def test_engine_prefers_provider_usage_for_context_totals():
                         "prompt_tokens": 123,
                         "completion_tokens": 17,
                         "total_tokens": 140,
+                        "cache_creation_input_tokens": 11,
+                        "cache_read_input_tokens": 19,
+                        "output_tokens_details": {"reasoning_tokens": 7},
                     },
                 )
             ]
@@ -895,6 +901,166 @@ def test_engine_prefers_provider_usage_for_context_totals():
     assert ctx["provider_total_tokens"] == 140
     assert ctx["output_tokens"] == 17
     assert ctx["tokens_total"] == 140
+    assert ctx["cached_tokens"] == 19
+    assert ctx["cache_write_tokens"] == 11
+    assert ctx["reasoning_tokens"] == 7
+    assert ctx["usage_source"] == ModelUsageSource.PROVIDER.value
+
+
+def test_engine_preserves_zero_provider_input_usage() -> None:
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    text="Final Answer: exact",
+                    done=True,
+                    usage={
+                        "prompt_tokens": 0,
+                        "completion_tokens": 3,
+                        "total_tokens": 3,
+                    },
+                )
+            ]
+        ],
+        model="dummy-zero-usage",
+        max_tokens=128,
+        context_window=8192,
+    )
+
+    class _Agent(DemoAgent):
+        def __init__(self):
+            super().__init__()
+            self.llm = model
+            self.model_parser = ReActTextParser()
+
+        def decide(self, state: DemoState, observation: dict[str, Any]):
+            return None
+
+    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=2)).run("demo")
+    context = result.records[0].context
+
+    assert context["provider_prompt_tokens"] == 0
+    assert context["input_tokens_total"] == 0
+    assert context["prompt_tokens_total"] == 0
+    assert context["tokens_total"] == context["provider_total_tokens"]
+
+
+def test_engine_keeps_estimated_usage_distinct_from_provider_usage() -> None:
+    input_tokens = 20 + uuid4().int % 10
+    output_tokens = 5 + uuid4().int % 5
+    cache_read_tokens = uuid4().int % input_tokens
+    cache_write_tokens = uuid4().int % input_tokens
+    reasoning_tokens = uuid4().int % output_tokens
+    total_tokens = input_tokens + output_tokens
+    usage = ModelUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+        reasoning_tokens=reasoning_tokens,
+        source=ModelUsageSource.ESTIMATE,
+    )
+    model = _ChunkSequenceModel(
+        [[ModelStreamChunk(text="Final Answer: estimate", done=True, usage=usage)]],
+        model="dummy-estimated-usage",
+        max_tokens=128,
+        context_window=8192,
+    )
+
+    class _Agent(DemoAgent):
+        def __init__(self):
+            super().__init__()
+            self.llm = model
+            self.model_parser = ReActTextParser()
+
+        def decide(self, state: DemoState, observation: dict[str, Any]):
+            return None
+
+    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=2)).run("demo")
+    context = result.records[0].context
+
+    assert context["usage_source"] == ModelUsageSource.ESTIMATE.value
+    assert context["provider_prompt_tokens"] is None
+    assert context["provider_completion_tokens"] is None
+    assert context["provider_total_tokens"] is None
+    assert context["input_tokens_total"] == input_tokens
+    assert context["output_tokens"] == output_tokens
+    assert context["tokens_total"] == total_tokens
+    assert context["cached_tokens"] == cache_read_tokens
+    assert context["cache_write_tokens"] == cache_write_tokens
+    assert context["reasoning_tokens"] == reasoning_tokens
+    assert context["counting_mode"] == "usage_estimate"
+
+
+def test_engine_accumulates_each_provider_transaction_once() -> None:
+    first_input = 10 + uuid4().int % 10
+    first_output = 2 + uuid4().int % 4
+    second_input = first_input + 10 + uuid4().int % 10
+    second_output = 2 + uuid4().int % 4
+    first_total = first_input + first_output
+    second_total = second_input + second_output
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(
+                    done=True,
+                    tool_calls=[
+                        {
+                            "id": "call_usage",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": '{"a": 20, "b": 22}',
+                            },
+                        }
+                    ],
+                    usage=ModelUsage(
+                        input_tokens=first_input,
+                        output_tokens=first_output,
+                        total_tokens=first_total,
+                    ),
+                    finish_reason="tool_calls",
+                )
+            ],
+            [
+                ModelStreamChunk(
+                    text="Final Answer: 42",
+                    done=True,
+                    usage=ModelUsage(
+                        input_tokens=second_input,
+                        output_tokens=second_output,
+                        total_tokens=second_total,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+        ],
+        model="dummy-multi-turn-usage",
+    )
+
+    class _Agent(DemoAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.llm = model
+            self.model_parser = ReActTextParser()
+
+        def decide(self, state: DemoState, observation: dict[str, Any]):
+            _ = state, observation
+            return None
+
+    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=3)).run("compute")
+
+    assert result.state.final_result == "42"
+    assert len(result.records) == 2
+    first_context = result.records[0].context
+    second_context = result.records[1].context
+    assert first_context["prompt_tokens_total"] == first_input
+    assert first_context["completion_tokens_total"] == first_output
+    assert first_context["tokens_total"] == first_total
+    assert second_context["prompt_tokens_total"] == first_input + second_input
+    assert second_context["completion_tokens_total"] == first_output + second_output
+    assert second_context["tokens_total"] == first_total + second_total
 
 
 def test_engine_uses_model_stream_native_tool_calls_before_parser():

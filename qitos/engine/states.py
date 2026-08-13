@@ -100,6 +100,9 @@ class ContextTelemetry:
     provider_total_tokens: Optional[int] = None
     planned_prompt_tokens: Optional[int] = None
     cached_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
+    usage_source: str = "absent"
     meter_source: str = "local_estimate"
     meter_status: str = "not_configured"
     meter_error: str = ""

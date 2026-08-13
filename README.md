@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Source-aware token accounting**: Engine context telemetry now distinguishes
+  provider counts, estimates, and absent usage. Provider zeroes remain authoritative;
+  cache read/write and reasoning subsets stay visible without being double-counted in
+  cumulative totals.
 - **Truthful model capability snapshots**: configured adapters expose immutable
   `ModelCapabilities`. Responses, Anthropic Messages, and compatible Chat report
   tested native-tool, reasoning/replay, usage/cache, and multimodal behavior without
