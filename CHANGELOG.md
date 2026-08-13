@@ -28,6 +28,8 @@ How to update:
 
 ### Added
 
+- Added the read-only `Engine.last_checkpoint_id` lifecycle property so hooks can
+  detect durable checkpoint advancement without depending on Engine internals.
 - Added read-only bundled Skill roots to `SkillToolSet`, with atomic validation,
   stable bounded `list_skills` summaries, and exact-name full-content `load_skill`
   disclosure independent of provider search and installation.

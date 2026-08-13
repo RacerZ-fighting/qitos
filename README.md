@@ -18,6 +18,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Public checkpoint lifecycle state**: hooks can read
+  `Engine.last_checkpoint_id` after a successful durable commit instead of reaching
+  into private Engine fields.
 - **Progressive bundled Skills**: applications can point `SkillToolSet` at read-only
   asset roots, expose a bounded catalog, and load one exact `SKILL.md` in full without
   invoking a provider or writing an installation registry.

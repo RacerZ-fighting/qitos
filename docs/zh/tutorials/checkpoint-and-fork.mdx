@@ -38,6 +38,10 @@ latest = await store.get_tuple(config)
 print(f"Checkpoint at step {latest.checkpoint.step}")
 ```
 
+`engine.last_checkpoint_id` 是只读的生命周期状态。首次 checkpoint 成功提交前它为
+`None`；只有 `CheckpointStore.put()` 成功后才会推进；resume 时则初始化为来源
+checkpoint 的 ID。Hook 可以在安全边界比较这个值，无需访问 Engine 私有字段。
+
 跨会话持久化存储，使用 `SqliteCheckpointStore`：
 
 ```python

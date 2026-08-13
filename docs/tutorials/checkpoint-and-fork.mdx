@@ -38,6 +38,11 @@ latest = await store.get_tuple(config)
 print(f"Checkpoint at step {latest.checkpoint.step}")
 ```
 
+`engine.last_checkpoint_id` is a read-only lifecycle value. It is `None` before the
+first successful checkpoint commit, advances only after `CheckpointStore.put()`
+succeeds, and is initialized to the source checkpoint during resume. Hooks can compare
+this value across safe boundaries without accessing Engine private fields.
+
 For persistent storage across sessions, use `SqliteCheckpointStore`:
 
 ```python
