@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Frozen per-turn tool exposure**: each model request and its action dispatcher now
+  share one revisioned, read-only `ToolExposure`. Applications can select by tool
+  group or policy, later registry changes wait until the next turn, and the Journal
+  records exact names plus a schema digest for replay audits.
 - **Strict tool inputs share one authority**: the exact JSON Schema projected to the
   model is now enforced before every handler. Generated root objects reject unknown
   fields by default, and missing fields, wrong types, enums, or bounds produce a

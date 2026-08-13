@@ -31,6 +31,7 @@ def read_file(path: str) -> str:
 |---|---|---|
 | `name` | `str \| None` | 在 `Decision.actions` 中使用的工具名。默认是函数 `__name__`。 |
 | `description` | `str \| None` | 展示给大模型的工具说明。默认回退到文档字符串。 |
+| `group` | `str` | 由应用定义的 exposure 分组。默认是 `"default"`。 |
 | `timeout_s` | `float \| None` | 整个 action 的超时，包括预检、重试和实际调用。 |
 | `retry_policy` | `RetryPolicy \| None` | 显式调用重试策略；未配置时只执行一次。 |
 | `permissions` | `ToolPermission \| None` | 声明该工具需要的系统能力。 |
@@ -138,6 +139,38 @@ registry.register_toolset(
 ```python
 registry.register_toolset(CodingToolSet(workspace_root="/tmp/work"), namespace="coding")
 ```
+
+### 冻结单个 turn 的工具 exposure
+
+`ToolRegistry` 是由 run 持有、可以变化的完整工具目录。每个模型 turn 开始时，Engine
+调用 `AgentModule.build_tool_exposure()` 取得只读 `ToolExposure`。模型 Schema 与动作
+分发器共用这一份快照。模型请求进行期间新注册的工具可以在下一 turn 出现，但当前
+turn 的分发器不能调用它。
+
+默认 hook 会冻结全部已注册工具。产品需要按 profile、运行能力、Skill 或策略筛选时，
+可以覆写它：
+
+```python
+class ProductAgent(AgentModule):
+    def build_tool_exposure(self, state, tool_registry):
+        selected = [
+            name
+            for name in tool_registry.list_tools()
+            if tool_registry.get(name).spec.group in state.enabled_tool_groups
+        ]
+        return tool_registry.freeze(
+            selected,
+            metadata={"profile": state.profile},
+        )
+```
+
+`group` 只负责选择，不代表授权。实际参数仍应交给 `PermissionPipeline` 判断。配置
+pipeline 后，它的 allow/deny/ask 结果是唯一准入结论；`needs_approval` 只作为未配置
+pipeline 时的后备行为。
+
+每个完成的模型事务都会记录 `prompt_metadata.tool_exposure`，其中包含源 registry
+revision、精确工具名、Schema 摘要和应用选择元数据。journal replay 因此可以解释历史
+决策实际使用的工具面，而不把当前可变 registry 当作历史真源。
 
 ---
 
@@ -281,7 +314,8 @@ class SearchAgent(AgentModule[MyState, dict, Action]):
         super().__init__(tool_registry=registry)
 ```
 
-Engine 会读取 `agent.tool_registry` 并据此创建 `ActionExecutor`。你也可以调用 `registry.get_tool_descriptions()` 得到格式化工具说明，用于插入系统提示词：
+Engine 会在每个 turn 冻结 `agent.tool_registry`，并用同一份 exposure 创建该 turn 的
+`ActionExecutor`。你也可以调用 `registry.get_tool_descriptions()` 检查完整注册目录：
 
 ```python
 def build_system_prompt(self, state: MyState) -> str | None:

@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **每 turn 冻结工具 exposure**：模型请求和动作分发器现在共用一份带 revision 的
+  只读 `ToolExposure`。应用可以按 group 或策略筛选；registry 的后续变化只影响下一
+  turn；Journal 会记录精确名称与 Schema 摘要，便于 replay 审计。
 - **工具输入只认同一份严格 Schema**：展示给模型的 JSON Schema 现在也会在每次
   handler 调用前执行。自动生成的根对象默认拒绝未知字段；字段缺失、类型错误、枚举
   或边界不合法时会生成可持久化的未执行终态，不再进入自定义工具代码。

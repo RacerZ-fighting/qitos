@@ -32,6 +32,7 @@ def read_file(path: str) -> str:
 | ------------- | --------------------------- | ---------------------------------------------------------------------------- |
 | `name`        | `str \| None`               | Tool name used in `Decision.actions`. Defaults to the function's `__name__`. |
 | `description` | `str \| None`               | Description shown to the LLM. Falls back to the function's docstring.        |
+| `group`       | `str`                        | Application-defined exposure group. Defaults to `"default"`.                |
 | `timeout_s`   | `float \| None`             | Whole-action timeout, including admission, retries, and invocation.          |
 | `retry_policy`| `RetryPolicy \| None`       | Explicit invocation retry policy. No policy means exactly one attempt.       |
 | `permissions` | `ToolPermission \| None`    | Declares which system capabilities this tool requires.                        |
@@ -146,6 +147,41 @@ registry.register_toolset(CodingToolSet(workspace_root="/tmp/work"), namespace="
 Built-in coding profiles expose only canonical lowercase names. Historical uppercase
 and `*_v2` aliases are not registered, so prompts, permission rules, and direct registry
 lookups all use the same exact names.
+
+### Freeze one turn's tool exposure
+
+Keep `ToolRegistry` as the mutable, run-owned catalog. At the start of every model
+turn, Engine calls `AgentModule.build_tool_exposure()` and receives a read-only
+`ToolExposure`. The model schema and action dispatcher use that same snapshot. A tool
+registered while the model request is running can appear on the next turn, but it
+cannot be called through the current turn's dispatcher.
+
+The default hook freezes every registered tool. Override it when your application
+needs profile, capability, Skill, or policy-based selection:
+
+```python
+class ProductAgent(AgentModule):
+    def build_tool_exposure(self, state, tool_registry):
+        selected = [
+            name
+            for name in tool_registry.list_tools()
+            if tool_registry.get(name).spec.group in state.enabled_tool_groups
+        ]
+        return tool_registry.freeze(
+            selected,
+            metadata={"profile": state.profile},
+        )
+```
+
+`group` is selection metadata, not authorization. Continue to evaluate the actual
+arguments through `PermissionPipeline`. When a pipeline is configured, its
+allow/deny/ask result owns admission; `needs_approval` remains the fallback for
+callers without a pipeline.
+
+Each completed model transaction records `prompt_metadata.tool_exposure`, including
+the source registry revision, exact names, schema digest, and application selection
+metadata. This lets journal replay explain the tool surface used for a historical
+decision without treating the mutable registry as that decision's source of truth.
 
 ---
 
@@ -298,7 +334,9 @@ class SearchAgent(AgentModule[MyState, dict, Action]):
         super().__init__(tool_registry=registry)
 ```
 
-The Engine reads `agent.tool_registry` and creates an `ActionExecutor` from it. You can also call `registry.get_tool_descriptions()` to get a formatted string of all registered tools for inclusion in your system prompt:
+The Engine freezes `agent.tool_registry` for each turn and creates the turn's
+`ActionExecutor` from that exposure. You can also call
+`registry.get_tool_descriptions()` to inspect the complete registered catalog:
 
 ```python
 def build_system_prompt(self, state: MyState) -> str | None:

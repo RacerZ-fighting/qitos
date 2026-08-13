@@ -61,6 +61,10 @@ How to update:
 
 ### Added
 
+- Added revisioned, read-only per-turn `ToolExposure` snapshots. The model projection
+  and action dispatcher now share one exact tool surface, while completed Journal
+  model transactions retain its names, schema digest, and application selection
+  metadata for replay audits.
 - Added stable `JournalRecordRef` locators and read-only committed Tool transaction
   lookup. Open JSONL journals rebuild the query view from canonical records, return
   only terminals published by `step.committed`, and preserve origin references across
@@ -134,6 +138,10 @@ How to update:
 
 ### Changed
 
+- Applications can assign tools to exposure `group` values and override
+  `AgentModule.build_tool_exposure()` to select the current turn's tools. A configured
+  `PermissionPipeline` now owns parameter-level allow/deny/ask admission instead of
+  also applying the static `needs_approval` fallback.
 - Tool calls now use one strict JSON Schema at model projection and execution.
   Generated argument objects reject undeclared fields by default; missing fields,
   wrong types, enums, and bounds fail before custom validation or handler execution

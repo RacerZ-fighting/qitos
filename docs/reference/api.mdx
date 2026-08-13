@@ -612,6 +612,7 @@ def tool(
     retry_policy: Optional[RetryPolicy] = None,
     permissions: Optional[ToolPermission] = None,
     required_ops: Optional[List[str]] = None,
+    group: str = "default",
 )
 ```
 
@@ -619,6 +620,7 @@ def tool(
 |-----------|------|-------------|
 | `name` | `str \| None` | Override the tool name (defaults to the function's `__name__`) |
 | `description` | `str \| None` | Override the tool description (defaults to the docstring) |
+| `group` | `str` | Application-defined per-turn exposure group |
 | `timeout_s` | `float \| None` | Whole-action timeout in seconds |
 | `retry_policy` | `RetryPolicy \| None` | Explicit invocation retry policy |
 | `permissions` | `ToolPermission \| None` | Permission flags for the tool |
@@ -676,6 +678,19 @@ Register all tools from a toolset object. Tool names are prefixed with `namespac
 def include(self, obj: Any) -> ToolRegistry
 ```
 Scan an object for methods decorated with `@tool` and register them all.
+
+---
+
+```python
+def freeze(
+    self,
+    names: Iterable[str] | None = None,
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> ToolExposure
+```
+Capture a read-only registry snapshot for one model turn. Engine uses the same
+exposure for tool projection and action dispatch.
 
 ---
 
