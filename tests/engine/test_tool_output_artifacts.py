@@ -14,7 +14,7 @@ from qitos.core.tool_registry import ToolRegistry
 from qitos.engine import ContextConfig, RuntimeBudget
 from qitos.kit import FileArtifactStore, ReActTextParser
 from qitos.kit.tool.file import ReadFile
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamChunk
 from qitos import tool
 
 
@@ -38,12 +38,9 @@ class _ToolModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic, kwargs
+        messages = request.message_dicts()
         self.inputs.append(list(messages))
         if self.calls == 0:
             self.calls += 1
@@ -70,12 +67,9 @@ class _FinalModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic, kwargs
+        messages = request.message_dicts()
         self.inputs.append(list(messages))
         yield ModelStreamChunk(text="Final Answer: resumed", done=True)
 

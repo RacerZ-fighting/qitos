@@ -21,7 +21,7 @@ from qitos.kit.parser import (
     ToolUseXmlParser,
     XmlDecisionParser,
 )
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamChunk
 
 
 class _ResponseSequenceModel(Model):
@@ -45,12 +45,9 @@ class _ResponseSequenceModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic, kwargs
+        messages = request.message_dicts()
         self.calls += 1
         self.seen_messages.append([dict(message) for message in messages])
         if not self.responses:
@@ -563,7 +560,7 @@ async def test_message_builder_falls_back_to_user_without_a_real_tool_result():
     await engine._model_runtime._run_llm_decide(
         state,
         {},
-        StepRecord(step_id=1),
+        StepRecord(step_id=1, transaction_id="model-runtime-test:1"),
         turn,
     )
 

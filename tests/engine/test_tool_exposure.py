@@ -11,7 +11,7 @@ from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegist
 from qitos.core import JournalRecordType, ToolExposure
 from qitos.kit import ReActTextParser
 from qitos.kit.journal import JsonlSessionJournal
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamChunk
 from qitos.protocols import ModelProtocol
 
 
@@ -113,13 +113,9 @@ class _ExposureModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic
-        schemas = list(kwargs.get("tools") or [])
+        schemas = list(request.option_dict().get("tools") or [])
         self.tool_names_by_call.append(
             [str(item["function"]["name"]) for item in schemas]
         )

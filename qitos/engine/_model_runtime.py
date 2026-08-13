@@ -32,6 +32,7 @@ from ..core.history import (
     message_tool_result_ids,
     select_recent_history,
 )
+from ..core.model_request import ModelContinuation, ModelRequest
 from ..core.model_response import ModelResponse, ModelTiming
 from ..core.multimodal import (
     content_to_text,
@@ -285,12 +286,18 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             content: Any = (
                 model_response.text if str(model_response.text or "").strip() else None
             )
-            if content is not None:
+            if (
+                content is not None
+                or model_response.reasoning_content
+                or model_response.native_items
+            ):
                 engine._history_append(
                     "assistant",
                     content,
                     record.step_id,
                     metadata={"source": "engine"},
+                    reasoning_content=model_response.reasoning_content,
+                    native_items=model_response.native_items,
                 )
         record.decision = decision
         record.actions = list(decision.actions)
@@ -904,15 +911,44 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 "runtime_context_display": runtime_context_display,
             },
         )
-        response = self._normalize_model_response(
-            await self._call_llm(
-                llm,
-                llm_messages,
-                request_options,
-                deadline_monotonic=turn.budget.deadline_monotonic,
+        provider = str(getattr(llm, "provider_name", None) or "model")
+        model_name = str(getattr(llm, "model", None) or "default")
+        protocol_id = str(getattr(protocol, "id", None) or "unknown")
+        continuation = engine._model_continuation
+        continuation_eligible = bool(
+            continuation is not None
+            and continuation.run_id == turn.run_id
+            and continuation.provider == provider
+            and continuation.model == model_name
+            and continuation.protocol == protocol_id
+            and turn.capabilities.model.continuation
+        )
+        model_request = ModelRequest(
+            run_id=turn.run_id,
+            transaction_id=record.transaction_id,
+            provider=provider,
+            model=model_name,
+            protocol=protocol_id,
+            messages=tuple(llm_messages),
+            options=request_options,
+            deadline_monotonic=turn.budget.deadline_monotonic,
+            continuation=continuation if continuation_eligible else None,
+        )
+        record.model_request = model_request
+        record.prompt_metadata["provider_continuation"] = {
+            "available": continuation is not None,
+            "eligible": continuation_eligible,
+            "response_id": (
+                continuation.response_id
+                if continuation_eligible and continuation is not None
+                else None
             ),
+        }
+        response = self._normalize_model_response(
+            await self._call_llm(llm, model_request),
             llm=llm,
         )
+        engine._model_continuation = response.continuation
         post_context = context_runtime.finalize_output(
             llm=llm,
             telemetry=pre_context,
@@ -1356,10 +1392,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
     async def _call_llm(
         self,
         llm: Any,
-        messages: List[Dict[str, Any]],
-        request_options: Dict[str, Any],
-        *,
-        deadline_monotonic: float | None,
+        request: ModelRequest,
     ) -> ModelResponse:
         """Consume the one canonical model stream into a completed response."""
 
@@ -1376,17 +1409,15 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         final_native_items: Optional[List[Dict[str, Any]]] = None
         final_finish_reason: Optional[str] = None
         final_metadata: Dict[str, Any] = {}
+        final_continuation: ModelContinuation | None = None
         started = False
         terminal_seen = False
         stream_error: Exception | None = None
         request_started_at = time.monotonic()
         first_event_at: float | None = None
         first_content_at: float | None = None
-        stream_iter: AsyncIterator[ModelStreamChunk] = llm.stream(
-            messages,
-            deadline_monotonic=deadline_monotonic,
-            **request_options,
-        )
+        deadline_monotonic = request.deadline_monotonic
+        stream_iter: AsyncIterator[ModelStreamChunk] = llm.stream(request)
 
         iterator = stream_iter.__aiter__()
         try:
@@ -1426,6 +1457,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 native_items = chunk.native_items
                 event_type = chunk.event_type
                 finish_reason = chunk.finish_reason
+                continuation = chunk.continuation
 
                 observable = bool(
                     text
@@ -1478,6 +1510,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         final_native_items = native_items
                     if finish_reason is not None:
                         final_finish_reason = str(finish_reason)
+                    final_continuation = continuation
                     final_metadata = dict(chunk.event_metadata)
             if not terminal_seen:
                 raise ModelTransportError(
@@ -1543,6 +1576,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     else None
                 ),
             ),
+            continuation=final_continuation,
         )
 
     def _build_current_user_message(
@@ -1997,6 +2031,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             reasoning_content=response.reasoning_content,
             native_items=response.native_items,
             timing=response.timing,
+            continuation=response.continuation,
         )
 
     def _extract_text_tool_call_markup(self, text: str) -> List[Dict[str, Any]] | None:

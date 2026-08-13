@@ -18,6 +18,11 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **可恢复模型请求与受校验的 continuation**：Engine 现在只向 Provider 传递一份
+  不可变 `ModelRequest`，并把精确、已脱敏的请求快照写入 Journal。Responses 只有在
+  Run、Provider、model、protocol、请求设置和 canonical input 前缀全部一致时才使用
+  `previous_response_id`；resume 可以保留这项优化，fork、Provider 切换、压缩漂移或
+  句柄过期都会回退到完整本地 transcript。
 - **同一个异步 turn 事务**：完整 Run 与交互式 step 现在共用一份不可变 turn
   事务。Parser、Critic 与 handoff 作为组合策略接入，不再各自占据或复制 Agent loop；
   Tool、Mailbox、MCP 与 Child 始终运行在调用方 event loop，取消会先等待已启动 handler
@@ -43,8 +48,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   与 reasoning 子项保持可见，同时不会被重复计入累计总量。
 - **真实的模型能力快照**：模型 adapter 现在暴露不可变的 `ModelCapabilities`。
   Responses、Anthropic Messages 与兼容 Chat 只声明已经通过测试的原生工具、
-  reasoning/replay、usage/cache 与多模态能力，不提前宣称尚未闭环的 continuation
-  或 hosted tool；终态 token 用量会收敛为类型化 `ModelUsage`，同时保留 Provider
+  reasoning/replay、usage/cache 与多模态能力，不提前宣称 hosted tool；Responses
+  还会声明已通过契约测试的受校验 continuation。终态 token 用量会收敛为类型化
+  `ModelUsage`，同时保留 Provider
   原始明细。
 - **模型家族与 wire 可独立选择**：同一 Kimi 家族配置可使用兼容 Chat Completions
   或 Anthropic Messages，且不会把一种 adapter 的请求默认值泄漏到另一种 wire。

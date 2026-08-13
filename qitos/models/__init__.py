@@ -10,6 +10,7 @@ from ..core.model_capabilities import (
     ModelCapabilities,
     ReasoningCapability,
 )
+from ..core.model_request import ModelContinuation, ModelRequest
 from .anthropic import AnthropicModel
 from .base import (
     Model,
@@ -82,8 +83,10 @@ __all__ = [
     "Model",
     "ModelAPI",
     "ModelCapabilities",
+    "ModelContinuation",
     "ModelFactory",
     "ModelProfile",
+    "ModelRequest",
     "ModelStreamChunk",
     "ReasoningCapability",
     "OllamaModel",

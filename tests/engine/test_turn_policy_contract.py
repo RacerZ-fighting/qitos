@@ -11,7 +11,7 @@ from qitos.core import CompletionAssessment, ModelPricing
 from qitos.core.history import HistoryMessage
 from qitos.core.model_response import ModelUsage
 from qitos.engine import RuntimeBudget
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamChunk
 
 
 @dataclass
@@ -171,12 +171,9 @@ class _UsageModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        _ = request
         yield ModelStreamChunk(
             text="wait",
             done=True,

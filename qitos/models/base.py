@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ..core.model_capabilities import ModelCapabilities
+from ..core.model_request import ModelRequest
+from ..core.model_request import ModelContinuation
 from ..core.multimodal import normalize_messages
 from ..core.model_response import ModelUsage, normalize_model_usage
 from .context_registry import infer_context_window
@@ -34,9 +36,14 @@ class ModelStreamChunk:
     event_metadata: Dict[str, Any] = field(default_factory=dict)
     reasoning_content: Optional[str] = None
     finish_reason: Optional[str] = None
+    continuation: ModelContinuation | None = None
 
     def __post_init__(self) -> None:
         self.usage = normalize_model_usage(self.usage)
+        if self.continuation is not None and not isinstance(
+            self.continuation, ModelContinuation
+        ):
+            raise TypeError("continuation must be a ModelContinuation or None")
 
     @property
     def is_final(self) -> bool:
@@ -77,10 +84,7 @@ class Model(ABC):
     @abstractmethod
     async def stream(
         self,
-        messages: List[Dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
         """Yield one complete logical model transaction.
 
@@ -97,6 +101,16 @@ class Model(ABC):
         Current adapters own clients per request, so the default lifecycle has
         no persistent resource to close.
         """
+
+    def validate_request(self, request: ModelRequest) -> None:
+        """Reject a request captured for another configured Provider."""
+
+        if not isinstance(request, ModelRequest):
+            raise TypeError("Model.stream() requires a ModelRequest")
+        if request.provider != self.provider_name:
+            raise ValueError("model request provider does not match the adapter")
+        if request.model != self.model:
+            raise ValueError("model request model does not match the adapter")
 
     @property
     def capabilities(self) -> ModelCapabilities:

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from ..core.errors import ModelTransportError
 from ..core.model_capabilities import ModelCapabilities
+from ..core.model_request import ModelRequest
 from ..core.model_response import ModelUsage, ModelUsageSource
 from ..models.base import Model, ModelStreamChunk
 from .backends import CacheBackend
@@ -68,23 +69,18 @@ class CachedModel(Model):
 
     async def stream(
         self,
-        messages: List[Dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
         """Yield a cached complete stream or commit one successful miss."""
 
+        self.validate_request(request)
+
         if not self._enabled:
-            async for chunk in self._wrapped.stream(
-                messages,
-                deadline_monotonic=deadline_monotonic,
-                **kwargs,
-            ):
+            async for chunk in self._wrapped.stream(request):
                 yield chunk
             return
 
-        key = self._cache_key(messages, dict(kwargs))
+        key = self._cache_key(request.message_dicts(), request.option_dict())
         cached = await asyncio.to_thread(self._backend.get, key)
         if cached is not None:
             try:
@@ -104,11 +100,7 @@ class CachedModel(Model):
 
         self._misses += 1
         committed_chunks: List[ModelStreamChunk] = []
-        async for chunk in self._wrapped.stream(
-            messages,
-            deadline_monotonic=deadline_monotonic,
-            **kwargs,
-        ):
+        async for chunk in self._wrapped.stream(request):
             committed_chunks.append(chunk)
         _validate_complete_chunks(committed_chunks)
         try:

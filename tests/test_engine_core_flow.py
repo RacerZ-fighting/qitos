@@ -24,7 +24,7 @@ from qitos.kit.parser import ReActTextParser
 from qitos.core.memory import Memory, MemoryRecord
 from qitos.engine import RuntimeBudget
 from qitos.engine.states import ContextConfig
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamChunk
 from qitos.trace import runtime_step_to_trace
 
 
@@ -58,14 +58,11 @@ class _ChunkSequenceModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic
+        messages = request.message_dicts()
         self.calls.append([dict(message) for message in messages])
-        self.request_options.append(dict(kwargs))
+        self.request_options.append(request.option_dict())
         if not self.transactions:
             raise AssertionError("no scripted model transaction remains")
         for chunk in self.transactions.pop(0):

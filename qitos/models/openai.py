@@ -11,12 +11,13 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, cast
 
-from ..core.errors import ModelTransportError
+from ..core.errors import ModelContinuationRejected, ModelTransportError
 from ..core.model_capabilities import (
     ModelAPI,
     ModelCapabilities,
     ReasoningCapability,
 )
+from ..core.model_request import ModelRequest
 from ..core.multimodal import (
     content_to_text,
     ensure_data_url,
@@ -576,6 +577,7 @@ class OpenAICompatibleModel(Model):
                     ReasoningCapability.OPAQUE_REPLAY,
                 ),
                 opaque_replay=True,
+                continuation=True,
                 usage=True,
                 prompt_cache_usage=True,
                 multimodal_input=True,
@@ -671,14 +673,13 @@ class OpenAICompatibleModel(Model):
 
     async def _open_stream(
         self,
-        messages: List[Dict[str, Any]],
+        request: ModelRequest,
         request_kwargs: Dict[str, Any],
-        *,
-        deadline_monotonic: float | None,
     ) -> AsyncIterator[ModelStreamChunk]:
+        deadline_monotonic = request.deadline_monotonic
         if self.api_mode == "chat_completions":
             chat_request = self._chat_stream_request(
-                messages,
+                request.message_dicts(),
                 request_kwargs,
                 deadline_monotonic=deadline_monotonic,
             )
@@ -693,7 +694,7 @@ class OpenAICompatibleModel(Model):
             stream = await _open_responses_stream(
                 self,
                 client,
-                messages,
+                request,
                 provider=self.provider_name,
                 request_kwargs=self._attempt_request_kwargs(
                     request_kwargs,
@@ -707,31 +708,53 @@ class OpenAICompatibleModel(Model):
 
     async def stream(
         self,
-        messages: List[Dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
         """Stream one committed Responses or Chat transaction."""
 
-        request_kwargs = self._request_kwargs(dict(kwargs))
+        self.validate_request(request)
+        effective_request = request
+        continuation_fallback = False
+        while True:
+            request_kwargs = self._request_kwargs(effective_request.option_dict())
 
-        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
-            return await self._open_stream(
-                messages,
-                dict(request_kwargs),
-                deadline_monotonic=deadline_monotonic,
-            )
+            async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+                return await self._open_stream(
+                    effective_request,
+                    dict(request_kwargs),
+                )
 
-        async for chunk in transactional_stream_with_retry(
-            create_stream,
-            policy=self.retry_policy,
-            connection_timeout_seconds=self.timeout,
-            event_idle_timeout_seconds=self.stream_idle_timeout,
-            deadline_monotonic=deadline_monotonic,
-            is_terminal=lambda item: item.done,
-        ):
-            yield chunk
+            published_content = False
+            try:
+                async for chunk in transactional_stream_with_retry(
+                    create_stream,
+                    policy=self.retry_policy,
+                    connection_timeout_seconds=self.timeout,
+                    event_idle_timeout_seconds=self.stream_idle_timeout,
+                    deadline_monotonic=effective_request.deadline_monotonic,
+                    is_terminal=lambda item: item.done,
+                ):
+                    if (
+                        chunk.text
+                        or chunk.reasoning_content
+                        or chunk.tool_calls
+                        or chunk.native_items
+                        or "function_call" in str(chunk.event_type or "")
+                    ):
+                        published_content = True
+                    if chunk.done and continuation_fallback:
+                        chunk.event_metadata["continuation_fallback"] = True
+                    yield chunk
+                return
+            except ModelContinuationRejected:
+                if (
+                    published_content
+                    or effective_request.continuation is None
+                    or continuation_fallback
+                ):
+                    raise
+                effective_request = effective_request.without_continuation()
+                continuation_fallback = True
 
     def supports_tool_schema_delivery(
         self, delivery: str, protocol: Any = None

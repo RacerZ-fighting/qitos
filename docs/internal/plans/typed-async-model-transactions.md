@@ -2,7 +2,7 @@
 
 ## Status
 
-Approved for serial implementation on `feat/typed-model-transactions`.
+Active on `refactor/model-continuation`.
 
 This plan replaces the earlier proposal to build a parallel typed model stack.
 QitOS already owns model content, responses, providers, retries, Engine model
@@ -13,6 +13,10 @@ gateway, mirror contract, or codec package.
 Only the model capability is in the current implementation batch. Tool,
 Session/Child, Runtime, Plan/Skill/MCP, and legacy pipeline removal are deferred
 until the model batch has passed its own acceptance gate.
+
+The native async transport and transactional retry slices are complete. The active
+slice closes the remaining request-snapshot, provider-continuation, canonical replay,
+and typed stream-event gaps without adding a second model path.
 
 ## Non-negotiable ownership rules
 
@@ -127,6 +131,23 @@ express the required committed result.
 - Migrate readers and writers together and delete the replaced representation.
 - Verify replay/resume and malformed-data failure behavior, then commit and push.
 
+The concrete implementation keeps four boundaries small:
+
+- one immutable `ModelRequest` is built after context projection and is the only value
+  passed from Engine to a Provider;
+- one typed `ModelContinuation` may accompany a request, but is accepted only when its
+  Run, provider, model, protocol, request settings, and canonical input prefix match;
+- `model.completed` stores the exact request snapshot and the next continuation handle;
+- continuation rejection retries once with the same full canonical request and without
+  the handle. Resume may reuse a matching handle, while fork and Provider/model changes
+  necessarily fall back to the transcript.
+
+Continuation never replaces History. Responses can send an incremental input only after
+validating that the current full input starts with the exact request-and-response prefix
+recorded by the preceding committed transaction. Anthropic keeps its thinking signature
+and message id in canonical native history, but does not claim server-side continuation
+because Messages has no equivalent replay handle.
+
 ### 5. Migrate PentestAgent directly to QitOS
 
 Only after the QitOS model batch is committed and passes its own gate:
@@ -184,6 +205,15 @@ UV_CACHE_DIR=tmp/uv-cache uv run --no-project --python 3.11 \
   --with twine twine check dist/*
 git diff --check
 ```
+
+## Active progress
+
+- [x] Prove the current Provider, Engine, History, Journal, and trace call graph.
+- [x] Replace `messages + **kwargs` dispatch with one immutable request value.
+- [x] Persist and validate Responses continuation with full-request fallback.
+- [ ] Replace ambiguous stream chunks with discriminated typed events.
+- [ ] Prove long-history projection, resume, fork, Provider switch, and invalid-handle behavior.
+- [ ] Run the complete QitOS gate and merge the feature branch into `main`.
 
 Run from PentestAgent only after the QitOS commit and gitlink update:
 

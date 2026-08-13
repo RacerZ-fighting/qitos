@@ -24,7 +24,7 @@ from qitos import (
 from qitos.engine import RuntimeBudget
 from qitos.engine.states import RuntimePhase
 from qitos.kit.parser import ReActTextParser
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamChunk
 
 
 @dataclass
@@ -81,12 +81,9 @@ class WaitingModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        _ = request
         self.started.set()
         try:
             await asyncio.Event().wait()

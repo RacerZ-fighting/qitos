@@ -14,7 +14,7 @@ import pytest
 
 from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegistry, tool
 from qitos.cache import CachedModel, DiskCache, InMemoryCache
-from qitos.core import ModelUsage, ModelUsageSource
+from qitos.core import ModelRequest, ModelUsage, ModelUsageSource
 from qitos.engine import RuntimeBudget
 from qitos.models import Model, ModelStreamChunk
 from qitos.trace import TraceWriter
@@ -70,12 +70,9 @@ class _StubModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        _ = request
         self.call_count += 1
         yield ModelStreamChunk(
             text=f"Final Answer: {self.answer}",
@@ -97,7 +94,18 @@ async def _collect(
     messages: list[dict[str, Any]],
     **kwargs: Any,
 ) -> list[ModelStreamChunk]:
-    return [chunk async for chunk in model.stream(messages, **kwargs)]
+    deadline = kwargs.pop("deadline_monotonic", None)
+    request = ModelRequest(
+        run_id="cache-test",
+        transaction_id="cache-test:0",
+        provider=model.provider_name,
+        model=model.model,
+        protocol=model.capabilities.api.value,
+        messages=tuple(messages),
+        options=kwargs,
+        deadline_monotonic=deadline,
+    )
+    return [chunk async for chunk in model.stream(request)]
 
 
 class TestInMemoryCache:
@@ -208,19 +216,14 @@ class TestCachedModel:
         class FailOnceModel(_StubModel):
             async def stream(
                 self,
-                messages: list[dict[str, Any]],
-                *,
-                deadline_monotonic: float | None = None,
-                **kwargs: Any,
+                request: ModelRequest,
             ) -> AsyncIterator[ModelStreamChunk]:
                 self.call_count += 1
                 if self.call_count == 1:
                     yield ModelStreamChunk(text="discarded")
                     raise TimeoutError("stream failed")
                 async for chunk in super().stream(
-                    messages,
-                    deadline_monotonic=deadline_monotonic,
-                    **kwargs,
+                    request,
                 ):
                     yield chunk
 

@@ -14,6 +14,7 @@ from .core.env import Env, EnvSpec
 from .core.errors import QitosRuntimeError, StopReason
 from .core.memory import Memory
 from .core.model_response import ModelResponse, ModelTiming
+from .core.model_request import ModelContinuation, ModelRequest
 from .core.runtime_input import RuntimeInput
 from .core.history import History, HistoryPolicy, HistorySnapshot
 from .core.observation import Observation
@@ -88,6 +89,8 @@ __all__ = [
     "Action",
     "Memory",
     "ModelResponse",
+    "ModelContinuation",
+    "ModelRequest",
     "ModelTiming",
     "History",
     "HistoryPolicy",

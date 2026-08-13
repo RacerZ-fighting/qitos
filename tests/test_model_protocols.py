@@ -10,7 +10,7 @@ from qitos.engine import Engine
 from qitos.harness import build_model_for_preset
 from qitos.kit import MiniMaxToolCallParser
 from qitos.kit.parser import ReActTextParser
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamChunk
 from qitos.models.profile_registry import infer_default_protocol, infer_model_profile
 from qitos.protocols import ModelProtocol, get_protocol
 
@@ -93,14 +93,11 @@ class _DummyModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic
+        messages = request.message_dicts()
         self.calls.append(list(messages))
-        self.request_options.append(dict(kwargs))
+        self.request_options.append(request.option_dict())
         yield ModelStreamChunk(text=self.output, event_type="text.delta")
         yield ModelStreamChunk(
             done=True,
@@ -285,13 +282,9 @@ def test_preset_model_protocol_delivers_tools_to_direct_engine_model_call() -> N
     calls: list[dict[str, Any]] = []
 
     async def stream(
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic
-        calls.append(dict(kwargs))
+        calls.append(request.option_dict())
         yield ModelStreamChunk(
             text='{"thought":"done","final_answer":"ok"}',
             event_type="text.delta",

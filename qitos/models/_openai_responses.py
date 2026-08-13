@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, cast
 
-from ..core.errors import ModelTransportError
+from ..core.errors import ModelContinuationRejected, ModelTransportError
+from ..core.model_request import (
+    ModelContinuation,
+    ModelRequest,
+    model_json_digest,
+)
 from ..core.model_response import ModelResponse
 from .transport import close_async_resource
 from .base import Model, ModelStreamChunk
@@ -343,6 +348,7 @@ def _request_payload(
     provider: str,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = _normalize_request_kwargs(kwargs)
+    payload.pop("previous_response_id", None)
     payload.update(
         {
             "model": adapter.model,
@@ -366,6 +372,61 @@ def _request_payload(
             include.append(_OPAQUE_REASONING_INCLUDE)
         payload["include"] = include
     return payload
+
+
+def _continuation_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in {"input", "previous_response_id", "stream", "timeout"}
+    }
+
+
+def _apply_continuation(
+    request: ModelRequest,
+    payload: Dict[str, Any],
+) -> tuple[Dict[str, Any], bool, str]:
+    """Use a handle only when the full canonical request proves its prefix."""
+
+    continuation = request.continuation
+    if continuation is None:
+        return payload, False, "absent"
+    if not continuation.belongs_to(request):
+        return payload, False, "request_identity_changed"
+    settings_digest = model_json_digest(_continuation_settings(payload))
+    if settings_digest != continuation.settings_digest:
+        return payload, False, "request_settings_changed"
+    full_input = payload.get("input")
+    if not isinstance(full_input, list):
+        return payload, False, "input_not_incremental"
+    prefix_items = continuation.prefix_items
+    if prefix_items > len(full_input):
+        return payload, False, "canonical_prefix_shortened"
+    if model_json_digest(full_input[:prefix_items]) != continuation.prefix_digest:
+        return payload, False, "canonical_prefix_changed"
+    incremental = dict(payload)
+    incremental["previous_response_id"] = continuation.response_id
+    incremental["input"] = full_input[prefix_items:]
+    return incremental, True, "applied"
+
+
+def _continuation_rejected(error: Any) -> bool:
+    status = _field(error, "status_code")
+    if status is None:
+        status = _field(_field(error, "response"), "status_code")
+    detail = f"{error} {_field(error, 'body', '')}".casefold()
+    mentions_handle = "previous_response_id" in detail or "previous response" in detail
+    rejected = any(
+        marker in detail
+        for marker in (
+            "expired",
+            "invalid",
+            "not found",
+            "unknown",
+            "does not exist",
+        )
+    )
+    return bool(mentions_handle and rejected and status in {400, 404, 409, 422, None})
 
 
 def _event_metadata(event: Any) -> Dict[str, Any]:
@@ -480,7 +541,17 @@ def _merge_completed_output(
 class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
     """Own and normalize one already-connected Responses stream."""
 
-    def __init__(self, events: Any, *, provider: str) -> None:
+    def __init__(
+        self,
+        events: Any,
+        *,
+        provider: str,
+        request: ModelRequest | None = None,
+        full_input: List[Dict[str, Any]] | None = None,
+        settings_digest: str = "",
+        continuation_applied: bool = False,
+        continuation_reason: str = "absent",
+    ) -> None:
         self._events = events
         self._iterator = events.__aiter__()
         self._provider = provider
@@ -489,6 +560,11 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
         self._streamed_text = ""
         self._streamed_reasoning = ""
         self._finished = False
+        self._request = request
+        self._full_input = list(full_input or [])
+        self._settings_digest = settings_digest
+        self._continuation_applied = continuation_applied
+        self._continuation_reason = continuation_reason
 
     def __aiter__(self) -> _ResponsesEventStream:
         return self
@@ -659,6 +735,27 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                     field_name="reasoning",
                 )
                 self._finished = True
+                continuation = None
+                response_id = str(normalized.metadata.get("id") or "").strip()
+                if self._request is not None and response_id:
+                    prefix = self._full_input + list(normalized.native_items or [])
+                    continuation = ModelContinuation(
+                        run_id=self._request.run_id,
+                        provider=self._request.provider,
+                        model=self._request.model,
+                        protocol=self._request.protocol,
+                        response_id=response_id,
+                        prefix_items=len(prefix),
+                        prefix_digest=model_json_digest(prefix),
+                        settings_digest=self._settings_digest,
+                    )
+                terminal_metadata = dict(normalized.metadata)
+                terminal_metadata.update(
+                    {
+                        "continuation_applied": self._continuation_applied,
+                        "continuation_reason": self._continuation_reason,
+                    }
+                )
                 return ModelStreamChunk(
                     text=text_suffix,
                     reasoning_content=reasoning_suffix or None,
@@ -667,11 +764,14 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                     tool_calls=normalized.tool_calls,
                     native_items=normalized.native_items,
                     event_type=event_type,
-                    event_metadata=dict(normalized.metadata),
+                    event_metadata=terminal_metadata,
                     finish_reason=normalized.finish_reason,
+                    continuation=continuation,
                 )
             if event_type in {"response.failed", "error"}:
                 error = _field(event, "error") or _field(event, "response")
+                if self._continuation_applied and _continuation_rejected(error):
+                    raise ModelContinuationRejected(str(error)[:1000])
                 raise ModelTransportError(
                     f"model stream failed: {str(error)[:1000]}",
                     attempts=1,
@@ -707,22 +807,45 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
 async def _open_responses_stream(
     adapter: Model,
     client: Any,
-    messages: List[Dict[str, Any]],
+    request: ModelRequest,
     *,
     provider: str,
     request_kwargs: Dict[str, Any],
 ) -> AsyncIterator[ModelStreamChunk]:
     """Establish one Responses stream and return its owning iterator."""
 
-    events = await _responses_create(client)(
-        **_request_payload(
-            adapter,
-            messages,
-            request_kwargs,
-            provider=provider,
-        )
+    full_payload = _request_payload(
+        adapter,
+        request.message_dicts(),
+        request_kwargs,
+        provider=provider,
     )
-    return _ResponsesEventStream(events, provider=provider)
+    raw_input = full_payload.get("input")
+    full_input = (
+        [dict(item) for item in raw_input if isinstance(item, dict)]
+        if isinstance(raw_input, list)
+        else []
+    )
+    settings_digest = model_json_digest(_continuation_settings(full_payload))
+    payload, continuation_applied, continuation_reason = _apply_continuation(
+        request,
+        full_payload,
+    )
+    try:
+        events = await _responses_create(client)(**payload)
+    except Exception as exc:
+        if continuation_applied and _continuation_rejected(exc):
+            raise ModelContinuationRejected(str(exc)[:1000]) from exc
+        raise
+    return _ResponsesEventStream(
+        events,
+        provider=provider,
+        request=request,
+        full_input=full_input,
+        settings_digest=settings_digest,
+        continuation_applied=continuation_applied,
+        continuation_reason=continuation_reason,
+    )
 
 
 __all__ = [

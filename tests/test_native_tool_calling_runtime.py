@@ -15,7 +15,7 @@ from qitos import (
 )
 from qitos.engine import RuntimeBudget
 from qitos.kit import ReActTextParser
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamChunk
 from qitos.models._openai_responses import _to_responses_input
 
 
@@ -63,12 +63,9 @@ class _NativeToolModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic, kwargs
+        messages = request.message_dicts()
         self.seen_messages.append(list(messages))
         call_index = self.calls
         self.calls += 1
@@ -116,12 +113,9 @@ class _HarnessAwareModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        _ = request
         yield ModelStreamChunk(
             text="Final Answer: auto harness parser worked",
             done=True,
@@ -273,12 +267,9 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
 
         async def stream(
             self,
-            messages: list[dict[str, Any]],
-            *,
-            deadline_monotonic: float | None = None,
-            **kwargs: Any,
+            request: ModelRequest,
         ) -> AsyncIterator[ModelStreamChunk]:
-            _ = deadline_monotonic, kwargs
+            messages = request.message_dicts()
             assistant_ids = {
                 str(tool_call["id"])
                 for message in messages

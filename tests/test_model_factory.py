@@ -11,6 +11,7 @@ from qitos.config import ModelConfig, build_model
 from qitos.models import (
     Model,
     ModelFactory,
+    ModelRequest,
     ModelStreamChunk,
     OpenAICompatibleModel,
     OpenAIModel,
@@ -21,12 +22,9 @@ from qitos.models import (
 class _TestModel(Model):
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        _ = request
         yield ModelStreamChunk(done=True, finish_reason="stop")
 
 

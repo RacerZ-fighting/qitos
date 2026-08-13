@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import FrozenInstanceError
-from typing import Any
-
 import pytest
 
 from qitos.cache import CachedModel, InMemoryCache
@@ -12,6 +10,7 @@ from qitos.models import (
     Model,
     ModelAPI,
     ModelCapabilities,
+    ModelRequest,
     ModelStreamChunk,
     OpenAICompatibleModel,
     OpenAIModel,
@@ -22,12 +21,9 @@ from qitos.models import (
 class _LegacyModel(Model):
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        _ = request
         yield ModelStreamChunk(done=True)
 
 
@@ -41,7 +37,7 @@ def test_unclassified_model_reports_conservative_capabilities() -> None:
     assert model.capabilities.hosted_tools == ()
 
 
-def test_responses_capabilities_do_not_claim_unimplemented_continuation() -> None:
+def test_responses_capabilities_claim_validated_continuation() -> None:
     model = OpenAIModel(api_key="test-key", model="gpt-test")
 
     assert model.capabilities.api is ModelAPI.RESPONSES
@@ -51,7 +47,7 @@ def test_responses_capabilities_do_not_claim_unimplemented_continuation() -> Non
         ReasoningCapability.OPAQUE_REPLAY,
     )
     assert model.capabilities.opaque_replay is True
-    assert model.capabilities.continuation is False
+    assert model.capabilities.continuation is True
     assert model.capabilities.usage is True
     assert model.capabilities.prompt_cache_usage is True
     assert model.capabilities.hosted_tools == ()

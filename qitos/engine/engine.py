@@ -50,6 +50,7 @@ from ..core.model_response import (
     ModelUsageSource,
     normalize_model_usage,
 )
+from ..core.model_request import ModelContinuation
 from ..core.runtime_input import RuntimeInput
 from ..core.spec import ExperimentSpec, RunSpec
 from ..core.state import StateSchema
@@ -361,6 +362,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_env_result: Optional[EnvStepResult] = None
         self._token_usage: int = 0
         self._cost_usage_usd: float = 0.0
+        self._model_continuation: ModelContinuation | None = None
         self._active_run_id: str = ""
         self._runtime_deadline_monotonic: Optional[float] = None
         from ..kit.history import WindowHistory
@@ -925,6 +927,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             kwargs.pop("_resume_canonical_results", ())
         )
         _resume_usage = dict(kwargs.pop("_resume_usage", {}) or {})
+        _resume_continuation = kwargs.pop("_resume_continuation", None)
 
         self._reset_run_state()
         self._canonical_action_results = list(_resume_canonical_results)
@@ -954,6 +957,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._activate_runtime_budget(started_at)
         self._token_usage = int(_resume_usage.get("total_tokens", 0) or 0)
         self._cost_usage_usd = float(_resume_usage.get("cost_usd", 0.0) or 0.0)
+        self._model_continuation = (
+            _resume_continuation
+            if isinstance(_resume_continuation, ModelContinuation)
+            else None
+        )
         self._last_context_telemetry = {}
         self._context_runtime.reset()
         self._context_runtime.restore_usage(
@@ -1985,6 +1993,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             _resume_journal=True,
             _resume_canonical_results=replay["canonical_results"],
             _resume_usage=replay["usage"],
+            _resume_continuation=replay["continuation"],
         )
 
     def resume_from_journal(self, run_id: str) -> EngineResult[StateT]:
@@ -2616,6 +2625,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_prompt_metadata = {}
         self._runtime_deadline_monotonic = None
         self._cost_usage_usd = 0.0
+        self._model_continuation = None
         self._last_checkpoint_id = None
         self._canonical_action_results = []
         self._journal_pending_history = []

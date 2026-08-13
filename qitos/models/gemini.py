@@ -19,6 +19,7 @@ from .transport import (
     transactional_stream_with_retry,
 )
 from .base import Model, ModelStreamChunk
+from ..core.model_request import ModelRequest
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -527,20 +528,18 @@ class GeminiModel(Model):
 
     async def stream(
         self,
-        messages: List[Dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
         """Stream one committed Gemini GenerateContent transaction."""
 
-        request_kwargs = dict(kwargs)
+        self.validate_request(request)
+        request_kwargs = request.option_dict()
 
         async def create_stream() -> AsyncIterator[ModelStreamChunk]:
             return await self._open_stream(
-                messages,
+                request.message_dicts(),
                 dict(request_kwargs),
-                deadline_monotonic=deadline_monotonic,
+                deadline_monotonic=request.deadline_monotonic,
             )
 
         async for chunk in transactional_stream_with_retry(
@@ -548,7 +547,7 @@ class GeminiModel(Model):
             policy=self.retry_policy,
             connection_timeout_seconds=self.timeout,
             event_idle_timeout_seconds=self.stream_idle_timeout,
-            deadline_monotonic=deadline_monotonic,
+            deadline_monotonic=request.deadline_monotonic,
             is_terminal=lambda item: item.done,
         ):
             yield chunk

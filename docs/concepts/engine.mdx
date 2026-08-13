@@ -317,9 +317,23 @@ q2 = stream.subscribe()  # asyncio.Queue for consumer 2
 
 ### Model streams
 
-All model providers implement the canonical async `Model.stream()` contract. The Engine
-consumes provider-neutral stream chunks and preserves cancellation and request deadlines
-throughout the transaction.
+All model providers implement the canonical async `Model.stream(request)` contract.
+The Engine assembles one immutable `ModelRequest` after History projection and passes
+that exact value to the Provider. Its message and option projections are isolated from
+mutation, while its absolute deadline is shared by connection, stream, retry, and
+cleanup work. A Journal-backed run stores the credential-redacted request snapshot in
+`model.completed` before any tool can start.
+
+OpenAI Responses may return a Run-bound continuation handle. The next request sends
+`previous_response_id` and only the incremental input when the Provider, model,
+protocol, non-input settings, and full canonical prefix all still match. A resumed Run
+can reuse that handle. A fork has a different Run id, and Provider/model changes,
+compaction changes, or an invalid/expired handle send the complete local transcript.
+History remains the recovery source; continuation is never required to resume.
+
+Anthropic Messages persists its message id, thinking signature, native content blocks,
+and usage in the canonical response/history representation. It does not advertise a
+server-side continuation handle because Messages replay is transcript-based.
 
 Class tools implement `async execute(...)`. A legacy synchronous decorated function is
 run in the isolated compatibility boundary and cancellation waits for that call to reach

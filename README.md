@@ -18,6 +18,12 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Recoverable model requests and guarded continuation**: the Engine now sends one
+  immutable `ModelRequest` and journals its exact credential-redacted snapshot.
+  Responses reuses `previous_response_id` only when the Run, Provider, model,
+  protocol, request settings, and canonical input prefix all match. Resume may keep
+  that optimization; fork, Provider changes, compaction drift, or an expired handle
+  automatically use the complete local transcript.
 - **One async turn transaction**: every model turn now captures an immutable model,
   protocol, complete History, Tool exposure, capability, deadline, pricing, and budget
   view. Full runs and interactive steps share this one transaction; parser and optional
@@ -66,7 +72,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Truthful model capability snapshots**: configured adapters expose immutable
   `ModelCapabilities`. Responses, Anthropic Messages, and compatible Chat report
   tested native-tool, reasoning/replay, usage/cache, and multimodal behavior without
-  claiming unfinished continuation or hosted-tool support. Their terminal token
+  claiming unfinished hosted-tool support. Responses also declares its guarded
+  continuation behavior. Their terminal token
   counts are normalized into typed `ModelUsage` without discarding provider details.
 - **Family and wire can be selected independently**: one Kimi family configuration can
   use compatible Chat Completions or Anthropic Messages without leaking wire-specific

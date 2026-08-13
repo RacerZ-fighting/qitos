@@ -24,6 +24,7 @@ from qitos.core.tool import (
 from qitos.engine.action_executor import ActionExecutor
 from qitos.engine.cancellation import CancelToken
 from qitos.engine.states import RuntimeBudget
+from qitos.models import ModelRequest
 from qitos.models.base import Model, ModelStreamChunk
 
 
@@ -428,12 +429,9 @@ class _BlockingModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        _ = request
         self.entered.set()
         try:
             await asyncio.Event().wait()
@@ -474,12 +472,18 @@ async def test_model_request_deadline_cancels_provider_and_closes_stream() -> No
 
     with pytest.raises(ModelRequestDeadlineExceeded):
         await asyncio.wait_for(
-                engine._model_runtime._call_llm(
-                    model,
-                    [],
-                    {},
+            engine._model_runtime._call_llm(
+                model,
+                ModelRequest(
+                    run_id="deadline-run",
+                    transaction_id="deadline-run:0",
+                    provider=model.provider_name,
+                    model=model.model,
+                    protocol=model.capabilities.api.value,
+                    messages=(),
                     deadline_monotonic=engine.runtime_deadline_monotonic,
                 ),
+            ),
             timeout=1.0,
         )
 
@@ -509,12 +513,9 @@ class _BlockingStreamModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
+        request: ModelRequest,
     ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        _ = request
         try:
             yield ModelStreamChunk(text="before deadline")
             self.entered.set()
@@ -567,12 +568,9 @@ def test_model_stream_reports_error_without_normal_end() -> None:
 
         async def stream(
             self,
-            messages: list[dict[str, Any]],
-            *,
-            deadline_monotonic: float | None = None,
-            **kwargs: Any,
+            request: ModelRequest,
         ) -> AsyncIterator[ModelStreamChunk]:
-            _ = messages, deadline_monotonic, kwargs
+            _ = request
             yield ModelStreamChunk(text="partial")
             raise ModelTransportError(
                 "stream broke",

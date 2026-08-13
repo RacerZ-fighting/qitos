@@ -16,6 +16,7 @@ from qitos.models import (
     AnthropicModel,
     GeminiModel,
     LiteLLMModel,
+    ModelRequest,
     OllamaModel,
     infer_context_window,
 )
@@ -52,7 +53,18 @@ class _AsyncCloser:
 async def _collect(
     model: Any, messages: list[dict[str, Any]], **kwargs: Any
 ) -> list[ModelStreamChunk]:
-    return [chunk async for chunk in model.stream(messages, **kwargs)]
+    deadline = kwargs.pop("deadline_monotonic", None)
+    request = ModelRequest(
+        run_id="provider-test",
+        transaction_id="provider-test:0",
+        provider=model.provider_name,
+        model=model.model,
+        protocol=model.capabilities.api.value,
+        messages=tuple(messages),
+        options=kwargs,
+        deadline_monotonic=deadline,
+    )
+    return [chunk async for chunk in model.stream(request)]
 
 
 @pytest.mark.asyncio
@@ -163,6 +175,8 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
     terminal = chunks[-1]
     assert terminal.done is True
     assert terminal.finish_reason == "tool_use"
+    assert terminal.event_metadata["id"] == "msg_1"
+    assert terminal.continuation is None
     assert terminal.tool_calls == [
         {
             "id": "toolu_1",

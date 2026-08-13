@@ -103,6 +103,10 @@ class ModelRequestCancelled(Exception):
     """Immediate Engine cancellation stopped waiting for a model request."""
 
 
+class ModelContinuationRejected(Exception):
+    """A Provider rejected an optional server-side continuation handle."""
+
+
 def _is_network_error(exc: Exception) -> bool:
     """Check if an exception is a transient network/SSL error."""
     # Standard Python errors

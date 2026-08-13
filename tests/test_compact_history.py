@@ -32,7 +32,7 @@ from qitos.kit.history import (
 )
 from qitos.kit.history.compact_history import SummaryCompactor
 from qitos.kit.parser import ReActTextParser
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamChunk
 
 
 def test_message_grouper_prefers_step_rounds() -> None:
@@ -1022,12 +1022,9 @@ def test_force_compaction_does_not_commit_staged_prompt_history() -> None:
 
         async def stream(
             self,
-            messages: list[dict[str, Any]],
-            *,
-            deadline_monotonic: float | None = None,
-            **kwargs: Any,
+            request: ModelRequest,
         ) -> AsyncIterator[ModelStreamChunk]:
-            _ = messages, deadline_monotonic, kwargs
+            _ = request
             self.calls += 1
             raise AssertionError(
                 "the provider must not be called at the force threshold"
