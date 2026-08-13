@@ -67,6 +67,10 @@ How to update:
   in-memory replay, reopened replay, stable record IDs, JSONL, and projection digests
   consistent. Unsupported schema versions now have a dedicated upgrade error, and a
   failed source close during fork no longer leaks the unreturned child's writer lease.
+- Plain-text Task coercion now derives a stable task ID from content instead of wall
+  time. Trace provenance preserves explicit structured Task IDs in an independent
+  `task_hash` without mixing task data into `run_config_hash`; qita requires the task
+  fingerprint for same-spec comparisons while keeping older manifests readable.
 - The `ChildRunResult.records` contract is now a read-only sequence view, so concrete
   typed `EngineResult` values structurally satisfy the Child Engine protocol.
 - Synchronous Engine hooks can now defer runtime input for durable async acceptance at

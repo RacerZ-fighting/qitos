@@ -181,6 +181,7 @@ class TraceWriter:
             "prompt_hash": self.metadata.get("prompt_hash", "unknown"),
             "tool_versions": self.metadata.get("tool_versions", {}),
             "seed": self.metadata.get("seed", None),
+            "task_hash": self.metadata.get("task_hash", "unknown"),
             "run_config_hash": self.metadata.get("run_config_hash", "unknown"),
             "git_sha": self.metadata.get("git_sha"),
             "package_version": self.metadata.get("package_version"),

@@ -11,11 +11,16 @@ description: "通过 qita 网页看板检查、回放并导出智能体运行。
 
 | 文件 | 内容 |
 |---|---|
-| `manifest.json` | 运行元数据：`run_id`、`model_id`、`status`、`stop_reason`、`step_count`、`event_count`、`schema_version`、`prompt_hash`、`run_config_hash`、`seed`、`summary` |
+| `manifest.json` | 运行元数据：`run_id`、`model_id`、`status`、`stop_reason`、`step_count`、`event_count`、`schema_version`、`prompt_hash`、`task_hash`、`run_config_hash`、`seed`、`summary` |
 | `events.jsonl` | 每行一个 `RuntimeEvent`，包含 `step_id`、`phase`、`ts`、`ok`、`error` 与 `payload` |
 | `steps.jsonl` | 每行一个 `StepRecord`，包含 `step_id`、决策（decision，智能体每步的结构化决策）、动作（action，标准化工具调用）、动作结果、观测结果（observation，每步后智能体接收的结构化观察结果）与评估器输出 |
 
 `manifest.json` 会在初始化时写出，并在 Engine 退出时完成定稿。`events.jsonl` 与 `steps.jsonl` 都是只追加写入。
+
+`task_hash` 对完整的 canonical Task 包计算指纹，其中包含稳定的任务或样本 ID。
+纯文本任务使用内容生成 ID，不再使用挂钟时间；trace `run_id` 才是执行实例标识。
+`run_config_hash` 单独标识运行配置。qita 只有在两者都完整且匹配时才会声明
+same-spec；缺少 `task_hash` 的旧 trace 仍可读取，但其比较 provenance 会被标为不完整。
 
 ---
 

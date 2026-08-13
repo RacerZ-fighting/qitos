@@ -149,6 +149,9 @@ result = agent.run(task, return_state=True)
 | `inputs` | `dict[str, Any]` | 提供给智能体的结构化输入。 |
 | `metadata` | `dict[str, Any]` | 写入追踪记录清单的自由元数据。 |
 
+`Task.id` 标识任务本身，而不是某次执行实例。纯文本任务会获得由内容生成的稳定
+ID；trace 与 Journal 的 `run_id` 才用于区分同一任务的多次执行或 trial。
+
 ### TaskBudget
 
 `TaskBudget` 用来指定单个任务的步数、时间和令牌限制。传入 `Task` 时，它会优先于 Engine 默认的 `RuntimeBudget`。
