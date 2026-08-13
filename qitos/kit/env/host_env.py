@@ -236,7 +236,14 @@ class HostCommandCapability(CommandCapability):
     ):
         self.cwd = str(Path(cwd).resolve())
         self._env = dict(env) if env is not None else None
-        self._managed = ManagedHostProcessRuntime(self.cwd, env=self._env)
+        self._managed: ManagedHostProcessRuntime | None = None
+
+    def _managed_runtime(self) -> ManagedHostProcessRuntime:
+        runtime = self._managed
+        if runtime is None:
+            runtime = ManagedHostProcessRuntime(self.cwd, env=self._env)
+            self._managed = runtime
+        return runtime
 
     async def arun(self, command: str, timeout: float = 30) -> Dict[str, Any]:
         if not command or not command.strip():
@@ -385,7 +392,7 @@ class HostCommandCapability(CommandCapability):
         journal: SessionJournal | None = None,
     ) -> ProcessSnapshot:
         effective_cwd = self._resolve_cwd(cwd)
-        return await self._managed.start(
+        return await self._managed_runtime().start(
             command,
             owner_run_id=owner_run_id,
             cwd=effective_cwd,
@@ -394,7 +401,7 @@ class HostCommandCapability(CommandCapability):
         )
 
     async def apoll(self, handle: ProcessHandle) -> ProcessSnapshot:
-        return await self._managed.poll(handle)
+        return await self._managed_runtime().poll(handle)
 
     async def aread(
         self,
@@ -403,7 +410,7 @@ class HostCommandCapability(CommandCapability):
         cursor: int = 0,
         wait_seconds: float = 0.0,
     ) -> ProcessSnapshot:
-        return await self._managed.read(
+        return await self._managed_runtime().read(
             handle,
             cursor=cursor,
             wait_seconds=wait_seconds,
@@ -414,7 +421,7 @@ class HostCommandCapability(CommandCapability):
         handle: ProcessHandle,
         data: str,
     ) -> ProcessSnapshot:
-        return await self._managed.write(handle, data)
+        return await self._managed_runtime().write(handle, data)
 
     async def await_process(
         self,
@@ -422,20 +429,20 @@ class HostCommandCapability(CommandCapability):
         *,
         deadline_monotonic: float | None = None,
     ) -> ProcessSnapshot:
-        return await self._managed.wait(
+        return await self._managed_runtime().wait(
             handle,
             deadline_monotonic=deadline_monotonic,
         )
 
     async def aterminate(self, handle: ProcessHandle) -> ProcessSnapshot:
-        return await self._managed.terminate(handle)
+        return await self._managed_runtime().terminate(handle)
 
     async def alist(
         self,
         *,
         owner_run_id: str | None = None,
     ) -> tuple[ProcessSnapshot, ...]:
-        return await self._managed.list(owner_run_id=owner_run_id)
+        return await self._managed_runtime().list(owner_run_id=owner_run_id)
 
     async def arecover(
         self,
@@ -443,13 +450,16 @@ class HostCommandCapability(CommandCapability):
         owner_run_id: str,
         journal: SessionJournal,
     ) -> tuple[ProcessSnapshot, ...]:
-        return await self._managed.recover(
+        return await self._managed_runtime().recover(
             owner_run_id=owner_run_id,
             journal=journal,
         )
 
     async def aclose(self) -> None:
-        await self._managed.close()
+        runtime = self._managed
+        self._managed = None
+        if runtime is not None:
+            await runtime.close()
 
 
 def _truncate_utf8(text: str, max_bytes: int) -> tuple[str, bool]:
