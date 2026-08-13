@@ -163,9 +163,12 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   asynchronous stream contract; the former sync/async class hierarchy, `call_raw`,
   import-time registration, and daemon-thread `AsyncEngine` bridge are gone.
 - **Same-spec qita comparisons**: compare views now verify recorded model, prompt,
-  tools, environment, context policy, budget, source revision, and experiment
-  provenance first. Mismatched or incomplete pairs are explicitly descriptive rather
-  than causal; matching pairs remain subject to provider and environment nondeterminism.
+  semantic task, tools, environment, context policy, budget, source revision, and
+  experiment provenance first. Plain-text tasks use content-derived stable IDs, while
+  task identity and runtime configuration use separate fingerprints, so wall-clock
+  task wrapping cannot create false mismatches.
+  Mismatched or incomplete pairs are explicitly descriptive rather than causal;
+  matching pairs remain subject to provider and environment nondeterminism.
 - **Truthful typed model streams**: Chat, Responses, and Anthropic streams retain
   provider finish reasons, reasoning and tool-call deltas, completed tool calls, and
   usage. Incomplete streams fail instead of fabricating completion, and Engine handlers

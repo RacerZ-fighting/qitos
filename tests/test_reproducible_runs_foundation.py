@@ -50,6 +50,7 @@ def _make_run_dir(root: Path, run_id: str) -> Path:
                 "prompt_hash": "hash",
                 "tool_versions": {},
                 "seed": None,
+                "task_hash": "task",
                 "run_config_hash": "cfg",
                 "git_sha": "sha123",
                 "package_version": "0.3.0",
@@ -113,6 +114,7 @@ def test_run_spec_trace_manifest_integration(tmp_path: Path):
     assert manifest["experiment_spec"]["name"] == "tau-bench:test"
     assert manifest["prompt_protocol"] == "react_text_v1"
     assert manifest["parser_name"] == "ReActTextParser"
+    assert manifest["task_hash"] not in {"", "unknown"}
     assert "git_sha" in manifest
     assert "package_version" in manifest
     assert manifest["replay_mode"] == "best_effort"

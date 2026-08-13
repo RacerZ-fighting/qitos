@@ -70,6 +70,10 @@ How to update:
 - Nested Journal forks now resolve inherited records to their canonical origin across
   every ancestor. A fork-of-fork can resume independently without replaying a
   completed Tool, and inconsistent inherited identity fails closed.
+- Plain-text Task coercion now derives a stable task ID from content instead of wall
+  time. Trace provenance preserves explicit structured Task IDs in an independent
+  `task_hash` without mixing task data into `run_config_hash`; qita requires the task
+  fingerprint for same-spec comparisons while keeping older manifests readable.
 - The `ChildRunResult.records` contract is now a read-only sequence view, so concrete
   typed `EngineResult` values structurally satisfy the Child Engine protocol.
 - Synchronous Engine hooks can now defer runtime input for durable async acceptance at

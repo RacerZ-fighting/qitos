@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from typing import Any
 
 from examples._support import SequenceModel
 from qitos_zoo.qitos_coder.preset_agent import ClaudeCodeAgent, _resolve_runtime_config
-from qitos import HistoryPolicy
+import qitos.core.agent_module as agent_module_module
+from qitos import HistoryPolicy, Task
 from qitos.harness import (
     build_harness_policy,
     build_model_for_preset,
@@ -236,15 +238,36 @@ def test_harness_metadata_reaches_trace_manifest(tmp_path: Path) -> None:
     }
 
 
-def test_scripted_runs_produce_a_same_spec_comparison(tmp_path: Path) -> None:
+def test_scripted_runs_produce_a_same_spec_comparison(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    def run_once(trace_root: Path) -> dict[str, Any]:
+    class _Clock:
+        current = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:
+            if tz is None:
+                return cls.current.replace(tzinfo=None)
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr(agent_module_module, "datetime", _Clock)
+
+    def run_once(
+        trace_root: Path,
+        *,
+        now: datetime,
+        objective: str = "finish",
+        model: str = "moonshot-v1-128k",
+        explicit_task_id: str | None = None,
+    ) -> dict[str, Any]:
+        _Clock.current = now
         harness = build_harness_policy(family_id="kimi")
         llm = SequenceModel(
             ['{"thought":"done","final_answer":"ok"}'],
-            model="moonshot-v1-128k",
+            model=model,
         )
         setattr(
             llm,
@@ -265,7 +288,11 @@ def test_scripted_runs_produce_a_same_spec_comparison(tmp_path: Path) -> None:
             model_protocol=harness.protocol,
         )
         agent.run(
-            task="finish",
+            task=(
+                Task(id=explicit_task_id, objective=objective)
+                if explicit_task_id is not None
+                else objective
+            ),
             workspace=str(workspace),
             max_steps=2,
             render=False,
@@ -277,10 +304,49 @@ def test_scripted_runs_produce_a_same_spec_comparison(tmp_path: Path) -> None:
         assert len(manifests) == 1
         return _load_run_payload(manifests[0].parent)
 
-    diff = _build_run_diff(
-        run_once(tmp_path / "left-runs"),
-        run_once(tmp_path / "right-runs"),
+    left = run_once(
+        tmp_path / "left-runs",
+        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
     )
+    right = run_once(
+        tmp_path / "right-runs",
+        now=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    changed_task = run_once(
+        tmp_path / "changed-task-runs",
+        now=datetime(2026, 1, 3, tzinfo=timezone.utc),
+        objective="finish a different task",
+    )
+    changed_config = run_once(
+        tmp_path / "changed-config-runs",
+        now=datetime(2026, 1, 4, tzinfo=timezone.utc),
+        model="moonshot-v1-32k",
+    )
+    changed_identity = run_once(
+        tmp_path / "changed-identity-runs",
+        now=datetime(2026, 1, 5, tzinfo=timezone.utc),
+        explicit_task_id="benchmark-sample-2",
+    )
+
+    left_manifest = left["manifest"]
+    right_manifest = right["manifest"]
+    changed_manifest = changed_task["manifest"]
+    changed_config_manifest = changed_config["manifest"]
+    changed_identity_manifest = changed_identity["manifest"]
+    assert left_manifest["summary"]["task_meta"]["task_id"] == right_manifest[
+        "summary"
+    ]["task_meta"]["task_id"]
+    assert left_manifest["task_hash"] == right_manifest["task_hash"]
+    assert left_manifest["task_hash"] != changed_manifest["task_hash"]
+    assert left_manifest["run_config_hash"] == changed_manifest["run_config_hash"]
+    assert left_manifest["task_hash"] == changed_config_manifest["task_hash"]
+    assert (
+        left_manifest["run_config_hash"]
+        != changed_config_manifest["run_config_hash"]
+    )
+    assert left_manifest["task_hash"] != changed_identity_manifest["task_hash"]
+
+    diff = _build_run_diff(left, right)
 
     assert diff["comparison"] == {
         "compatible": True,

@@ -11,7 +11,7 @@ Each run directory contains three files:
 
 | File | Contents |
 |---|---|
-| `manifest.json` | Run metadata: `run_id`, `model_id`, `status`, `stop_reason`, `step_count`, `event_count`, `schema_version`, `prompt_hash`, `run_config_hash`, `seed`, `summary` |
+| `manifest.json` | Run metadata: `run_id`, `model_id`, `status`, `stop_reason`, `step_count`, `event_count`, `schema_version`, `prompt_hash`, `task_hash`, `run_config_hash`, `seed`, `summary` |
 | `events.jsonl` | One JSON object per line; each line is a `RuntimeEvent` with `step_id`, `phase`, `ts`, `ok`, `error`, and `payload` |
 | `steps.jsonl` | One JSON object per line; each line is a `StepRecord` with `step_id`, `decision` (the model's structured output), `actions` (the tool calls dispatched), `action_results`, `observation` (the environment's response), and `critic_outputs` |
 
@@ -20,6 +20,13 @@ Runtime events are staged until their step reaches the trace boundary; the
 events are flushed before the corresponding `steps.jsonl` commit marker. This
 keeps each completed step replayable as one ordered transaction. Lifecycle
 events such as cancellation remain observable immediately.
+
+`task_hash` fingerprints the complete canonical Task package, including its stable
+task/sample ID. Plain-text tasks receive a content-derived ID rather than a
+wall-clock-derived ID; the trace `run_id` remains the execution-instance identity.
+`run_config_hash` fingerprints runtime configuration separately. Qita requires both
+when declaring two traces a same-spec comparison; older traces without `task_hash`
+remain readable but have incomplete comparison provenance.
 
 ---
 
