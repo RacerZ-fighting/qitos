@@ -44,6 +44,7 @@ Those projects remain design references, not runtime dependencies.
 - [x] Define and test canonical immutable Child contracts.
 - [x] Migrate `AgentTool` to handles, typed statuses, conclusions, and `TaskBudget`.
 - [x] Extract one Run-owned async supervisor.
-- [ ] Add wait, message/follow-up, and interrupt projections.
+- [x] Add status, wait, active-message, and interrupt projections.
+- [ ] Let a product resume a terminal Child Session for follow-up work.
 - [x] Journal lifecycle facts and define resume/fork behavior.
 - [ ] Adopt the canonical lifecycle directly in PentestAgent `GeneralAgent`.

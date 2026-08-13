@@ -5,9 +5,21 @@ from .agent_tool import (
     ChildInvocationFactory,
     AgentTool,
 )
+from .control import (
+    ChildControlToolSet,
+    ChildInterruptTool,
+    ChildMessageTool,
+    ChildStatusTool,
+    ChildWaitTool,
+)
 
 __all__ = [
     "AgentExecutionMode",
     "ChildInvocationFactory",
     "AgentTool",
+    "ChildControlToolSet",
+    "ChildInterruptTool",
+    "ChildMessageTool",
+    "ChildStatusTool",
+    "ChildWaitTool",
 ]

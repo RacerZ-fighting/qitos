@@ -710,7 +710,7 @@ inject an invocation factory that constructs the child from its run-scoped resou
 
 ```python
 from qitos.core import ChildInvocation, TaskBudget
-from qitos.kit.tool.agent import AgentTool
+from qitos.kit.tool.agent import AgentTool, ChildControlToolSet
 
 def build_child(request, runtime_context):
     child_engine = make_fresh_engine(
@@ -725,6 +725,8 @@ tool = AgentTool(
     max_delegate_depth=1,
     child_budget=TaskBudget(max_steps=200),
 )
+registry.register(tool)
+registry.register_toolset(ChildControlToolSet(tool.supervisor), namespace="")
 ```
 
 The model-facing arguments are `description`, `prompt`, optional `name`, and optional
@@ -777,6 +779,13 @@ Terminal result state is stored before QitOS attempts to wake the parent. An
 `execution_scope` that waits for an application slot should observe the
 `runtime_context["agent_cancelled"]` callback so teardown can wake a child that has not
 entered its Engine yet.
+
+`ChildControlToolSet` exposes exact `child_status`, `child_wait`, `child_message`, and
+`child_interrupt` tools over that same supervisor. Wait timeout never cancels the Child.
+Message delivery uses the Child Engine's durable mailbox and becomes visible only at a
+turn safe point. Unknown or foreign handles return stable `unknown` state. A terminal
+Child rejects messages explicitly; continuing a terminal Session requires a product
+resume factory rather than silently creating a different Child.
 
 Delegation depth is checked before the factory runs. Multiple Agent calls execute in
 parallel only when the parent Engine's `ActionExecutionPolicy` allows `Agent` and the

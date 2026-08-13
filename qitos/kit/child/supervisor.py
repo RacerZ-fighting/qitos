@@ -44,6 +44,7 @@ class _OwnedChild:
     runtime_context: dict[str, Any]
     cancel_event: asyncio.Event
     terminal_event: asyncio.Event
+    engine_ready: asyncio.Event
     journal: SessionJournal | None = None
     task: asyncio.Task[ChildResult] | None = None
     engine: ChildEngine | None = None
@@ -111,6 +112,7 @@ class ChildSupervisor:
                 runtime_context=dict(runtime_context),
                 cancel_event=asyncio.Event(),
                 terminal_event=asyncio.Event(),
+                engine_ready=asyncio.Event(),
                 journal=journal,
             )
             self._children[handle] = owned
@@ -274,6 +276,7 @@ class ChildSupervisor:
                         runtime_context={},
                         cancel_event=asyncio.Event(),
                         terminal_event=asyncio.Event(),
+                        engine_ready=asyncio.Event(),
                     )
                     self._children[handle] = owned
                 self._set_terminal(owned, result)
@@ -307,6 +310,52 @@ class ChildSupervisor:
             if task.done() and not owned.terminal_event.is_set():
                 self._set_terminal(owned, self._cancelled_result(owned))
         return self._current_result(owned)
+
+    async def message(
+        self,
+        handle: ChildHandle,
+        content: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[bool, ChildResult | None]:
+        """Post one parent message to an active Child's durable mailbox."""
+
+        text = str(content or "").strip()
+        if not text:
+            raise ValueError("content must be a non-empty string")
+        if timeout_seconds is not None and timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be non-negative or None")
+        owned = self._owned(handle)
+        if owned is None:
+            return False, None
+        current = self._current_result(owned)
+        if current.ready:
+            return False, current
+        try:
+            await self._wait_until_ready_or_terminal(
+                owned,
+                timeout_seconds=timeout_seconds,
+            )
+        except TimeoutError:
+            return False, self._current_result(owned)
+        current = self._current_result(owned)
+        if current.ready or owned.engine is None:
+            return False, current
+        post_runtime_event = getattr(owned.engine, "apost_runtime_event", None)
+        if not callable(post_runtime_event):
+            raise RuntimeError("child Engine does not expose an async runtime mailbox")
+        child_run_id = self._child_run_id(owned)
+        if not child_run_id:
+            return False, current
+        event = RuntimeInput(
+            event_id=f"{owned.handle.child_id}:parent:{uuid.uuid4().hex}",
+            kind="agent.parent.message",
+            correlation_id=owned.handle.child_id,
+            source="qitos.parent",
+            payload={"content": text},
+        )
+        accepted = await post_runtime_event(event, run_id=child_run_id)
+        return bool(accepted), self._current_result(owned)
 
     def request_interrupt(self, handle: ChildHandle) -> bool:
         """Signal one active child without waiting for terminal cleanup."""
@@ -501,6 +550,7 @@ class ChildSupervisor:
             invocation.engine.cancel("immediate")
             raise RuntimeError("child supervisor closed before child start")
         owned.engine = invocation.engine
+        owned.engine_ready.set()
         engine_result = await invocation.engine.arun(
             invocation.task,
             **dict(invocation.run_kwargs),
@@ -536,6 +586,30 @@ class ChildSupervisor:
     def _set_terminal(self, owned: _OwnedChild, result: ChildResult) -> None:
         owned.result = result
         owned.terminal_event.set()
+
+    @staticmethod
+    async def _wait_until_ready_or_terminal(
+        owned: _OwnedChild,
+        *,
+        timeout_seconds: float | None,
+    ) -> None:
+        engine_wait = asyncio.create_task(
+            owned.engine_ready.wait(),
+            name=f"qitos-{owned.handle.child_id}-engine-ready",
+        )
+        terminal_wait = asyncio.create_task(
+            owned.terminal_event.wait(),
+            name=f"qitos-{owned.handle.child_id}-terminal-wait",
+        )
+        waits = (engine_wait, terminal_wait)
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in waits:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*waits, return_exceptions=True)
 
     async def _persist_started(self, owned: _OwnedChild) -> None:
         if owned.journal is None:

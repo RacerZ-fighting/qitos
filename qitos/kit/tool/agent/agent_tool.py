@@ -230,6 +230,12 @@ class AgentTool(BaseTool):
     def active_background_count(self) -> int:
         return self._supervisor.active_count
 
+    @property
+    def supervisor(self) -> ChildSupervisor:
+        """Return the shared Run-owned lifecycle capability for control tools."""
+
+        return self._supervisor
+
     def snapshot_background_events(self) -> list[RuntimeInput]:
         return self._supervisor.snapshot_events()
 

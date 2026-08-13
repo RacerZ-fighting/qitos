@@ -103,6 +103,10 @@ How to update:
   `child.terminal` before parent delivery. Recovery marks a started child without a
   terminal as `interrupted` and never replays it; forked Runs do not acquire authority
   over inherited parent handles.
+- Added `child_status`, `child_wait`, `child_message`, and `child_interrupt` tools over
+  the shared supervisor. Message delivery uses the active Child's async durable mailbox;
+  wait timeout preserves execution, interrupt awaits cleanup, and unknown or foreign
+  handles return stable state.
 - Added canonical Child Agent contracts that keep persisted launch intent, stable
   identity, lifecycle status, bounded conclusions, evidence references, and live Engine
   ownership separate. The contracts round-trip without serializing a runnable Agent.
