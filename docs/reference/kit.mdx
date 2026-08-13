@@ -536,16 +536,29 @@ registry.register(skills.read_skill_resource)
 ```
 
 Roots are scanned during construction and when `refresh_bundled_skills()` is called.
-Refresh validates every immediate child containing `SKILL.md`, rejects duplicate
-manifest names, and replaces the previous in-memory snapshot only after the entire
-catalog succeeds. `list_skills` returns stable name-sorted summaries with a bounded
-limit; `load_skill` requires one exact catalog name and returns the complete validated
-snapshot, its SHA-256 content revision, declared requirements, and stable relative
-resource identifiers. `read_skill_resource` accepts only one of those identifiers,
-rechecks the resolved path against the selected Skill root, and returns an opaque
-content-bound cursor when a UTF-8 resource needs another page. Applications can use
-`bundled_skill_snapshots()` to persist and later revalidate loaded instructions. These
-paths do not invoke a provider, install a package, or create a workspace registry.
+Discovery recurses until it reaches a directory containing `SKILL.md`, then treats that
+directory as one Skill and does not reinterpret nested files as another Skill. Earlier
+configured roots win name collisions. Missing roots, invalid manifests, unreadable or
+escaping resources, and shadowed names become typed `BundledSkillDiagnostic` values;
+valid siblings remain available and refresh atomically replaces the old catalog.
+
+`list_skills` returns stable name-sorted summaries, availability, bounded diagnostics,
+and a bounded entry limit. `load_skill` requires one exact catalog name and returns the
+complete validated snapshot, declared requirements, stable relative resource
+identifiers, and both instruction-only and whole-bundle SHA-256 revisions. Pass an
+immutable `available_requirements` collection when constructing the toolset to gate
+full loading before instructions reach the model. Requirement identifiers are opaque
+to QitOS, so an application can use exact values such as `command:nmap` and
+`tool:run_command`. Omitting the collection preserves compatibility but reports
+availability as `unchecked`.
+
+`read_skill_resource` accepts only an identifier captured by the latest refresh,
+rechecks the resolved path against the selected Skill root, verifies that its bytes
+still match the bundle revision, and returns an opaque content-bound cursor when a
+UTF-8 resource needs another page. Applications can use
+`bundled_skill_snapshots()` and `bundled_skill_diagnostics()` to persist and revalidate
+loaded instructions or explain discovery gaps. These paths do not invoke a provider,
+install a package, or create a workspace registry.
 
 </Accordion>
 

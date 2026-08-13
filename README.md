@@ -130,9 +130,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   `Engine.last_checkpoint_id` after a successful durable commit instead of reaching
   into private Engine fields.
 - **Progressive bundled Skills**: applications can point `SkillToolSet` at read-only
-  asset roots, expose a bounded catalog, load one exact `SKILL.md` in full, persist its
-  content revision, and page linked UTF-8 resources without invoking a provider or
-  writing an installation registry.
+  asset roots, expose a bounded catalog, load one exact `SKILL.md` in full, and page
+  linked UTF-8 resources without invoking a provider or writing an installation
+  registry. Recursive discovery uses explicit root precedence and typed diagnostics;
+  one bundle revision covers the instructions and resources, while an optional frozen
+  requirement set prevents loading workflows unavailable in the current runtime.
 - **Application-owned command environments**: host command capabilities and
   `RunCommand` can now receive one explicit environment snapshot for shell, argv, and
   background processes, while existing callers continue to inherit by default.

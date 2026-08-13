@@ -19,6 +19,11 @@ How to update:
 
 ### Changed
 
+- Bundled Skill roots now use recursive nearest-root discovery, deterministic
+  first-root-wins precedence, and typed non-fatal diagnostics. Explicit refresh
+  replaces the catalog atomically; bundle revisions cover both `SKILL.md` and resource
+  bytes, stale resources fail instead of mixing revisions, and an optional immutable
+  requirement inventory gates full Skill loading.
 - Context recovery coverage now exercises compaction, cancellation, committed-boundary
   fork, and resume as one Run. It verifies ordered ToolCall/ToolResult parity in the
   canonical Journal while resume alone may retain a matching Provider continuation.
