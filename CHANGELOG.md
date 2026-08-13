@@ -19,6 +19,10 @@ How to update:
 
 ### Fixed
 
+- Session Journal payloads now cross one strict JSON boundary before append, keeping
+  in-memory replay, reopened replay, stable record IDs, JSONL, and projection digests
+  consistent. Unsupported schema versions now have a dedicated upgrade error, and a
+  failed source close during fork no longer leaks the unreturned child's writer lease.
 - Native tool calls now require a complete protocol terminal before execution. Chat
   drops calls on output-limit/non-tool finishes; Anthropic keeps interleaved block
   arguments isolated and records, but does not replay or execute, unclosed, malformed,

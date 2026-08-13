@@ -49,14 +49,22 @@ boundaries. They accelerate replay but are not a second source of truth.
 The JSONL writer waits for durable acknowledgement for every record. Darwin uses
 `F_FULLFSYNC`. Other POSIX systems prefer `fdatasync` when available.
 
+Every append first converts its payload into one isolated strict JSON value. Python
+tuples become JSON arrays; non-string object keys, non-finite numbers, bytes, sets,
+cycles, and custom objects are rejected before any record is written. The same value
+therefore drives in-memory replay, stable-record-id settlement, JSONL encoding, reopened
+replay, and projection digests.
+
 `journal.index.sqlite3` is a disposable read projection beside the canonical file.
 QitOS updates it only after the JSONL append is durable. A missing, stale, corrupt, or
 unsupported projection is rebuilt from validated JSONL records. Open and replay always
 parse canonical JSONL first; SQLite never supplies replay records. QitOS retains the
 projection only when its record digests match those canonical records. Projection
 failures do not fail or roll back a canonical append, and deleting the SQLite file loses
-no Run state. Complete JSONL records with unknown schemas or invalid semantics fail
-closed; only an unterminated syntactically torn tail is truncated during recovery.
+no Run state. Complete JSONL records with invalid semantics raise
+`JournalCorruptionError`. Valid records using an unsupported old or new schema raise
+`JournalUnsupportedVersionError` with upgrade or migration guidance. Both fail closed;
+only an unterminated syntactically torn tail is truncated during recovery.
 
 ```python
 from qitos import Engine
@@ -74,7 +82,9 @@ resumed = await Engine(
 Forking accepts only a committed `JournalPosition`. The child journal owns an
 independent inherited prefix and can resume without changing its parent. Forking
 closes the source journal and returns the child open; the caller that receives that
-child owns its lifecycle until an Engine run consumes it or `close()` is called.
+child owns its lifecycle until an Engine run consumes it or `close()` is called. If the
+source cannot close after the child is created, QitOS closes the unreturned child before
+propagating the source error, so no hidden writer lease remains.
 
 ## Committed tool lookup
 

@@ -14,9 +14,11 @@ import pytest
 from qitos.core.journal import (
     JournalClosedError,
     JournalCorruptionError,
+    JournalError,
     JournalOwnershipError,
     JournalRecordRef,
     JournalRecordType,
+    JournalUnsupportedVersionError,
 )
 from qitos.kit.journal import JsonlSessionJournal
 from qitos.kit.journal import jsonl as jsonl_module
@@ -72,6 +74,81 @@ async def test_append_and_replay_isolate_nested_payloads(tmp_path: Path) -> None
 
     reread = await journal.replay()
     assert reread[1].payload == {"nested": {"items": ["canonical"]}}
+
+
+@pytest.mark.asyncio
+async def test_payload_is_canonical_before_append_and_stable_after_reopen(
+    tmp_path: Path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    await journal.create("run-1", {})
+
+    first = await journal.append(
+        JournalRecordType.INPUT_ACCEPTED,
+        {"items": ("one", "two")},
+        record_id="stable",
+    )
+
+    assert (await journal.replay())[-1].payload == {"items": ["one", "two"]}
+    await journal.close()
+
+    reopened = JsonlSessionJournal(tmp_path)
+    await reopened.open("run-1")
+    settled = await reopened.append(
+        JournalRecordType.INPUT_ACCEPTED,
+        {"items": ("one", "two")},
+        record_id="stable",
+    )
+
+    assert settled == first
+    assert [record.record_id for record in await reopened.replay()].count("stable") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_payload",
+    [
+        {"nested": {1: "non-string key"}},
+        {"number": float("nan")},
+        {"value": b"bytes"},
+        {"value": {"set"}},
+        {"value": object()},
+    ],
+)
+async def test_payload_rejects_non_json_values_before_writing(
+    tmp_path: Path,
+    invalid_payload: dict[str, object],
+) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    await journal.create("run-1", {})
+    before = journal.path.read_bytes()
+
+    with pytest.raises(JournalError, match="strict JSON value"):
+        await journal.append(
+            JournalRecordType.INPUT_ACCEPTED,
+            invalid_payload,
+            record_id="invalid",
+        )
+
+    assert journal.path.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_payload_rejects_cycles_before_writing(tmp_path: Path) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    await journal.create("run-1", {})
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    before = journal.path.read_bytes()
+
+    with pytest.raises(JournalError, match="strict JSON value"):
+        await journal.append(
+            JournalRecordType.INPUT_ACCEPTED,
+            cyclic,
+            record_id="invalid",
+        )
+
+    assert journal.path.read_bytes() == before
 
 
 @pytest.mark.asyncio
@@ -380,18 +457,25 @@ async def test_replay_rejects_corruption_before_the_final_line(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_replay_rejects_unsupported_canonical_schema(tmp_path: Path) -> None:
+@pytest.mark.parametrize("schema_version", [0, 2])
+async def test_replay_distinguishes_unsupported_schema_from_corruption(
+    tmp_path: Path,
+    schema_version: int,
+) -> None:
     journal = JsonlSessionJournal(tmp_path)
     await journal.create("run-1", {})
     await journal.close()
     lines = journal.path.read_text(encoding="utf-8").splitlines()
     first = json.loads(lines[0])
-    first["schema_version"] = 2
+    first["schema_version"] = schema_version
     lines[0] = json.dumps(first, ensure_ascii=False, sort_keys=True)
     invalid = "\n".join(lines).encode("utf-8")
     journal.path.write_bytes(invalid)
 
-    with pytest.raises(JournalCorruptionError, match="schema version"):
+    with pytest.raises(
+        JournalUnsupportedVersionError,
+        match=rf"found {schema_version}.*supports 1",
+    ):
         await JsonlSessionJournal(tmp_path).open("run-1")
     assert journal.path.read_bytes() == invalid
 
