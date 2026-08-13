@@ -94,6 +94,10 @@ How to update:
   immediately. Retries remain available before the first provider event, but an
   observable attempt is never replayed; its terminal chunk is committed only after
   provider EOF confirms that no late event follows it.
+- Synchronous history retrieval no longer calls the async `Model` contract as a
+  function during compaction. It uses the bounded heuristic projection and records
+  `summarizer_mode=heuristic_async_model`; explicit synchronous summarizers keep their
+  existing failure and circuit-breaker semantics.
 - **Breaking:** Removed the `read_only` and `allow_destructive` model arguments from
   `run_command`. Applications that need command admission enforce it before execution.
 - Oversized tool results now retain canonical output for reducers and traces while

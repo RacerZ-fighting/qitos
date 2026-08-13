@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import re
@@ -150,7 +151,7 @@ class SummaryCompactor:
             return ""
 
         prompt = self._summary_prompt(items, prior_summary=prior_summary)
-        if self.llm is not None:
+        if self.summarizer_mode == "sync_model":
             try:
                 response = self.llm(
                     [
@@ -174,6 +175,19 @@ class SummaryCompactor:
             raise RuntimeError("history summarizer returned an empty summary")
 
         return self._heuristic_summary(items, prior_summary=prior_summary)
+
+    @property
+    def summarizer_mode(self) -> str:
+        """Return the active synchronous summary path without bridging event loops."""
+
+        if self.llm is None:
+            return "heuristic"
+        if not callable(self.llm):
+            return "heuristic_async_model"
+        callback = getattr(self.llm, "__call__", self.llm)
+        if inspect.iscoroutinefunction(callback):
+            return "heuristic_async_model"
+        return "sync_model"
 
     def _normalize_summary(self, value: str) -> str:
         """Strip the model's drafting scratchpad from the durable summary."""
@@ -685,6 +699,7 @@ class CompactionController:
             "summary_budget": budget,
             "summary_char_limit": summary_char_limit,
             "summary_chars": len(summary_text),
+            "summarizer_mode": self.summary.summarizer_mode,
         }
         summary_message = HistoryMessage(
             role="system",

@@ -25,7 +25,12 @@ from qitos.core.history import (
     HistorySnapshot,
     select_recent_history,
 )
-from qitos.kit.history import CompactHistory, MessageGrouper
+from qitos.kit.history import (
+    CompactConfig,
+    CompactHistory,
+    MessageGrouper,
+)
+from qitos.kit.history.compact_history import SummaryCompactor
 from qitos.kit.parser import ReActTextParser
 from qitos.models import Model, ModelStreamChunk
 
@@ -465,6 +470,19 @@ def test_summary_compactor_persists_summary_without_drafting_scratchpad() -> Non
     assert "scratchpad" not in summary
 
 
+def test_summary_compactor_uses_heuristic_for_async_model_contract() -> None:
+    model = SequenceModel(["must not be called"], model="async-summary-model")
+    compactor = SummaryCompactor(CompactConfig(), llm=model)
+
+    summary = compactor.summarize(
+        [HistoryMessage(role="user", content="Preserve this goal", step_id=0)]
+    )
+
+    assert "Preserve this goal" in summary
+    assert compactor.summarizer_mode == "heuristic_async_model"
+    assert model.calls == []
+
+
 def _numbered_history(
     count: int,
     *,
@@ -578,6 +596,7 @@ def test_summary_trace_reports_real_input_counts_and_ranges() -> None:
         assert payload["summary_input_mode"] in {"full", "microcompacted"}
         assert re.fullmatch(r"[0-9a-f]{64}", payload["source_digest"])
         assert payload["source_history_version"] == history.history_version
+        assert payload["summarizer_mode"] == "sync_model"
 
 
 def test_repeated_compaction_reuses_summary_for_unchanged_source() -> None:

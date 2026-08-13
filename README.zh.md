@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **上下文压缩不再错调异步模型**：同步 `CompactHistory.retrieve()` 遇到 QitOS
+  异步 `Model` 时会使用有界 heuristic summary 并记录实际模式，不再把异步模型当
+  普通函数调用，也不引入 sync/async event-loop 桥。
 - **模型 delta 真实实时可见**：文本、reasoning 与工具调用分片到达后立即发布。
   只有首个 provider event 之前的失败可以重试，因此不会重复展示输出或重复工具调用；
   terminal chunk 仍会等到 provider EOF 后才提交，保留成功事务边界。

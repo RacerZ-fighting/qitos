@@ -44,6 +44,12 @@ Responses 模式支持同步、异步和类型化流式调用。工具循环期�
 不同 OpenAI 兼容端点可能只实现 `/v1/responses` 的一部分。Responses 请求失败后，QitOS 不会静默回退到 Chat Completions；不支持 Responses 的端点应显式使用 `chat_completions`。
 </Warning>
 
+`CompactHistory.retrieve()` 仍是同步 history 契约。若配置的 `llm` 是 QitOS
+异步原生 `Model`，压缩会改用有界 heuristic summary，不会调用异步模型或创建
+event-loop 桥；summary metadata 与 context event 会记录
+`summarizer_mode="heuristic_async_model"`。显式传入的同步 summarizer 仍可使用，
+其失败继续遵循现有的有界 circuit 语义。
+
 Reasoning item 被视为不透明的续接状态。追踪摘要只保留安全的 item 描述与供应商允许的摘要，并排除加密 reasoning 续接内容。
 
 ### Reasoning 强度与续接

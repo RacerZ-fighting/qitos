@@ -54,6 +54,13 @@ fails. Select `chat_completions` explicitly for endpoints that do not support
 Responses.
 </Warning>
 
+`CompactHistory.retrieve()` remains a synchronous history contract. When its configured
+`llm` is an async-native QitOS `Model`, compaction uses the bounded heuristic summary
+instead of calling that model or creating an event-loop bridge. Summary metadata and
+context events record `summarizer_mode="heuristic_async_model"`. Applications may still
+provide an explicit synchronous summary callable; its errors remain visible and use the
+existing bounded failure circuit.
+
 Reasoning items are treated as opaque continuation state. Trace summaries keep
 safe item descriptors and provider-authorized summaries, but omit encrypted
 reasoning continuation payloads.
