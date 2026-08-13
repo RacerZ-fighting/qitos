@@ -406,6 +406,7 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             raise
         except Exception as exc:
             _logger.warning("Env teardown failed: %s", exc)
+            raise
 
     def run_env_step(
         self,

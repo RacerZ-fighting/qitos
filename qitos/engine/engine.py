@@ -1088,19 +1088,29 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 run_id=self._active_run_id,
                 _cancel_token=self._cancel_token,
             )
-            if self.journal is not None:
-                await self._journal_finish_run(state)
             self._runtime_inbox.close(self._active_run_id)
             self._notify_run_end(result)
             self._clear_active_context()
-            await self._teardown_env()
-            await self._ateardown_toolsets(
-                {
-                    "state": state,
-                    "trace_writer": self.trace_writer,
-                    "task": task_obj or task_text,
-                }
-            )
+            preflight_cleanup_error: BaseException | None = None
+            try:
+                await self._teardown_env()
+            except BaseException as exc:
+                preflight_cleanup_error = exc
+            try:
+                await self._ateardown_toolsets(
+                    {
+                        "state": state,
+                        "trace_writer": self.trace_writer,
+                        "task": task_obj or task_text,
+                    }
+                )
+            except BaseException as exc:
+                if preflight_cleanup_error is None:
+                    preflight_cleanup_error = exc
+            if preflight_cleanup_error is not None:
+                raise preflight_cleanup_error
+            if self.journal is not None:
+                await self._journal_finish_run(state)
             return result
 
         step_id = _resume_step if _resume_step is not None else 0
@@ -1208,14 +1218,22 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             journal_interrupted = True
         finally:
             self._runtime_inbox.close(self._active_run_id)
-            await self._teardown_env()
-            await self._ateardown_toolsets(
-                {
-                    "state": state,
-                    "trace_writer": self.trace_writer,
-                    "task": task_obj or task_text,
-                }
-            )
+            cleanup_error: BaseException | None = None
+            try:
+                await self._teardown_env()
+            except BaseException as exc:
+                cleanup_error = exc
+            try:
+                await self._ateardown_toolsets(
+                    {
+                        "state": state,
+                        "trace_writer": self.trace_writer,
+                        "task": task_obj or task_text,
+                    }
+                )
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
             # Checkpoint on cancellation (immediate mode)
             if (
                 self._cancel_token.is_cancel_requested
@@ -1233,7 +1251,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         "Checkpoint save failed during cancellation: %s", exc
                     )
             # Cleanup MCP servers
-            await self._cleanup_mcp_servers()
+            try:
+                await self._cleanup_mcp_servers()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            if cleanup_error is not None:
+                raise cleanup_error
 
         if cancelled and propagate_cancel:
             self._clear_active_context()
@@ -2544,6 +2568,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             self._write_lifecycle_event(
                 "toolset_teardown_error", context, ok=False, error=str(exc)
             )
+            raise
 
     async def _ateardown_toolsets(self, context: Dict[str, Any]) -> None:
         if not hasattr(self.tool_registry, "ateardown"):
@@ -2557,6 +2582,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             self._write_lifecycle_event(
                 "toolset_teardown_error", context, ok=False, error=str(exc)
             )
+            raise
 
     def _write_lifecycle_event(
         self,

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from qitos.core.journal import JournalError, JournalRecordType
-from qitos.core.process import ProcessStatus
+from qitos.core.process import ProcessPersistenceError, ProcessStatus
 from qitos.kit.env.managed_process import ManagedHostProcessRuntime
 from qitos.kit.journal import JsonlSessionJournal
 
@@ -244,6 +244,19 @@ class _StartFailingJournal(JsonlSessionJournal):
         return await super().append(record_type, payload, record_id=record_id)
 
 
+class _TerminalFailingJournal(JsonlSessionJournal):
+    async def append(
+        self,
+        record_type: JournalRecordType,
+        payload,
+        *,
+        record_id: str,
+    ):
+        if record_type is JournalRecordType.PROCESS_TERMINAL:
+            raise JournalError("injected process.terminal failure")
+        return await super().append(record_type, payload, record_id=record_id)
+
+
 @pytest.mark.asyncio
 async def test_started_record_failure_reaps_process_and_returns_no_handle(
     tmp_path: Path,
@@ -269,6 +282,26 @@ async def test_started_record_failure_reaps_process_and_returns_no_handle(
         and not task.done()
     ] == []
     await runtime.close()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_record_failure_is_reported_during_runtime_cleanup(
+    tmp_path: Path,
+) -> None:
+    journal = _TerminalFailingJournal(tmp_path / "journal")
+    await journal.create("run-1", {})
+    runtime = ManagedHostProcessRuntime(str(tmp_path))
+    await runtime.start(
+        _python_command("import time; time.sleep(60)"),
+        owner_run_id="run-1",
+        cwd=str(tmp_path),
+        journal=journal,
+    )
+
+    with pytest.raises(ProcessPersistenceError, match="terminal"):
+        await runtime.close()
+
     await journal.close()
 
 

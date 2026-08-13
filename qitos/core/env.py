@@ -215,7 +215,7 @@ class CommandCapability(ABC):
     """Command execution capability contract used by env implementations."""
 
     @abstractmethod
-    async def arun(self, command: str, timeout: int = 30) -> Dict[str, Any]:
+    async def arun(self, command: str, timeout: float = 30) -> Dict[str, Any]:
         """Run one shell command without blocking the owning event loop."""
 
     @abstractmethod
@@ -223,7 +223,7 @@ class CommandCapability(ABC):
         self,
         argv: Sequence[str],
         *,
-        timeout: int = 30,
+        timeout: float = 30,
         cwd: str | None = None,
         stdin: bytes | None = None,
     ) -> Dict[str, Any]:
@@ -312,6 +312,17 @@ class CommandCapability(ABC):
 
         _ = owner_run_id
         raise NotImplementedError("managed background commands are not supported")
+
+    async def arecover(
+        self,
+        *,
+        owner_run_id: str,
+        journal: SessionJournal,
+    ) -> tuple[ProcessSnapshot, ...]:
+        """Restore terminal observations and close interrupted ownership gaps."""
+
+        _ = owner_run_id, journal
+        return ()
 
     async def aclose(self) -> None:
         """Terminate owned live processes and await all runtime Tasks."""

@@ -97,6 +97,7 @@ class _ProcessEntry:
     started_monotonic: float
     journal: SessionJournal | None
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    interaction_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     reader_task: asyncio.Task[None] | None = None
     watcher_task: asyncio.Task[None] | None = None
     status: ProcessStatus = ProcessStatus.RUNNING
@@ -135,7 +136,10 @@ class ManagedHostProcessRuntime:
         self._max_output_bytes = int(max_output_bytes)
         self._terminate_grace_seconds = float(terminate_grace_seconds)
         self._entries: dict[str, _ProcessEntry] = {}
+        self._detached: dict[str, ProcessSnapshot] = {}
+        self._recovered_runs: set[str] = set()
         self._lock = asyncio.Lock()
+        self._recovery_lock = asyncio.Lock()
         self._start_condition = asyncio.Condition(self._lock)
         self._starting = 0
         self._closed = False
@@ -220,18 +224,18 @@ class ManagedHostProcessRuntime:
                 writer_fd=writer_fd,
                 read_transport=read_transport,
             )
-            entry.reader_task = asyncio.create_task(
-                self._read_output(entry, reader),
-                name=f"qitos-process-reader-{handle.process_id}",
-            )
-            entry.watcher_task = asyncio.create_task(
-                self._watch_terminal(entry),
-                name=f"qitos-process-watcher-{handle.process_id}",
-            )
             async with self._lock:
                 if self._closed:
                     raise RuntimeError("managed process runtime closed during spawn")
                 self._entries[handle.process_id] = entry
+                entry.reader_task = asyncio.create_task(
+                    self._read_output(entry, reader),
+                    name=f"qitos-process-reader-{handle.process_id}",
+                )
+                entry.watcher_task = asyncio.create_task(
+                    self._watch_terminal(entry),
+                    name=f"qitos-process-watcher-{handle.process_id}",
+                )
             if journal is not None:
                 try:
                     await journal.append(
@@ -271,7 +275,11 @@ class ManagedHostProcessRuntime:
             raise
 
     async def poll(self, handle: ProcessHandle) -> ProcessSnapshot:
-        return await self._snapshot(await self._lookup(handle), cursor=0)
+        entry, detached = await self._lookup(handle)
+        if detached is not None:
+            return detached
+        assert entry is not None
+        return await self._snapshot(entry, cursor=0)
 
     async def read(
         self,
@@ -282,7 +290,10 @@ class ManagedHostProcessRuntime:
     ) -> ProcessSnapshot:
         if wait_seconds < 0:
             raise ValueError("wait_seconds must be non-negative")
-        entry = await self._lookup(handle)
+        entry, detached = await self._lookup(handle)
+        if detached is not None:
+            return self._read_detached(detached, cursor=cursor)
+        assert entry is not None
         async with entry.condition:
             if (
                 wait_seconds > 0
@@ -299,18 +310,27 @@ class ManagedHostProcessRuntime:
             return self._snapshot_locked(entry, cursor=cursor)
 
     async def write(self, handle: ProcessHandle, data: str) -> ProcessSnapshot:
-        entry = await self._lookup(handle)
+        entry, detached = await self._lookup(handle)
+        if detached is not None:
+            raise RuntimeError("process stdin is closed")
+        assert entry is not None
         if not isinstance(data, str):
             raise TypeError("process input must be a string")
-        async with entry.condition:
-            if entry.status is not ProcessStatus.RUNNING or entry.termination_requested:
-                raise RuntimeError("process stdin is closed")
-            if entry.tty:
-                if entry.writer_fd is None:
-                    raise RuntimeError("process terminal input is unavailable")
-                await asyncio.to_thread(os.write, entry.writer_fd, data.encode("utf-8"))
-            else:
+        async with entry.interaction_lock:
+            async with entry.condition:
+                if (
+                    entry.status is not ProcessStatus.RUNNING
+                    or entry.termination_requested
+                ):
+                    raise RuntimeError("process stdin is closed")
+                writer_fd = entry.writer_fd
                 stdin = entry.process.stdin
+                tty = entry.tty
+            if tty:
+                if writer_fd is None:
+                    raise RuntimeError("process terminal input is unavailable")
+                await self._write_fd(writer_fd, data.encode("utf-8"))
+            else:
                 if stdin is None or stdin.is_closing():
                     raise RuntimeError("process stdin is closed")
                 stdin.write(data.encode("utf-8"))
@@ -323,7 +343,10 @@ class ManagedHostProcessRuntime:
         *,
         deadline_monotonic: float | None = None,
     ) -> ProcessSnapshot:
-        entry = await self._lookup(handle)
+        entry, detached = await self._lookup(handle)
+        if detached is not None:
+            return detached
+        assert entry is not None
         watcher = entry.watcher_task
         if watcher is not None and not watcher.done():
             if deadline_monotonic is None:
@@ -340,7 +363,10 @@ class ManagedHostProcessRuntime:
         return await self._snapshot(entry, cursor=0)
 
     async def terminate(self, handle: ProcessHandle) -> ProcessSnapshot:
-        entry = await self._lookup(handle)
+        entry, detached = await self._lookup(handle)
+        if detached is not None:
+            return detached
+        assert entry is not None
         await self._terminate_entry(entry)
         self._raise_journal_error(entry)
         return await self._snapshot(entry, cursor=0)
@@ -356,13 +382,88 @@ class ManagedHostProcessRuntime:
                 for entry in self._entries.values()
                 if owner_run_id is None or entry.handle.owner_run_id == owner_run_id
             ]
-        entries.sort(key=lambda entry: entry.started_monotonic)
-        return tuple(
-            [
-                await self._snapshot(entry, cursor=entry.output.total_bytes)
-                for entry in entries
+            detached = [
+                snapshot
+                for snapshot in self._detached.values()
+                if owner_run_id is None
+                or snapshot.handle.owner_run_id == owner_run_id
             ]
-        )
+        snapshots = [
+            await self._snapshot(entry, cursor=entry.output.total_bytes)
+            for entry in entries
+        ]
+        snapshots.extend(detached)
+        snapshots.sort(key=lambda snapshot: snapshot.started_at)
+        return tuple(snapshots)
+
+    async def recover(
+        self,
+        *,
+        owner_run_id: str,
+        journal: SessionJournal,
+    ) -> tuple[ProcessSnapshot, ...]:
+        """Recover this Run without reattaching or replaying a process."""
+
+        if not isinstance(owner_run_id, str) or not owner_run_id.strip():
+            raise ValueError("owner_run_id must be a non-empty string")
+        async with self._recovery_lock:
+            if owner_run_id in self._recovered_runs:
+                return await self.list(owner_run_id=owner_run_id)
+            records = await journal.replay()
+            started: dict[str, dict[str, Any]] = {}
+            terminal: dict[str, ProcessSnapshot] = {}
+            try:
+                for record in records:
+                    if record.run_id != owner_run_id:
+                        continue
+                    if record.type is JournalRecordType.PROCESS_STARTED:
+                        raw_handle = record.payload.get("handle")
+                        if not isinstance(raw_handle, Mapping):
+                            raise ValueError("process.started handle is invalid")
+                        handle = ProcessHandle.from_dict(raw_handle)
+                        if handle.owner_run_id != owner_run_id:
+                            raise ValueError("process.started owner is inconsistent")
+                        started[handle.process_id] = dict(record.payload)
+                    elif record.type is JournalRecordType.PROCESS_TERMINAL:
+                        snapshot = ProcessSnapshot.from_dict(record.payload)
+                        if snapshot.handle.owner_run_id != owner_run_id:
+                            raise ValueError("process.terminal owner is inconsistent")
+                        if not snapshot.terminal:
+                            raise ValueError("process.terminal contains a live process")
+                        terminal[snapshot.handle.process_id] = snapshot
+            except (TypeError, ValueError) as exc:
+                raise ProcessPersistenceError(
+                    "managed process journal records are invalid"
+                ) from exc
+
+            recovered = dict(terminal)
+            for process_id, payload in started.items():
+                if process_id in terminal:
+                    continue
+                snapshot = await self._lost_snapshot(payload)
+                try:
+                    await journal.append(
+                        JournalRecordType.PROCESS_TERMINAL,
+                        snapshot.to_dict(),
+                        record_id=(
+                            f"{owner_run_id}:process:{process_id}:terminal"
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    raise ProcessPersistenceError(
+                        "failed to persist lost process terminal record"
+                    ) from exc
+                recovered[process_id] = snapshot
+
+            async with self._lock:
+                for process_id, snapshot in recovered.items():
+                    if process_id not in self._entries:
+                        self._detached[process_id] = snapshot
+                self._prune_detached_locked()
+                self._recovered_runs.add(owner_run_id)
+            return await self.list(owner_run_id=owner_run_id)
 
     async def close(self) -> None:
         async with self._start_condition:
@@ -428,6 +529,7 @@ class ManagedHostProcessRuntime:
 
         master_fd, slave_fd = pty.openpty()
         writer_fd = os.dup(master_fd)
+        os.set_blocking(writer_fd, False)
         try:
             shell = os.environ.get("SHELL") or "/bin/sh"
             process = await asyncio.create_subprocess_exec(
@@ -453,6 +555,27 @@ class ManagedHostProcessRuntime:
             pipe,
         )
         return process, reader, writer_fd, transport
+
+    @staticmethod
+    async def _write_fd(writer_fd: int, content: bytes) -> None:
+        loop = asyncio.get_running_loop()
+        offset = 0
+        while offset < len(content):
+            try:
+                offset += os.write(writer_fd, content[offset:])
+                continue
+            except BlockingIOError:
+                writable = loop.create_future()
+
+                def _ready() -> None:
+                    if not writable.done():
+                        writable.set_result(None)
+
+                loop.add_writer(writer_fd, _ready)
+                try:
+                    await writable
+                finally:
+                    loop.remove_writer(writer_fd)
 
     async def _read_output(
         self,
@@ -576,14 +699,139 @@ class ManagedHostProcessRuntime:
         except ProcessLookupError:
             pass
 
-    async def _lookup(self, handle: ProcessHandle) -> _ProcessEntry:
+    async def _lookup(
+        self,
+        handle: ProcessHandle,
+    ) -> tuple[_ProcessEntry | None, ProcessSnapshot | None]:
         if not isinstance(handle, ProcessHandle):
             raise TypeError("handle must be a ProcessHandle")
         async with self._lock:
             entry = self._entries.get(handle.process_id)
-        if entry is None or entry.handle != handle:
-            raise ProcessNotFoundError(f"unknown process handle: {handle.process_id}")
-        return entry
+            detached = self._detached.get(handle.process_id)
+        if entry is not None and entry.handle == handle:
+            return entry, None
+        if detached is not None and detached.handle == handle:
+            return None, detached
+        raise ProcessNotFoundError(f"unknown process handle: {handle.process_id}")
+
+    async def _lost_snapshot(self, payload: Mapping[str, Any]) -> ProcessSnapshot:
+        required = {
+            "handle",
+            "command",
+            "cwd",
+            "pid",
+            "tty",
+            "started_at",
+            "log_path",
+        }
+        if set(payload) != required:
+            raise ProcessPersistenceError("process.started fields are invalid")
+        raw_handle = payload.get("handle")
+        if not isinstance(raw_handle, Mapping):
+            raise ProcessPersistenceError("process.started handle is invalid")
+        handle = ProcessHandle.from_dict(raw_handle)
+        for name in ("command", "cwd", "started_at", "log_path"):
+            if not isinstance(payload[name], str) or not payload[name]:
+                raise ProcessPersistenceError(f"process.started {name} is invalid")
+        if not isinstance(payload["tty"], bool):
+            raise ProcessPersistenceError("process.started tty is invalid")
+        pid = payload["pid"]
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            raise ProcessPersistenceError("process.started pid is invalid")
+        relative_log = payload["log_path"]
+        output = await asyncio.to_thread(self._read_log_tail, relative_log)
+        return ProcessSnapshot(
+            handle=handle,
+            status=ProcessStatus.LOST,
+            command=payload["command"],
+            cwd=payload["cwd"],
+            pid=None,
+            tty=payload["tty"],
+            started_at=payload["started_at"],
+            ended_at=_utc_now(),
+            exit_code=None,
+            output=output,
+            error="process ownership was lost before resume",
+        )
+
+    def _read_log_tail(self, relative_log: str) -> ProcessOutput:
+        path = (self.workspace_root / relative_log).resolve()
+        try:
+            path.relative_to(self.workspace_root)
+        except ValueError as exc:
+            raise ProcessPersistenceError("process log path escapes workspace") from exc
+        if not relative_log or not path.exists():
+            return ProcessOutput(
+                content="",
+                cursor=0,
+                next_cursor=0,
+                total_bytes=0,
+                omitted_bytes=0,
+                truncated=False,
+                log_path=relative_log,
+            )
+        total_bytes = path.stat().st_size
+        retained_from = max(0, total_bytes - self._max_output_bytes)
+        with path.open("rb") as stream:
+            stream.seek(retained_from)
+            content = stream.read()
+        skipped_for_utf8 = 0
+        while content and content[0] & 0xC0 == 0x80:
+            content = content[1:]
+            skipped_for_utf8 += 1
+        omitted = retained_from + skipped_for_utf8
+        return ProcessOutput(
+            content=content.decode("utf-8", errors="replace"),
+            cursor=0,
+            next_cursor=total_bytes,
+            total_bytes=total_bytes,
+            omitted_bytes=omitted,
+            truncated=omitted > 0,
+            log_path=relative_log,
+        )
+
+    @staticmethod
+    def _read_detached(
+        snapshot: ProcessSnapshot,
+        *,
+        cursor: int,
+    ) -> ProcessSnapshot:
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise ValueError("cursor must be a non-negative integer")
+        encoded = snapshot.output.content.encode("utf-8")
+        retained_from = snapshot.output.next_cursor - len(encoded)
+        effective_cursor = min(
+            max(cursor, retained_from),
+            snapshot.output.next_cursor,
+        )
+        content = encoded[effective_cursor - retained_from :]
+        skipped_for_utf8 = 0
+        while content and content[0] & 0xC0 == 0x80:
+            content = content[1:]
+            effective_cursor += 1
+            skipped_for_utf8 += 1
+        omitted = max(0, retained_from - cursor) + skipped_for_utf8
+        return ProcessSnapshot(
+            handle=snapshot.handle,
+            status=snapshot.status,
+            command=snapshot.command,
+            cwd=snapshot.cwd,
+            pid=snapshot.pid,
+            tty=snapshot.tty,
+            started_at=snapshot.started_at,
+            ended_at=snapshot.ended_at,
+            exit_code=snapshot.exit_code,
+            output=ProcessOutput(
+                content=content.decode("utf-8", errors="replace"),
+                cursor=cursor,
+                next_cursor=snapshot.output.next_cursor,
+                total_bytes=snapshot.output.total_bytes,
+                omitted_bytes=omitted,
+                truncated=omitted > 0,
+                log_path=snapshot.output.log_path,
+            ),
+            error=snapshot.error,
+        )
 
     async def _snapshot(
         self,
@@ -622,7 +870,8 @@ class ManagedHostProcessRuntime:
             ) from entry.journal_error
 
     def _prune_finished_locked(self) -> None:
-        if len(self._entries) < self._max_tracked:
+        self._prune_detached_locked(reserve=1)
+        if len(self._entries) + len(self._detached) < self._max_tracked:
             return
         finished = sorted(
             (
@@ -632,9 +881,22 @@ class ManagedHostProcessRuntime:
             ),
             key=lambda entry: entry.started_monotonic,
         )
-        while len(self._entries) >= self._max_tracked and finished:
+        while (
+            len(self._entries) + len(self._detached) >= self._max_tracked
+            and finished
+        ):
             entry = finished.pop(0)
             self._entries.pop(entry.handle.process_id, None)
+
+    def _prune_detached_locked(self, *, reserve: int = 0) -> None:
+        limit = max(0, self._max_tracked - reserve)
+        ordered = sorted(
+            self._detached.values(),
+            key=lambda snapshot: snapshot.started_at,
+        )
+        while len(self._entries) + len(self._detached) > limit and ordered:
+            snapshot = ordered.pop(0)
+            self._detached.pop(snapshot.handle.process_id, None)
 
 
 __all__ = ["ManagedHostProcessRuntime"]

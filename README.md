@@ -22,7 +22,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   supervisor with opaque typed handles, incremental bounded output, complete UTF-8
   logs, stdin/PTY interaction, process-group cleanup, and exactly one terminal state.
   Runs await every reader and watcher during shutdown, while Journal-enabled starts
-  persist `process.started` and `process.terminal` around the live lifecycle.
+  persist `process.started` and `process.terminal` around the live lifecycle. The shell
+  profile exposes list/read/write/wait/terminate controls; resume marks interrupted
+  ownership as `lost`, and forks do not inherit live handles.
 - **Discriminated model stream events**: every Provider event now declares whether it
   is text, reasoning, a ToolCall delta, a native output item, usage, lifecycle,
   successful completion, or failure. The ambiguous `ModelStreamChunk` field bag is

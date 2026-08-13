@@ -40,6 +40,9 @@ No reference project is a runtime dependency and no source is copied.
 
 ## Implementation slices
 
+The QitOS kernel and shell slices below are complete on the managed-process feature
+branch. Product adoption remains a separate PentestAgent commit boundary.
+
 ### 1. Typed process kernel
 
 - Add immutable process handle, status, output, and snapshot types.

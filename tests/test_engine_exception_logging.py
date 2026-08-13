@@ -86,7 +86,7 @@ def test_env_runtime_logger_exists():
 
 @pytest.mark.asyncio
 async def test_env_teardown_failure_logs_warning(caplog):
-    """Env teardown failure logs a warning."""
+    """Env teardown failure logs and remains observable to the Run owner."""
     from qitos.engine._env_runtime import _EnvRuntime
 
     engine_mock = MagicMock()
@@ -95,7 +95,8 @@ async def test_env_teardown_failure_logs_warning(caplog):
     engine_mock.env = env_mock
     rt = _EnvRuntime(engine=engine_mock)
     with caplog.at_level(logging.WARNING, logger="qitos.engine._env_runtime"):
-        await rt.teardown_env()
+        with pytest.raises(RuntimeError, match="teardown crashed"):
+            await rt.teardown_env()
     assert any("teardown failed" in r.message.lower() for r in caplog.records)
 
 

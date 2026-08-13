@@ -485,7 +485,11 @@ Profiles expose one exact lowercase tool surface. `glob` and `grep` use fixed-ar
 `run_command` executes a command after the normal tool-admission boundary. It does not
 repeat permission classification inside the handler or expose model-controlled
 `read_only` and `allow_destructive` switches. Applications that need command policy
-apply it through the executor before invoking the tool.
+apply it through the executor before invoking the tool. The `shell` and `full` profiles
+also expose `process_list`, `process_read`, `process_write`, `process_wait`, and
+`process_terminate`. These tools share one environment capability, bind opaque ids to
+the active Run, preserve full logs outside the bounded model view, and respect the
+current absolute Tool deadline.
 
 `process_env` optionally supplies one complete application-owned environment snapshot
 for local shell, fixed-argv, and background subprocesses. Leave it unset to preserve

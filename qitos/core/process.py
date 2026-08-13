@@ -7,6 +7,20 @@ from enum import Enum
 from typing import Any, Mapping
 
 
+def _non_negative_int(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _optional_int(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer or null")
+    return value
+
+
 class ProcessStatus(str, Enum):
     """Lifecycle states observable through the managed process API."""
 
@@ -89,6 +103,37 @@ class ProcessOutput:
             "log_path": self.log_path,
         }
 
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ProcessOutput":
+        required = {
+            "content",
+            "cursor",
+            "next_cursor",
+            "total_bytes",
+            "omitted_bytes",
+            "truncated",
+            "log_path",
+        }
+        if set(value) != required:
+            raise ValueError("process output fields are invalid")
+        if not isinstance(value["content"], str):
+            raise ValueError("process output content is invalid")
+        if not isinstance(value["truncated"], bool):
+            raise ValueError("process output truncated flag is invalid")
+        if not isinstance(value["log_path"], str):
+            raise ValueError("process output log_path is invalid")
+        return cls(
+            content=value["content"],
+            cursor=_non_negative_int(value["cursor"], "cursor"),
+            next_cursor=_non_negative_int(value["next_cursor"], "next_cursor"),
+            total_bytes=_non_negative_int(value["total_bytes"], "total_bytes"),
+            omitted_bytes=_non_negative_int(
+                value["omitted_bytes"], "omitted_bytes"
+            ),
+            truncated=value["truncated"],
+            log_path=value["log_path"],
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class ProcessSnapshot:
@@ -135,6 +180,65 @@ class ProcessSnapshot:
             "output": self.output.to_dict(),
             "error": self.error,
         }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "ProcessSnapshot":
+        required = {
+            "handle",
+            "process_id",
+            "owner_run_id",
+            "status",
+            "terminal",
+            "command",
+            "cwd",
+            "pid",
+            "tty",
+            "started_at",
+            "ended_at",
+            "exit_code",
+            "output",
+            "error",
+        }
+        if set(value) != required:
+            raise ValueError("process snapshot fields are invalid")
+        handle_value = value["handle"]
+        output_value = value["output"]
+        if not isinstance(handle_value, Mapping):
+            raise ValueError("process snapshot handle is invalid")
+        if not isinstance(output_value, Mapping):
+            raise ValueError("process snapshot output is invalid")
+        handle = ProcessHandle.from_dict(handle_value)
+        if value["process_id"] != handle.process_id:
+            raise ValueError("process snapshot process_id is inconsistent")
+        if value["owner_run_id"] != handle.owner_run_id:
+            raise ValueError("process snapshot owner_run_id is inconsistent")
+        for name in ("terminal", "tty"):
+            if not isinstance(value[name], bool):
+                raise ValueError(f"process snapshot {name} flag is invalid")
+        for name in ("command", "cwd", "started_at"):
+            if not isinstance(value[name], str) or not value[name]:
+                raise ValueError(f"process snapshot {name} is invalid")
+        if value["ended_at"] is not None and not isinstance(value["ended_at"], str):
+            raise ValueError("process snapshot ended_at is invalid")
+        if value["error"] is not None and not isinstance(value["error"], str):
+            raise ValueError("process snapshot error is invalid")
+        status = ProcessStatus(str(value["status"]))
+        snapshot = cls(
+            handle=handle,
+            status=status,
+            command=value["command"],
+            cwd=value["cwd"],
+            pid=_optional_int(value["pid"], "pid"),
+            tty=value["tty"],
+            started_at=value["started_at"],
+            ended_at=value["ended_at"],
+            exit_code=_optional_int(value["exit_code"], "exit_code"),
+            output=ProcessOutput.from_dict(output_value),
+            error=value["error"],
+        )
+        if value["terminal"] != snapshot.terminal:
+            raise ValueError("process snapshot terminal flag is inconsistent")
+        return snapshot
 
 
 __all__ = [

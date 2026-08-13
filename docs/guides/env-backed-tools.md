@@ -68,7 +68,18 @@ When a Session Journal is supplied to `astart()`, QitOS writes
 `process.started` only after the OS process exists and writes one terminal record after
 output collection settles. A failed started-record write terminates the process and
 returns no usable handle. `Engine.arun()` awaits environment teardown before closing
-the Journal, so no process reader or watcher remains detached from the Run.
+the Journal, so no process reader or watcher remains detached from the Run. On resume,
+`arecover()` converts a start without a terminal record into an immutable `lost`
+snapshot; it never reattaches to or replays the command. Fork Journal records are
+historical context only and grant no process ownership to the child Run.
+
+Register `CodingToolSet(profile="shell")` to expose the shared managed lifecycle to a
+model. `run_command(..., run_in_background=True)` returns a process id, and
+`process_list`, `process_read`, `process_write`, `process_wait`, and
+`process_terminate` operate only on handles owned by the active Run. Reads and waits
+honor the current Tool deadline. A backend such as Docker that has not implemented the
+managed async contract can still run foreground commands, but reports background mode
+as unavailable instead of creating an untracked process.
 
 Host-backed command tools inherit the current process environment by default. An
 application that owns a stricter execution boundary can instead pass one complete,

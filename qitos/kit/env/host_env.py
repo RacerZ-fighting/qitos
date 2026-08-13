@@ -238,7 +238,7 @@ class HostCommandCapability(CommandCapability):
         self._env = dict(env) if env is not None else None
         self._managed = ManagedHostProcessRuntime(self.cwd, env=self._env)
 
-    async def arun(self, command: str, timeout: int = 30) -> Dict[str, Any]:
+    async def arun(self, command: str, timeout: float = 30) -> Dict[str, Any]:
         if not command or not command.strip():
             return {"status": "error", "error": "empty command"}
         try:
@@ -277,7 +277,7 @@ class HostCommandCapability(CommandCapability):
         self,
         argv: Sequence[str],
         *,
-        timeout: int = 30,
+        timeout: float = 30,
         cwd: str | None = None,
         stdin: bytes | None = None,
     ) -> Dict[str, Any]:
@@ -436,6 +436,17 @@ class HostCommandCapability(CommandCapability):
         owner_run_id: str | None = None,
     ) -> tuple[ProcessSnapshot, ...]:
         return await self._managed.list(owner_run_id=owner_run_id)
+
+    async def arecover(
+        self,
+        *,
+        owner_run_id: str,
+        journal: SessionJournal,
+    ) -> tuple[ProcessSnapshot, ...]:
+        return await self._managed.recover(
+            owner_run_id=owner_run_id,
+            journal=journal,
+        )
 
     async def aclose(self) -> None:
         await self._managed.close()

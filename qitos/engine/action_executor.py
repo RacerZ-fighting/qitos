@@ -1407,7 +1407,13 @@ class ActionExecutor:
             "emit_progress": _emit_progress,
             "record_artifact": _record_artifact,
             "delegate_depth": self.delegate_depth,
+            "run_id": active_run_id,
             "parent_run_id": active_run_id,
+            "journal": (
+                getattr(self._engine, "journal", None)
+                if self._engine is not None
+                else None
+            ),
             "max_children": max_children,
             "post_runtime_event": _post_runtime_event,
             "record_runtime_event": _record_runtime_event,
