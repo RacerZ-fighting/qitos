@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
+import time
 from collections.abc import AsyncIterator
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -18,6 +20,7 @@ from qitos.models import (
     infer_context_window,
 )
 from qitos.models.base import ModelStreamChunk
+from qitos.models.anthropic import _AnthropicEventStream
 
 
 class _AsyncListStream(AsyncIterator[Any]):
@@ -33,6 +36,14 @@ class _AsyncListStream(AsyncIterator[Any]):
             return next(self._items)
         except StopIteration as exc:
             raise StopAsyncIteration from exc
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _AsyncCloser:
+    def __init__(self) -> None:
+        self.closed = False
 
     async def aclose(self) -> None:
         self.closed = True
@@ -196,6 +207,160 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
 
 
 @pytest.mark.asyncio
+async def test_anthropic_interleaved_tool_blocks_keep_arguments_separate() -> None:
+    marker = time.monotonic_ns()
+    expected = {
+        "call-left": {"value": f"left-{marker}"},
+        "call-right": {"value": f"right-{marker}"},
+    }
+    specs = [
+        (index, call_id, json.dumps(arguments, separators=(",", ":")))
+        for index, (call_id, arguments) in enumerate(expected.items(), start=2)
+    ]
+    payload: list[dict[str, Any]] = []
+    for index, call_id, _ in specs:
+        payload.append(
+            {
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": "lookup",
+                    "input": {},
+                },
+            }
+        )
+    fragments = {
+        index: (arguments[: len(arguments) // 2], arguments[len(arguments) // 2 :])
+        for index, _, arguments in specs
+    }
+    for fragment_index in range(2):
+        for index, _, _ in reversed(specs):
+            payload.append(
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": fragments[index][fragment_index],
+                    },
+                }
+            )
+    for index, _, _ in specs:
+        payload.append({"type": "content_block_stop", "index": index})
+    payload.extend(
+        [
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+            {"type": "message_stop"},
+        ]
+    )
+    events = _AsyncListStream(payload)
+    client = _AsyncCloser()
+    stream = _AnthropicEventStream(
+        events,
+        client,
+        provider="anthropic",
+        model="claude-test",
+    )
+
+    chunks = [chunk async for chunk in stream]
+    await stream.aclose()
+
+    terminal = chunks[-1]
+    assert terminal.tool_calls is not None
+    actual = {
+        call["id"]: json.loads(call["function"]["arguments"])
+        for call in terminal.tool_calls
+    }
+    assert actual == expected
+    assert terminal.event_metadata["invalid_tool_calls"] == []
+    assert events.closed is True
+    assert client.closed is True
+
+
+@pytest.mark.parametrize(
+    ("close_block", "arguments", "stop_reason", "expected_code"),
+    [
+        (False, '{"value":', "max_tokens", "tool_call_not_completed"),
+        (True, '{"value":', "tool_use", "tool_call_arguments_invalid"),
+        (
+            True,
+            '{"value":"complete"}',
+            "max_tokens",
+            "tool_call_unexpected_stop_reason",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_anthropic_invalid_tool_blocks_never_become_calls_or_replay(
+    close_block: bool,
+    arguments: str,
+    stop_reason: str,
+    expected_code: str,
+) -> None:
+    block_index = 3
+    call_id = f"call-{time.monotonic_ns()}"
+    payload: list[dict[str, Any]] = [
+        {
+            "type": "content_block_start",
+            "index": block_index,
+            "content_block": {
+                "type": "tool_use",
+                "id": call_id,
+                "name": "lookup",
+                "input": {},
+            },
+        },
+        {
+            "type": "content_block_delta",
+            "index": block_index,
+            "delta": {"type": "input_json_delta", "partial_json": arguments},
+        },
+    ]
+    if close_block:
+        payload.append({"type": "content_block_stop", "index": block_index})
+    payload.extend(
+        [
+            {"type": "message_delta", "delta": {"stop_reason": stop_reason}},
+            {"type": "message_stop"},
+        ]
+    )
+    stream = _AnthropicEventStream(
+        _AsyncListStream(payload),
+        _AsyncCloser(),
+        provider="anthropic",
+        model="claude-test",
+    )
+
+    chunks = [chunk async for chunk in stream]
+
+    terminal = chunks[-1]
+    assert terminal.tool_calls is None
+    invalid = terminal.event_metadata["invalid_tool_calls"]
+    assert invalid[0]["call_id"] == call_id
+    assert invalid[0]["code"] == expected_code
+    assert invalid[0]["arguments_chars"] == len(arguments)
+    assert terminal.native_items is None
+
+    model = AnthropicModel(api_key="test-key", model="claude-test")
+    replay = model._anthropic_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "recover",
+                "native_items": terminal.native_items,
+            }
+        ]
+    )
+    assert all(
+        block.get("type") != "tool_use"
+        for message in replay
+        for block in message["content"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_anthropic_request_defaults_reach_payload_and_allow_call_overrides(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -322,9 +487,7 @@ async def test_anthropic_cancellation_closes_stream_and_client_without_retry(
         model="claude-test",
         max_attempts=3,
     )
-    task = asyncio.create_task(
-        _collect(model, [{"role": "user", "content": "answer"}])
-    )
+    task = asyncio.create_task(_collect(model, [{"role": "user", "content": "answer"}]))
     await entered.wait()
     task.cancel()
 

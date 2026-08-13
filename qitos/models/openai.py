@@ -119,20 +119,42 @@ class ChatStreamAccumulator:
                 attempts=1,
                 retryable=True,
             )
-        tool_calls = [
+        complete_tool_calls = [
             item
             for item in self._tool_calls
             if item.get("id") and item.get("function", {}).get("name")
         ]
+        incomplete_tool_calls = [
+            {
+                "index": index,
+                "call_id": item.get("id"),
+                "name": item.get("function", {}).get("name"),
+                "code": "tool_call_incomplete",
+            }
+            for index, item in enumerate(self._tool_calls)
+            if item not in complete_tool_calls
+        ]
+        if self._finish_reason not in {"tool_calls", "function_call"}:
+            incomplete_tool_calls.extend(
+                {
+                    "index": index,
+                    "call_id": item.get("id"),
+                    "name": item.get("function", {}).get("name"),
+                    "code": "tool_call_unexpected_finish_reason",
+                }
+                for index, item in enumerate(complete_tool_calls)
+            )
+            complete_tool_calls = []
         return ModelStreamChunk(
             done=True,
             usage=self._usage,
-            tool_calls=tool_calls or None,
+            tool_calls=complete_tool_calls or None,
             event_type="chat.completion.completed",
             event_metadata={
                 "provider": self._provider,
                 "model": self._model,
                 "api_mode": "chat_completions",
+                "invalid_tool_calls": incomplete_tool_calls,
             },
             finish_reason=self._finish_reason,
         )

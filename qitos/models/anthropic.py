@@ -144,6 +144,8 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
         self._model = model
         self._blocks: Dict[int, Dict[str, Any]] = {}
         self._input_json: Dict[int, str] = {}
+        self._stopped_blocks: set[int] = set()
+        self._tool_errors: Dict[int, str] = {}
         self._usage: Dict[str, Any] = {}
         self._message_id: str | None = None
         self._finish_reason: str | None = None
@@ -239,7 +241,8 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
                 continue
 
             if event_type == "content_block_stop":
-                self._finish_block(index)
+                self._stopped_blocks.add(index)
+                self._finish_block(index, completed=True)
                 continue
 
             if event_type == "message_delta":
@@ -252,7 +255,10 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
 
             if event_type == "message_stop":
                 for block_index in list(self._blocks):
-                    self._finish_block(block_index)
+                    self._finish_block(
+                        block_index,
+                        completed=block_index in self._stopped_blocks,
+                    )
                 self._finished = True
                 return self._terminal_chunk()
 
@@ -263,20 +269,30 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
                     retryable=False,
                 )
 
-    def _finish_block(self, index: int) -> None:
+    def _finish_block(self, index: int, *, completed: bool) -> None:
         block = self._blocks.get(index)
         if not isinstance(block, dict) or block.get("type") != "tool_use":
             return
+        if index in self._tool_errors:
+            return
         raw_arguments = self._input_json.get(index, "")
+        if not completed:
+            self._tool_errors[index] = "tool_call_not_completed"
+            return
         if not raw_arguments:
-            block.setdefault("input", {})
+            existing = block.setdefault("input", {})
+            if not isinstance(existing, dict):
+                self._tool_errors[index] = "tool_call_arguments_invalid"
             return
         try:
             parsed = json.loads(raw_arguments)
         except json.JSONDecodeError:
-            block["input"] = {"_raw": raw_arguments}
+            self._tool_errors[index] = "tool_call_arguments_invalid"
         else:
-            block["input"] = parsed
+            if not isinstance(parsed, dict):
+                self._tool_errors[index] = "tool_call_arguments_invalid"
+            else:
+                block["input"] = parsed
 
     def _record_usage(self, usage: Any) -> None:
         if usage is None:
@@ -308,15 +324,33 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
         }
 
     def _terminal_chunk(self) -> ModelStreamChunk:
-        native_items = [self._blocks[index] for index in sorted(self._blocks)]
+        native_items: List[Dict[str, Any]] = []
         tool_calls: List[Dict[str, Any]] = []
-        for block in native_items:
+        invalid_tool_calls: List[Dict[str, Any]] = []
+        for index in sorted(self._blocks):
+            block = self._blocks[index]
             if block.get("type") != "tool_use":
+                native_items.append(block)
                 continue
             call_id = str(block.get("id") or "").strip()
             name = str(block.get("name") or "").strip()
+            protocol_error = self._tool_errors.get(index, "")
+            if not protocol_error and self._finish_reason != "tool_use":
+                protocol_error = "tool_call_unexpected_stop_reason"
             if not call_id or not name:
+                protocol_error = protocol_error or "tool_call_invalid"
+            if protocol_error:
+                invalid_tool_calls.append(
+                    {
+                        "index": index,
+                        "call_id": call_id or None,
+                        "name": name or None,
+                        "code": protocol_error,
+                        "arguments_chars": len(self._input_json.get(index, "")),
+                    }
+                )
                 continue
+            native_items.append(block)
             tool_calls.append(
                 {
                     "id": call_id,
@@ -342,6 +376,7 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
                 "model": self._model,
                 "api_mode": "anthropic_messages",
                 "id": self._message_id,
+                "invalid_tool_calls": invalid_tool_calls,
             },
             finish_reason=self._finish_reason,
         )

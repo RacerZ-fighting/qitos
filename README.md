@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Complete-before-execute tool calls**: compatible Chat and Anthropic Messages now
+  publish native calls only after their protocol-specific terminal proves completion.
+  Output-limit, unclosed, or malformed calls remain diagnostic and never reach a tool
+  handler or provider replay.
 - **Complete Responses stream lifecycle**: Responses adapters retain lifecycle and
   item events, refusals, terminal-only text/reasoning, and independently interleaved
   function arguments. Incomplete or contradictory terminal responses cannot become
