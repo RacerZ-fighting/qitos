@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field as dc_field
+import math
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -63,13 +64,39 @@ class TaskResource:
     metadata: Dict[str, Any] = dc_field(default_factory=dict)
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class TaskBudget:
     """Task-level budget contract."""
 
     max_steps: Optional[int] = None
     max_runtime_seconds: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_cost_usd: Optional[float] = None
+    max_tool_concurrency: Optional[int] = None
+    max_children: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "max_steps",
+            "max_tokens",
+            "max_tool_concurrency",
+            "max_children",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer or None")
+            if value <= 0:
+                raise ValueError(f"{name} must be positive or None")
+        for name in ("max_runtime_seconds", "max_cost_usd"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TypeError(f"{name} must be a number or None")
+            if not math.isfinite(float(value)) or float(value) <= 0:
+                raise ValueError(f"{name} must be positive or None")
 
 
 @dataclass

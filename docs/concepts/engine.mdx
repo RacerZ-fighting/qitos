@@ -14,16 +14,32 @@ description: "Engine is the execution kernel that owns the agent loop: it calls 
 Each step follows a fixed sequence:
 
 ```
-prepare → decide → act → reduce → critics → check_stop → trace
+safe-point input → capture turn → decide → act → reduce → critics → check_stop → commit
 ```
 
-1. **prepare** — `agent.prepare(state)` formats state into the model-ready prompt text.
-2. **decide** — `agent.decide(state, observation)` is checked first; if it returns `None`, the Engine calls the LLM via the configured parser.
-3. **act** — Tool calls in the decision's `actions` list are executed against the `ToolRegistry`.
-4. **reduce** — `agent.reduce(state, observation, decision)` updates state with the new observation.
-5. **critics** — Any registered `Critic` instances (post-step evaluators that can approve, stop, or retry the step) evaluate the step; they can trigger a stop or retry.
-6. **check_stop** — Budget exhaustion, `FinalResultCriteria`, `agent.should_stop()`, and any custom `StopCriteria` are evaluated.
-7. **trace** — The step record and events are written to the `TraceWriter`.
+1. **safe-point input** — queued runtime events are projected before the next model
+   transaction, never in the middle of a turn.
+2. **capture turn** — Engine creates an immutable `TurnSnapshot` containing the exact
+   model, protocol, complete History view, Tool exposure, runtime capabilities,
+   deadline, pricing, and remaining budgets shared by model projection and dispatch.
+3. **prepare** — `agent.prepare_turn(state, observation, turn)` formats state into the
+   model-ready prompt text. Its default delegates to `prepare(state)`.
+4. **decide** — `agent.decide(state, observation)` is checked first; if it returns
+   `None`, the Engine calls the async Provider path.
+5. **act** — Tool calls are admitted and awaited through the frozen Tool exposure.
+   Explicitly concurrency-safe calls may overlap; terminal results commit in input order.
+6. **reduce** — `agent.reduce(state, observation, decision)` updates state with the new observation.
+7. **critics** — Optional post-step evaluators can stop or request another turn.
+8. **check_stop** — Completion policy, budgets, `agent.should_stop()`, and custom criteria are evaluated.
+9. **commit** — Journal state, trace records, and safe snapshots advance only after the
+   complete transaction is ready.
+
+`Engine.arun()` and `Engine.astep()` both delegate this sequence to the same turn
+transaction. The outer Engine owns Run setup, safe-point admission, budget/cancellation
+checks, and cleanup; it does not maintain a second step implementation. Provider
+transport and request projection remain in the model runtime, while response-to-
+`Decision` parsing is a composed decision runtime. Critics and handoff are optional
+control policies around the transaction rather than alternate Agent loops.
 
 ## Constructor
 
@@ -45,7 +61,9 @@ engine = Engine(
 | Parameter          | Type                        | Description                                                                 |
 | ------------------ | --------------------------- | --------------------------------------------------------------------------- |
 | `agent`            | `AgentModule`               | **Required.** The policy module to execute.                                 |
-| `budget`           | `RuntimeBudget \| None`     | Step/time/token limits. Defaults to `RuntimeBudget(max_steps=10)`.          |
+| `budget`           | `RuntimeBudget \| None`     | Step/time/token/cost/Tool/Child limits. Defaults to `RuntimeBudget(max_steps=10)`. |
+| `model_pricing`    | `ModelPricing \| None`      | Explicit USD-per-million prices required when a cost budget is configured. |
+| `journal`          | `SessionJournal \| None`    | Canonical per-Run transaction journal; mutually exclusive with checkpoints. |
 | `parser`           | `Parser \| None`            | Parses raw model output into a `Decision`. Must match your prompt format.   |
 | `critics`          | `list[Critic] \| None`      | Post-step evaluators that can stop or retry a step.                         |
 | `stop_criteria`    | `list[StopCriteria] \| None`| Stop conditions. Defaults to `[FinalResultCriteria()]`.                     |
@@ -69,7 +87,7 @@ state:
 ```python
 from qitos import RuntimeInput
 
-accepted = engine.post_runtime_event(
+accepted = await engine.apost_runtime_event(
     RuntimeInput(
         event_id="command:42:terminal",
         kind="command.terminal",
@@ -83,8 +101,18 @@ accepted = engine.post_runtime_event(
 
 Capture `run_id` from `engine.active_run_id` after the run starts. A post returns
 `False` when the event id is a duplicate, the run id does not match, or the run
-has ended. Keep event payloads small. Store full command output behind the tool's
-normal result or read API.
+has ended. On Journal-backed runs, returning `True` means `runtime_input.posted` is
+durable before the Engine wakes. If the process exits before a completed model
+transaction binds the event, resume redelivers it exactly once. Input accepted while a
+final turn is in flight defers completion until that input is processed at the next
+safe point.
+
+`post_runtime_event()` is the synchronous application-boundary form for a different
+thread. It schedules onto the active Engine loop; code already on that loop must await
+`apost_runtime_event()`.
+
+Keep event payloads small. Store full command output behind the tool's normal result or
+read API.
 
 An agent can explicitly enter idle wait with
 `Decision.wait(meta={"runtime_wait": True})`. JSON decision agents can return:
@@ -95,15 +123,17 @@ An agent can explicitly enter idle wait with
 
 While idle, the Engine does not call the model or advance the step. A runtime
 event, cancellation, or runtime deadline wakes it. Events are drained only before
-the next model request and are appended as runtime-sourced user context. QitOS
-does not forge a second tool result for a tool call that has already ended.
+the next model request and are appended as runtime-sourced user context. QitOS does
+not inject input in the middle of a model or Tool batch and does not forge a second
+tool result for a tool call that has already ended.
 
 Unmarked `Decision.wait()` retains its existing immediate-loop behavior for parser
 repair and search backtracking.
 
 ## Protocol resolution
 
-`Engine` resolves the model protocol once per run using the following precedence:
+`Engine` resolves the model protocol while capturing each immutable turn, using the
+following precedence:
 
 1. The `protocol` passed directly to `Engine`.
 2. `agent.model_protocol`.
@@ -113,6 +143,9 @@ repair and search backtracking.
 6. The framework default, `react_text_v1`.
 
 The model-level declarations in step 4 are attached by `build_model_for_preset(...)`. This means direct construction such as `Engine(agent=agent)` preserves an explicitly selected family preset even when the provider model name is an alias that QitOS cannot infer. Unknown model-level protocol identifiers are ignored so the existing model-name and framework fallbacks remain available. Traces record `model_qitos_protocol` or `model_harness_metadata` as the resolution source when either declaration is selected.
+
+The selected protocol stays fixed for that turn. Configuration or model changes made
+while it runs are resolved only when the next turn snapshot is captured.
 
 ## Empty model responses
 
@@ -196,7 +229,10 @@ You can also pass hooks at construction time via the `hooks` parameter, or at ru
 
 ## Budget exhaustion
 
-When the step budget, wall-clock time limit, or token budget is exceeded, the Engine sets `state.stop_reason` to the appropriate value and emits an `END` event. The run terminates gracefully and `EngineResult` is still returned — inspect `state.stop_reason` to detect this case.
+When a step, wall-clock, token, or cost budget is exhausted, Engine sets a distinct
+`state.stop_reason` and emits an `END` event. Tool concurrency and Child count are
+admission bounds rather than completion reasons. The run terminates gracefully and
+still returns `EngineResult`.
 
 ```python
 import time
@@ -209,11 +245,17 @@ engine = Engine(
         max_steps=30,
         max_runtime_seconds=120.0,
         max_tokens=50_000,
+        max_cost_usd=2.0,
+        max_tool_concurrency=4,
+        max_children=4,
         # Optional outer scheduler deadline; the earlier limit wins.
         deadline_monotonic=time.monotonic() + 120.0,
     ),
 )
 ```
+
+Cost limits never guess from model names. Pass `model_pricing=ModelPricing(...)` to
+Engine, or expose a typed `pricing` value on the configured Model.
 
 The effective run deadline is shared by Engine step admission, runtime waits, tool
 admission and timeout, and tool retry backoff. Expiry requests graceful termination; it
@@ -290,9 +332,35 @@ q2 = stream.subscribe()  # asyncio.Queue for consumer 2
 
 ### Model streams
 
-All model providers implement the canonical async `Model.stream()` contract. The Engine
-consumes provider-neutral stream chunks and preserves cancellation and request deadlines
-throughout the transaction.
+All model providers implement the canonical async `Model.stream(request)` contract.
+The Engine assembles one immutable `ModelRequest` after History projection and passes
+that exact value to the Provider. Its message and option projections are isolated from
+mutation, while its absolute deadline is shared by connection, stream, retry, and
+cleanup work. A Journal-backed run stores the credential-redacted request snapshot in
+`model.completed` before any tool can start.
+
+OpenAI Responses may return a Run-bound continuation handle. The next request sends
+`previous_response_id` and only the incremental input when the Provider, model,
+protocol, non-input settings, and full canonical prefix all still match. A resumed Run
+can reuse that handle. A fork has a different Run id, and Provider/model changes,
+compaction changes, or an invalid/expired handle send the complete local transcript.
+History remains the recovery source; continuation is never required to resume.
+
+Anthropic Messages persists its message id, thinking signature, native content blocks,
+and usage in the canonical response/history representation. It does not advertise a
+server-side continuation handle because Messages replay is transcript-based.
+
+Each Provider yields discriminated `ModelStreamEvent` values. Text, reasoning,
+ToolCall deltas, native output items, usage, and lifecycle notifications have distinct
+event kinds, so a consumer never infers semantics from a combination of optional
+fields. Every transaction ends with exactly one `COMPLETED` or `FAILED` event. Only a
+`COMPLETED` event can contribute finish state, final ToolCalls, or a continuation;
+`FAILED` is an error terminal and is never committed as a model response.
+
+Class tools implement `async execute(...)`. A legacy synchronous decorated function is
+run in the isolated compatibility boundary and cancellation waits for that call to reach
+a known side-effect boundary. Native subprocess, managed Web, MCP, Mailbox, and Child
+implementations are asynchronous and do not create temporary event loops.
 
 ```python
 from qitos.models import OpenAICompatibleModel

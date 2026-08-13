@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 import re
@@ -12,10 +14,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-import requests
+import httpx
 
-from qitos.core.env import CommandCapability, FileSystemCapability
+from qitos.core.env import (
+    AtomicFileWrite,
+    CommandCapability,
+    FileRevisionConflictError,
+    FileSystemCapability,
+)
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.process import (
+    ProcessHandle,
+    ProcessSnapshot,
+    ProcessTerminalNotifier,
+)
+from qitos.core.runtime_input import RuntimeInput
 from qitos.kit.env.host_env import HostCommandCapability, HostFSCapability
 from qitos.kit.tool.internal.coding_utils import (
     build_diff,
@@ -37,6 +50,7 @@ except Exception:  # pragma: no cover
 
 TASK_STATUSES = {"pending", "in_progress", "blocked", "completed", "cancelled"}
 _MAX_SEARCH_RESULTS = 2000
+_PROCESS_TERMINAL_EVENT_MAX_CHARS = 8000
 
 
 def _utc_now() -> str:
@@ -61,6 +75,11 @@ def _build_diff(old_content: str, new_content: str, path: str) -> str:
 
 def _default_rule_scope(args: Dict[str, Any]) -> Optional[str]:
     return default_rule_scope(args)
+
+
+def _process_rule_scope(args: Dict[str, Any]) -> Optional[str]:
+    process_id = str(args.get("process_id") or "").strip()
+    return f"process:{process_id}" if process_id else None
 
 
 def _join_capability_path(base: str, child: str) -> str:
@@ -238,7 +257,14 @@ class CodingToolSet:
             "list_tree",
             "make_directory",
         ),
-        "shell": ("run_command",),
+        "shell": (
+            "run_command",
+            "process_list",
+            "process_read",
+            "process_write",
+            "process_wait",
+            "process_terminate",
+        ),
         "web": ("web_fetch",),
         "full": (
             "read_file",
@@ -251,6 +277,11 @@ class CodingToolSet:
             "list_tree",
             "make_directory",
             "run_command",
+            "process_list",
+            "process_read",
+            "process_write",
+            "process_wait",
+            "process_terminate",
             "web_fetch",
             "ask_user_choice",
             "update_plan",
@@ -320,6 +351,11 @@ class CodingToolSet:
     def teardown(self, context: Dict[str, Any]) -> None:
         _ = context
 
+    async def ateardown(self, context: Dict[str, Any]) -> None:
+        _ = context
+        if self._local_process_ops is not None:
+            await self._local_process_ops.aclose()
+
     def tools(self) -> List[Any]:
         tool_names = self._PROFILE_TOOL_NAMES[self.profile]
         items = [
@@ -383,6 +419,92 @@ class CodingToolSet:
     ) -> CommandCapability:
         return select_runtime_ops(runtime_context, "process", self._local_process_ops)
 
+    async def _managed_process_ops(
+        self,
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> tuple[CommandCapability, str]:
+        context = runtime_context or {}
+        run_id = str(context.get("run_id") or "").strip()
+        if not run_id:
+            raise RuntimeError("managed process tools require an active Run")
+        process_ops = self._process_ops(runtime_context)
+        journal = context.get("journal")
+        if journal is not None:
+            required = ("run_id", "replay", "append")
+            if any(not hasattr(journal, name) for name in required):
+                raise TypeError("runtime journal does not satisfy SessionJournal")
+            if str(journal.run_id or "") != run_id:
+                raise RuntimeError("managed process journal belongs to another Run")
+            await process_ops.arecover(owner_run_id=run_id, journal=journal)
+        return process_ops, run_id
+
+    @staticmethod
+    def _process_handle(process_id: str, owner_run_id: str) -> ProcessHandle:
+        return ProcessHandle(
+            process_id=str(process_id or "").strip(),
+            owner_run_id=owner_run_id,
+        )
+
+    @staticmethod
+    def _process_terminal_notifier(
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> ProcessTerminalNotifier | None:
+        post_runtime_event = (runtime_context or {}).get("post_runtime_event")
+        if not callable(post_runtime_event):
+            return None
+
+        async def notify(snapshot: ProcessSnapshot) -> bool:
+            process_id = snapshot.handle.process_id
+            return bool(
+                await post_runtime_event(
+                    RuntimeInput(
+                        event_id=f"{process_id}:terminal",
+                        kind="process.completed",
+                        correlation_id=process_id,
+                        source="qitos.process",
+                        payload=CodingToolSet._process_terminal_payload(snapshot),
+                    )
+                )
+            )
+
+        return notify
+
+    @staticmethod
+    def _process_terminal_payload(snapshot: ProcessSnapshot) -> Dict[str, Any]:
+        content, notification_truncated = _truncate_text(
+            snapshot.output.content,
+            _PROCESS_TERMINAL_EVENT_MAX_CHARS,
+        )
+        return {
+            "handle": snapshot.handle.to_dict(),
+            "process_id": snapshot.handle.process_id,
+            "owner_run_id": snapshot.handle.owner_run_id,
+            "status": snapshot.status.value,
+            "terminal": snapshot.terminal,
+            "ended_at": snapshot.ended_at,
+            "exit_code": snapshot.exit_code,
+            "error": snapshot.error,
+            "output": {
+                "content": content,
+                "next_cursor": snapshot.output.next_cursor,
+                "total_bytes": snapshot.output.total_bytes,
+                "truncated": snapshot.output.truncated
+                or notification_truncated,
+                "notification_truncated": notification_truncated,
+                "log_path": snapshot.output.log_path,
+            },
+        }
+
+    @staticmethod
+    def _remaining_seconds(
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> float | None:
+        remaining = (runtime_context or {}).get("remaining_seconds")
+        if not callable(remaining):
+            return None
+        value = remaining()
+        return None if value is None else max(0.0, float(value))
+
     def _require_search_directory(
         self,
         path: str,
@@ -405,7 +527,7 @@ class CodingToolSet:
         self,
         path: str,
         runtime_context: Optional[Dict[str, Any]],
-    ) -> tuple[str, str, float]:
+    ) -> tuple[str, str, float, str]:
         file_ops = self._file_ops(runtime_context)
         raw = file_ops.read_bytes(path)
         modified_at = file_ops.stat(path).modified_at
@@ -413,6 +535,7 @@ class CodingToolSet:
             raw.decode("utf-8", errors="strict"),
             _detect_line_ending(raw),
             float(modified_at or 0.0),
+            hashlib.sha256(raw).hexdigest(),
         )
 
     def _write_text_file(
@@ -421,13 +544,19 @@ class CodingToolSet:
         content: str,
         line_ending: str,
         runtime_context: Optional[Dict[str, Any]],
-    ) -> None:
+        *,
+        expected_sha256: str | None = None,
+    ) -> AtomicFileWrite:
         normalized = (
             content.replace("\r\n", "\n").replace("\r", "\n").replace("\n", line_ending)
         )
-        self._file_ops(runtime_context).write_text(path, normalized)
+        return self._file_ops(runtime_context).write_text_atomic(
+            path,
+            normalized,
+            expected_sha256=expected_sha256,
+        )
 
-    def _run_rg_files(
+    async def _run_rg_files(
         self,
         target_dir: str,
         pattern: str,
@@ -441,7 +570,7 @@ class CodingToolSet:
         if include_ignored:
             cmd.append("--no-ignore")
         cmd.append(".")
-        result = self._process_ops(runtime_context).run_argv(
+        result = await self._process_ops(runtime_context).arun_argv(
             cmd,
             timeout=self.shell_timeout,
             cwd=target_dir,
@@ -454,7 +583,7 @@ class CodingToolSet:
         )
         return matches, exit_code, stderr
 
-    def _run_rg_grep(
+    async def _run_rg_grep(
         self,
         pattern: str,
         target_dir: str,
@@ -496,7 +625,7 @@ class CodingToolSet:
         if context > 0 and not files_with_matches:
             cmd.extend(["--context", str(context)])
         cmd.extend(["--", pattern, "."])
-        result = self._process_ops(runtime_context).run_argv(
+        result = await self._process_ops(runtime_context).arun_argv(
             cmd,
             timeout=self.shell_timeout,
             cwd=target_dir,
@@ -593,7 +722,7 @@ class CodingToolSet:
         walk(path, "", 1)
         return lines
 
-    def _request(
+    async def _request(
         self,
         method: str,
         url: str,
@@ -615,17 +744,19 @@ class CodingToolSet:
                 "url": url,
             }
         try:
-            response = requests.request(
-                method=str(method or "GET").upper(),
-                url=url,
-                params=params,
-                data=data,
-                json=json_data,
-                headers=headers,
-                timeout=int(timeout or 30),
+            async with httpx.AsyncClient(
                 verify=verify_tls,
-                allow_redirects=allow_redirects,
-            )
+                follow_redirects=allow_redirects,
+            ) as client:
+                response = await client.request(
+                    method=str(method or "GET").upper(),
+                    url=url,
+                    params=params,
+                    data=data,
+                    json=json_data,
+                    headers=headers,
+                    timeout=int(timeout or 30),
+                )
             text, truncated = _truncate_text(response.text, max_content_chars)
             payload: Dict[str, Any] = {
                 "status": "success" if response.status_code < 400 else "error",
@@ -680,10 +811,11 @@ class CodingToolSet:
         environment_ops=["process"],
         rule_scope_builder=_default_rule_scope,
     )
-    def run_command(
+    async def run_command(
         self,
         command: str,
         run_in_background: bool = False,
+        tty: bool = False,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -691,6 +823,7 @@ class CodingToolSet:
 
         :param command: Shell command string to execute.
         :param run_in_background: Detach the command and return its task handle.
+        :param tty: Allocate a pseudo-terminal for a managed background command.
         :param runtime_context: Optional runtime context injected by the executor.
         """
         text = str(command or "").strip()
@@ -699,10 +832,180 @@ class CodingToolSet:
         try:
             process_ops = self._process_ops(runtime_context)
             if run_in_background:
-                return process_ops.start(text)
-            return process_ops.run(text, timeout=self.shell_timeout)
+                process_ops, run_id = await self._managed_process_ops(runtime_context)
+                context = runtime_context or {}
+                snapshot = await process_ops.astart(
+                    text,
+                    owner_run_id=run_id,
+                    tty=bool(tty),
+                    journal=context.get("journal"),
+                    terminal_notifier=self._process_terminal_notifier(context),
+                )
+                return snapshot.to_dict()
+            if tty:
+                return {
+                    "status": "error",
+                    "message": "tty requires run_in_background=true",
+                    "command": text,
+                }
+            timeout = float(self.shell_timeout)
+            remaining = self._remaining_seconds(runtime_context)
+            if remaining is not None:
+                timeout = min(timeout, remaining)
+            if timeout <= 0:
+                return {
+                    "status": "error",
+                    "message": "command deadline expired before execution",
+                    "command": text,
+                }
+            return await process_ops.arun(text, timeout=timeout)
         except Exception as exc:
             return {"status": "error", "message": str(exc), "command": text}
+
+    @function_tool(
+        name="process_list",
+        read_only=True,
+        concurrency_safe=True,
+        environment_ops=["process"],
+    )
+    async def process_list(
+        self,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """List background processes owned by the active Run."""
+
+        try:
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            snapshots = await process_ops.alist(owner_run_id=run_id)
+            return {
+                "status": "success",
+                "processes": [snapshot.to_dict() for snapshot in snapshots],
+            }
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+    @function_tool(
+        name="process_read",
+        read_only=True,
+        concurrency_safe=True,
+        environment_ops=["process"],
+    )
+    async def process_read(
+        self,
+        process_id: str,
+        cursor: int = 0,
+        wait_seconds: float = 0.0,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Read incremental output from one active-Run process."""
+
+        try:
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            remaining = self._remaining_seconds(runtime_context)
+            bounded_wait = max(0.0, float(wait_seconds))
+            if remaining is not None:
+                bounded_wait = min(bounded_wait, remaining)
+            snapshot = await process_ops.aread(
+                self._process_handle(process_id, run_id),
+                cursor=int(cursor),
+                wait_seconds=bounded_wait,
+            )
+            return snapshot.to_dict()
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": str(exc),
+                "process_id": process_id,
+            }
+
+    @function_tool(
+        name="process_write",
+        needs_approval=True,
+        environment_ops=["process"],
+        rule_scope_builder=_process_rule_scope,
+    )
+    async def process_write(
+        self,
+        process_id: str,
+        data: str,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Write UTF-8 input to one active-Run process."""
+
+        try:
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            snapshot = await process_ops.awrite(
+                self._process_handle(process_id, run_id),
+                data,
+            )
+            return snapshot.to_dict()
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": str(exc),
+                "process_id": process_id,
+            }
+
+    @function_tool(
+        name="process_wait",
+        read_only=True,
+        concurrency_safe=True,
+        environment_ops=["process"],
+    )
+    async def process_wait(
+        self,
+        process_id: str,
+        timeout_seconds: Optional[float] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Wait for one process without exceeding the current absolute deadline."""
+
+        try:
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            context = runtime_context or {}
+            raw_deadline = context.get("deadline_monotonic")
+            deadline = None if raw_deadline is None else float(raw_deadline)
+            if timeout_seconds is not None:
+                relative = asyncio.get_running_loop().time() + max(
+                    0.0, float(timeout_seconds)
+                )
+                deadline = relative if deadline is None else min(deadline, relative)
+            snapshot = await process_ops.await_process(
+                self._process_handle(process_id, run_id),
+                deadline_monotonic=deadline,
+            )
+            return snapshot.to_dict()
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": str(exc),
+                "process_id": process_id,
+            }
+
+    @function_tool(
+        name="process_terminate",
+        environment_ops=["process"],
+        rule_scope_builder=_process_rule_scope,
+    )
+    async def process_terminate(
+        self,
+        process_id: str,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Terminate one active-Run process group and await cleanup."""
+
+        try:
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            snapshot = await process_ops.aterminate(
+                self._process_handle(process_id, run_id)
+            )
+            return snapshot.to_dict()
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": str(exc),
+                "process_id": process_id,
+            }
 
     def _read_file_chunk(
         self,
@@ -748,6 +1051,7 @@ class CodingToolSet:
                 "limit": chunk.line_count,
                 "total_lines": chunk.total_lines,
                 "size_bytes": chunk.size_bytes,
+                "content_sha256": chunk.content_sha256,
                 "has_more": chunk.has_more,
                 "truncated": chunk.truncated,
             }
@@ -857,6 +1161,7 @@ class CodingToolSet:
         self,
         path: str,
         content: str,
+        expected_sha256: Optional[str] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -864,11 +1169,27 @@ class CodingToolSet:
 
         :param path: Path relative to the workspace root.
         :param content: Full text content to write into the file.
+        :param expected_sha256: Optional complete-file revision required before replace.
         :param runtime_context: Optional runtime context injected by the executor.
         """
         try:
-            self._write_text_file(path, str(content), "\n", runtime_context)
-            return {"status": "success", "path": path, "size": len(content)}
+            write = self._write_text_file(
+                path,
+                str(content),
+                "\n",
+                runtime_context,
+                expected_sha256=expected_sha256,
+            )
+            return {
+                "status": "success",
+                "path": path,
+                "size": write.size_bytes,
+                "content_sha256": write.content_sha256,
+                "previous_sha256": write.previous_sha256,
+                "created": write.created,
+            }
+        except FileRevisionConflictError as exc:
+            return self._revision_conflict_result(exc)
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
 
@@ -885,6 +1206,7 @@ class CodingToolSet:
         new_text: str,
         replace_all: bool = False,
         expected_mtime: Optional[float] = None,
+        expected_sha256: Optional[str] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Replace exact text in one workspace file.
@@ -894,13 +1216,14 @@ class CodingToolSet:
         :param new_text: Replacement text.
         :param replace_all: Replace every occurrence instead of requiring uniqueness.
         :param expected_mtime: Optional optimistic concurrency check.
+        :param expected_sha256: Optional complete-file revision required before edit.
         :param runtime_context: Optional runtime context injected by the executor.
         """
         try:
             file_ops = self._file_ops(runtime_context)
             if not file_ops.stat(path).is_file:
                 return {"status": "error", "message": f"Not a file: {path}"}
-            old_content, line_ending, current_mtime = self._read_text_file(
+            old_content, line_ending, current_mtime, current_sha256 = self._read_text_file(
                 path,
                 runtime_context,
             )
@@ -945,7 +1268,13 @@ class CodingToolSet:
                 new_text,
                 -1 if replace_all else 1,
             )
-            self._write_text_file(path, new_content, line_ending, runtime_context)
+            write = self._write_text_file(
+                path,
+                new_content,
+                line_ending,
+                runtime_context,
+                expected_sha256=expected_sha256 or current_sha256,
+            )
             return {
                 "status": "success",
                 "path": path,
@@ -958,7 +1287,11 @@ class CodingToolSet:
                 "line_ending": line_ending,
                 "expected_mtime": expected_mtime,
                 "current_mtime": file_ops.stat(path).modified_at,
+                "previous_sha256": write.previous_sha256,
+                "content_sha256": write.content_sha256,
             }
+        except FileRevisionConflictError as exc:
+            return self._revision_conflict_result(exc)
         except FileNotFoundError:
             return {
                 "status": "error",
@@ -967,6 +1300,17 @@ class CodingToolSet:
             }
         except Exception as e:
             return {"status": "error", "message": str(e), "path": path}
+
+    @staticmethod
+    def _revision_conflict_result(exc: FileRevisionConflictError) -> Dict[str, Any]:
+        return {
+            "status": "error",
+            "error_category": "file_revision_conflict",
+            "message": str(exc),
+            "path": exc.path,
+            "expected_sha256": exc.expected_sha256,
+            "current_sha256": exc.current_sha256,
+        }
 
     @function_tool(
         name="make_directory",
@@ -995,7 +1339,7 @@ class CodingToolSet:
         environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
     )
-    def glob(
+    async def glob(
         self,
         pattern: str,
         path: str = ".",
@@ -1019,7 +1363,7 @@ class CodingToolSet:
         try:
             result_limit = _search_limit(limit)
             self._require_search_directory(path, runtime_context)
-            matches, exit_code, stderr = self._run_rg_files(
+            matches, exit_code, stderr = await self._run_rg_files(
                 path,
                 pattern,
                 include_hidden,
@@ -1053,7 +1397,7 @@ class CodingToolSet:
         environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
     )
-    def grep(
+    async def grep(
         self,
         pattern: str,
         path: str = ".",
@@ -1092,7 +1436,7 @@ class CodingToolSet:
             if context_lines < 0:
                 raise ValueError("context must be non-negative")
             self._require_search_directory(path, runtime_context)
-            matches, records, exit_code, stderr = self._run_rg_grep(
+            matches, records, exit_code, stderr = await self._run_rg_grep(
                 pattern,
                 path,
                 glob,
@@ -1257,7 +1601,7 @@ class CodingToolSet:
         name="http_request",
         rule_scope_builder=_default_rule_scope,
     )
-    def http_request(
+    async def http_request(
         self,
         method: str,
         url: str,
@@ -1284,7 +1628,7 @@ class CodingToolSet:
         :param allow_redirects: Whether redirects should be followed automatically.
         :param max_content_chars: Maximum number of response characters to keep.
         """
-        return self._request(
+        return await self._request(
             method=method,
             url=url,
             params=params,
@@ -1302,7 +1646,7 @@ class CodingToolSet:
         needs_approval=True,
         rule_scope_builder=_default_rule_scope,
     )
-    def http_get(
+    async def http_get(
         self,
         url: str,
         params: Optional[Dict[str, Any]] = None,
@@ -1321,7 +1665,7 @@ class CodingToolSet:
         :param verify_tls: Whether TLS certificates should be verified.
         :param allow_redirects: Whether redirects should be followed automatically.
         """
-        return self.http_request(
+        return await self.http_request(
             method="GET",
             url=url,
             params=params,
@@ -1335,7 +1679,7 @@ class CodingToolSet:
         name="http_post",
         rule_scope_builder=_default_rule_scope,
     )
-    def http_post(
+    async def http_post(
         self,
         url: str,
         data: Optional[Dict[str, Any]] = None,
@@ -1356,7 +1700,7 @@ class CodingToolSet:
         :param verify_tls: Whether TLS certificates should be verified.
         :param allow_redirects: Whether redirects should be followed automatically.
         """
-        return self.http_request(
+        return await self.http_request(
             method="POST",
             url=url,
             data=data,
@@ -1386,7 +1730,7 @@ class CodingToolSet:
         needs_approval=True,
         rule_scope_builder=_default_rule_scope,
     )
-    def web_fetch(
+    async def web_fetch(
         self,
         url: str,
         prompt: str = "",
@@ -1400,7 +1744,7 @@ class CodingToolSet:
         :param runtime_context: Optional runtime context injected by the executor.
         """
         _ = runtime_context
-        response = self.http_get(url=url, allow_redirects=False)
+        response = await self.http_get(url=url, allow_redirects=False)
         if response.get("status") == "error":
             return response
         if response.get("status_code") in {301, 302, 303, 307, 308}:

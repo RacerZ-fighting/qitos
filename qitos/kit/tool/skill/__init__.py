@@ -2,6 +2,17 @@
 
 from __future__ import annotations
 
-from .toolset import BundledSkillSnapshot, SkillToolSet
+from qitos.kit.skill import (
+    BundledSkillDiagnostic,
+    BundledSkillDiagnosticCode,
+    BundledSkillSnapshot,
+)
 
-__all__ = ["BundledSkillSnapshot", "SkillToolSet"]
+from .toolset import SkillToolSet
+
+__all__ = [
+    "BundledSkillDiagnostic",
+    "BundledSkillDiagnosticCode",
+    "BundledSkillSnapshot",
+    "SkillToolSet",
+]

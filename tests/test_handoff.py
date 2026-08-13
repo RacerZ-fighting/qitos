@@ -249,7 +249,7 @@ class TestEngineHandoffIntegration:
 
         # The final agent should have set the final answer
         assert result.state.final_result == "task complete"
-        assert result.state.stop_reason == "final"
+        assert result.state.stop_reason == "completed"
 
     def test_handoff_without_registry_raises_in_loop(self):
         """If handoff decision is produced but no registry, the loop should error."""
@@ -526,4 +526,4 @@ class TestHandoffContextActivation:
         engine = Engine(agent=FirstAgent(), agent_registry=registry)
         result = engine.run(task="test", max_steps=5)
         # The run should complete successfully
-        assert result.state.stop_reason == "final"
+        assert result.state.stop_reason == "completed"

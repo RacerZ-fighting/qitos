@@ -233,7 +233,7 @@ class CronCreateTool(BaseTool):
         )
         super().__init__(spec=spec)
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         _ = runtime_context
@@ -266,7 +266,7 @@ class CronDeleteTool(BaseTool):
         )
         super().__init__(spec=spec)
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         _ = runtime_context
@@ -294,7 +294,7 @@ class CronListTool(BaseTool):
         )
         super().__init__(spec=spec)
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         _ = args, runtime_context

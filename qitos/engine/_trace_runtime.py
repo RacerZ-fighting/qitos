@@ -144,14 +144,27 @@ class _TraceRuntime(Generic[StateT]):
         if task_obj is None:
             return None
         payload = task_obj.to_dict()
-        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         return {
             "task_id": task_obj.id,
             "env_spec": payload.get("env_spec"),
             "budget": payload.get("budget"),
             "success_criteria": payload.get("success_criteria", []),
-            "input_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16],
+            "input_hash": self.task_fingerprint(task_obj, task_obj.objective),
         }
+
+    def task_fingerprint(self, task_obj: Optional[Task], task_text: str) -> str:
+        """Fingerprint the canonical task package independently of Run identity."""
+        if task_obj is None:
+            payload: Dict[str, Any] = {"objective": task_text}
+        else:
+            payload = task_obj.to_dict()
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
 
     def task_issue_to_dict(self, issue: TaskValidationIssue) -> Dict[str, Any]:
         return {
@@ -166,7 +179,6 @@ class _TraceRuntime(Generic[StateT]):
         if engine.trace_writer is None:
             return
         run_meta = self.run_meta()
-        task_meta = self.task_meta(task_obj) or {}
         prompt_seed = {
             "task": task_text,
             "agent": getattr(engine.agent, "name", engine.agent.__class__.__name__),
@@ -180,7 +192,10 @@ class _TraceRuntime(Generic[StateT]):
         ).hexdigest()[:16]
         run_cfg_hash = hashlib.sha256(
             json.dumps(
-                {"task_meta": task_meta, "run_meta": run_meta}, sort_keys=True
+                run_meta,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
             ).encode("utf-8")
         ).hexdigest()[:16]
         engine.trace_writer.metadata.update(
@@ -198,7 +213,7 @@ class _TraceRuntime(Generic[StateT]):
                     else None
                 ),
                 "run_config_hash": run_cfg_hash,
-                "task_hash": task_meta.get("input_hash"),
+                "task_hash": self.task_fingerprint(task_obj, task_text),
                 "env_fingerprint": run_meta.get("env"),
                 "prompt_builder": (engine._last_prompt_metadata or {}).get(
                     "prompt_builder"
@@ -313,6 +328,9 @@ class _TraceRuntime(Generic[StateT]):
                 "max_steps": engine.budget.max_steps,
                 "max_runtime_seconds": engine.budget.max_runtime_seconds,
                 "max_tokens": engine.budget.max_tokens,
+                "max_cost_usd": engine.budget.max_cost_usd,
+                "max_tool_concurrency": engine.budget.max_tool_concurrency,
+                "max_children": engine.budget.max_children,
                 # Absolute monotonic values are process-local timestamps and
                 # therefore cannot be compared across runs.  Record only the
                 # stable fact that an external deadline constrained this run.
@@ -354,6 +372,7 @@ class _TraceRuntime(Generic[StateT]):
         stop_reason = state.stop_reason
         success = stop_reason in {
             StopReason.SUCCESS.value,
+            StopReason.COMPLETED.value,
             StopReason.FINAL.value,
             StopReason.ENV_TERMINAL.value,
         }
@@ -389,6 +408,7 @@ class _TraceRuntime(Generic[StateT]):
                 "steps": len(self.engine.records),
                 "elapsed_seconds": elapsed_seconds,
                 "token_usage": self.engine._context_runtime.tokens_total,
+                "cost_usd": self.engine._cost_usage_usd,
                 "prompt_tokens_total": self.engine._context_runtime.prompt_tokens_total,
                 "completion_tokens_total": self.engine._context_runtime.completion_tokens_total,
                 "peak_context_occupancy_ratio": self.engine._context_runtime.peak_occupancy_ratio,

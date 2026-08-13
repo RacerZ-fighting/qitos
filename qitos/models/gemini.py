@@ -18,7 +18,9 @@ from .transport import (
     effective_request_timeout,
     transactional_stream_with_retry,
 )
-from .base import Model, ModelStreamChunk
+from .base import Model, ModelStreamEvent
+from ..core.model_request import ModelRequest
+from ..core.model_stream import ModelStreamEventType
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -145,7 +147,7 @@ def _gemini_tool_config(tool_choice: Any) -> Optional[Dict[str, Any]]:
     }
 
 
-class _GeminiEventStream(AsyncIterator[ModelStreamChunk]):
+class _GeminiEventStream(AsyncIterator[ModelStreamEvent]):
     """Normalize and own one connected Gemini GenerateContent stream."""
 
     def __init__(self, responses: Any, client: Any, *, model: str) -> None:
@@ -153,7 +155,7 @@ class _GeminiEventStream(AsyncIterator[ModelStreamChunk]):
         self._client = client
         self._iterator = responses.__aiter__()
         self._model = model
-        self._pending: Deque[ModelStreamChunk] = deque()
+        self._pending: Deque[ModelStreamEvent] = deque()
         self._native_items: List[Dict[str, Any]] = []
         self._tool_calls: List[Dict[str, Any]] = []
         self._usage: Optional[Dict[str, Any]] = None
@@ -165,7 +167,7 @@ class _GeminiEventStream(AsyncIterator[ModelStreamChunk]):
     def __aiter__(self) -> _GeminiEventStream:
         return self
 
-    async def __anext__(self) -> ModelStreamChunk:
+    async def __anext__(self) -> ModelStreamEvent:
         if self._pending:
             return self._pending.popleft()
         if self._finished:
@@ -226,7 +228,12 @@ class _GeminiEventStream(AsyncIterator[ModelStreamChunk]):
         is_thought = bool(_field(part, "thought", False))
         if text:
             self._pending.append(
-                ModelStreamChunk(
+                ModelStreamEvent(
+                    type=(
+                        ModelStreamEventType.REASONING_DELTA
+                        if is_thought
+                        else ModelStreamEventType.TEXT_DELTA
+                    ),
                     text="" if is_thought else text,
                     reasoning_content=text if is_thought else None,
                     event_type=("reasoning.delta" if is_thought else "text.delta"),
@@ -261,7 +268,8 @@ class _GeminiEventStream(AsyncIterator[ModelStreamChunk]):
         }
         self._tool_calls.append(tool_call)
         self._pending.append(
-            ModelStreamChunk(
+            ModelStreamEvent(
+                type=ModelStreamEventType.TOOL_CALL_DELTA,
                 event_type="tool_call.done",
                 event_metadata={
                     "index": len(self._tool_calls) - 1,
@@ -272,15 +280,15 @@ class _GeminiEventStream(AsyncIterator[ModelStreamChunk]):
             )
         )
 
-    def _terminal_chunk(self) -> ModelStreamChunk:
+    def _terminal_chunk(self) -> ModelStreamEvent:
         if self._finish_reason is None and not self._native_items:
             raise ModelTransportError(
                 "Gemini stream ended without a candidate",
                 attempts=1,
                 retryable=True,
             )
-        return ModelStreamChunk(
-            done=True,
+        return ModelStreamEvent(
+            type=ModelStreamEventType.COMPLETED,
             usage=self._usage,
             tool_calls=self._tool_calls or None,
             native_items=self._native_items or None,
@@ -494,7 +502,7 @@ class GeminiModel(Model):
         request_kwargs: Dict[str, Any],
         *,
         deadline_monotonic: float | None,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         try:
             from google import genai
         except ImportError as exc:
@@ -527,20 +535,18 @@ class GeminiModel(Model):
 
     async def stream(
         self,
-        messages: List[Dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
         """Stream one committed Gemini GenerateContent transaction."""
 
-        request_kwargs = dict(kwargs)
+        self.validate_request(request)
+        request_kwargs = request.option_dict()
 
-        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+        async def create_stream() -> AsyncIterator[ModelStreamEvent]:
             return await self._open_stream(
-                messages,
+                request.message_dicts(),
                 dict(request_kwargs),
-                deadline_monotonic=deadline_monotonic,
+                deadline_monotonic=request.deadline_monotonic,
             )
 
         async for chunk in transactional_stream_with_retry(
@@ -548,8 +554,8 @@ class GeminiModel(Model):
             policy=self.retry_policy,
             connection_timeout_seconds=self.timeout,
             event_idle_timeout_seconds=self.stream_idle_timeout,
-            deadline_monotonic=deadline_monotonic,
-            is_terminal=lambda item: item.done,
+            deadline_monotonic=request.deadline_monotonic,
+            is_terminal=lambda item: item.is_final,
         ):
             yield chunk
 

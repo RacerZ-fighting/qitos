@@ -3,20 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import random
-import threading
 import time
-from concurrent.futures import (
-    FIRST_COMPLETED,
-    TimeoutError as FuturesTimeoutError,
-    wait,
-)
 from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
 from ..core.action import Action, ActionExecutionPolicy, ActionResult, ActionStatus
 from ..core.env import Env
 from ..core.tool_result import ToolResult
+from ..core.turn import TurnBudgetSnapshot
 from ..core.tool_registry import ToolRegistry
 from ..core.tool import (
     BaseTool,
@@ -25,7 +19,6 @@ from ..core.tool import (
     ToolValidationResult,
 )
 from ..core.tool_schema import tool_input_schema_errors
-from ._daemon_pool import DaemonTaskPool
 from .interrupt import EngineInterrupt
 from .states import RuntimeEvent, RuntimePhase
 
@@ -44,40 +37,34 @@ _FAILED_STATUSES = frozenset(
 
 
 class _ConcurrencyTracker:
-    """Thread-safe peak-concurrency counter for a single execute() batch."""
+    """Peak-concurrency counter owned by one event loop."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
         self._active = 0
         self.peak = 0
 
     def enter(self) -> None:
-        with self._lock:
-            self._active += 1
-            if self._active > self.peak:
-                self.peak = self._active
+        self._active += 1
+        if self._active > self.peak:
+            self.peak = self._active
 
     def exit(self) -> None:
-        with self._lock:
-            self._active -= 1
+        self._active -= 1
 
 
 class _ActionProgress:
-    """Thread-safe invocation count for a possibly detached action worker."""
+    """Invocation count for one event-loop-owned action task."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
         self._attempts = 0
 
     def begin_attempt(self) -> int:
-        with self._lock:
-            self._attempts += 1
-            return self._attempts
+        self._attempts += 1
+        return self._attempts
 
     @property
     def attempts(self) -> int:
-        with self._lock:
-            return self._attempts
+        return self._attempts
 
 
 class ActionExecutor:
@@ -96,6 +83,7 @@ class ActionExecutor:
         permission_interaction_callback: Optional[Any] = None,
         auto_approve: bool = False,
         cancel_token: Optional[CancelToken] = None,
+        turn_budget: TurnBudgetSnapshot | None = None,
     ):
         self.tool_registry = tool_registry
         self.policy = policy or ActionExecutionPolicy()
@@ -108,6 +96,7 @@ class ActionExecutor:
         self._permission_interaction_callback = permission_interaction_callback
         self.auto_approve = auto_approve
         self._cancel_token = cancel_token
+        self._turn_budget = turn_budget
         # Populated by execute(); consumed by the trace layer.
         self.last_execution_stats: Dict[str, Any] = {}
 
@@ -128,6 +117,13 @@ class ActionExecutor:
         return bool(getattr(token, "is_cancel_requested", False))
 
     def _remaining_runtime_seconds(self) -> Optional[float]:
+        if self._turn_budget is not None:
+            deadline = self._turn_budget.deadline_monotonic
+            return (
+                None
+                if deadline is None
+                else max(0.0, float(deadline) - time.monotonic())
+            )
         if self._engine is None:
             return None
         remaining = getattr(self._engine, "remaining_runtime_seconds", None)
@@ -139,7 +135,7 @@ class ActionExecutor:
             return None
         return max(0.0, float(deadline) - time.monotonic())
 
-    def execute(
+    async def execute(
         self, actions: Sequence[Action], env: Optional[Env] = None, state: Any = None
     ) -> List[ActionResult]:
         self.last_execution_stats = {
@@ -170,7 +166,7 @@ class ActionExecutor:
 
         # Single action: execute directly
         if len(actions) == 1:
-            result = self._execute_one(
+            result = await self._execute_one(
                 actions[0], env=env, state=state, tracker=tracker, segment_index=0
             )
             self.last_execution_stats["concurrency_peak"] = tracker.peak
@@ -179,11 +175,15 @@ class ActionExecutor:
 
         # Respect ActionExecutionPolicy.mode
         if self.policy.mode == "serial":
-            return self._execute_serial(actions, env=env, state=state, tracker=tracker)
+            return await self._execute_serial(
+                actions, env=env, state=state, tracker=tracker
+            )
 
-        return self._execute_segmented(actions, env=env, state=state, tracker=tracker)
+        return await self._execute_segmented(
+            actions, env=env, state=state, tracker=tracker
+        )
 
-    def _execute_serial(
+    async def _execute_serial(
         self,
         actions: Sequence[Action],
         env: Optional[Env],
@@ -210,7 +210,7 @@ class ActionExecutor:
                     )
                 )
                 continue
-            result = self._execute_one(
+            result = await self._execute_one(
                 action, env=env, state=state, tracker=tracker, segment_index=idx
             )
             results.append(result)
@@ -253,7 +253,7 @@ class ActionExecutor:
             segments.append(current)
         return segments
 
-    def _execute_segmented(
+    async def _execute_segmented(
         self,
         actions: Sequence[Action],
         env: Optional[Env],
@@ -287,7 +287,7 @@ class ActionExecutor:
 
             if len(segment) == 1:
                 idx = segment[0]
-                results[idx] = self._execute_one(
+                results[idx] = await self._execute_one(
                     actions[idx],
                     env=env,
                     state=state,
@@ -295,7 +295,7 @@ class ActionExecutor:
                     segment_index=segment_index,
                 )
             else:
-                aborted = self._execute_segment_concurrently(
+                aborted = await self._execute_segment_concurrently(
                     actions,
                     segment,
                     results,
@@ -328,7 +328,7 @@ class ActionExecutor:
             for i, r in enumerate(results)
         ]
 
-    def _execute_segment_concurrently(
+    async def _execute_segment_concurrently(
         self,
         actions: Sequence[Action],
         segment: List[int],
@@ -346,69 +346,51 @@ class ActionExecutor:
         always drained to their real terminal state — never relabelled as
         errors — while actions that never started are recorded as cancelled.
         """
-        max_workers = min(max(1, self.policy.max_concurrency), len(segment))
+        max_concurrency = min(max(1, self.policy.max_concurrency), len(segment))
         abort_reason: Optional[str] = None
+        semaphore = asyncio.Semaphore(max_concurrency)
 
-        pool = DaemonTaskPool(
-            max_workers=max_workers,
-            thread_name_prefix="qitos-action",
-            propagate_context=True,
-        )
-        try:
-            futures: Dict[Any, int] = {}
-            for idx in segment:
-                future = pool.submit(
-                    self._execute_one,
-                    actions[idx],
-                    env=env,
-                    state=state,
-                    tracker=tracker,
+        async def _run_index(index: int) -> ActionResult:
+            try:
+                async with semaphore:
+                    if self._is_cancelled():
+                        return self._terminal_result(
+                            actions[index],
+                            ActionStatus.CANCELLED,
+                            "cancel_token",
+                            segment_index=segment_index,
+                        )
+                    return await self._execute_one(
+                        actions[index],
+                        env=env,
+                        state=state,
+                        tracker=tracker,
+                        segment_index=segment_index,
+                    )
+            except asyncio.CancelledError:
+                return self._terminal_result(
+                    actions[index],
+                    ActionStatus.CANCELLED,
+                    abort_reason or "parent_cancelled",
                     segment_index=segment_index,
                 )
-                futures[future] = idx
 
-            pending = set(futures)
+        tasks = {
+            asyncio.create_task(
+                _run_index(index), name=f"qitos-tool-{actions[index].name}"
+            ): index
+            for index in segment
+        }
+        try:
+            pending = set(tasks)
             while pending:
-                remaining = self._remaining_runtime_seconds()
-                if remaining is not None and remaining <= 0:
-                    abort_reason = "runtime_deadline"
-                    for future in pending:
-                        idx = futures[future]
-                        future.cancel()
-                        results[idx] = self._deadline_result(
-                            action=actions[idx],
-                            start=time.monotonic(),
-                            attempts=0,
-                            tool_meta=self._tool_meta(actions[idx].name),
-                            segment_index=segment_index,
-                            started=False,
-                            worker_still_running=future.running(),
-                        )
-                    pending.clear()
-                    break
-                done, pending = wait(
-                    pending,
-                    timeout=(0.05 if remaining is None else min(0.05, remaining)),
-                    return_when=FIRST_COMPLETED,
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
                 )
-                if not done:
-                    if self._is_cancelled():
-                        abort_reason = "cancel_token"
-                        for future in pending:
-                            idx = futures[future]
-                            future.cancel()
-                            results[idx] = self._terminal_result(
-                                actions[idx],
-                                ActionStatus.CANCELLED,
-                                abort_reason,
-                                segment_index=segment_index,
-                            )
-                        pending.clear()
-                    continue
-                for future in done:
-                    idx = futures[future]
+                for task in done:
+                    idx = tasks[task]
                     try:
-                        results[idx] = future.result()
+                        results[idx] = task.result()
                     except EngineInterrupt:
                         raise
                     except Exception as exc:  # pragma: no cover - defensive path
@@ -424,23 +406,55 @@ class ActionExecutor:
                 if abort_reason is None and self._is_cancelled():
                     abort_reason = "cancel_token"
                 if abort_reason is not None and pending:
-                    # Cancel only what has not started. Anything already
-                    # running is drained below so its true result is kept.
-                    still_pending = set()
-                    for future in pending:
-                        if future.cancel():
-                            idx = futures[future]
-                            results[idx] = self._terminal_result(
-                                actions[idx],
-                                ActionStatus.CANCELLED,
-                                abort_reason,
-                                segment_index=segment_index,
-                            )
-                        else:
-                            still_pending.add(future)
-                    pending = still_pending
+                    pending_tasks = list(pending)
+                    for task in pending_tasks:
+                        task.cancel()
+                    drained_outcomes = await asyncio.gather(
+                        *pending_tasks, return_exceptions=True
+                    )
+                    for pending_task, drained_outcome in zip(
+                        pending_tasks, drained_outcomes
+                    ):
+                        idx = tasks[pending_task]
+                        results[idx] = (
+                            drained_outcome
+                            if isinstance(drained_outcome, ActionResult)
+                            else self._error_result(actions[idx], str(drained_outcome))
+                        )
+                    pending.clear()
+        except asyncio.CancelledError:
+            abort_reason = "cancel_token"
+            self.last_execution_stats["cancel_source"] = abort_reason
+            pending = {task for task in tasks if not task.done()}
+            pending_tasks = list(pending)
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                drained = await asyncio.gather(
+                    *pending_tasks, return_exceptions=True
+                )
+                for pending_task, drained_outcome in zip(pending_tasks, drained):
+                    idx = tasks[pending_task]
+                    results[idx] = (
+                        drained_outcome
+                        if isinstance(drained_outcome, ActionResult)
+                        else self._terminal_result(
+                            actions[idx],
+                            ActionStatus.CANCELLED,
+                            abort_reason,
+                            segment_index=segment_index,
+                        )
+                    )
+            for task, idx in tasks.items():
+                if results[idx] is None and task.done() and not task.cancelled():
+                    completed_outcome = task.result()
+                    results[idx] = completed_outcome
         finally:
-            pool.shutdown(wait_for_workers=False, cancel_futures=True)
+            unfinished = [task for task in tasks if not task.done()]
+            for task in unfinished:
+                task.cancel()
+            if unfinished:
+                await asyncio.gather(*unfinished, return_exceptions=True)
         return abort_reason
 
     def _terminal_result(
@@ -508,9 +522,13 @@ class ActionExecutor:
         )
         tool_deadline = started + tool_timeout if tool_timeout is not None else None
         runtime_deadline = (
-            getattr(self._engine, "runtime_deadline_monotonic", None)
-            if self._engine is not None
-            else None
+            self._turn_budget.deadline_monotonic
+            if self._turn_budget is not None
+            else (
+                getattr(self._engine, "runtime_deadline_monotonic", None)
+                if self._engine is not None
+                else None
+            )
         )
         if runtime_deadline is not None and (
             tool_deadline is None or runtime_deadline <= tool_deadline
@@ -532,57 +550,23 @@ class ActionExecutor:
             return None
         return max(0.0, deadline_monotonic - time.monotonic())
 
-    def _resolve_awaitable(self, value: Any, timeout_s: Optional[float]) -> Any:
-        """Drive a coroutine/awaitable returned by a tool to completion.
-
-        Async handlers are awaited rather than being handed back as an
-        un-awaited coroutine. Raises ``TimeoutError`` when ``timeout_s``
-        elapses first.
-        """
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        else:
-            running_loop = True
-
-        if running_loop is not None:
-            # We are inside a live event loop on this thread, so we cannot
-            # drive the coroutine here without deadlocking. Close it rather
-            # than leaking an un-awaited coroutine, and report honestly.
-            close = getattr(value, "close", None)
-            if callable(close):
-                close()
-            raise RuntimeError(
-                "async tool handler cannot be awaited from a synchronous "
-                "executor running inside an active event loop"
-            )
-
-        async def _driver() -> Any:
-            if timeout_s is not None:
-                return await asyncio.wait_for(value, timeout=timeout_s)
-            return await value
-
-        try:
-            return asyncio.run(_driver())
-        except asyncio.TimeoutError as exc:
-            raise TimeoutError("async action timed out") from exc
-
-    def _invoke_tool(
+    async def _invoke_tool(
         self,
         tool: BaseTool,
         args: Dict[str, Any],
         runtime_context: Optional[Dict[str, Any]],
         timeout_s: Optional[float],
     ) -> Any:
-        """Invoke a tool in the current daemon action worker."""
+        """Await a tool with one absolute, downward-propagated deadline."""
 
-        output = self._call_tool(tool, args, runtime_context=runtime_context)
-        if inspect.isawaitable(output):
-            return self._resolve_awaitable(output, timeout_s)
-        return output
+        invocation = self._call_tool(tool, args, runtime_context=runtime_context)
+        if timeout_s is None:
+            return await invocation
+        if timeout_s <= 0:
+            raise asyncio.TimeoutError("action deadline expired")
+        return await asyncio.wait_for(invocation, timeout=timeout_s)
 
-    def _execute_one(
+    async def _execute_one(
         self,
         action: Action,
         env: Optional[Env] = None,
@@ -598,108 +582,21 @@ class ActionExecutor:
         if tracker is not None:
             tracker.enter()
         try:
-            token = self._resolve_cancel_token()
-            if deadline is None and token is None:
-                return self._execute_one_inner(
-                    action,
-                    env=env,
-                    state=state,
-                    segment_index=segment_index,
-                    action_deadline_monotonic=None,
-                    timeout_source=timeout_source,
-                    timeout_s=timeout_s,
-                    progress=progress,
-                )
-
-            pool = DaemonTaskPool(
-                max_workers=1,
-                thread_name_prefix=f"qitos-tool-{action.name}",
-                propagate_context=True,
-            )
-            future = pool.submit(
-                self._execute_one_inner,
+            return await self._execute_one_inner(
                 action,
-                env,
-                state,
-                segment_index,
-                deadline,
-                timeout_source,
-                timeout_s,
-                progress,
+                env=env,
+                state=state,
+                segment_index=segment_index,
+                action_deadline_monotonic=deadline,
+                timeout_source=timeout_source,
+                timeout_s=timeout_s,
+                progress=progress,
             )
-            try:
-                while True:
-                    if self._is_cancelled():
-                        grace = self._remaining_action_seconds(deadline)
-                        grace = 0.05 if grace is None else min(0.05, grace)
-                        if grace > 0:
-                            try:
-                                return future.result(timeout=grace)
-                            except FuturesTimeoutError:
-                                pass
-                            except EngineInterrupt:
-                                raise
-                        future.cancel()
-                        return self._finish_result(
-                            action=action,
-                            status=ActionStatus.CANCELLED,
-                            start=start,
-                            attempts=progress.attempts,
-                            tool_meta=self._tool_meta(action.name),
-                            error="action cancelled",
-                            extra_metadata={
-                                "error_category": "cancelled",
-                                "cancel_source": "cancel_token",
-                                "segment_index": segment_index,
-                                "started": progress.attempts > 0,
-                                "worker_still_running": future.running(),
-                                "ended_at": time.time(),
-                            },
-                        )
-                    remaining = self._remaining_action_seconds(deadline)
-                    if remaining is not None and remaining <= 0:
-                        future.cancel()
-                        return self._deadline_result(
-                            action=action,
-                            start=start,
-                            attempts=progress.attempts,
-                            tool_meta=self._tool_meta(action.name),
-                            segment_index=segment_index,
-                            started=progress.attempts > 0,
-                            timeout_source=timeout_source,
-                            timeout_s=timeout_s,
-                            worker_still_running=future.running(),
-                        )
-                    wait_seconds = 0.05 if remaining is None else min(0.05, remaining)
-                    try:
-                        return future.result(timeout=wait_seconds)
-                    except FuturesTimeoutError:
-                        continue
-                    except EngineInterrupt:
-                        raise
-                    except Exception as exc:
-                        return self._finish_result(
-                            action=action,
-                            status=ActionStatus.ERROR,
-                            start=start,
-                            attempts=progress.attempts,
-                            tool_meta=self._tool_meta(action.name),
-                            error=str(exc),
-                            extra_metadata={
-                                "error_category": "action_runtime_error",
-                                "segment_index": segment_index,
-                                "started": progress.attempts > 0,
-                                "worker_still_running": False,
-                                "ended_at": time.time(),
-                            },
-                        )
-            finally:
-                pool.shutdown(wait_for_workers=False, cancel_futures=True)
         finally:
             if tracker is not None:
                 tracker.exit()
 
-    def _execute_one_inner(
+    async def _execute_one_inner(
         self,
         action: Action,
         env: Optional[Env] = None,
@@ -1079,7 +976,7 @@ class ActionExecutor:
             attempts = progress.begin_attempt()
             ordering_meta["started"] = True
             try:
-                output = self._invoke_tool(
+                output = await self._invoke_tool(
                     tool,
                     effective_args,
                     runtime_context=runtime_context,
@@ -1171,7 +1068,23 @@ class ActionExecutor:
                 return result
             except EngineInterrupt:
                 raise
-            except TimeoutError as exc:
+            except asyncio.CancelledError:
+                return self._finish_result(
+                    action=action,
+                    status=ActionStatus.CANCELLED,
+                    start=start,
+                    attempts=attempts,
+                    tool_meta=tool_meta,
+                    error="action cancelled",
+                    extra_metadata={
+                        **ordering_meta,
+                        "error_category": "cancelled",
+                        "cancel_source": "cancel_token",
+                        "worker_still_running": False,
+                        "ended_at": time.time(),
+                    },
+                )
+            except asyncio.TimeoutError as exc:
                 timed_out_result = self._finish_result(
                     action=action,
                     status=ActionStatus.TIMED_OUT,
@@ -1216,7 +1129,7 @@ class ActionExecutor:
                             timeout_source=timeout_source,
                             timeout_s=timeout_s,
                         )
-                    if self._wait_for_retry(
+                    if await self._wait_for_retry(
                         delay,
                         deadline_monotonic=action_deadline_monotonic,
                     ):
@@ -1267,7 +1180,7 @@ class ActionExecutor:
         )
         return error_result
 
-    def _wait_for_retry(
+    async def _wait_for_retry(
         self,
         delay: float,
         *,
@@ -1295,7 +1208,10 @@ class ActionExecutor:
                 sleep_for = min(sleep_for, remaining_deadline)
             if sleep_for <= 0:
                 return False
-            time.sleep(sleep_for)
+            try:
+                await asyncio.sleep(sleep_for)
+            except asyncio.CancelledError:
+                return True
 
     def _action_stop_result(
         self,
@@ -1443,10 +1359,15 @@ class ActionExecutor:
             else ""
         )
 
-        def _post_runtime_event(event: Any) -> bool:
+        async def _post_runtime_event(event: Any) -> bool:
             if self._engine is None or not active_run_id:
                 return False
-            return bool(self._engine.post_runtime_event(event, run_id=active_run_id))
+            return bool(
+                await self._engine.apost_runtime_event(
+                    event,
+                    run_id=active_run_id,
+                )
+            )
 
         def _record_runtime_event(phase: str, payload: Dict[str, Any]) -> None:
             if self._engine is None:
@@ -1467,6 +1388,11 @@ class ActionExecutor:
             )
 
         runtime_deadline = deadline_monotonic
+        max_children = (
+            self._turn_budget.max_children
+            if self._turn_budget is not None
+            else int(getattr(getattr(self._engine, "budget", None), "max_children", 0))
+        )
 
         def _remaining_seconds() -> Optional[float]:
             return self._remaining_action_seconds(runtime_deadline)
@@ -1486,7 +1412,14 @@ class ActionExecutor:
             "emit_progress": _emit_progress,
             "record_artifact": _record_artifact,
             "delegate_depth": self.delegate_depth,
-            "parent_run_id": "",
+            "run_id": active_run_id,
+            "parent_run_id": active_run_id,
+            "journal": (
+                getattr(self._engine, "journal", None)
+                if self._engine is not None
+                else None
+            ),
+            "max_children": max_children,
             "post_runtime_event": _post_runtime_event,
             "record_runtime_event": _record_runtime_event,
             "deadline_monotonic": runtime_deadline,
@@ -1538,13 +1471,13 @@ class ActionExecutor:
             )
         return tool.check_permissions(dict(args), runtime_context=runtime_context)
 
-    def _call_tool(
+    async def _call_tool(
         self,
         tool: BaseTool,
         args: Dict[str, Any],
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Any:
-        return tool.execute(args, runtime_context=runtime_context)
+        return await tool.execute(args, runtime_context=runtime_context)
 
     def _normalize_output(self, tool: BaseTool, output: Any) -> Any:
         if isinstance(output, ToolResult):

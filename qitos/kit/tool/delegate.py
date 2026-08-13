@@ -1,4 +1,4 @@
-"""DelegateTool: wraps an AgentSpec as a callable tool for synchronous delegation."""
+"""DelegateTool: wraps an AgentSpec as one awaited child-agent call."""
 
 from __future__ import annotations
 
@@ -16,9 +16,9 @@ MAX_DELEGATE_DEPTH = 3
 
 
 class DelegateTool(BaseTool):
-    """Wraps an AgentSpec as a callable tool for synchronous delegation.
+    """Wrap an AgentSpec as an async callable tool.
 
-    When the parent agent calls this tool, a nested Engine.run() is started
+    When the parent agent calls this tool, a nested ``Engine.arun()`` is awaited
     for the sub-agent. The parent agent's reduce() receives the sub-agent's
     final_result as a normal tool result.
     """
@@ -49,7 +49,7 @@ class DelegateTool(BaseTool):
         # with the class docstring. We want the agent spec's description.
         self.spec.description = spec.description
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Any:
         runtime_context = runtime_context or {}
@@ -87,7 +87,7 @@ class DelegateTool(BaseTool):
             context_arg = args.get("context")
             if isinstance(context_arg, dict):
                 run_kwargs["context"] = dict(context_arg)
-            result = sub_engine.run(prepared_task, **run_kwargs)
+            result = await sub_engine.arun(prepared_task, **run_kwargs)
         except Exception as exc:
             self._emit_delegate_event(
                 trace_writer,
@@ -111,7 +111,11 @@ class DelegateTool(BaseTool):
             "DELEGATE_END",
             {
                 "agent": self.agent_spec.name,
-                "status": "success" if stop_reason == "final" else "partial",
+                "status": (
+                    "success"
+                    if stop_reason in {"completed", "final", "success"}
+                    else "partial"
+                ),
                 "steps": result.step_count,
                 "stop_reason": stop_reason,
             },
@@ -119,7 +123,11 @@ class DelegateTool(BaseTool):
         )
 
         return {
-            "status": "success" if stop_reason == "final" else "partial",
+            "status": (
+                "success"
+                if stop_reason in {"completed", "final", "success"}
+                else "partial"
+            ),
             "agent": self.agent_spec.name,
             "final_result": final_result,
             "steps": result.step_count,
@@ -137,6 +145,8 @@ class DelegateTool(BaseTool):
         env = runtime_context.get("env") if self.agent_spec.shared_env else None
         budget = RuntimeBudget(
             max_steps=self.agent_spec.max_steps_override or 10,
+            deadline_monotonic=runtime_context.get("deadline_monotonic"),
+            max_children=max(1, int(runtime_context.get("max_children", 1) or 1)),
         )
 
         trace_writer = runtime_context.get("trace_writer")

@@ -16,10 +16,12 @@ from qitos.models import (
     AnthropicModel,
     GeminiModel,
     LiteLLMModel,
+    ModelRequest,
+    ModelStreamEventType,
     OllamaModel,
     infer_context_window,
 )
-from qitos.models.base import ModelStreamChunk
+from qitos.models.base import ModelStreamEvent
 from qitos.models.anthropic import _AnthropicEventStream
 
 
@@ -51,8 +53,19 @@ class _AsyncCloser:
 
 async def _collect(
     model: Any, messages: list[dict[str, Any]], **kwargs: Any
-) -> list[ModelStreamChunk]:
-    return [chunk async for chunk in model.stream(messages, **kwargs)]
+) -> list[ModelStreamEvent]:
+    deadline = kwargs.pop("deadline_monotonic", None)
+    request = ModelRequest(
+        run_id="provider-test",
+        transaction_id="provider-test:0",
+        provider=model.provider_name,
+        model=model.model,
+        protocol=model.capabilities.api.value,
+        messages=tuple(messages),
+        options=kwargs,
+        deadline_monotonic=deadline,
+    )
+    return [chunk async for chunk in model.stream(request)]
 
 
 @pytest.mark.asyncio
@@ -163,6 +176,8 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
     terminal = chunks[-1]
     assert terminal.done is True
     assert terminal.finish_reason == "tool_use"
+    assert terminal.event_metadata["id"] == "msg_1"
+    assert terminal.continuation is None
     assert terminal.tool_calls == [
         {
             "id": "toolu_1",
@@ -358,6 +373,32 @@ async def test_anthropic_invalid_tool_blocks_never_become_calls_or_replay(
         for message in replay
         for block in message["content"]
     )
+
+
+@pytest.mark.asyncio
+async def test_anthropic_error_is_an_explicit_failed_terminal() -> None:
+    events = _AsyncListStream(
+        [{"type": "error", "error": {"message": "overloaded"}}]
+    )
+    client = _AsyncCloser()
+    stream = _AnthropicEventStream(
+        events,
+        client,
+        provider="anthropic",
+        model="claude-test",
+    )
+
+    terminal = await stream.__anext__()
+
+    assert terminal.type is ModelStreamEventType.FAILED
+    assert terminal.is_final is True
+    assert terminal.done is False
+    assert "overloaded" in str(terminal.error)
+    with pytest.raises(StopAsyncIteration):
+        await stream.__anext__()
+    await stream.aclose()
+    assert events.closed is True
+    assert client.closed is True
 
 
 @pytest.mark.asyncio

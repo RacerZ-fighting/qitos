@@ -26,43 +26,53 @@ class _Response:
     encoding: str | None = "utf-8"
     closed: bool = False
 
-    def iter_content(self, chunk_size: int) -> list[bytes]:
-        return [
-            self.body[offset : offset + chunk_size]
-            for offset in range(0, len(self.body), chunk_size)
-        ]
-
-    def close(self) -> None:
-        self.closed = True
+    async def aiter_bytes(self, chunk_size: int):
+        for offset in range(0, len(self.body), chunk_size):
+            yield self.body[offset : offset + chunk_size]
 
 
 @dataclass
-class _Session:
+class _Stream:
+    def __init__(self, response: _Response) -> None:
+        self.response = response
+
+    async def __aenter__(self) -> _Response:
+        return self.response
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        _ = exc_type, exc, traceback
+        self.response.closed = True
+
+
+@dataclass
+class _Client:
     response: _Response
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def post(self, url: str, **kwargs: Any) -> _Response:
-        self.calls.append({"url": url, **kwargs})
-        return self.response
+    def stream(self, method: str, url: str, **kwargs: Any) -> _Stream:
+        self.calls.append({"method": method, "url": url, **kwargs})
+        return _Stream(self.response)
 
 
-def test_kimi_fetch_uses_managed_contract_and_returns_bounded_markdown() -> None:
+@pytest.mark.asyncio
+async def test_kimi_fetch_uses_managed_contract_and_returns_bounded_markdown() -> None:
     response = _Response(200, b"# Vendor advisory\n\nAffected versions.")
-    session = _Session(response)
+    client = _Client(response)
     capability = KimiWebFetchCapability(
         api_key="secret",
         fetch_url=_FETCH_URL,
-        session=session,  # type: ignore[arg-type]
+        client=client,
     )
 
-    result = capability.fetch("https://vendor.example/advisory")
+    result = await capability.fetch("https://vendor.example/advisory")
 
     assert result.content == "# Vendor advisory\n\nAffected versions."
     assert result.url == "https://vendor.example/advisory"
     assert result.truncated is False
     assert response.closed is True
-    assert session.calls == [
+    assert client.calls == [
         {
+            "method": "POST",
             "url": _FETCH_URL,
             "headers": {
                 "Authorization": "Bearer secret",
@@ -71,7 +81,6 @@ def test_kimi_fetch_uses_managed_contract_and_returns_bounded_markdown() -> None
             },
             "json": {"url": "https://vendor.example/advisory"},
             "timeout": 30.0,
-            "stream": True,
         }
     ]
 
@@ -86,15 +95,16 @@ def test_kimi_fetch_uses_managed_contract_and_returns_bounded_markdown() -> None
         (503, "provider"),
     ],
 )
-def test_kimi_fetch_preserves_failure_kind(status: int, kind: str) -> None:
+@pytest.mark.asyncio
+async def test_kimi_fetch_preserves_failure_kind(status: int, kind: str) -> None:
     capability = KimiWebFetchCapability(
         api_key="secret",
         fetch_url=_FETCH_URL,
-        session=_Session(_Response(status)),  # type: ignore[arg-type]
+        client=_Client(_Response(status)),
     )
 
     with pytest.raises(WebFetchError) as error:
-        capability.fetch("https://vendor.example/advisory")
+        await capability.fetch("https://vendor.example/advisory")
 
     assert error.value.kind == kind
 
@@ -110,31 +120,35 @@ def test_kimi_fetch_preserves_failure_kind(status: int, kind: str) -> None:
         "https://user:password@example.com/",
     ],
 )
-def test_kimi_fetch_rejects_non_public_urls_before_provider_call(url: str) -> None:
-    session = _Session(_Response(200, b"unused"))
+@pytest.mark.asyncio
+async def test_kimi_fetch_rejects_non_public_urls_before_provider_call(
+    url: str,
+) -> None:
+    client = _Client(_Response(200, b"unused"))
     capability = KimiWebFetchCapability(
         api_key="secret",
         fetch_url=_FETCH_URL,
-        session=session,  # type: ignore[arg-type]
+        client=client,
     )
 
     with pytest.raises((PermissionError, ValueError)):
-        capability.fetch(url)
+        await capability.fetch(url)
 
-    assert session.calls == []
+    assert client.calls == []
 
 
-def test_factory_and_managed_tool_keep_provider_contract_separate() -> None:
+@pytest.mark.asyncio
+async def test_factory_and_managed_tool_keep_provider_contract_separate() -> None:
     assert build_web_fetch_capability(provider="unknown", api_key="secret") is None
     assert build_web_fetch_capability(provider="kimi", api_key="secret") is None
     capability = KimiWebFetchCapability(
         api_key="secret",
         fetch_url=_FETCH_URL,
-        session=_Session(_Response(200, b"Extracted documentation.")),  # type: ignore[arg-type]
+        client=_Client(_Response(200, b"Extracted documentation.")),
     )
     tool = ManagedWebFetchTool(capability)
 
-    result = tool.execute({"url": "https://docs.example/reference"})
+    result = await tool.execute({"url": "https://docs.example/reference"})
 
     assert tool.spec.read_only is True
     assert tool.spec.concurrency_safe is True

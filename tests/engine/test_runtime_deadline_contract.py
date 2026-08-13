@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import threading
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -25,7 +24,9 @@ from qitos.core.tool import (
 from qitos.engine.action_executor import ActionExecutor
 from qitos.engine.cancellation import CancelToken
 from qitos.engine.states import RuntimeBudget
-from qitos.models.base import Model, ModelStreamChunk
+from qitos.models import ModelRequest
+from qitos.models import ModelStreamEventType
+from qitos.models.base import Model, ModelStreamEvent
 
 
 class _RuntimeEngine:
@@ -44,16 +45,16 @@ class _RuntimeEngine:
             return None
         return max(0.0, self._deadline_monotonic - time.monotonic())
 
-    def post_runtime_event(self, event: Any, *, run_id: str) -> bool:
+    async def apost_runtime_event(self, event: Any, *, run_id: str) -> bool:
         _ = event, run_id
         return True
 
 
-def _execute(tool: BaseTool, engine: _RuntimeEngine) -> ActionResult:
-    return ActionExecutor(
+async def _execute(tool: BaseTool, engine: _RuntimeEngine) -> ActionResult:
+    return (await ActionExecutor(
         tool_registry=ToolRegistry().register(tool),
         engine=engine,
-    ).execute([Action(name=tool.spec.name)])[0]
+    ).execute([Action(name=tool.spec.name)]))[0]
 
 
 class _RecordingTool(BaseTool):
@@ -62,9 +63,9 @@ class _RecordingTool(BaseTool):
         self.delay = delay
         self.calls = 0
         self.runtime_context: dict[str, Any] | None = None
-        self.worker_daemon: bool | None = None
+        self.cleaned = False
 
-    def execute(
+    async def execute(
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
@@ -72,10 +73,12 @@ class _RecordingTool(BaseTool):
         _ = args
         self.calls += 1
         self.runtime_context = runtime_context
-        self.worker_daemon = threading.current_thread().daemon
-        if self.delay:
-            time.sleep(self.delay)
-        return "ok"
+        try:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            return "ok"
+        finally:
+            self.cleaned = True
 
 
 def test_runtime_budget_accepts_an_absolute_monotonic_deadline() -> None:
@@ -86,11 +89,12 @@ def test_runtime_budget_accepts_an_absolute_monotonic_deadline() -> None:
     assert budget.deadline_monotonic == deadline
 
 
-def test_expired_deadline_prevents_tool_admission() -> None:
+@pytest.mark.asyncio
+async def test_expired_deadline_prevents_tool_admission() -> None:
     tool = _RecordingTool()
     engine = _RuntimeEngine(time.monotonic() - 1.0)
 
-    result = _execute(tool, engine)
+    result = await _execute(tool, engine)
 
     assert tool.calls == 0
     assert result.status is ActionStatus.TIMED_OUT
@@ -99,18 +103,19 @@ def test_expired_deadline_prevents_tool_admission() -> None:
     assert result.metadata["started"] is False
 
 
-def test_runtime_deadline_clamps_a_longer_tool_timeout() -> None:
+@pytest.mark.asyncio
+async def test_runtime_deadline_clamps_a_longer_tool_timeout() -> None:
     tool = _RecordingTool(delay=0.2)
     engine = _RuntimeEngine(time.monotonic() + 0.03)
     started = time.monotonic()
 
-    result = _execute(tool, engine)
+    result = await _execute(tool, engine)
 
     assert time.monotonic() - started < 0.15
     assert result.status is ActionStatus.TIMED_OUT
     assert result.metadata["timeout_source"] == "runtime_deadline"
-    assert result.metadata["worker_still_running"] is True
-    assert tool.worker_daemon is True
+    assert result.metadata["worker_still_running"] is False
+    assert tool.cleaned is True
 
 
 class _RetryingTool(BaseTool):
@@ -130,18 +135,21 @@ class _RetryingTool(BaseTool):
         )
         self.calls = 0
 
-    def execute(self, args: dict[str, Any], runtime_context: Any = None) -> None:
+    async def execute(
+        self, args: dict[str, Any], runtime_context: Any = None
+    ) -> None:
         _ = args, runtime_context
         self.calls += 1
         raise RuntimeError("retry me")
 
 
-def test_retry_backoff_does_not_cross_the_runtime_deadline() -> None:
+@pytest.mark.asyncio
+async def test_retry_backoff_does_not_cross_the_runtime_deadline() -> None:
     tool = _RetryingTool()
     engine = _RuntimeEngine(time.monotonic() + 0.01)
     started = time.monotonic()
 
-    result = _execute(tool, engine)
+    result = await _execute(tool, engine)
 
     assert time.monotonic() - started < 0.05
     assert tool.calls == 1
@@ -185,7 +193,9 @@ class _AdmissionCountingTool(BaseTool):
         self.permission_calls += 1
         return ToolPermissionDecision.allow()
 
-    def execute(self, args: dict[str, Any], runtime_context: Any = None) -> str:
+    async def execute(
+        self, args: dict[str, Any], runtime_context: Any = None
+    ) -> str:
         _ = args, runtime_context
         self.execution_calls += 1
         if self.execution_calls < 3:
@@ -193,9 +203,10 @@ class _AdmissionCountingTool(BaseTool):
         return "ok"
 
 
-def test_tool_retry_repeats_only_the_admitted_invocation() -> None:
+@pytest.mark.asyncio
+async def test_tool_retry_repeats_only_the_admitted_invocation() -> None:
     tool = _AdmissionCountingTool()
-    result = _execute(tool, _RuntimeEngine(time.monotonic() + 1.0))
+    result = await _execute(tool, _RuntimeEngine(time.monotonic() + 1.0))
 
     assert result.status is ActionStatus.SUCCESS
     assert result.attempts == 3
@@ -204,17 +215,16 @@ def test_tool_retry_repeats_only_the_admitted_invocation() -> None:
     assert tool.execution_calls == 3
 
 
-class _BlockingPermissionTool(BaseTool):
-    def __init__(self, release: threading.Event) -> None:
+class _SlowAdmissionTool(BaseTool):
+    def __init__(self) -> None:
         super().__init__(
             ToolSpec(
-                name="blocking_permission",
-                description="block during admission",
+                name="slow_admission",
+                description="consume the admission budget",
                 timeout_s=0.02,
                 concurrency_safe=True,
             )
         )
-        self.release = release
         self.executed = False
 
     def check_permissions(
@@ -223,30 +233,33 @@ class _BlockingPermissionTool(BaseTool):
         runtime_context: dict[str, Any] | None = None,
     ) -> ToolPermissionDecision:
         _ = args, runtime_context
-        self.release.wait(timeout=1.0)
+        time.sleep(0.03)
         return ToolPermissionDecision.allow()
 
-    def execute(self, args: dict[str, Any], runtime_context: Any = None) -> str:
+    async def execute(
+        self, args: dict[str, Any], runtime_context: Any = None
+    ) -> str:
         _ = args, runtime_context
         self.executed = True
         return "unexpected"
 
 
-def test_tool_timeout_bounds_permission_admission() -> None:
-    release = threading.Event()
-    tool = _BlockingPermissionTool(release)
+@pytest.mark.asyncio
+async def test_tool_timeout_includes_permission_admission() -> None:
+    tool = _SlowAdmissionTool()
     started = time.monotonic()
 
-    result = ActionExecutor(ToolRegistry().register(tool)).execute(
-        [Action(name=tool.name)]
+    result = (
+        await ActionExecutor(ToolRegistry().register(tool)).execute(
+            [Action(name=tool.name)]
+        )
     )[0]
-    release.set()
 
     assert time.monotonic() - started < 0.15
     assert result.status is ActionStatus.TIMED_OUT
     assert result.attempts == 0
     assert result.metadata["timeout_source"] == "tool_spec"
-    assert result.metadata["worker_still_running"] is True
+    assert result.metadata["worker_still_running"] is False
     assert tool.executed is False
 
 
@@ -267,19 +280,24 @@ class _SharedRetryBudgetTool(BaseTool):
         )
         self.calls = 0
 
-    def execute(self, args: dict[str, Any], runtime_context: Any = None) -> str:
+    async def execute(
+        self, args: dict[str, Any], runtime_context: Any = None
+    ) -> str:
         _ = args, runtime_context
         self.calls += 1
-        time.sleep(0.015)
+        await asyncio.sleep(0.015)
         raise RuntimeError("retry")
 
 
-def test_tool_retries_share_one_tool_deadline() -> None:
+@pytest.mark.asyncio
+async def test_tool_retries_share_one_tool_deadline() -> None:
     tool = _SharedRetryBudgetTool()
     started = time.monotonic()
 
-    result = ActionExecutor(ToolRegistry().register(tool)).execute(
-        [Action(name=tool.name)]
+    result = (
+        await ActionExecutor(ToolRegistry().register(tool)).execute(
+            [Action(name=tool.name)]
+        )
     )[0]
 
     assert time.monotonic() - started < 0.1
@@ -294,12 +312,12 @@ class _CancellationAwareTool(BaseTool):
         super().__init__(
             ToolSpec(name="cancel_aware", description="cooperative cancel")
         )
-        self.entered = threading.Event()
+        self.entered = asyncio.Event()
         self.observed_cancel = False
         self.deadline_monotonic: float | None = None
         self.remaining_seconds: Any = None
 
-    def execute(
+    async def execute(
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
@@ -315,29 +333,24 @@ class _CancellationAwareTool(BaseTool):
             if cancelled():
                 self.observed_cancel = True
                 return "cancelled"
-            time.sleep(0.001)
+            await asyncio.sleep(0)
         return "missed cancellation"
 
 
-def test_tool_runtime_context_exposes_live_deadline_and_cancellation() -> None:
+@pytest.mark.asyncio
+async def test_tool_runtime_context_exposes_live_deadline_and_cancellation() -> None:
     tool = _CancellationAwareTool()
     engine = _RuntimeEngine(time.monotonic() + 1.0)
-    result_holder: list[ActionResult] = []
-    thread = threading.Thread(
-        target=lambda: result_holder.append(_execute(tool, engine))
-    )
-
-    thread.start()
-    assert tool.entered.wait(timeout=0.2)
+    execution = asyncio.create_task(_execute(tool, engine))
+    await asyncio.wait_for(tool.entered.wait(), timeout=0.2)
     engine._cancel_token.request_cancel("immediate")
-    thread.join(timeout=0.5)
+    result = await asyncio.wait_for(execution, timeout=0.5)
 
-    assert not thread.is_alive()
     assert tool.observed_cancel is True
     assert tool.deadline_monotonic == engine.runtime_deadline_monotonic
     assert callable(tool.remaining_seconds)
-    assert result_holder[0].status is ActionStatus.CANCELLED
-    assert "action cancelled" in result_holder[0].output
+    assert result.status is ActionStatus.CANCELLED
+    assert "action cancelled" in result.output
 
 
 @dataclass
@@ -417,19 +430,19 @@ class _BlockingModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        _ = request
         self.entered.set()
         try:
             await asyncio.Event().wait()
         finally:
             self.closed.set()
         if False:  # pragma: no cover - preserve async-generator typing
-            yield ModelStreamChunk()
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.LIFECYCLE,
+                event_type="unreachable",
+            )
 
 
 @dataclass
@@ -463,7 +476,18 @@ async def test_model_request_deadline_cancels_provider_and_closes_stream() -> No
 
     with pytest.raises(ModelRequestDeadlineExceeded):
         await asyncio.wait_for(
-            engine._model_runtime._call_llm(model, [], {}),
+            engine._model_runtime._call_llm(
+                model,
+                ModelRequest(
+                    run_id="deadline-run",
+                    transaction_id="deadline-run:0",
+                    provider=model.provider_name,
+                    model=model.model,
+                    protocol=model.capabilities.api.value,
+                    messages=(),
+                    deadline_monotonic=engine.runtime_deadline_monotonic,
+                ),
+            ),
             timeout=1.0,
         )
 
@@ -480,8 +504,8 @@ async def test_immediate_cancel_stops_waiting_for_async_model() -> None:
     await asyncio.wait_for(model.entered.wait(), timeout=0.2)
     engine.cancel("immediate")
 
-    with pytest.raises(asyncio.CancelledError):
-        await run_task
+    result = await run_task
+    assert result.state.stop_reason == "cancelled_immediate"
     assert model.closed.is_set()
 
 
@@ -493,14 +517,14 @@ class _BlockingStreamModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        _ = request
         try:
-            yield ModelStreamChunk(text="before deadline")
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.TEXT_DELTA,
+                text="before deadline",
+            )
             self.entered.set()
             await asyncio.Event().wait()
         finally:
@@ -551,13 +575,13 @@ def test_model_stream_reports_error_without_normal_end() -> None:
 
         async def stream(
             self,
-            messages: list[dict[str, Any]],
-            *,
-            deadline_monotonic: float | None = None,
-            **kwargs: Any,
-        ) -> AsyncIterator[ModelStreamChunk]:
-            _ = messages, deadline_monotonic, kwargs
-            yield ModelStreamChunk(text="partial")
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            _ = request
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.TEXT_DELTA,
+                text="partial",
+            )
             raise ModelTransportError(
                 "stream broke",
                 attempts=1,
@@ -565,7 +589,7 @@ def test_model_stream_reports_error_without_normal_end() -> None:
             )
 
     class _DetailedStreamHandler(_RecordingStreamHandler):
-        def on_chunk(self, chunk: ModelStreamChunk) -> None:
+        def on_chunk(self, chunk: ModelStreamEvent) -> None:
             self.events.append(("chunk", chunk.event_type))
 
         def on_error(self, exc: Exception) -> None:
@@ -585,5 +609,45 @@ def test_model_stream_reports_error_without_normal_end() -> None:
         ("start", None),
         ("chunk", None),
         ("delta", "partial"),
+        ("error", "ModelTransportError"),
+    ]
+
+
+def test_model_failed_terminal_reports_error_without_normal_end() -> None:
+    class _FailedStreamModel(Model):
+        def __init__(self) -> None:
+            super().__init__(model="failed-stream-model", temperature=None)
+
+        async def stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            _ = request
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.FAILED,
+                event_type="provider.failed",
+                error="provider rejected the transaction",
+            )
+
+    class _DetailedStreamHandler(_RecordingStreamHandler):
+        def on_chunk(self, chunk: ModelStreamEvent) -> None:
+            self.events.append(("chunk", chunk.event_type))
+
+        def on_error(self, exc: Exception) -> None:
+            self.events.append(("error", type(exc).__name__))
+
+    handler = _DetailedStreamHandler()
+    engine = Engine(
+        _ModelDeadlineAgent(_FailedStreamModel()),
+        budget=RuntimeBudget(max_steps=1),
+    )
+    engine.stream_callback = handler
+
+    result = engine.run("stream")
+
+    assert result.state.stop_reason == "unrecoverable_error"
+    assert handler.events == [
+        ("start", None),
+        ("chunk", "provider.failed"),
         ("error", "ModelTransportError"),
     ]

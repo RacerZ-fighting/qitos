@@ -14,16 +14,26 @@ description: "Engine 是执行内核，负责驱动智能体循环、执行动�
 每一步都遵循固定顺序：
 
 ```
-prepare → decide → act → reduce → critics → check_stop → trace
+安全点输入 → 捕获 turn → decide → act → reduce → critics → check_stop → commit
 ```
 
-1. **prepare**：`agent.prepare(state)` 把状态格式化成模型可直接消费的提示词文本。
-2. **decide**：先调用 `agent.decide(state, observation)`；若返回 `None`，再走 Engine 的默认模型调用路径。
-3. **act**：把 `Decision.actions` 中的工具调用交给 `ToolRegistry` 执行。
-4. **reduce**：`agent.reduce(state, observation, decision)` 用新的观测结果更新状态。
-5. **评估器**：所有已注册的 `Critic` 在此步后评估当前结果，必要时可停止或重试。
-6. **check_stop**：检查预算、`FinalResultCriteria`、`agent.should_stop()` 以及自定义 `StopCriteria`。
-7. **追踪记录**：把本步的步骤记录与运行时事件写入 `TraceWriter`。
+1. **安全点输入**：只在下一次模型事务之前投影排队的外部事件。
+2. **捕获 turn**：创建不可变 `TurnSnapshot`，固定本轮的模型、协议、完整 History、
+   Tool exposure、运行能力、绝对 deadline、定价和剩余预算。
+3. **prepare**：`agent.prepare_turn(state, observation, turn)` 生成模型输入；默认转调
+   `prepare(state)`。
+4. **decide**：先调用 `agent.decide(state, observation)`；若返回 `None`，再进入异步 Provider 路径。
+5. **act**：只通过冻结 Tool exposure 准入和等待调用；并发安全调用可并行，terminal
+   结果仍按输入顺序提交。
+6. **reduce**：`agent.reduce(state, observation, decision)` 用新的观测结果更新状态。
+7. **评估器**：所有已注册的 `Critic` 在此步后评估当前结果，必要时可停止或重试。
+8. **check_stop**：检查产品完成策略、预算、`agent.should_stop()` 和自定义条件。
+9. **commit**：完整事务就绪后才推进 Journal、trace 和安全快照。
+
+`Engine.arun()` 与 `Engine.astep()` 现在共用同一个 turn 事务实现。外层 Engine 只负责
+Run 初始化、安全点准入、预算/取消检查和资源清理，不再维护第二份 step 流程。Provider
+传输与请求投影留在 model runtime，响应到 `Decision` 的解析由独立 decision runtime
+组合进入；Critic 与 handoff 是事务外围的可选控制策略，不是另一条 Agent loop。
 
 ## 构造函数
 
@@ -62,7 +72,7 @@ engine = Engine(
 
 ## 协议解析
 
-`Engine` 在每次运行中按照以下优先级解析模型协议：
+`Engine` 在捕获每个不可变 turn 时，按照以下优先级解析模型协议：
 
 1. 直接传给 `Engine` 的 `protocol`。
 2. `agent.model_protocol`。
@@ -72,6 +82,9 @@ engine = Engine(
 6. 框架默认协议 `react_text_v1`。
 
 第 4 步中的模型声明由 `build_model_for_preset(...)` 写入。因此，即使服务商使用了 QitOS 无法从名称识别的模型别名，直接调用 `Engine(agent=agent)` 也会保留显式选择的 family preset。无法识别的模型级协议声明会被忽略，原有的模型名称推断和框架默认回退仍然有效。选择这些声明时，trace 会将解析来源记录为 `model_qitos_protocol` 或 `model_harness_metadata`。
+
+选定协议在当前 turn 内保持不变。运行期间发生的配置或模型变化只会在捕获下一份 turn
+snapshot 时重新解析。
 
 ## 空模型响应
 
@@ -150,7 +163,9 @@ engine.clear_hooks()
 
 ## 预算耗尽
 
-当步数、墙钟时间或令牌预算耗尽时，Engine 会把 `state.stop_reason` 设置为对应值，并写出 `END` 事件。运行会优雅结束，仍然返回 `EngineResult`，你可以通过检查 `state.stop_reason` 判断是否发生了预算耗尽。
+当步数、墙钟时间、令牌或费用预算耗尽时，Engine 会把 `state.stop_reason` 设置为
+对应值，并写出 `END` 事件。`RuntimeBudget` 也统一限制 Tool 并发和 Child 数量。
+费用限制必须配合显式 `ModelPricing`，不会根据模型名称猜价。
 
 ```python
 from qitos.engine.states import RuntimeBudget
@@ -161,6 +176,9 @@ engine = Engine(
         max_steps=30,
         max_runtime_seconds=120.0,
         max_tokens=50_000,
+        max_cost_usd=2.0,
+        max_tool_concurrency=4,
+        max_children=4,
     ),
 )
 ```
@@ -183,6 +201,10 @@ result = engine.run(task)
 
 `Engine` 只有一条异步原生执行路径。`arun()` 直接运行在调用方的事件循环上，
 模型 Provider 通过原生异步流返回结果，不使用工作线程桥接。
+
+类式 Tool 实现 `async execute(...)`。原生 subprocess、Managed Web、MCP、Mailbox 和 Child
+路径不创建临时 event loop。旧同步装饰器 Tool 只通过隔离兼容边界执行；取消会等待它抵达
+已知副作用边界后再发布 terminal。
 
 ```python
 from qitos import Engine
@@ -235,8 +257,14 @@ q2 = stream.subscribe()  # 消费者 2 的 asyncio.Queue
 
 ### 模型流
 
-所有模型 Provider 都实现唯一的异步 `Model.stream()` 契约。Engine 消费 Provider 无关的
-流式 chunk，并在整个事务中保留取消和请求截止时间。
+所有模型 Provider 都实现唯一的异步 `Model.stream(request)` 契约。Engine 在 History
+投影后组装一份不可变 `ModelRequest`，并把同一份绝对 deadline 传给连接、流读取、重试和
+清理过程。
+
+Provider 返回带判别类型的 `ModelStreamEvent`。文本、reasoning、ToolCall 增量、原生输出项、
+usage 和生命周期分别使用不同事件类型，消费方无需再从可选字段组合猜测语义。每个事务只能以
+一个 `COMPLETED` 或 `FAILED` 事件结束；只有 `COMPLETED` 能携带最终 ToolCall、finish state
+和 continuation，`FAILED` 始终进入错误路径，不会被提交为模型响应。
 
 ```python
 from qitos.models import OpenAICompatibleModel

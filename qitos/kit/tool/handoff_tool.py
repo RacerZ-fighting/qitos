@@ -45,7 +45,7 @@ class HandoffTool(BaseTool):
         # Override BaseTool's auto-description from execute() docstring
         self.spec.description = _description
 
-    def execute(self, args: Any, runtime_context: Any = None) -> Dict[str, Any]:
+    async def execute(self, args: Any, runtime_context: Any = None) -> Dict[str, Any]:
         """Return a handoff signal.
 
         Note: In practice, the Engine intercepts this tool call before

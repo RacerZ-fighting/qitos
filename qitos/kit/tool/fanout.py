@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ...core.agent_spec import AgentSpec, AgentRegistry, ContextStrategy
@@ -20,7 +20,7 @@ class FanOutTool(BaseTool):
     """Parallel delegation: fan out multiple subtasks, fan in aggregated results.
 
     The parent agent calls this tool with a list of subtasks. Each subtask is
-    dispatched to a sub-agent in parallel via ThreadPoolExecutor. All sub-agents
+    dispatched to independently stateful child engines. All child runs
     run independently. Results are collected and aggregated before returning.
     """
 
@@ -58,13 +58,13 @@ class FanOutTool(BaseTool):
             required=["tasks"],
             timeout_s=300.0,
             concurrency_safe=True,
-            supports_background=True,
+            supports_background=False,
         )
         super().__init__(tool_spec)
         # Override description after BaseTool.__init__
         self.spec.description = tool_spec.description
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Any:
         runtime_context = runtime_context or {}
@@ -83,68 +83,103 @@ class FanOutTool(BaseTool):
 
         self._emit_event(trace_writer, "FANOUT_START", {"task_count": len(tasks)})
 
-        results: Dict[str, Any] = {}
-        overall_deadline = time.monotonic() + self.spec.timeout_s
-        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
-            futures = {}
-            for i, task_spec in enumerate(tasks):
-                agent_name = task_spec.get("agent", "")
-                task_text = str(task_spec.get("task", "")).strip()
-                if not agent_name or not task_text:
-                    results[f"invalid_{i}"] = {
-                        "status": "error",
-                        "message": "Each task requires 'agent' and 'task' fields",
-                    }
-                    continue
-                try:
-                    spec = self.agent_registry.resolve(agent_name)
-                except KeyError:
-                    results[f"{agent_name}_{i}"] = {
-                        "status": "error",
-                        "message": f"Agent '{agent_name}' not found in registry",
-                    }
-                    continue
-                prepared_task = self._prepare_task(spec, task_text, runtime_context)
-                task_deadline = time.monotonic() + self._per_task_timeout
-                future = pool.submit(
-                    self._run_sub_agent,
+        ordered: list[tuple[str, AgentSpec | None, str, dict[str, Any] | None]] = []
+        max_children = max(1, int(runtime_context.get("max_children", len(tasks)) or 1))
+        admitted_children = 0
+        for i, task_spec in enumerate(tasks):
+            agent_name = str(task_spec.get("agent", ""))
+            task_text = str(task_spec.get("task", "")).strip()
+            key = f"{agent_name}_{i}" if agent_name else f"invalid_{i}"
+            if not agent_name or not task_text:
+                ordered.append(
+                    (
+                        key,
+                        None,
+                        "",
+                        {
+                            "status": "error",
+                            "message": "Each task requires 'agent' and 'task' fields",
+                        },
+                    )
+                )
+                continue
+            try:
+                spec = self.agent_registry.resolve(agent_name)
+            except KeyError:
+                ordered.append(
+                    (
+                        key,
+                        None,
+                        "",
+                        {
+                            "status": "error",
+                            "message": f"Agent '{agent_name}' not found in registry",
+                        },
+                    )
+                )
+                continue
+            if admitted_children >= max_children:
+                ordered.append(
+                    (
+                        key,
+                        None,
+                        "",
+                        {
+                            "status": "error",
+                            "message": f"Run child-agent budget exhausted: max_children={max_children}",
+                        },
+                    )
+                )
+                continue
+            admitted_children += 1
+            ordered.append(
+                (
+                    key,
                     spec,
-                    prepared_task,
+                    self._prepare_task(spec, task_text, runtime_context),
+                    None,
+                )
+            )
+
+        semaphore = asyncio.Semaphore(min(self._max_workers, max_children))
+
+        async def _run_one(spec: AgentSpec, task_text: str, idx: int) -> Dict[str, Any]:
+            async with semaphore:
+                return await self._run_sub_agent(
+                    spec,
+                    task_text,
                     runtime_context,
                     current_depth,
-                    i,
-                    task_deadline,
+                    idx,
                 )
-                futures[future] = (agent_name, i)
 
-            remaining_timeout = max(0.0, overall_deadline - time.monotonic())
-            try:
-                for future in as_completed(futures, timeout=remaining_timeout):
-                    agent_name, idx = futures[future]
-                    key = f"{agent_name}_{idx}"
-                    try:
-                        results[key] = future.result(timeout=0.1)
-                    except TimeoutError:
-                        results[key] = {
-                            "status": "error",
-                            "message": f"Task timed out after {self._per_task_timeout}s",
-                        }
-                    except Exception as exc:
-                        results[key] = {"status": "error", "message": str(exc)}
-            except TimeoutError:
-                pass  # Overall deadline reached; collect what we have
+        running = [
+            asyncio.create_task(_run_one(spec, task_text, idx))
+            for idx, (_, spec, task_text, error) in enumerate(ordered)
+            if spec is not None and error is None
+        ]
+        try:
+            completed = await asyncio.gather(*running, return_exceptions=True)
+        finally:
+            pending = [task for task in running if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
-            # Cancel any futures that didn't complete in time
-            for future in futures:
-                if not future.done():
-                    future.cancel()
-                    agent_name, idx = futures[future]
-                    key = f"{agent_name}_{idx}"
-                    if key not in results:
-                        results[key] = {
-                            "status": "error",
-                            "message": f"Task timed out (overall timeout {self.spec.timeout_s}s)",
-                        }
+        outcomes = iter(completed)
+        results: Dict[str, Any] = {}
+        for key, spec, _, error in ordered:
+            if error is not None:
+                results[key] = error
+                continue
+            assert spec is not None
+            outcome = next(outcomes)
+            results[key] = (
+                {"status": "error", "agent": spec.name, "message": str(outcome)}
+                if isinstance(outcome, Exception)
+                else outcome
+            )
 
         self._emit_event(trace_writer, "FANOUT_END", {
             "total": len(results),
@@ -157,31 +192,39 @@ class FanOutTool(BaseTool):
             "summary": self._aggregate(results),
         }
 
-    def _run_sub_agent(
+    async def _run_sub_agent(
         self,
         spec: AgentSpec,
         task: str,
         runtime_context: Dict[str, Any],
         depth: int,
         idx: int,
-        task_deadline: float = 0.0,
     ) -> Dict[str, Any]:
-        """Run a single sub-agent synchronously (called from thread pool)."""
+        """Await one child under the parent and per-task deadlines."""
         try:
-            if task_deadline > 0 and time.monotonic() >= task_deadline:
-                return {
-                    "status": "error",
-                    "agent": spec.name,
-                    "message": f"Task timed out after {self._per_task_timeout}s",
-                }
             sub_engine = self._build_sub_engine(spec, runtime_context, depth, idx)
-            result = sub_engine.run(task)
+            parent_deadline = runtime_context.get("deadline_monotonic")
+            task_deadline = time.monotonic() + self._per_task_timeout
+            if isinstance(parent_deadline, (int, float)):
+                task_deadline = min(task_deadline, float(parent_deadline))
+            remaining = max(0.0, task_deadline - time.monotonic())
+            result = await asyncio.wait_for(sub_engine.arun(task), timeout=remaining)
             return {
-                "status": "success" if result.state.stop_reason == "final" else "partial",
+                "status": (
+                    "success"
+                    if result.state.stop_reason in {"completed", "final", "success"}
+                    else "partial"
+                ),
                 "agent": spec.name,
                 "final_result": result.state.final_result or "",
                 "steps": result.step_count,
                 "stop_reason": str(result.state.stop_reason or ""),
+            }
+        except asyncio.TimeoutError:
+            return {
+                "status": "error",
+                "agent": spec.name,
+                "message": f"Task timed out after {self._per_task_timeout}s",
             }
         except Exception as exc:
             return {"status": "error", "agent": spec.name, "message": str(exc)}
@@ -198,7 +241,11 @@ class FanOutTool(BaseTool):
 
         sub_agent = spec.agent
         env = runtime_context.get("env") if spec.shared_env else None
-        budget = RuntimeBudget(max_steps=spec.max_steps_override or 10)
+        budget = RuntimeBudget(
+            max_steps=spec.max_steps_override or 10,
+            deadline_monotonic=runtime_context.get("deadline_monotonic"),
+            max_children=max(1, int(runtime_context.get("max_children", 1) or 1)),
+        )
         trace_writer = self._build_sub_trace_writer(
             runtime_context.get("trace_writer"), spec.name, idx
         )

@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence
+
+from .process import ProcessHandle, ProcessSnapshot, ProcessTerminalNotifier
+
+if TYPE_CHECKING:
+    from .journal import SessionJournal
 
 
 @dataclass
@@ -77,6 +83,38 @@ class TextFileChunk:
     has_more: bool
     truncated: bool
     line_ending: Literal["lf", "crlf", "mixed"] = "lf"
+    content_sha256: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AtomicFileWrite:
+    """Result of one atomic capability-scoped file replacement."""
+
+    path: str
+    size_bytes: int
+    content_sha256: str
+    previous_sha256: str | None
+    created: bool
+
+
+class FileRevisionConflictError(RuntimeError):
+    """The file changed after the caller captured its expected revision."""
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        expected_sha256: str,
+        current_sha256: str | None,
+    ) -> None:
+        self.path = path
+        self.expected_sha256 = expected_sha256
+        self.current_sha256 = current_sha256
+        current = current_sha256 if current_sha256 is not None else "missing"
+        super().__init__(
+            f"file revision conflict for {path}: expected "
+            f"{expected_sha256}, current {current}"
+        )
 
 
 class Env(ABC):
@@ -133,6 +171,11 @@ class Env(ABC):
         """Symmetric shutdown hook called by runtime."""
         self.close()
 
+    async def ateardown(self) -> None:
+        """Release legacy environment resources outside the event loop."""
+
+        await asyncio.to_thread(self.teardown)
+
 
 class FileSystemCapability(ABC):
     """Root-scoped filesystem contract used by environment implementations."""
@@ -176,6 +219,21 @@ class FileSystemCapability(ABC):
         """Write UTF-8 text to file path."""
 
     @abstractmethod
+    def write_text_atomic(
+        self,
+        path: str,
+        content: str,
+        *,
+        expected_sha256: str | None = None,
+    ) -> AtomicFileWrite:
+        """Atomically replace UTF-8 text after an optional revision check.
+
+        Implementations serialize mutations to the same canonical path within
+        one capability instance. A supplied SHA-256 value is compared with the
+        complete current file immediately before replacement.
+        """
+
+    @abstractmethod
     def write_bytes(self, path: str, content: bytes) -> None:
         """Write raw bytes to file path."""
 
@@ -204,8 +262,23 @@ class CommandCapability(ABC):
     """Command execution capability contract used by env implementations."""
 
     @abstractmethod
+    async def arun(self, command: str, timeout: float = 30) -> Dict[str, Any]:
+        """Run one shell command without blocking the owning event loop."""
+
+    @abstractmethod
+    async def arun_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float = 30,
+        cwd: str | None = None,
+        stdin: bytes | None = None,
+    ) -> Dict[str, Any]:
+        """Run one argv process asynchronously without shell interpretation."""
+
+    @abstractmethod
     def run(self, command: str, timeout: int = 30) -> Dict[str, Any]:
-        """Run one command and return standardized result payload."""
+        """Compatibility entry point for synchronous environment setup code."""
 
     @abstractmethod
     def run_argv(
@@ -218,16 +291,95 @@ class CommandCapability(ABC):
     ) -> Dict[str, Any]:
         """Run one process without interpreting arguments through a shell."""
 
-    def start(
+    async def astart(
         self,
         command: str,
         *,
+        owner_run_id: str,
         cwd: str | None = None,
-        stdout_path: str | None = None,
-    ) -> Dict[str, Any]:
-        """Start one background shell command when the provider supports it."""
+        tty: bool = False,
+        journal: SessionJournal | None = None,
+        terminal_notifier: ProcessTerminalNotifier | None = None,
+    ) -> ProcessSnapshot:
+        """Start one Run-owned background command when supported.
 
-        raise NotImplementedError("background commands are not supported")
+        A terminal notifier runs only after the process terminal fact is durable.
+        It may enqueue a safe-point input, but it does not own Agent state.
+        """
+
+        _ = command, owner_run_id, cwd, tty, journal, terminal_notifier
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def apoll(self, handle: ProcessHandle) -> ProcessSnapshot:
+        """Return the current process state without waiting for new output."""
+
+        _ = handle
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def aread(
+        self,
+        handle: ProcessHandle,
+        *,
+        cursor: int = 0,
+        wait_seconds: float = 0.0,
+    ) -> ProcessSnapshot:
+        """Read bounded incremental output, optionally waiting for a change."""
+
+        _ = handle, cursor, wait_seconds
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def awrite(
+        self,
+        handle: ProcessHandle,
+        data: str,
+    ) -> ProcessSnapshot:
+        """Write UTF-8 input to a live process and return its new state."""
+
+        _ = handle, data
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def await_process(
+        self,
+        handle: ProcessHandle,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> ProcessSnapshot:
+        """Wait until terminal or until the supplied absolute deadline."""
+
+        _ = handle, deadline_monotonic
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def aterminate(self, handle: ProcessHandle) -> ProcessSnapshot:
+        """Terminate a live process group and await its terminal snapshot."""
+
+        _ = handle
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def alist(
+        self,
+        *,
+        owner_run_id: str | None = None,
+    ) -> tuple[ProcessSnapshot, ...]:
+        """List tracked processes in stable start order."""
+
+        _ = owner_run_id
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def arecover(
+        self,
+        *,
+        owner_run_id: str,
+        journal: SessionJournal,
+    ) -> tuple[ProcessSnapshot, ...]:
+        """Restore terminal observations and close interrupted ownership gaps."""
+
+        _ = owner_run_id, journal
+        return ()
+
+    async def aclose(self) -> None:
+        """Terminate owned live processes and await all runtime Tasks."""
+
+        return None
 
 
 class TerminalCapability(ABC):

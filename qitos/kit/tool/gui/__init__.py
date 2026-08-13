@@ -48,7 +48,7 @@ class _GUIActionTool(BaseTool):
         )
         super().__init__(spec)
 
-    def execute(self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None) -> Any:
+    async def execute(self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None) -> Any:
         controller = _controller_from_context(runtime_context)
         if controller is None:
             raise RuntimeError("GUI controller ops are not available in the current runtime context")

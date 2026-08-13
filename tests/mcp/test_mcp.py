@@ -36,7 +36,6 @@ from qitos.mcp.schema_convert import (
     _resolve_refs,
     convert_mcp_schema_to_tool_spec,
 )
-from qitos.mcp.runtime import MCPEventLoopRuntime
 
 
 # --------------------------------------------------------------------------- #
@@ -544,22 +543,11 @@ class TestBridge:
                 )
             ],
         )
-        runtime = MCPEventLoopRuntime()
-        runtime.start()
-        try:
-            bridged = await runtime.run(
-                mcp_server_to_function_tools(
-                    server,
-                    name_prefix=f"mcp__{server.name}",
-                    call_runner=runtime.run_sync,
-                )
-            )
-            result = await asyncio.to_thread(
-                bridged[0].execute,
-                {"value": "evidence"},
-            )
-        finally:
-            await runtime.close()
+        bridged = await mcp_server_to_function_tools(
+            server,
+            name_prefix=f"mcp__{server.name}",
+        )
+        result = await bridged[0].execute({"value": "evidence"})
 
         assert bridged[0].name == "mcp__server_one__tool_two_three"
         assert result == {

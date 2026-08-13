@@ -21,7 +21,7 @@ from qitos.kit.parser import (
     ToolUseXmlParser,
     XmlDecisionParser,
 )
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 
 
 class _ResponseSequenceModel(Model):
@@ -45,20 +45,17 @@ class _ResponseSequenceModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        messages = request.message_dicts()
         self.calls += 1
         self.seen_messages.append([dict(message) for message in messages])
         if not self.responses:
             raise AssertionError("no scripted model response remains")
         response = self.responses.pop(0)
-        yield ModelStreamChunk(
+        yield ModelStreamEvent(
             text=response.text,
-            done=True,
+            type=ModelStreamEventType.COMPLETED,
             usage=response.usage,
             tool_calls=response.tool_calls,
             native_items=response.native_items,
@@ -267,7 +264,7 @@ def test_agent_interpretation_can_handle_empty_model_response():
         "handle provider metadata"
     )
 
-    assert result.state.stop_reason == "final"
+    assert result.state.stop_reason == "completed"
     assert result.state.final_result == "handled by agent"
     assert result.records[0].model_response["text"] == ""
 
@@ -557,11 +554,14 @@ async def test_message_builder_falls_back_to_user_without_a_real_tool_result():
     engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=2))
     state = agent.init_state("compute")
     state.current_step = 1
+    engine._active_run_id = "model-runtime-test"
+    turn = engine._capture_turn(state, 1)
 
     await engine._model_runtime._run_llm_decide(
         state,
         {},
-        StepRecord(step_id=1),
+        StepRecord(step_id=1, transaction_id="model-runtime-test:1"),
+        turn,
     )
 
     request = model.seen_messages[0]
@@ -968,7 +968,7 @@ def test_native_text_structured_action_parse_error_stays_in_recovery(response_te
     engine = _native_text_engine()
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
         step=0,
         record=record,
@@ -996,7 +996,7 @@ def test_native_text_structured_final_parse_error_stays_in_recovery():
         '"summary":"Ligolo "agent" upload failed","fact_ids":["fact-1"]}}'
     )
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
         step=0,
         record=record,
@@ -1019,7 +1019,7 @@ def test_native_text_plain_natural_language_still_becomes_final():
     record = StepRecord(step_id=0)
     response_text = "The requested action is complete; the tool named add returned 42."
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(
             text=response_text,
             finish_reason="stop",
@@ -1047,7 +1047,7 @@ def test_native_text_ambiguous_labels_still_become_final(response_text):
     engine = _native_text_engine()
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
         step=0,
         record=record,
@@ -1063,7 +1063,7 @@ def test_native_text_tool_use_parser_heuristic_wait_keeps_legacy_final_fallback(
     record = StepRecord(step_id=0)
     response_text = "All requested checks passed successfully."
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
         step=0,
         record=record,
@@ -1078,7 +1078,7 @@ def test_native_text_valid_react_action_still_uses_parser():
     engine = _native_text_engine()
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(
             text="Thought: calculate\nAction: add(a=20, b=22)",
             finish_reason="stop",
@@ -1097,7 +1097,7 @@ def test_native_text_valid_react_final_still_uses_parser():
     engine = _native_text_engine()
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(
             text="Thought: finished\nFinal Answer: 42",
             finish_reason="stop",
@@ -1131,7 +1131,7 @@ def test_native_text_explicit_parser_wait_stays_wait(parser, protocol, response_
     engine = _native_text_engine(parser=parser, protocol=protocol)
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(
             text=response_text,
             finish_reason="stop",
@@ -1167,7 +1167,7 @@ def test_native_text_malformed_protocol_action_stays_in_recovery(
     engine = _native_text_engine(parser=parser, protocol=protocol)
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
         step=0,
         record=record,
@@ -1191,7 +1191,7 @@ def test_native_text_malformed_protocol_action_stays_in_recovery(
     ],
 )
 def test_structured_action_intent_recognizes_native_protocol_markers(response_text):
-    assert _native_text_engine()._model_runtime._looks_like_structured_action_intent(
+    assert _native_text_engine()._decision_runtime._looks_like_structured_action_intent(
         response_text
     )
 
@@ -1241,7 +1241,7 @@ def test_native_text_parse_recovery_runs_tool_then_finishes():
     ).run("recover malformed action")
 
     assert model.calls == 3
-    assert result.state.stop_reason == "final"
+    assert result.state.stop_reason == "completed"
     assert result.state.final_result == "done"
     assert [record.decision.mode for record in result.records] == [
         "wait",

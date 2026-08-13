@@ -2,30 +2,47 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import os
 import re
+import secrets
 import stat as stat_module
 import subprocess
-import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from qitos.core.action import Action
 from qitos.core.env import (
+    AtomicFileWrite,
     CommandCapability,
     Env,
     EnvObservation,
     EnvStepResult,
+    FileRevisionConflictError,
     FileStat,
     FileSystemCapability,
     TextFileChunk,
 )
+from qitos.core.journal import SessionJournal
+from qitos.core.process import (
+    ProcessHandle,
+    ProcessSnapshot,
+    ProcessTerminalNotifier,
+)
+from qitos.kit.env._async_process import run_process
+from qitos.kit.env._file_mutation import (
+    FileMutationQueue,
+    normalize_expected_sha256,
+)
+from qitos.kit.env.managed_process import ManagedHostProcessRuntime
 
 
 class HostFSCapability(FileSystemCapability):
     def __init__(self, root: str):
         self.root = Path(root).resolve()
+        self._mutations = FileMutationQueue()
 
     def resolve_path(self, path: str, *, allow_missing: bool = False) -> str:
         return str(self._resolve(path, allow_missing=allow_missing))
@@ -94,9 +111,11 @@ class HostFSCapability(FileSystemCapability):
         has_crlf = False
         has_lf = False
         has_lone_cr = False
+        content_hash = hashlib.sha256()
 
         with p.open("r", encoding="utf-8", errors="strict", newline="") as handle:
             for raw_line in handle:
+                content_hash.update(raw_line.encode("utf-8"))
                 total_lines += 1
                 if "\x00" in raw_line:
                     raise UnicodeError(f"file contains NUL bytes: {path}")
@@ -127,6 +146,7 @@ class HostFSCapability(FileSystemCapability):
                 selected.append(rendered)
                 selected_bytes += separator_size + encoded_size
                 truncated = truncated or line_truncated
+            size_bytes = int(os.fstat(handle.fileno()).st_size)
 
         if has_lone_cr or (has_crlf and has_lf):
             line_ending = "mixed"
@@ -140,21 +160,50 @@ class HostFSCapability(FileSystemCapability):
             offset=offset,
             line_count=len(selected),
             total_lines=total_lines,
-            size_bytes=int(p.stat().st_size),
+            size_bytes=size_bytes,
             has_more=has_more,
             truncated=truncated or has_more and len(selected) < min(limit, total_lines),
             line_ending=line_ending,
+            content_sha256=content_hash.hexdigest(),
         )
 
     def write_text(self, path: str, content: str) -> None:
-        p = self._resolve(path, allow_missing=True)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        self.write_text_atomic(path, content)
+
+    def write_text_atomic(
+        self,
+        path: str,
+        content: str,
+        *,
+        expected_sha256: str | None = None,
+    ) -> AtomicFileWrite:
+        """Atomically replace one UTF-8 file under a revision guard."""
+
+        if not isinstance(content, str):
+            raise TypeError("content must be a string")
+        expected = normalize_expected_sha256(expected_sha256)
+        target = self._resolve(path, allow_missing=True)
+        relative = target.relative_to(self.root)
+        key = relative.as_posix()
+        if key in {"", "."}:
+            raise IsADirectoryError(path)
+        with self._mutations.hold(key):
+            return self._replace_bytes_at(
+                relative,
+                content.encode("utf-8"),
+                expected_sha256=expected,
+            )
 
     def write_bytes(self, path: str, content: bytes) -> None:
-        p = self._resolve(path, allow_missing=True)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(content)
+        if not isinstance(content, bytes):
+            raise TypeError("content must be bytes")
+        target = self._resolve(path, allow_missing=True)
+        relative = target.relative_to(self.root)
+        key = relative.as_posix()
+        if key in {"", "."}:
+            raise IsADirectoryError(path)
+        with self._mutations.hold(key):
+            self._replace_bytes_at(relative, content, expected_sha256=None)
 
     def append_text(self, path: str, content: str) -> None:
         p = self._resolve(path, allow_missing=True)
@@ -222,6 +271,109 @@ class HostFSCapability(FileSystemCapability):
             raise PermissionError(f"path outside root: {path}") from exc
         return resolved
 
+    def _replace_bytes_at(
+        self,
+        relative: Path,
+        content: bytes,
+        *,
+        expected_sha256: str | None,
+    ) -> AtomicFileWrite:
+        """Commit bytes through one descriptor-confined parent directory."""
+
+        parent_fd, name = self._open_parent_directory(relative)
+        temp_name = f".qitos-write-{secrets.token_hex(8)}"
+        temp_fd: int | None = None
+        try:
+            previous_sha256, previous_mode = self._current_revision(parent_fd, name)
+            if expected_sha256 is not None and previous_sha256 != expected_sha256:
+                raise FileRevisionConflictError(
+                    relative.as_posix(),
+                    expected_sha256=expected_sha256,
+                    current_sha256=previous_sha256,
+                )
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            temp_fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+            view = memoryview(content)
+            while view:
+                written = os.write(temp_fd, view)
+                if written <= 0:
+                    raise OSError("atomic file write made no progress")
+                view = view[written:]
+            if previous_mode is not None:
+                os.fchmod(temp_fd, previous_mode)
+            os.fsync(temp_fd)
+            os.close(temp_fd)
+            temp_fd = None
+            os.replace(
+                temp_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        finally:
+            if temp_fd is not None:
+                os.close(temp_fd)
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(parent_fd)
+        return AtomicFileWrite(
+            path=relative.as_posix(),
+            size_bytes=len(content),
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            previous_sha256=previous_sha256,
+            created=previous_sha256 is None,
+        )
+
+    def _open_parent_directory(self, relative: Path) -> tuple[int, str]:
+        parts = tuple(part for part in relative.parts if part not in {"", "."})
+        if not parts:
+            raise IsADirectoryError(relative.as_posix())
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        current_fd = os.open(self.root, directory_flags)
+        try:
+            for part in parts[:-1]:
+                try:
+                    next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    os.mkdir(part, mode=0o755, dir_fd=current_fd)
+                    next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            return current_fd, parts[-1]
+        except BaseException:
+            os.close(current_fd)
+            raise
+
+    @staticmethod
+    def _current_revision(parent_fd: int, name: str) -> tuple[str | None, int | None]:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            file_fd = os.open(name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return None, None
+        try:
+            info = os.fstat(file_fd)
+            if not stat_module.S_ISREG(info.st_mode):
+                raise IsADirectoryError(name)
+            content_hash = hashlib.sha256()
+            while True:
+                chunk = os.read(file_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                content_hash.update(chunk)
+            return content_hash.hexdigest(), stat_module.S_IMODE(info.st_mode)
+        finally:
+            os.close(file_fd)
+
 
 class HostCommandCapability(CommandCapability):
     def __init__(
@@ -232,6 +384,77 @@ class HostCommandCapability(CommandCapability):
     ):
         self.cwd = str(Path(cwd).resolve())
         self._env = dict(env) if env is not None else None
+        self._managed: ManagedHostProcessRuntime | None = None
+
+    def _managed_runtime(self) -> ManagedHostProcessRuntime:
+        runtime = self._managed
+        if runtime is None:
+            runtime = ManagedHostProcessRuntime(self.cwd, env=self._env)
+            self._managed = runtime
+        return runtime
+
+    async def arun(self, command: str, timeout: float = 30) -> Dict[str, Any]:
+        if not command or not command.strip():
+            return {"status": "error", "error": "empty command"}
+        try:
+            result = await run_process(
+                shell_command=command,
+                cwd=self.cwd,
+                env=self._env,
+                timeout=float(timeout),
+            )
+            return {
+                "status": "success" if result.returncode == 0 else "partial",
+                "returncode": result.returncode,
+                "stdout": result.stdout.decode("utf-8", errors="replace"),
+                "stderr": result.stderr.decode("utf-8", errors="replace"),
+                "cwd": self.cwd,
+                "command": command,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "status": "error",
+                "error": f"command timed out after {timeout} seconds",
+                "command": command,
+                "cwd": self.cwd,
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": str(exc),
+                "command": command,
+                "cwd": self.cwd,
+            }
+
+    async def arun_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float = 30,
+        cwd: str | None = None,
+        stdin: bytes | None = None,
+    ) -> Dict[str, Any]:
+        args = [str(item) for item in argv]
+        if not args or not args[0].strip():
+            raise ValueError("argv must contain a non-empty executable")
+        effective_cwd = self._resolve_cwd(cwd)
+        result = await run_process(
+            argv=args,
+            cwd=effective_cwd,
+            env=self._env,
+            stdin=stdin,
+            timeout=float(timeout),
+        )
+        return {
+            "status": "success" if result.returncode == 0 else "partial",
+            "returncode": result.returncode,
+            "stdout": result.stdout.decode("utf-8", errors="replace"),
+            "stderr": result.stderr.decode("utf-8", errors="replace"),
+            "cwd": effective_cwd,
+            "argv": args,
+        }
 
     def run(self, command: str, timeout: int = 30) -> Dict[str, Any]:
         if not command or not command.strip():
@@ -307,39 +530,86 @@ class HostCommandCapability(CommandCapability):
             raise PermissionError(f"cwd outside command root: {cwd}") from exc
         return str(candidate)
 
-    def start(
+    async def astart(
         self,
         command: str,
         *,
+        owner_run_id: str,
         cwd: str | None = None,
-        stdout_path: str | None = None,
-    ) -> Dict[str, Any]:
-        if not command or not command.strip():
-            raise ValueError("command cannot be empty")
+        tty: bool = False,
+        journal: SessionJournal | None = None,
+        terminal_notifier: ProcessTerminalNotifier | None = None,
+    ) -> ProcessSnapshot:
         effective_cwd = self._resolve_cwd(cwd)
-        relative_log = stdout_path or f".qitos/background/{uuid.uuid4().hex}.log"
-        log_path = HostFSCapability(self.cwd)._resolve(
-            relative_log,
-            allow_missing=True,
+        return await self._managed_runtime().start(
+            command,
+            owner_run_id=owner_run_id,
+            cwd=effective_cwd,
+            tty=tty,
+            journal=journal,
+            terminal_notifier=terminal_notifier,
         )
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("wb") as output:
-            process = subprocess.Popen(
-                command,
-                cwd=effective_cwd,
-                shell=True,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                env=self._env,
-            )
-        return {
-            "status": "success",
-            "command": command,
-            "pid": process.pid,
-            "stdout_path": str(log_path.relative_to(Path(self.cwd))),
-            "cwd": effective_cwd,
-        }
+
+    async def apoll(self, handle: ProcessHandle) -> ProcessSnapshot:
+        return await self._managed_runtime().poll(handle)
+
+    async def aread(
+        self,
+        handle: ProcessHandle,
+        *,
+        cursor: int = 0,
+        wait_seconds: float = 0.0,
+    ) -> ProcessSnapshot:
+        return await self._managed_runtime().read(
+            handle,
+            cursor=cursor,
+            wait_seconds=wait_seconds,
+        )
+
+    async def awrite(
+        self,
+        handle: ProcessHandle,
+        data: str,
+    ) -> ProcessSnapshot:
+        return await self._managed_runtime().write(handle, data)
+
+    async def await_process(
+        self,
+        handle: ProcessHandle,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> ProcessSnapshot:
+        return await self._managed_runtime().wait(
+            handle,
+            deadline_monotonic=deadline_monotonic,
+        )
+
+    async def aterminate(self, handle: ProcessHandle) -> ProcessSnapshot:
+        return await self._managed_runtime().terminate(handle)
+
+    async def alist(
+        self,
+        *,
+        owner_run_id: str | None = None,
+    ) -> tuple[ProcessSnapshot, ...]:
+        return await self._managed_runtime().list(owner_run_id=owner_run_id)
+
+    async def arecover(
+        self,
+        *,
+        owner_run_id: str,
+        journal: SessionJournal,
+    ) -> tuple[ProcessSnapshot, ...]:
+        return await self._managed_runtime().recover(
+            owner_run_id=owner_run_id,
+            journal=journal,
+        )
+
+    async def aclose(self) -> None:
+        runtime = self._managed
+        self._managed = None
+        if runtime is not None:
+            await runtime.close()
 
 
 def _truncate_utf8(text: str, max_bytes: int) -> tuple[str, bool]:
@@ -437,6 +707,10 @@ class HostEnv(Env):
             return self.cmd
         return None
 
+    async def ateardown(self) -> None:
+        await self.cmd.aclose()
+        self.close()
+
     def supports_action(self, action: Any) -> bool:
         name = self._to_action_name(action)
         return name in {
@@ -455,13 +729,29 @@ class HostEnv(Env):
         try:
             if name == "read_file":
                 path = str(args.get("path") or args.get("filename") or "")
-                content = self.fs.read_text(path)
-                return {"status": "success", "path": path, "content": content}
+                raw = self.fs.read_bytes(path)
+                content = raw.decode("utf-8", errors="strict")
+                return {
+                    "status": "success",
+                    "path": path,
+                    "content": content,
+                    "content_sha256": hashlib.sha256(raw).hexdigest(),
+                }
             if name == "write_file":
                 path = str(args.get("path") or args.get("filename") or "")
                 content = str(args.get("content", ""))
-                self.fs.write_text(path, content)
-                return {"status": "success", "path": path, "size": len(content)}
+                write = self.fs.write_text_atomic(
+                    path,
+                    content,
+                    expected_sha256=args.get("expected_sha256"),
+                )
+                return {
+                    "status": "success",
+                    "path": path,
+                    "size": write.size_bytes,
+                    "content_sha256": write.content_sha256,
+                    "previous_sha256": write.previous_sha256,
+                }
             if name == "list_files":
                 path = str(args.get("path", "."))
                 files = self.fs.list_files(path=path, limit=int(args.get("limit", 200)))
@@ -483,20 +773,38 @@ class HostEnv(Env):
                     old_text=str(args.get("old_text", "")),
                     new_text=str(args.get("new_text", "")),
                     replace_all=bool(args.get("replace_all", False)),
+                    expected_sha256=args.get("expected_sha256"),
                 )
             if name == "run_command":
                 return self.cmd.run(
                     str(args.get("command", "")), timeout=int(args.get("timeout", 30))
                 )
             return {"status": "error", "error": f"unsupported action: {name}"}
+        except FileRevisionConflictError as exc:
+            self._last_error = str(exc)
+            return {
+                "status": "error",
+                "error": str(exc),
+                "error_category": "file_revision_conflict",
+                "path": exc.path,
+                "expected_sha256": exc.expected_sha256,
+                "current_sha256": exc.current_sha256,
+            }
         except Exception as exc:
             self._last_error = str(exc)
             return {"status": "error", "error": str(exc), "action": name}
 
     def _edit_file(
-        self, path: str, old_text: str, new_text: str, replace_all: bool
+        self,
+        path: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool,
+        expected_sha256: str | None = None,
     ) -> Dict[str, Any]:
-        text = self.fs.read_text(path)
+        raw = self.fs.read_bytes(path)
+        text = raw.decode("utf-8", errors="strict")
+        current_sha256 = hashlib.sha256(raw).hexdigest()
         if not old_text:
             return {"status": "error", "error": "old_text cannot be empty", "path": path}
         count = text.count(old_text)
@@ -510,11 +818,17 @@ class HostEnv(Env):
                 "occurrences": count,
             }
         updated = text.replace(old_text, new_text, -1 if replace_all else 1)
-        self.fs.write_text(path, updated)
+        write = self.fs.write_text_atomic(
+            path,
+            updated,
+            expected_sha256=expected_sha256 or current_sha256,
+        )
         return {
             "status": "success",
             "path": path,
             "replacements": count if replace_all else 1,
+            "previous_sha256": write.previous_sha256,
+            "content_sha256": write.content_sha256,
         }
 
     def _grep_file(self, path: str, pattern: str, limit: int = 50) -> Dict[str, Any]:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Sequence
+
+import pytest
 
 from qitos.core.action import Action, ActionStatus
 from qitos.core.env import CommandCapability
@@ -20,6 +23,9 @@ class _RecordingProcess(CommandCapability):
 
     def run(self, command: str, timeout: int = 30) -> Dict[str, Any]:
         raise AssertionError(f"search tools must not use shell strings: {command}")
+
+    async def arun(self, command: str, timeout: int = 30) -> Dict[str, Any]:
+        return self.run(command, timeout=timeout)
 
     def run_argv(
         self,
@@ -53,6 +59,21 @@ class _RecordingProcess(CommandCapability):
             "stdout": stdout,
             "stderr": "",
         }
+
+    async def arun_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: int = 30,
+        cwd: str | None = None,
+        stdin: bytes | None = None,
+    ) -> Dict[str, Any]:
+        return self.run_argv(
+            argv,
+            timeout=timeout,
+            cwd=cwd,
+            stdin=stdin,
+        )
 
 
 class _StaticProcess(_RecordingProcess):
@@ -96,7 +117,8 @@ def _tool_context(tmp_path: Path, process: CommandCapability) -> Dict[str, Any]:
     }
 
 
-def test_coding_tools_use_selected_environment_instead_of_local_fallback(
+@pytest.mark.asyncio
+async def test_coding_tools_use_selected_environment_instead_of_local_fallback(
     tmp_path: Path,
 ) -> None:
     local = tmp_path / "local"
@@ -122,19 +144,22 @@ def test_coding_tools_use_selected_environment_instead_of_local_fallback(
     }
     tools = CodingToolSet(workspace_root=str(local), include_notebook=False)
 
-    read = tools.read_file.execute({"path": "src/a.py"}, runtime_context=context)
-    glob = tools.glob.execute(
+    read = await tools.read_file.execute(
+        {"path": "src/a.py"}, runtime_context=context
+    )
+    glob = await tools.glob.execute(
         {"pattern": "*.py", "path": "src"}, runtime_context=context
     )
-    grep = tools.grep.execute(
+    grep = await tools.grep.execute(
         {"pattern": "remote", "path": "src"}, runtime_context=context
     )
-    write = tools.write_file.execute(
+    write = await tools.write_file.execute(
         {"path": "src/new.txt", "content": "created remotely"},
         runtime_context=context,
     )
 
     assert read["content"] == "remote value"
+    assert read["content_sha256"] == hashlib.sha256(b"remote value\n").hexdigest()
     assert glob["files"] == ["src/a.py"]
     assert grep["matches"] == [
         {"path": "src/a.py", "line": 1, "text": "remote value"}
@@ -148,7 +173,47 @@ def test_coding_tools_use_selected_environment_instead_of_local_fallback(
     assert all(call[1] == "src" for call in process.calls)
 
 
-def test_canonical_tools_preserve_offsets_replace_all_and_match_paths(
+@pytest.mark.asyncio
+async def test_canonical_write_uses_read_revision_as_compare_and_swap(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "demo.txt"
+    target.write_text("first\n", encoding="utf-8")
+    process = _RecordingProcess()
+    context = _tool_context(tmp_path, process)
+    tools = CodingToolSet(workspace_root=str(tmp_path), include_notebook=False)
+
+    read = await tools.read_file.execute(
+        {"path": "demo.txt"},
+        runtime_context=context,
+    )
+    replaced = await tools.write_file.execute(
+        {
+            "path": "demo.txt",
+            "content": "second\n",
+            "expected_sha256": read["content_sha256"],
+        },
+        runtime_context=context,
+    )
+    stale = await tools.write_file.execute(
+        {
+            "path": "demo.txt",
+            "content": "stale\n",
+            "expected_sha256": read["content_sha256"],
+        },
+        runtime_context=context,
+    )
+
+    assert replaced["status"] == "success"
+    assert replaced["previous_sha256"] == read["content_sha256"]
+    assert stale["status"] == "error"
+    assert stale["error_category"] == "file_revision_conflict"
+    assert stale["current_sha256"] == replaced["content_sha256"]
+    assert target.read_text(encoding="utf-8") == "second\n"
+
+
+@pytest.mark.asyncio
+async def test_canonical_tools_preserve_offsets_replace_all_and_match_paths(
     tmp_path: Path,
 ) -> None:
     (tmp_path / "src").mkdir()
@@ -173,11 +238,11 @@ def test_canonical_tools_preserve_offsets_replace_all_and_match_paths(
         include_notebook=False,
     )
 
-    read = tools.read_file.execute(
+    read = await tools.read_file.execute(
         {"path": "src/a.py", "line_offset": 2, "line_count": 2},
         runtime_context=context,
     )
-    edit = tools.edit_file.execute(
+    edit = await tools.edit_file.execute(
         {
             "path": "src/a.py",
             "old_text": "remote",
@@ -186,11 +251,11 @@ def test_canonical_tools_preserve_offsets_replace_all_and_match_paths(
         },
         runtime_context=context,
     )
-    grep = tools.grep.execute(
+    grep = await tools.grep.execute(
         {"pattern": "remote", "path": "src"},
         runtime_context=context,
     )
-    files = tools.grep.execute(
+    files = await tools.grep.execute(
         {
             "pattern": "remote",
             "path": "src",
@@ -209,7 +274,8 @@ def test_canonical_tools_preserve_offsets_replace_all_and_match_paths(
     assert files["matches"] == [{"path": "src/a.py"}]
 
 
-def test_search_tools_use_nul_paths_stable_order_and_explicit_visibility(
+@pytest.mark.asyncio
+async def test_search_tools_use_nul_paths_stable_order_and_explicit_visibility(
     tmp_path: Path,
 ) -> None:
     process = _StaticProcess(
@@ -226,7 +292,7 @@ def test_search_tools_use_nul_paths_stable_order_and_explicit_visibility(
         allow_local_fallback=False,
     )
 
-    result = tools.glob.execute(
+    result = await tools.glob.execute(
         {
             "pattern": "*.py",
             "include_hidden": True,
@@ -247,7 +313,10 @@ def test_search_tools_use_nul_paths_stable_order_and_explicit_visibility(
     assert argv[-1] == "."
 
 
-def test_search_limits_are_strict_and_do_not_start_process(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_search_limits_are_strict_and_do_not_start_process(
+    tmp_path: Path,
+) -> None:
     process = _RecordingProcess()
     tools = CodingToolSet(
         workspace_root=str(tmp_path),
@@ -256,15 +325,15 @@ def test_search_limits_are_strict_and_do_not_start_process(tmp_path: Path) -> No
     )
     context = _tool_context(tmp_path, process)
 
-    low = tools.glob.execute(
+    low = await tools.glob.execute(
         {"pattern": "*.py", "limit": 0},
         runtime_context=context,
     )
-    high = tools.grep.execute(
+    high = await tools.grep.execute(
         {"pattern": "value", "limit": 2001},
         runtime_context=context,
     )
-    missing = tools.grep.execute(
+    missing = await tools.grep.execute(
         {"pattern": "value", "path": "missing"},
         runtime_context=context,
     )
@@ -278,7 +347,8 @@ def test_search_limits_are_strict_and_do_not_start_process(tmp_path: Path) -> No
     assert process.calls == []
 
 
-def test_grep_returns_sorted_matches_and_context_records(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_grep_returns_sorted_matches_and_context_records(tmp_path: Path) -> None:
     def event(kind: str, path: str, line: int, text: str) -> str:
         return json.dumps(
             {
@@ -313,7 +383,7 @@ def test_grep_returns_sorted_matches_and_context_records(tmp_path: Path) -> None
         allow_local_fallback=False,
     )
 
-    result = tools.grep.execute(
+    result = await tools.grep.execute(
         {
             "pattern": "needle",
             "context": 1,
@@ -346,7 +416,8 @@ def test_grep_returns_sorted_matches_and_context_records(tmp_path: Path) -> None
     assert argv[-3:] == ["--", "needle", "."]
 
 
-def test_search_distinguishes_empty_errors_and_timeout(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_search_distinguishes_empty_errors_and_timeout(tmp_path: Path) -> None:
     tools = CodingToolSet(
         workspace_root=str(tmp_path),
         include_notebook=False,
@@ -372,15 +443,15 @@ def test_search_distinguishes_empty_errors_and_timeout(tmp_path: Path) -> None:
         error=subprocess.TimeoutExpired(["rg"], timeout=30)
     )
 
-    empty = tools.grep.execute(
+    empty = await tools.grep.execute(
         {"pattern": "missing"},
         runtime_context=_tool_context(tmp_path, empty_process),
     )
-    failed = tools.grep.execute(
+    failed = await tools.grep.execute(
         {"pattern": "["},
         runtime_context=_tool_context(tmp_path, failed_process),
     )
-    timed_out = tools.glob.execute(
+    timed_out = await tools.glob.execute(
         {"pattern": "*.py"},
         runtime_context=_tool_context(tmp_path, timeout_process),
     )
@@ -410,7 +481,8 @@ def test_canonical_read_returns_structured_tool_error(tmp_path: Path) -> None:
     }
 
 
-def test_executor_promotes_structured_tool_failure_to_action_error(
+@pytest.mark.asyncio
+async def test_executor_promotes_structured_tool_failure_to_action_error(
     tmp_path: Path,
 ) -> None:
     env = CapabilityEnv(
@@ -431,9 +503,11 @@ def test_executor_promotes_structured_tool_failure_to_action_error(
         namespace="",
     )
 
-    result = ActionExecutor(registry).execute(
-        [Action(name="read_file", args={"path": "missing.txt"})],
-        env=env,
+    result = (
+        await ActionExecutor(registry).execute(
+            [Action(name="read_file", args={"path": "missing.txt"})],
+            env=env,
+        )
     )[0]
 
     assert result.status is ActionStatus.ERROR

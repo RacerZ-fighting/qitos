@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import os
 import shlex
 import sys
 from pathlib import Path
+
+import pytest
 
 from qitos.kit.env.host_env import HostCommandCapability
 from qitos.kit.tool.shell import RunCommand
@@ -32,7 +33,8 @@ def test_host_command_uses_inherited_environment_by_default(
     assert result["stdout"].strip() == "from-parent"
 
 
-def test_explicit_environment_reaches_all_host_command_paths(
+@pytest.mark.asyncio
+async def test_explicit_environment_reaches_all_host_command_paths(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -47,21 +49,23 @@ def test_explicit_environment_reaches_all_host_command_paths(
     shell_result = capability.run(
         shlex.join(_print_environment(inherited_name))
     )
-    background = capability.start(
+    background = await capability.astart(
         shlex.join(_print_environment(configured_name)),
-        stdout_path="background.log",
+        owner_run_id="environment-test",
     )
-    _, wait_status = os.waitpid(background["pid"], 0)
+    terminal = await capability.await_process(background.handle)
 
-    assert os.waitstatus_to_exitcode(wait_status) == 0
+    assert terminal.exit_code == 0
     assert argv_result["stdout"].strip() == "configured"
     assert shell_result["stdout"].strip() == "<missing>"
-    assert (tmp_path / "background.log").read_text(encoding="utf-8").strip() == (
-        "configured"
-    )
+    assert (tmp_path / terminal.output.log_path).read_text(
+        encoding="utf-8"
+    ).strip() == "configured"
+    await capability.aclose()
 
 
-def test_run_command_accepts_an_explicit_process_environment(
+@pytest.mark.asyncio
+async def test_run_command_accepts_an_explicit_process_environment(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -73,10 +77,10 @@ def test_run_command_accepts_an_explicit_process_environment(
         process_env={configured_name: "configured"},
     )
 
-    configured_result = tool.execute(
+    configured_result = await tool.execute(
         {"command": shlex.join(_print_environment(configured_name))}
     )
-    filtered_result = tool.execute(
+    filtered_result = await tool.execute(
         {"command": shlex.join(_print_environment(inherited_name))}
     )
 

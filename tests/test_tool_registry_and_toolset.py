@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from typing import Any
 
 import pytest
@@ -81,7 +83,7 @@ def test_tool_registry_include_and_toolset_lifecycle(tmp_path):
     result = Engine(
         agent=_Agent(tool_registry=registry), budget=RuntimeBudget(max_steps=2)
     ).run("x")
-    assert result.state.stop_reason == "final"
+    assert result.state.stop_reason == "completed"
     assert events == ["setup", "teardown"]
 
     editor = ToolRegistry()
@@ -97,6 +99,104 @@ def test_tool_registry_include_and_toolset_lifecycle(tmp_path):
     )
     assert "read_file" in editor.list_tools()
     assert "edit_file" in editor.list_tools()
+
+
+@pytest.mark.asyncio
+async def test_tool_registry_awaits_native_async_lifecycle_hooks() -> None:
+    loop = asyncio.get_running_loop()
+    event_loop_thread = threading.get_ident()
+    events: list[tuple[str, int]] = []
+
+    class AsyncLifecycleTool(BaseTool):
+        def __init__(self) -> None:
+            super().__init__(ToolSpec(name="async_lifecycle", description="test"))
+
+        async def asetup(self, context: dict[str, Any]) -> None:
+            assert asyncio.get_running_loop() is loop
+            events.append(("tool.setup", threading.get_ident()))
+
+        async def execute(
+            self,
+            args: dict[str, Any],
+            runtime_context: dict[str, Any] | None = None,
+        ) -> str:
+            _ = args, runtime_context
+            return "ok"
+
+        async def aclose(self) -> None:
+            assert asyncio.get_running_loop() is loop
+            events.append(("tool.close", threading.get_ident()))
+
+    class LegacyToolSet:
+        name = "legacy"
+        version = "1"
+
+        def setup(self, context: dict[str, Any]) -> None:
+            events.append(("toolset.setup", threading.get_ident()))
+
+        def teardown(self, context: dict[str, Any]) -> None:
+            events.append(("toolset.teardown", threading.get_ident()))
+
+        def tools(self) -> list[BaseTool]:
+            return []
+
+    registry = ToolRegistry()
+    registry.register(AsyncLifecycleTool())
+    registry.register_toolset(LegacyToolSet())
+
+    await registry.asetup({"run_id": "run"})
+    await registry.ateardown({"run_id": "run"})
+
+    assert [event for event, _ in events] == [
+        "tool.setup",
+        "toolset.setup",
+        "tool.close",
+        "toolset.teardown",
+    ]
+    assert events[0][1] == event_loop_thread
+    assert events[2][1] == event_loop_thread
+    assert events[1][1] != event_loop_thread
+    assert events[3][1] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_tool_exposure_freezes_spec_but_keeps_one_handler_owner() -> None:
+    class StatefulTool(BaseTool):
+        def __init__(self) -> None:
+            self.calls = 0
+            super().__init__(
+                ToolSpec(
+                    name="stateful",
+                    description="stateful fixture",
+                    timeout_s=3.0,
+                )
+            )
+
+        async def execute(
+            self,
+            args: dict[str, Any],
+            runtime_context: dict[str, Any] | None = None,
+        ) -> int:
+            _ = args, runtime_context
+            self.calls += 1
+            return self.calls
+
+    handler = StatefulTool()
+    registry = ToolRegistry().register(handler)
+    exposure = registry.freeze()
+    handler.spec.timeout_s = 9.0
+
+    first = exposure.get("stateful")
+    second = exposure.get("stateful")
+
+    assert first is not None
+    assert second is not None
+    assert first.spec.timeout_s == 3.0
+    first.spec.timeout_s = 1.0
+    assert second.spec.timeout_s == 3.0
+    assert await first.execute({}) == 1
+    assert await second.execute({}) == 2
+    assert handler.calls == 2
 
 
 def test_register_name_override_does_not_mutate_source_tool(tmp_path):
@@ -222,17 +322,18 @@ def test_tool_package_does_not_export_uncurated_cyber_toolsets():
     assert "PasswordToolSet" not in exported
 
 
-def test_new_tool_domains_and_toolset_surface_are_importable(tmp_path):
+@pytest.mark.asyncio
+async def test_new_tool_domains_and_toolset_surface_are_importable(tmp_path):
     sample = tmp_path / "demo.txt"
     sample.write_text("hello\n", encoding="utf-8")
 
     read_file = ReadFile(workspace_root=str(tmp_path))
-    out = read_file.execute({"path": "demo.txt"})
+    out = await read_file.execute({"path": "demo.txt"})
     assert out["status"] == "success"
     assert "hello" in out["content"]
 
     glob = Glob(workspace_root=str(tmp_path))
-    glob_out = glob.execute({"pattern": "*.txt"})
+    glob_out = await glob.execute({"pattern": "*.txt"})
     assert glob_out["status"] == "success"
     assert glob_out["files"] == ["demo.txt"]
 
@@ -319,7 +420,7 @@ def test_agent_module_can_be_initialized_with_toolset_list(tmp_path):
             return state
 
     result = Engine(agent=_ToolsetAgent(), budget=RuntimeBudget(max_steps=2)).run("x")
-    assert result.state.stop_reason == "final"
+    assert result.state.stop_reason == "completed"
 
 
 def test_computer_use_toolset_atomic_tools_are_callable() -> None:

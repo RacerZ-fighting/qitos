@@ -39,7 +39,12 @@ from .browser import (
     ArchiveSearch,
 )
 from .library import InMemoryToolLibrary, ToolArtifact, BaseToolLibrary
-from .skill import BundledSkillSnapshot, SkillToolSet
+from .skill import (
+    BundledSkillDiagnostic,
+    BundledSkillDiagnosticCode,
+    BundledSkillSnapshot,
+    SkillToolSet,
+)
 from .workspace_aware import WorkspaceAwareMixin
 from .tools import (
     math_tools,
@@ -93,6 +98,8 @@ __all__ = [
     "InMemoryToolLibrary",
     "ToolArtifact",
     "BaseToolLibrary",
+    "BundledSkillDiagnostic",
+    "BundledSkillDiagnosticCode",
     "BundledSkillSnapshot",
     "SkillToolSet",
     "WorkspaceAwareMixin",

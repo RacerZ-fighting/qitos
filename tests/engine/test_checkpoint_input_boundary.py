@@ -16,7 +16,7 @@ from qitos.core.history import HistoryMessage, HistorySnapshot
 from qitos.engine import RuntimeBudget
 from qitos.kit.history import WindowHistory
 from qitos.kit.parser import ReActTextParser
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos.trace import TraceWriter
 
 
@@ -94,16 +94,13 @@ class _BlockingModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        _ = request
         self.calls += 1
         self.entered.set()
         await self.release.wait()
-        yield ModelStreamChunk(text="Final Answer: resumed", done=True)
+        yield ModelStreamEvent(text="Final Answer: resumed", type=ModelStreamEventType.COMPLETED)
 
 
 class _FailingModel(Model):
@@ -114,18 +111,18 @@ class _FailingModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        _ = request
         self.calls += 1
         if self.observe is not None:
             await self.observe()
         raise RuntimeError("provider failed before producing a response")
         if False:  # pragma: no cover
-            yield ModelStreamChunk()
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.LIFECYCLE,
+                event_type="unreachable",
+            )
 
 
 class _FinalModel(Model):
@@ -136,14 +133,11 @@ class _FinalModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        _ = request
         self.calls += 1
-        yield ModelStreamChunk(text=f"Final Answer: {self.answer}", done=True)
+        yield ModelStreamEvent(text=f"Final Answer: {self.answer}", type=ModelStreamEventType.COMPLETED)
 
 
 @pytest.mark.asyncio

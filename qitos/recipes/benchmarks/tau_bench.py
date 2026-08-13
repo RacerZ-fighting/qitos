@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import tempfile
@@ -111,13 +112,13 @@ class TauActionTool:
                     )
                 )
 
-            def execute(
+            async def execute(
                 self,
                 args: Dict[str, Any],
                 runtime_context: Optional[Dict[str, Any]] = None,
             ) -> Dict[str, Any]:
                 _ = runtime_context
-                return runner(name, dict(args))
+                return await asyncio.to_thread(runner, name, dict(args))
 
         self.impl = _Impl()
 

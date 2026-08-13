@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
 import shlex
 import subprocess
 import threading
-import uuid
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterator, Optional, Sequence
 
 from qitos.core.env import (
+    AtomicFileWrite,
     CommandCapability,
+    FileRevisionConflictError,
     FileStat,
     FileSystemCapability,
     TextFileChunk,
+)
+from qitos.kit.env._async_process import run_process
+from qitos.kit.env._file_mutation import (
+    FileMutationQueue,
+    normalize_expected_sha256,
 )
 from qitos.kit.env.host_env import HostEnv
 
@@ -28,6 +36,77 @@ class DockerCommandCapability(CommandCapability):
     def __init__(self, container: str, workdir: str = "/workspace"):
         self.container = container
         self.workdir = workdir
+
+    async def arun(self, command: str, timeout: float = 30) -> Dict[str, Any]:
+        if not command or not command.strip():
+            return {"status": "error", "error": "empty command"}
+        docker_cmd = [
+            "docker",
+            "exec",
+            "-w",
+            self.workdir,
+            self.container,
+            "sh",
+            "-lc",
+            command,
+        ]
+        try:
+            result = await run_process(argv=docker_cmd, timeout=float(timeout))
+            return {
+                "status": "success" if result.returncode == 0 else "partial",
+                "returncode": result.returncode,
+                "stdout": result.stdout.decode("utf-8", errors="replace"),
+                "stderr": result.stderr.decode("utf-8", errors="replace"),
+                "command": command,
+                "container": self.container,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "status": "error",
+                "error": f"command timed out after {timeout} seconds",
+                "command": command,
+                "container": self.container,
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": str(exc),
+                "command": command,
+                "container": self.container,
+            }
+
+    async def arun_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: float = 30,
+        cwd: str | None = None,
+        stdin: bytes | None = None,
+    ) -> Dict[str, Any]:
+        args = [str(item) for item in argv]
+        if not args or not args[0].strip():
+            raise ValueError("argv must contain a non-empty executable")
+        workdir = self.workdir if cwd is None else _docker_scoped_path(self.workdir, cwd)
+        docker_argv = ["docker", "exec"]
+        if stdin is not None:
+            docker_argv.append("-i")
+        docker_argv.extend(["-w", workdir, self.container, *args])
+        result = await run_process(
+            argv=docker_argv,
+            stdin=stdin,
+            timeout=float(timeout),
+        )
+        return {
+            "status": "success" if result.returncode == 0 else "partial",
+            "returncode": result.returncode,
+            "stdout": result.stdout.decode("utf-8", errors="replace"),
+            "stderr": result.stderr.decode("utf-8", errors="replace"),
+            "argv": args,
+            "container": self.container,
+            "cwd": workdir,
+        }
 
     def run(self, command: str, timeout: int = 30) -> Dict[str, Any]:
         if not command or not command.strip():
@@ -93,56 +172,13 @@ class DockerCommandCapability(CommandCapability):
             "cwd": workdir,
         }
 
-    def start(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        stdout_path: str | None = None,
-    ) -> Dict[str, Any]:
-        if not command or not command.strip():
-            raise ValueError("command cannot be empty")
-        workdir = self.workdir if cwd is None else _docker_scoped_path(self.workdir, cwd)
-        relative_log = stdout_path or f".qitos/background/{uuid.uuid4().hex}.log"
-        log_path = _docker_scoped_path(self.workdir, relative_log)
-        shell_command = (
-            f"mkdir -p -- {shlex.quote(str(PurePosixPath(log_path).parent))} && "
-            f"({command}) > {shlex.quote(log_path)} 2>&1 & echo $!"
-        )
-        result = _run(
-            [
-                "docker",
-                "exec",
-                "-w",
-                workdir,
-                self.container,
-                "sh",
-                "-lc",
-                shell_command,
-            ]
-        )
-        if result.returncode != 0:
-            return {
-                "status": "error",
-                "error": result.stderr or "failed to start background command",
-                "command": command,
-                "container": self.container,
-            }
-        return {
-            "status": "success",
-            "command": command,
-            "pid": int(result.stdout.strip()),
-            "stdout_path": _relative_docker_path(self.workdir, log_path),
-            "container": self.container,
-            "cwd": workdir,
-        }
-
 
 class DockerFSCapability(FileSystemCapability):
     def __init__(self, container: str, workdir: str = "/workspace"):
         self.container = container
         self.workdir = workdir.rstrip("/") or "/workspace"
         self.cmd = DockerCommandCapability(container=container, workdir=workdir)
+        self._mutations = FileMutationQueue()
 
     def resolve_path(self, path: str, *, allow_missing: bool = False) -> str:
         inner = self._inner_path(path)
@@ -231,6 +267,12 @@ class DockerFSCapability(FileSystemCapability):
         if not info.is_file:
             raise IsADirectoryError(path)
         inner = self.resolve_path(path)
+        digest_result = self.cmd.run_argv(["sha256sum", "--", inner])
+        if int(digest_result.get("returncode", 1)) != 0:
+            raise RuntimeError(
+                str(digest_result.get("stderr", "failed to hash file"))
+            )
+        content_sha256 = str(digest_result.get("stdout", "")).split(maxsplit=1)[0]
         if info.size > 0:
             text_probe = self.cmd.run(
                 f"LC_ALL=C grep -Iq -- '' {shlex.quote(inner)}"
@@ -289,25 +331,101 @@ class DockerFSCapability(FileSystemCapability):
             has_more=has_more,
             truncated=line_truncated or byte_truncated,
             line_ending=line_ending,
+            content_sha256=content_sha256,
         )
 
     def write_text(self, path: str, content: str) -> None:
-        self.write_bytes(path, content.encode("utf-8"))
+        self.write_text_atomic(path, content)
+
+    def write_text_atomic(
+        self,
+        path: str,
+        content: str,
+        *,
+        expected_sha256: str | None = None,
+    ) -> AtomicFileWrite:
+        """Atomically replace one UTF-8 file inside the container workspace."""
+
+        if not isinstance(content, str):
+            raise TypeError("content must be a string")
+        return self._write_bytes_atomic(
+            path,
+            content.encode("utf-8"),
+            expected_sha256=normalize_expected_sha256(expected_sha256),
+        )
 
     def write_bytes(self, path: str, content: bytes) -> None:
+        if not isinstance(content, bytes):
+            raise TypeError("content must be bytes")
+        self._write_bytes_atomic(path, content, expected_sha256=None)
+
+    def _write_bytes_atomic(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_sha256: str | None,
+    ) -> AtomicFileWrite:
         inner = self.resolve_path(path, allow_missing=True)
-        parent_result = self.cmd.run_argv(
-            ["mkdir", "-p", "--", str(PurePosixPath(inner).parent)]
-        )
-        if int(parent_result.get("returncode", 1)) != 0:
-            raise RuntimeError(
-                str(parent_result.get("stderr", "failed to create parent directory"))
+        relative = _relative_docker_path(self.workdir, inner)
+        if relative in {"", "."}:
+            raise IsADirectoryError(path)
+        script = """
+set -eu
+target=$1
+expected=$2
+parent=${target%/*}
+mkdir -p -- "$parent"
+current=
+if [ -e "$target" ]; then
+  current=$(sha256sum -- "$target")
+  current=${current%% *}
+fi
+if [ -n "$expected" ] && [ "$current" != "$expected" ]; then
+  printf 'QITOS_CONFLICT:%s' "$current" >&2
+  exit 73
+fi
+temporary=$(mktemp "$parent/.qitos-write.XXXXXX")
+trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+cat > "$temporary"
+if [ -e "$target" ]; then
+  chmod --reference="$target" "$temporary" 2>/dev/null || true
+fi
+mv -f -- "$temporary" "$target"
+trap - EXIT HUP INT TERM
+printf '%s' "$current"
+""".strip()
+        with self._mutations.hold(relative):
+            result = self.cmd.run_argv(
+                [
+                    "sh",
+                    "-c",
+                    script,
+                    "qitos-atomic-write",
+                    inner,
+                    expected_sha256 or "",
+                ],
+                stdin=content,
             )
-        result = self.cmd.run_argv(
-            ["dd", f"of={inner}", "status=none"], stdin=content
+        returncode = int(result.get("returncode", 1))
+        stderr = str(result.get("stderr", ""))
+        if returncode == 73 and stderr.startswith("QITOS_CONFLICT:"):
+            current = stderr.removeprefix("QITOS_CONFLICT:").strip() or None
+            raise FileRevisionConflictError(
+                relative,
+                expected_sha256=expected_sha256 or "",
+                current_sha256=current,
+            )
+        if returncode != 0:
+            raise RuntimeError(stderr or "failed to atomically write file")
+        previous_sha256 = str(result.get("stdout", "")).strip() or None
+        return AtomicFileWrite(
+            path=relative,
+            size_bytes=len(content),
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            previous_sha256=previous_sha256,
+            created=previous_sha256 is None,
         )
-        if int(result.get("returncode", 1)) != 0:
-            raise RuntimeError(str(result.get("stderr", "failed to write file")))
 
     def append_text(self, path: str, content: str) -> None:
         inner = self.resolve_path(path, allow_missing=True)

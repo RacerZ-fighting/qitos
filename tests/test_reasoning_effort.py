@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from qitos.harness import build_model_for_preset, resolve_reasoning
-from qitos.models import AnthropicModel
+from qitos.models import AnthropicModel, ModelRequest
 
 
 class _AsyncStream(AsyncIterator[Any]):
@@ -29,8 +29,16 @@ class _AsyncStream(AsyncIterator[Any]):
 
 
 async def _drain(model: Any) -> list[Any]:
+    request = ModelRequest(
+        run_id="reasoning-test",
+        transaction_id="reasoning-test:0",
+        provider=model.provider_name,
+        model=model.model,
+        protocol=model.capabilities.api.value,
+        messages=({"role": "user", "content": "answer"},),
+    )
     return [
-        chunk async for chunk in model.stream([{"role": "user", "content": "answer"}])
+        chunk async for chunk in model.stream(request)
     ]
 
 

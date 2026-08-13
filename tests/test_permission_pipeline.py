@@ -10,6 +10,8 @@ import tempfile
 import time
 from unittest.mock import MagicMock
 
+import pytest
+
 from qitos.core.tool import (
     ToolPermission,
     ToolPermissionContext,
@@ -519,7 +521,8 @@ class TestActionExecutorIntegration:
         hook = engine_mock.hooks[0]
         assert hook.on_before_tool_use.called
 
-    def test_permission_pipeline_in_executor(self):
+    @pytest.mark.asyncio
+    async def test_permission_pipeline_in_executor(self):
         """Test that the executor uses PermissionPipeline when provided."""
         from qitos.engine.action_executor import ActionExecutor
         from qitos.core.action import Action, ActionStatus
@@ -542,10 +545,11 @@ class TestActionExecutorIntegration:
         )
 
         action = Action(name="edit_file", args={"path": "test.py"})
-        results = executor.execute([action])
+        results = await executor.execute([action])
         assert results[0].status == ActionStatus.DENIED
 
-    def test_rbw_enforcer_in_executor(self):
+    @pytest.mark.asyncio
+    async def test_rbw_enforcer_in_executor(self):
         """Test that read-before-write enforcer blocks writes to unread files."""
         from qitos.engine.action_executor import ActionExecutor
         from qitos.core.action import Action, ActionStatus
@@ -570,7 +574,7 @@ class TestActionExecutorIntegration:
 
         try:
             action = Action(name="edit_file", args={"path": path})
-            results = executor.execute([action])
+            results = await executor.execute([action])
             assert results[0].status == ActionStatus.DENIED
             assert results[0].output.get("error_category") == "read_before_write"
         finally:

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from examples._support import SequenceModel
 from examples.real.terminus_2 import Terminus2Agent
 from qitos.core import HistoryMessage, TerminalCapability
@@ -93,10 +95,11 @@ class FakeTerminal(TerminalCapability):
         return self.ts
 
 
-def test_send_terminal_keys_tool_uses_terminal_ops() -> None:
+@pytest.mark.asyncio
+async def test_send_terminal_keys_tool_uses_terminal_ops() -> None:
     terminal = FakeTerminal()
     tool = SendTerminalKeys()
-    result = tool.execute(
+    result = await tool.execute(
         {"keystrokes": "ls\n", "duration_sec": 0.25},
         runtime_context={"ops": {"terminal": terminal}},
     )
@@ -105,10 +108,11 @@ def test_send_terminal_keys_tool_uses_terminal_ops() -> None:
     assert terminal.waits == [0.25]
 
 
-def test_send_terminal_keys_submit_appends_newline_once() -> None:
+@pytest.mark.asyncio
+async def test_send_terminal_keys_submit_appends_newline_once() -> None:
     terminal = FakeTerminal()
     tool = SendTerminalKeys()
-    result = tool.execute(
+    result = await tool.execute(
         {
             "keystrokes": "pwd",
             "duration_sec": 0.1,

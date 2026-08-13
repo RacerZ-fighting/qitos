@@ -2,61 +2,27 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from collections.abc import Iterable
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from qitos.core.function_tool_decorator import function_tool
-from qitos.kit.skill import SkillManager, SkillManifest, SkillRegistry
+from qitos.kit.skill import SkillManager, SkillRegistry
+from qitos.kit.skill.bundled import (
+    BundledSkillDiagnostic,
+    BundledSkillEntry,
+    BundledSkillSnapshot,
+    discover_bundled_skills,
+    normalize_bundled_roots,
+    read_bundled_resource,
+)
 
 _DEFAULT_BUNDLED_SKILL_LIMIT = 20
 _MAX_BUNDLED_SKILL_LIMIT = 100
 _MAX_BUNDLED_DESCRIPTION_CHARS = 500
+_MAX_BUNDLED_DIAGNOSTICS = 100
 _MAX_BUNDLED_RESOURCE_RESPONSE_BYTES = 512 * 1024
-
-
-@dataclass(frozen=True)
-class BundledSkillSnapshot:
-    """Stable metadata for one validated, application-owned Skill bundle."""
-
-    name: str
-    description: str
-    source: str
-    content_sha256: str
-    requires: Tuple[str, ...] = ()
-    resources: Tuple[str, ...] = ()
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "name": self.name,
-            "description": self.description,
-            "source": self.source,
-            "content_sha256": self.content_sha256,
-            "requires": list(self.requires),
-            "resources": list(self.resources),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "BundledSkillSnapshot":
-        return cls(
-            name=_required_snapshot_string(payload, "name"),
-            description=_required_snapshot_string(payload, "description"),
-            source=_required_snapshot_string(payload, "source"),
-            content_sha256=_required_snapshot_string(payload, "content_sha256"),
-            requires=_snapshot_string_tuple(payload, "requires"),
-            resources=_snapshot_string_tuple(payload, "resources"),
-        )
-
-
-@dataclass(frozen=True)
-class _BundledSkillEntry:
-    manifest: SkillManifest
-    skill_path: Path
-    content: str
-    snapshot: BundledSkillSnapshot
 
 
 class SkillToolSet:
@@ -72,15 +38,18 @@ class SkillToolSet:
         workspace_root: Optional[str] = None,
         default_provider: str = "skillhub",
         bundled_roots: Optional[Iterable[str | Path]] = None,
+        available_requirements: Optional[Iterable[str]] = None,
     ):
         self.workspace_root = workspace_root
         self.registry = registry
         self._manager = manager
         self.default_provider = default_provider
-        self.bundled_roots = tuple(
-            Path(root).expanduser().resolve() for root in bundled_roots or ()
+        self.bundled_roots = normalize_bundled_roots(bundled_roots or ())
+        self.available_requirements = _requirement_snapshot(
+            available_requirements
         )
-        self._bundled_skills: dict[str, _BundledSkillEntry] = {}
+        self._bundled_skills: dict[str, BundledSkillEntry] = {}
+        self._bundled_diagnostics: Tuple[BundledSkillDiagnostic, ...] = ()
         self.refresh_bundled_skills()
 
     @property
@@ -107,55 +76,13 @@ class SkillToolSet:
             tools.extend([self.list_skills, self.load_skill, self.read_skill_resource])
         return tools
 
-    def refresh_bundled_skills(self) -> None:
-        """Reload configured read-only roots as one validated catalog snapshot."""
+    def refresh_bundled_skills(self) -> Tuple[BundledSkillDiagnostic, ...]:
+        """Atomically replace the catalog and return its typed diagnostics."""
 
-        refreshed: dict[str, _BundledSkillEntry] = {}
-        for root in self.bundled_roots:
-            if not root.is_dir():
-                raise FileNotFoundError(
-                    f"Bundled skill root is not a directory: {root}"
-                )
-            for skill_dir in sorted(root.iterdir(), key=lambda path: path.name):
-                skill_path = skill_dir / "SKILL.md"
-                if not skill_dir.is_dir() or not skill_path.is_file():
-                    continue
-                content = skill_path.read_text(encoding="utf-8")
-                try:
-                    manifest = SkillManifest.from_string(
-                        content,
-                        source=str(skill_dir),
-                    )
-                except ValueError as exc:
-                    raise ValueError(
-                        f"Invalid bundled skill at {skill_path}: {exc}"
-                    ) from exc
-                issues = manifest.validate()
-                if issues:
-                    raise ValueError(
-                        f"Invalid bundled skill at {skill_path}: {'; '.join(issues)}"
-                    )
-                if manifest.name in refreshed:
-                    previous_path = refreshed[manifest.name].skill_path
-                    raise ValueError(
-                        f"Duplicate bundled skill name {manifest.name!r}: "
-                        f"{previous_path} and {skill_path}"
-                    )
-                snapshot = BundledSkillSnapshot(
-                    name=manifest.name,
-                    description=manifest.description,
-                    source=str(skill_path),
-                    content_sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                    requires=tuple(manifest.requires),
-                    resources=_bundled_resource_paths(skill_dir),
-                )
-                refreshed[manifest.name] = _BundledSkillEntry(
-                    manifest=manifest,
-                    skill_path=skill_path,
-                    content=content,
-                    snapshot=snapshot,
-                )
+        refreshed, diagnostics = discover_bundled_skills(self.bundled_roots)
         self._bundled_skills = refreshed
+        self._bundled_diagnostics = diagnostics
+        return diagnostics
 
     def bundled_skill_snapshots(self) -> Tuple[BundledSkillSnapshot, ...]:
         """Return the current name-sorted immutable bundle snapshot."""
@@ -166,6 +93,11 @@ class SkillToolSet:
                 self._bundled_skills.items(), key=lambda item: item[0]
             )
         )
+
+    def bundled_skill_diagnostics(self) -> Tuple[BundledSkillDiagnostic, ...]:
+        """Return all diagnostics captured by the latest explicit refresh."""
+
+        return self._bundled_diagnostics
 
     @function_tool(name="list_skills", read_only=True, concurrency_safe=True)
     def list_skills(
@@ -185,18 +117,28 @@ class SkillToolSet:
             raise ValueError(f"limit must be between 1 and {_MAX_BUNDLED_SKILL_LIMIT}")
         ordered = sorted(self._bundled_skills.items(), key=lambda item: item[0])
         selected = ordered[:resolved_limit]
+        diagnostics = self._bundled_diagnostics[:_MAX_BUNDLED_DIAGNOSTICS]
         return {
             "skills": [
                 {
                     "name": name,
                     "description": _bounded_description(entry.manifest.description),
                     "source": str(entry.skill_path),
+                    "requires": list(entry.snapshot.requires),
+                    **_availability_payload(
+                        entry.snapshot.requires,
+                        self.available_requirements,
+                    ),
                 }
                 for name, entry in selected
             ],
             "returned_count": len(selected),
             "total_count": len(ordered),
             "truncated": len(selected) < len(ordered),
+            "diagnostics": [diagnostic.to_dict() for diagnostic in diagnostics],
+            "diagnostic_count": len(self._bundled_diagnostics),
+            "diagnostics_truncated": len(diagnostics)
+            < len(self._bundled_diagnostics),
         }
 
     @function_tool(name="load_skill", read_only=True, concurrency_safe=True)
@@ -214,7 +156,21 @@ class SkillToolSet:
             entry = self._bundled_skills[name]
         except KeyError as exc:
             raise ValueError(f"Bundled skill {name!r} was not found") from exc
-        return {**entry.snapshot.to_dict(), "content": entry.content}
+        availability = _availability_payload(
+            entry.snapshot.requires,
+            self.available_requirements,
+        )
+        missing = availability["missing_requirements"]
+        if missing:
+            raise ValueError(
+                f"Bundled skill {name!r} is unavailable; missing requirements: "
+                + ", ".join(missing)
+            )
+        return {
+            **entry.snapshot.to_dict(),
+            **availability,
+            "content": entry.content,
+        }
 
     @function_tool(name="read_skill_resource", read_only=True, concurrency_safe=True)
     def read_skill_resource(
@@ -253,23 +209,11 @@ class SkillToolSet:
             raise ValueError(
                 f"Resource {normalized!r} was not found in bundled skill {name!r}"
             )
-        skill_root = entry.skill_path.parent.resolve()
         try:
-            resource_path = (skill_root / requested).resolve(strict=True)
-        except OSError as exc:
-            raise ValueError(
-                f"Resource {normalized!r} was not found in bundled skill {name!r}"
-            ) from exc
-        if not resource_path.is_relative_to(skill_root) or not resource_path.is_file():
-            raise ValueError("Skill resource path escapes the selected Skill")
-        try:
-            data = resource_path.read_bytes()
+            data, content_sha256 = read_bundled_resource(entry, normalized)
             content = data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError("Skill resource is not valid UTF-8 text") from exc
-        except OSError as exc:
-            raise ValueError(f"Could not read Skill resource: {normalized}") from exc
-        content_sha256 = hashlib.sha256(data).hexdigest()
         start = _parse_resource_cursor(cursor, content_sha256, len(content))
         return _page_resource(
             {
@@ -459,38 +403,33 @@ def _bounded_description(description: str) -> str:
     return description[: _MAX_BUNDLED_DESCRIPTION_CHARS - 3] + "..."
 
 
-def _bundled_resource_paths(skill_root: Path) -> Tuple[str, ...]:
-    resolved_root = skill_root.resolve()
-    resources: List[str] = []
-    for candidate in sorted(
-        skill_root.rglob("*"), key=lambda path: path.relative_to(skill_root).as_posix()
-    ):
-        relative = candidate.relative_to(skill_root)
-        if relative == Path("SKILL.md"):
-            continue
-        try:
-            resolved = candidate.resolve(strict=True)
-        except OSError:
-            continue
-        if candidate.is_file() and resolved.is_relative_to(resolved_root):
-            resources.append(relative.as_posix())
-    return tuple(resources)
+def _requirement_snapshot(
+    available_requirements: Optional[Iterable[str]],
+) -> Optional[frozenset[str]]:
+    if available_requirements is None:
+        return None
+    normalized: set[str] = set()
+    for requirement in available_requirements:
+        if not isinstance(requirement, str) or not requirement.strip():
+            raise TypeError("available requirements must be non-empty strings")
+        normalized.add(requirement.strip())
+    return frozenset(normalized)
 
 
-def _required_snapshot_string(payload: Mapping[str, Any], key: str) -> str:
-    value = payload.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise TypeError(f"bundled Skill snapshot {key} must be a non-empty string")
-    return value
-
-
-def _snapshot_string_tuple(payload: Mapping[str, Any], key: str) -> Tuple[str, ...]:
-    value = payload.get(key, [])
-    if not isinstance(value, list) or any(
-        not isinstance(item, str) or not item for item in value
-    ):
-        raise TypeError(f"bundled Skill snapshot {key} must be an array of strings")
-    return tuple(value)
+def _availability_payload(
+    requires: Tuple[str, ...],
+    available_requirements: Optional[frozenset[str]],
+) -> Dict[str, Any]:
+    if available_requirements is None:
+        return {
+            "availability": "unchecked",
+            "missing_requirements": [],
+        }
+    missing = sorted(set(requires) - available_requirements)
+    return {
+        "availability": "unavailable" if missing else "available",
+        "missing_requirements": missing,
+    }
 
 
 def _parse_resource_cursor(cursor: str, content_sha256: str, length: int) -> int:

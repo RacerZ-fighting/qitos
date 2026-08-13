@@ -10,7 +10,7 @@ from qitos.engine import Engine
 from qitos.harness import build_model_for_preset
 from qitos.kit import MiniMaxToolCallParser
 from qitos.kit.parser import ReActTextParser
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos.models.profile_registry import infer_default_protocol, infer_model_profile
 from qitos.protocols import ModelProtocol, get_protocol
 
@@ -93,17 +93,18 @@ class _DummyModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        messages = request.message_dicts()
         self.calls.append(list(messages))
-        self.request_options.append(dict(kwargs))
-        yield ModelStreamChunk(text=self.output, event_type="text.delta")
-        yield ModelStreamChunk(
-            done=True,
+        self.request_options.append(request.option_dict())
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.TEXT_DELTA,
+            text=self.output,
+            event_type="text.delta",
+        )
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.COMPLETED,
             event_type="test.completed",
             finish_reason="stop",
         )
@@ -285,18 +286,15 @@ def test_preset_model_protocol_delivers_tools_to_direct_engine_model_call() -> N
     calls: list[dict[str, Any]] = []
 
     async def stream(
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic
-        calls.append(dict(kwargs))
-        yield ModelStreamChunk(
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        calls.append(request.option_dict())
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.TEXT_DELTA,
             text='{"thought":"done","final_answer":"ok"}',
             event_type="text.delta",
         )
-        yield ModelStreamChunk(done=True, event_type="test.completed")
+        yield ModelStreamEvent(type=ModelStreamEventType.COMPLETED, event_type="test.completed")
 
     llm.stream = stream
     agent = _ProtocolAgent(llm=llm)
@@ -322,7 +320,7 @@ def test_engine_uses_protocol_fallback_chain() -> None:
         output='{"analysis":"done","plan":"finish","commands":[],"task_complete":true}',
     )
     result = Engine(agent=_ProtocolAgent(llm=llm)).run("finish the task")
-    assert result.state.stop_reason in ("success", "final")
+    assert result.state.stop_reason in ("success", "completed")
     assert result.records[0].protocol_id == "terminus_json_v1"
     assert result.records[0].parser_selected == "TerminusJsonParser"
     assert result.records[0].parser_fallback_used is True

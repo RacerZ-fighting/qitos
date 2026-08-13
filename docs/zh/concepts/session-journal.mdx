@@ -49,9 +49,15 @@ replay record；只有逐条摘要与 canonical record 一致时才会保留该�
 丢失 Run 状态。语法完整但 schema 未知或语义无效的 JSONL 记录会 fail closed；恢复时只截断
 语法未完成的 torn tail。
 
+`JsonlRunCatalog` 是这条边界的只读侧。即使 writer lease 仍由运行中的 Engine 持有，它也能检查、
+列出 Run，并在不构造 Agent 的情况下校验祖先与直接 Child lineage。Catalog 优先读取与 canonical
+文件完全一致的 SQLite 投影，否则只读取当前完整的 JSONL 前缀；它不会取得 writer lease、修复
+torn tail 或重建任何 artifact。`RunStatus.RESUMABLE` 只表示没有 durable `run.completed`，并不
+声称当前一定有 Engine 进程在运行。
+
 ```python
 from qitos import Engine
-from qitos.kit.journal import JsonlSessionJournal
+from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 
 journal = JsonlSessionJournal(".qitos/sessions")
 result = await Engine(agent=agent, journal=journal).arun("inspect the project")
@@ -60,11 +66,18 @@ resumed = await Engine(
     agent=agent,
     journal=JsonlSessionJournal(".qitos/sessions"),
 ).aresume_from_journal(result.run_id)
+
+catalog = JsonlRunCatalog(".qitos/sessions")
+handle = await catalog.inspect_run(result.run_id)
+all_runs = await catalog.list_runs()
+ancestors = await catalog.lineage(result.run_id)
 ```
 
 Fork 只接受 committed `JournalPosition`。Child Journal 拥有独立的继承前缀，不会修改 Parent。
-Fork 会关闭 source Journal，并返回仍处于 open 状态的 Child；接收 Child 的调用方负责其生命周期，
-直至 Engine run 消费它或显式调用 `close()`。
+继承到本 Run 的 committed record 也能成为下一次 fork 的本地边界，因此 fork 后可以继续 fork，
+并且后代无需祖先文件也能恢复。直接调用 `SessionJournal.fork()` 会保留两边 open；
+`Engine.afork_journal()` 会关闭 source，并把 open Child 交给调用方。每个 open Journal 都由调用方
+持有，直至 Engine 消费它或显式调用 `close()`。
 
 ## 查询已提交的工具事务
 
@@ -85,4 +98,8 @@ if transaction is not None:
 origin reference 解析继承结果，不把 ToolResult 复制到第二个存储。未知、未提交或改写成 Child
 run id 的引用都返回 `None`。
 
-后台任务、Mailbox、Child 生命周期和交互输入目前还不能从 Journal 恢复。
+Run Mailbox 使用 `runtime_input.posted` 持久化尚未被模型事务消费的输入。后台进程和 Child
+分别使用自己的生命周期记录：Child 在构造 Engine 前写入 `child.started`，在通知 Parent 前写入
+`child.terminal`。Resume 会恢复终态，并把缺少 terminal 的 started Child 补成 `interrupted`，
+不会重新连接或重放 Child Engine；Fork 只继承审计事实，不获得 Parent Handle 的控制权。终态
+Child 的 follow-up 恢复仍由应用层 Session 负责。

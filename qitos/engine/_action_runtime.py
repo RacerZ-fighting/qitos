@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import TYPE_CHECKING, Any, Dict, Generic, List, TypeVar, cast
 
@@ -10,6 +9,7 @@ from ..core.action import Action
 from ..core.artifact import ArtifactRef, ArtifactStoreError
 from ..core.decision import Decision
 from ..core.tool_result import ToolResult
+from ..core.turn import TurnSnapshot
 from .states import RuntimePhase, StepRecord
 
 if TYPE_CHECKING:
@@ -25,7 +25,11 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         self.engine = engine
 
     async def run_act(
-        self, state: StateT, decision: Decision[ActionT], record: StepRecord
+        self,
+        state: StateT,
+        decision: Decision[ActionT],
+        record: StepRecord,
+        turn: TurnSnapshot,
     ) -> List[Any]:
         engine = self.engine
         engine._dispatch_hook(
@@ -47,7 +51,9 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 payload={"stage": "skipped", "reason": "decision_not_act"},
             )
             return []
-        executor = engine._action_executor_for_step(record.step_id)
+        if turn.step_id != record.step_id:
+            raise ValueError("turn snapshot does not match the action step")
+        executor = engine._build_action_executor(turn.tools, turn=turn)
         if executor is None:
             raise RuntimeError("No tool registry configured for action execution")
 
@@ -257,8 +263,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             ],
             record,
         )
-        execution = await asyncio.to_thread(
-            executor.execute,
+        execution = await executor.execute(
             executable_actions,
             env=engine.env,
             state=state,

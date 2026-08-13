@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar, cast
 
 from ..core.decision import Decision
+from ..core.completion import CompletionDisposition
 from ..core.errors import (
+    ErrorCategory,
     ModelRequestCancelled,
     ModelRequestDeadlineExceeded,
+    QitosRuntimeError,
+    RuntimeErrorInfo,
     StopReason,
 )
 from ..core.state import StateSchema
@@ -78,6 +82,65 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
                 record=record,
                 payload={"state_diff": record.state_diff},
             ),
+        )
+
+    def run_handoff(
+        self,
+        state: StateT,
+        decision: Decision[ActionT],
+        record: StepRecord,
+    ) -> ObservationT:
+        """Apply the optional legacy handoff policy outside the turn loop."""
+
+        engine = self.engine
+        if engine.agent_registry is None:
+            raise ValueError("handoff requires agent_registry on Engine")
+        target_name = str(decision.meta.get("handoff_target", ""))
+        if target_name in engine._handoff_history:
+            raise QitosRuntimeError(
+                RuntimeErrorInfo(
+                    category=ErrorCategory.SYSTEM,
+                    message=(
+                        f"Handoff loop detected: agent '{target_name}' already visited "
+                        f"in this run (history: {' -> '.join(engine._handoff_history)})"
+                    ),
+                    phase="handoff",
+                    step_id=record.step_id,
+                    recoverable=False,
+                )
+            )
+        max_handoffs = engine.context_config.max_handoffs
+        if len(engine._handoff_history) >= max_handoffs:
+            raise QitosRuntimeError(
+                RuntimeErrorInfo(
+                    category=ErrorCategory.SYSTEM,
+                    message=f"Maximum handoff count ({max_handoffs}) exceeded",
+                    phase="handoff",
+                    step_id=record.step_id,
+                    recoverable=False,
+                )
+            )
+
+        engine._handoff_history.append(engine.agent.name)
+        handoff = engine._handoff_runtime.execute_handoff(state, decision, record)
+        state.metadata["last_handoff"] = {
+            "from": handoff.from_agent,
+            "to": handoff.to_agent,
+        }
+        if engine.trace_writer is not None:
+            count = engine.trace_writer.metadata.get("handoff_count", 0) or 0
+            engine.trace_writer.metadata["handoff_count"] = count + 1
+        return cast(
+            ObservationT,
+            {
+                "action_results": [
+                    {
+                        "handoff": True,
+                        "from": handoff.from_agent,
+                        "to": handoff.to_agent,
+                    }
+                ]
+            },
         )
 
     def apply_critics(self, state: StateT, record: StepRecord) -> Dict[str, Any]:
@@ -224,12 +287,70 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
         )
 
         if decision.mode == "final":
-            if state.final_result is None and decision.final_answer is not None:
-                state.final_result = decision.final_answer
-            if state.stop_reason is None:
-                state.set_stop(StopReason.FINAL, decision.final_answer)
+            if engine._runtime_inbox.has_events(engine.active_run_id):
+                state.final_result = None
+                if state.stop_reason in {
+                    StopReason.FINAL.value,
+                    StopReason.COMPLETED.value,
+                    StopReason.BLOCKED.value,
+                }:
+                    state.stop_reason = None
+                self._finish_check_stop(
+                    step_id=step_id,
+                    state=state,
+                    decision=decision,
+                    stop=False,
+                    extra_payload={
+                        "completion_disposition": "continue",
+                        "completion_reason": "runtime_input_pending",
+                    },
+                )
+                return False
+            assessment = engine.agent.assess_completion(state, decision)
+            disposition = assessment.disposition
+            if disposition is CompletionDisposition.CONTINUE:
+                state.final_result = None
+                if state.stop_reason in {
+                    StopReason.FINAL.value,
+                    StopReason.COMPLETED.value,
+                    StopReason.BLOCKED.value,
+                }:
+                    state.stop_reason = None
+                engine._history_append(
+                    "user",
+                    assessment.feedback,
+                    step_id,
+                    metadata={
+                        "source": "completion_assessment",
+                        "reason": assessment.reason,
+                    },
+                )
+                self._finish_check_stop(
+                    step_id=step_id,
+                    state=state,
+                    decision=decision,
+                    stop=False,
+                    extra_payload={
+                        "completion_disposition": disposition.value,
+                        "completion_reason": assessment.reason,
+                    },
+                )
+                return False
+            stop_reason = (
+                StopReason.BLOCKED
+                if disposition is CompletionDisposition.BLOCKED
+                else StopReason.COMPLETED
+            )
+            state.set_stop(stop_reason, decision.final_answer)
             self._finish_check_stop(
-                step_id=step_id, state=state, decision=decision, stop=True
+                step_id=step_id,
+                state=state,
+                decision=decision,
+                stop=True,
+                extra_payload={
+                    "completion_disposition": disposition.value,
+                    "completion_reason": assessment.reason,
+                },
             )
             return True
         if engine.agent.should_stop(state):
@@ -293,10 +414,13 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
                 payload.update(extra_payload)
             engine._emit(state.current_step, RuntimePhase.CHECK_STOP, payload=payload)
         else:
+            payload = {"stage": "continue"}
+            if extra_payload:
+                payload.update(extra_payload)
             engine._emit(
                 state.current_step,
                 RuntimePhase.CHECK_STOP,
-                payload={"stage": "continue"},
+                payload=payload,
             )
         engine._dispatch_hook(
             "on_after_check_stop",
@@ -324,9 +448,11 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
                 runtime_info={
                     "elapsed_seconds": elapsed_seconds,
                     "total_tokens": int(engine._token_usage),
+                    "total_cost_usd": float(engine._cost_usage_usd),
                     "budget_max_steps": engine.budget.max_steps,
                     "budget_max_runtime_seconds": engine.budget.max_runtime_seconds,
                     "budget_max_tokens": engine.budget.max_tokens,
+                    "budget_max_cost_usd": engine.budget.max_cost_usd,
                 },
             )
             if hit:
@@ -346,6 +472,12 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
             engine.budget.max_tokens
         ):
             state.set_stop(StopReason.BUDGET_TOKENS)
+            return True
+        if (
+            engine.budget.max_cost_usd is not None
+            and engine._cost_usage_usd >= float(engine.budget.max_cost_usd)
+        ):
+            state.set_stop(StopReason.BUDGET_COST)
             return True
         return False
 

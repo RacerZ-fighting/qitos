@@ -334,7 +334,13 @@ class WhitzardAgent(AgentModule[WhitzardState, dict[str, Any], dict[str, Any]]):
         )
 
     def prepare(self, state: WhitzardState) -> str:
-        observation = getattr(self, "_runtime_observation", None)
+        return self._prepare_with_observation(state, None)
+
+    def prepare_turn(self, state, observation, turn) -> str:
+        _ = turn
+        return self._prepare_with_observation(state, observation)
+
+    def _prepare_with_observation(self, state: WhitzardState, observation: Any) -> str:
         terminal = self._extract_terminal_payload(observation) or {
             "output": state.terminal_output,
             "screen": state.terminal_screen,

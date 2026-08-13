@@ -18,6 +18,49 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Lease-free Run discovery and lineage**: `JsonlRunCatalog` now returns immutable
+  typed summaries, deterministic listings, validated ancestors, and direct children
+  while an Engine still owns the writer lease. Reads never repair canonical JSONL or
+  rebuild its disposable SQLite projection. Inherited committed boundaries support
+  nested forks, whose Engine recovery no longer depends on ancestor files or replays
+  completed tools.
+- **Revision-safe atomic file tools**: bounded reads now return a SHA-256 revision for
+  the complete UTF-8 file. Host and Docker filesystem capabilities replace files
+  atomically, serialize same-path mutations per environment, and support compare-and-
+  swap writes. `edit_file` automatically guards the revision it read, so concurrent
+  edits fail explicitly instead of silently overwriting one another.
+- **Run-owned managed processes**: host background commands now use one asyncio
+  supervisor with opaque typed handles, incremental bounded output, complete UTF-8
+  logs, stdin/PTY interaction, process-group cleanup, and exactly one terminal state.
+  Runs await every reader and watcher during shutdown, while Journal-enabled starts
+  persist `process.started` and `process.terminal` around the live lifecycle. The shell
+  profile exposes list/read/write/wait/terminate controls; resume marks interrupted
+  ownership as `lost`, and forks do not inherit live handles. A terminal watcher posts
+  one durable `process.completed` input after the terminal record, waking an active
+  Agent only through its next turn safe point.
+- **Discriminated model stream events**: every Provider event now declares whether it
+  is text, reasoning, a ToolCall delta, a native output item, usage, lifecycle,
+  successful completion, or failure. The ambiguous `ModelStreamChunk` field bag is
+  gone; Engine treats `FAILED` as an error terminal and commits only `COMPLETED`.
+- **Recoverable model requests and guarded continuation**: the Engine now sends one
+  immutable `ModelRequest` and journals its exact credential-redacted snapshot.
+  Responses reuses `previous_response_id` only when the Run, Provider, model,
+  protocol, request settings, and canonical input prefix all match. Resume may keep
+  that optimization; fork, Provider changes, compaction drift, or an expired handle
+  automatically use the complete local transcript. Recovery coverage now follows a
+  multi-turn Run through compaction, cancellation, committed-boundary fork, and resume
+  while proving that the canonical ToolCall/ToolResult transcript remains complete.
+- **One async turn transaction**: every model turn now captures an immutable model,
+  protocol, complete History, Tool exposure, capability, deadline, pricing, and budget
+  view. Full runs and interactive steps share this one transaction; parser and optional
+  critic/handoff policies compose around it instead of adding another loop. Engine,
+  Tool, Mailbox, MCP, and Child calls stay on the caller's event loop; cancellation
+  drains started handlers and journals one ordered terminal result per call before it
+  propagates. Model changes re-resolve inferred protocol only for the next turn.
+- **Product-owned completion and bounded Runs**: `AgentModule.assess_completion()` can
+  accept a final answer, request another evidence-gathering turn, or classify a concrete
+  blocker. Runtime and Task budgets now cover steps, time, tokens, cost, Tool
+  concurrency, and Child count, with token/cost usage restored on Journal resume.
 - **Single-owner Session journals**: each Run now has one process-safe JSONL writer
   lease and an explicit terminal lifecycle. Replay always validates canonical JSONL;
   the disposable SQLite read projection is retained only when it matches JSONL and
@@ -55,7 +98,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Truthful model capability snapshots**: configured adapters expose immutable
   `ModelCapabilities`. Responses, Anthropic Messages, and compatible Chat report
   tested native-tool, reasoning/replay, usage/cache, and multimodal behavior without
-  claiming unfinished continuation or hosted-tool support. Their terminal token
+  claiming unfinished hosted-tool support. Responses also declares its guarded
+  continuation behavior. Their terminal token
   counts are normalized into typed `ModelUsage` without discarding provider details.
 - **Family and wire can be selected independently**: one Kimi family configuration can
   use compatible Chat Completions or Anthropic Messages without leaking wire-specific
@@ -86,9 +130,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   `Engine.last_checkpoint_id` after a successful durable commit instead of reaching
   into private Engine fields.
 - **Progressive bundled Skills**: applications can point `SkillToolSet` at read-only
-  asset roots, expose a bounded catalog, load one exact `SKILL.md` in full, persist its
-  content revision, and page linked UTF-8 resources without invoking a provider or
-  writing an installation registry.
+  asset roots, expose a bounded catalog, load one exact `SKILL.md` in full, and page
+  linked UTF-8 resources without invoking a provider or writing an installation
+  registry. Recursive discovery uses explicit root precedence and typed diagnostics;
+  one bundle revision covers the instructions and resources, while an optional frozen
+  requirement set prevents loading workflows unavailable in the current runtime.
 - **Application-owned command environments**: host command capabilities and
   `RunCommand` can now receive one explicit environment snapshot for shell, argv, and
   background processes, while existing callers continue to inherit by default.
@@ -119,13 +165,16 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   asynchronous stream contract; the former sync/async class hierarchy, `call_raw`,
   import-time registration, and daemon-thread `AsyncEngine` bridge are gone.
 - **Same-spec qita comparisons**: compare views now verify recorded model, prompt,
-  tools, environment, context policy, budget, source revision, and experiment
-  provenance first. Mismatched or incomplete pairs are explicitly descriptive rather
-  than causal; matching pairs remain subject to provider and environment nondeterminism.
-- **Truthful typed model streams**: Chat, Responses, and Anthropic streams now retain
+  semantic task, tools, environment, context policy, budget, source revision, and
+  experiment provenance first. Plain-text tasks use content-derived stable IDs, while
+  task identity and runtime configuration use separate fingerprints, so wall-clock
+  task wrapping cannot create false mismatches.
+  Mismatched or incomplete pairs are explicitly descriptive rather than causal;
+  matching pairs remain subject to provider and environment nondeterminism.
+- **Truthful typed model streams**: Chat, Responses, and Anthropic streams retain
   provider finish reasons, reasoning and tool-call deltas, completed tool calls, and
-  usage through one `ModelStreamChunk` contract. Incomplete streams fail instead of
-  fabricating completion, and Engine handlers no longer receive `on_end` after an error.
+  usage. Incomplete streams fail instead of fabricating completion, and Engine handlers
+  no longer receive `on_end` after an error.
 - **Call-accurate qita tool statistics**: tool counts and failures now come from the
   canonical action/result pairing instead of applying one step-level error to every
   call. Exact lifecycle counts and unmatched trace evidence remain visible for audits.
@@ -136,9 +185,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **One bounded tool-action lifecycle**: one absolute deadline now covers interceptor-
   free admission, approval, permission checks, invocation retries, and backoff.
   `ToolSpec.retry_policy` is the sole retry owner; validation and authorization run once,
-  HTTP client retries are disabled, and daemon action workers avoid unbounded concurrent
-  executor drain. Dead Action execution knobs and the duplicate interceptor middleware
-  have been removed.
+  HTTP client retries are disabled, and event-loop-owned tasks drain before the batch
+  returns. Dead Action execution knobs and the duplicate interceptor middleware have
+  been removed.
 - **One class-tool execution contract**: class tools now expose only
   `execute(args, runtime_context)`. `ToolRegistry` performs exact canonical-name lookup,
   while `ActionExecutor` alone owns validation, permissions, timeout/retry handling,
@@ -159,17 +208,20 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Run-scoped deadlines and bounded async shutdown**: relative runtime budgets and
   caller-supplied monotonic deadlines now resolve to one effective deadline shared by
   the Engine, tool admission, tool timeouts, retry backoff, and runtime waits. Async
-  cancellation requests cooperative Engine shutdown without letting an unresponsive
-  synchronous call keep the hosting event loop or CLI process alive indefinitely.
+  cancellation requests cooperative Engine shutdown. Legacy synchronous decorated
+  functions run outside the event loop and are awaited to a known side-effect boundary.
 - **One native tool-call lane**: when a model preset prefers provider-native tools,
   typed calls now bypass text interpreters and parsers, API requests omit the duplicate
   framework action contract, and every accepted, rejected, or malformed call commits one
   ordered result with the original call id. Malformed arguments never execute a tool.
-- **Bounded child-agent lifecycle**: `AgentTool` snapshots parent history at launch,
-  admits child Engines only when a concurrency slot opens, records terminal state before
-  waking the parent, and uses bounded daemon workers so cooperative cancellation cannot
-  hold interpreter shutdown indefinitely. Its model contract still keeps dependent or
-  cheap mechanical work local.
+- **Typed child-agent lifecycle**: immutable launch, handle, status, result, budget, and
+  conclusion contracts separate persisted Child identity from live Engines. A Run-owned
+  async supervisor handles admission, wait, interrupt, terminal state, parent delivery,
+  and teardown; durable started/terminal records prevent recovery from replaying a Child,
+  and forks cannot control inherited handles. Launch policy carries narrowed profile,
+  Tool groups, workspace, and budget, while invocation cleanup owns fresh model
+  resources. Shared status, wait, message, and interrupt tools use the same supervisor;
+  `AgentTool` is now a thin launch projection.
 - **Environment-backed coding tools**: named Env capability groups now let the same
   bounded workspace tools run against host, container, or remote providers. The compact
   workspace profile exposes one lowercase surface (`read_file`, `write_file`,
@@ -181,8 +233,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   public-initial-URL validation, bounded results, and provider failure categories; QitOS
   does not guess a service URL from the selected model.
 - **Runtime input and idle wait**: background work can post a small event to an exact
-  Engine run. Explicit runtime waits sleep without model polling or step growth and
-  wake on input, cancellation, or the run deadline.
+  Engine run through an async, Journal-first mailbox. Explicit runtime waits sleep
+  without model polling or step growth and wake on input, cancellation, or the run
+  deadline. Accepted input survives restart until a completed model transaction binds
+  it, and input racing a final answer is handled on the next turn.
 - **Live OpenAI-compatible streams**: Engine calls use one explicit QitOS retry budget
   with SDK retries disabled. Connection and pre-event failures can retry within a
   300-second recovery window by default; after the first provider event, deltas stay

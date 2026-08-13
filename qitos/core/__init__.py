@@ -1,6 +1,7 @@
 """Core modules for QitOS Framework."""
 
 from .agent_module import ActionResultContext, AgentModule, CanonicalActionResult
+from .completion import CompletionAssessment, CompletionDisposition
 from .decision import Decision
 from .action import (
     Action,
@@ -10,6 +11,7 @@ from .action import (
 )
 from .errors import (
     ErrorCategory,
+    ModelContinuationRejected,
     ModelTransportError,
     StopReason,
     RuntimeErrorInfo,
@@ -23,8 +25,40 @@ from .state import (
 )
 from .memory import Memory, MemoryRecord
 from .model_capabilities import ModelAPI, ModelCapabilities, ReasoningCapability
-from .model_response import ModelResponse, ModelTiming, ModelUsage, ModelUsageSource
+from .model_request import ModelContinuation, ModelRequest
+from .model_stream import ModelStreamEvent, ModelStreamEventType
+from .model_response import (
+    ModelPricing,
+    ModelResponse,
+    ModelTiming,
+    ModelUsage,
+    ModelUsageSource,
+)
 from .runtime_input import RuntimeInput
+from .child import (
+    DEFAULT_CHILD_MAX_STEPS,
+    AgentConclusion,
+    ChildEngine,
+    ChildHandle,
+    ChildInvocation,
+    ChildInvocationCleanup,
+    ChildLaunchRequest,
+    ChildPersistenceError,
+    ChildResult,
+    ChildRunResult,
+    ChildStateView,
+    ChildStatus,
+)
+from .process import (
+    ProcessError,
+    ProcessHandle,
+    ProcessNotFoundError,
+    ProcessOutput,
+    ProcessPersistenceError,
+    ProcessSnapshot,
+    ProcessStatus,
+    ProcessTerminalNotifier,
+)
 from .history import History, HistoryMessage, HistoryPolicy, HistorySnapshot
 from .observation import Observation
 from .journal import (
@@ -39,12 +73,16 @@ from .journal import (
     JournalUnsupportedVersionError,
     SessionJournal,
     ToolTransaction,
+    resolve_inherited_record,
 )
+from .run import RunCatalog, RunHandle, RunNotFoundError, RunStatus
 from .env import (
+    AtomicFileWrite,
     Env,
     EnvSpec,
     EnvObservation,
     EnvStepResult,
+    FileRevisionConflictError,
     FileSystemCapability,
     CommandCapability,
     TerminalCapability,
@@ -80,6 +118,7 @@ from .function_tool_decorator import function_tool
 from .channel import Append, Replace, Ephemeral, last_value, append_list, dict_merge, add_messages
 from .field_reducers import FieldReducerRegistry
 from .tool_registry import ToolExposure, ToolRegistry
+from .turn import TurnBudgetSnapshot, TurnRuntimeCapabilities, TurnSnapshot
 from .work_plan import (
     MAX_WORK_PLAN_EXPLANATION_CHARS,
     MAX_WORK_PLAN_ITEMS,
@@ -103,12 +142,15 @@ __all__ = [
     "ActionResultContext",
     "AgentModule",
     "CanonicalActionResult",
+    "CompletionAssessment",
+    "CompletionDisposition",
     "Decision",
     "Action",
     "ActionResult",
     "ActionStatus",
     "ActionExecutionPolicy",
     "ErrorCategory",
+    "ModelContinuationRejected",
     "ModelTransportError",
     "StopReason",
     "RuntimeErrorInfo",
@@ -121,12 +163,37 @@ __all__ = [
     "MemoryRecord",
     "ModelAPI",
     "ModelCapabilities",
+    "ModelContinuation",
+    "ModelPricing",
+    "ModelRequest",
+    "ModelStreamEvent",
+    "ModelStreamEventType",
     "ModelResponse",
     "ModelTiming",
     "ModelUsage",
     "ModelUsageSource",
     "ReasoningCapability",
     "RuntimeInput",
+    "DEFAULT_CHILD_MAX_STEPS",
+    "AgentConclusion",
+    "ChildEngine",
+    "ChildHandle",
+    "ChildInvocation",
+    "ChildInvocationCleanup",
+    "ChildLaunchRequest",
+    "ChildPersistenceError",
+    "ChildResult",
+    "ChildRunResult",
+    "ChildStateView",
+    "ChildStatus",
+    "ProcessError",
+    "ProcessHandle",
+    "ProcessNotFoundError",
+    "ProcessOutput",
+    "ProcessPersistenceError",
+    "ProcessSnapshot",
+    "ProcessStatus",
+    "ProcessTerminalNotifier",
     "History",
     "HistoryMessage",
     "HistoryPolicy",
@@ -143,6 +210,11 @@ __all__ = [
     "JournalUnsupportedVersionError",
     "SessionJournal",
     "ToolTransaction",
+    "resolve_inherited_record",
+    "RunCatalog",
+    "RunHandle",
+    "RunNotFoundError",
+    "RunStatus",
     "RunSpec",
     "ExperimentSpec",
     "BenchmarkRunResult",
@@ -150,6 +222,8 @@ __all__ = [
     "EnvSpec",
     "EnvObservation",
     "EnvStepResult",
+    "AtomicFileWrite",
+    "FileRevisionConflictError",
     "FileSystemCapability",
     "CommandCapability",
     "TerminalCapability",
@@ -197,6 +271,9 @@ __all__ = [
     "FieldReducerRegistry",
     "ToolRegistry",
     "ToolExposure",
+    "TurnBudgetSnapshot",
+    "TurnRuntimeCapabilities",
+    "TurnSnapshot",
     "MAX_WORK_PLAN_EXPLANATION_CHARS",
     "MAX_WORK_PLAN_ITEMS",
     "MAX_WORK_PLAN_STEP_CHARS",

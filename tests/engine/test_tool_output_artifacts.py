@@ -14,7 +14,7 @@ from qitos.core.tool_registry import ToolRegistry
 from qitos.engine import ContextConfig, RuntimeBudget
 from qitos.kit import FileArtifactStore, ReActTextParser
 from qitos.kit.tool.file import ReadFile
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos import tool
 
 
@@ -38,17 +38,14 @@ class _ToolModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        messages = request.message_dicts()
         self.inputs.append(list(messages))
         if self.calls == 0:
             self.calls += 1
-            yield ModelStreamChunk(
-                done=True,
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.COMPLETED,
                 tool_calls=[
                     {
                         "id": self.call_id,
@@ -60,7 +57,7 @@ class _ToolModel(Model):
             )
             return
         self.calls += 1
-        yield ModelStreamChunk(text="Final Answer: complete", done=True)
+        yield ModelStreamEvent(text="Final Answer: complete", type=ModelStreamEventType.COMPLETED)
 
 
 class _FinalModel(Model):
@@ -70,14 +67,11 @@ class _FinalModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        messages = request.message_dicts()
         self.inputs.append(list(messages))
-        yield ModelStreamChunk(text="Final Answer: resumed", done=True)
+        yield ModelStreamEvent(text="Final Answer: resumed", type=ModelStreamEventType.COMPLETED)
 
 
 class _Agent(AgentModule[_State, Observation, Action]):
@@ -162,7 +156,7 @@ async def test_large_output_is_durable_readable_and_stable_on_resume(
     assert len(model_content) <= context.tool_result_max_chars
     assert original_model_message["tool_call_id"] == call_id
 
-    read_result = ReadFile(str(workspace)).execute(
+    read_result = await ReadFile(str(workspace)).execute(
         {"path": artifact.path, "line_offset": 0, "line_count": 20}
     )
     assert read_result["status"] == "success"

@@ -14,7 +14,28 @@ from .core.env import Env, EnvSpec
 from .core.errors import QitosRuntimeError, StopReason
 from .core.memory import Memory
 from .core.model_response import ModelResponse, ModelTiming
+from .core.model_request import ModelContinuation, ModelRequest
+from .core.model_stream import ModelStreamEvent, ModelStreamEventType
 from .core.runtime_input import RuntimeInput
+from .core.child import (
+    DEFAULT_CHILD_MAX_STEPS,
+    AgentConclusion,
+    ChildHandle,
+    ChildLaunchRequest,
+    ChildPersistenceError,
+    ChildResult,
+    ChildStatus,
+)
+from .core.process import (
+    ProcessError,
+    ProcessHandle,
+    ProcessNotFoundError,
+    ProcessOutput,
+    ProcessPersistenceError,
+    ProcessSnapshot,
+    ProcessStatus,
+    ProcessTerminalNotifier,
+)
 from .core.history import History, HistoryPolicy, HistorySnapshot
 from .core.observation import Observation
 from .core.tool_result import ToolResult, ToolResultStatus
@@ -67,6 +88,21 @@ __all__ = [
     "EventStream",
     "EngineResult",
     "RuntimeInput",
+    "DEFAULT_CHILD_MAX_STEPS",
+    "AgentConclusion",
+    "ChildHandle",
+    "ChildLaunchRequest",
+    "ChildPersistenceError",
+    "ChildResult",
+    "ChildStatus",
+    "ProcessError",
+    "ProcessHandle",
+    "ProcessNotFoundError",
+    "ProcessOutput",
+    "ProcessPersistenceError",
+    "ProcessSnapshot",
+    "ProcessStatus",
+    "ProcessTerminalNotifier",
     "StepSummary",
     "ContextConfig",
     "Task",
@@ -88,6 +124,10 @@ __all__ = [
     "Action",
     "Memory",
     "ModelResponse",
+    "ModelContinuation",
+    "ModelRequest",
+    "ModelStreamEvent",
+    "ModelStreamEventType",
     "ModelTiming",
     "History",
     "HistoryPolicy",

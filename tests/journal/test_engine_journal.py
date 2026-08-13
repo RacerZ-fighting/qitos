@@ -22,13 +22,22 @@ from qitos import (
 )
 from qitos.core.action import ActionExecutionPolicy
 from qitos.core.agent_module import ActionResultContext
-from qitos.core import JournalRecordType, ToolResult
+from qitos.core import (
+    JournalRecordType,
+    ModelAPI,
+    ModelCapabilities,
+    ModelContinuation,
+    ModelPricing,
+    ModelUsage,
+    ToolResult,
+)
 from qitos.core.journal import JournalError, JournalRecordRef
 from qitos.checkpoint import InMemoryCheckpointStore
-from qitos.kit.journal import JsonlSessionJournal
+from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 from qitos.kit.parser import ReActTextParser
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos.engine.critic import Critic
+from qitos.engine.states import RuntimeBudget
 
 
 @dataclass
@@ -243,6 +252,189 @@ async def test_terminal_run_resumes_without_model_or_tool_replay(tmp_path: Path)
     assert resumed.state.final_result == "done"
     assert resumed.state.seen == ["canonical"]
     assert resumed_agent.executions == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_resume_restores_model_usage_and_cost(tmp_path: Path) -> None:
+    class UsageModel(Model):
+        def __init__(self) -> None:
+            super().__init__(model="usage-model", temperature=None)
+            self.calls = 0
+
+        async def stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            _ = request
+            self.calls += 1
+            yield ModelStreamEvent(
+                text="finished",
+                type=ModelStreamEventType.COMPLETED,
+                usage=ModelUsage(
+                    input_tokens=7,
+                    output_tokens=3,
+                    total_tokens=10,
+                ),
+            )
+
+    class UsageAgent(AgentModule[JournalState, dict[str, Any], Action]):
+        def __init__(self, model: UsageModel) -> None:
+            super().__init__(llm=model)
+
+        def init_state(self, task: str, **kwargs: Any) -> JournalState:
+            _ = kwargs
+            return JournalState(task=task, max_steps=2)
+
+        def interpret_model_response(
+            self,
+            state: JournalState,
+            observation: dict[str, Any],
+            response: Any,
+        ) -> Decision[Action]:
+            _ = state, observation, response
+            return Decision.final("done")
+
+        def reduce(
+            self,
+            state: JournalState,
+            observation: dict[str, Any],
+            decision: Decision[Action],
+        ) -> JournalState:
+            _ = observation, decision
+            return state
+
+    pricing = ModelPricing(1_000_000, 1_000_000)
+    original_model = UsageModel()
+    original = await Engine(
+        UsageAgent(original_model),
+        budget=RuntimeBudget(max_steps=2, max_cost_usd=100.0),
+        model_pricing=pricing,
+        journal=JsonlSessionJournal(tmp_path),
+    ).arun("usage")
+
+    resumed_model = UsageModel()
+    resumed_engine = Engine(
+        UsageAgent(resumed_model),
+        budget=RuntimeBudget(max_steps=2, max_cost_usd=100.0),
+        model_pricing=pricing,
+        journal=JsonlSessionJournal(tmp_path),
+    )
+    resumed = await resumed_engine.aresume_from_journal(original.run_id)
+
+    assert original.total_tokens == 10
+    assert original.total_cost_usd == pytest.approx(10.0)
+    assert resumed.total_tokens == original.total_tokens
+    assert resumed.total_cost_usd == pytest.approx(original.total_cost_usd)
+    assert resumed_engine._token_usage == original.total_tokens
+    assert resumed_engine._cost_usage_usd == pytest.approx(original.total_cost_usd)
+    assert resumed_model.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_reuses_only_the_last_committed_model_continuation(
+    tmp_path: Path,
+) -> None:
+    second_request_started = asyncio.Event()
+
+    class ContinuationModel(Model):
+        def __init__(self, *, block_continuation: bool) -> None:
+            super().__init__(model="continuation-model", temperature=None)
+            self.block_continuation = block_continuation
+            self.requests: list[ModelRequest] = []
+            self.qitos_harness_metadata = {
+                "tool_policy": {"native_tool_call_preferred": True},
+                "parser": "ReActTextParser",
+                "protocol": "react_text_v1",
+            }
+
+        @property
+        def capabilities(self) -> ModelCapabilities:
+            return ModelCapabilities(
+                api=ModelAPI.RESPONSES,
+                native_tool_calls=True,
+                continuation=True,
+            )
+
+        async def stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if request.continuation is not None:
+                if self.block_continuation:
+                    second_request_started.set()
+                    await asyncio.Event().wait()
+                yield ModelStreamEvent(
+                    text="Final Answer: resumed",
+                    type=ModelStreamEventType.COMPLETED,
+                    finish_reason="stop",
+                )
+                return
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.COMPLETED,
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"},
+                    }
+                ],
+                finish_reason="tool_calls",
+                continuation=ModelContinuation(
+                    run_id=request.run_id,
+                    provider=request.provider,
+                    model=request.model,
+                    protocol=request.protocol,
+                    response_id="resp-1",
+                    prefix_items=1,
+                    prefix_digest="prefix",
+                    settings_digest="settings",
+                ),
+            )
+
+    class ContinuationAgent(JournalAgent):
+        def __init__(self, model: ContinuationModel) -> None:
+            super().__init__()
+            self.llm = model
+            self.model_parser = ReActTextParser()
+
+        def decide(
+            self,
+            state: JournalState,
+            observation: dict[str, Any],
+        ) -> Decision[Action] | None:
+            _ = state, observation
+            return None
+
+    original_model = ContinuationModel(block_continuation=True)
+    journal = JsonlSessionJournal(tmp_path)
+    engine = Engine(ContinuationAgent(original_model), journal=journal)
+    running = asyncio.create_task(engine.arun("inspect"))
+    await second_request_started.wait()
+    engine.cancel()
+    cancelled = await running
+
+    assert cancelled.state.stop_reason == "cancelled_immediate"
+    model_records = [
+        record
+        for record in await journal.replay()
+        if record.type is JournalRecordType.MODEL_COMPLETED
+    ]
+    assert model_records[0].payload["model_request"]["provider"] == "model"
+    assert model_records[0].payload["model_response"]["continuation"][
+        "response_id"
+    ] == "resp-1"
+
+    resumed_model = ContinuationModel(block_continuation=False)
+    resumed = await Engine(
+        ContinuationAgent(resumed_model),
+        journal=JsonlSessionJournal(tmp_path),
+    ).aresume_from_journal(journal.run_id)
+
+    assert resumed.state.final_result == "resumed"
+    assert len(resumed_model.requests) == 1
+    assert resumed_model.requests[0].continuation is not None
+    assert resumed_model.requests[0].continuation.response_id == "resp-1"
 
 
 class FailingJournal(JsonlSessionJournal):
@@ -628,18 +820,15 @@ async def test_cancel_appends_interruption_and_resume_uses_committed_state(
 
         async def stream(
             self,
-            messages: list[dict[str, Any]],
-            *,
-            deadline_monotonic: float | None = None,
-            **kwargs: Any,
-        ) -> AsyncIterator[ModelStreamChunk]:
-            _ = messages, deadline_monotonic, kwargs
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            _ = request
             if self._wait:
                 started.set()
                 await asyncio.Event().wait()
-            yield ModelStreamChunk(
+            yield ModelStreamEvent(
                 text="Final Answer: resumed",
-                done=True,
+                type=ModelStreamEventType.COMPLETED,
                 finish_reason="stop",
             )
 
@@ -664,8 +853,8 @@ async def test_cancel_appends_interruption_and_resume_uses_committed_state(
 
     engine.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await run_task
+    cancelled = await run_task
+    assert cancelled.state.stop_reason == "cancelled_immediate"
     records = await journal.replay()
     assert records[-1].type is JournalRecordType.RUN_INTERRUPTED
     assert not any(record.type is JournalRecordType.RUN_COMPLETED for record in records)
@@ -739,6 +928,47 @@ async def test_fork_closes_child_when_source_close_fails(tmp_path: Path) -> None
     reopened_child = JsonlSessionJournal(tmp_path)
     await reopened_child.open("orphan-safe-child")
     await reopened_child.close()
+
+
+@pytest.mark.asyncio
+async def test_nested_terminal_fork_recovers_without_replaying_tools(
+    tmp_path: Path,
+) -> None:
+    original_journal = JsonlSessionJournal(tmp_path)
+    original = await Engine(
+        agent=JournalAgent(),
+        journal=original_journal,
+    ).arun("inspect")
+    terminal_boundary = next(
+        record
+        for record in reversed(await original_journal.replay())
+        if record.type is JournalRecordType.STATE_SNAPSHOT
+    )
+
+    source = JsonlSessionJournal(tmp_path)
+    await source.open(original.run_id)
+    child = await source.fork(terminal_boundary.position, "child-run")
+    child_boundary = (await JsonlRunCatalog(tmp_path).inspect_run("child-run"))
+    assert child_boundary.committed_position is not None
+    grandchild = await child.fork(
+        child_boundary.committed_position,
+        "grandchild-run",
+    )
+    await grandchild.close()
+    await child.close()
+    await source.close()
+    (tmp_path / original.run_id / "journal.jsonl").unlink()
+    (tmp_path / "child-run" / "journal.jsonl").unlink()
+
+    resumed_agent = JournalAgent()
+    resumed = await Engine(
+        agent=resumed_agent,
+        journal=JsonlSessionJournal(tmp_path),
+    ).aresume_from_journal("grandchild-run")
+
+    assert resumed_agent.executions == 0
+    assert resumed.state.seen == ["canonical"]
+    assert resumed.state.final_result == "done"
 
 
 @pytest.mark.asyncio

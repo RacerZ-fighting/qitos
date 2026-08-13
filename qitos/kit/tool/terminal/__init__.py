@@ -33,7 +33,7 @@ class SendTerminalKeys(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """

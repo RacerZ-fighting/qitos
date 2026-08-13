@@ -1,5 +1,10 @@
 """Third-party skill system for QitOS."""
 
+from .bundled import (
+    BundledSkillDiagnostic,
+    BundledSkillDiagnosticCode,
+    BundledSkillSnapshot,
+)
 from .cli import main as skill_cli_main
 from .injector import (
     AutoSkillSelector,
@@ -27,6 +32,9 @@ from .provider import (
 from .registry import RegistryEntry, SkillRegistry, installed_to_entry
 
 __all__ = [
+    "BundledSkillDiagnostic",
+    "BundledSkillDiagnosticCode",
+    "BundledSkillSnapshot",
     "SkillManifest",
     "SkillPackage",
     "InstalledSkill",

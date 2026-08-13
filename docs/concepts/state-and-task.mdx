@@ -140,7 +140,7 @@ result = agent.run(task, return_state=True)
 
 | Field              | Type                    | Description                                                       |
 | ------------------ | ----------------------- | ----------------------------------------------------------------- |
-| `id`               | `str`                   | Unique run identifier. Used in trace artifacts.                   |
+| `id`               | `str`                   | Stable task or benchmark-sample identifier.                       |
 | `objective`        | `str`                   | The plain-text task instruction passed to `init_state`.           |
 | `resources`        | `list[TaskResource]`    | Files, directories, URLs, or artifacts the agent needs.           |
 | `env_spec`         | `EnvSpec \| None`       | Declares the environment type and configuration.                  |
@@ -149,6 +149,10 @@ result = agent.run(task, return_state=True)
 | `budget`           | `TaskBudget`            | Per-task budget that overrides the Engine's default budget.       |
 | `inputs`           | `dict[str, Any]`        | Structured input data available to the agent.                     |
 | `metadata`         | `dict[str, Any]`        | Freeform metadata stored in the trace manifest.                   |
+
+`Task.id` identifies the task, not one execution of it. A plain-text task is wrapped
+with a content-derived stable ID. Trace and Journal `run_id` values identify separate
+execution instances, including repeated trials of the same task.
 
 ### TaskBudget
 

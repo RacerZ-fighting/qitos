@@ -18,6 +18,34 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **无 writer lease 的 Run 查询与 lineage**：`JsonlRunCatalog` 现在可以在 Engine
+  仍持有 writer lease 时返回不可变、类型化的 Run 摘要、确定性列表、已校验祖先和直接
+  Child。读取不会修复 canonical JSONL，也不会重建可丢弃的 SQLite 投影。继承到本地的
+  committed boundary 可继续 fork；嵌套 fork 的 Engine 恢复不依赖祖先文件，也不会重放
+  已完成工具。
+- **带 revision 的原子文件工具**：有界读取现在会返回完整 UTF-8 文件的 SHA-256
+  revision。Host 与 Docker 文件能力通过原子替换提交内容，并在每个 environment 内按
+  相同路径串行化 mutation；`write_file` 支持 compare-and-swap，`edit_file` 默认校验
+  它刚读到的 revision，因此并发修改会明确报冲突，不会静默覆盖。
+- **后台进程完成后安全唤醒 Agent**：Host watcher 会先收完输出并持久化
+  `process.terminal`，再通过既有 durable Mailbox 提交唯一的 `process.completed` 输入。
+  活跃 Agent 只在下一 turn safe point 读取该事件；Mailbox 已关闭或拒绝时，terminal
+  snapshot 仍可由进程控制工具查询。
+- **带判别类型的模型流事件**：每个 Provider 事件现在都会明确声明它是文本、reasoning、
+  ToolCall 增量、原生输出项、usage、生命周期、成功终态还是失败终态。含混的
+  `ModelStreamChunk` 字段集合已经删除；Engine 把 `FAILED` 视为错误，只提交
+  `COMPLETED` 事务。
+- **可恢复模型请求与受校验的 continuation**：Engine 现在只向 Provider 传递一份
+  不可变 `ModelRequest`，并把精确、已脱敏的请求快照写入 Journal。Responses 只有在
+  Run、Provider、model、protocol、请求设置和 canonical input 前缀全部一致时才使用
+  `previous_response_id`；resume 可以保留这项优化，fork、Provider 切换、压缩漂移或
+  句柄过期都会回退到完整本地 transcript。恢复回归现在会让多轮 Run 依次经历压缩、
+  取消、从 committed boundary fork 和 resume，并验证 canonical ToolCall/ToolResult
+  transcript 始终完整。
+- **同一个异步 turn 事务**：完整 Run 与交互式 step 现在共用一份不可变 turn
+  事务。Parser、Critic 与 handoff 作为组合策略接入，不再各自占据或复制 Agent loop；
+  Tool、Mailbox、MCP 与 Child 始终运行在调用方 event loop，取消会先等待已启动 handler
+  清理并按输入顺序写完 terminal 结果。模型变化只会让下一 turn 重新解析推断协议。
 - **Session Journal 只有一个 owner**：每个 Run 现在使用进程安全的 JSONL writer lease
   和明确的终止生命周期。replay 始终先验证 canonical JSONL；可丢弃的 SQLite 读取投影只有
   在与 JSONL 一致时才会保留，并会在过期或损坏后重建。payload 在 append 前先通过唯一的
@@ -39,8 +67,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   与 reasoning 子项保持可见，同时不会被重复计入累计总量。
 - **真实的模型能力快照**：模型 adapter 现在暴露不可变的 `ModelCapabilities`。
   Responses、Anthropic Messages 与兼容 Chat 只声明已经通过测试的原生工具、
-  reasoning/replay、usage/cache 与多模态能力，不提前宣称尚未闭环的 continuation
-  或 hosted tool；终态 token 用量会收敛为类型化 `ModelUsage`，同时保留 Provider
+  reasoning/replay、usage/cache 与多模态能力，不提前宣称 hosted tool；Responses
+  还会声明已通过契约测试的受校验 continuation。终态 token 用量会收敛为类型化
+  `ModelUsage`，同时保留 Provider
   原始明细。
 - **模型家族与 wire 可独立选择**：同一 Kimi 家族配置可使用兼容 Chat Completions
   或 Anthropic Messages，且不会把一种 adapter 的请求默认值泄漏到另一种 wire。
@@ -59,9 +88,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   Engine 会完成连接、发现、暴露 `mcp__server__tool` 名称、在 transport 所属 event
   loop 上执行调用，并在 run 结束时注销工具和关闭连接；默认空配置没有启动成本。
 - **渐进式 bundled Skill**：应用可以给 `SkillToolSet` 配置只读资源根目录，先暴露
-  有界目录，再按精确名称加载完整 `SKILL.md`。加载结果带可持久化的内容 revision；
-  `read_skill_resource` 通过受 Skill 根目录约束、绑定内容哈希的游标按需读取 UTF-8
-  reference，无需调用 provider 或写安装 registry。
+  有界目录，再按精确名称加载完整 `SKILL.md`。递归发现遵循显式根目录优先级，并返回
+  强类型诊断；同一个 bundle revision 同时覆盖说明与资源。应用还可以传入冻结的运行时
+  requirement 集合，在完整说明暴露给模型前拒绝当前环境不可用的工作流；整个过程无需
+  调用 provider 或写安装 registry。
 - **强类型 WorkPlan**：`WorkPlanState` 与 `update_plan` 提供经过校验、可随
   checkpoint 恢复的轻量清单，并带有纯 reducer 和确定性 Markdown 投影。coding preset
   不再直接修改自由格式的 todo metadata。
@@ -87,10 +117,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 - **qita 同规格对比预检**：compare 页面会先核对模型、提示词、工具、环境、
   上下文策略、预算、源码版本与实验来源。配置不同或来源信息不完整的结果会明确标为
   只能描述、不能用于因果判断；配置一致也不会掩盖供应商或外部环境的非确定性。
-- **真实且类型化的模型流**：Chat、Responses 与 Anthropic 流现在通过同一个
-  `ModelStreamChunk` 契约保留供应商终止原因、reasoning 与工具调用分片、完整工具调用
-  及 usage。不完整的流会明确失败，不再伪造完成；发生错误后 Engine handler 也不会
-  再收到正常 `on_end`。
+- **真实且类型化的模型流**：Chat、Responses 与 Anthropic 流会保留供应商终止原因、
+  reasoning 与工具调用分片、完整工具调用及 usage。不完整的流会明确失败，不再伪造
+  完成；发生错误后 Engine handler 也不会再收到正常 `on_end`。
 - **按调用准确统计 qita 工具状态**：工具次数与失败数现在来自 canonical action/result
   配对，不会再把同一步中的一个失败错误归到所有调用上。精确生命周期计数以及无法配对
   的 trace 证据都会保留供审计。
@@ -112,6 +141,7 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   重试；首个 provider event 之后保持实时发布，失败时直接停止而不重放。事件空闲
   超时能识别卡住的流，又不会截断持续有输出的长响应。
 - **qita 轨迹分析工作台**：run 页面现在默认进入失败诊断视图，用 Focus Navigator、Agent Behavior Story 和右侧 Inspector 引导用户先看关键证据。每步按照 `Input -> Thought -> Action Calls -> Environment Observation` 展示；每个 action 都和自己的完整参数、状态、耗时及 model-visible result 成对出现，canonical raw 与无法配对的证据仍可在 Inspector 审计。异常调用默认展开、成功调用默认折叠，长正文自动折行且绝不会只有截断预览。CyberGym 的预算耗尽和 `submit_poc` 验证失败会被提升为重点复盘信号；Light/Dark 主题覆盖 board、run、replay 与 compare 页面。
+- **稳定的 same-spec 比较指纹**：纯文本任务使用内容生成的稳定 ID，qita 分别记录完整任务与运行配置指纹；挂钟时间不再造成假差异，不同任务或缺少 provenance 的旧 trace 也不会被误报为 same-spec。
 - **立即取消状态保持一致**：Engine 识别立即取消后，State、任务/运行结果、END event 与 trace manifest 现在都会记录 `cancelled_immediate`；qita 会将该 manifest 视为 `stopped`，不再误判为正常完成。
 - **结构化动作文本不再假完成**：当原生工具模型没有返回 `tool_calls`、却以文本输出了格式错误的动作字段时，QitOS 现在会保留 parser 恢复路径，而不会把动作文本当成最终答案；普通自然语言结论的行为保持不变。
 - **窗口安全的原生工具历史**：当消息窗口裁掉 assistant 调用声明时，模型请求会移除对应的孤立工具结果，避免长时并行工具 Agent 发送非法 `tool_call_id` 链，同时保持完整轮次和原有恢复行为不变。

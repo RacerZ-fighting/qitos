@@ -17,12 +17,75 @@ How to update:
 
 ## Unreleased
 
+### Changed
+
+- Bundled Skill roots now use recursive nearest-root discovery, deterministic
+  first-root-wins precedence, and typed non-fatal diagnostics. Explicit refresh
+  replaces the catalog atomically; bundle revisions cover both `SKILL.md` and resource
+  bytes, stale resources fail instead of mixing revisions, and an optional immutable
+  requirement inventory gates full Skill loading.
+- Context recovery coverage now exercises compaction, cancellation, committed-boundary
+  fork, and resume as one Run. It verifies ordered ToolCall/ToolResult parity in the
+  canonical Journal while resume alone may retain a matching Provider continuation.
+- Canonical `write_file` and `edit_file` now commit through the selected environment's
+  atomic replacement operation. Reads expose a complete-file SHA-256 revision;
+  explicit and implicit compare-and-swap guards turn concurrent changes into a stable
+  `file_revision_conflict` result instead of a lost update.
+- Child invocation factories now receive the already-journaled `ChildHandle` in their
+  runtime context, so product runtimes can correlate independent Child sessions and
+  traces without deriving identity from mutable task data.
+
+### Breaking
+
+- Custom `FileSystemCapability` implementations must provide `write_text_atomic()`.
+  The method owns same-path mutation ordering, optional SHA-256 preconditions, and the
+  final replace boundary; `write_text()` remains the unconditional convenience path.
+- `AgentRequest`, `AgentInvocation`, and `AgentResult` have been replaced by the
+  immutable core `ChildLaunchRequest`, `ChildInvocation`, `ChildHandle`, `ChildResult`,
+  `ChildStatus`, and `AgentConclusion` contracts. `AgentTool` now accepts a complete
+  `TaskBudget`, returns parent-scoped handles, and exposes typed `child_result(handle)`
+  and `cancel_child(handle)` lifecycle operations. Tool execution status remains
+  separate from the child task's `child_status`.
+- `CommandCapability.start()` has been replaced by the async typed
+  `astart()`/`apoll()`/`aread()`/`awrite()`/`await_process()`/`aterminate()` lifecycle.
+  Environment cleanup now awaits `Env.ateardown()` so managed subprocess readers and
+  watchers settle before a Run closes. Docker's untracked shell-detach implementation
+  was removed; a remote environment must implement the same managed async contract
+  before exposing background execution.
+- `ModelStreamChunk` has been replaced by the discriminated `ModelStreamEvent`.
+  Provider implementations must emit exactly one explicit event kind and terminate
+  with `COMPLETED` or `FAILED`; only `COMPLETED` is a successful transaction.
+- `Model.stream()` now accepts one immutable `ModelRequest` instead of mutable
+  `messages + **kwargs`. Provider implementations read isolated message and option
+  projections from that request; the Engine is the only owner that assembles it.
+- Class-based tools now implement `async execute(args, runtime_context)`. Managed Web
+  capabilities and their concrete adapters are async as well. Synchronous decorated
+  functions remain supported through one explicit compatibility boundary, but code
+  inside an active event loop must await Tool and Engine APIs.
+- Runtime components now await `Engine.apost_runtime_event()`. The synchronous
+  `post_runtime_event()` entry remains only for callers outside the Engine event loop
+  and schedules onto that loop without creating a temporary loop.
+
 ### Fixed
 
 - Session Journal payloads now cross one strict JSON boundary before append, keeping
   in-memory replay, reopened replay, stable record IDs, JSONL, and projection digests
   consistent. Unsupported schema versions now have a dedicated upgrade error, and a
   failed source close during fork no longer leaks the unreturned child's writer lease.
+- Nested Journal forks now resolve inherited records to their canonical origin across
+  every ancestor. A fork-of-fork can resume independently without replaying a
+  completed Tool, and inconsistent inherited identity fails closed.
+- Plain-text Task coercion now derives a stable task ID from content instead of wall
+  time. Trace provenance preserves explicit structured Task IDs in an independent
+  `task_hash` without mixing task data into `run_config_hash`; qita requires the task
+  fingerprint for same-spec comparisons while keeping older manifests readable.
+- The `ChildRunResult.records` contract is now a read-only sequence view, so concrete
+  typed `EngineResult` values structurally satisfy the Child Engine protocol.
+- Synchronous Engine hooks can now defer runtime input for durable async acceptance at
+  the next turn safe point instead of calling the external sync mailbox bridge from
+  the Engine event loop.
+- Inferred model protocols are now resolved from each immutable turn snapshot instead
+  of being cached for the whole Run, so a model change takes effect on the next turn.
 - Native tool calls now require a complete protocol terminal before execution. Chat
   drops calls on output-limit/non-tool finishes; Anthropic keeps interleaved block
   arguments isolated and records, but does not replay or execute, unclosed, malformed,
@@ -65,6 +128,64 @@ How to update:
 
 ### Added
 
+- Added immutable `RunHandle`/`RunStatus` contracts and a lease-free
+  `JsonlRunCatalog` for inspect, deterministic listing, validated lineage, and direct
+  children. Catalog reads use only an exact read-only SQLite projection or canonical
+  JSONL prefix and never acquire ownership, repair, or rebuild storage.
+- `AgentTool` composition can now populate the Child profile, allowed Tool groups, and
+  working directory in each immutable launch request. `ChildInvocation.cleanup` gives
+  the supervisor explicit async ownership of per-Child model and trace resources across
+  success, failure, and cancellation.
+- Added a reusable Run-owned `ChildSupervisor`. It admits fresh Engines under one async
+  concurrency limit, supports non-destructive wait and bounded interrupt, stores
+  terminal results before parent delivery, and continues to own delivery tasks until
+  shutdown drains them. `AgentTool` is now only the model-facing launch projection.
+- Child supervision now journals `child.started` before constructing an Engine and
+  `child.terminal` before parent delivery. Recovery marks a started child without a
+  terminal as `interrupted` and never replays it; forked Runs do not acquire authority
+  over inherited parent handles.
+- Added `child_status`, `child_wait`, `child_message`, and `child_interrupt` tools over
+  the shared supervisor. Message delivery uses the active Child's async durable mailbox;
+  wait timeout preserves execution, interrupt awaits cleanup, and unknown or foreign
+  handles return stable state.
+- Added canonical Child Agent contracts that keep persisted launch intent, stable
+  identity, lifecycle status, bounded conclusions, evidence references, and live Engine
+  ownership separate. The contracts round-trip without serializing a runnable Agent.
+- Added durable run-scoped mailbox acceptance. Journal-backed events append
+  `runtime_input.posted` before waking the Engine, bind to the next completed model
+  transaction, and are redelivered exactly once on resume if that transaction was not
+  durable. Final completion is linearized with mailbox acceptance, so input accepted
+  during a final turn is processed on a following turn instead of being silently lost.
+- Added a Run-owned host process supervisor with opaque `ProcessHandle` values,
+  immutable snapshots, incremental bounded UTF-8 output, complete workspace logs,
+  stdin and POSIX PTY interaction, active-process limits, and graceful process-group
+  shutdown with forced escalation. Journal-enabled background starts persist exactly
+  one `process.started` and `process.terminal` record, and a failed started-record
+  write reaps the process before returning an error. The shell profile now exposes
+  process list/read/write/wait/terminate tools through that same capability. Resume
+  closes an interrupted start as `lost` without replaying or reattaching it; forked
+  Runs receive no authority over inherited parent handles. Terminal watchers now post
+  one bounded `process.completed` RuntimeInput only after `process.terminal` is
+  durable, so an active Agent wakes through the existing turn-safe mailbox rather than
+  receiving an out-of-band state mutation.
+- Added durable model request snapshots and guarded OpenAI Responses continuation.
+  `model.completed` records the exact credential-redacted Provider input plus an
+  optional Run-bound handle. Resume reuses a handle only when provider, model,
+  protocol, request settings, and canonical input prefix still match; fork, Provider
+  changes, compaction drift, and rejected/expired handles fall back to the complete
+  local transcript without replaying a tool.
+- Added one immutable `TurnSnapshot` for every model transaction. It freezes the model
+  reference, protocol, transaction-complete History view, Tool definitions, runtime
+  capabilities, absolute deadline, explicit pricing, and remaining step/token/cost,
+  Tool-concurrency, and Child budgets used by both model projection and dispatch.
+- Added typed completion assessment. Product agents can accept a proposed final answer,
+  reject it with durable feedback for another turn, or classify it as blocked; new
+  runs distinguish `completed`, `blocked`, step/time/token/cost budget exhaustion,
+  cancellation, and failure.
+- Added explicit `ModelPricing` plus Run and Task limits for cost, Tool concurrency, and
+  Child count. Journal resume restores accumulated provider token usage and calculated
+  cost before another turn is admitted.
+
 - Added one process-safe writer lease per Run and a disposable SQLite Journal read
   projection. JSONL remains the only canonical source; stale, corrupt, missing, or
   unsupported projections rebuild without changing canonical recovery semantics.
@@ -79,8 +200,9 @@ How to update:
 - Added immutable `ModelCapabilities` snapshots for configured adapters. OpenAI
   Responses, Anthropic Messages, and compatible Chat Completions now report only
   tested transport facts such as native tools, reasoning replay, usage/cache
-  reporting, and multimodal input; continuation and hosted tools remain disabled
-  until their runtime contracts are complete. Completed model transactions now
+  reporting, and multimodal input. Responses additionally reports its guarded
+  continuation contract; hosted tools remain disabled until their runtime contracts
+  are complete. Completed model transactions now
   normalize token counts into typed `ModelUsage` while retaining the lossless
   provider usage mapping for cache, trace, and compatibility consumers.
 - Added a durable per-Run JSONL journal for canonical model/tool transactions,
@@ -148,6 +270,24 @@ How to update:
 - Journal replay now always parses and validates canonical JSONL before consulting the
   disposable SQLite projection. A projection is retained only when its record digests
   match the validated JSONL; drift rebuilds the projection and can never override replay.
+- `Engine.arun()` and `Engine.astep()` now share one immutable turn transaction instead
+  of duplicating decide/act/reduce behavior. Run lifecycle stays in Engine, parser and
+  compatibility interpretation live in a composed decision runtime, and optional
+  critic/handoff policies no longer occupy the outer loop.
+- The canonical action path is now async from Engine through Tool, Mailbox, MCP, and
+  Child execution. Blocking host and Docker commands use asyncio subprocesses with
+  process-group cleanup; explicitly concurrency-safe calls remain parallel and commit
+  terminal results in source order.
+- Cancellation now drains every started Tool handler before publishing its terminal
+  result. A direct caller `Task.cancel()` is re-raised only after terminal persistence
+  and runtime cleanup, while controlled Engine cancellation returns an auditable
+  cancelled result without leaving event-loop tasks behind.
+- `ToolExposure` now freezes each Tool definition while retaining one live handler
+  owner, so stateful Tool lifecycle and Run-scoped Child accounting cannot be copied
+  away between lookups or turns.
+- Runtime input is accepted through a thread-safe async inbox and projected only at the
+  next pre-turn safe point. MCP transports and background Child tasks stay on their
+  owning event loop; the temporary-loop MCP bridge and daemon action pool were removed.
 - Journal records now deep-copy nested payloads at construction and projection
   boundaries. Replay and committed-tool queries return isolated values.
 - Engine run and resume entry points now own and close their configured Journal on
@@ -234,9 +374,9 @@ How to update:
   reject calls from an active event loop; the daemon-thread `AsyncEngine` bridge has
   been removed.
 - Background `AgentTool` runs now snapshot parent history at launch but defer model,
-  Engine, and trace construction until an execution slot opens. A bounded daemon pool,
-  repeatable bounded close, canonical cancellation stops, and terminal-before-wakeup
-  ordering keep child teardown from extending process lifetime indefinitely. Terminal
+  Engine, and trace construction until an execution slot opens. Event-loop-owned tasks,
+  awaited close, canonical cancellation stops, and terminal-before-wakeup ordering keep
+  child teardown structured and observable. Terminal
   children retain their queryable result while active task, request, Engine, and
   cancellation records are reaped immediately.
 - Clarified the generic `AgentTool` model contract: independent multi-step tasks can be
@@ -282,8 +422,8 @@ How to update:
   promoted to a visible final answer.
 - Fixed runtime deadlines being checked only at Engine step boundaries. The effective
   deadline now clamps tool admission, execution timeout, retry backoff, and runtime
-  waits. Timed-out synchronous tools use daemon workers so an orphan cannot block
-  interpreter shutdown. Saturated event queues now report dropped deliveries, retain
+  waits. Synchronous compatibility tools run off-loop and are awaited to a known
+  side-effect boundary. Saturated event queues now report dropped deliveries, retain
   exactly one priority `run_end` before the close marker, and terminate late subscribers.
 - Fixed native-capable agent turns so provider `tool_calls` are authoritative before
   custom text interpreters or parsers, API-delivered tools no longer receive a second

@@ -106,4 +106,4 @@ def test_security_audit_agent_template_runs_minimal_path(tmp_path: Path) -> None
         return_state=True,
     )
     assert result.state.final_result == "audit complete"
-    assert result.state.stop_reason == "final"
+    assert result.state.stop_reason == "completed"

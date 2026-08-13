@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import threading
 import time
 from dataclasses import dataclass
@@ -23,7 +24,10 @@ from qitos import (
 from qitos.engine import RuntimeBudget
 from qitos.kit.history import WindowHistory
 from qitos.kit.parser import JsonDecisionParser
-from qitos.kit.tool.agent import AgentInvocation, AgentTool
+from qitos.core.child import ChildInvocation
+from qitos.core.journal import JournalRecordType
+from qitos.kit.tool.agent import AgentTool
+from qitos.kit.journal import JsonlSessionJournal
 
 
 @dataclass
@@ -92,6 +96,90 @@ def test_runtime_input_rejects_non_json_payload(payload: dict[str, Any]) -> None
         )
 
 
+def test_runtime_input_round_trips_its_strict_journal_shape() -> None:
+    event = _event()
+
+    assert RuntimeInput.from_dict(event.to_dict()) == event
+    with pytest.raises(ValueError, match="fields are invalid"):
+        RuntimeInput.from_dict({**event.to_dict(), "unexpected": True})
+
+
+@pytest.mark.asyncio
+async def test_sync_hook_defers_runtime_input_to_async_safe_point(tmp_path) -> None:
+    accepted: list[bool] = []
+
+    class Hook:
+        def on_run_start(self, task: str, state: _State, engine: Engine) -> None:
+            _ = task, state
+            accepted.append(
+                engine.defer_runtime_event(_event(), run_id=engine.active_run_id)
+            )
+            accepted.append(
+                engine.defer_runtime_event(_event(), run_id=engine.active_run_id)
+            )
+
+    class Agent(AgentModule[_State, dict[str, Any], Any]):
+        def __init__(self) -> None:
+            self.history = WindowHistory(window_size=20)
+            super().__init__(tool_registry=ToolRegistry(), history=self.history)
+
+        def init_state(self, task: str, **kwargs: Any) -> _State:
+            _ = kwargs
+            return _State(task=task)
+
+        def decide(
+            self,
+            state: _State,
+            observation: dict[str, Any],
+        ) -> Decision[Any]:
+            _ = state, observation
+            return Decision.final("done")
+
+        def reduce(
+            self,
+            state: _State,
+            observation: dict[str, Any],
+            decision: Decision[Any],
+        ) -> _State:
+            _ = observation, decision
+            return state
+
+    agent = Agent()
+    journal_root = tmp_path / "journal"
+    result = await Engine(
+        agent,
+        hooks=[Hook()],
+        journal=JsonlSessionJournal(journal_root),
+    ).arun("inspect")
+
+    assert accepted == [True, False]
+    runtime_messages = [
+        message
+        for message in agent.history.messages
+        if message.role == "user" and message.metadata.get("source") == "runtime"
+    ]
+    assert len(runtime_messages) == 1
+    assert (
+        json.loads(runtime_messages[0].content)["runtime_events"][0]["event_id"]
+        == "event-1"
+    )
+
+    reader = JsonlSessionJournal(journal_root)
+    await reader.open(result.run_id)
+    records = await reader.replay()
+    posted = next(
+        record
+        for record in records
+        if record.type is JournalRecordType.RUNTIME_INPUT_POSTED
+    )
+    completed = next(
+        record for record in records if record.type is JournalRecordType.MODEL_COMPLETED
+    )
+    assert posted.seq < completed.seq
+    assert completed.payload["runtime_input_ids"] == ["event-1"]
+    await reader.close()
+
+
 def test_runtime_wait_sleeps_until_event_and_delivers_it_at_safe_point() -> None:
     agent = _WaitAgent()
     engine = Engine(agent, budget=RuntimeBudget(max_steps=4))
@@ -143,10 +231,10 @@ def test_background_agent_completion_wakes_parent_runtime_wait() -> None:
     class ChildEngine:
         active_run_id = "child-run"
 
-        def run(self, task: str, **kwargs: Any) -> Any:
+        async def arun(self, task: str, **kwargs: Any) -> Any:
             _ = kwargs
             child_started.set()
-            assert release_child.wait(timeout=1)
+            assert await asyncio.to_thread(release_child.wait, 1)
             return SimpleNamespace(
                 state=SimpleNamespace(
                     final_result=f"validated:{task}",
@@ -163,9 +251,9 @@ def test_background_agent_completion_wakes_parent_runtime_wait() -> None:
             release_child.set()
 
     agent_tool = AgentTool(
-        invocation_factory=lambda request, _context: AgentInvocation(
+        invocation_factory=lambda request, _context: ChildInvocation(
             engine=ChildEngine(),
-            task=request.prompt,
+            task=request.task,
         ),
         execution_mode="background",
     )
@@ -228,7 +316,6 @@ def test_background_agent_completion_wakes_parent_runtime_wait() -> None:
 
     release_child.set()
     thread.join(timeout=1)
-    agent_tool.close(wait_seconds=1)
 
     assert not thread.is_alive()
     assert parent.calls == 3

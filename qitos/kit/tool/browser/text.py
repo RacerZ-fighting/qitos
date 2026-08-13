@@ -41,7 +41,7 @@ class WebSearch(_WebBrowserTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -80,7 +80,7 @@ class VisitURL(_WebBrowserTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -112,7 +112,7 @@ class PageDown(_WebBrowserTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -140,7 +140,7 @@ class PageUp(_WebBrowserTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -168,7 +168,7 @@ class FindInPage(_WebBrowserTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -196,7 +196,7 @@ class FindNext(_WebBrowserTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -226,7 +226,7 @@ class ArchiveSearch(_WebBrowserTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """

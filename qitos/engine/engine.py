@@ -12,7 +12,7 @@ import traceback
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar, cast
+from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
 from uuid import uuid4
 
 _logger = logging.getLogger("qitos.engine")
@@ -43,24 +43,35 @@ from ..core.journal import (
     SessionJournal,
 )
 from ..core.memory import Memory, MemoryRecord
+from ..core.model_capabilities import ModelCapabilities
+from ..core.model_response import (
+    ModelPricing,
+    ModelUsage,
+    ModelUsageSource,
+    normalize_model_usage,
+)
+from ..core.model_request import ModelContinuation
 from ..core.runtime_input import RuntimeInput
 from ..core.spec import ExperimentSpec, RunSpec
 from ..core.state import StateSchema
 from ..core.task import Task, TaskResult, TaskValidationIssue
 from ..core.tool_result import ToolResult
 from ..core.tool_registry import ToolExposure
+from ..core.turn import TurnBudgetSnapshot, TurnRuntimeCapabilities, TurnSnapshot
 from ..trace import TraceWriter
 from ..protocols import get_protocol, infer_protocol_from_parser
 from ..models.profile_registry import infer_default_protocol, infer_model_profile
 from ._action_runtime import _ActionRuntime
 from ._context_runtime import _ContextRuntime
 from ._control_runtime import _ControlRuntime
+from ._decision_runtime import _DecisionRuntime
 from ._env_runtime import _EnvRuntime
 from ._loop_detector import ToolCallLoopDetector
 from ._model_runtime import _ModelRuntime
 from ._handoff_runtime import _HandoffRuntime
 from ._journal_runtime import _JournalRuntime, history_message_to_dict
 from ._trace_runtime import _TraceRuntime
+from ._turn_runtime import _TurnRuntime
 from .action_executor import ActionExecutor
 from .cancellation import CancelMode, CancelToken
 from .branching import BranchSelector, FirstCandidateSelector
@@ -121,6 +132,7 @@ class EngineResult(Generic[StateT]):
     task_result: Optional[TaskResult] = None
     runtime_seconds: float = 0.0
     total_tokens: int = 0
+    total_cost_usd: float = 0.0
     run_id: str = ""
     critic_traces: List[CriticTrace] = field(default_factory=list)
     handoff_traces: List[HandoffTrace] = field(default_factory=list)
@@ -255,6 +267,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         tracing_provider: Optional[Any] = None,
         auto_approve: bool = False,
         action_execution_policy: Optional[ActionExecutionPolicy] = None,
+        model_pricing: ModelPricing | None = None,
         journal: SessionJournal | None = None,
         state_snapshot_interval: int = 16,
     ):
@@ -274,10 +287,23 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
             self.tool_registry = _TR()
         self.budget = budget or RuntimeBudget()
+        if model_pricing is not None and not isinstance(model_pricing, ModelPricing):
+            raise TypeError("model_pricing must be a ModelPricing")
+        configured_pricing = model_pricing
+        if configured_pricing is None:
+            candidate_pricing = getattr(getattr(agent, "llm", None), "pricing", None)
+            if isinstance(candidate_pricing, ModelPricing):
+                configured_pricing = candidate_pricing
+        if self.budget.max_cost_usd is not None and configured_pricing is None:
+            raise ValueError("max_cost_usd requires explicit model_pricing")
+        self.model_pricing = configured_pricing
         self._base_budget = RuntimeBudget(
             max_steps=self.budget.max_steps,
             max_runtime_seconds=self.budget.max_runtime_seconds,
             max_tokens=self.budget.max_tokens,
+            max_cost_usd=self.budget.max_cost_usd,
+            max_tool_concurrency=self.budget.max_tool_concurrency,
+            max_children=self.budget.max_children,
             deadline_monotonic=self.budget.deadline_monotonic,
         )
         self.validation_gate = validation_gate or StateValidationGate()
@@ -335,6 +361,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_env_observation: Optional[EnvObservation] = None
         self._last_env_result: Optional[EnvStepResult] = None
         self._token_usage: int = 0
+        self._cost_usage_usd: float = 0.0
+        self._model_continuation: ModelContinuation | None = None
         self._active_run_id: str = ""
         self._runtime_deadline_monotonic: Optional[float] = None
         from ..kit.history import WindowHistory
@@ -358,10 +386,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_prompt_metadata: Dict[str, Any] = {}
         self._last_context_telemetry: Dict[str, Any] = {}
         self._last_runtime_error: Optional[Dict[str, Any]] = None
-        self._active_tool_exposure: ToolExposure | None = None
-        self._active_tool_exposure_step_id: int | None = None
         self._model_runtime: _ModelRuntime[StateT, ObservationT, ActionT] = (
             _ModelRuntime(self)
+        )
+        self._decision_runtime: _DecisionRuntime[StateT, ObservationT, ActionT] = (
+            _DecisionRuntime(self, self._model_runtime)
         )
         self._action_runtime: _ActionRuntime[StateT, ActionT] = _ActionRuntime(self)
         self._journal_runtime: _JournalRuntime[StateT, ActionT] = _JournalRuntime(self)
@@ -370,6 +399,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         )
         self._control_runtime: _ControlRuntime[StateT, ObservationT, ActionT] = (
             _ControlRuntime(self)
+        )
+        self._turn_runtime: _TurnRuntime[StateT, ObservationT, ActionT] = (
+            _TurnRuntime(self)
         )
         self._trace_runtime: _TraceRuntime[StateT] = _TraceRuntime(self)
         self._handoff_runtime: _HandoffRuntime[StateT, ObservationT, ActionT] = (
@@ -405,6 +437,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             raise ValueError("state_snapshot_interval must be positive")
         self._state_snapshot_interval = int(state_snapshot_interval)
         self._journal_pending_history: list[dict[str, Any]] = []
+        self._pending_runtime_input_ids: list[str] = []
+        self._deferred_runtime_inputs: list[RuntimeInput] = []
         self._journal_terminal_record_ids: dict[str, list[str]] = {}
         self._canonical_action_results: list[CanonicalActionResult] = []
         self._last_journal_position: JournalPosition | None = None
@@ -419,13 +453,18 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         # Cancellation token — shared with EngineResult for external cancel
         self._cancel_token = CancelToken()
         self._runtime_inbox = _RuntimeInbox()
+        self._runtime_input_post_lock = asyncio.Lock()
         self._active_async_task: Optional[asyncio.Task[Any]] = None
         self._active_async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._connected_mcp_servers: List[Any] = []
         self._mcp_tool_names: List[str] = []
-        self._mcp_runtime: Any = None
 
-    def _build_action_executor(self, tool_registry: Any) -> Optional[ActionExecutor]:
+    def _build_action_executor(
+        self,
+        tool_registry: Any,
+        *,
+        turn: TurnSnapshot | None = None,
+    ) -> Optional[ActionExecutor]:
         """Construct an ActionExecutor carrying every engine-level dependency.
 
         Single source of truth for executor construction so that rebuilds
@@ -434,9 +473,24 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         """
         if tool_registry is None:
             return None
+        configured_policy = self._action_execution_policy or ActionExecutionPolicy()
+        max_tool_concurrency = (
+            turn.budget.max_tool_concurrency
+            if turn is not None
+            else self.budget.max_tool_concurrency
+        )
+        policy = ActionExecutionPolicy(
+            mode=configured_policy.mode,
+            fail_fast=configured_policy.fail_fast,
+            max_concurrency=min(
+                int(configured_policy.max_concurrency),
+                int(max_tool_concurrency),
+            ),
+            parallel_tool_names=configured_policy.parallel_tool_names,
+        )
         return ActionExecutor(
             tool_registry=tool_registry,
-            policy=self._action_execution_policy,
+            policy=policy,
             trace_writer=self.trace_writer,
             delegate_depth=self._delegate_depth,
             shared_memory=self._shared_memory,
@@ -445,27 +499,66 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             read_before_write_enforcer=self._rbw_enforcer,
             permission_interaction_callback=self._permission_interaction_callback,
             auto_approve=self.auto_approve,
+            turn_budget=turn.budget if turn is not None else None,
         )
 
-    def _capture_tool_exposure(
+    def _capture_turn(
         self,
         state: StateT,
         step_id: int,
-    ) -> ToolExposure:
+    ) -> TurnSnapshot:
+        """Capture the exact immutable inputs shared by model and tools."""
+
         exposure = self.agent.build_tool_exposure(state, self.tool_registry)
         if not isinstance(exposure, ToolExposure):
             raise TypeError("Agent.build_tool_exposure() must return ToolExposure")
-        self._active_tool_exposure = exposure
-        self._active_tool_exposure_step_id = step_id
-        return exposure
-
-    def _action_executor_for_step(self, step_id: int) -> ActionExecutor | None:
-        if (
-            self._active_tool_exposure is not None
-            and self._active_tool_exposure_step_id == step_id
-        ):
-            return self._build_action_executor(self._active_tool_exposure)
-        return self.executor
+        model = getattr(self.agent, "llm", None)
+        model_capabilities = getattr(model, "capabilities", ModelCapabilities())
+        if not isinstance(model_capabilities, ModelCapabilities):
+            model_capabilities = ModelCapabilities()
+        environment_ops: set[str] = set()
+        for name in exposure.list_tools():
+            description = exposure.describe_tool(name)
+            environment_ops.update(description.get("required_ops") or [])
+            environment_ops.update(description.get("environment_ops") or [])
+        remaining_tokens = (
+            None
+            if self.budget.max_tokens is None
+            else max(0, int(self.budget.max_tokens) - int(self._token_usage))
+        )
+        remaining_cost = (
+            None
+            if self.budget.max_cost_usd is None
+            else max(0.0, float(self.budget.max_cost_usd) - self._cost_usage_usd)
+        )
+        protocol = self.resolve_protocol()
+        return TurnSnapshot(
+            run_id=self._active_run_id,
+            step_id=step_id,
+            model=model,
+            protocol=protocol,
+            protocol_source=self._resolved_protocol_source,
+            history=self._history().snapshot(),
+            tools=exposure,
+            capabilities=TurnRuntimeCapabilities(
+                model=model_capabilities,
+                environment_ops=tuple(sorted(environment_ops)),
+                mailbox=True,
+                child_agents="Agent" in exposure.list_tools(),
+            ),
+            budget=TurnBudgetSnapshot(
+                step=step_id,
+                max_steps=int(self.budget.max_steps),
+                used_tokens=int(self._token_usage),
+                remaining_tokens=remaining_tokens,
+                used_cost_usd=float(self._cost_usage_usd),
+                remaining_cost_usd=remaining_cost,
+                model_pricing=self.model_pricing,
+                deadline_monotonic=self._runtime_deadline_monotonic,
+                max_tool_concurrency=int(self.budget.max_tool_concurrency),
+                max_children=int(self.budget.max_children),
+            ),
+        )
 
     def cancel(self, mode: str = "immediate") -> None:
         """Request cancellation of an in-flight run.
@@ -505,6 +598,26 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             return None
         return max(0.0, deadline - time.monotonic())
 
+    def _record_model_cost(
+        self,
+        usage: ModelUsage | Mapping[str, Any] | None,
+        *,
+        pricing: ModelPricing | None,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> float:
+        if pricing is None:
+            return 0.0
+        normalized = normalize_model_usage(usage) or ModelUsage(
+            input_tokens=max(0, int(input_tokens)),
+            output_tokens=max(0, int(output_tokens)),
+            total_tokens=max(0, int(input_tokens)) + max(0, int(output_tokens)),
+            source=ModelUsageSource.ESTIMATE,
+        )
+        transaction_cost = pricing.cost_usd(normalized)
+        self._cost_usage_usd += transaction_cost
+        return transaction_cost
+
     def _activate_runtime_budget(self, started_at: float) -> None:
         deadlines: List[float] = []
         if self.budget.deadline_monotonic is not None:
@@ -519,18 +632,103 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         return self._active_run_id
 
-    def post_runtime_event(self, event: RuntimeInput, *, run_id: str) -> bool:
-        """Post one idempotent event to the exact active run."""
+    async def apost_runtime_event(
+        self, event: RuntimeInput, *, run_id: str
+    ) -> bool:
+        """Durably post one idempotent event to the exact active run.
+
+        Journal-backed runs append the event before making it visible to the
+        in-memory inbox. A failed append therefore never wakes the run.
+        """
 
         if not isinstance(event, RuntimeInput):
             raise TypeError("event must be a RuntimeInput")
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
-        return self._runtime_inbox.post(run_id, event)
+        async with self._runtime_input_post_lock:
+            if not self._runtime_inbox.accepts(run_id, event.event_id):
+                return False
+            if self.journal is not None:
+                self._last_journal_position = await self.journal.append(
+                    JournalRecordType.RUNTIME_INPUT_POSTED,
+                    {"event": event.to_dict()},
+                    record_id=f"{run_id}:runtime-input:{event.event_id}",
+                )
+            return self._runtime_inbox.post(run_id, event)
+
+    def post_runtime_event(self, event: RuntimeInput, *, run_id: str) -> bool:
+        """Post from a synchronous caller outside the Engine event loop.
+
+        Async callers must await :meth:`apost_runtime_event`. This compatibility
+        boundary schedules onto the active Engine loop without creating another
+        event loop.
+        """
+
+        if not isinstance(event, RuntimeInput):
+            raise TypeError("event must be a RuntimeInput")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        loop = self._active_async_loop
+        if loop is None or not loop.is_running():
+            return False
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is loop:
+            raise RuntimeError(
+                "post_runtime_event() cannot run on the Engine event loop; "
+                "await apost_runtime_event() instead"
+            )
+        post = self.apost_runtime_event(event, run_id=run_id)
+        try:
+            future = asyncio.run_coroutine_threadsafe(post, loop)
+        except RuntimeError:
+            post.close()
+            return False
+        return bool(future.result())
+
+    def defer_runtime_event(self, event: RuntimeInput, *, run_id: str) -> bool:
+        """Queue an event from a synchronous Engine hook for the next safe point.
+
+        This method is intentionally limited to a hook running on this Engine's
+        active event loop. It performs no I/O and creates no Task. The next safe-point
+        drain persists queued events through :meth:`apost_runtime_event` before making
+        them model-visible. Async producers should await that method directly.
+        """
+
+        if not isinstance(event, RuntimeInput):
+            raise TypeError("event must be a RuntimeInput")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        loop = self._active_async_loop
+        if loop is None or not loop.is_running():
+            return False
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        if current_loop is not loop or run_id != self._active_run_id:
+            return False
+        if not self._runtime_inbox.accepts(run_id, event.event_id):
+            return False
+        if any(
+            queued.event_id == event.event_id
+            for queued in self._deferred_runtime_inputs
+        ):
+            return False
+        self._deferred_runtime_inputs.append(event)
+        return True
+
+    async def _close_runtime_inbox(self, run_id: str | None = None) -> None:
+        """Close after every in-flight durable post has reached a known boundary."""
+
+        async with self._runtime_input_post_lock:
+            self._runtime_inbox.close(run_id)
 
     def resolve_protocol(self) -> Any:
-        if self._resolved_protocol is not None:
-            return self._resolved_protocol
+        """Resolve the protocol from the configuration visible to this turn."""
+
         explicit = self.protocol
         if explicit is not None:
             self._resolved_protocol = get_protocol(explicit)
@@ -625,6 +823,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         task_obj, task_text = self._normalize_task(task)
         self._apply_task_budget(task_obj)
+        self.budget.__post_init__()
+        if self.budget.max_cost_usd is not None and self.model_pricing is None:
+            raise ValueError("max_cost_usd requires explicit model_pricing")
+        self.executor = self._build_action_executor(self.tool_registry)
         started_at = time.monotonic()
         self._activate_runtime_budget(started_at)
 
@@ -652,196 +854,22 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         state: StateT,
         observation: ObservationT,
     ) -> StepResult:
-        """Execute a single decide → act → reduce step.
+        """Execute one canonical immutable turn on the caller's event loop.
 
-        Returns a :class:`StepResult` with the decision, action results,
-        new observation, and stop status.
-
-        The caller can inspect ``result.stop`` to decide whether to
-        continue the loop.
+        Interactive callers own step advancement; full runs use the same turn
+        runtime with transactional advancement and persistence enabled.
         """
-        from .interrupt import (
-            EngineInterrupt,
-            InterruptInfo,
-            _reset_interrupt_context,
+
+        await self._drain_runtime_events(state.current_step)
+        execution = await self._turn_runtime.execute(
+            state,
+            observation,
+            task=self._active_task or state.task,
+            started_at=time.monotonic(),
+            step_id=state.current_step,
+            managed_run=False,
         )
-
-        _reset_interrupt_context()
-        step_id = state.current_step
-        started_at = time.monotonic()
-        record = StepRecord(step_id=step_id, agent_id=self.agent.name)
-        self.records.append(record)
-
-        # DECIDE
-        try:
-            decision = await self._run_decide(state, observation, record)
-        except EngineInterrupt as ei:
-            # Save checkpoint and report interrupt
-            cp_id = await self._save_interrupt_checkpoint(step_id, state, ei)
-            info = InterruptInfo(
-                interrupt_id=ei.interrupt_id,
-                checkpoint_id=cp_id,
-                value=ei.value,
-            )
-            self._emit(
-                step_id,
-                RuntimePhase.INTERRUPT,
-                ok=True,
-                payload={"interrupt_id": ei.interrupt_id},
-            )
-            self._finalize_step(record, state)
-            return StepResult(
-                step_id=step_id,
-                decision=None,
-                record=record,
-                observation=observation,
-                action_results=[],
-                stop=True,
-                stop_reason=StopReason.INTERRUPT,
-                interrupt_info=info,
-            )
-        except Exception as exc:
-            failed_phase = self._infer_failed_phase(record)
-            if self._recover(state, failed_phase, exc):
-                self._finalize_step(record, state)
-                return StepResult(
-                    step_id=step_id,
-                    decision=None,
-                    record=record,
-                    observation=observation,
-                    action_results=[],
-                    stop=False,
-                    recovered=True,
-                )
-            self._finalize_step(record, state)
-            return StepResult(
-                step_id=step_id,
-                decision=None,
-                record=record,
-                observation=observation,
-                action_results=[],
-                stop=True,
-                stop_reason=StopReason.UNRECOVERABLE_ERROR,
-                error=exc,
-            )
-
-        # Handle non-act modes directly
-        if decision.mode in ("final", "wait", "handoff"):
-            if decision.mode == "final":
-                new_observation = self._build_observation_after_action(
-                    state, step_id, started_at, decision, []
-                )
-                record.observation = new_observation
-                self._memory_append("observation", new_observation, record.step_id)
-                self._run_reduce(state, new_observation, decision, record)
-                stop = self._run_check_stop(state, decision, step_id, started_at)
-                self._finalize_step(record, state)
-                return StepResult(
-                    step_id=step_id,
-                    decision=decision,
-                    record=record,
-                    observation=new_observation,
-                    action_results=[],
-                    stop=stop,
-                    stop_reason=(
-                        StopReason(state.stop_reason)
-                        if state.stop_reason
-                        else StopReason.FINAL
-                    ),
-                )
-            self._finalize_step(record, state)
-            return StepResult(
-                step_id=step_id,
-                decision=decision,
-                record=record,
-                observation=observation,
-                action_results=[],
-                stop=(decision.mode == "final"),
-                stop_reason=StopReason.FINAL if decision.mode == "final" else None,
-            )
-
-        # ACT
-        try:
-            action_results = await self._run_act(state, decision, record)
-        except Exception as exc:
-            failed_phase = self._infer_failed_phase(record)
-            if self._recover(state, failed_phase, exc):
-                self._finalize_step(record, state)
-                return StepResult(
-                    step_id=step_id,
-                    decision=decision,
-                    record=record,
-                    observation=observation,
-                    action_results=[],
-                    stop=False,
-                    recovered=True,
-                )
-            self._finalize_step(record, state)
-            return StepResult(
-                step_id=step_id,
-                decision=decision,
-                record=record,
-                observation=observation,
-                action_results=[],
-                stop=True,
-                stop_reason=StopReason.UNRECOVERABLE_ERROR,
-                error=exc,
-            )
-
-        # REDUCE
-        new_observation = self._build_observation_after_action(
-            state, step_id, started_at, decision, action_results
-        )
-        record.observation = new_observation
-        self._memory_append("observation", new_observation, record.step_id)
-        try:
-            self._run_reduce(state, new_observation, decision, record)
-        except EngineInterrupt as ei:
-            cp_id = await self._save_interrupt_checkpoint(step_id, state, ei)
-            info = InterruptInfo(
-                interrupt_id=ei.interrupt_id,
-                checkpoint_id=cp_id,
-                value=ei.value,
-            )
-            self._emit(
-                step_id,
-                RuntimePhase.INTERRUPT,
-                ok=True,
-                payload={"interrupt_id": ei.interrupt_id},
-            )
-            self._finalize_step(record, state)
-            return StepResult(
-                step_id=step_id,
-                decision=decision,
-                record=record,
-                observation=new_observation,
-                action_results=action_results,
-                stop=True,
-                stop_reason=StopReason.INTERRUPT,
-                interrupt_info=info,
-            )
-
-        # CHECK STOP
-        stop = self._run_check_stop(state, decision, step_id, started_at)
-        self._finalize_step(record, state)
-
-        stop_reason = None
-        if stop:
-            stop_reason = (
-                StopReason(state.stop_reason)
-                if state.stop_reason
-                else StopReason.MAX_STEPS
-            )
-
-        return StepResult(
-            step_id=step_id,
-            decision=decision,
-            record=record,
-            observation=new_observation,
-            action_results=action_results,
-            stop=stop,
-            stop_reason=stop_reason,
-        )
+        return execution.step
 
     def step(
         self,
@@ -884,7 +912,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         Useful for REPLs that want to handle DECIDE themselves but delegate
         ACT execution to the engine.
         """
-        return await self._run_act(state, decision, record)
+        turn = self._capture_turn(state, record.step_id)
+        return await self._run_act(state, decision, record, turn)
 
     def execute_actions(
         self, state: StateT, decision: Decision[ActionT], record: StepRecord
@@ -985,6 +1014,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         _resume_canonical_results = tuple(
             kwargs.pop("_resume_canonical_results", ())
         )
+        _resume_usage = dict(kwargs.pop("_resume_usage", {}) or {})
+        _resume_continuation = kwargs.pop("_resume_continuation", None)
+        _resume_runtime_inputs = tuple(kwargs.pop("_resume_runtime_inputs", ()))
+        if not all(isinstance(item, RuntimeInput) for item in _resume_runtime_inputs):
+            raise TypeError("_resume_runtime_inputs must contain RuntimeInput values")
 
         self._reset_run_state()
         self._canonical_action_results = list(_resume_canonical_results)
@@ -1012,9 +1046,20 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._apply_task_budget(task_obj)
         started_at = time.monotonic()
         self._activate_runtime_budget(started_at)
-        self._token_usage = 0
+        self._token_usage = int(_resume_usage.get("total_tokens", 0) or 0)
+        self._cost_usage_usd = float(_resume_usage.get("cost_usd", 0.0) or 0.0)
+        self._model_continuation = (
+            _resume_continuation
+            if isinstance(_resume_continuation, ModelContinuation)
+            else None
+        )
         self._last_context_telemetry = {}
         self._context_runtime.reset()
+        self._context_runtime.restore_usage(
+            prompt_tokens=int(_resume_usage.get("prompt_tokens", 0) or 0),
+            completion_tokens=int(_resume_usage.get("completion_tokens", 0) or 0),
+            total_tokens=self._token_usage,
+        )
         self._resolved_protocol = self.resolve_protocol()
         # Record multi-agent topology in trace metadata
         if self.trace_writer is not None and self.agent_registry is not None:
@@ -1047,11 +1092,14 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._hydrate_trace_metadata(task_obj=task_obj, task_text=task_text)
 
         try:
-            self._setup_toolsets(
+            await self._asetup_toolsets(
                 {
                     "state": state,
                     "trace_writer": self.trace_writer,
                     "task": task_obj or task_text,
+                    "run_id": self._active_run_id,
+                    "journal": self.journal,
+                    "resume_journal": _resume_journal,
                 }
             )
         except Exception as exc:
@@ -1067,7 +1115,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             self._active_state = type(state).from_dict(state.to_dict())
         elif self.journal is not None:
             self._active_state = type(state).from_dict(state.to_dict())
-        self._runtime_inbox.open(self._active_run_id)
+        self._runtime_inbox.open(
+            self._active_run_id,
+            recovered=_resume_runtime_inputs,
+        )
         harness_diagnostics = self._harness_mismatch_diagnostics()
         self._emit(
             0,
@@ -1093,7 +1144,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 task_obj=task_obj, workspace=kwargs.get("workspace")
             )
         except BaseException:
-            self._runtime_inbox.close(self._active_run_id)
+            await self._close_runtime_inbox(self._active_run_id)
             raise
         if preflight_issues:
             has_task_issue = any(
@@ -1130,26 +1181,38 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 ),
                 runtime_seconds=time.monotonic() - started_at,
                 total_tokens=int(self._token_usage),
+                total_cost_usd=float(self._cost_usage_usd),
                 run_id=self._active_run_id,
                 _cancel_token=self._cancel_token,
             )
-            if self.journal is not None:
-                await self._journal_finish_run(state)
-            self._runtime_inbox.close(self._active_run_id)
+            await self._close_runtime_inbox(self._active_run_id)
             self._notify_run_end(result)
             self._clear_active_context()
-            self._teardown_env()
-            self._teardown_toolsets(
-                {
-                    "state": state,
-                    "trace_writer": self.trace_writer,
-                    "task": task_obj or task_text,
-                }
-            )
+            preflight_cleanup_error: BaseException | None = None
+            try:
+                await self._teardown_env()
+            except BaseException as exc:
+                preflight_cleanup_error = exc
+            try:
+                await self._ateardown_toolsets(
+                    {
+                        "state": state,
+                        "trace_writer": self.trace_writer,
+                        "task": task_obj or task_text,
+                    }
+                )
+            except BaseException as exc:
+                if preflight_cleanup_error is None:
+                    preflight_cleanup_error = exc
+            if preflight_cleanup_error is not None:
+                raise preflight_cleanup_error
+            if self.journal is not None:
+                await self._journal_finish_run(state)
             return result
 
         step_id = _resume_step if _resume_step is not None else 0
         cancelled = False
+        propagate_cancel = False
         journal_interrupted = False
         try:
             # MCP discovery happens after preflight but before the first model
@@ -1168,24 +1231,23 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         source="input",
                     )
             while True:
-                # -- Cancellation check --
-                if self._cancel_token.is_cancel_requested:
-                    if self._cancel_token.mode == CancelMode.IMMEDIATE:
-                        state.set_stop(StopReason.CANCELLED_IMMEDIATE)
-                        self._emit(
-                            step_id,
-                            RuntimePhase.END,
-                            ok=False,
-                            payload={"stop_reason": state.stop_reason},
-                        )
-                        await self._journal_interrupt_run(
-                            step_id=step_id,
-                            reason=StopReason.CANCELLED_IMMEDIATE.value,
-                        )
-                        journal_interrupted = True
-                        break
-                    # after_step: break after this iteration's step completes
-                    # (checked again at end of loop body below)
+                if (
+                    self._cancel_token.is_cancel_requested
+                    and self._cancel_token.mode == CancelMode.IMMEDIATE
+                ):
+                    state.set_stop(StopReason.CANCELLED_IMMEDIATE)
+                    self._emit(
+                        step_id,
+                        RuntimePhase.END,
+                        ok=False,
+                        payload={"stop_reason": state.stop_reason},
+                    )
+                    await self._journal_interrupt_run(
+                        step_id=step_id,
+                        reason=StopReason.CANCELLED_IMMEDIATE.value,
+                    )
+                    journal_interrupted = True
+                    break
 
                 if self._budget_exhausted(step_id, state):
                     self._emit(
@@ -1196,518 +1258,39 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     )
                     break
 
-                self._drain_runtime_events(step_id)
-
-                self.validation_gate.before_phase(state, RuntimePhase.DECIDE.value)
-
-                record = StepRecord(step_id=step_id, agent_id=self.agent.name)
-                self.records.append(record)
-                record.transaction_id = f"step-{step_id}-{uuid4().hex[:12]}"
-                step_before = state.to_dict()
-                if self.journal is not None:
-                    state = type(state).from_dict(step_before)
-                    step_before = state.to_dict()
-
-                self._dispatch_hook(
-                    "on_before_step",
-                    HookContext(
-                        task=task_text,
-                        step_id=step_id,
-                        phase=RuntimePhase.DECIDE,
-                        state=state,
-                        observation=current_observation,
-                        record=record,
-                    ),
+                # External input is accepted only here. The turn runtime then
+                # captures one immutable provider/tool/config view and commits
+                # one complete transaction before control returns.
+                await self._drain_runtime_events(step_id)
+                execution = await self._turn_runtime.execute(
+                    state,
+                    current_observation,
+                    task=task_text,
+                    started_at=started_at,
+                    step_id=step_id,
                 )
-                try:
-                    decision = await self._run_decide(
-                        state,
-                        current_observation,
-                        record,
-                    )
-                    await self._journal_model_completed(record, decision)
-                except Exception as exc:
-                    if isinstance(exc, JournalError):
-                        raise
-                    failed_phase = self._infer_failed_phase(record)
-                    if not self._recover(state, failed_phase, exc):
-                        self._finalize_step(record, state)
-                        self._emit(
-                            step_id,
-                            RuntimePhase.END,
-                            ok=False,
-                            payload={"stop_reason": state.stop_reason},
-                        )
-                        await self._journal_interrupt_run(
-                            step_id=step_id,
-                            reason=state.stop_reason or "unrecoverable_error",
-                        )
-                        journal_interrupted = True
-                        break
-                    self._finalize_step(record, state)
-                    current_observation = self._build_initial_observation(
-                        state, step_id + 1, started_at
-                    )
-                    state.advance_step()
-                    await self._journal_snapshot_state(
-                        state,
-                        step_id=step_id,
-                        reason="recovery",
-                        record_id=f"{record.transaction_id}:recovery",
-                    )
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.RECOVER,
-                            state=state,
-                            record=record,
-                            stop_reason=state.stop_reason,
-                            journal_position=self._last_journal_position,
-                        ),
-                    )
-                    step_id += 1
-                    continue
-
-                # Handoff: swap agent within the same loop, skip act/reduce/critic
-                if decision.mode == "handoff":
-                    if self.agent_registry is None:
-                        raise ValueError("handoff requires agent_registry on Engine")
-                    target_name = decision.meta.get("handoff_target", "")
-                    # Loop detection: reject if target already in history (cycle)
-                    if target_name in self._handoff_history:
-                        from ..core.errors import QitosRuntimeError, RuntimeErrorInfo
-
-                        raise QitosRuntimeError(
-                            RuntimeErrorInfo(
-                                category=ErrorCategory.SYSTEM,
-                                message=(
-                                    f"Handoff loop detected: agent '{target_name}' already visited "
-                                    f"in this run (history: {' -> '.join(self._handoff_history)})"
-                                ),
-                                phase="handoff",
-                                step_id=step_id,
-                                recoverable=False,
-                            )
-                        )
-                    # Max handoff count guard
-                    max_handoffs = self.context_config.max_handoffs
-                    if len(self._handoff_history) >= max_handoffs:
-                        from ..core.errors import QitosRuntimeError, RuntimeErrorInfo
-
-                        raise QitosRuntimeError(
-                            RuntimeErrorInfo(
-                                category=ErrorCategory.SYSTEM,
-                                message=f"Maximum handoff count ({max_handoffs}) exceeded",
-                                phase="handoff",
-                                step_id=step_id,
-                                recoverable=False,
-                            )
-                        )
-                    current_agent_name = self.agent.name
-                    self._handoff_history.append(current_agent_name)
-                    handoff_result = self._handoff_runtime.execute_handoff(
-                        state,
-                        decision,
-                        record,
-                    )
-                    self._finalize_step(record, state)
-                    # Store handoff context in state.metadata for the new agent
-                    state.metadata["last_handoff"] = {
-                        "from": handoff_result.from_agent,
-                        "to": handoff_result.to_agent,
-                    }
-                    # Increment handoff_count in trace metadata
-                    if self.trace_writer is not None:
-                        hc = self.trace_writer.metadata.get("handoff_count", 0) or 0
-                        self.trace_writer.metadata["handoff_count"] = hc + 1
-                    # Observation after handoff carries handoff info for reduce()
-                    current_observation = cast(
-                        ObservationT,
-                        {
-                            "action_results": [
-                                {
-                                    "handoff": True,
-                                    "from": handoff_result.from_agent,
-                                    "to": handoff_result.to_agent,
-                                }
-                            ],
-                        },
-                    )
-                    state.advance_step()
-                    if self.journal is not None:
-                        await self._journal_commit_step(
-                            record,
-                            before=step_before,
-                            state=state,
-                            terminal=False,
-                        )
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.HANDOFF_END,
-                            state=state,
-                            record=record,
-                            journal_position=self._last_journal_position,
-                        ),
-                    )
-                    step_id += 1
-                    continue
-
-                # Runtime wait: block without spending model calls or steps until
-                # an external event, cancellation, or the run deadline wakes us.
-                if (
-                    decision.mode == "wait"
-                    and decision.meta.get("runtime_wait") is True
-                    and not bool(decision.meta.get("task_complete_requested"))
-                    and not bool(decision.meta.get("parser_error"))
-                ):
-                    self._emit(
-                        step_id,
-                        RuntimePhase.DECIDE,
-                        payload={"stage": "runtime_wait_start"},
-                    )
-                    wait_outcome = self._wait_for_runtime_event()
-                    self._emit(
-                        step_id,
-                        RuntimePhase.DECIDE,
-                        payload={
-                            "stage": "runtime_wait_end",
-                            "outcome": wait_outcome,
-                        },
-                    )
-                    self._finalize_step(record, state)
-                    if wait_outcome == "event":
-                        current_observation = self._build_initial_observation(
-                            state, step_id + 1, started_at
-                        )
-                        state.advance_step()
-                        if self.journal is not None:
-                            await self._journal_commit_step(
-                                record,
-                                before=step_before,
-                                state=state,
-                                terminal=False,
-                            )
-                        self._dispatch_hook(
-                            "on_after_step",
-                            HookContext(
-                                task=task_text,
-                                step_id=step_id,
-                                phase=RuntimePhase.CHECK_STOP,
-                                state=state,
-                                record=record,
-                                journal_position=self._last_journal_position,
-                            ),
-                        )
-                        step_id += 1
-                        continue
-                    if wait_outcome in {"cancelled", "timeout"}:
-                        if self.journal is not None:
-                            await self._journal_commit_step(
-                                record,
-                                before=step_before,
-                                state=state,
-                                terminal=False,
-                            )
-                        self._dispatch_hook(
-                            "on_after_step",
-                            HookContext(
-                                task=task_text,
-                                step_id=step_id,
-                                phase=RuntimePhase.CHECK_STOP,
-                                state=state,
-                                record=record,
-                                journal_position=self._last_journal_position,
-                            ),
-                        )
-                        continue
-                    raise RuntimeError("runtime inbox closed while Engine was waiting")
-
-                # Ordinary parser/search wait: preserve the existing immediate
-                # repair-loop behavior instead of treating every wait as idle.
-                if (
-                    decision.mode == "wait"
-                    and not bool(decision.meta.get("task_complete_requested"))
-                    and not bool(decision.meta.get("parser_error"))
-                ):
-                    self._finalize_step(record, state)
-                    current_observation = self._build_initial_observation(
-                        state, step_id + 1, started_at
-                    )
-                    state.advance_step()
-                    if self.journal is not None:
-                        await self._journal_commit_step(
-                            record,
-                            before=step_before,
-                            state=state,
-                            terminal=False,
-                        )
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.CHECK_STOP,
-                            state=state,
-                            record=record,
-                            journal_position=self._last_journal_position,
-                        ),
-                    )
-                    step_id += 1
-                    continue
-
-                # Final decisions still flow through reduce, critics, and
-                # check-stop so hooks, memory, checkpoints, and agent-specific
-                # finalization all see the same lifecycle as action steps.
-                if decision.mode == "final" or (
-                    decision.mode == "wait"
-                    and (
-                        bool(decision.meta.get("task_complete_requested"))
-                        or bool(decision.meta.get("parser_error"))
-                    )
-                ):
-                    try:
-                        action_results: list[Any] = []
-                        observation = self._build_observation_after_action(
-                            state=state,
-                            step_id=step_id,
-                            started_at=started_at,
-                            decision=decision,
-                            action_results=action_results,
-                        )
-                        record.observation = observation
-                        self._memory_append("observation", observation, record.step_id)
-                        self._run_reduce(state, observation, decision, record)
-                        fr = getattr(state, "final_result", None)
-                        if isinstance(fr, str) and fr and state.stop_reason is None:
-                            state.set_stop("final", fr)
-                    except Exception as exc:
-                        if self.journal is not None:
-                            raise
-                        failed_phase = self._infer_failed_phase(record)
-                        if not self._recover(state, failed_phase, exc):
-                            self._finalize_step(record, state)
-                            self._emit(
-                                step_id,
-                                RuntimePhase.END,
-                                ok=False,
-                                payload={"stop_reason": state.stop_reason},
-                            )
-                            await self._journal_interrupt_run(
-                                step_id=step_id,
-                                reason=state.stop_reason or "unrecoverable_error",
-                            )
-                            journal_interrupted = True
-                            break
-                        self._finalize_step(record, state)
-                        current_observation = self._build_initial_observation(
-                            state, step_id + 1, started_at
-                        )
-                        state.advance_step()
-                        if self.journal is not None:
-                            await self._journal_commit_step(
-                                record,
-                                before=step_before,
-                                state=state,
-                                terminal=False,
-                            )
-                        self._dispatch_hook(
-                            "on_after_step",
-                            HookContext(
-                                task=task_text,
-                                step_id=step_id,
-                                phase=RuntimePhase.RECOVER,
-                                state=state,
-                                record=record,
-                                stop_reason=state.stop_reason,
-                                journal_position=self._last_journal_position,
-                            ),
-                        )
-                        step_id += 1
-                        continue
-                else:
-                    try:
-                        action_results = await self._run_act(state, decision, record)
-                        observation = self._build_observation_after_action(
-                            state=state,
-                            step_id=step_id,
-                            started_at=started_at,
-                            decision=decision,
-                            action_results=action_results,
-                        )
-                        record.observation = observation
-                        self._memory_append("observation", observation, record.step_id)
-                        self._run_reduce(state, observation, decision, record)
-                        # Early exit: if reduce set final_result, set stop reason
-                        # so critics don't override it and FinalResultCriteria catches it
-                        fr = getattr(state, "final_result", None)
-                        if isinstance(fr, str) and fr and state.stop_reason is None:
-                            state.set_stop("final", fr)
-                    except Exception as exc:
-                        if self.journal is not None:
-                            raise
-                        failed_phase = self._infer_failed_phase(record)
-                        if not self._recover(state, failed_phase, exc):
-                            self._finalize_step(record, state)
-                            self._emit(
-                                step_id,
-                                RuntimePhase.END,
-                                ok=False,
-                                payload={"stop_reason": state.stop_reason},
-                            )
-                            await self._journal_interrupt_run(
-                                step_id=step_id,
-                                reason=state.stop_reason or "unrecoverable_error",
-                            )
-                            journal_interrupted = True
-                            break
-                        self._finalize_step(record, state)
-                        current_observation = self._build_initial_observation(
-                            state, step_id + 1, started_at
-                        )
-                        state.advance_step()
-                        if self.journal is not None:
-                            await self._journal_commit_step(
-                                record,
-                                before=step_before,
-                                state=state,
-                                terminal=False,
-                            )
-                        self._dispatch_hook(
-                            "on_after_step",
-                            HookContext(
-                                task=task_text,
-                                step_id=step_id,
-                                phase=RuntimePhase.RECOVER,
-                                state=state,
-                                record=record,
-                                stop_reason=state.stop_reason,
-                                journal_position=self._last_journal_position,
-                            ),
-                        )
-                        step_id += 1
-                        continue
-
-                critic_result = self._apply_critics(state, record)
-                # Support both legacy str return and new dict return
-                if isinstance(critic_result, str):
-                    critic_result = {
-                        "action": critic_result,
-                        "modified_prompt": None,
-                        "instruction_patch": None,
-                        "state_patch": None,
-                    }
-                critic_action = critic_result["action"]
-                if critic_action == "stop":
-                    state.set_stop(StopReason.CRITIC_STOP)
-                    self._finalize_step(record, state)
-                    if self.journal is not None:
-                        await self._journal_commit_step(
-                            record,
-                            before=step_before,
-                            state=state,
-                            terminal=True,
-                        )
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.CRITIC,
-                            state=state,
-                            record=record,
-                            stop_reason=state.stop_reason,
-                            journal_position=self._last_journal_position,
-                        ),
-                    )
-                    self._emit(
-                        step_id,
-                        RuntimePhase.END,
-                        payload={"stop_reason": state.stop_reason},
-                    )
-                    break
-                if critic_action == "retry":
-                    # Apply patches from critic if provided
-                    self._apply_critic_patches(state, critic_result)
-                    self._finalize_step(record, state)
-                    current_observation = observation
-                    state.advance_step()
-                    if self.journal is not None:
-                        await self._journal_commit_step(
-                            record,
-                            before=step_before,
-                            state=state,
-                            terminal=False,
-                        )
-                    self._dispatch_hook(
-                        "on_after_step",
-                        HookContext(
-                            task=task_text,
-                            step_id=step_id,
-                            phase=RuntimePhase.CRITIC,
-                            state=state,
-                            record=record,
-                            journal_position=self._last_journal_position,
-                        ),
-                    )
-                    step_id += 1
-                    continue
-
-                stop = self._run_check_stop(state, record.decision, step_id, started_at)
-
-                self.validation_gate.after_phase(state, RuntimePhase.CHECK_STOP.value)
-                self._finalize_step(record, state)
-                if not stop:
-                    state.advance_step()
-                if self.journal is not None:
-                    await self._journal_commit_step(
-                        record,
-                        before=step_before,
-                        state=state,
-                        terminal=stop,
-                    )
-                else:
-                    await self._save_checkpoint(step_id, state, task_text)
-                self._dispatch_hook(
-                    "on_after_step",
-                    HookContext(
-                        task=task_text,
-                        step_id=step_id,
-                        phase=RuntimePhase.CHECK_STOP,
-                        state=state,
-                        record=record,
-                        stop_reason=state.stop_reason,
-                        journal_position=self._last_journal_position,
-                    ),
+                state = execution.state
+                current_observation = execution.observation
+                step_id = execution.next_step_id
+                journal_interrupted = (
+                    journal_interrupted or execution.journal_interrupted
                 )
 
-                if stop:
-                    self._emit(
-                        step_id,
-                        RuntimePhase.END,
-                        payload={"stop_reason": state.stop_reason},
-                    )
+                if execution.stop:
                     break
 
-                current_observation = observation
-                step_id += 1
-
-                # -- after_step cancellation: break after step completes --
                 if (
-                    self._cancel_token.is_cancel_requested
+                    execution.check_after_step_cancel
+                    and self._cancel_token.is_cancel_requested
                     and self._cancel_token.mode == CancelMode.AFTER_STEP
                 ):
                     await self._journal_interrupt_run(
-                        step_id=step_id - 1,
+                        step_id=execution.step.step_id,
                         reason="cancelled_after_step",
                     )
                     journal_interrupted = True
                     self._emit(
-                        step_id - 1,
+                        execution.step.step_id,
                         RuntimePhase.END,
                         ok=False,
                         payload={"stop_reason": "cancelled_after_step"},
@@ -1715,6 +1298,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     break
         except asyncio.CancelledError:
             cancelled = True
+            propagate_cancel = not self._cancel_token.is_cancel_requested
             self._cancel_token.request_cancel("immediate")
             if state.stop_reason is None:
                 state.set_stop(StopReason.CANCELLED_IMMEDIATE)
@@ -1730,15 +1314,23 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             )
             journal_interrupted = True
         finally:
-            self._runtime_inbox.close(self._active_run_id)
-            self._teardown_env()
-            self._teardown_toolsets(
-                {
-                    "state": state,
-                    "trace_writer": self.trace_writer,
-                    "task": task_obj or task_text,
-                }
-            )
+            await self._close_runtime_inbox(self._active_run_id)
+            cleanup_error: BaseException | None = None
+            try:
+                await self._teardown_env()
+            except BaseException as exc:
+                cleanup_error = exc
+            try:
+                await self._ateardown_toolsets(
+                    {
+                        "state": state,
+                        "trace_writer": self.trace_writer,
+                        "task": task_obj or task_text,
+                    }
+                )
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
             # Checkpoint on cancellation (immediate mode)
             if (
                 self._cancel_token.is_cancel_requested
@@ -1756,9 +1348,15 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         "Checkpoint save failed during cancellation: %s", exc
                     )
             # Cleanup MCP servers
-            await self._cleanup_mcp_servers()
+            try:
+                await self._cleanup_mcp_servers()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+            if cleanup_error is not None:
+                raise cleanup_error
 
-        if cancelled:
+        if cancelled and propagate_cancel:
             self._clear_active_context()
             raise asyncio.CancelledError
 
@@ -1774,7 +1372,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     "steps": len(self.records),
                     "token_usage": self._context_runtime.tokens_total,
                     "latency_seconds": task_result.metrics.get("elapsed_seconds", 0.0),
-                    "cost": task_result.metrics.get("cost", 0.0),
+                    "cost_usd": task_result.metrics.get("cost_usd", 0.0),
                     "context": self._context_runtime.run_summary(),
                     "parser": self._trace_runtime.parser_summary(),
                     "task_meta": self._task_meta(task_obj),
@@ -1804,6 +1402,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             ),
             runtime_seconds=time.monotonic() - started_at,
             total_tokens=int(self._token_usage),
+            total_cost_usd=float(self._cost_usage_usd),
             run_id=self._active_run_id,
             critic_traces=_critic_traces,
             handoff_traces=_handoff_traces,
@@ -1921,15 +1520,47 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self.budget.max_steps = self._base_budget.max_steps
         self.budget.max_runtime_seconds = self._base_budget.max_runtime_seconds
         self.budget.max_tokens = self._base_budget.max_tokens
+        self.budget.max_cost_usd = self._base_budget.max_cost_usd
+        self.budget.max_tool_concurrency = self._base_budget.max_tool_concurrency
+        self.budget.max_children = self._base_budget.max_children
         self.budget.deadline_monotonic = self._base_budget.deadline_monotonic
         if task_obj is not None:
             budget = task_obj.budget
             if budget.max_steps is not None:
-                self.budget.max_steps = int(budget.max_steps)
+                self.budget.max_steps = min(
+                    self.budget.max_steps, int(budget.max_steps)
+                )
             if budget.max_runtime_seconds is not None:
-                self.budget.max_runtime_seconds = float(budget.max_runtime_seconds)
+                requested_runtime = float(budget.max_runtime_seconds)
+                self.budget.max_runtime_seconds = (
+                    requested_runtime
+                    if self.budget.max_runtime_seconds is None
+                    else min(self.budget.max_runtime_seconds, requested_runtime)
+                )
             if budget.max_tokens is not None:
-                self.budget.max_tokens = int(budget.max_tokens)
+                requested_tokens = int(budget.max_tokens)
+                self.budget.max_tokens = (
+                    requested_tokens
+                    if self.budget.max_tokens is None
+                    else min(self.budget.max_tokens, requested_tokens)
+                )
+            if budget.max_cost_usd is not None:
+                requested_cost = float(budget.max_cost_usd)
+                self.budget.max_cost_usd = (
+                    requested_cost
+                    if self.budget.max_cost_usd is None
+                    else min(self.budget.max_cost_usd, requested_cost)
+                )
+            if budget.max_tool_concurrency is not None:
+                self.budget.max_tool_concurrency = min(
+                    self.budget.max_tool_concurrency,
+                    int(budget.max_tool_concurrency),
+                )
+            if budget.max_children is not None:
+                self.budget.max_children = min(
+                    self.budget.max_children,
+                    int(budget.max_children),
+                )
         if self._uses_default_stop_criteria:
             self.stop_criteria = [FinalResultCriteria()]
 
@@ -2018,7 +1649,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         )
 
     async def _run_decide(
-        self, state: StateT, observation: ObservationT, record: StepRecord
+        self,
+        state: StateT,
+        observation: ObservationT,
+        record: StepRecord,
+        turn: TurnSnapshot,
     ) -> Decision[ActionT]:
         # Propagate streaming callback to model runtime
         self._model_runtime.stream_callback = self.stream_callback
@@ -2027,6 +1662,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 state,
                 observation,
                 record,
+                turn,
             )
         finally:
             self._model_runtime.stream_callback = None
@@ -2037,12 +1673,18 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         observation: ObservationT,
         branch_decision: Decision[ActionT],
     ) -> Decision[ActionT]:
-        return self._model_runtime.select_branch(state, observation, branch_decision)
+        return self._decision_runtime.select_branch(
+            state, observation, branch_decision
+        )
 
     async def _run_act(
-        self, state: StateT, decision: Decision[ActionT], record: StepRecord
+        self,
+        state: StateT,
+        decision: Decision[ActionT],
+        record: StepRecord,
+        turn: TurnSnapshot,
     ) -> List[Any]:
-        return await self._action_runtime.run_act(state, decision, record)
+        return await self._action_runtime.run_act(state, decision, record, turn)
 
     def _run_reduce(
         self,
@@ -2107,10 +1749,15 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     def _budget_exhausted(self, step_id: int, state: StateT) -> bool:
         return self._control_runtime.budget_exhausted(step_id, state)
 
-    def _drain_runtime_events(self, step_id: int) -> None:
+    async def _drain_runtime_events(self, step_id: int) -> None:
+        deferred = self._deferred_runtime_inputs
+        self._deferred_runtime_inputs = []
+        for event in deferred:
+            await self.apost_runtime_event(event, run_id=self._active_run_id)
         events = self._runtime_inbox.drain(self._active_run_id)
         if not events:
             return
+        self._pending_runtime_input_ids.extend(event.event_id for event in events)
         payload = {"runtime_events": [event.to_dict() for event in events]}
         self._history_append(
             "user",
@@ -2124,16 +1771,16 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             payload={"stage": "runtime_input", **payload},
         )
 
-    def _wait_for_runtime_event(self) -> RuntimeWaitOutcome:
+    async def _wait_for_runtime_event(self) -> RuntimeWaitOutcome:
         timeout_seconds = self.remaining_runtime_seconds()
-        return self._runtime_inbox.wait(
+        return await self._runtime_inbox.wait(
             self._active_run_id,
             timeout_seconds=timeout_seconds,
             cancelled=lambda: self._cancel_token.is_cancel_requested,
         )
 
     def _normalize_decision(self, raw_decision: Any, step: int) -> Decision[ActionT]:
-        return self._model_runtime.normalize_decision(raw_decision, step)
+        return self._decision_runtime.normalize_decision(raw_decision, step)
 
     def _compute_state_diff(
         self, before: Dict[str, Any], after: Dict[str, Any]
@@ -2184,10 +1831,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         error_log = os.environ.get("QITOS_ERROR_LOG", "").strip()
         if not error_log:
-            trace_dir = (
-                os.environ.get("QITOS_TRACE_DIR", "").strip()
-                or os.environ.get("CYBERGYM_TASK_TRACE_DIR", "").strip()
-            )
+            trace_dir = os.environ.get("QITOS_TRACE_DIR", "").strip()
             if trace_dir:
                 error_log = str(Path(trace_dir) / "step_error.log")
         if error_log:
@@ -2425,6 +2069,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             self._active_task = task_text
             self._active_task_obj = task if isinstance(task, Task) else None
             self._active_state = state
+            self._token_usage = int(replay["usage"]["total_tokens"])
+            self._cost_usage_usd = float(replay["usage"]["cost_usd"])
+            self._context_runtime.restore_usage(
+                prompt_tokens=int(replay["usage"]["prompt_tokens"]),
+                completion_tokens=int(replay["usage"]["completion_tokens"]),
+                total_tokens=self._token_usage,
+            )
             replayed_records = await journal.replay()
             self._last_journal_position = replayed_records[-1].position
             self._reset_history(history)
@@ -2438,6 +2089,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 records=replay["records"],
                 events=[],
                 step_count=len(replay["records"]),
+                total_tokens=self._token_usage,
+                total_cost_usd=self._cost_usage_usd,
                 run_id=run_id,
             )
             self._notify_run_end(result)
@@ -2465,6 +2118,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             _resume_run_id=run_id,
             _resume_journal=True,
             _resume_canonical_results=replay["canonical_results"],
+            _resume_usage=replay["usage"],
+            _resume_continuation=replay["continuation"],
+            _resume_runtime_inputs=replay["pending_runtime_inputs"],
         )
 
     def resume_from_journal(self, run_id: str) -> EngineResult[StateT]:
@@ -2950,8 +2606,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     ) -> Optional[Env]:
         return self._env_runtime.build_env_from_spec(env_spec, fallback_workspace)
 
-    def _teardown_env(self) -> None:
-        self._env_runtime.teardown_env()
+    async def _teardown_env(self) -> None:
+        await self._env_runtime.teardown_env()
 
     def _run_env_step(
         self,
@@ -2990,6 +2646,20 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 "toolset_setup_error", context, ok=False, error=str(exc)
             )
 
+    async def _asetup_toolsets(self, context: Dict[str, Any]) -> None:
+        if not hasattr(self.tool_registry, "asetup"):
+            self._setup_toolsets(context)
+            return
+        self._write_lifecycle_event("toolset_setup_start", context)
+        try:
+            await self.tool_registry.asetup(context)
+            self._write_lifecycle_event("toolset_setup_end", context)
+        except Exception as exc:
+            self._write_lifecycle_event(
+                "toolset_setup_error", context, ok=False, error=str(exc)
+            )
+            raise
+
     def _teardown_toolsets(self, context: Dict[str, Any]) -> None:
         if not hasattr(self.tool_registry, "teardown"):
             return
@@ -3001,6 +2671,21 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             self._write_lifecycle_event(
                 "toolset_teardown_error", context, ok=False, error=str(exc)
             )
+            raise
+
+    async def _ateardown_toolsets(self, context: Dict[str, Any]) -> None:
+        if not hasattr(self.tool_registry, "ateardown"):
+            self._teardown_toolsets(context)
+            return
+        self._write_lifecycle_event("toolset_teardown_start", context)
+        try:
+            await self.tool_registry.ateardown(context)
+            self._write_lifecycle_event("toolset_teardown_end", context)
+        except Exception as exc:
+            self._write_lifecycle_event(
+                "toolset_teardown_error", context, ok=False, error=str(exc)
+            )
+            raise
 
     def _write_lifecycle_event(
         self,
@@ -3062,17 +2747,20 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
     def _reset_run_state(self) -> None:
         self._runtime_inbox.close()
+        self._runtime_input_post_lock = asyncio.Lock()
         self._trace_runtime.reset_run_state()
         self._last_runtime_error = None
         self._resolved_protocol = None
         self._resolved_protocol_source = ""
         self._last_prompt_metadata = {}
-        self._active_tool_exposure = None
-        self._active_tool_exposure_step_id = None
         self._runtime_deadline_monotonic = None
+        self._cost_usage_usd = 0.0
+        self._model_continuation = None
         self._last_checkpoint_id = None
         self._canonical_action_results = []
         self._journal_pending_history = []
+        self._pending_runtime_input_ids = []
+        self._deferred_runtime_inputs = []
         self._journal_terminal_record_ids = {}
         self._last_journal_position = None
         if self._tool_loop_detector is not None:
@@ -3087,15 +2775,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     async def _connect_mcp_servers(self) -> None:
         """Connect all configured MCP servers and bridge their tools."""
         from ..mcp.bridge import mcp_server_to_function_tools
-        from ..mcp.runtime import MCPEventLoopRuntime
 
         servers = list(getattr(self.agent, "mcp_servers", None) or [])
         if not servers:
             return
 
-        runtime = MCPEventLoopRuntime()
-        runtime.start()
-        self._mcp_runtime = runtime
         used_names = set(
             self.tool_registry.list_tools() if self.tool_registry is not None else []
         )
@@ -3115,7 +2799,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         )
                 if hasattr(server, "cleanup"):
                     try:
-                        await runtime.run(server.cleanup())
+                        await server.cleanup()
                     except Exception as cleanup_exc:
                         _logger.warning(
                             "MCP server cleanup after setup failure failed: %s",
@@ -3124,16 +2808,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
             try:
                 if hasattr(server, "connect"):
-                    await runtime.run(server.connect())
+                    await server.connect()
                 # Bridge MCP tools into the engine's tool registry
                 if self.tool_registry is not None:
-                    tools = await runtime.run(
-                        mcp_server_to_function_tools(
-                            server,
-                            name_prefix=f"mcp__{server.name}",
-                            call_runner=runtime.run_sync,
-                            used_names=used_names,
-                        )
+                    tools = await mcp_server_to_function_tools(
+                        server,
+                        name_prefix=f"mcp__{server.name}",
+                        used_names=used_names,
                     )
                     for tool in tools:
                         if hasattr(self.tool_registry, "register"):
@@ -3153,12 +2834,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     exc,
                 )
 
-        if not self._connected_mcp_servers:
-            await runtime.close()
-            self._mcp_runtime = None
-
     async def _cleanup_mcp_servers(self) -> None:
-        """Remove run-scoped MCP tools and cleanup their transport loop."""
+        """Remove run-scoped MCP tools and close transports on this loop."""
         for name in reversed(self._mcp_tool_names):
             try:
                 if self.tool_registry is not None:
@@ -3167,22 +2844,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 _logger.warning("MCP tool cleanup failed for %s: %s", name, exc)
         self._mcp_tool_names = []
 
-        runtime = self._mcp_runtime
         for server in self._connected_mcp_servers:
             try:
                 if hasattr(server, "cleanup"):
-                    if runtime is not None:
-                        await runtime.run(server.cleanup())
-                    else:
-                        await server.cleanup()
+                    await server.cleanup()
             except Exception as exc:
                 _logger.warning("MCP server cleanup failed: %s", exc)
         self._connected_mcp_servers = []
-        if runtime is not None:
-            try:
-                await runtime.close()
-            finally:
-                self._mcp_runtime = None
 
     # -- Handoff tool helpers --
 

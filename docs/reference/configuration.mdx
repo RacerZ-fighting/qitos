@@ -128,19 +128,20 @@ Connection failures and stream failures before the first provider event may retr
 both the `max_attempts` budget and `retry_window_seconds`, measured from the first
 retryable failure. Once an event has arrived, QitOS never replays that attempt: a later
 failure closes the stream and surfaces the error, so visible output and tool-call deltas
-cannot be duplicated. The terminal chunk is held until provider EOF confirms that no
+cannot be duplicated. The terminal event is held until provider EOF confirms that no
 late event follows it. A healthy long response may run beyond `timeout` while events
 continue only when no earlier Engine deadline applies; `stream_idle_timeout` detects a
 stalled response. Direct callers use the same live `stream()` contract.
 
-All model stream paths use `ModelStreamChunk` as the normalized contract. Its terminal
-chunk retains the provider's actual `finish_reason`; text, reasoning, typed event
-metadata, completed tool calls, native items, and usage remain separate fields. Chat
+All model stream paths use discriminated `ModelStreamEvent` values. Text, reasoning,
+ToolCall deltas, native items, usage, lifecycle, completion, and failure each have an
+explicit kind. A `COMPLETED` event retains the provider's actual `finish_reason` and
+final model fields. Chat
 tool-argument fragments use `event_type="tool_call.delta"`, while Responses keeps its
 provider event type and sequence metadata. A provider stream that closes without its
 terminal event raises `ModelTransportError` instead of inventing a successful finish.
 Existing Engine stream handlers keep `on_start/on_delta/on_end`; richer handlers may
-optionally implement `on_chunk(chunk)` and `on_error(exc)` without changing the required
+optionally implement `on_chunk(event)` and `on_error(exc)` without changing the required
 protocol.
 
 Native calls are complete-before-execute. Chat exposes calls only for a tool-call finish

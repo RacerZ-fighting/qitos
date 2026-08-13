@@ -488,7 +488,12 @@ async def test_store_rejects_incomplete_history_transaction(store_factory) -> No
 
 
 def test_trace_writer_commits_events_before_step_marker(tmp_path) -> None:
-    writer = TraceWriter(str(tmp_path), "run-1", strict_validate=False)
+    writer = TraceWriter(
+        str(tmp_path),
+        "run-1",
+        metadata={"task_hash": "semantic-task"},
+        strict_validate=False,
+    )
     event = TraceEvent(
         run_id="run-1",
         step_id=1,
@@ -508,6 +513,7 @@ def test_trace_writer_commits_events_before_step_marker(tmp_path) -> None:
     manifest = json.loads((tmp_path / "run-1" / "manifest.json").read_text())
     assert manifest["event_count"] == 1
     assert manifest["step_count"] == 1
+    assert manifest["task_hash"] == "semantic-task"
 
 
 def test_trace_writer_flushes_lifecycle_events_immediately(tmp_path) -> None:

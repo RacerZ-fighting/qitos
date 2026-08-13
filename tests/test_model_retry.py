@@ -14,13 +14,14 @@ from qitos.models.transport import (
     ModelRetryPolicy,
     transactional_stream_with_retry,
 )
-from qitos.models.base import ModelStreamChunk
+from qitos.models.base import ModelStreamEvent
+from qitos.models import ModelStreamEventType
 
 
-class _AttemptStream(AsyncIterator[ModelStreamChunk]):
+class _AttemptStream(AsyncIterator[ModelStreamEvent]):
     def __init__(
         self,
-        events: list[ModelStreamChunk],
+        events: list[ModelStreamEvent],
         *,
         failure: Exception | None = None,
     ) -> None:
@@ -31,7 +32,7 @@ class _AttemptStream(AsyncIterator[ModelStreamChunk]):
     def __aiter__(self) -> _AttemptStream:
         return self
 
-    async def __anext__(self) -> ModelStreamChunk:
+    async def __anext__(self) -> ModelStreamEvent:
         try:
             return next(self._events)
         except StopIteration:
@@ -49,7 +50,7 @@ async def _collect(
     *,
     policy: ModelRetryPolicy,
     deadline_monotonic: float | None = None,
-) -> list[ModelStreamChunk]:
+) -> list[ModelStreamEvent]:
     return [
         chunk
         async for chunk in transactional_stream_with_retry(
@@ -58,7 +59,7 @@ async def _collect(
             connection_timeout_seconds=1.0,
             event_idle_timeout_seconds=1.0,
             deadline_monotonic=deadline_monotonic,
-            is_terminal=lambda item: item.done,
+            is_terminal=lambda item: item.is_final,
         )
     ]
 
@@ -89,19 +90,20 @@ async def test_failure_before_first_event_retries_then_publishes_success(
 
     monkeypatch.setattr("qitos.models.transport.asyncio.sleep", no_sleep)
 
-    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
         failed = not attempts
         stream = _AttemptStream(
             (
                 []
                 if failed
                 else [
-                    ModelStreamChunk(
+                    ModelStreamEvent(
+                        type=ModelStreamEventType.TEXT_DELTA,
                         text="committed",
                         event_type="text.delta",
                     ),
-                    ModelStreamChunk(
-                        done=True,
+                    ModelStreamEvent(
+                        type=ModelStreamEventType.COMPLETED,
                         event_type="model.completed",
                         finish_reason="stop",
                     ),
@@ -131,7 +133,7 @@ async def test_empty_incomplete_stream_retries_without_publishing_output(
 
     monkeypatch.setattr("qitos.models.transport.asyncio.sleep", no_sleep)
 
-    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
         nonlocal attempts
         attempts += 1
         return _AttemptStream([])
@@ -147,13 +149,19 @@ async def test_empty_incomplete_stream_retries_without_publishing_output(
 @pytest.mark.asyncio
 async def test_failure_after_first_event_is_not_retried_or_duplicated() -> None:
     attempts = 0
-    published: list[ModelStreamChunk] = []
+    published: list[ModelStreamEvent] = []
 
-    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
         nonlocal attempts
         attempts += 1
         return _AttemptStream(
-            [ModelStreamChunk(text="visible", event_type="text.delta")],
+            [
+                ModelStreamEvent(
+                    type=ModelStreamEventType.TEXT_DELTA,
+                    text="visible",
+                    event_type="text.delta",
+                )
+            ],
             failure=TimeoutError("stalled"),
         )
 
@@ -164,7 +172,7 @@ async def test_failure_after_first_event_is_not_retried_or_duplicated() -> None:
             connection_timeout_seconds=1.0,
             event_idle_timeout_seconds=1.0,
             deadline_monotonic=None,
-            is_terminal=lambda item: item.done,
+            is_terminal=lambda item: item.is_final,
         ):
             published.append(chunk)
 
@@ -178,7 +186,7 @@ async def test_nonterminal_event_is_visible_before_provider_terminal() -> None:
     release_terminal = asyncio.Event()
     terminal_wait_started = asyncio.Event()
 
-    class BlockingTerminalStream(AsyncIterator[ModelStreamChunk]):
+    class BlockingTerminalStream(AsyncIterator[ModelStreamEvent]):
         def __init__(self) -> None:
             self._index = 0
             self.closed = False
@@ -186,15 +194,19 @@ async def test_nonterminal_event_is_visible_before_provider_terminal() -> None:
         def __aiter__(self) -> BlockingTerminalStream:
             return self
 
-        async def __anext__(self) -> ModelStreamChunk:
+        async def __anext__(self) -> ModelStreamEvent:
             if self._index == 0:
                 self._index += 1
-                return ModelStreamChunk(text="live", event_type="text.delta")
+                return ModelStreamEvent(
+                    type=ModelStreamEventType.TEXT_DELTA,
+                    text="live",
+                    event_type="text.delta",
+                )
             if self._index == 1:
                 self._index += 1
                 terminal_wait_started.set()
                 await release_terminal.wait()
-                return ModelStreamChunk(done=True, finish_reason="stop")
+                return ModelStreamEvent(type=ModelStreamEventType.COMPLETED, finish_reason="stop")
             raise StopAsyncIteration
 
         async def aclose(self) -> None:
@@ -202,7 +214,7 @@ async def test_nonterminal_event_is_visible_before_provider_terminal() -> None:
 
     provider_stream = BlockingTerminalStream()
 
-    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
         return provider_stream
 
     stream = transactional_stream_with_retry(
@@ -211,7 +223,7 @@ async def test_nonterminal_event_is_visible_before_provider_terminal() -> None:
         connection_timeout_seconds=1.0,
         event_idle_timeout_seconds=1.0,
         deadline_monotonic=None,
-        is_terminal=lambda item: item.done,
+        is_terminal=lambda item: item.is_final,
     )
     iterator = stream.__aiter__()
 
@@ -235,7 +247,7 @@ async def test_nonretryable_status_fails_after_one_attempt() -> None:
     class ForbiddenError(Exception):
         status_code = 403
 
-    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
         nonlocal attempts
         attempts += 1
         raise ForbiddenError("forbidden")
@@ -252,15 +264,15 @@ async def test_nonretryable_status_fails_after_one_attempt() -> None:
 async def test_event_after_terminal_is_rejected() -> None:
     stream = _AttemptStream(
         [
-            ModelStreamChunk(done=True, finish_reason="stop"),
-            ModelStreamChunk(text="late"),
+            ModelStreamEvent(type=ModelStreamEventType.COMPLETED, finish_reason="stop"),
+            ModelStreamEvent(type=ModelStreamEventType.TEXT_DELTA, text="late"),
         ]
     )
 
-    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
         return stream
 
-    published: list[ModelStreamChunk] = []
+    published: list[ModelStreamEvent] = []
     with pytest.raises(ModelTransportError) as exc_info:
         async for chunk in transactional_stream_with_retry(
             create_stream,
@@ -268,7 +280,7 @@ async def test_event_after_terminal_is_rejected() -> None:
             connection_timeout_seconds=1.0,
             event_idle_timeout_seconds=1.0,
             deadline_monotonic=None,
-            is_terminal=lambda item: item.done,
+            is_terminal=lambda item: item.is_final,
         ):
             published.append(chunk)
 
@@ -281,7 +293,7 @@ async def test_event_after_terminal_is_rejected() -> None:
 async def test_backoff_cannot_cross_absolute_deadline() -> None:
     attempts = 0
 
-    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
         nonlocal attempts
         attempts += 1
         raise TimeoutError("provider unavailable")
@@ -305,14 +317,14 @@ async def test_cancellation_closes_stream_and_is_not_retried() -> None:
     release = asyncio.Event()
     attempts = 0
 
-    class BlockingStream(AsyncIterator[ModelStreamChunk]):
+    class BlockingStream(AsyncIterator[ModelStreamEvent]):
         def __init__(self) -> None:
             self.closed = False
 
         def __aiter__(self) -> BlockingStream:
             return self
 
-        async def __anext__(self) -> ModelStreamChunk:
+        async def __anext__(self) -> ModelStreamEvent:
             entered.set()
             await release.wait()
             raise StopAsyncIteration
@@ -322,7 +334,7 @@ async def test_cancellation_closes_stream_and_is_not_retried() -> None:
 
     stream = BlockingStream()
 
-    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
         nonlocal attempts
         attempts += 1
         return stream
@@ -344,12 +356,12 @@ async def test_cancellation_closes_stream_and_is_not_retried() -> None:
 async def test_successful_stream_is_closed_once_complete() -> None:
     stream = _AttemptStream(
         [
-            ModelStreamChunk(text="ok"),
-            ModelStreamChunk(done=True, finish_reason="stop"),
+            ModelStreamEvent(type=ModelStreamEventType.TEXT_DELTA, text="ok"),
+            ModelStreamEvent(type=ModelStreamEventType.COMPLETED, finish_reason="stop"),
         ]
     )
 
-    async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
         return stream
 
     chunks = await _collect(create_stream, policy=ModelRetryPolicy(max_attempts=1))

@@ -101,6 +101,20 @@ def should_stop(self, state: StateT) -> bool:
     return state.final_result is not None
 ```
 
+### `assess_completion`（可选）
+
+模型给出的 final 是完成提议，不应直接等价于产品完成。产品可以覆写
+`assess_completion(state, decision)`，返回 `CompletionAssessment.completed()`、
+`blocked()`，或带反馈的 `continue_run()`。继续运行时，反馈写入 canonical History，
+`final_result` 被清空；完成和阻塞使用不同的 stop reason。
+
+### `prepare_turn` 与 `build_tool_exposure`（可选）
+
+每轮开始时 Engine 会冻结一个 `TurnSnapshot`。需要读取显式协议、History、Tool、能力或
+剩余预算时覆写 `prepare_turn`，不要在 Agent 上保存临时 `_runtime_*` 属性。
+`build_tool_exposure` 返回的同一个冻结视图同时用于模型 schema 和执行分发；本轮中发生的
+注册表或策略变化只能影响下一轮。
+
 ## 一个最小可运行示例
 
 在 QitOS 里，公开的最小示例依然是一个真实的编码智能体：它会配置模型、挂载工作区，并让 Engine 驱动工具使用与验证。

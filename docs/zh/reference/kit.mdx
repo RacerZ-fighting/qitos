@@ -163,6 +163,8 @@ QitOS 把长时上下文管理当成一等能力，而不是隐形中间件。
 QitOS 的工具集帮你直接组合出一个工作环境，而不是一组松散工具。
 
 - `CodingToolSet`：文件、编辑、终端、任务、笔记本等编码环境
+- `SkillToolSet`：从应用拥有的只读根目录递归发现 `SKILL.md`，按名称渐进加载完整说明与
+  UTF-8 资源
 - `run_command` 通过统一工具准入后直接执行，不在 handler 内重复权限判断，也不向模型
   暴露 `read_only` 或 `allow_destructive` 开关
 - `TaskToolSet`：待办与进度跟踪
@@ -173,6 +175,17 @@ QitOS 的工具集帮你直接组合出一个工作环境，而不是一组松�
 
 - 学习框架时手工构建注册表
 - 做真实工作流时切换到预设工具集
+
+`SkillToolSet` 把配置顺序当成明确优先级：更早的根目录覆盖同名 Skill，并用
+`BundledSkillDiagnostic` 报告冲突、无效 manifest、缺失根目录或越界资源，不会让坏的
+兄弟目录遮蔽有效 Skill。目录一旦包含 `SKILL.md` 就成为一个 Skill 根，发现过程不再把
+其内部目录解释为另一个 Skill。`refresh_bundled_skills()` 显式、原子地替换整份目录快照。
+
+加载结果同时带 `content_sha256` 与 `bundle_sha256`；后者覆盖 `SKILL.md` 和所有已发现
+资源。资源在未 refresh 的情况下发生变化时，读取会返回 stale 错误，不会把新资源与旧
+说明混用。应用可以在构造时传入冻结的 `available_requirements`，用 `command:nmap`、
+`tool:run_command` 等自身约定的精确标识，在完整说明进入模型上下文前拒绝缺少运行能力的
+Skill；省略该集合时 availability 明确为 `unchecked`。
 
 </Tab>
 
