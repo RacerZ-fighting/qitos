@@ -17,6 +17,12 @@ How to update:
 
 ## Unreleased
 
+### Changed
+
+- Child invocation factories now receive the already-journaled `ChildHandle` in their
+  runtime context, so product runtimes can correlate independent Child sessions and
+  traces without deriving identity from mutable task data.
+
 ### Breaking
 
 - `AgentRequest`, `AgentInvocation`, and `AgentResult` have been replaced by the

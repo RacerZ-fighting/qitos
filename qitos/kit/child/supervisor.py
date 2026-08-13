@@ -497,6 +497,7 @@ class ChildSupervisor:
     async def _run_request(self, owned: _OwnedChild) -> ChildResult:
         started = time.monotonic()
         scoped_context = dict(owned.runtime_context)
+        scoped_context["child_handle"] = owned.handle
         scoped_context["agent_cancelled"] = owned.cancel_event.is_set
         scope = (
             self._execution_scope(scoped_context)
