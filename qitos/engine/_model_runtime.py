@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import Counter
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -33,7 +34,7 @@ from ..core.history import (
     message_tool_result_ids,
     select_recent_history,
 )
-from ..core.model_response import ModelResponse
+from ..core.model_response import ModelResponse, ModelTiming
 from ..core.multimodal import (
     content_to_text,
     image_base64_block,
@@ -74,6 +75,22 @@ _logger = logging.getLogger("qitos.engine._model_runtime")
 StateT = TypeVar("StateT", bound=StateSchema)
 ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
+
+
+def _chunk_has_model_content(chunk: ModelStreamChunk) -> bool:
+    """Return whether a stream chunk contains user-visible or actionable content."""
+
+    if chunk.text or chunk.reasoning_content or chunk.tool_calls or chunk.native_items:
+        return True
+    event_type = str(chunk.event_type or "")
+    if event_type in {"tool_call.start", "tool_call.delta", "tool_call.done"}:
+        return True
+    if event_type.startswith("response.function_call_arguments."):
+        return True
+    return (
+        event_type == "response.output_item.added"
+        and chunk.event_metadata.get("item_type") == "function_call"
+    )
 
 
 def _measure_prompt(
@@ -1369,6 +1386,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         started = False
         terminal_seen = False
         stream_error: Exception | None = None
+        request_started_at = time.monotonic()
+        first_event_at: float | None = None
+        first_content_at: float | None = None
         stream_iter: AsyncIterator[ModelStreamChunk] = llm.stream(
             messages,
             deadline_monotonic=getattr(self.engine, "runtime_deadline_monotonic", None),
@@ -1396,6 +1416,11 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     ) from exc
                 if not isinstance(chunk, ModelStreamChunk):
                     raise TypeError("Model.stream() must yield ModelStreamChunk values")
+                chunk_received_at = time.monotonic()
+                if first_event_at is None:
+                    first_event_at = chunk_received_at
+                if first_content_at is None and _chunk_has_model_content(chunk):
+                    first_content_at = chunk_received_at
                 text = chunk.text
                 reasoning = chunk.reasoning_content
                 done = chunk.done
@@ -1495,6 +1520,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 except Exception:
                     pass
 
+        completed_at = time.monotonic()
         return ModelResponse(
             text="".join(accumulated_text),
             usage=final_usage,
@@ -1507,6 +1533,19 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 "".join(accumulated_reasoning) if accumulated_reasoning else None
             ),
             native_items=final_native_items,
+            timing=ModelTiming(
+                total_ms=(completed_at - request_started_at) * 1000,
+                time_to_first_event_ms=(
+                    (first_event_at - request_started_at) * 1000
+                    if first_event_at is not None
+                    else None
+                ),
+                time_to_first_content_ms=(
+                    (first_content_at - request_started_at) * 1000
+                    if first_content_at is not None
+                    else None
+                ),
+            ),
         )
 
     def _build_current_user_message(
@@ -2473,6 +2512,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             metadata=metadata,
             reasoning_content=response.reasoning_content,
             native_items=response.native_items,
+            timing=response.timing,
         )
 
     def _extract_text_tool_call_markup(self, text: str) -> List[Dict[str, Any]] | None:

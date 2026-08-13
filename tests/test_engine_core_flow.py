@@ -123,6 +123,47 @@ def test_engine_happy_path():
     assert result.to_dict()["tool_calls_by_name"]["add"] == 1
 
 
+def test_engine_records_local_model_stream_timing(monkeypatch):
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamChunk(event_type="response.created"),
+                ModelStreamChunk(text="Final Answer: done", event_type="text.delta"),
+                ModelStreamChunk(done=True, finish_reason="stop"),
+            ]
+        ]
+    )
+
+    class _Agent(DemoAgent):
+        def __init__(self):
+            super().__init__()
+            self.llm = model
+
+        def decide(self, state: DemoState, observation: dict[str, Any]):
+            _ = state
+            _ = observation
+            return None
+
+    class _MonotonicClock:
+        def __init__(self) -> None:
+            self.current = 10.0
+
+        def __call__(self) -> float:
+            value = self.current
+            self.current += 0.01
+            return value
+
+    monkeypatch.setattr("qitos.engine._model_runtime.time.monotonic", _MonotonicClock())
+
+    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=1)).run("finish")
+
+    timing = result.records[0].model_response["timing"]
+    assert 0 <= timing["time_to_first_event_ms"]
+    assert timing["time_to_first_event_ms"] < timing["time_to_first_content_ms"]
+    assert timing["time_to_first_content_ms"] <= timing["total_ms"]
+    assert runtime_step_to_trace(result.records[0]).model_response["timing"] == timing
+
+
 def test_tool_loop_detection_can_be_disabled_for_long_running_agents():
     class RepeatingAgent(AgentModule[DemoState, dict[str, Any], Action]):
         def __init__(self) -> None:

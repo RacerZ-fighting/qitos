@@ -275,7 +275,7 @@ def runtime_step_to_trace(
     response = dict(getattr(step, "model_response", {}) or {})
     model_response = {
         key: response.get(key)
-        for key in ("model_name", "provider", "finish_reason")
+        for key in ("model_name", "provider", "finish_reason", "timing")
         if response.get(key) not in (None, "")
     }
     return TraceStep(

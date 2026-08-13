@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from qitos.core import ModelResponse, ModelUsage, ModelUsageSource
+from qitos.core import ModelResponse, ModelTiming, ModelUsage, ModelUsageSource
 from qitos.models import ModelStreamChunk
 
 
@@ -86,3 +86,25 @@ def test_model_transaction_preserves_estimated_usage_source() -> None:
     assert response.usage is usage
     assert chunk.usage is usage
     assert response.to_summary_dict()["usage_source"] == "estimate"
+
+
+def test_model_timing_round_trips_through_response_summary() -> None:
+    timing = ModelTiming(
+        total_ms=25,
+        time_to_first_event_ms=4,
+        time_to_first_content_ms=9,
+    )
+
+    response = ModelResponse(text="done", timing=timing)
+
+    assert response.timing is timing
+    assert response.to_summary_dict()["timing"] == timing.to_dict()
+
+
+def test_model_timing_rejects_impossible_ordering() -> None:
+    with pytest.raises(ValueError, match="must not precede"):
+        ModelTiming(
+            total_ms=25,
+            time_to_first_event_ms=9,
+            time_to_first_content_ms=4,
+        )
