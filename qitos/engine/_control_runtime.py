@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar, cast
 
 from ..core.decision import Decision
 from ..core.completion import CompletionDisposition
 from ..core.errors import (
+    ErrorCategory,
     ModelRequestCancelled,
     ModelRequestDeadlineExceeded,
+    QitosRuntimeError,
+    RuntimeErrorInfo,
     StopReason,
 )
 from ..core.state import StateSchema
@@ -79,6 +82,65 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
                 record=record,
                 payload={"state_diff": record.state_diff},
             ),
+        )
+
+    def run_handoff(
+        self,
+        state: StateT,
+        decision: Decision[ActionT],
+        record: StepRecord,
+    ) -> ObservationT:
+        """Apply the optional legacy handoff policy outside the turn loop."""
+
+        engine = self.engine
+        if engine.agent_registry is None:
+            raise ValueError("handoff requires agent_registry on Engine")
+        target_name = str(decision.meta.get("handoff_target", ""))
+        if target_name in engine._handoff_history:
+            raise QitosRuntimeError(
+                RuntimeErrorInfo(
+                    category=ErrorCategory.SYSTEM,
+                    message=(
+                        f"Handoff loop detected: agent '{target_name}' already visited "
+                        f"in this run (history: {' -> '.join(engine._handoff_history)})"
+                    ),
+                    phase="handoff",
+                    step_id=record.step_id,
+                    recoverable=False,
+                )
+            )
+        max_handoffs = engine.context_config.max_handoffs
+        if len(engine._handoff_history) >= max_handoffs:
+            raise QitosRuntimeError(
+                RuntimeErrorInfo(
+                    category=ErrorCategory.SYSTEM,
+                    message=f"Maximum handoff count ({max_handoffs}) exceeded",
+                    phase="handoff",
+                    step_id=record.step_id,
+                    recoverable=False,
+                )
+            )
+
+        engine._handoff_history.append(engine.agent.name)
+        handoff = engine._handoff_runtime.execute_handoff(state, decision, record)
+        state.metadata["last_handoff"] = {
+            "from": handoff.from_agent,
+            "to": handoff.to_agent,
+        }
+        if engine.trace_writer is not None:
+            count = engine.trace_writer.metadata.get("handoff_count", 0) or 0
+            engine.trace_writer.metadata["handoff_count"] = count + 1
+        return cast(
+            ObservationT,
+            {
+                "action_results": [
+                    {
+                        "handoff": True,
+                        "from": handoff.from_agent,
+                        "to": handoff.to_agent,
+                    }
+                ]
+            },
         )
 
     def apply_critics(self, state: StateT, record: StepRecord) -> Dict[str, Any]:

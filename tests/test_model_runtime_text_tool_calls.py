@@ -971,7 +971,7 @@ def test_native_text_structured_action_parse_error_stays_in_recovery(response_te
     engine = _native_text_engine()
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
         step=0,
         record=record,
@@ -999,7 +999,7 @@ def test_native_text_structured_final_parse_error_stays_in_recovery():
         '"summary":"Ligolo "agent" upload failed","fact_ids":["fact-1"]}}'
     )
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
         step=0,
         record=record,
@@ -1022,7 +1022,7 @@ def test_native_text_plain_natural_language_still_becomes_final():
     record = StepRecord(step_id=0)
     response_text = "The requested action is complete; the tool named add returned 42."
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(
             text=response_text,
             finish_reason="stop",
@@ -1050,7 +1050,7 @@ def test_native_text_ambiguous_labels_still_become_final(response_text):
     engine = _native_text_engine()
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
         step=0,
         record=record,
@@ -1066,7 +1066,7 @@ def test_native_text_tool_use_parser_heuristic_wait_keeps_legacy_final_fallback(
     record = StepRecord(step_id=0)
     response_text = "All requested checks passed successfully."
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
         step=0,
         record=record,
@@ -1081,7 +1081,7 @@ def test_native_text_valid_react_action_still_uses_parser():
     engine = _native_text_engine()
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(
             text="Thought: calculate\nAction: add(a=20, b=22)",
             finish_reason="stop",
@@ -1100,7 +1100,7 @@ def test_native_text_valid_react_final_still_uses_parser():
     engine = _native_text_engine()
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(
             text="Thought: finished\nFinal Answer: 42",
             finish_reason="stop",
@@ -1134,7 +1134,7 @@ def test_native_text_explicit_parser_wait_stays_wait(parser, protocol, response_
     engine = _native_text_engine(parser=parser, protocol=protocol)
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(
             text=response_text,
             finish_reason="stop",
@@ -1170,7 +1170,7 @@ def test_native_text_malformed_protocol_action_stays_in_recovery(
     engine = _native_text_engine(parser=parser, protocol=protocol)
     record = StepRecord(step_id=0)
 
-    decision = engine._model_runtime.normalize_decision(
+    decision = engine._decision_runtime.normalize_decision(
         ModelResponse(text=response_text, finish_reason="stop", tool_calls=None),
         step=0,
         record=record,
@@ -1194,7 +1194,7 @@ def test_native_text_malformed_protocol_action_stays_in_recovery(
     ],
 )
 def test_structured_action_intent_recognizes_native_protocol_markers(response_text):
-    assert _native_text_engine()._model_runtime._looks_like_structured_action_intent(
+    assert _native_text_engine()._decision_runtime._looks_like_structured_action_intent(
         response_text
     )
 

@@ -127,6 +127,27 @@ def test_completion_policy_can_reject_a_final_then_complete() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_single_step_uses_completion_policy_without_owning_advancement() -> None:
+    agent = _CompletionAgent()
+    engine = Engine(agent, budget=RuntimeBudget(max_steps=3))
+    state, observation = engine.init_session("investigate")
+
+    result = await engine.astep(state, observation)
+
+    assert result.stop is False
+    assert result.decision.mode == "final"
+    assert state.current_step == 0
+    feedback = [
+        message
+        for message in engine._history().messages
+        if message.metadata.get("source") == "completion_assessment"
+    ]
+    assert [message.content for message in feedback] == [
+        "Collect the missing evidence."
+    ]
+
+
 class _BlockedAgent(_CompletionAgent):
     def assess_completion(
         self,
