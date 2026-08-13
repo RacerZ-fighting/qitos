@@ -271,13 +271,14 @@ def test_coding_toolset_uses_one_canonical_schema_surface():
     edit_schema = registry.describe_tool("edit_file")["input_schema"]["properties"]
 
     assert set(read_schema) == {"path", "line_offset", "line_count"}
-    assert set(write_schema) == {"path", "content"}
+    assert set(write_schema) == {"path", "content", "expected_sha256"}
     assert set(edit_schema) == {
         "path",
         "old_text",
         "new_text",
         "replace_all",
         "expected_mtime",
+        "expected_sha256",
     }
 
 

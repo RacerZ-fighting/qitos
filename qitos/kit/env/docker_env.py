@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import shlex
 import subprocess
 import threading
@@ -12,12 +13,18 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterator, Optional, Sequence
 
 from qitos.core.env import (
+    AtomicFileWrite,
     CommandCapability,
+    FileRevisionConflictError,
     FileStat,
     FileSystemCapability,
     TextFileChunk,
 )
 from qitos.kit.env._async_process import run_process
+from qitos.kit.env._file_mutation import (
+    FileMutationQueue,
+    normalize_expected_sha256,
+)
 from qitos.kit.env.host_env import HostEnv
 
 
@@ -171,6 +178,7 @@ class DockerFSCapability(FileSystemCapability):
         self.container = container
         self.workdir = workdir.rstrip("/") or "/workspace"
         self.cmd = DockerCommandCapability(container=container, workdir=workdir)
+        self._mutations = FileMutationQueue()
 
     def resolve_path(self, path: str, *, allow_missing: bool = False) -> str:
         inner = self._inner_path(path)
@@ -259,6 +267,12 @@ class DockerFSCapability(FileSystemCapability):
         if not info.is_file:
             raise IsADirectoryError(path)
         inner = self.resolve_path(path)
+        digest_result = self.cmd.run_argv(["sha256sum", "--", inner])
+        if int(digest_result.get("returncode", 1)) != 0:
+            raise RuntimeError(
+                str(digest_result.get("stderr", "failed to hash file"))
+            )
+        content_sha256 = str(digest_result.get("stdout", "")).split(maxsplit=1)[0]
         if info.size > 0:
             text_probe = self.cmd.run(
                 f"LC_ALL=C grep -Iq -- '' {shlex.quote(inner)}"
@@ -317,25 +331,101 @@ class DockerFSCapability(FileSystemCapability):
             has_more=has_more,
             truncated=line_truncated or byte_truncated,
             line_ending=line_ending,
+            content_sha256=content_sha256,
         )
 
     def write_text(self, path: str, content: str) -> None:
-        self.write_bytes(path, content.encode("utf-8"))
+        self.write_text_atomic(path, content)
+
+    def write_text_atomic(
+        self,
+        path: str,
+        content: str,
+        *,
+        expected_sha256: str | None = None,
+    ) -> AtomicFileWrite:
+        """Atomically replace one UTF-8 file inside the container workspace."""
+
+        if not isinstance(content, str):
+            raise TypeError("content must be a string")
+        return self._write_bytes_atomic(
+            path,
+            content.encode("utf-8"),
+            expected_sha256=normalize_expected_sha256(expected_sha256),
+        )
 
     def write_bytes(self, path: str, content: bytes) -> None:
+        if not isinstance(content, bytes):
+            raise TypeError("content must be bytes")
+        self._write_bytes_atomic(path, content, expected_sha256=None)
+
+    def _write_bytes_atomic(
+        self,
+        path: str,
+        content: bytes,
+        *,
+        expected_sha256: str | None,
+    ) -> AtomicFileWrite:
         inner = self.resolve_path(path, allow_missing=True)
-        parent_result = self.cmd.run_argv(
-            ["mkdir", "-p", "--", str(PurePosixPath(inner).parent)]
-        )
-        if int(parent_result.get("returncode", 1)) != 0:
-            raise RuntimeError(
-                str(parent_result.get("stderr", "failed to create parent directory"))
+        relative = _relative_docker_path(self.workdir, inner)
+        if relative in {"", "."}:
+            raise IsADirectoryError(path)
+        script = """
+set -eu
+target=$1
+expected=$2
+parent=${target%/*}
+mkdir -p -- "$parent"
+current=
+if [ -e "$target" ]; then
+  current=$(sha256sum -- "$target")
+  current=${current%% *}
+fi
+if [ -n "$expected" ] && [ "$current" != "$expected" ]; then
+  printf 'QITOS_CONFLICT:%s' "$current" >&2
+  exit 73
+fi
+temporary=$(mktemp "$parent/.qitos-write.XXXXXX")
+trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+cat > "$temporary"
+if [ -e "$target" ]; then
+  chmod --reference="$target" "$temporary" 2>/dev/null || true
+fi
+mv -f -- "$temporary" "$target"
+trap - EXIT HUP INT TERM
+printf '%s' "$current"
+""".strip()
+        with self._mutations.hold(relative):
+            result = self.cmd.run_argv(
+                [
+                    "sh",
+                    "-c",
+                    script,
+                    "qitos-atomic-write",
+                    inner,
+                    expected_sha256 or "",
+                ],
+                stdin=content,
             )
-        result = self.cmd.run_argv(
-            ["dd", f"of={inner}", "status=none"], stdin=content
+        returncode = int(result.get("returncode", 1))
+        stderr = str(result.get("stderr", ""))
+        if returncode == 73 and stderr.startswith("QITOS_CONFLICT:"):
+            current = stderr.removeprefix("QITOS_CONFLICT:").strip() or None
+            raise FileRevisionConflictError(
+                relative,
+                expected_sha256=expected_sha256 or "",
+                current_sha256=current,
+            )
+        if returncode != 0:
+            raise RuntimeError(stderr or "failed to atomically write file")
+        previous_sha256 = str(result.get("stdout", "")).strip() or None
+        return AtomicFileWrite(
+            path=relative,
+            size_bytes=len(content),
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            previous_sha256=previous_sha256,
+            created=previous_sha256 is None,
         )
-        if int(result.get("returncode", 1)) != 0:
-            raise RuntimeError(str(result.get("stderr", "failed to write file")))
 
     def append_text(self, path: str, content: str) -> None:
         inner = self.resolve_path(path, allow_missing=True)
