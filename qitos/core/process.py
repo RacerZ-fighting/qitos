@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 
 def _non_negative_int(value: Any, name: str) -> int:
@@ -241,6 +241,13 @@ class ProcessSnapshot:
         return snapshot
 
 
+class ProcessTerminalNotifier(Protocol):
+    """Async sink invoked after one managed process reaches a known terminal."""
+
+    async def __call__(self, snapshot: ProcessSnapshot) -> bool:
+        """Submit the terminal snapshot and report whether it was accepted."""
+
+
 __all__ = [
     "ProcessError",
     "ProcessHandle",
@@ -249,4 +256,5 @@ __all__ = [
     "ProcessPersistenceError",
     "ProcessSnapshot",
     "ProcessStatus",
+    "ProcessTerminalNotifier",
 ]

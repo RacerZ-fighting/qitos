@@ -148,7 +148,10 @@ How to update:
   write reaps the process before returning an error. The shell profile now exposes
   process list/read/write/wait/terminate tools through that same capability. Resume
   closes an interrupted start as `lost` without replaying or reattaching it; forked
-  Runs receive no authority over inherited parent handles.
+  Runs receive no authority over inherited parent handles. Terminal watchers now post
+  one bounded `process.completed` RuntimeInput only after `process.terminal` is
+  durable, so an active Agent wakes through the existing turn-safe mailbox rather than
+  receiving an out-of-band state mutation.
 - Added durable model request snapshots and guarded OpenAI Responses continuation.
   `model.completed` records the exact credential-redacted Provider input plus an
   optional Run-bound handle. Resume reuses a handle only when provider, model,

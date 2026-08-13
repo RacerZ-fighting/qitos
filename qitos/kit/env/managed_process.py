@@ -22,6 +22,7 @@ from qitos.core.process import (
     ProcessPersistenceError,
     ProcessSnapshot,
     ProcessStatus,
+    ProcessTerminalNotifier,
 )
 
 
@@ -96,6 +97,7 @@ class _ProcessEntry:
     started_at: str
     started_monotonic: float
     journal: SessionJournal | None
+    terminal_notifier: ProcessTerminalNotifier | None
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     interaction_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     reader_task: asyncio.Task[None] | None = None
@@ -152,6 +154,7 @@ class ManagedHostProcessRuntime:
         cwd: str,
         tty: bool = False,
         journal: SessionJournal | None = None,
+        terminal_notifier: ProcessTerminalNotifier | None = None,
     ) -> ProcessSnapshot:
         async with self._start_condition:
             if self._closed:
@@ -171,6 +174,7 @@ class ManagedHostProcessRuntime:
                 cwd=cwd,
                 tty=tty,
                 journal=journal,
+                terminal_notifier=terminal_notifier,
             )
         finally:
             async with self._start_condition:
@@ -185,6 +189,7 @@ class ManagedHostProcessRuntime:
         cwd: str,
         tty: bool,
         journal: SessionJournal | None,
+        terminal_notifier: ProcessTerminalNotifier | None,
     ) -> ProcessSnapshot:
         text = str(command or "").strip()
         if not text:
@@ -221,6 +226,7 @@ class ManagedHostProcessRuntime:
                 started_at=_utc_now(),
                 started_monotonic=loop.time(),
                 journal=journal,
+                terminal_notifier=terminal_notifier,
                 writer_fd=writer_fd,
                 read_transport=read_transport,
             )
@@ -623,6 +629,7 @@ class ManagedHostProcessRuntime:
                     entry.status = ProcessStatus.EXITED
                 entry.condition.notify_all()
             await entry.started_record_ready.wait()
+            terminal_persisted = entry.journal is None
             if entry.journal is not None and not entry.suppress_terminal_record:
                 snapshot = await self._snapshot(entry, cursor=0)
                 try:
@@ -634,10 +641,21 @@ class ManagedHostProcessRuntime:
                             f"{entry.handle.process_id}:terminal"
                         ),
                     )
+                    terminal_persisted = True
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     entry.journal_error = exc
+            if terminal_persisted and entry.terminal_notifier is not None:
+                snapshot = await self._snapshot(entry, cursor=0)
+                try:
+                    await entry.terminal_notifier(snapshot)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # The process terminal remains queryable even if an active
+                    # Run can no longer accept a safe-point notification.
+                    pass
         finally:
             if entry.writer_fd is not None:
                 try:

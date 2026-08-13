@@ -23,7 +23,12 @@ from qitos.core.env import (
     FileSystemCapability,
 )
 from qitos.core.function_tool_decorator import function_tool
-from qitos.core.process import ProcessHandle
+from qitos.core.process import (
+    ProcessHandle,
+    ProcessSnapshot,
+    ProcessTerminalNotifier,
+)
+from qitos.core.runtime_input import RuntimeInput
 from qitos.kit.env.host_env import HostCommandCapability, HostFSCapability
 from qitos.kit.tool.internal.coding_utils import (
     build_diff,
@@ -45,6 +50,7 @@ except Exception:  # pragma: no cover
 
 TASK_STATUSES = {"pending", "in_progress", "blocked", "completed", "cancelled"}
 _MAX_SEARCH_RESULTS = 2000
+_PROCESS_TERMINAL_EVENT_MAX_CHARS = 8000
 
 
 def _utc_now() -> str:
@@ -440,6 +446,56 @@ class CodingToolSet:
         )
 
     @staticmethod
+    def _process_terminal_notifier(
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> ProcessTerminalNotifier | None:
+        post_runtime_event = (runtime_context or {}).get("post_runtime_event")
+        if not callable(post_runtime_event):
+            return None
+
+        async def notify(snapshot: ProcessSnapshot) -> bool:
+            process_id = snapshot.handle.process_id
+            return bool(
+                await post_runtime_event(
+                    RuntimeInput(
+                        event_id=f"{process_id}:terminal",
+                        kind="process.completed",
+                        correlation_id=process_id,
+                        source="qitos.process",
+                        payload=CodingToolSet._process_terminal_payload(snapshot),
+                    )
+                )
+            )
+
+        return notify
+
+    @staticmethod
+    def _process_terminal_payload(snapshot: ProcessSnapshot) -> Dict[str, Any]:
+        content, notification_truncated = _truncate_text(
+            snapshot.output.content,
+            _PROCESS_TERMINAL_EVENT_MAX_CHARS,
+        )
+        return {
+            "handle": snapshot.handle.to_dict(),
+            "process_id": snapshot.handle.process_id,
+            "owner_run_id": snapshot.handle.owner_run_id,
+            "status": snapshot.status.value,
+            "terminal": snapshot.terminal,
+            "ended_at": snapshot.ended_at,
+            "exit_code": snapshot.exit_code,
+            "error": snapshot.error,
+            "output": {
+                "content": content,
+                "next_cursor": snapshot.output.next_cursor,
+                "total_bytes": snapshot.output.total_bytes,
+                "truncated": snapshot.output.truncated
+                or notification_truncated,
+                "notification_truncated": notification_truncated,
+                "log_path": snapshot.output.log_path,
+            },
+        }
+
+    @staticmethod
     def _remaining_seconds(
         runtime_context: Optional[Dict[str, Any]],
     ) -> float | None:
@@ -783,6 +839,7 @@ class CodingToolSet:
                     owner_run_id=run_id,
                     tty=bool(tty),
                     journal=context.get("journal"),
+                    terminal_notifier=self._process_terminal_notifier(context),
                 )
                 return snapshot.to_dict()
             if tty:

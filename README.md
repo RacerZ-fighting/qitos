@@ -29,7 +29,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   Runs await every reader and watcher during shutdown, while Journal-enabled starts
   persist `process.started` and `process.terminal` around the live lifecycle. The shell
   profile exposes list/read/write/wait/terminate controls; resume marks interrupted
-  ownership as `lost`, and forks do not inherit live handles.
+  ownership as `lost`, and forks do not inherit live handles. A terminal watcher posts
+  one durable `process.completed` input after the terminal record, waking an active
+  Agent only through its next turn safe point.
 - **Discriminated model stream events**: every Provider event now declares whether it
   is text, reasoning, a ToolCall delta, a native output item, usage, lifecycle,
   successful completion, or failure. The ambiguous `ModelStreamChunk` field bag is
