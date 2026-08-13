@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from examples.benchmarks.tau_bench_eval import run_tau_recipe_task as wrapper_run_tau_recipe_task
 from qitos.benchmark import TauBenchAdapter, resolve_builtin_runner
 from qitos.recipes.benchmarks.tau_bench import TauActionTool, run_tau_recipe_task
@@ -61,7 +63,8 @@ def test_tau_bench_uses_builtin_runner_and_thin_example_wrapper():
     assert wrapper_run_tau_recipe_task is run_tau_recipe_task
 
 
-def test_tau_action_tool_uses_canonical_execute_contract():
+@pytest.mark.asyncio
+async def test_tau_action_tool_uses_canonical_execute_contract():
     calls = []
 
     def runner(name, args):
@@ -76,7 +79,9 @@ def test_tau_action_tool_uses_canonical_execute_contract():
         runner,
     ).impl
 
-    result = tool.execute({"record_id": "42"}, runtime_context={"run_id": "test"})
+    result = await tool.execute(
+        {"record_id": "42"}, runtime_context={"run_id": "test"}
+    )
 
     assert result == {"ok": True}
     assert calls == [("lookup", {"record_id": "42"})]

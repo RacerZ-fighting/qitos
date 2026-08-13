@@ -17,6 +17,13 @@ How to update:
 
 ## Unreleased
 
+### Breaking
+
+- Class-based tools now implement `async execute(args, runtime_context)`. Managed Web
+  capabilities and their concrete adapters are async as well. Synchronous decorated
+  functions remain supported through one explicit compatibility boundary, but code
+  inside an active event loop must await Tool and Engine APIs.
+
 ### Fixed
 
 - Session Journal payloads now cross one strict JSON boundary before append, keeping
@@ -64,6 +71,18 @@ How to update:
   another model request, executing tools, or writing a descendant checkpoint.
 
 ### Added
+
+- Added one immutable `TurnSnapshot` for every model transaction. It freezes the model
+  reference, protocol, transaction-complete History view, Tool definitions, runtime
+  capabilities, absolute deadline, explicit pricing, and remaining step/token/cost,
+  Tool-concurrency, and Child budgets used by both model projection and dispatch.
+- Added typed completion assessment. Product agents can accept a proposed final answer,
+  reject it with durable feedback for another turn, or classify it as blocked; new
+  runs distinguish `completed`, `blocked`, step/time/token/cost budget exhaustion,
+  cancellation, and failure.
+- Added explicit `ModelPricing` plus Run and Task limits for cost, Tool concurrency, and
+  Child count. Journal resume restores accumulated provider token usage and calculated
+  cost before another turn is admitted.
 
 - Added one process-safe writer lease per Run and a disposable SQLite Journal read
   projection. JSONL remains the only canonical source; stale, corrupt, missing, or
@@ -148,6 +167,20 @@ How to update:
 - Journal replay now always parses and validates canonical JSONL before consulting the
   disposable SQLite projection. A projection is retained only when its record digests
   match the validated JSONL; drift rebuilds the projection and can never override replay.
+- The canonical action path is now async from Engine through Tool, Mailbox, MCP, and
+  Child execution. Blocking host and Docker commands use asyncio subprocesses with
+  process-group cleanup; explicitly concurrency-safe calls remain parallel and commit
+  terminal results in source order.
+- Cancellation now drains every started Tool handler before publishing its terminal
+  result. A direct caller `Task.cancel()` is re-raised only after terminal persistence
+  and runtime cleanup, while controlled Engine cancellation returns an auditable
+  cancelled result without leaving event-loop tasks behind.
+- `ToolExposure` now freezes each Tool definition while retaining one live handler
+  owner, so stateful Tool lifecycle and Run-scoped Child accounting cannot be copied
+  away between lookups or turns.
+- Runtime input is accepted through a thread-safe async inbox and projected only at the
+  next pre-turn safe point. MCP transports and background Child tasks stay on their
+  owning event loop; the temporary-loop MCP bridge and daemon action pool were removed.
 - Journal records now deep-copy nested payloads at construction and projection
   boundaries. Replay and committed-tool queries return isolated values.
 - Engine run and resume entry points now own and close their configured Journal on
@@ -234,9 +267,9 @@ How to update:
   reject calls from an active event loop; the daemon-thread `AsyncEngine` bridge has
   been removed.
 - Background `AgentTool` runs now snapshot parent history at launch but defer model,
-  Engine, and trace construction until an execution slot opens. A bounded daemon pool,
-  repeatable bounded close, canonical cancellation stops, and terminal-before-wakeup
-  ordering keep child teardown from extending process lifetime indefinitely. Terminal
+  Engine, and trace construction until an execution slot opens. Event-loop-owned tasks,
+  awaited close, canonical cancellation stops, and terminal-before-wakeup ordering keep
+  child teardown structured and observable. Terminal
   children retain their queryable result while active task, request, Engine, and
   cancellation records are reaped immediately.
 - Clarified the generic `AgentTool` model contract: independent multi-step tasks can be
@@ -282,8 +315,8 @@ How to update:
   promoted to a visible final answer.
 - Fixed runtime deadlines being checked only at Engine step boundaries. The effective
   deadline now clamps tool admission, execution timeout, retry backoff, and runtime
-  waits. Timed-out synchronous tools use daemon workers so an orphan cannot block
-  interpreter shutdown. Saturated event queues now report dropped deliveries, retain
+  waits. Synchronous compatibility tools run off-loop and are awaited to a known
+  side-effect boundary. Saturated event queues now report dropped deliveries, retain
   exactly one priority `run_end` before the close marker, and terminate late subscribers.
 - Fixed native-capable agent turns so provider `tool_calls` are authoritative before
   custom text interpreters or parsers, API-delivered tools no longer receive a second

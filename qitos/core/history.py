@@ -350,7 +350,17 @@ class History(ABC):
         """Reset history runtime state for a new run."""
 
     def snapshot(self) -> HistorySnapshot:
-        """Capture a transaction-complete history prefix."""
+        """Capture a transaction-complete history prefix.
+
+        Stores exposing canonical ``HistoryMessage`` objects through a
+        ``messages`` property receive a safe default. Stores with another
+        representation must override this method explicitly.
+        """
+        raw_messages = getattr(self, "messages", None)
+        if raw_messages is not None:
+            messages = list(raw_messages)
+            if all(isinstance(message, HistoryMessage) for message in messages):
+                return HistorySnapshot.from_messages(messages)
         raise NotImplementedError(
             f"{type(self).__name__} does not support history snapshots"
         )

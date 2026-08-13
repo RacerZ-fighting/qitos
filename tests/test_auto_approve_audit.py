@@ -59,7 +59,8 @@ class _AuditToolSet:
 class TestAutoApproveAudit:
     """Audit trail tests for auto_approve bypass in ActionExecutor."""
 
-    def test_auto_approve_adds_audit_metadata(self):
+    @pytest.mark.asyncio
+    async def test_auto_approve_adds_audit_metadata(self):
         """When auto_approve=True and tool has needs_approval=True,
         the result metadata contains auto_approved=True and approval_required=True."""
         ts = _AuditToolSet()
@@ -67,13 +68,14 @@ class TestAutoApproveAudit:
         executor = ActionExecutor(tool_registry=registry, auto_approve=True)
 
         action = Action(name="dangerous_action", args={"command": "echo hello"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
 
         assert result.status == ActionStatus.SUCCESS
         assert result.metadata.get("auto_approved") is True
         assert result.metadata.get("approval_required") is True
 
-    def test_auto_approve_no_metadata_for_non_approval_tools(self):
+    @pytest.mark.asyncio
+    async def test_auto_approve_no_metadata_for_non_approval_tools(self):
         """When auto_approve=True but tool does NOT need approval,
         the result metadata does NOT contain auto_approved or approval_required."""
         ts = _AuditToolSet()
@@ -81,13 +83,14 @@ class TestAutoApproveAudit:
         executor = ActionExecutor(tool_registry=registry, auto_approve=True)
 
         action = Action(name="safe_action", args={"value": "test"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
 
         assert result.status == ActionStatus.SUCCESS
         assert "auto_approved" not in result.metadata
         assert "approval_required" not in result.metadata
 
-    def test_no_auto_approve_raises_interrupt(self):
+    @pytest.mark.asyncio
+    async def test_no_auto_approve_raises_interrupt(self):
         """When auto_approve=False, needs_approval tools still raise EngineInterrupt
         (the normal flow is unchanged)."""
         ts = _AuditToolSet()
@@ -96,9 +99,10 @@ class TestAutoApproveAudit:
 
         action = Action(name="dangerous_action", args={"command": "rm -rf /"})
         with pytest.raises(EngineInterrupt):
-            executor._execute_one(action)
+            await executor._execute_one(action)
 
-    def test_no_auto_approve_no_audit_for_non_approval_tools(self):
+    @pytest.mark.asyncio
+    async def test_no_auto_approve_no_audit_for_non_approval_tools(self):
         """When auto_approve=False and tool does not need approval,
         no audit metadata is added (tool executes normally)."""
         ts = _AuditToolSet()
@@ -106,13 +110,14 @@ class TestAutoApproveAudit:
         executor = ActionExecutor(tool_registry=registry, auto_approve=False)
 
         action = Action(name="safe_action", args={"value": "test"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
 
         assert result.status == ActionStatus.SUCCESS
         assert "auto_approved" not in result.metadata
         assert "approval_required" not in result.metadata
 
-    def test_execute_batch_auto_approve_audit(self):
+    @pytest.mark.asyncio
+    async def test_execute_batch_auto_approve_audit(self):
         """Batch execute with auto_approve=True includes audit metadata
         only on tools that require approval."""
         ts = _AuditToolSet()
@@ -126,7 +131,7 @@ class TestAutoApproveAudit:
             Action(name="safe_action", args={"value": "first"}),
             Action(name="dangerous_action", args={"command": "echo hello"}),
         ]
-        results = executor.execute(actions)
+        results = await executor.execute(actions)
 
         assert len(results) == 2
 

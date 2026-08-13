@@ -621,7 +621,7 @@ def build_benchmark_result(
     if task_result and isinstance(getattr(task_result, "metadata", None), dict):
         trace_run_dir = task_result.metadata.get("trace_run_dir")
     success = bool(
-        getattr(state, "stop_reason", None) == "final"
+        getattr(state, "stop_reason", None) in {"completed", "final", "success"}
         and getattr(state, "final_result", None)
     )
     contract = dict((execution.task.metadata or {}).get("completion_contract") or {})

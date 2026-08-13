@@ -48,7 +48,7 @@ def test_qit_demo_minimal_creates_qita_ready_run(
     assert "test_command:" in output
     assert "trace_run:" in output
     assert "final_result: Patch applied and verification passed." in output
-    assert "stop_reason: final" in output
+    assert "stop_reason: completed" in output
     assert "qita board --logdir" in output
 
     runs = _discover_runs(logdir)

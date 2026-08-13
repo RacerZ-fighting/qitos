@@ -2,6 +2,8 @@
 
 from typing import Literal, Optional
 
+import pytest
+
 from qitos.core.function_tool_decorator import function_tool
 from qitos.core.tool import FunctionTool, RetryPolicy, tool
 from qitos.core.tool_registry import ToolRegistry
@@ -90,12 +92,13 @@ class TestFunctionToolDecorator:
         registry.register(add)
         assert "math.add" in registry.list_tools()
 
-    def test_function_tool_context_injection(self) -> None:
+    @pytest.mark.asyncio
+    async def test_function_tool_context_injection(self) -> None:
         @function_tool
         def use_context(x: int, runtime_context: dict = None) -> dict:
             return {"x": x, "ctx": runtime_context}
 
-        result = use_context.execute(
+        result = await use_context.execute(
             {"x": 42}, runtime_context={"env": "test"}
         )
         assert result["x"] == 42

@@ -14,16 +14,25 @@ description: "Engine is the execution kernel that owns the agent loop: it calls 
 Each step follows a fixed sequence:
 
 ```
-prepare → decide → act → reduce → critics → check_stop → trace
+safe-point input → capture turn → decide → act → reduce → critics → check_stop → commit
 ```
 
-1. **prepare** — `agent.prepare(state)` formats state into the model-ready prompt text.
-2. **decide** — `agent.decide(state, observation)` is checked first; if it returns `None`, the Engine calls the LLM via the configured parser.
-3. **act** — Tool calls in the decision's `actions` list are executed against the `ToolRegistry`.
-4. **reduce** — `agent.reduce(state, observation, decision)` updates state with the new observation.
-5. **critics** — Any registered `Critic` instances (post-step evaluators that can approve, stop, or retry the step) evaluate the step; they can trigger a stop or retry.
-6. **check_stop** — Budget exhaustion, `FinalResultCriteria`, `agent.should_stop()`, and any custom `StopCriteria` are evaluated.
-7. **trace** — The step record and events are written to the `TraceWriter`.
+1. **safe-point input** — queued runtime events are projected before the next model
+   transaction, never in the middle of a turn.
+2. **capture turn** — Engine creates an immutable `TurnSnapshot` containing the exact
+   model, protocol, complete History view, Tool exposure, runtime capabilities,
+   deadline, pricing, and remaining budgets shared by model projection and dispatch.
+3. **prepare** — `agent.prepare_turn(state, observation, turn)` formats state into the
+   model-ready prompt text. Its default delegates to `prepare(state)`.
+4. **decide** — `agent.decide(state, observation)` is checked first; if it returns
+   `None`, the Engine calls the async Provider path.
+5. **act** — Tool calls are admitted and awaited through the frozen Tool exposure.
+   Explicitly concurrency-safe calls may overlap; terminal results commit in input order.
+6. **reduce** — `agent.reduce(state, observation, decision)` updates state with the new observation.
+7. **critics** — Optional post-step evaluators can stop or request another turn.
+8. **check_stop** — Completion policy, budgets, `agent.should_stop()`, and custom criteria are evaluated.
+9. **commit** — Journal state, trace records, and safe snapshots advance only after the
+   complete transaction is ready.
 
 ## Constructor
 
@@ -45,7 +54,9 @@ engine = Engine(
 | Parameter          | Type                        | Description                                                                 |
 | ------------------ | --------------------------- | --------------------------------------------------------------------------- |
 | `agent`            | `AgentModule`               | **Required.** The policy module to execute.                                 |
-| `budget`           | `RuntimeBudget \| None`     | Step/time/token limits. Defaults to `RuntimeBudget(max_steps=10)`.          |
+| `budget`           | `RuntimeBudget \| None`     | Step/time/token/cost/Tool/Child limits. Defaults to `RuntimeBudget(max_steps=10)`. |
+| `model_pricing`    | `ModelPricing \| None`      | Explicit USD-per-million prices required when a cost budget is configured. |
+| `journal`          | `SessionJournal \| None`    | Canonical per-Run transaction journal; mutually exclusive with checkpoints. |
 | `parser`           | `Parser \| None`            | Parses raw model output into a `Decision`. Must match your prompt format.   |
 | `critics`          | `list[Critic] \| None`      | Post-step evaluators that can stop or retry a step.                         |
 | `stop_criteria`    | `list[StopCriteria] \| None`| Stop conditions. Defaults to `[FinalResultCriteria()]`.                     |
@@ -196,7 +207,10 @@ You can also pass hooks at construction time via the `hooks` parameter, or at ru
 
 ## Budget exhaustion
 
-When the step budget, wall-clock time limit, or token budget is exceeded, the Engine sets `state.stop_reason` to the appropriate value and emits an `END` event. The run terminates gracefully and `EngineResult` is still returned — inspect `state.stop_reason` to detect this case.
+When a step, wall-clock, token, or cost budget is exhausted, Engine sets a distinct
+`state.stop_reason` and emits an `END` event. Tool concurrency and Child count are
+admission bounds rather than completion reasons. The run terminates gracefully and
+still returns `EngineResult`.
 
 ```python
 import time
@@ -209,11 +223,17 @@ engine = Engine(
         max_steps=30,
         max_runtime_seconds=120.0,
         max_tokens=50_000,
+        max_cost_usd=2.0,
+        max_tool_concurrency=4,
+        max_children=4,
         # Optional outer scheduler deadline; the earlier limit wins.
         deadline_monotonic=time.monotonic() + 120.0,
     ),
 )
 ```
+
+Cost limits never guess from model names. Pass `model_pricing=ModelPricing(...)` to
+Engine, or expose a typed `pricing` value on the configured Model.
 
 The effective run deadline is shared by Engine step admission, runtime waits, tool
 admission and timeout, and tool retry backoff. Expiry requests graceful termination; it
@@ -293,6 +313,11 @@ q2 = stream.subscribe()  # asyncio.Queue for consumer 2
 All model providers implement the canonical async `Model.stream()` contract. The Engine
 consumes provider-neutral stream chunks and preserves cancellation and request deadlines
 throughout the transaction.
+
+Class tools implement `async execute(...)`. A legacy synchronous decorated function is
+run in the isolated compatibility boundary and cancellation waits for that call to reach
+a known side-effect boundary. Native subprocess, managed Web, MCP, Mailbox, and Child
+implementations are asynchronous and do not create temporary event loops.
 
 ```python
 from qitos.models import OpenAICompatibleModel

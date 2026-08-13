@@ -113,7 +113,7 @@ class DemoAgent(AgentModule[DemoState, dict[str, Any], Action]):
 def test_engine_happy_path():
     result = Engine(agent=DemoAgent(), budget=RuntimeBudget(max_steps=3)).run("compute")
     assert result.state.final_result == "42"
-    assert result.state.stop_reason == "final"
+    assert result.state.stop_reason == "completed"
     assert len(result.records[0].action_results) == 1
     first_result = result.records[0].action_results[0]
     assert first_result.status == "success"
@@ -734,6 +734,10 @@ def test_engine_uses_history_retrieve_contract():
         def reset(self, run_id=None) -> None:
             self._messages = []
 
+        @property
+        def messages(self) -> list[HistoryMessage]:
+            return list(self._messages)
+
     class ContractMemory(Memory):
         def __init__(self):
             self._records: list[MemoryRecord] = []
@@ -846,7 +850,7 @@ def test_memory_and_history_streams_are_strictly_separated():
     agent.memory = mem
     agent.history = hist
     result = Engine(agent=agent, budget=RuntimeBudget(max_steps=2)).run("compute")
-    assert result.state.stop_reason == "final"
+    assert result.state.stop_reason == "completed"
 
     mem_roles = {r.role for r in mem.records}
     assert {"task", "state", "decision", "next_state", "observation"}.issubset(

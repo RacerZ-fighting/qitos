@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import difflib
 import hashlib
 import json
@@ -21,6 +22,40 @@ class ToolOrigin:
     source: str  # function | toolset
     toolset_name: Optional[str] = None
     toolset_version: Optional[str] = None
+
+
+class _FrozenTool(BaseTool):
+    """One turn's immutable Tool definition bound to its live handler owner."""
+
+    def __init__(self, handler: BaseTool) -> None:
+        self._handler = handler
+        self.spec = deepcopy(handler.spec)
+        if hasattr(handler, "meta"):
+            self.meta = deepcopy(handler.meta)
+
+    def validate_input(
+        self,
+        args: Dict[str, Any],
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        return self._handler.validate_input(args, runtime_context=runtime_context)
+
+    def check_permissions(
+        self,
+        args: Dict[str, Any],
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        return self._handler.check_permissions(args, runtime_context=runtime_context)
+
+    def build_rule_scope(self, args: Dict[str, Any]) -> str:
+        return self._handler.build_rule_scope(args)
+
+    async def execute(
+        self,
+        args: Dict[str, Any],
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        return await self._handler.execute(args, runtime_context=runtime_context)
 
 
 class ToolRegistry:
@@ -219,9 +254,43 @@ class ToolRegistry:
         if self._setup_done:
             return
         payload = context or {}
+        seen: set[int] = set()
+        for tool in self._tools.values():
+            identity = id(tool)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            setup = getattr(tool, "setup", None)
+            if callable(setup):
+                setup(payload)
         for toolset in self._toolsets:
             if hasattr(toolset, "setup"):
                 toolset.setup(payload)
+        self._setup_done = True
+
+    async def asetup(self, context: Optional[Dict[str, Any]] = None) -> None:
+        """Set up toolsets without blocking the caller's event loop."""
+
+        if self._setup_done:
+            return
+        payload = context or {}
+        seen: set[int] = set()
+        for tool in self._tools.values():
+            identity = id(tool)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            setup = getattr(tool, "asetup", None)
+            if callable(setup):
+                await setup(payload)
+        for toolset in self._toolsets:
+            setup = getattr(toolset, "asetup", None)
+            if callable(setup):
+                await setup(payload)
+                continue
+            setup = getattr(toolset, "setup", None)
+            if callable(setup):
+                await asyncio.to_thread(setup, payload)
         self._setup_done = True
 
     def teardown(self, context: Optional[Dict[str, Any]] = None) -> None:
@@ -229,6 +298,29 @@ class ToolRegistry:
         for toolset in reversed(self._toolsets):
             if hasattr(toolset, "teardown"):
                 toolset.teardown(payload)
+        self._setup_done = False
+
+    async def ateardown(self, context: Optional[Dict[str, Any]] = None) -> None:
+        """Await tool-owned tasks before tearing down legacy toolsets."""
+
+        payload = context or {}
+        seen: set[int] = set()
+        for tool in reversed(list(self._tools.values())):
+            identity = id(tool)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            close = getattr(tool, "aclose", None)
+            if callable(close):
+                await close()
+        for toolset in reversed(self._toolsets):
+            teardown = getattr(toolset, "ateardown", None)
+            if callable(teardown):
+                await teardown(payload)
+                continue
+            teardown = getattr(toolset, "teardown", None)
+            if callable(teardown):
+                await asyncio.to_thread(teardown, payload)
         self._setup_done = False
 
     def get_tool_descriptions(self, protocol: Any = None, renderer: Any = None) -> str:
@@ -436,10 +528,7 @@ class ToolExposure(ToolRegistry):
             )
         )
         for name in names:
-            tool = copy(source._tools[name])
-            tool.spec = deepcopy(source._tools[name].spec)
-            if hasattr(tool, "meta"):
-                tool.meta = deepcopy(tool.meta)
+            tool = _FrozenTool(source._tools[name])
             exposure._tools[name] = tool
             exposure._origins[name] = deepcopy(
                 source._origins.get(name, ToolOrigin(source="function"))
@@ -510,6 +599,12 @@ class ToolExposure(ToolRegistry):
         _ = context
 
     def teardown(self, context: Optional[Dict[str, Any]] = None) -> None:
+        _ = context
+
+    async def asetup(self, context: Optional[Dict[str, Any]] = None) -> None:
+        _ = context
+
+    async def ateardown(self, context: Optional[Dict[str, Any]] = None) -> None:
         _ = context
 
 

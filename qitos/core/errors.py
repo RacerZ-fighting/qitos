@@ -19,11 +19,16 @@ class ErrorCategory(str, Enum):
 
 class StopReason(str, Enum):
     SUCCESS = "success"
+    COMPLETED = "completed"
+    BLOCKED = "blocked"
+    # Retained for durable replay of runs created before typed completion
+    # assessment. New model-proposed completions use COMPLETED.
     FINAL = "final"
     MAX_STEPS = "max_steps"
     BUDGET_STEPS = "budget_steps"
     BUDGET_TIME = "budget_time"
     BUDGET_TOKENS = "budget_tokens"
+    BUDGET_COST = "budget_cost"
     CONTEXT_OVERFLOW = "context_overflow"
     AGENT_CONDITION = "agent_condition"
     CRITIC_STOP = "critic_stop"

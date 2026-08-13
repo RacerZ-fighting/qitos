@@ -48,7 +48,7 @@ class _StrictInputTool(BaseTool):
             return ToolValidationResult.fail("blocked by domain rule", code="blocked")
         return ToolValidationResult.ok()
 
-    def execute(
+    async def execute(
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
@@ -69,13 +69,16 @@ class _StrictInputTool(BaseTool):
         {"count": 2, "mode": "safe", "label": "x"},
     ],
 )
-def test_schema_violation_is_terminal_before_custom_validation_or_handler(
+@pytest.mark.asyncio
+async def test_schema_violation_is_terminal_before_custom_validation_or_handler(
     arguments: dict[str, Any],
 ) -> None:
     tool = _StrictInputTool()
 
-    result = ActionExecutor(ToolRegistry().register(tool)).execute(
-        [Action(name=tool.name, args=arguments, action_id="call-1")]
+    result = (
+        await ActionExecutor(ToolRegistry().register(tool)).execute(
+            [Action(name=tool.name, args=arguments, action_id="call-1")]
+        )
     )[0]
 
     assert result.status is ActionStatus.ERROR
@@ -87,16 +90,19 @@ def test_schema_violation_is_terminal_before_custom_validation_or_handler(
     assert tool.execution_calls == 0
 
 
-def test_custom_validation_runs_after_schema_validation() -> None:
+@pytest.mark.asyncio
+async def test_custom_validation_runs_after_schema_validation() -> None:
     tool = _StrictInputTool()
 
-    result = ActionExecutor(ToolRegistry().register(tool)).execute(
-        [
-            Action(
-                name=tool.name,
-                args={"count": 2, "mode": "safe", "label": "blocked"},
-            )
-        ]
+    result = (
+        await ActionExecutor(ToolRegistry().register(tool)).execute(
+            [
+                Action(
+                    name=tool.name,
+                    args={"count": 2, "mode": "safe", "label": "blocked"},
+                )
+            ]
+        )
     )[0]
 
     assert result.status is ActionStatus.ERROR
@@ -133,7 +139,7 @@ class _InvalidSchemaTool(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,

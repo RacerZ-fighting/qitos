@@ -9,6 +9,7 @@ from uuid import uuid4
 from ..core.action import Action
 from ..core.agent_module import ActionResultContext, CanonicalActionResult
 from ..core.decision import Decision
+from ..core.completion import CompletionDisposition
 from ..core.errors import StopReason
 from ..core.history import HistoryMessage
 from ..core.journal import (
@@ -309,6 +310,10 @@ class _JournalRuntime(Generic[StateT, ActionT]):
         recovered_steps: list[dict[str, Any]] = []
         canonical_results: list[CanonicalActionResult] = []
         terminal_snapshot_digest = ""
+        usage_prompt_tokens = 0
+        usage_completion_tokens = 0
+        usage_total_tokens = 0
+        usage_cost_usd = 0.0
         for journal_record in effective:
             payload = journal_record.payload
             if journal_record.type is JournalRecordType.INPUT_ACCEPTED:
@@ -344,6 +349,39 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 record.model_response = (
                     dict(raw_response) if isinstance(raw_response, Mapping) else {}
                 )
+                raw_usage = record.model_response.get("usage")
+                if isinstance(raw_usage, Mapping):
+                    prompt_tokens = raw_usage.get(
+                        "prompt_tokens", raw_usage.get("input_tokens", 0)
+                    )
+                    completion_tokens = raw_usage.get(
+                        "completion_tokens", raw_usage.get("output_tokens", 0)
+                    )
+                    total_tokens = raw_usage.get("total_tokens")
+                    prompt_value = (
+                        int(prompt_tokens)
+                        if isinstance(prompt_tokens, int)
+                        and not isinstance(prompt_tokens, bool)
+                        else 0
+                    )
+                    completion_value = (
+                        int(completion_tokens)
+                        if isinstance(completion_tokens, int)
+                        and not isinstance(completion_tokens, bool)
+                        else 0
+                    )
+                    total_value = (
+                        int(total_tokens)
+                        if isinstance(total_tokens, int)
+                        and not isinstance(total_tokens, bool)
+                        else prompt_value + completion_value
+                    )
+                    usage_prompt_tokens += max(0, prompt_value)
+                    usage_completion_tokens += max(0, completion_value)
+                    usage_total_tokens += max(0, total_value)
+                raw_cost = record.model_response.get("cost_usd", 0.0)
+                if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool):
+                    usage_cost_usd += max(0.0, float(raw_cost))
                 raw_prompt_metadata = payload.get("prompt_metadata")
                 record.prompt_metadata = (
                     dict(raw_prompt_metadata)
@@ -506,6 +544,12 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 "recovered_steps": [],
                 "canonical_results": canonical_results,
                 "terminal_snapshot_current": False,
+                "usage": {
+                    "prompt_tokens": usage_prompt_tokens,
+                    "completion_tokens": usage_completion_tokens,
+                    "total_tokens": usage_total_tokens,
+                    "cost_usd": usage_cost_usd,
+                },
             }
         for transaction_id, transaction in transactions.items():
             if transaction["committed"]:
@@ -538,11 +582,32 @@ class _JournalRuntime(Generic[StateT, ActionT]):
             next_state = engine.agent.reduce(working, observation, decision)
             if next_state is not working:
                 working.reduce_update(next_state.to_dict())
+            completion_history: list[HistoryMessage] = []
+            if decision.mode == "final":
+                assessment = engine.agent.assess_completion(working, decision)
+                if assessment.disposition is CompletionDisposition.CONTINUE:
+                    working.final_result = None
+                    working.stop_reason = None
+                    completion_history.append(
+                        HistoryMessage(
+                            role="user",
+                            step_id=int(transaction["step_id"]),
+                            content=assessment.feedback,
+                            metadata={
+                                "source": "completion_assessment",
+                                "reason": assessment.reason,
+                            },
+                        )
+                    )
+                elif assessment.disposition is CompletionDisposition.BLOCKED:
+                    working.set_stop(StopReason.BLOCKED, decision.final_answer)
+                else:
+                    working.set_stop(StopReason.COMPLETED, decision.final_answer)
             if not working.final_result and not working.stop_reason:
                 working.advance_step()
             state_data = working.to_dict()
             if state_data.get("final_result") and not state_data.get("stop_reason"):
-                state_data["stop_reason"] = StopReason.FINAL.value
+                state_data["stop_reason"] = StopReason.COMPLETED.value
             history_append = [
                 tool_result_history_message(
                     action,
@@ -551,6 +616,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 )
                 for action, result in zip(actions, ordered_results, strict=True)
             ]
+            history_append.extend(completion_history)
             history.extend(history_append)
             recovered_steps.append(
                 {
@@ -586,6 +652,12 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 bool(terminal_snapshot_digest)
                 and terminal_snapshot_digest == state_digest(state_data)
             ),
+            "usage": {
+                "prompt_tokens": usage_prompt_tokens,
+                "completion_tokens": usage_completion_tokens,
+                "total_tokens": usage_total_tokens,
+                "cost_usd": usage_cost_usd,
+            },
         }
 
     @staticmethod

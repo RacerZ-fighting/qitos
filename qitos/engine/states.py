@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import math
 from typing import Any, Dict, List, Optional
 
 
@@ -36,7 +37,35 @@ class RuntimeBudget:
     max_steps: int = 10  # Default matches Engine's safe step limit
     max_runtime_seconds: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_cost_usd: Optional[float] = None
+    max_tool_concurrency: int = 4
+    max_children: int = 4
     deadline_monotonic: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        for name in ("max_steps", "max_tool_concurrency", "max_children"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.max_tokens is not None:
+            if not isinstance(self.max_tokens, int) or isinstance(
+                self.max_tokens, bool
+            ):
+                raise TypeError("max_tokens must be an integer or None")
+            if self.max_tokens <= 0:
+                raise ValueError("max_tokens must be positive")
+        for name in ("max_runtime_seconds", "max_cost_usd", "deadline_monotonic"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TypeError(f"{name} must be a number or None")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+            if name != "deadline_monotonic" and float(value) <= 0:
+                raise ValueError(f"{name} must be positive")
 
 
 @dataclass
@@ -69,10 +98,8 @@ class ContextConfig:
     tool_result_per_message_max_chars: int = 200000
     conversation_max_rounds: int = 10
     reactive_compact: bool = True
-    # Generic QitOS applications retain repeated-call protection by default.
-    # Long-running CyberGym tasks can opt out so that a recoverable tool Card
-    # remains observable instead of turning a repeated request into a
-    # permanent runtime block.
+    # Repeated-call protection is generic policy and may be disabled explicitly
+    # by a product configuration when its investigation semantics require it.
     tool_call_loop_detection_enabled: bool = True
     loop_max_repeats: int = 3
     max_handoffs: int = 10

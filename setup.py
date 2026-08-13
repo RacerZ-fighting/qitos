@@ -59,6 +59,7 @@ setup(
     ),
     python_requires=">=3.10",
     install_requires=[
+        "httpx>=0.27,<1",
         "requests>=2.31.0",
         "beautifulsoup4>=4.12.3",
         "jsonschema>=4.23,<5",

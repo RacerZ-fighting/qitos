@@ -59,7 +59,7 @@ class ReadNotebook(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -127,7 +127,7 @@ class ReplaceNotebookCell(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -186,7 +186,7 @@ class InsertNotebookCell(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """

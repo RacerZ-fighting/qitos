@@ -22,13 +22,14 @@ from qitos import (
 )
 from qitos.core.action import ActionExecutionPolicy
 from qitos.core.agent_module import ActionResultContext
-from qitos.core import JournalRecordType, ToolResult
+from qitos.core import JournalRecordType, ModelPricing, ModelUsage, ToolResult
 from qitos.core.journal import JournalError, JournalRecordRef
 from qitos.checkpoint import InMemoryCheckpointStore
 from qitos.kit.journal import JsonlSessionJournal
 from qitos.kit.parser import ReActTextParser
 from qitos.models import Model, ModelStreamChunk
 from qitos.engine.critic import Critic
+from qitos.engine.states import RuntimeBudget
 
 
 @dataclass
@@ -243,6 +244,83 @@ async def test_terminal_run_resumes_without_model_or_tool_replay(tmp_path: Path)
     assert resumed.state.final_result == "done"
     assert resumed.state.seen == ["canonical"]
     assert resumed_agent.executions == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_resume_restores_model_usage_and_cost(tmp_path: Path) -> None:
+    class UsageModel(Model):
+        def __init__(self) -> None:
+            super().__init__(model="usage-model", temperature=None)
+            self.calls = 0
+
+        async def stream(
+            self,
+            messages: list[dict[str, Any]],
+            **kwargs: Any,
+        ) -> AsyncIterator[ModelStreamChunk]:
+            _ = messages, kwargs
+            self.calls += 1
+            yield ModelStreamChunk(
+                text="finished",
+                done=True,
+                usage=ModelUsage(
+                    input_tokens=7,
+                    output_tokens=3,
+                    total_tokens=10,
+                ),
+            )
+
+    class UsageAgent(AgentModule[JournalState, dict[str, Any], Action]):
+        def __init__(self, model: UsageModel) -> None:
+            super().__init__(llm=model)
+
+        def init_state(self, task: str, **kwargs: Any) -> JournalState:
+            _ = kwargs
+            return JournalState(task=task, max_steps=2)
+
+        def interpret_model_response(
+            self,
+            state: JournalState,
+            observation: dict[str, Any],
+            response: Any,
+        ) -> Decision[Action]:
+            _ = state, observation, response
+            return Decision.final("done")
+
+        def reduce(
+            self,
+            state: JournalState,
+            observation: dict[str, Any],
+            decision: Decision[Action],
+        ) -> JournalState:
+            _ = observation, decision
+            return state
+
+    pricing = ModelPricing(1_000_000, 1_000_000)
+    original_model = UsageModel()
+    original = await Engine(
+        UsageAgent(original_model),
+        budget=RuntimeBudget(max_steps=2, max_cost_usd=100.0),
+        model_pricing=pricing,
+        journal=JsonlSessionJournal(tmp_path),
+    ).arun("usage")
+
+    resumed_model = UsageModel()
+    resumed_engine = Engine(
+        UsageAgent(resumed_model),
+        budget=RuntimeBudget(max_steps=2, max_cost_usd=100.0),
+        model_pricing=pricing,
+        journal=JsonlSessionJournal(tmp_path),
+    )
+    resumed = await resumed_engine.aresume_from_journal(original.run_id)
+
+    assert original.total_tokens == 10
+    assert original.total_cost_usd == pytest.approx(10.0)
+    assert resumed.total_tokens == original.total_tokens
+    assert resumed.total_cost_usd == pytest.approx(original.total_cost_usd)
+    assert resumed_engine._token_usage == original.total_tokens
+    assert resumed_engine._cost_usage_usd == pytest.approx(original.total_cost_usd)
+    assert resumed_model.calls == 0
 
 
 class FailingJournal(JsonlSessionJournal):
@@ -664,8 +742,8 @@ async def test_cancel_appends_interruption_and_resume_uses_committed_state(
 
     engine.cancel()
 
-    with pytest.raises(asyncio.CancelledError):
-        await run_task
+    cancelled = await run_task
+    assert cancelled.state.stop_reason == "cancelled_immediate"
     records = await journal.replay()
     assert records[-1].type is JournalRecordType.RUN_INTERRUPTED
     assert not any(record.type is JournalRecordType.RUN_COMPLETED for record in records)

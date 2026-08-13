@@ -6,6 +6,7 @@ import time
 from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
 
 from ..core.decision import Decision
+from ..core.completion import CompletionDisposition
 from ..core.errors import (
     ModelRequestCancelled,
     ModelRequestDeadlineExceeded,
@@ -224,12 +225,51 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
         )
 
         if decision.mode == "final":
-            if state.final_result is None and decision.final_answer is not None:
-                state.final_result = decision.final_answer
-            if state.stop_reason is None:
-                state.set_stop(StopReason.FINAL, decision.final_answer)
+            assessment = engine.agent.assess_completion(state, decision)
+            disposition = assessment.disposition
+            if disposition is CompletionDisposition.CONTINUE:
+                state.final_result = None
+                if state.stop_reason in {
+                    StopReason.FINAL.value,
+                    StopReason.COMPLETED.value,
+                    StopReason.BLOCKED.value,
+                }:
+                    state.stop_reason = None
+                engine._history_append(
+                    "user",
+                    assessment.feedback,
+                    step_id,
+                    metadata={
+                        "source": "completion_assessment",
+                        "reason": assessment.reason,
+                    },
+                )
+                self._finish_check_stop(
+                    step_id=step_id,
+                    state=state,
+                    decision=decision,
+                    stop=False,
+                    extra_payload={
+                        "completion_disposition": disposition.value,
+                        "completion_reason": assessment.reason,
+                    },
+                )
+                return False
+            stop_reason = (
+                StopReason.BLOCKED
+                if disposition is CompletionDisposition.BLOCKED
+                else StopReason.COMPLETED
+            )
+            state.set_stop(stop_reason, decision.final_answer)
             self._finish_check_stop(
-                step_id=step_id, state=state, decision=decision, stop=True
+                step_id=step_id,
+                state=state,
+                decision=decision,
+                stop=True,
+                extra_payload={
+                    "completion_disposition": disposition.value,
+                    "completion_reason": assessment.reason,
+                },
             )
             return True
         if engine.agent.should_stop(state):
@@ -293,10 +333,13 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
                 payload.update(extra_payload)
             engine._emit(state.current_step, RuntimePhase.CHECK_STOP, payload=payload)
         else:
+            payload = {"stage": "continue"}
+            if extra_payload:
+                payload.update(extra_payload)
             engine._emit(
                 state.current_step,
                 RuntimePhase.CHECK_STOP,
-                payload={"stage": "continue"},
+                payload=payload,
             )
         engine._dispatch_hook(
             "on_after_check_stop",
@@ -324,9 +367,11 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
                 runtime_info={
                     "elapsed_seconds": elapsed_seconds,
                     "total_tokens": int(engine._token_usage),
+                    "total_cost_usd": float(engine._cost_usage_usd),
                     "budget_max_steps": engine.budget.max_steps,
                     "budget_max_runtime_seconds": engine.budget.max_runtime_seconds,
                     "budget_max_tokens": engine.budget.max_tokens,
+                    "budget_max_cost_usd": engine.budget.max_cost_usd,
                 },
             )
             if hit:
@@ -346,6 +391,12 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
             engine.budget.max_tokens
         ):
             state.set_stop(StopReason.BUDGET_TOKENS)
+            return True
+        if (
+            engine.budget.max_cost_usd is not None
+            and engine._cost_usage_usd >= float(engine.budget.max_cost_usd)
+        ):
+            state.set_stop(StopReason.BUDGET_COST)
             return True
         return False
 

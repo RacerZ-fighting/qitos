@@ -42,7 +42,7 @@ class ManagedWebSearchTool(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
@@ -54,10 +54,17 @@ class ManagedWebSearchTool(BaseTool):
             raise TypeError("web search query must be a string")
         if isinstance(max_results, bool) or not isinstance(max_results, int):
             raise TypeError("web search max_results must be an integer")
-        return self._capability.search(
-            query,
-            max_results=max_results,
+        return (
+            await self._capability.search(
+                query,
+                max_results=max_results,
+            )
         ).to_dict()
+
+    async def aclose(self) -> None:
+        close = getattr(self._capability, "aclose", None)
+        if callable(close):
+            await close()
 
 
 __all__ = ["ManagedWebSearchTool"]

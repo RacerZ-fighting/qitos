@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -209,21 +209,23 @@ class TestDelegateTool:
         # The tool should be findable
         assert tool_reg.get("delegate_to_worker") is not None
 
-    def test_execute_no_task_returns_error(self):
+    @pytest.mark.asyncio
+    async def test_execute_no_task_returns_error(self):
         spec = _make_spec()
         registry = AgentRegistry()
         registry.register(spec)
         tool = registry.get_delegate_tools()[0]
-        result = tool.execute({"task": ""})
+        result = await tool.execute({"task": ""})
         assert result["status"] == "error"
         assert "task is required" in result["message"]
 
-    def test_execute_depth_guard(self):
+    @pytest.mark.asyncio
+    async def test_execute_depth_guard(self):
         spec = _make_spec()
         registry = AgentRegistry()
         registry.register(spec)
         tool = registry.get_delegate_tools()[0]
-        result = tool.execute(
+        result = await tool.execute(
             {"task": "do something"},
             runtime_context={"delegate_depth": MAX_DELEGATE_DEPTH},
         )
@@ -234,7 +236,8 @@ class TestDelegateTool:
 class TestDelegateToolExecution:
     """Integration-style tests that actually run a sub-engine."""
 
-    def test_execute_returns_result(self):
+    @pytest.mark.asyncio
+    async def test_execute_returns_result(self):
         spec = _make_spec()
         registry = AgentRegistry()
         registry.register(spec)
@@ -246,15 +249,16 @@ class TestDelegateToolExecution:
         mock_result.step_count = 2
 
         with patch("qitos.engine.engine.Engine") as MockEngine:
-            MockEngine.return_value.run.return_value = mock_result
-            result = tool.execute({"task": "find the bug"})
+            MockEngine.return_value.arun = AsyncMock(return_value=mock_result)
+            result = await tool.execute({"task": "find the bug"})
 
         assert result["status"] == "success"
         assert result["agent"] == "worker"
         assert result["final_result"] == "research complete"
         assert result["steps"] == 2
 
-    def test_execute_partial_result(self):
+    @pytest.mark.asyncio
+    async def test_execute_partial_result(self):
         spec = _make_spec()
         registry = AgentRegistry()
         registry.register(spec)
@@ -266,13 +270,14 @@ class TestDelegateToolExecution:
         mock_result.step_count = 5
 
         with patch("qitos.engine.engine.Engine") as MockEngine:
-            MockEngine.return_value.run.return_value = mock_result
-            result = tool.execute({"task": "research"})
+            MockEngine.return_value.arun = AsyncMock(return_value=mock_result)
+            result = await tool.execute({"task": "research"})
 
         assert result["status"] == "partial"
         assert result["stop_reason"] == "max_steps"
 
-    def test_execute_passes_context_argument_to_sub_engine(self):
+    @pytest.mark.asyncio
+    async def test_execute_passes_context_argument_to_sub_engine(self):
         spec = _make_spec()
         registry = AgentRegistry()
         registry.register(spec)
@@ -285,16 +290,17 @@ class TestDelegateToolExecution:
 
         context = {"repo_summary": "src/", "parser_paths": ["src/parser.c"]}
         with patch("qitos.engine.engine.Engine") as MockEngine:
-            MockEngine.return_value.run.return_value = mock_result
-            result = tool.execute({"task": "find the bug", "context": context})
+            MockEngine.return_value.arun = AsyncMock(return_value=mock_result)
+            result = await tool.execute({"task": "find the bug", "context": context})
 
         assert result["status"] == "success"
-        MockEngine.return_value.run.assert_called_once_with(
+        MockEngine.return_value.arun.assert_awaited_once_with(
             "find the bug",
             context=context,
         )
 
-    def test_execute_records_delegate_runtime_events(self):
+    @pytest.mark.asyncio
+    async def test_execute_records_delegate_runtime_events(self):
         spec = _make_spec()
         registry = AgentRegistry()
         registry.register(spec)
@@ -307,8 +313,8 @@ class TestDelegateToolExecution:
         mock_result.step_count = 2
 
         with patch("qitos.engine.engine.Engine") as mock_engine:
-            mock_engine.return_value.run.return_value = mock_result
-            result = tool.execute(
+            mock_engine.return_value.arun = AsyncMock(return_value=mock_result)
+            result = await tool.execute(
                 {"task": "research"},
                 runtime_context={
                     "record_runtime_event": (

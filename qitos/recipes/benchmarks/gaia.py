@@ -474,7 +474,10 @@ def build_gaia_benchmark_result(execution: GaiaRecipeExecution) -> BenchmarkRunR
             or "validation"
         ),
         prediction=execution.prediction,
-        success=not bool(execution.error) and str(stop_reason) == "final",
+        success=(
+            not bool(execution.error)
+            and str(stop_reason) in {"completed", "final", "success"}
+        ),
         stop_reason=str(stop_reason),
         steps=int(getattr(execution.result, "step_count", 0) if execution.result is not None else 0),
         latency_seconds=float(

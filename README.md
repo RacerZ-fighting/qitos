@@ -18,6 +18,15 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One async turn transaction**: every model turn now captures an immutable model,
+  protocol, complete History, Tool exposure, capability, deadline, pricing, and budget
+  view. Engine, Tool, Mailbox, MCP, and Child calls stay on the caller's event loop;
+  cancellation drains started handlers and journals one ordered terminal result per
+  call before it propagates.
+- **Product-owned completion and bounded Runs**: `AgentModule.assess_completion()` can
+  accept a final answer, request another evidence-gathering turn, or classify a concrete
+  blocker. Runtime and Task budgets now cover steps, time, tokens, cost, Tool
+  concurrency, and Child count, with token/cost usage restored on Journal resume.
 - **Single-owner Session journals**: each Run now has one process-safe JSONL writer
   lease and an explicit terminal lifecycle. Replay always validates canonical JSONL;
   the disposable SQLite read projection is retained only when it matches JSONL and
@@ -136,9 +145,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **One bounded tool-action lifecycle**: one absolute deadline now covers interceptor-
   free admission, approval, permission checks, invocation retries, and backoff.
   `ToolSpec.retry_policy` is the sole retry owner; validation and authorization run once,
-  HTTP client retries are disabled, and daemon action workers avoid unbounded concurrent
-  executor drain. Dead Action execution knobs and the duplicate interceptor middleware
-  have been removed.
+  HTTP client retries are disabled, and event-loop-owned tasks drain before the batch
+  returns. Dead Action execution knobs and the duplicate interceptor middleware have
+  been removed.
 - **One class-tool execution contract**: class tools now expose only
   `execute(args, runtime_context)`. `ToolRegistry` performs exact canonical-name lookup,
   while `ActionExecutor` alone owns validation, permissions, timeout/retry handling,
@@ -159,17 +168,17 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Run-scoped deadlines and bounded async shutdown**: relative runtime budgets and
   caller-supplied monotonic deadlines now resolve to one effective deadline shared by
   the Engine, tool admission, tool timeouts, retry backoff, and runtime waits. Async
-  cancellation requests cooperative Engine shutdown without letting an unresponsive
-  synchronous call keep the hosting event loop or CLI process alive indefinitely.
+  cancellation requests cooperative Engine shutdown. Legacy synchronous decorated
+  functions run outside the event loop and are awaited to a known side-effect boundary.
 - **One native tool-call lane**: when a model preset prefers provider-native tools,
   typed calls now bypass text interpreters and parsers, API requests omit the duplicate
   framework action contract, and every accepted, rejected, or malformed call commits one
   ordered result with the original call id. Malformed arguments never execute a tool.
 - **Bounded child-agent lifecycle**: `AgentTool` snapshots parent history at launch,
   admits child Engines only when a concurrency slot opens, records terminal state before
-  waking the parent, and uses bounded daemon workers so cooperative cancellation cannot
-  hold interpreter shutdown indefinitely. Its model contract still keeps dependent or
-  cheap mechanical work local.
+  waking the parent, and owns background children as asyncio tasks that are cancelled
+  and drained during Tool teardown. Its model contract still keeps dependent or cheap
+  mechanical work local.
 - **Environment-backed coding tools**: named Env capability groups now let the same
   bounded workspace tools run against host, container, or remote providers. The compact
   workspace profile exposes one lowercase surface (`read_file`, `write_file`,

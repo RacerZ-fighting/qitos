@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+
 from qitos.core.agent_module import AgentModule
 from qitos.core.state import StateSchema
 from qitos.core.tool_registry import ToolRegistry
@@ -42,9 +44,10 @@ class TestHandoffTool:
         tool = HandoffTool("researcher")
         assert tool.spec.read_only is True
 
-    def test_execute_returns_handoff_signal(self):
+    @pytest.mark.asyncio
+    async def test_execute_returns_handoff_signal(self):
         tool = HandoffTool("researcher")
-        result = tool.execute({"rationale": "Need deep research"})
+        result = await tool.execute({"rationale": "Need deep research"})
         assert result["handoff_target"] == "researcher"
         assert result["status"] == "success"
         assert result["handoff_status"] == "pending"

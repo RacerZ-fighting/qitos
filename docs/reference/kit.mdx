@@ -742,16 +742,16 @@ child has no final answer, the completion payload contains a bounded projection 
 recent tool evidence instead of silently dropping useful work.
 
 `active_background_count`, `get_background_result(task_id)`, `cancel_background(task_id)`,
-`snapshot_background_events()`, and `close()` expose lifecycle control to the owning
+`snapshot_background_events()`, and `aclose()` expose lifecycle control to the owning
 application. A snapshot projects only the active children's bounded, completed tool
 results into `agent.child.snapshot` runtime events; it does not expose model responses or
 reasoning. This lets an owner preserve evidence immediately before a forced conclusion.
-`close()` cooperatively cancels outstanding child Engines; applications with run-scoped
+`aclose()` cooperatively cancels outstanding child Engines; applications with run-scoped
 resources should call it before those resources leave scope. It returns the number of
 tasks still winding down after the requested bounded wait, and a later call can wait
-again after an earlier non-blocking cancellation request. Background children use a
-bounded daemon worker pool, so an uncooperative synchronous child cannot keep interpreter
-shutdown alive indefinitely. Terminal result state is stored before QitOS attempts to
+again after an earlier non-blocking cancellation request. Background children are
+event-loop-owned asyncio tasks; teardown cancels and drains every task. Terminal result
+state is stored before QitOS attempts to
 wake the parent. An `execution_scope` that waits for an application slot should observe the
 `runtime_context["agent_cancelled"]` callback so teardown can wake a child that has not
 entered its Engine yet.

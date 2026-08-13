@@ -45,6 +45,20 @@ class _ContextRuntime:
         self.last_request: Optional[ContextTelemetry] = None
         self.reactive_compact_attempts = 0
 
+    def restore_usage(
+        self,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+    ) -> None:
+        """Restore durable completed-model usage before the next turn."""
+
+        self.prompt_tokens_total = max(0, int(prompt_tokens))
+        self.completion_tokens_total = max(0, int(completion_tokens))
+        self.tokens_total = max(0, int(total_tokens))
+        self.engine._token_usage = self.tokens_total
+
     def apply_config(self, config: ContextConfig | Dict[str, Any] | None) -> None:
         if config is None:
             return

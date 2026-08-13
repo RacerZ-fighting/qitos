@@ -18,7 +18,7 @@ class _ResultTool(BaseTool):
         super().__init__(ToolSpec(name="result", description="return a fixed result"))
         self._payload = payload
 
-    def execute(
+    async def execute(
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
@@ -107,7 +107,8 @@ def test_tool_result_round_trip_preserves_domain_output() -> None:
     assert restored.metadata == result.metadata
 
 
-def test_action_executor_preserves_typed_artifact_projection() -> None:
+@pytest.mark.asyncio
+async def test_action_executor_preserves_typed_artifact_projection() -> None:
     content = "evidence"
     artifact = ArtifactRef(
         artifact_id="run:step:call",
@@ -125,8 +126,10 @@ def test_action_executor_preserves_typed_artifact_projection() -> None:
             model_output=artifact.path,
         )
 
-    result = ActionExecutor(ToolRegistry().register(artifact_result)).execute(
-        [Action(name="artifact_result")]
+    result = (
+        await ActionExecutor(ToolRegistry().register(artifact_result)).execute(
+            [Action(name="artifact_result")]
+        )
     )[0]
 
     assert result.output == content
@@ -159,14 +162,15 @@ def test_tool_result_rejects_a_contradictory_success_error() -> None:
         ("cancelled", ActionStatus.CANCELLED),
     ],
 )
-def test_action_executor_preserves_structured_tool_lifecycle_status(
+@pytest.mark.asyncio
+async def test_action_executor_preserves_structured_tool_lifecycle_status(
     reported: str,
     action_status: ActionStatus,
 ) -> None:
     tool = _ResultTool({"status": reported, "message": "result state"})
     executor = ActionExecutor(ToolRegistry().register(tool))
 
-    result = executor.execute([Action(name="result")])[0]
+    result = (await executor.execute([Action(name="result")]))[0]
 
     assert result.status is action_status
     assert result.output == {"message": "result state"}
@@ -183,11 +187,14 @@ def test_action_executor_preserves_structured_tool_lifecycle_status(
         assert result.error == "result state"
 
 
-def test_action_executor_unwraps_the_exact_success_envelope() -> None:
+@pytest.mark.asyncio
+async def test_action_executor_unwraps_the_exact_success_envelope() -> None:
     tool = _ResultTool({"status": "success", "output": "done"})
 
-    result = ActionExecutor(ToolRegistry().register(tool)).execute(
-        [Action(name="result")]
+    result = (
+        await ActionExecutor(ToolRegistry().register(tool)).execute(
+            [Action(name="result")]
+        )
     )[0]
 
     assert result.status is ActionStatus.SUCCESS

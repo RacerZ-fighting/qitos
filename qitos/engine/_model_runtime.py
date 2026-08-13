@@ -8,7 +8,6 @@ import hashlib
 import inspect
 import json
 import logging
-import os
 import re
 import time
 from collections import Counter
@@ -51,6 +50,7 @@ from ..harness._types import native_tool_calls_preferred
 from ..models.base import Model, ModelStreamChunk
 from ..protocols import get_protocol, resolve_protocol_chain
 from ..core.state import StateSchema
+from ..core.turn import TurnSnapshot
 from ._context_runtime import (
     ContextCompactionRequired,
     ContextOverflowError,
@@ -202,10 +202,13 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         self._last_full_step: int = -1
 
     async def run_decide(
-        self, state: StateT, observation: ObservationT, record: StepRecord
+        self,
+        state: StateT,
+        observation: ObservationT,
+        record: StepRecord,
+        turn: TurnSnapshot,
     ) -> Decision[ActionT]:
         engine = self.engine
-        engine._capture_tool_exposure(state, record.step_id)
         engine._dispatch_hook(
             "on_before_decide",
             engine._hook_context(
@@ -233,12 +236,15 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         model_response: ModelResponse | None = None
         if raw_decision is None:
             model_response = await self._run_llm_decide(
-                state=state, observation=observation, record=record
+                state=state,
+                observation=observation,
+                record=record,
+                turn=turn,
             )
             native_tool_calls_are_authoritative = (
                 isinstance(model_response.tool_calls, list)
                 and bool(model_response.tool_calls)
-                and self._native_tool_call_preferred()
+                and self._native_tool_call_preferred(turn.model, turn.protocol)
             )
             if native_tool_calls_are_authoritative:
                 raw_decision = model_response
@@ -259,7 +265,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 )
 
         decision = self.normalize_decision(
-            raw_decision, step=record.step_id, record=record
+            raw_decision, step=record.step_id, record=record, turn=turn
         )
         if decision.mode == "branch":
             decision = self.select_branch(state, observation, decision)
@@ -356,34 +362,20 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         )
 
     async def _run_llm_decide(
-        self, state: StateT, observation: ObservationT, record: StepRecord
+        self,
+        state: StateT,
+        observation: ObservationT,
+        record: StepRecord,
+        turn: TurnSnapshot,
     ) -> ModelResponse:
         engine = self.engine
-        if engine.agent.llm is None:
+        llm = turn.model
+        if llm is None:
             raise ValueError("No llm configured and Agent.decide returned None")
-        protocol = engine.resolve_protocol()
-        setattr(engine.agent, "_runtime_observation", observation)
-        setattr(engine.agent, "_runtime_step_id", record.step_id)
-        setattr(engine.agent, "_runtime_protocol", protocol)
-        setattr(
-            engine.agent, "_runtime_protocol_source", engine._resolved_protocol_source
-        )
-        setattr(engine.agent, "_runtime_tool_exposure", engine._active_tool_exposure)
-        try:
-            prompt_bundle = engine.agent.build_prompt_bundle(state)
-            system_prompt = prompt_bundle.system_prompt
-            prepared = engine.agent.prepare(state)
-        finally:
-            if hasattr(engine.agent, "_runtime_observation"):
-                delattr(engine.agent, "_runtime_observation")
-            if hasattr(engine.agent, "_runtime_step_id"):
-                delattr(engine.agent, "_runtime_step_id")
-            if hasattr(engine.agent, "_runtime_protocol"):
-                delattr(engine.agent, "_runtime_protocol")
-            if hasattr(engine.agent, "_runtime_protocol_source"):
-                delattr(engine.agent, "_runtime_protocol_source")
-            if hasattr(engine.agent, "_runtime_tool_exposure"):
-                delattr(engine.agent, "_runtime_tool_exposure")
+        protocol = turn.protocol
+        prompt_bundle = engine.agent.build_prompt_bundle(state, turn)
+        system_prompt = prompt_bundle.system_prompt
+        prepared = engine.agent.prepare_turn(state, observation, turn)
         prompt_metadata = dict(getattr(prompt_bundle, "metadata", {}) or {})
         engine._last_prompt_metadata = dict(prompt_metadata)
         if engine.trace_writer is not None:
@@ -419,9 +411,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         request_options = self._build_model_request_options(
             prompt_bundle=prompt_bundle,
             protocol=protocol,
+            llm=llm,
         )
         pre_context = context_runtime.build_pre_request(
-            llm=engine.agent.llm,
+            llm=llm,
             system_prompt=effective_system_prompt,
             prepared=str(prepared),
             message_injections=prompt_messages,
@@ -445,7 +438,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         if isinstance(query, dict):
             query.setdefault("pending_content", str(prepared))
             query.setdefault(
-                "model_name", getattr(getattr(engine.agent, "llm", None), "model", None)
+                "model_name", getattr(llm, "model", None)
             )
             query.setdefault("step_id", record.step_id)
             query.setdefault(
@@ -464,6 +457,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         history_impl: Any = None
         try:
             history_impl = engine._history()
+            if history_impl.snapshot() != turn.history:
+                raise RuntimeError("history changed after the turn snapshot was captured")
             retrieved = history_impl.retrieve(
                 state=state, observation=observation, query=query
             )
@@ -534,7 +529,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 exc,
             )
         pre_context = context_runtime.finalize_input(
-            llm=engine.agent.llm,
+            llm=llm,
             telemetry=pre_context,
             history_messages=history,
             compact_events=compact_events,
@@ -550,10 +545,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             "fallback_reason": None,
         }
         runtime_context_display: Dict[str, Any] | None = None
-        # Only agents that explicitly opt in to CyberGym's controller-owned
-        # Decision Context receive this strict packet invariant.  Generic
-        # QitOS agents may use ``prepare()`` for ordinary text and must retain
-        # their existing message-building behavior.
+        # Message builders may opt into one controller-owned Decision Context.
         decision_context_required = bool(
             getattr(custom_builder, "requires_decision_context", False)
         )
@@ -639,6 +631,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         prompt_user_content_blocks=prompt_user_content_blocks,
                         observation=observation,
                         record=record,
+                        llm=llm,
                     )
                     messages.append(current_user)
                     runtime_context_delivery["effective"] = "user"
@@ -651,23 +644,15 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         else:
             # --- Default message construction (original logic) ---
             injection_prefixes: List[str] = []
-            if self._native_tool_call_preferred():
-                if os.environ.get(
-                    "CYBERGYM_DISABLE_HISTORY_TRIM", ""
-                ).strip().lower() not in {
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                }:
-                    configured_rounds = int(
-                        getattr(engine.context_config, "conversation_max_rounds", 10)
+            if self._native_tool_call_preferred(turn.model, turn.protocol):
+                configured_rounds = int(
+                    getattr(engine.context_config, "conversation_max_rounds", 10)
+                )
+                if configured_rounds > 0:
+                    history = self._trim_native_tool_history(
+                        history,
+                        max_rounds=configured_rounds,
                     )
-                    if configured_rounds > 0:
-                        history = self._trim_native_tool_history(
-                            history,
-                            max_rounds=configured_rounds,
-                        )
             messages.extend(history)
             for item in prompt_messages:
                 if not isinstance(item, dict):
@@ -690,6 +675,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 prompt_user_content_blocks=prompt_user_content_blocks,
                 observation=observation,
                 record=record,
+                llm=llm,
             )
             messages.append(current_user)
             prepared_full = content_to_text(current_user.get("content"))
@@ -708,7 +694,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         # packet recovery never reaches this branch.
         if decision_context_required and len(source_context_blocks) != 1:
             try:
-                decision_context_source = str(engine.agent.prepare(state) or "")
+                decision_context_source = str(
+                    engine.agent.prepare_turn(state, observation, turn) or ""
+                )
             except Exception as exc:
                 raise DecisionContextConfigurationError(
                     "could not render the authoritative DECISION_CONTEXT"
@@ -737,7 +725,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 )
             )
         pre_context = context_runtime.finalize_assembled_input(
-            llm=engine.agent.llm,
+            llm=llm,
             telemetry=pre_context,
             messages=llm_messages,
             request_options=request_options,
@@ -753,7 +741,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     messages=llm_messages,
                     tools=list(request_options.get("tools") or []),
                     request_options=dict(request_options),
-                    llm=engine.agent.llm,
+                    llm=llm,
                 )
             except Exception as exc:
                 meter_result = {
@@ -767,9 +755,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 and str(meter_result.get("status") or "") != "ready"
             ):
                 raise ContextOverflowError("required prompt meter is unavailable")
-        # Historical blocks are an audit signal only.  They are stripped from
-        # the projected provider packet by the normalizer and never make a
-        # long-running CyberGym task terminal.
+        # Historical blocks are an audit signal only. They are stripped from
+        # the projected provider packet by the normalizer.
         history_context_blocks = self._decision_context_blocks(
             self._strip_internal_message_keys(history)
         )
@@ -861,6 +848,28 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         record.prompt_metadata = dict(prompt_metadata)
         record.prompt_metadata.update(
             {
+                "turn": {
+                    "run_id": turn.run_id,
+                    "step_id": turn.step_id,
+                    "protocol": getattr(turn.protocol, "id", None),
+                    "protocol_source": turn.protocol_source,
+                    "history_revision": turn.history.source_revision,
+                    "tool_exposure": turn.tools.audit_metadata(),
+                    "budget": {
+                        "remaining_steps": turn.budget.remaining_steps,
+                        "remaining_tokens": turn.budget.remaining_tokens,
+                        "remaining_cost_usd": turn.budget.remaining_cost_usd,
+                        "deadline_monotonic": turn.budget.deadline_monotonic,
+                        "max_tool_concurrency": turn.budget.max_tool_concurrency,
+                        "max_children": turn.budget.max_children,
+                    },
+                    "runtime_capabilities": {
+                        "model_api": turn.capabilities.model.api.value,
+                        "environment_ops": list(turn.capabilities.environment_ops),
+                        "mailbox": turn.capabilities.mailbox,
+                        "child_agents": turn.capabilities.child_agents,
+                    },
+                },
                 "model_input_modalities": list(record.model_input_modalities),
                 "model_input_visual_count": int(record.model_input_visual_count),
                 "observation_modalities": list(record.observation_modalities),
@@ -903,16 +912,24 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         )
         response = self._normalize_model_response(
             await self._call_llm(
-                engine.agent.llm,
+                llm,
                 llm_messages,
                 request_options,
-            )
+                deadline_monotonic=turn.budget.deadline_monotonic,
+            ),
+            llm=llm,
         )
         post_context = context_runtime.finalize_output(
-            llm=engine.agent.llm,
+            llm=llm,
             telemetry=pre_context,
             raw_output=response.text,
             usage=response.usage,
+        )
+        transaction_cost_usd = engine._record_model_cost(
+            response.usage,
+            pricing=turn.budget.model_pricing,
+            input_tokens=post_context.input_tokens_total,
+            output_tokens=post_context.output_tokens,
         )
         if pending_system_history is not None:
             engine._history_append(
@@ -958,6 +975,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             decision_context_recovery=decision_context_recovery,
         )
         record.model_response = response.to_summary_dict()
+        record.model_response["cost_usd"] = transaction_cost_usd
         engine._last_context_telemetry = dict(record.context)
         engine._emit(
             record.step_id,
@@ -972,7 +990,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             },
         )
         assistant_tool_calls = []
-        if response.tool_calls and self._native_tool_call_preferred():
+        if response.tool_calls and self._native_tool_call_preferred(
+            turn.model, turn.protocol
+        ):
             assistant_tool_calls = [
                 {
                     "id": item.get("id"),
@@ -1094,20 +1114,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 summary["tool_names"] = tool_names
             message_summaries.append(summary)
 
-        system_text = "\n".join(
-            content_to_text(message.get("content"))
-            for message in messages
-            if message.get("role") == "system"
-        )
-        sections = {
-            "contract": "# CyberGym Agent Contract" in system_text
-            or "Core Rules" in system_text,
-            "runtime_context": "<runtime_context>" in system_text,
-            "exploration_prompt": "# Exploration Phase" in system_text,
-            "construction_prompt": "# Construction Phase" in system_text,
-            "runtime_reminder": "<runtime_reminder>" in system_text,
-        }
-
         sidecar_path = ""
         try:
             metadata = dict(getattr(state, "metadata", {}) or {})
@@ -1129,7 +1135,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             "messages_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest()[
                 :16
             ],
-            "sections": sections,
             "messages": message_summaries,
             "recent_history": message_summaries[-8:],
             "sidecar_path": sidecar_path,
@@ -1200,17 +1205,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 json.dumps(messages, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-
-            # Keep the canonical CyberGym state beside the exact prompt that
-            # consumed it. This makes an exported trace independently
-            # auditable even when the task workspace is later removed.
-            workspace = str(getattr(state, "workspace_root", "") or "").strip()
-            if workspace:
-                state_path = Path(workspace) / ".cybergym" / "state.json"
-                if state_path.is_file():
-                    (step_dir / "cybergym_state.json").write_text(
-                        state_path.read_text(encoding="utf-8"), encoding="utf-8"
-                    )
 
             self._last_message_count = len(messages)
             self._last_full_step = step_id
@@ -1335,12 +1329,11 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         return blocks
 
     def _build_model_request_options(
-        self, *, prompt_bundle: Any, protocol: Any
+        self, *, prompt_bundle: Any, protocol: Any, llm: Any
     ) -> Dict[str, Any]:
         metadata = dict(getattr(prompt_bundle, "metadata", {}) or {})
         delivery = str(metadata.get("tool_schema_delivery") or "prompt_injection")
         payload = getattr(prompt_bundle, "tool_schema_payload", None)
-        llm = getattr(self.engine.agent, "llm", None)
         options: Dict[str, Any] = {}
 
         # Model defaults are the baseline. Turn-owned tool projection is applied
@@ -1371,6 +1364,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         llm: Any,
         messages: List[Dict[str, Any]],
         request_options: Dict[str, Any],
+        *,
+        deadline_monotonic: float | None,
     ) -> ModelResponse:
         """Consume the one canonical model stream into a completed response."""
 
@@ -1395,14 +1390,18 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         first_content_at: float | None = None
         stream_iter: AsyncIterator[ModelStreamChunk] = llm.stream(
             messages,
-            deadline_monotonic=getattr(self.engine, "runtime_deadline_monotonic", None),
+            deadline_monotonic=deadline_monotonic,
             **request_options,
         )
 
         iterator = stream_iter.__aiter__()
         try:
             while True:
-                remaining = self.engine.remaining_runtime_seconds()
+                remaining = (
+                    None
+                    if deadline_monotonic is None
+                    else max(0.0, deadline_monotonic - time.monotonic())
+                )
                 if remaining is not None and remaining <= 0:
                     raise ModelRequestDeadlineExceeded("model request deadline expired")
                 try:
@@ -1559,6 +1558,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         prompt_user_content_blocks: List[Dict[str, Any]],
         observation: ObservationT,
         record: StepRecord,
+        llm: Any,
     ) -> Dict[str, Any]:
         content_blocks: List[Dict[str, Any]] = []
         if str(prepared_text or "").strip():
@@ -1577,7 +1577,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             1 for block in content_blocks if str(block.get("type") or "text") != "text"
         )
         if record.model_input_visual_count > 0 and not self._llm_supports_multimodal(
-            getattr(self.engine.agent, "llm", None)
+            llm
         ):
             raise ValueError(
                 "Configured model adapter does not support multimodal input content blocks."
@@ -1999,7 +1999,11 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         return selected
 
     def normalize_decision(
-        self, raw_decision: Any, step: int, record: StepRecord | None = None
+        self,
+        raw_decision: Any,
+        step: int,
+        record: StepRecord | None = None,
+        turn: TurnSnapshot | None = None,
     ) -> Decision[ActionT]:
         if isinstance(raw_decision, Decision):
             if record is not None and not record.decision_source:
@@ -2011,6 +2015,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             response=response,
             step=step,
             record=record,
+            llm=turn.model if turn is not None else None,
+            protocol=turn.protocol if turn is not None else None,
         )
         if native_decision is not None:
             return native_decision
@@ -2024,7 +2030,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         # to loop forever without ever producing a final result.
         is_native_text_response = (
             response is not None
-            and self._native_tool_call_preferred()
+            and self._native_tool_call_preferred(
+                turn.model if turn is not None else None,
+                turn.protocol if turn is not None else None,
+            )
             and not (isinstance(response.tool_calls, list) and response.tool_calls)
             and str(response.text or "").strip()
         )
@@ -2483,12 +2492,13 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             )
             record.decision_source = "parser"
 
-    def _normalize_model_response(self, response: ModelResponse) -> ModelResponse:
+    def _normalize_model_response(
+        self, response: ModelResponse, *, llm: Any
+    ) -> ModelResponse:
         """Apply Engine-only text tool-call salvage to a completed response."""
 
         if not isinstance(response, ModelResponse):
             raise TypeError("model response must be a ModelResponse")
-        llm = getattr(self.engine.agent, "llm", None)
         model_name = response.model_name or getattr(llm, "model", None)
         provider = response.provider or getattr(llm, "provider_name", None)
         metadata = dict(response.metadata or {})
@@ -2581,6 +2591,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         response: ModelResponse | None,
         step: int,
         record: StepRecord | None,
+        llm: Any = None,
+        protocol: Any = None,
     ) -> Decision[ActionT] | None:
         if (
             response is None
@@ -2588,7 +2600,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             or not response.tool_calls
         ):
             return None
-        if not self._native_tool_call_preferred():
+        if not self._native_tool_call_preferred(llm, protocol):
             if record is not None and not record.decision_source:
                 record.decision_source = "parser"
             return None
@@ -2622,11 +2634,16 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             record.native_tool_call_fallback_reason = None
         return decision
 
-    def _native_tool_call_preferred(self) -> bool:
-        llm = getattr(self.engine.agent, "llm", None)
+    def _native_tool_call_preferred(
+        self, llm: Any = None, protocol: Any = None
+    ) -> bool:
+        if llm is None:
+            llm = getattr(self.engine.agent, "llm", None)
+        if protocol is None:
+            protocol = self.engine.resolve_protocol()
         return native_tool_calls_preferred(
             llm=llm,
-            protocol=self.engine.resolve_protocol(),
+            protocol=protocol,
         )
 
     def _trim_native_tool_history(

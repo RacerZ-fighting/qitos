@@ -135,7 +135,8 @@ def _make_registry(tools_dict):
 class TestActionExecutorNeedsApproval:
     """Test ActionExecutor integration with needs_approval."""
 
-    def test_needs_approval_false_does_not_interrupt(self):
+    @pytest.mark.asyncio
+    async def test_needs_approval_false_does_not_interrupt(self):
         """Tool without needs_approval should execute without interruption."""
         @tool()
         def safe_read(path: str) -> str:
@@ -147,11 +148,12 @@ class TestActionExecutorNeedsApproval:
         executor = ActionExecutor(tool_registry=registry)
 
         action = Action(name="safe_read", args={"path": "/tmp/test.txt"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 
     @patch("qitos.engine.interrupt.interrupt")
-    def test_needs_approval_true_triggers_interrupt(self, mock_interrupt):
+    @pytest.mark.asyncio
+    async def test_needs_approval_true_triggers_interrupt(self, mock_interrupt):
         """Tool with needs_approval=True should call interrupt()."""
         mock_interrupt.return_value = "allow"
 
@@ -165,7 +167,7 @@ class TestActionExecutorNeedsApproval:
         executor = ActionExecutor(tool_registry=registry)
 
         action = Action(name="dangerous_delete", args={"target": "db"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
 
         # interrupt should have been called
         assert mock_interrupt.called
@@ -173,7 +175,8 @@ class TestActionExecutorNeedsApproval:
         assert result.status == ActionStatus.SUCCESS
 
     @patch("qitos.engine.interrupt.interrupt")
-    def test_approval_deny_returns_denied(self, mock_interrupt):
+    @pytest.mark.asyncio
+    async def test_approval_deny_returns_denied(self, mock_interrupt):
         """When interrupt returns 'deny', the action should be DENIED."""
         mock_interrupt.return_value = "deny"
 
@@ -187,14 +190,15 @@ class TestActionExecutorNeedsApproval:
         executor = ActionExecutor(tool_registry=registry)
 
         action = Action(name="dangerous_delete", args={"target": "db"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
 
         assert result.status == ActionStatus.DENIED
         assert result.output["message"] == "User denied approval"
         assert result.metadata.get("error_category") == "approval_denied"
 
     @patch("qitos.engine.interrupt.interrupt")
-    def test_approval_allow_continues_execution(self, mock_interrupt):
+    @pytest.mark.asyncio
+    async def test_approval_allow_continues_execution(self, mock_interrupt):
         """When interrupt returns 'allow', the tool should execute normally."""
         mock_interrupt.return_value = "allow"
 
@@ -208,13 +212,14 @@ class TestActionExecutorNeedsApproval:
         executor = ActionExecutor(tool_registry=registry)
 
         action = Action(name="deploy_app", args={"target_env": "production"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
 
         assert result.status == ActionStatus.SUCCESS
         assert "deployed to production" in result.output
 
     @patch("qitos.engine.interrupt.interrupt")
-    def test_interrupt_receives_tool_approval_item(self, mock_interrupt):
+    @pytest.mark.asyncio
+    async def test_interrupt_receives_tool_approval_item(self, mock_interrupt):
         """interrupt() should receive a ToolApprovalItem as its value."""
         mock_interrupt.return_value = "allow"
 
@@ -228,7 +233,7 @@ class TestActionExecutorNeedsApproval:
         executor = ActionExecutor(tool_registry=registry)
 
         action = Action(name="risky_op", args={"x": 5})
-        executor._execute_one(action)
+        await executor._execute_one(action)
 
         # Check that interrupt was called with a ToolApprovalItem
         call_args = mock_interrupt.call_args
@@ -253,14 +258,15 @@ class TestActionExecutorNeedsApproval:
         with pytest.raises(TypeError, match="needs_approval must be a boolean"):
             FunctionTool(deploy)
 
-    def test_unknown_tool_no_approval_check(self):
+    @pytest.mark.asyncio
+    async def test_unknown_tool_no_approval_check(self):
         """If tool is not in registry, no approval check should be attempted."""
         registry = _make_registry({})
         executor = ActionExecutor(tool_registry=registry)
 
         action = Action(name="nonexistent", args={})
         with patch("qitos.engine.interrupt.interrupt") as mock_interrupt:
-            result = executor._execute_one(action)
+            result = await executor._execute_one(action)
             mock_interrupt.assert_not_called()
             assert result.status is ActionStatus.ERROR
             assert result.metadata["error_category"] == "tool_not_found"

@@ -322,7 +322,7 @@ def test_engine_uses_protocol_fallback_chain() -> None:
         output='{"analysis":"done","plan":"finish","commands":[],"task_complete":true}',
     )
     result = Engine(agent=_ProtocolAgent(llm=llm)).run("finish the task")
-    assert result.state.stop_reason in ("success", "final")
+    assert result.state.stop_reason in ("success", "completed")
     assert result.records[0].protocol_id == "terminus_json_v1"
     assert result.records[0].parser_selected == "TerminusJsonParser"
     assert result.records[0].parser_fallback_used is True

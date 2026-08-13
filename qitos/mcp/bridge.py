@@ -22,9 +22,8 @@ Usage::
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-from typing import Any, Callable, Coroutine, List, Optional, Set
+from typing import Any, List, Optional, Set
 
 from ..core.tool import FunctionTool, ToolMeta, ToolSpec
 from .filter import ToolFilter
@@ -36,7 +35,6 @@ async def mcp_server_to_function_tools(
     server: MCPServer,
     tool_filter: Optional[ToolFilter] = None,
     name_prefix: Optional[str] = None,
-    call_runner: Optional[Callable[[Coroutine[Any, Any, Any]], Any]] = None,
     used_names: Optional[Set[str]] = None,
 ) -> List[FunctionTool]:
     """Convert all tools exposed by an MCP server into QitOS FunctionTools.
@@ -46,16 +44,12 @@ async def mcp_server_to_function_tools(
     :param name_prefix: Optional prefix to disambiguate tool names when
         multiple MCP servers are bridged into the same registry.  When
         provided, tool names become ``{prefix}__{original_name}``.
-    :param call_runner: Synchronous owner for transport coroutines. Engine
-        integrations should provide a long-lived MCP event-loop runtime.
     :param used_names: Existing model-visible names to avoid when normalizing.
     :returns: A list of ``FunctionTool`` instances, one per MCP tool that
         passes the filter.
     """
     mcp_tools = await server.list_tools()
     tools: List[FunctionTool] = []
-    owner_loop = asyncio.get_running_loop()
-    runner = call_runner or _owner_loop_runner(owner_loop)
     occupied = used_names if used_names is not None else set()
 
     for mcp_tool in mcp_tools:
@@ -73,7 +67,7 @@ async def mcp_server_to_function_tools(
 
         # Create a closure that captures the server and original tool name
         tool_name = mcp_tool.name
-        tool = _make_function_tool(server, tool_name, spec, runner)
+        tool = _make_function_tool(server, tool_name, spec)
         tools.append(tool)
 
     return tools
@@ -83,28 +77,27 @@ def _make_function_tool(
     server: MCPServer,
     original_name: str,
     spec: ToolSpec,
-    call_runner: Callable[[Coroutine[Any, Any, Any]], Any],
 ) -> FunctionTool:
     """Create a FunctionTool that delegates to ``server.call_tool``.
 
     The function wrapped by FunctionTool must accept keyword arguments
     matching the spec parameters, plus optional ``runtime_context``.
-    Since the actual MCP call is async but FunctionTool.execute is
-    synchronous, the supplied runner submits it to the transport's owner loop.
+    The closure remains async so the MCP transport, Engine, and Tool share the
+    caller's event loop and cancellation domain.
     """
     # Build a callable with the right parameter signature for FunctionTool.
     # FunctionTool inspects the function signature to build its own spec,
     # but we want to use *our* spec (from MCP schema conversion).  We
     # override by providing a ToolMeta that carries our custom spec fields.
 
-    def _sync_wrapper(**kwargs: Any) -> Any:
-        """Synchronous wrapper that runs the async MCP call."""
+    async def _async_wrapper(**kwargs: Any) -> Any:
+        """Call the MCP transport on its owning event loop."""
         call_kwargs = {
             k: v
             for k, v in kwargs.items()
             if k not in ("runtime_context", "env", "ops", "file_ops", "process_ops")
         }
-        return call_runner(server.call_tool(original_name, call_kwargs))
+        return await server.call_tool(original_name, call_kwargs)
 
     # Attach metadata so FunctionTool uses our spec fields.
     meta = ToolMeta(
@@ -115,33 +108,10 @@ def _make_function_tool(
         concurrency_safe=spec.concurrency_safe,
     )
 
-    tool = FunctionTool(_sync_wrapper, meta=meta)
+    tool = FunctionTool(_async_wrapper, meta=meta)
     # Override the spec with our MCP-derived spec (preserving all fields)
     tool.spec = spec
     return tool
-
-
-def _owner_loop_runner(
-    owner_loop: asyncio.AbstractEventLoop,
-) -> Callable[[Coroutine[Any, Any, Any]], Any]:
-    """Build a safe fallback runner for manually bridged tools."""
-
-    def _run(coroutine: Coroutine[Any, Any, Any]) -> Any:
-        try:
-            current_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            current_loop = None
-        if current_loop is owner_loop:
-            coroutine.close()
-            raise RuntimeError(
-                "MCP tool execution must not block its transport event loop"
-            )
-        if owner_loop.is_closed() or not owner_loop.is_running():
-            coroutine.close()
-            raise RuntimeError("MCP transport event loop is not running")
-        return asyncio.run_coroutine_threadsafe(coroutine, owner_loop).result()
-
-    return _run
 
 
 def _sanitize_model_tool_name(value: str) -> str:

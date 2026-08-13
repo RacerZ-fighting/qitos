@@ -10,6 +10,7 @@ from typing import Any, Dict, Generic, List, Optional, TypeVar
 
 from .action import Action
 from .decision import Decision
+from .completion import CompletionAssessment
 from .env import EnvSpec
 from .history import History
 from .journal import JournalRecordRef
@@ -19,6 +20,7 @@ from .spec import ExperimentSpec, RunSpec
 from .task import Task, TaskBudget
 from .tool_result import ToolResult
 from .tool_registry import ToolExposure, ToolRegistry
+from .turn import TurnSnapshot
 from ..prompting import PromptBuildResult, PromptBuilder, PromptSpec
 
 
@@ -120,6 +122,32 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         """Convert current state into model-ready text."""
         return str(state)
 
+    def prepare_turn(
+        self,
+        state: StateT,
+        observation: ObservationT,
+        turn: TurnSnapshot,
+    ) -> str:
+        """Project state for one explicitly captured turn."""
+
+        _ = observation, turn
+        return self.prepare(state)
+
+    def assess_completion(
+        self,
+        state: StateT,
+        decision: Decision[ActionT],
+    ) -> CompletionAssessment:
+        """Assess one model-proposed final answer against product state.
+
+        Generic agents accept valid final decisions. Products with stronger
+        completion conditions can return ``continue_run`` with feedback or
+        classify the run as blocked.
+        """
+
+        _ = state, decision
+        return CompletionAssessment.completed()
+
     def decide(
         self, state: StateT, observation: ObservationT
     ) -> Optional[Decision[ActionT]]:
@@ -188,9 +216,8 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         return Engine(agent=self, **engine_kwargs)
 
     def active_protocol(self) -> Any:
-        runtime_protocol = getattr(self, "_runtime_protocol", None)
-        if runtime_protocol is not None:
-            return runtime_protocol
+        """Return the agent's configured protocol outside a captured turn."""
+
         return self.model_protocol
 
     def prompt_builder(self) -> PromptBuilder:
@@ -211,12 +238,13 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         _ = state
         return tool_registry.freeze()
 
-    def _prompt_tool_registry(self) -> Any:
-        exposure = getattr(self, "_runtime_tool_exposure", None)
-        return exposure if isinstance(exposure, ToolExposure) else self.tool_registry
-
-    def render_tool_schema(self, protocol: Any = None) -> str:
-        tool_registry = self._prompt_tool_registry()
+    def render_tool_schema(
+        self,
+        protocol: Any = None,
+        *,
+        tool_registry: ToolRegistry | ToolExposure | None = None,
+    ) -> str:
+        tool_registry = tool_registry or self.tool_registry
         if tool_registry is None:
             return ""
         resolved = protocol if protocol is not None else self.active_protocol()
@@ -224,14 +252,20 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
             return tool_registry.render_tool_schema(protocol=resolved)
         return tool_registry.get_tool_descriptions(protocol=resolved)
 
-    def compose_system_prompt(self, base_prompt: str, protocol: Any = None) -> str:
+    def compose_system_prompt(
+        self,
+        base_prompt: str,
+        protocol: Any = None,
+        *,
+        tool_registry: ToolRegistry | ToolExposure | None = None,
+    ) -> str:
         resolved = protocol if protocol is not None else self.active_protocol()
         try:
             spec = PromptSpec(persona_prompt=str(base_prompt or ""))
             result = self.prompt_builder().build(
                 spec=spec,
                 protocol=resolved,
-                tool_registry=self._prompt_tool_registry(),
+                tool_registry=tool_registry or self.tool_registry,
                 llm=self.llm,
                 resolution_source="compose_system_prompt",
             )
@@ -239,10 +273,19 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         except Exception:
             return str(base_prompt or "")
 
-    def build_prompt_bundle(self, state: StateT) -> PromptBuildResult:
+    def build_prompt_bundle(
+        self,
+        state: StateT,
+        turn: TurnSnapshot | None = None,
+    ) -> PromptBuildResult:
         """Build the protocol-aware prompt bundle for the current model step."""
         if getattr(self, "_prompt_bundle_reentry_guard", False):
-            return self._build_default_prompt_bundle(state)
+            return self._build_default_prompt_bundle(state, turn)
+        protocol = turn.protocol if turn is not None else self.active_protocol()
+        tool_registry = turn.tools if turn is not None else self.tool_registry
+        resolution_source = (
+            turn.protocol_source if turn is not None else "agent_default"
+        )
         custom_system_prompt = (
             type(self).build_system_prompt is not AgentModule.build_system_prompt
         )
@@ -266,22 +309,22 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
             )
             scaffold = builder.build(
                 spec=scaffold_spec,
-                protocol=self.active_protocol(),
-                tool_registry=self._prompt_tool_registry(),
+                protocol=protocol,
+                tool_registry=tool_registry,
                 llm=self.llm,
                 state=state,
-                resolution_source="agent_override",
+                resolution_source=resolution_source,
             )
             metadata = dict(scaffold.metadata or {})
             metadata.update(
                 {
-                    "protocol": getattr(self.active_protocol(), "id", None),
-                    "protocol_resolution_source": "agent_override",
+                    "protocol": getattr(protocol, "id", None),
+                    "protocol_resolution_source": resolution_source,
                     "prompt_builder": "manual_build_system_prompt",
                     "prompt_builder_version": "manual",
                     "sections_used": scaffold.metadata.get("sections_used", []),
                     "tool_schema_style": getattr(
-                        self.active_protocol(), "id", None
+                        protocol, "id", None
                     ),
                     "prompt_hash_static": scaffold.metadata.get("prompt_hash_static", ""),
                     "prompt_hash_full": scaffold.metadata.get("prompt_hash_full", ""),
@@ -297,18 +340,26 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
                 tool_schema_payload=scaffold.tool_schema_payload,
                 metadata=metadata,
             )
-        return self._build_default_prompt_bundle(state)
+        return self._build_default_prompt_bundle(state, turn)
 
-    def _build_default_prompt_bundle(self, state: StateT) -> PromptBuildResult:
+    def _build_default_prompt_bundle(
+        self,
+        state: StateT,
+        turn: TurnSnapshot | None = None,
+    ) -> PromptBuildResult:
         spec = self.build_prompt_spec(state)
-        resolution_source = getattr(self, "_runtime_protocol_source", None)
+        protocol = turn.protocol if turn is not None else self.active_protocol()
+        tool_registry = turn.tools if turn is not None else self.tool_registry
+        resolution_source = (
+            turn.protocol_source if turn is not None else "agent_default"
+        )
         return self.prompt_builder().build(
             spec=spec,
-            protocol=self.active_protocol(),
-            tool_registry=self._prompt_tool_registry(),
+            protocol=protocol,
+            tool_registry=tool_registry,
             llm=self.llm,
             state=state,
-            resolution_source=str(resolution_source or "agent_default"),
+            resolution_source=resolution_source,
         )
 
     def _state_prompt_attr(self, state: StateT, name: str) -> str:

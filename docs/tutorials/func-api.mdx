@@ -171,7 +171,7 @@ class GetTimeTool(BaseTool):
         )
         super().__init__(spec)
 
-    def execute(self, args: dict, runtime_context: dict | None = None) -> str:
+    async def execute(self, args: dict, runtime_context: dict | None = None) -> str:
         _ = args, runtime_context
         from datetime import datetime
         return datetime.now().isoformat()

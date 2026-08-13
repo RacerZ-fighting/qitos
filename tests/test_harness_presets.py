@@ -178,7 +178,7 @@ def test_same_claude_code_agent_switches_across_gold_families(tmp_path: Path) ->
             history_policy=HistoryPolicy(max_messages=8, max_tokens=1200),
             return_state=True,
         )
-        assert result.state.stop_reason == "final"
+        assert result.state.stop_reason == "completed"
 
 
 def test_harness_metadata_reaches_trace_manifest(tmp_path: Path) -> None:
@@ -229,6 +229,9 @@ def test_harness_metadata_reaches_trace_manifest(tmp_path: Path) -> None:
         "max_steps": 2,
         "max_runtime_seconds": None,
         "max_tokens": None,
+        "max_cost_usd": None,
+        "max_tool_concurrency": 4,
+        "max_children": 4,
         "deadline_constrained": False,
     }
 

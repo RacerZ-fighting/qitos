@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import shlex
 import subprocess
@@ -17,6 +18,7 @@ from qitos.core.env import (
     FileSystemCapability,
     TextFileChunk,
 )
+from qitos.kit.env._async_process import run_process
 from qitos.kit.env.host_env import HostEnv
 
 
@@ -28,6 +30,77 @@ class DockerCommandCapability(CommandCapability):
     def __init__(self, container: str, workdir: str = "/workspace"):
         self.container = container
         self.workdir = workdir
+
+    async def arun(self, command: str, timeout: int = 30) -> Dict[str, Any]:
+        if not command or not command.strip():
+            return {"status": "error", "error": "empty command"}
+        docker_cmd = [
+            "docker",
+            "exec",
+            "-w",
+            self.workdir,
+            self.container,
+            "sh",
+            "-lc",
+            command,
+        ]
+        try:
+            result = await run_process(argv=docker_cmd, timeout=float(timeout))
+            return {
+                "status": "success" if result.returncode == 0 else "partial",
+                "returncode": result.returncode,
+                "stdout": result.stdout.decode("utf-8", errors="replace"),
+                "stderr": result.stderr.decode("utf-8", errors="replace"),
+                "command": command,
+                "container": self.container,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "status": "error",
+                "error": f"command timed out after {timeout} seconds",
+                "command": command,
+                "container": self.container,
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": str(exc),
+                "command": command,
+                "container": self.container,
+            }
+
+    async def arun_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: int = 30,
+        cwd: str | None = None,
+        stdin: bytes | None = None,
+    ) -> Dict[str, Any]:
+        args = [str(item) for item in argv]
+        if not args or not args[0].strip():
+            raise ValueError("argv must contain a non-empty executable")
+        workdir = self.workdir if cwd is None else _docker_scoped_path(self.workdir, cwd)
+        docker_argv = ["docker", "exec"]
+        if stdin is not None:
+            docker_argv.append("-i")
+        docker_argv.extend(["-w", workdir, self.container, *args])
+        result = await run_process(
+            argv=docker_argv,
+            stdin=stdin,
+            timeout=float(timeout),
+        )
+        return {
+            "status": "success" if result.returncode == 0 else "partial",
+            "returncode": result.returncode,
+            "stdout": result.stdout.decode("utf-8", errors="replace"),
+            "stderr": result.stderr.decode("utf-8", errors="replace"),
+            "argv": args,
+            "container": self.container,
+            "cwd": workdir,
+        }
 
     def run(self, command: str, timeout: int = 30) -> Dict[str, Any]:
         if not command or not command.strip():

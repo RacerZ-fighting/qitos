@@ -267,7 +267,7 @@ def test_agent_interpretation_can_handle_empty_model_response():
         "handle provider metadata"
     )
 
-    assert result.state.stop_reason == "final"
+    assert result.state.stop_reason == "completed"
     assert result.state.final_result == "handled by agent"
     assert result.records[0].model_response["text"] == ""
 
@@ -557,11 +557,14 @@ async def test_message_builder_falls_back_to_user_without_a_real_tool_result():
     engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=2))
     state = agent.init_state("compute")
     state.current_step = 1
+    engine._active_run_id = "model-runtime-test"
+    turn = engine._capture_turn(state, 1)
 
     await engine._model_runtime._run_llm_decide(
         state,
         {},
         StepRecord(step_id=1),
+        turn,
     )
 
     request = model.seen_messages[0]
@@ -1241,7 +1244,7 @@ def test_native_text_parse_recovery_runs_tool_then_finishes():
     ).run("recover malformed action")
 
     assert model.calls == 3
-    assert result.state.stop_reason == "final"
+    assert result.state.stop_reason == "completed"
     assert result.state.final_result == "done"
     assert [record.decision.mode for record in result.records] == [
         "wait",

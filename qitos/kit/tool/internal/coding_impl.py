@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-import requests
+import httpx
 
 from qitos.core.env import CommandCapability, FileSystemCapability
 from qitos.core.function_tool_decorator import function_tool
@@ -427,7 +427,7 @@ class CodingToolSet:
         )
         self._file_ops(runtime_context).write_text(path, normalized)
 
-    def _run_rg_files(
+    async def _run_rg_files(
         self,
         target_dir: str,
         pattern: str,
@@ -441,7 +441,7 @@ class CodingToolSet:
         if include_ignored:
             cmd.append("--no-ignore")
         cmd.append(".")
-        result = self._process_ops(runtime_context).run_argv(
+        result = await self._process_ops(runtime_context).arun_argv(
             cmd,
             timeout=self.shell_timeout,
             cwd=target_dir,
@@ -454,7 +454,7 @@ class CodingToolSet:
         )
         return matches, exit_code, stderr
 
-    def _run_rg_grep(
+    async def _run_rg_grep(
         self,
         pattern: str,
         target_dir: str,
@@ -496,7 +496,7 @@ class CodingToolSet:
         if context > 0 and not files_with_matches:
             cmd.extend(["--context", str(context)])
         cmd.extend(["--", pattern, "."])
-        result = self._process_ops(runtime_context).run_argv(
+        result = await self._process_ops(runtime_context).arun_argv(
             cmd,
             timeout=self.shell_timeout,
             cwd=target_dir,
@@ -593,7 +593,7 @@ class CodingToolSet:
         walk(path, "", 1)
         return lines
 
-    def _request(
+    async def _request(
         self,
         method: str,
         url: str,
@@ -615,17 +615,19 @@ class CodingToolSet:
                 "url": url,
             }
         try:
-            response = requests.request(
-                method=str(method or "GET").upper(),
-                url=url,
-                params=params,
-                data=data,
-                json=json_data,
-                headers=headers,
-                timeout=int(timeout or 30),
+            async with httpx.AsyncClient(
                 verify=verify_tls,
-                allow_redirects=allow_redirects,
-            )
+                follow_redirects=allow_redirects,
+            ) as client:
+                response = await client.request(
+                    method=str(method or "GET").upper(),
+                    url=url,
+                    params=params,
+                    data=data,
+                    json=json_data,
+                    headers=headers,
+                    timeout=int(timeout or 30),
+                )
             text, truncated = _truncate_text(response.text, max_content_chars)
             payload: Dict[str, Any] = {
                 "status": "success" if response.status_code < 400 else "error",
@@ -680,7 +682,7 @@ class CodingToolSet:
         environment_ops=["process"],
         rule_scope_builder=_default_rule_scope,
     )
-    def run_command(
+    async def run_command(
         self,
         command: str,
         run_in_background: bool = False,
@@ -700,7 +702,7 @@ class CodingToolSet:
             process_ops = self._process_ops(runtime_context)
             if run_in_background:
                 return process_ops.start(text)
-            return process_ops.run(text, timeout=self.shell_timeout)
+            return await process_ops.arun(text, timeout=self.shell_timeout)
         except Exception as exc:
             return {"status": "error", "message": str(exc), "command": text}
 
@@ -995,7 +997,7 @@ class CodingToolSet:
         environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
     )
-    def glob(
+    async def glob(
         self,
         pattern: str,
         path: str = ".",
@@ -1019,7 +1021,7 @@ class CodingToolSet:
         try:
             result_limit = _search_limit(limit)
             self._require_search_directory(path, runtime_context)
-            matches, exit_code, stderr = self._run_rg_files(
+            matches, exit_code, stderr = await self._run_rg_files(
                 path,
                 pattern,
                 include_hidden,
@@ -1053,7 +1055,7 @@ class CodingToolSet:
         environment_ops=["file", "process"],
         rule_scope_builder=_default_rule_scope,
     )
-    def grep(
+    async def grep(
         self,
         pattern: str,
         path: str = ".",
@@ -1092,7 +1094,7 @@ class CodingToolSet:
             if context_lines < 0:
                 raise ValueError("context must be non-negative")
             self._require_search_directory(path, runtime_context)
-            matches, records, exit_code, stderr = self._run_rg_grep(
+            matches, records, exit_code, stderr = await self._run_rg_grep(
                 pattern,
                 path,
                 glob,
@@ -1257,7 +1259,7 @@ class CodingToolSet:
         name="http_request",
         rule_scope_builder=_default_rule_scope,
     )
-    def http_request(
+    async def http_request(
         self,
         method: str,
         url: str,
@@ -1284,7 +1286,7 @@ class CodingToolSet:
         :param allow_redirects: Whether redirects should be followed automatically.
         :param max_content_chars: Maximum number of response characters to keep.
         """
-        return self._request(
+        return await self._request(
             method=method,
             url=url,
             params=params,
@@ -1302,7 +1304,7 @@ class CodingToolSet:
         needs_approval=True,
         rule_scope_builder=_default_rule_scope,
     )
-    def http_get(
+    async def http_get(
         self,
         url: str,
         params: Optional[Dict[str, Any]] = None,
@@ -1321,7 +1323,7 @@ class CodingToolSet:
         :param verify_tls: Whether TLS certificates should be verified.
         :param allow_redirects: Whether redirects should be followed automatically.
         """
-        return self.http_request(
+        return await self.http_request(
             method="GET",
             url=url,
             params=params,
@@ -1335,7 +1337,7 @@ class CodingToolSet:
         name="http_post",
         rule_scope_builder=_default_rule_scope,
     )
-    def http_post(
+    async def http_post(
         self,
         url: str,
         data: Optional[Dict[str, Any]] = None,
@@ -1356,7 +1358,7 @@ class CodingToolSet:
         :param verify_tls: Whether TLS certificates should be verified.
         :param allow_redirects: Whether redirects should be followed automatically.
         """
-        return self.http_request(
+        return await self.http_request(
             method="POST",
             url=url,
             data=data,
@@ -1386,7 +1388,7 @@ class CodingToolSet:
         needs_approval=True,
         rule_scope_builder=_default_rule_scope,
     )
-    def web_fetch(
+    async def web_fetch(
         self,
         url: str,
         prompt: str = "",
@@ -1400,7 +1402,7 @@ class CodingToolSet:
         :param runtime_context: Optional runtime context injected by the executor.
         """
         _ = runtime_context
-        response = self.http_get(url=url, allow_redirects=False)
+        response = await self.http_get(url=url, allow_redirects=False)
         if response.get("status") == "error":
             return response
         if response.get("status_code") in {301, 302, 303, 307, 308}:

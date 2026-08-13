@@ -6,7 +6,8 @@ from qitos.core import WorkPlanContractError, WorkPlanState, parse_work_plan_upd
 from qitos.kit.tool.planning import UpdateWorkPlanTool
 
 
-def test_update_work_plan_tool_returns_normalized_intent_without_mutating_state() -> None:
+@pytest.mark.asyncio
+async def test_update_work_plan_tool_returns_normalized_intent_without_mutating_state() -> None:
     class _State:
         work_plan = WorkPlanState()
 
@@ -20,7 +21,7 @@ def test_update_work_plan_tool_returns_normalized_intent_without_mutating_state(
     state = _State()
     tool = UpdateWorkPlanTool()
 
-    result = tool.execute(arguments, runtime_context={"state": state})
+    result = await tool.execute(arguments, runtime_context={"state": state})
 
     assert result["plan"] == arguments["plan"]
     assert result["explanation"] == arguments["explanation"]
@@ -28,11 +29,12 @@ def test_update_work_plan_tool_returns_normalized_intent_without_mutating_state(
     assert parse_work_plan_update(result).plan.items
 
 
-def test_update_work_plan_tool_rejects_invalid_replacement() -> None:
+@pytest.mark.asyncio
+async def test_update_work_plan_tool_rejects_invalid_replacement() -> None:
     tool = UpdateWorkPlanTool()
 
     with pytest.raises(WorkPlanContractError):
-        tool.execute(
+        await tool.execute(
             {
                 "plan": [
                     {"step": "first", "status": "in_progress"},

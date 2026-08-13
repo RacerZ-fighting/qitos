@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import ipaddress
+from typing import Any
 from urllib.parse import urlsplit
 
-import requests
+import httpx
 
 from .capability import WebFetchError, WebFetchResponse
 
@@ -24,7 +25,7 @@ class KimiWebFetchCapability:
         api_key: str,
         fetch_url: str,
         timeout_seconds: float = 30.0,
-        session: requests.Session | None = None,
+        client: Any = None,
     ) -> None:
         if not api_key.strip():
             raise ValueError("Kimi web fetch requires a non-empty API key")
@@ -35,12 +36,14 @@ class KimiWebFetchCapability:
         self._api_key = api_key
         self._fetch_url = fetch_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
-        self._session = session or requests.Session()
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient()
 
-    def fetch(self, url: str) -> WebFetchResponse:
+    async def fetch(self, url: str) -> WebFetchResponse:
         normalized_url = _validate_public_url(url)
         try:
-            response = self._session.post(
+            async with self._client.stream(
+                "POST",
                 self._fetch_url,
                 headers={
                     "Authorization": f"Bearer {self._api_key}",
@@ -49,48 +52,54 @@ class KimiWebFetchCapability:
                 },
                 json={"url": normalized_url},
                 timeout=self._timeout_seconds,
-                stream=True,
-            )
-        except requests.Timeout as exc:
+            ) as response:
+                status_code = response.status_code
+                if status_code in {401, 403}:
+                    raise WebFetchError(
+                        "authentication", "Kimi web fetch authentication failed"
+                    )
+                if status_code == 402:
+                    raise WebFetchError(
+                        "billing", "Kimi web fetch payment is required"
+                    )
+                if status_code == 429:
+                    raise WebFetchError(
+                        "rate_limited", "Kimi web fetch was rate limited"
+                    )
+                if status_code != 200:
+                    raise WebFetchError(
+                        "provider",
+                        f"Kimi web fetch returned HTTP {status_code}",
+                    )
+
+                content, truncated_bytes = await _bounded_response_bytes(response)
+                encoding = response.encoding or "utf-8"
+                try:
+                    text = content.decode(encoding, errors="strict")
+                except (LookupError, UnicodeDecodeError) as exc:
+                    raise WebFetchError(
+                        "protocol", "Kimi web fetch returned invalid text"
+                    ) from exc
+                truncated_chars = len(text) > _MAX_CONTENT_CHARS
+                if truncated_chars:
+                    text = text[:_MAX_CONTENT_CHARS]
+                content_type = str(
+                    response.headers.get("Content-Type") or "text/markdown"
+                )
+        except httpx.TimeoutException as exc:
             raise WebFetchError("timeout", "Kimi web fetch timed out") from exc
-        except requests.RequestException as exc:
+        except httpx.RequestError as exc:
             raise WebFetchError("network", "Kimi web fetch request failed") from exc
-
-        status_code = response.status_code
-        if status_code != 200:
-            response.close()
-        if status_code in {401, 403}:
-            raise WebFetchError(
-                "authentication", "Kimi web fetch authentication failed"
-            )
-        if status_code == 402:
-            raise WebFetchError("billing", "Kimi web fetch payment is required")
-        if status_code == 429:
-            raise WebFetchError("rate_limited", "Kimi web fetch was rate limited")
-        if status_code != 200:
-            raise WebFetchError(
-                "provider",
-                f"Kimi web fetch returned HTTP {status_code}",
-            )
-
-        content, truncated_bytes = _bounded_response_bytes(response)
-        encoding = response.encoding or "utf-8"
-        try:
-            text = content.decode(encoding, errors="strict")
-        except (LookupError, UnicodeDecodeError) as exc:
-            raise WebFetchError(
-                "protocol", "Kimi web fetch returned invalid text"
-            ) from exc
-        truncated_chars = len(text) > _MAX_CONTENT_CHARS
-        if truncated_chars:
-            text = text[:_MAX_CONTENT_CHARS]
-        content_type = str(response.headers.get("Content-Type") or "text/markdown")
         return WebFetchResponse(
             url=normalized_url,
             content=text,
             content_type=content_type,
             truncated=truncated_bytes or truncated_chars,
         )
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
 
 
 def _validate_public_url(url: str) -> str:
@@ -121,25 +130,22 @@ def _validate_public_url(url: str) -> str:
     return normalized
 
 
-def _bounded_response_bytes(response: requests.Response) -> tuple[bytes, bool]:
+async def _bounded_response_bytes(response: Any) -> tuple[bytes, bool]:
     chunks: list[bytes] = []
     size = 0
     truncated = False
-    try:
-        for chunk in response.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            remaining = _MAX_CONTENT_BYTES - size
-            if remaining <= 0:
-                truncated = True
-                break
-            chunks.append(chunk[:remaining])
-            size += min(len(chunk), remaining)
-            if len(chunk) > remaining:
-                truncated = True
-                break
-    finally:
-        response.close()
+    async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+        if not chunk:
+            continue
+        remaining = _MAX_CONTENT_BYTES - size
+        if remaining <= 0:
+            truncated = True
+            break
+        chunks.append(chunk[:remaining])
+        size += min(len(chunk), remaining)
+        if len(chunk) > remaining:
+            truncated = True
+            break
     return b"".join(chunks), truncated
 
 
