@@ -111,5 +111,9 @@ Run-scoped mailbox acceptance is journal-recoverable. `runtime_input.posted` pre
 in-memory delivery, while `model.completed.runtime_input_ids` binds the exact events
 seen by that transaction. Resume redelivers only local posted events without such a
 binding; forks never inherit pending parent input. Background process state uses its
-own process records. Full child-agent identity and control lifecycle recovery remains a
-separate contract.
+own process records. Child supervision writes `child.started` before constructing an
+Engine and `child.terminal` before parent notification. Resume restores terminal results
+and closes any start without a terminal as `interrupted`; it never reattaches or replays
+a Child Engine. Forks preserve inherited facts for audit but receive no control authority
+over parent handles. Resuming a terminal Child for follow-up remains an application-owned
+Session concern.

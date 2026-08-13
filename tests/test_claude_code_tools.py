@@ -6,6 +6,7 @@ import tempfile
 from types import SimpleNamespace
 
 import pytest
+from qitos.core.child import ChildHandle, ChildStatus
 
 from qitos.kit.tool.internal.coding_utils import (
     is_image_file,
@@ -265,7 +266,9 @@ class TestAgentTool:
         from contextlib import contextmanager
         from types import SimpleNamespace
 
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.core.tool_result import ToolResult
+        from qitos.kit.tool.agent import AgentTool
 
         engines = []
         scopes = []
@@ -287,10 +290,10 @@ class TestAgentTool:
 
         def build_invocation(request, runtime_context):
             assert runtime_context["delegate_depth"] == 0
-            assert request.max_turns == 200
+            assert request.budget.max_steps == 200
             engine = FakeEngine()
             engines.append(engine)
-            return AgentInvocation(engine=engine, task=f"seeded:{request.prompt}")
+            return ChildInvocation(engine=engine, task=f"seeded:{request.task}")
 
         @contextmanager
         def execution_scope(runtime_context):
@@ -308,17 +311,20 @@ class TestAgentTool:
         )
         first = await tool.execute(
             {"description": "first task", "prompt": "one"},
-            runtime_context={"delegate_depth": 0},
+            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
         second = await tool.execute(
             {"description": "second task", "prompt": "two"},
-            runtime_context={"delegate_depth": 0},
+            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
         assert first["status"] == "success"
+        assert first["child_status"] == "completed"
+        assert ToolResult.from_value(first).is_success
         assert first["steps"] == 3
         assert first["total_tokens"] == 42
         assert second["status"] == "success"
+        assert second["child_status"] == "completed"
         assert len(engines) == 2
         assert engines[0] is not engines[1]
         assert scopes == ["enter", "exit", "enter", "exit"]
@@ -335,7 +341,7 @@ class TestAgentTool:
         )
         result = await tool.execute(
             {"description": "nested task", "prompt": "recurse"},
-            runtime_context={"delegate_depth": 1},
+            runtime_context={"delegate_depth": 1, "parent_run_id": "parent-run"},
         )
 
         assert result["status"] == "error"
@@ -343,7 +349,8 @@ class TestAgentTool:
 
     @pytest.mark.asyncio
     async def test_run_child_budget_rejects_calls_beyond_limit(self):
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         class FakeEngine:
             active_run_id = "child-run"
@@ -361,13 +368,17 @@ class TestAgentTool:
                 )
 
         tool = AgentTool(
-            invocation_factory=lambda request, _context: AgentInvocation(
+            invocation_factory=lambda request, _context: ChildInvocation(
                 engine=FakeEngine(),
-                task=request.prompt,
+                task=request.task,
             ),
             execution_mode="foreground",
         )
-        context = {"delegate_depth": 0, "max_children": 1}
+        context = {
+            "delegate_depth": 0,
+            "parent_run_id": "parent-run",
+            "max_children": 1,
+        }
 
         first = await tool.execute(
             {"description": "first", "prompt": "one"},
@@ -379,13 +390,15 @@ class TestAgentTool:
         )
 
         assert first["status"] == "success"
+        assert first["child_status"] == "completed"
         assert second["status"] == "error"
         assert "max_children=1" in second["error"]
 
     @pytest.mark.asyncio
     async def test_forced_background_children_launch_concurrently_and_notify_parent(self):
         from qitos.core.runtime_input import RuntimeInput
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         both_started = asyncio.Event()
         release = asyncio.Event()
@@ -421,9 +434,9 @@ class TestAgentTool:
                 release.set()
 
         tool = AgentTool(
-            invocation_factory=lambda request, _context: AgentInvocation(
+            invocation_factory=lambda request, _context: ChildInvocation(
                 engine=FakeEngine(),
-                task=request.prompt,
+                task=request.task,
             ),
             execution_mode="background",
             max_background_workers=2,
@@ -437,6 +450,7 @@ class TestAgentTool:
 
         runtime_context = {
             "delegate_depth": 0,
+            "parent_run_id": "parent-run",
             "post_runtime_event": post_runtime_event,
         }
 
@@ -474,7 +488,8 @@ class TestAgentTool:
     async def test_background_invocation_is_created_after_execution_slot_opens(self):
         from contextlib import asynccontextmanager
 
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         waiting = asyncio.Event()
         open_slot = asyncio.Event()
@@ -510,7 +525,7 @@ class TestAgentTool:
             factory_called.set()
             received_parent_history = _runtime_context["parent_history"]
             received_parent_snapshot = _runtime_context["parent_history_snapshot"]
-            return AgentInvocation(engine=FakeEngine(), task=request.prompt)
+            return ChildInvocation(engine=FakeEngine(), task=request.task)
 
         tool = AgentTool(
             invocation_factory=invocation_factory,
@@ -525,6 +540,7 @@ class TestAgentTool:
             },
             runtime_context={
                 "delegate_depth": 0,
+                "parent_run_id": "parent-run",
                 "agent": SimpleNamespace(
                     history=SimpleNamespace(
                         messages=parent_messages,
@@ -539,21 +555,23 @@ class TestAgentTool:
         assert not factory_called.is_set()
         parent_messages.append(object())
         open_slot.set()
-        result = tool.get_background_result(launched["task_id"])
+        handle = ChildHandle.from_dict(launched["handle"])
+        result = tool.child_result(handle)
         async with asyncio.timeout(1):
-            while result and result["status"] == "running":
+            while result is not None and not result.ready:
                 await asyncio.sleep(0)
-                result = tool.get_background_result(launched["task_id"])
+                result = tool.child_result(handle)
 
         assert factory_called.is_set()
         assert received_parent_history == (before_launch,)
         assert received_parent_snapshot == (before_launch,)
-        assert result is not None and result["status"] == "success"
+        assert result is not None and result.status is ChildStatus.COMPLETED
         assert await tool.aclose(wait_seconds=0) == 0
 
     @pytest.mark.asyncio
     async def test_background_child_becomes_terminal_before_event_delivery(self):
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         delivery_started = asyncio.Event()
 
@@ -578,9 +596,9 @@ class TestAgentTool:
             return True
 
         tool = AgentTool(
-            invocation_factory=lambda request, _context: AgentInvocation(
+            invocation_factory=lambda request, _context: ChildInvocation(
                 engine=FakeEngine(),
-                task=request.prompt,
+                task=request.task,
             ),
             execution_mode="background",
         )
@@ -588,6 +606,7 @@ class TestAgentTool:
             {"description": "fast route", "prompt": "inspect"},
             runtime_context={
                 "delegate_depth": 0,
+                "parent_run_id": "parent-run",
                 "post_runtime_event": post_runtime_event,
             },
         )
@@ -595,15 +614,17 @@ class TestAgentTool:
         assert launched["status"] == "running"
         await asyncio.wait_for(delivery_started.wait(), timeout=1)
         assert tool.active_background_count == 0
-        terminal = tool.get_background_result(launched["task_id"])
-        assert terminal is not None and terminal["status"] == "success"
-        assert tool.cancel_background(launched["task_id"]) is False
+        handle = ChildHandle.from_dict(launched["handle"])
+        terminal = tool.child_result(handle)
+        assert terminal is not None and terminal.status is ChildStatus.COMPLETED
+        assert tool.cancel_child(handle) is False
         assert await tool.aclose(wait_seconds=1) == 0
 
     @pytest.mark.asyncio
     async def test_background_budget_stop_returns_partial_tool_evidence(self):
         from qitos.engine.states import StepRecord
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         events = []
         completed = asyncio.Event()
@@ -633,9 +654,9 @@ class TestAgentTool:
                 _ = mode
 
         tool = AgentTool(
-            invocation_factory=lambda request, _context: AgentInvocation(
+            invocation_factory=lambda request, _context: ChildInvocation(
                 engine=FakeEngine(),
-                task=request.prompt,
+                task=request.task,
             ),
             execution_mode="background",
         )
@@ -649,6 +670,7 @@ class TestAgentTool:
             {"description": "validate route", "prompt": "validate"},
             runtime_context={
                 "delegate_depth": 0,
+                "parent_run_id": "parent-run",
                 "post_runtime_event": post_runtime_event,
             },
         )
@@ -658,14 +680,16 @@ class TestAgentTool:
         assert launched["status"] == "running"
         assert len(events) == 1
         assert events[0].payload["status"] == "partial"
-        assert events[0].payload["stop_reason"] == "budget_time"
+        assert events[0].payload["child_status"] == "budget_exhausted"
+        assert events[0].payload["stop_reason"] == "budget_exhausted"
         assert "uid=33(www-data)" in events[0].payload["output"]
         assert await tool.aclose(wait_seconds=0) == 0
 
     @pytest.mark.asyncio
     async def test_running_background_child_exposes_bounded_tool_evidence_snapshot(self):
         from qitos.engine.states import StepRecord
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         started = asyncio.Event()
         cancelled = asyncio.Event()
@@ -707,9 +731,9 @@ class TestAgentTool:
                 cancelled.set()
 
         tool = AgentTool(
-            invocation_factory=lambda request, _context: AgentInvocation(
+            invocation_factory=lambda request, _context: ChildInvocation(
                 engine=FakeEngine(),
-                task=request.prompt,
+                task=request.task,
             ),
             execution_mode="background",
         )
@@ -719,7 +743,7 @@ class TestAgentTool:
                 "name": "extension-bypass",
                 "prompt": "validate",
             },
-            runtime_context={"delegate_depth": 0},
+            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
         assert launched["status"] == "running"
@@ -730,8 +754,9 @@ class TestAgentTool:
         assert len(snapshots) == 1
         snapshot = snapshots[0]
         assert snapshot.kind == "agent.child.snapshot"
-        assert snapshot.event_id == f"{launched['task_id']}:conclude-snapshot"
-        assert snapshot.payload["task_id"] == launched["task_id"]
+        assert snapshot.event_id == f"{launched['child_id']}:conclude-snapshot"
+        assert snapshot.payload["child_id"] == launched["child_id"]
+        assert snapshot.payload["handle"] == launched["handle"]
         assert snapshot.payload["status"] == "running"
         assert snapshot.payload["name"] == "extension-bypass"
         assert snapshot.payload["description"] == "validate extension bypass"
@@ -745,7 +770,8 @@ class TestAgentTool:
 
     @pytest.mark.asyncio
     async def test_completed_background_child_is_not_repeated_in_snapshot(self):
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         class FakeEngine:
             active_run_id = "child-run"
@@ -764,19 +790,20 @@ class TestAgentTool:
                 _ = mode
 
         tool = AgentTool(
-            invocation_factory=lambda request, _context: AgentInvocation(
+            invocation_factory=lambda request, _context: ChildInvocation(
                 engine=FakeEngine(),
-                task=request.prompt,
+                task=request.task,
             ),
             execution_mode="background",
         )
         launched = await tool.execute(
             {"description": "done", "prompt": "done"},
-            runtime_context={"delegate_depth": 0},
+            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
+        handle = ChildHandle.from_dict(launched["handle"])
         async with asyncio.timeout(1):
-            while tool.get_background_result(launched["task_id"])["status"] == "running":
+            while not tool.child_result(handle).ready:
                 await asyncio.sleep(0)
 
         assert tool.snapshot_background_events() == []
@@ -784,7 +811,8 @@ class TestAgentTool:
 
     @pytest.mark.asyncio
     async def test_close_cancels_a_running_background_child(self):
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         started = asyncio.Event()
         cancelled = asyncio.Event()
@@ -811,15 +839,15 @@ class TestAgentTool:
                 cancelled.set()
 
         tool = AgentTool(
-            invocation_factory=lambda request, _context: AgentInvocation(
+            invocation_factory=lambda request, _context: ChildInvocation(
                 engine=FakeEngine(),
-                task=request.prompt,
+                task=request.task,
             ),
             execution_mode="background",
         )
         result = await tool.execute(
             {"description": "long route", "prompt": "wait"},
-            runtime_context={"delegate_depth": 0},
+            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
         assert result["status"] == "running"
@@ -829,7 +857,8 @@ class TestAgentTool:
 
     @pytest.mark.asyncio
     async def test_close_drains_an_already_cancelled_child(self):
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         started = asyncio.Event()
         cancelled = asyncio.Event()
@@ -856,15 +885,15 @@ class TestAgentTool:
                 cancelled.set()
 
         tool = AgentTool(
-            invocation_factory=lambda request, _context: AgentInvocation(
+            invocation_factory=lambda request, _context: ChildInvocation(
                 engine=FakeEngine(),
-                task=request.prompt,
+                task=request.task,
             ),
             execution_mode="background",
         )
         result = await tool.execute(
             {"description": "long route", "prompt": "wait"},
-            runtime_context={"delegate_depth": 0},
+            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
         assert result["status"] == "running"
@@ -875,7 +904,8 @@ class TestAgentTool:
     async def test_close_wakes_a_child_waiting_for_an_execution_slot(self):
         from contextlib import asynccontextmanager
 
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         waiting = asyncio.Event()
         child_started = asyncio.Event()
@@ -903,7 +933,7 @@ class TestAgentTool:
 
         def invocation_factory(request, _context):
             factory_called.set()
-            return AgentInvocation(engine=FakeEngine(), task=request.prompt)
+            return ChildInvocation(engine=FakeEngine(), task=request.task)
 
         tool = AgentTool(
             invocation_factory=invocation_factory,
@@ -912,15 +942,16 @@ class TestAgentTool:
         )
         result = await tool.execute(
             {"description": "queued route", "prompt": "wait"},
-            runtime_context={"delegate_depth": 0},
+            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
         assert result["status"] == "running"
         await asyncio.wait_for(waiting.wait(), timeout=1)
         assert await tool.aclose(wait_seconds=1) == 0
-        terminal = tool.get_background_result(result["task_id"])
+        handle = ChildHandle.from_dict(result["handle"])
+        terminal = tool.child_result(handle)
         assert terminal is not None
-        assert terminal["stop_reason"] == "cancelled_immediate"
+        assert terminal.status is ChildStatus.CANCELLED
         assert not factory_called.is_set()
         assert not child_started.is_set()
 
@@ -928,7 +959,8 @@ class TestAgentTool:
     async def test_background_child_deadline_expires_before_execution_slot_opens(self):
         from contextlib import asynccontextmanager
 
-        from qitos.kit.tool.agent import AgentInvocation, AgentTool
+        from qitos.core.child import ChildInvocation
+        from qitos.kit.tool.agent import AgentTool
 
         factory_called = asyncio.Event()
 
@@ -939,7 +971,7 @@ class TestAgentTool:
 
         def invocation_factory(request, _context):
             factory_called.set()
-            return AgentInvocation(engine=object(), task=request.prompt)
+            return ChildInvocation(engine=object(), task=request.task)
 
         tool = AgentTool(
             invocation_factory=invocation_factory,
@@ -948,18 +980,18 @@ class TestAgentTool:
         )
         launched = await tool.execute(
             {"description": "queued route", "prompt": "wait"},
-            runtime_context={"delegate_depth": 0},
+            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
-        terminal = tool.get_background_result(launched["task_id"])
+        handle = ChildHandle.from_dict(launched["handle"])
+        terminal = tool.child_result(handle)
         async with asyncio.timeout(1):
-            while terminal is not None and terminal["status"] == "running":
+            while terminal is not None and not terminal.ready:
                 await asyncio.sleep(0)
-                terminal = tool.get_background_result(launched["task_id"])
+                terminal = tool.child_result(handle)
 
         assert terminal is not None
-        assert terminal["status"] == "error"
-        assert terminal["stop_reason"] == "budget_time"
+        assert terminal.status is ChildStatus.BUDGET_EXHAUSTED
         assert not factory_called.is_set()
         assert tool.active_background_count == 0
         assert await tool.aclose(wait_seconds=0) == 0
