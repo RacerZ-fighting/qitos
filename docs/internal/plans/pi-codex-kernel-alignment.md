@@ -35,7 +35,7 @@ remain read-only and are not dependencies.
 | Journal and Session | Canonical JSONL, writer lease, derived per-Run SQLite index, lease-free typed catalog, lineage, resume/fork | Complete; keep the journal authoritative and indexes disposable |
 | File and process runtime | Revision-safe files and Run-owned host background processes | Add the same managed contract for a real remote/container backend when its owner is available |
 | Child and Mailbox | Typed Child supervisor and durable safe-point input | Complete baseline; retain one product factory boundary |
-| Skill and resources | Progressive catalog/load/resource tools exist | Audit discovery diagnostics, precedence, reload, and runtime requirements against Pi/Codex |
+| Skill and resources | Deterministic recursive catalog, bounded diagnostics, explicit refresh, whole-bundle revisions, and requirement admission | Complete; preserve the small progressive-disclosure surface |
 | MCP | Run-scoped async connect/discover/execute/close exists | Add safe refresh and unified exposure/permission handling only where current callers require it |
 | Runtime capabilities | Environment ops exist but capability identity/preflight is incomplete | Define one immutable runtime capability snapshot and implement a container consumer |
 | Permission and scope | Tool admission and frozen exposure exist | Close command/path/network scope gaps at the existing admission boundary |
@@ -59,7 +59,7 @@ Each module plan records:
 - [x] Turn transaction, completion policy, model/context recovery, atomic files,
   managed host processes, durable Mailbox, and typed Child lifecycle.
 - [x] Lease-free Run catalog, lineage, status, and nested fork.
-- [ ] Skill/resource alignment.
+- [x] Skill/resource alignment.
 - [ ] MCP refresh and admission alignment.
 - [ ] Runtime capability and managed container alignment.
 - [ ] Permission/scope alignment.

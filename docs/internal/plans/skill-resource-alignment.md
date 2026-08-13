@@ -32,18 +32,28 @@ read-only and are not dependencies.
 
 ## Success conditions
 
-- [ ] Nested discovery stops at the nearest Skill root and is deterministic.
-- [ ] Missing roots, invalid manifests, unreadable assets, and name collisions return
+- [x] Nested discovery stops at the nearest Skill root and is deterministic.
+- [x] Missing roots, invalid manifests, unreadable assets, and name collisions return
   typed, bounded diagnostics while valid siblings remain available.
-- [ ] Root order defines stable first-wins precedence and duplicate physical roots are
+- [x] Root order defines stable first-wins precedence and duplicate physical roots are
   scanned once.
-- [ ] Explicit refresh publishes one new snapshot without retaining removed or invalid
+- [x] Explicit refresh publishes one new snapshot without retaining removed or invalid
   entries.
-- [ ] Bundle revisions include resource identity and resource reads reject unrefreshed
+- [x] Bundle revisions include resource identity and resource reads reject unrefreshed
   changes or path escapes.
-- [ ] A checked runtime-requirement snapshot marks catalog availability and prevents
+- [x] A checked runtime-requirement snapshot marks catalog availability and prevents
   full loading when requirements are missing; an omitted snapshot remains explicitly
   unchecked for compatibility.
-- [ ] Existing provider-backed search/install tools remain behaviorally separate.
-- [ ] Focused tests, full QitOS checks, consuming PentestAgent checks, configured live
+- [x] Existing provider-backed search/install tools remain behaviorally separate.
+- [x] Focused tests, full QitOS checks, consuming PentestAgent checks, configured live
   Provider contracts, and relevant isolated runtime acceptance pass before merge.
+
+## Acceptance
+
+- QitOS passed its full suite with 1,995 passed and 47 skipped, plus the stable
+  flake8 and mypy checks.
+- PentestAgent passed `make check` with 930 passed and 38 skipped; the configured live
+  Provider matrix passed all 6 protocol cases.
+- The isolated production-image lane passed all 11 cases, including probing every
+  declared runtime command and loading every bundled Skill against the immutable
+  requirement snapshot. No acceptance container remained running afterward.
