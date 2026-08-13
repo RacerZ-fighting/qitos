@@ -57,6 +57,8 @@ How to update:
   in-memory replay, reopened replay, stable record IDs, JSONL, and projection digests
   consistent. Unsupported schema versions now have a dedicated upgrade error, and a
   failed source close during fork no longer leaks the unreturned child's writer lease.
+- The `ChildRunResult.records` contract is now a read-only sequence view, so concrete
+  typed `EngineResult` values structurally satisfy the Child Engine protocol.
 - Synchronous Engine hooks can now defer runtime input for durable async acceptance at
   the next turn safe point instead of calling the external sync mailbox bridge from
   the Engine event loop.
