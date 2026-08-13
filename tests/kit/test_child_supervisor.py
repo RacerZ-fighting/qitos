@@ -295,6 +295,35 @@ async def test_child_lifecycle_journals_started_before_terminal(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_invocation_factory_receives_persisted_child_handle(tmp_path) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+    observed_handle = None
+
+    def invocation_factory(request, runtime_context):
+        nonlocal observed_handle
+        observed_handle = runtime_context["child_handle"]
+        return ChildInvocation(engine=_CompletingEngine(), task=request.task)
+
+    supervisor = ChildSupervisor(invocation_factory=invocation_factory)
+    result = await supervisor.launch(
+        _request(),
+        {"journal": journal},
+        parent_run_id="parent-run",
+        background=False,
+    )
+
+    assert observed_handle == result.handle
+    records = await journal.replay()
+    started = next(
+        record for record in records if record.type is JournalRecordType.CHILD_STARTED
+    )
+    assert observed_handle == ChildHandle.from_dict(started.payload["handle"])
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
 async def test_started_record_failure_never_constructs_child(tmp_path) -> None:
     factory_called = False
     journal = _FailingChildJournal(
