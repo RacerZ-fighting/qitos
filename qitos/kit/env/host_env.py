@@ -7,7 +7,6 @@ import os
 import re
 import stat as stat_module
 import subprocess
-import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -22,7 +21,10 @@ from qitos.core.env import (
     FileSystemCapability,
     TextFileChunk,
 )
+from qitos.core.journal import SessionJournal
+from qitos.core.process import ProcessHandle, ProcessSnapshot
 from qitos.kit.env._async_process import run_process
+from qitos.kit.env.managed_process import ManagedHostProcessRuntime
 
 
 class HostFSCapability(FileSystemCapability):
@@ -234,6 +236,7 @@ class HostCommandCapability(CommandCapability):
     ):
         self.cwd = str(Path(cwd).resolve())
         self._env = dict(env) if env is not None else None
+        self._managed = ManagedHostProcessRuntime(self.cwd, env=self._env)
 
     async def arun(self, command: str, timeout: int = 30) -> Dict[str, Any]:
         if not command or not command.strip():
@@ -372,39 +375,70 @@ class HostCommandCapability(CommandCapability):
             raise PermissionError(f"cwd outside command root: {cwd}") from exc
         return str(candidate)
 
-    def start(
+    async def astart(
         self,
         command: str,
         *,
+        owner_run_id: str,
         cwd: str | None = None,
-        stdout_path: str | None = None,
-    ) -> Dict[str, Any]:
-        if not command or not command.strip():
-            raise ValueError("command cannot be empty")
+        tty: bool = False,
+        journal: SessionJournal | None = None,
+    ) -> ProcessSnapshot:
         effective_cwd = self._resolve_cwd(cwd)
-        relative_log = stdout_path or f".qitos/background/{uuid.uuid4().hex}.log"
-        log_path = HostFSCapability(self.cwd)._resolve(
-            relative_log,
-            allow_missing=True,
+        return await self._managed.start(
+            command,
+            owner_run_id=owner_run_id,
+            cwd=effective_cwd,
+            tty=tty,
+            journal=journal,
         )
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        with log_path.open("wb") as output:
-            process = subprocess.Popen(
-                command,
-                cwd=effective_cwd,
-                shell=True,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                env=self._env,
-            )
-        return {
-            "status": "success",
-            "command": command,
-            "pid": process.pid,
-            "stdout_path": str(log_path.relative_to(Path(self.cwd))),
-            "cwd": effective_cwd,
-        }
+
+    async def apoll(self, handle: ProcessHandle) -> ProcessSnapshot:
+        return await self._managed.poll(handle)
+
+    async def aread(
+        self,
+        handle: ProcessHandle,
+        *,
+        cursor: int = 0,
+        wait_seconds: float = 0.0,
+    ) -> ProcessSnapshot:
+        return await self._managed.read(
+            handle,
+            cursor=cursor,
+            wait_seconds=wait_seconds,
+        )
+
+    async def awrite(
+        self,
+        handle: ProcessHandle,
+        data: str,
+    ) -> ProcessSnapshot:
+        return await self._managed.write(handle, data)
+
+    async def await_process(
+        self,
+        handle: ProcessHandle,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> ProcessSnapshot:
+        return await self._managed.wait(
+            handle,
+            deadline_monotonic=deadline_monotonic,
+        )
+
+    async def aterminate(self, handle: ProcessHandle) -> ProcessSnapshot:
+        return await self._managed.terminate(handle)
+
+    async def alist(
+        self,
+        *,
+        owner_run_id: str | None = None,
+    ) -> tuple[ProcessSnapshot, ...]:
+        return await self._managed.list(owner_run_id=owner_run_id)
+
+    async def aclose(self) -> None:
+        await self._managed.close()
 
 
 def _truncate_utf8(text: str, max_bytes: int) -> tuple[str, bool]:
@@ -501,6 +535,10 @@ class HostEnv(Env):
         if group == "process":
             return self.cmd
         return None
+
+    async def ateardown(self) -> None:
+        await self.cmd.aclose()
+        self.close()
 
     def supports_action(self, action: Any) -> bool:
         name = self._to_action_name(action)

@@ -35,6 +35,15 @@ from .model_response import (
     ModelUsageSource,
 )
 from .runtime_input import RuntimeInput
+from .process import (
+    ProcessError,
+    ProcessHandle,
+    ProcessNotFoundError,
+    ProcessOutput,
+    ProcessPersistenceError,
+    ProcessSnapshot,
+    ProcessStatus,
+)
 from .history import History, HistoryMessage, HistoryPolicy, HistorySnapshot
 from .observation import Observation
 from .journal import (
@@ -146,6 +155,13 @@ __all__ = [
     "ModelUsageSource",
     "ReasoningCapability",
     "RuntimeInput",
+    "ProcessError",
+    "ProcessHandle",
+    "ProcessNotFoundError",
+    "ProcessOutput",
+    "ProcessPersistenceError",
+    "ProcessSnapshot",
+    "ProcessStatus",
     "History",
     "HistoryMessage",
     "HistoryPolicy",

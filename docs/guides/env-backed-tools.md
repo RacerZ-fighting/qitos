@@ -25,11 +25,50 @@ Providers retain their own lifecycle. The application that creates the container
 remote session, or host resource must close it after the Engine finishes; composing a
 `CapabilityEnv` does not transfer ownership.
 
-The stable filesystem and process contracts live in `qitos.core.env`.
+The stable filesystem and process contracts live in `qitos.core.env` and
+`qitos.core.process`.
 `FileSystemCapability` supplies root-scoped metadata, bounded text and binary reads,
 writes, directory operations, and listings. `CommandCapability.run_argv()` executes
 fixed arguments without shell interpolation, while `run()` remains the explicit shell
-command path.
+command compatibility path. Runtime code uses `arun()` and `arun_argv()` so subprocess
+I/O, deadlines, and cancellation stay on the caller's event loop.
+
+Host background commands use one Run-owned supervisor. `astart()` returns an opaque
+`ProcessHandle`; `apoll()` and `aread()` return immutable snapshots; `awrite()`,
+`await_process()`, and `aterminate()` provide the interaction lifecycle. The in-memory
+view is byte-bounded and reports omitted output explicitly. The complete normalized
+UTF-8 transcript is written under `.qitos/processes/` in the workspace.
+
+```python
+import asyncio
+
+from qitos.kit.env.host_env import HostCommandCapability
+
+
+async def main() -> None:
+    commands = HostCommandCapability("/workspace")
+    started = await commands.astart(
+        "python -u server.py",
+        owner_run_id="run-example",
+    )
+    update = await commands.aread(
+        started.handle,
+        cursor=started.output.next_cursor,
+        wait_seconds=5,
+    )
+    print(update.output.content)
+    await commands.aterminate(started.handle)
+    await commands.aclose()
+
+
+asyncio.run(main())
+```
+
+When a Session Journal is supplied to `astart()`, QitOS writes
+`process.started` only after the OS process exists and writes one terminal record after
+output collection settles. A failed started-record write terminates the process and
+returns no usable handle. `Engine.arun()` awaits environment teardown before closing
+the Journal, so no process reader or watcher remains detached from the Run.
 
 Host-backed command tools inherit the current process environment by default. An
 application that owns a stricter execution boundary can instead pass one complete,
@@ -47,7 +86,7 @@ shell = RunCommand(
 )
 ```
 
-The same snapshot is used for shell commands, fixed-argument subprocesses, and
+The same snapshot is used for shell commands, fixed-argument subprocesses, and managed
 background starts. QitOS does not merge, discover, or filter credentials in this
 mapping; the application that constructs the runtime owns that policy.
 

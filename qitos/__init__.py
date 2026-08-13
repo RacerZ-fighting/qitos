@@ -17,6 +17,15 @@ from .core.model_response import ModelResponse, ModelTiming
 from .core.model_request import ModelContinuation, ModelRequest
 from .core.model_stream import ModelStreamEvent, ModelStreamEventType
 from .core.runtime_input import RuntimeInput
+from .core.process import (
+    ProcessError,
+    ProcessHandle,
+    ProcessNotFoundError,
+    ProcessOutput,
+    ProcessPersistenceError,
+    ProcessSnapshot,
+    ProcessStatus,
+)
 from .core.history import History, HistoryPolicy, HistorySnapshot
 from .core.observation import Observation
 from .core.tool_result import ToolResult, ToolResultStatus
@@ -69,6 +78,13 @@ __all__ = [
     "EventStream",
     "EngineResult",
     "RuntimeInput",
+    "ProcessError",
+    "ProcessHandle",
+    "ProcessNotFoundError",
+    "ProcessOutput",
+    "ProcessPersistenceError",
+    "ProcessSnapshot",
+    "ProcessStatus",
     "StepSummary",
     "ContextConfig",
     "Task",

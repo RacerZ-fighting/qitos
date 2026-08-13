@@ -18,6 +18,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Run-owned managed processes**: host background commands now use one asyncio
+  supervisor with opaque typed handles, incremental bounded output, complete UTF-8
+  logs, stdin/PTY interaction, process-group cleanup, and exactly one terminal state.
+  Runs await every reader and watcher during shutdown, while Journal-enabled starts
+  persist `process.started` and `process.terminal` around the live lifecycle.
 - **Discriminated model stream events**: every Provider event now declares whether it
   is text, reasoning, a ToolCall delta, a native output item, usage, lifecycle,
   successful completion, or failure. The ambiguous `ModelStreamChunk` field bag is

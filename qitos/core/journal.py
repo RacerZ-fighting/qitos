@@ -48,6 +48,8 @@ class JournalRecordType(str, Enum):
     MODEL_COMPLETED = "model.completed"
     TOOL_STARTED = "tool.started"
     TOOL_TERMINAL = "tool.terminal"
+    PROCESS_STARTED = "process.started"
+    PROCESS_TERMINAL = "process.terminal"
     STEP_COMMITTED = "step.committed"
     STATE_SNAPSHOT = "state.snapshot"
     RUN_INTERRUPTED = "run.interrupted"

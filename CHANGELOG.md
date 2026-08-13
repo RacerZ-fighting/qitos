@@ -19,6 +19,10 @@ How to update:
 
 ### Breaking
 
+- `CommandCapability.start()` has been replaced by the async typed
+  `astart()`/`apoll()`/`aread()`/`awrite()`/`await_process()`/`aterminate()` lifecycle.
+  Environment cleanup now awaits `Env.ateardown()` so managed subprocess readers and
+  watchers settle before a Run closes.
 - `ModelStreamChunk` has been replaced by the discriminated `ModelStreamEvent`.
   Provider implementations must emit exactly one explicit event kind and terminate
   with `COMPLETED` or `FAILED`; only `COMPLETED` is a successful transaction.
@@ -80,6 +84,12 @@ How to update:
 
 ### Added
 
+- Added a Run-owned host process supervisor with opaque `ProcessHandle` values,
+  immutable snapshots, incremental bounded UTF-8 output, complete workspace logs,
+  stdin and POSIX PTY interaction, active-process limits, and graceful process-group
+  shutdown with forced escalation. Journal-enabled background starts persist exactly
+  one `process.started` and `process.terminal` record, and a failed started-record
+  write reaps the process before returning an error.
 - Added durable model request snapshots and guarded OpenAI Responses continuation.
   `model.completed` records the exact credential-redacted Provider input plus an
   optional Run-bound handle. Resume reuses a handle only when provider, model,

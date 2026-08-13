@@ -1093,7 +1093,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             self._runtime_inbox.close(self._active_run_id)
             self._notify_run_end(result)
             self._clear_active_context()
-            self._teardown_env()
+            await self._teardown_env()
             await self._ateardown_toolsets(
                 {
                     "state": state,
@@ -1208,7 +1208,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             journal_interrupted = True
         finally:
             self._runtime_inbox.close(self._active_run_id)
-            self._teardown_env()
+            await self._teardown_env()
             await self._ateardown_toolsets(
                 {
                     "state": state,
@@ -2479,8 +2479,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     ) -> Optional[Env]:
         return self._env_runtime.build_env_from_spec(env_spec, fallback_workspace)
 
-    def _teardown_env(self) -> None:
-        self._env_runtime.teardown_env()
+    async def _teardown_env(self) -> None:
+        await self._env_runtime.teardown_env()
 
     def _run_env_step(
         self,
