@@ -866,6 +866,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         return self._checkpoint_store
 
     @property
+    def last_checkpoint_id(self) -> Optional[CheckpointId]:
+        """Return the latest successfully committed checkpoint id, if any."""
+        return self._last_checkpoint_id
+
+    @property
     def tracing_provider(self) -> Any:
         """Return the configured TracingProvider, if any."""
         return self._tracing_provider
@@ -2091,6 +2096,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             else type(self.agent.init_state(task_text))
         )
         state = state_type.from_dict(checkpoint.state_data)
+        self._last_checkpoint_id = checkpoint.id
         if state.stop_reason:
             if self.trace_writer is not None:
                 task_obj = task if isinstance(task, Task) else None

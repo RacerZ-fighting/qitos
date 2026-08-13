@@ -34,6 +34,8 @@ How to update:
 - `AgentModule.mcp_servers` now forms a complete opt-in Engine lifecycle: an empty
   list is inert, while configured servers connect after preflight, expose bounded
   `mcp__server__tool` names for the first model turn, and close at run end.
+- Added the read-only `Engine.last_checkpoint_id` lifecycle property so hooks can
+  detect durable checkpoint advancement without depending on Engine internals.
 - Added read-only bundled Skill roots to `SkillToolSet`, with atomic validation,
   stable bounded `list_skills` summaries, and exact-name full-content `load_skill`
   disclosure independent of provider search and installation.

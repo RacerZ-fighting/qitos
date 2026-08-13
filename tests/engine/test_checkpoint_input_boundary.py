@@ -155,6 +155,7 @@ async def test_input_checkpoint_is_visible_while_first_provider_request_blocks()
         checkpoint_store=store,
         budget=RuntimeBudget(max_steps=3),
     )
+    assert engine.last_checkpoint_id is None
     run_task = asyncio.create_task(
         engine.arun(
             "new task",
@@ -168,6 +169,7 @@ async def test_input_checkpoint_is_visible_while_first_provider_request_blocks()
         thread_id = engine._active_run_id
         input_tuple = await store.get_tuple(CheckpointConfig(thread_id=thread_id))
         assert input_tuple is not None
+        assert engine.last_checkpoint_id == input_tuple.checkpoint.id
         assert input_tuple.metadata["source"] == "input"
         assert input_tuple.checkpoint.step == 0
         assert input_tuple.checkpoint.task_text == "new task"
@@ -263,13 +265,14 @@ async def test_terminal_checkpoint_resume_does_not_execute_another_step(
         before = await store.list(CheckpointConfig(thread_id=completed.run_id))
         resumed_model = _FinalModel(uuid4().hex)
         trace_id = f"resume-{uuid4().hex}"
-
-        resumed = await Engine(
+        resumed_engine = Engine(
             _Agent(resumed_model),
             checkpoint_store=store,
             budget=RuntimeBudget(max_steps=3),
             trace_writer=TraceWriter(str(tmp_path), trace_id),
-        ).aresume_from_checkpoint(before[0].config)
+        )
+
+        resumed = await resumed_engine.aresume_from_checkpoint(before[0].config)
 
         after = await store.list(CheckpointConfig(thread_id=completed.run_id))
         assert resumed.state.to_dict() == completed.state.to_dict()
@@ -277,6 +280,7 @@ async def test_terminal_checkpoint_resume_does_not_execute_another_step(
         assert resumed.records == []
         assert resumed.events == []
         assert resumed_model.calls == 0
+        assert resumed_engine.last_checkpoint_id == before[0].checkpoint.id
         assert [item.config for item in after] == [item.config for item in before]
         manifest = json.loads(
             (tmp_path / trace_id / "manifest.json").read_text(encoding="utf-8")
