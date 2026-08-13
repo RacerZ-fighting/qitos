@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence
+
+from .process import ProcessHandle, ProcessSnapshot
+
+if TYPE_CHECKING:
+    from .journal import SessionJournal
 
 
 @dataclass
@@ -133,6 +139,11 @@ class Env(ABC):
         """Symmetric shutdown hook called by runtime."""
         self.close()
 
+    async def ateardown(self) -> None:
+        """Release legacy environment resources outside the event loop."""
+
+        await asyncio.to_thread(self.teardown)
+
 
 class FileSystemCapability(ABC):
     """Root-scoped filesystem contract used by environment implementations."""
@@ -204,7 +215,7 @@ class CommandCapability(ABC):
     """Command execution capability contract used by env implementations."""
 
     @abstractmethod
-    async def arun(self, command: str, timeout: int = 30) -> Dict[str, Any]:
+    async def arun(self, command: str, timeout: float = 30) -> Dict[str, Any]:
         """Run one shell command without blocking the owning event loop."""
 
     @abstractmethod
@@ -212,7 +223,7 @@ class CommandCapability(ABC):
         self,
         argv: Sequence[str],
         *,
-        timeout: int = 30,
+        timeout: float = 30,
         cwd: str | None = None,
         stdin: bytes | None = None,
     ) -> Dict[str, Any]:
@@ -233,16 +244,90 @@ class CommandCapability(ABC):
     ) -> Dict[str, Any]:
         """Run one process without interpreting arguments through a shell."""
 
-    def start(
+    async def astart(
         self,
         command: str,
         *,
+        owner_run_id: str,
         cwd: str | None = None,
-        stdout_path: str | None = None,
-    ) -> Dict[str, Any]:
-        """Start one background shell command when the provider supports it."""
+        tty: bool = False,
+        journal: SessionJournal | None = None,
+    ) -> ProcessSnapshot:
+        """Start one Run-owned background command when supported."""
 
-        raise NotImplementedError("background commands are not supported")
+        _ = command, owner_run_id, cwd, tty, journal
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def apoll(self, handle: ProcessHandle) -> ProcessSnapshot:
+        """Return the current process state without waiting for new output."""
+
+        _ = handle
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def aread(
+        self,
+        handle: ProcessHandle,
+        *,
+        cursor: int = 0,
+        wait_seconds: float = 0.0,
+    ) -> ProcessSnapshot:
+        """Read bounded incremental output, optionally waiting for a change."""
+
+        _ = handle, cursor, wait_seconds
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def awrite(
+        self,
+        handle: ProcessHandle,
+        data: str,
+    ) -> ProcessSnapshot:
+        """Write UTF-8 input to a live process and return its new state."""
+
+        _ = handle, data
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def await_process(
+        self,
+        handle: ProcessHandle,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> ProcessSnapshot:
+        """Wait until terminal or until the supplied absolute deadline."""
+
+        _ = handle, deadline_monotonic
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def aterminate(self, handle: ProcessHandle) -> ProcessSnapshot:
+        """Terminate a live process group and await its terminal snapshot."""
+
+        _ = handle
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def alist(
+        self,
+        *,
+        owner_run_id: str | None = None,
+    ) -> tuple[ProcessSnapshot, ...]:
+        """List tracked processes in stable start order."""
+
+        _ = owner_run_id
+        raise NotImplementedError("managed background commands are not supported")
+
+    async def arecover(
+        self,
+        *,
+        owner_run_id: str,
+        journal: SessionJournal,
+    ) -> tuple[ProcessSnapshot, ...]:
+        """Restore terminal observations and close interrupted ownership gaps."""
+
+        _ = owner_run_id, journal
+        return ()
+
+    async def aclose(self) -> None:
+        """Terminate owned live processes and await all runtime Tasks."""
+
+        return None
 
 
 class TerminalCapability(ABC):

@@ -7,7 +7,6 @@ import base64
 import shlex
 import subprocess
 import threading
-import uuid
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterator, Optional, Sequence
@@ -31,7 +30,7 @@ class DockerCommandCapability(CommandCapability):
         self.container = container
         self.workdir = workdir
 
-    async def arun(self, command: str, timeout: int = 30) -> Dict[str, Any]:
+    async def arun(self, command: str, timeout: float = 30) -> Dict[str, Any]:
         if not command or not command.strip():
             return {"status": "error", "error": "empty command"}
         docker_cmd = [
@@ -75,7 +74,7 @@ class DockerCommandCapability(CommandCapability):
         self,
         argv: Sequence[str],
         *,
-        timeout: int = 30,
+        timeout: float = 30,
         cwd: str | None = None,
         stdin: bytes | None = None,
     ) -> Dict[str, Any]:
@@ -162,50 +161,6 @@ class DockerCommandCapability(CommandCapability):
             "stdout": result.stdout.decode("utf-8", errors="replace"),
             "stderr": result.stderr.decode("utf-8", errors="replace"),
             "argv": args,
-            "container": self.container,
-            "cwd": workdir,
-        }
-
-    def start(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        stdout_path: str | None = None,
-    ) -> Dict[str, Any]:
-        if not command or not command.strip():
-            raise ValueError("command cannot be empty")
-        workdir = self.workdir if cwd is None else _docker_scoped_path(self.workdir, cwd)
-        relative_log = stdout_path or f".qitos/background/{uuid.uuid4().hex}.log"
-        log_path = _docker_scoped_path(self.workdir, relative_log)
-        shell_command = (
-            f"mkdir -p -- {shlex.quote(str(PurePosixPath(log_path).parent))} && "
-            f"({command}) > {shlex.quote(log_path)} 2>&1 & echo $!"
-        )
-        result = _run(
-            [
-                "docker",
-                "exec",
-                "-w",
-                workdir,
-                self.container,
-                "sh",
-                "-lc",
-                shell_command,
-            ]
-        )
-        if result.returncode != 0:
-            return {
-                "status": "error",
-                "error": result.stderr or "failed to start background command",
-                "command": command,
-                "container": self.container,
-            }
-        return {
-            "status": "success",
-            "command": command,
-            "pid": int(result.stdout.strip()),
-            "stdout_path": _relative_docker_path(self.workdir, log_path),
             "container": self.container,
             "cwd": workdir,
         }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import httpx
 
 from qitos.core.env import CommandCapability, FileSystemCapability
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.process import ProcessHandle
 from qitos.kit.env.host_env import HostCommandCapability, HostFSCapability
 from qitos.kit.tool.internal.coding_utils import (
     build_diff,
@@ -61,6 +63,11 @@ def _build_diff(old_content: str, new_content: str, path: str) -> str:
 
 def _default_rule_scope(args: Dict[str, Any]) -> Optional[str]:
     return default_rule_scope(args)
+
+
+def _process_rule_scope(args: Dict[str, Any]) -> Optional[str]:
+    process_id = str(args.get("process_id") or "").strip()
+    return f"process:{process_id}" if process_id else None
 
 
 def _join_capability_path(base: str, child: str) -> str:
@@ -238,7 +245,14 @@ class CodingToolSet:
             "list_tree",
             "make_directory",
         ),
-        "shell": ("run_command",),
+        "shell": (
+            "run_command",
+            "process_list",
+            "process_read",
+            "process_write",
+            "process_wait",
+            "process_terminate",
+        ),
         "web": ("web_fetch",),
         "full": (
             "read_file",
@@ -251,6 +265,11 @@ class CodingToolSet:
             "list_tree",
             "make_directory",
             "run_command",
+            "process_list",
+            "process_read",
+            "process_write",
+            "process_wait",
+            "process_terminate",
             "web_fetch",
             "ask_user_choice",
             "update_plan",
@@ -320,6 +339,11 @@ class CodingToolSet:
     def teardown(self, context: Dict[str, Any]) -> None:
         _ = context
 
+    async def ateardown(self, context: Dict[str, Any]) -> None:
+        _ = context
+        if self._local_process_ops is not None:
+            await self._local_process_ops.aclose()
+
     def tools(self) -> List[Any]:
         tool_names = self._PROFILE_TOOL_NAMES[self.profile]
         items = [
@@ -382,6 +406,42 @@ class CodingToolSet:
         self, runtime_context: Optional[Dict[str, Any]]
     ) -> CommandCapability:
         return select_runtime_ops(runtime_context, "process", self._local_process_ops)
+
+    async def _managed_process_ops(
+        self,
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> tuple[CommandCapability, str]:
+        context = runtime_context or {}
+        run_id = str(context.get("run_id") or "").strip()
+        if not run_id:
+            raise RuntimeError("managed process tools require an active Run")
+        process_ops = self._process_ops(runtime_context)
+        journal = context.get("journal")
+        if journal is not None:
+            required = ("run_id", "replay", "append")
+            if any(not hasattr(journal, name) for name in required):
+                raise TypeError("runtime journal does not satisfy SessionJournal")
+            if str(journal.run_id or "") != run_id:
+                raise RuntimeError("managed process journal belongs to another Run")
+            await process_ops.arecover(owner_run_id=run_id, journal=journal)
+        return process_ops, run_id
+
+    @staticmethod
+    def _process_handle(process_id: str, owner_run_id: str) -> ProcessHandle:
+        return ProcessHandle(
+            process_id=str(process_id or "").strip(),
+            owner_run_id=owner_run_id,
+        )
+
+    @staticmethod
+    def _remaining_seconds(
+        runtime_context: Optional[Dict[str, Any]],
+    ) -> float | None:
+        remaining = (runtime_context or {}).get("remaining_seconds")
+        if not callable(remaining):
+            return None
+        value = remaining()
+        return None if value is None else max(0.0, float(value))
 
     def _require_search_directory(
         self,
@@ -686,6 +746,7 @@ class CodingToolSet:
         self,
         command: str,
         run_in_background: bool = False,
+        tty: bool = False,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -693,6 +754,7 @@ class CodingToolSet:
 
         :param command: Shell command string to execute.
         :param run_in_background: Detach the command and return its task handle.
+        :param tty: Allocate a pseudo-terminal for a managed background command.
         :param runtime_context: Optional runtime context injected by the executor.
         """
         text = str(command or "").strip()
@@ -701,10 +763,179 @@ class CodingToolSet:
         try:
             process_ops = self._process_ops(runtime_context)
             if run_in_background:
-                return process_ops.start(text)
-            return await process_ops.arun(text, timeout=self.shell_timeout)
+                process_ops, run_id = await self._managed_process_ops(runtime_context)
+                context = runtime_context or {}
+                snapshot = await process_ops.astart(
+                    text,
+                    owner_run_id=run_id,
+                    tty=bool(tty),
+                    journal=context.get("journal"),
+                )
+                return snapshot.to_dict()
+            if tty:
+                return {
+                    "status": "error",
+                    "message": "tty requires run_in_background=true",
+                    "command": text,
+                }
+            timeout = float(self.shell_timeout)
+            remaining = self._remaining_seconds(runtime_context)
+            if remaining is not None:
+                timeout = min(timeout, remaining)
+            if timeout <= 0:
+                return {
+                    "status": "error",
+                    "message": "command deadline expired before execution",
+                    "command": text,
+                }
+            return await process_ops.arun(text, timeout=timeout)
         except Exception as exc:
             return {"status": "error", "message": str(exc), "command": text}
+
+    @function_tool(
+        name="process_list",
+        read_only=True,
+        concurrency_safe=True,
+        environment_ops=["process"],
+    )
+    async def process_list(
+        self,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """List background processes owned by the active Run."""
+
+        try:
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            snapshots = await process_ops.alist(owner_run_id=run_id)
+            return {
+                "status": "success",
+                "processes": [snapshot.to_dict() for snapshot in snapshots],
+            }
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+    @function_tool(
+        name="process_read",
+        read_only=True,
+        concurrency_safe=True,
+        environment_ops=["process"],
+    )
+    async def process_read(
+        self,
+        process_id: str,
+        cursor: int = 0,
+        wait_seconds: float = 0.0,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Read incremental output from one active-Run process."""
+
+        try:
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            remaining = self._remaining_seconds(runtime_context)
+            bounded_wait = max(0.0, float(wait_seconds))
+            if remaining is not None:
+                bounded_wait = min(bounded_wait, remaining)
+            snapshot = await process_ops.aread(
+                self._process_handle(process_id, run_id),
+                cursor=int(cursor),
+                wait_seconds=bounded_wait,
+            )
+            return snapshot.to_dict()
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": str(exc),
+                "process_id": process_id,
+            }
+
+    @function_tool(
+        name="process_write",
+        needs_approval=True,
+        environment_ops=["process"],
+        rule_scope_builder=_process_rule_scope,
+    )
+    async def process_write(
+        self,
+        process_id: str,
+        data: str,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Write UTF-8 input to one active-Run process."""
+
+        try:
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            snapshot = await process_ops.awrite(
+                self._process_handle(process_id, run_id),
+                data,
+            )
+            return snapshot.to_dict()
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": str(exc),
+                "process_id": process_id,
+            }
+
+    @function_tool(
+        name="process_wait",
+        read_only=True,
+        concurrency_safe=True,
+        environment_ops=["process"],
+    )
+    async def process_wait(
+        self,
+        process_id: str,
+        timeout_seconds: Optional[float] = None,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Wait for one process without exceeding the current absolute deadline."""
+
+        try:
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            context = runtime_context or {}
+            raw_deadline = context.get("deadline_monotonic")
+            deadline = None if raw_deadline is None else float(raw_deadline)
+            if timeout_seconds is not None:
+                relative = asyncio.get_running_loop().time() + max(
+                    0.0, float(timeout_seconds)
+                )
+                deadline = relative if deadline is None else min(deadline, relative)
+            snapshot = await process_ops.await_process(
+                self._process_handle(process_id, run_id),
+                deadline_monotonic=deadline,
+            )
+            return snapshot.to_dict()
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": str(exc),
+                "process_id": process_id,
+            }
+
+    @function_tool(
+        name="process_terminate",
+        environment_ops=["process"],
+        rule_scope_builder=_process_rule_scope,
+    )
+    async def process_terminate(
+        self,
+        process_id: str,
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Terminate one active-Run process group and await cleanup."""
+
+        try:
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            snapshot = await process_ops.aterminate(
+                self._process_handle(process_id, run_id)
+            )
+            return snapshot.to_dict()
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": str(exc),
+                "process_id": process_id,
+            }
 
     def _read_file_chunk(
         self,

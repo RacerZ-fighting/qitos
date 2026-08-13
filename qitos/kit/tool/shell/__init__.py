@@ -16,13 +16,16 @@ class RunCommand(DelegatingTool):
         *,
         process_env: Mapping[str, str] | None = None,
     ):
-        super().__init__(
-            CodingToolSet(
-                workspace_root=workspace_root,
-                shell_timeout=shell_timeout,
-                process_env=process_env,
-            ).run_command
+        self._toolset = CodingToolSet(
+            workspace_root=workspace_root,
+            shell_timeout=shell_timeout,
+            profile="shell",
+            process_env=process_env,
         )
+        super().__init__(self._toolset.run_command)
+
+    async def aclose(self) -> None:
+        await self._toolset.ateardown({})
 
 
 __all__ = ["RunCommand"]

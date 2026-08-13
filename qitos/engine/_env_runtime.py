@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
@@ -395,14 +396,17 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
                 return None
         return None
 
-    def teardown_env(self) -> None:
+    async def teardown_env(self) -> None:
         engine = self.engine
         if engine.env is None:
             return
         try:
-            engine.env.teardown()
+            await engine.env.ateardown()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             _logger.warning("Env teardown failed: %s", exc)
+            raise
 
     def run_env_step(
         self,

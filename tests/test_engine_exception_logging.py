@@ -1,8 +1,11 @@
 """Tests for engine exception logging and RuntimeBudget defaults."""
+
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from qitos.engine.states import RuntimeBudget
 from qitos.engine.engine import Engine
@@ -81,16 +84,19 @@ def test_env_runtime_logger_exists():
     assert logging.getLogger("qitos.engine._env_runtime") is not None
 
 
-def test_env_teardown_failure_logs_warning(caplog):
-    """Env teardown failure logs a warning."""
+@pytest.mark.asyncio
+async def test_env_teardown_failure_logs_warning(caplog):
+    """Env teardown failure logs and remains observable to the Run owner."""
     from qitos.engine._env_runtime import _EnvRuntime
+
     engine_mock = MagicMock()
     env_mock = MagicMock()
-    env_mock.teardown.side_effect = RuntimeError("teardown crashed")
+    env_mock.ateardown = AsyncMock(side_effect=RuntimeError("teardown crashed"))
     engine_mock.env = env_mock
     rt = _EnvRuntime(engine=engine_mock)
     with caplog.at_level(logging.WARNING, logger="qitos.engine._env_runtime"):
-        rt.teardown_env()
+        with pytest.raises(RuntimeError, match="teardown crashed"):
+            await rt.teardown_env()
     assert any("teardown failed" in r.message.lower() for r in caplog.records)
 
 
@@ -98,6 +104,7 @@ def test_build_env_from_spec_failure_logs_debug(caplog):
     """build_env_from_spec returning None logs debug on import failure."""
     from qitos.engine._env_runtime import _EnvRuntime
     from qitos.engine.states import RuntimeBudget
+
     engine_mock = MagicMock()
     engine_mock.env = None
     engine_mock.budget = RuntimeBudget()
