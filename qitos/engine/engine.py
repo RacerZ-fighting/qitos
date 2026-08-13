@@ -953,11 +953,17 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._active_async_task = current_task
         self._active_async_loop = asyncio.get_running_loop()
         try:
-            return await self._arun_impl(
+            result = await self._arun_impl(
                 task,
                 history_snapshot=history_snapshot,
                 **kwargs,
             )
+        except BaseException:
+            await self._close_journal_after_error()
+            raise
+        else:
+            await self._close_journal()
+            return result
         finally:
             if self._active_async_task is current_task:
                 self._active_async_task = None
@@ -2360,6 +2366,18 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     async def aresume_from_journal(self, run_id: str) -> EngineResult[StateT]:
         """Resume one Run from its canonical journal."""
 
+        try:
+            result = await self._aresume_from_journal_impl(run_id)
+        except BaseException:
+            await self._close_journal_after_error()
+            raise
+        else:
+            await self._close_journal()
+            return result
+
+    async def _aresume_from_journal_impl(self, run_id: str) -> EngineResult[StateT]:
+        """Resume implementation with lifecycle ownership held by the caller."""
+
         journal = self.journal
         if journal is None:
             raise RuntimeError("No journal configured; cannot resume.")
@@ -2469,13 +2487,31 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         journal = self.journal
         if journal is None:
             raise RuntimeError("No journal configured; cannot fork.")
-        if journal.run_id:
-            if journal.run_id != run_id:
-                raise JournalError("journal is already open for another Run")
+        try:
+            if journal.run_id:
+                if journal.run_id != run_id:
+                    raise JournalError("journal is already open for another Run")
+            else:
+                await journal.open(run_id)
+            child_run_id = str(new_run_id or f"run_{uuid4().hex[:12]}")
+            child = await journal.fork(position, child_run_id)
+        except BaseException:
+            await self._close_journal_after_error()
+            raise
         else:
-            await journal.open(run_id)
-        child_run_id = str(new_run_id or f"run_{uuid4().hex[:12]}")
-        return await journal.fork(position, child_run_id)
+            await journal.close()
+            return child
+
+    async def _close_journal(self) -> None:
+        journal = self.journal
+        if journal is not None:
+            await journal.close()
+
+    async def _close_journal_after_error(self) -> None:
+        try:
+            await self._close_journal()
+        except Exception as exc:
+            _logger.warning("Journal close failed while handling an error: %s", exc)
 
     async def aresume_from_checkpoint(
         self,

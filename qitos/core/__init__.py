@@ -28,8 +28,10 @@ from .runtime_input import RuntimeInput
 from .history import History, HistoryMessage, HistoryPolicy, HistorySnapshot
 from .observation import Observation
 from .journal import (
+    JournalClosedError,
     JournalCorruptionError,
     JournalError,
+    JournalOwnershipError,
     JournalPosition,
     JournalRecord,
     JournalRecordRef,
@@ -129,8 +131,10 @@ __all__ = [
     "HistoryPolicy",
     "HistorySnapshot",
     "Observation",
+    "JournalClosedError",
     "JournalCorruptionError",
     "JournalError",
+    "JournalOwnershipError",
     "JournalPosition",
     "JournalRecord",
     "JournalRecordRef",

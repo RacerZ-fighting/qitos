@@ -175,6 +175,7 @@ async def test_engine_persists_one_finalized_terminal_result(tmp_path: Path) -> 
     )
     history_result = result.records[0].action_results[0]
 
+    assert journal.closed is True
     assert agent.executions == 1
     assert terminal.payload["result"] == history_result.to_dict()
     assert terminal.payload["result"]["model_output"] == "canonical"
@@ -291,6 +292,12 @@ class OneShotFailingJournal(JsonlSessionJournal):
         return await super().append(record_type, payload, record_id=record_id)
 
 
+class CloseFailingJournal(FailingJournal):
+    async def close(self) -> None:
+        await super().close()
+        raise RuntimeError("injected close failure")
+
+
 @pytest.mark.asyncio
 async def test_tool_does_not_execute_when_started_record_fails(tmp_path: Path) -> None:
     agent = JournalAgent()
@@ -299,7 +306,21 @@ async def test_tool_does_not_execute_when_started_record_fails(tmp_path: Path) -
     with pytest.raises(JournalError, match="tool.started"):
         await Engine(agent=agent, journal=journal).arun("inspect")
 
+    assert journal.closed is True
     assert agent.executions == 0
+
+
+@pytest.mark.asyncio
+async def test_close_failure_does_not_mask_run_failure(tmp_path: Path) -> None:
+    journal = CloseFailingJournal(
+        tmp_path,
+        fail_type=JournalRecordType.TOOL_STARTED,
+    )
+
+    with pytest.raises(JournalError, match="tool.started"):
+        await Engine(agent=JournalAgent(), journal=journal).arun("inspect")
+
+    assert journal.closed is True
 
 
 @pytest.mark.asyncio
@@ -665,13 +686,15 @@ async def test_fork_resumes_from_committed_boundary_independently(
     )
     forked = await Engine(
         agent=JournalAgent(),
-        journal=JsonlSessionJournal(tmp_path),
+        journal=(source_journal := JsonlSessionJournal(tmp_path)),
     ).afork_journal(
         original.run_id,
         committed.position,
         new_run_id="forked-run",
     )
 
+    assert source_journal.closed is True
+    assert forked.closed is False
     fork_agent = JournalAgent()
     resumed = await Engine(
         agent=fork_agent,
@@ -679,6 +702,7 @@ async def test_fork_resumes_from_committed_boundary_independently(
     ).aresume_from_journal("forked-run")
 
     assert fork_agent.executions == 0
+    assert forked.closed is True
     assert resumed.run_id == "forked-run"
     assert resumed.state.seen == ["canonical"]
     assert resumed.state.final_result == "done"

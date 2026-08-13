@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -19,6 +20,14 @@ class JournalCorruptionError(JournalError):
     """Raised when a journal cannot be replayed without guessing."""
 
 
+class JournalOwnershipError(JournalError):
+    """Raised when another writer already owns the requested Run journal."""
+
+
+class JournalClosedError(JournalError):
+    """Raised when an operation requires a journal whose lifecycle has ended."""
+
+
 class JournalRecordType(str, Enum):
     RUN_STARTED = "run.started"
     INPUT_ACCEPTED = "input.accepted"
@@ -33,7 +42,7 @@ class JournalRecordType(str, Enum):
     INHERITED = "journal.inherited"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class JournalPosition:
     run_id: str
     seq: int
@@ -75,7 +84,7 @@ class ToolTransaction:
     result: ToolResult
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class JournalRecord:
     schema_version: int
     seq: int
@@ -102,7 +111,7 @@ class JournalRecord:
             type=type,
             run_id=run_id,
             timestamp=datetime.now(timezone.utc).isoformat(),
-            payload=dict(payload),
+            payload=copy.deepcopy(dict(payload)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -113,7 +122,7 @@ class JournalRecord:
             "type": self.type.value,
             "run_id": self.run_id,
             "timestamp": self.timestamp,
-            "payload": dict(self.payload),
+            "payload": copy.deepcopy(self.payload),
         }
 
     @classmethod
@@ -157,7 +166,7 @@ class JournalRecord:
             type=record_type,
             run_id=run_id,
             timestamp=timestamp,
-            payload=dict(payload),
+            payload=copy.deepcopy(payload),
         )
 
     @property
@@ -202,6 +211,11 @@ class SessionJournal(Protocol):
     async def flush(self) -> None:
         ...
 
+    async def close(self) -> None:
+        """Flush pending writes and permanently release this journal instance."""
+
+        ...
+
     async def fork(
         self, parent_position: JournalPosition, new_run_id: str
     ) -> "SessionJournal":
@@ -210,7 +224,9 @@ class SessionJournal(Protocol):
 
 __all__ = [
     "JournalCorruptionError",
+    "JournalClosedError",
     "JournalError",
+    "JournalOwnershipError",
     "JournalPosition",
     "JournalRecord",
     "JournalRecordRef",

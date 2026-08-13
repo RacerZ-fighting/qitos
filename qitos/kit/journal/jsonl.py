@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import os
 import sys
 import threading
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ...core.journal import (
+    JournalClosedError,
     JournalCorruptionError,
     JournalError,
     JournalPosition,
@@ -23,9 +25,18 @@ from ...core.journal import (
 )
 from ...core.action import Action
 from ...core.tool_result import ToolResult
+from ._sqlite_index import (
+    JournalFingerprint,
+    JournalIndexError,
+    SqliteJournalIndex,
+)
+from ._writer_lease import JournalWriterLease
 
 FileSync = Callable[[int, str], None]
 DirectorySync = Callable[[Path], None]
+
+_logger = logging.getLogger(__name__)
+_INDEX_FILENAME = "journal.index.sqlite3"
 
 
 class JsonlSessionJournal:
@@ -44,6 +55,9 @@ class JsonlSessionJournal:
         self._run_id = ""
         self._path: Path | None = None
         self._records: list[JournalRecord] = []
+        self._closed = False
+        self._writer_lease: JournalWriterLease | None = None
+        self._sqlite_index: SqliteJournalIndex | None = None
         self._lock = asyncio.Lock()
         self._query_lock = threading.RLock()
         self._terminal_records: dict[JournalRecordRef, JournalRecord] = {}
@@ -59,21 +73,49 @@ class JsonlSessionJournal:
             raise JournalError("journal is not open")
         return self._path
 
+    @property
+    def index_path(self) -> Path:
+        """Return the disposable projection path for the current Run."""
+
+        return self.path.parent / _INDEX_FILENAME
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    async def __aenter__(self) -> "JsonlSessionJournal":
+        if self._closed:
+            raise JournalClosedError("journal is closed")
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.close()
+
     async def create(self, run_id: str, metadata: Mapping[str, Any]) -> JournalPosition:
         _validate_run_id(run_id)
         async with self._lock:
-            if self._path is not None:
-                raise JournalError("journal is already open")
+            self._ensure_can_open()
             await asyncio.to_thread(self._create_sync, run_id)
             self._run_id = run_id
             self._path = self.root / run_id / "journal.jsonl"
             self._records = []
             self._rebuild_tool_transaction_index(())
-            return await self._append_locked(
-                JournalRecordType.RUN_STARTED,
-                dict(metadata),
-                record_id=f"{run_id}:start",
-            )
+            try:
+                self._writer_lease = await asyncio.to_thread(
+                    JournalWriterLease.acquire,
+                    self._path.parent,
+                    run_id,
+                )
+                position = await self._append_locked(
+                    JournalRecordType.RUN_STARTED,
+                    metadata,
+                    record_id=f"{run_id}:start",
+                )
+                await self._rebuild_sqlite_index_locked()
+                return position
+            except BaseException:
+                await self._close_locked(flush=False)
+                raise
 
     def _create_sync(self, run_id: str) -> None:
         run_dir = self.root / run_id
@@ -87,14 +129,27 @@ class JsonlSessionJournal:
     async def open(self, run_id: str) -> None:
         _validate_run_id(run_id)
         async with self._lock:
-            if self._path is not None:
-                raise JournalError("journal is already open")
+            self._ensure_can_open()
             path = self.root / run_id / "journal.jsonl"
-            records = await asyncio.to_thread(self._load_and_repair, path, run_id)
             self._run_id = run_id
             self._path = path
-            self._records = records
-            self._rebuild_tool_transaction_index(records)
+            try:
+                self._writer_lease = await asyncio.to_thread(
+                    JournalWriterLease.acquire,
+                    path.parent,
+                    run_id,
+                )
+                records, sqlite_index = await asyncio.to_thread(
+                    self._load_records,
+                    path,
+                    run_id,
+                )
+                self._records = records
+                self._sqlite_index = sqlite_index
+                self._rebuild_tool_transaction_index(records)
+            except BaseException:
+                await self._close_locked(flush=False)
+                raise
 
     async def append(
         self,
@@ -113,8 +168,7 @@ class JsonlSessionJournal:
         *,
         record_id: str,
     ) -> JournalPosition:
-        if self._path is None:
-            raise JournalError("journal is not open")
+        path = self._require_open_path()
         if not isinstance(record_type, JournalRecordType):
             raise TypeError("record_type must be a JournalRecordType")
         for existing in self._records:
@@ -138,9 +192,10 @@ class JsonlSessionJournal:
             payload=payload,
         )
         encoded = _encode_record(record)
-        await asyncio.to_thread(self._write_sync, self._path, encoded)
+        await asyncio.to_thread(self._write_sync, path, encoded)
         self._records.append(record)
         self._index_tool_transaction_record(record)
+        await self._project_append_locked(record, path)
         return record.position
 
     def _write_sync(self, path: Path, encoded: bytes) -> None:
@@ -151,7 +206,8 @@ class JsonlSessionJournal:
 
     async def replay(self) -> tuple[JournalRecord, ...]:
         async with self._lock:
-            return tuple(self._records)
+            self._require_records_available()
+            return tuple(_clone_record(record) for record in self._records)
 
     def find_tool_transaction(
         self,
@@ -161,6 +217,7 @@ class JsonlSessionJournal:
 
         if not isinstance(reference, JournalRecordRef):
             raise TypeError("reference must be a JournalRecordRef")
+        self._require_records_available()
         with self._query_lock:
             terminal = self._terminal_records.get(reference)
             committed = self._terminal_commits.get(reference)
@@ -210,9 +267,13 @@ class JsonlSessionJournal:
 
     async def flush(self) -> None:
         async with self._lock:
-            if self._path is None:
-                raise JournalError("journal is not open")
-            await asyncio.to_thread(self._flush_sync, self._path)
+            await asyncio.to_thread(self._flush_sync, self._require_open_path())
+
+    async def close(self) -> None:
+        """Flush the canonical file and permanently release writer ownership."""
+
+        async with self._lock:
+            await self._close_locked(flush=True)
 
     def _flush_sync(self, path: Path) -> None:
         with path.open("rb") as stream:
@@ -236,35 +297,183 @@ class JsonlSessionJournal:
                 JournalRecordType.STATE_SNAPSHOT,
             }:
                 raise ValueError("fork position is not a committed boundary")
-            inherited = tuple(self._records[: parent_position.seq])
+            inherited = tuple(
+                _clone_record(record)
+                for record in self._records[: parent_position.seq]
+            )
             await asyncio.to_thread(self._flush_sync, self.path)
         child = type(self)(
             self.root,
             sync_file=self._sync_file,
             sync_directory=self._sync_directory,
         )
-        await child.create(new_run_id, {"forked_from": self._run_id})
-        await child.append(
-            JournalRecordType.RUN_FORKED,
-            {
-                "parent_run_id": self._run_id,
-                "parent_seq": parent_position.seq,
-                "parent_record_id": parent_position.record_id,
-            },
-            record_id=f"{new_run_id}:fork",
-        )
-        for record in inherited:
+        try:
+            await child.create(new_run_id, {"forked_from": self._run_id})
             await child.append(
-                JournalRecordType.INHERITED,
+                JournalRecordType.RUN_FORKED,
                 {
-                    "origin_run_id": record.run_id,
-                    "origin_seq": record.seq,
-                    "origin_record_id": record.record_id,
-                    "record": record.to_dict(),
+                    "parent_run_id": self._run_id,
+                    "parent_seq": parent_position.seq,
+                    "parent_record_id": parent_position.record_id,
                 },
-                record_id=f"{new_run_id}:inherited:{record.record_id}",
+                record_id=f"{new_run_id}:fork",
             )
+            for record in inherited:
+                await child.append(
+                    JournalRecordType.INHERITED,
+                    {
+                        "origin_run_id": record.run_id,
+                        "origin_seq": record.seq,
+                        "origin_record_id": record.record_id,
+                        "record": record.to_dict(),
+                    },
+                    record_id=f"{new_run_id}:inherited:{record.record_id}",
+                )
+        except BaseException:
+            await child.close()
+            raise
         return child
+
+    def _ensure_can_open(self) -> None:
+        if self._closed:
+            raise JournalClosedError("journal is closed")
+        if self._path is not None:
+            raise JournalError("journal is already open")
+
+    def _require_open_path(self) -> Path:
+        if self._closed:
+            raise JournalClosedError("journal is closed")
+        if self._path is None or self._writer_lease is None:
+            raise JournalError("journal is not open")
+        return self._path
+
+    def _require_records_available(self) -> None:
+        if self._path is None:
+            raise JournalError("journal is not open")
+
+    async def _close_locked(self, *, flush: bool) -> None:
+        if self._closed:
+            return
+        path = self._path
+        failure: BaseException | None = None
+        try:
+            if flush and path is not None and self._writer_lease is not None:
+                await asyncio.to_thread(self._flush_sync, path)
+        except BaseException as exc:
+            failure = exc
+        sqlite_index = self._sqlite_index
+        writer_lease = self._writer_lease
+        self._sqlite_index = None
+        self._writer_lease = None
+        self._closed = True
+        if sqlite_index is not None:
+            try:
+                await asyncio.to_thread(sqlite_index.close)
+            except BaseException as exc:
+                failure = self._retain_close_failure(failure, exc)
+        if writer_lease is not None:
+            try:
+                await asyncio.to_thread(writer_lease.release)
+            except BaseException as exc:
+                failure = self._retain_close_failure(failure, exc)
+        if failure is not None:
+            raise failure
+
+    def _retain_close_failure(
+        self,
+        existing: BaseException | None,
+        later: BaseException,
+    ) -> BaseException:
+        if existing is None:
+            return later
+        _logger.warning(
+            "Additional Journal close failure for Run %s: %s",
+            self._run_id,
+            later,
+        )
+        return existing
+
+    def _load_records(
+        self,
+        path: Path,
+        run_id: str,
+    ) -> tuple[list[JournalRecord], SqliteJournalIndex | None]:
+        index_path = path.parent / _INDEX_FILENAME
+        try:
+            loaded = SqliteJournalIndex.load_if_current(
+                index_path,
+                path,
+                run_id,
+            )
+        except JournalIndexError as exc:
+            _logger.warning(
+                "Discarding unreadable Journal projection for Run %s: %s",
+                run_id,
+                exc,
+            )
+            loaded = None
+        if loaded is not None:
+            sqlite_index, records = loaded
+            return records, sqlite_index
+        records = self._load_and_repair(path, run_id)
+        try:
+            sqlite_index = SqliteJournalIndex.rebuild(
+                index_path,
+                path,
+                run_id,
+                records,
+            )
+        except JournalIndexError as exc:
+            _logger.warning(
+                "Journal projection unavailable for Run %s: %s",
+                run_id,
+                exc,
+            )
+            sqlite_index = None
+        return records, sqlite_index
+
+    async def _rebuild_sqlite_index_locked(self) -> None:
+        path = self._require_open_path()
+        try:
+            self._sqlite_index = await asyncio.to_thread(
+                SqliteJournalIndex.rebuild,
+                path.parent / _INDEX_FILENAME,
+                path,
+                self._run_id,
+                self._records,
+            )
+        except JournalIndexError as exc:
+            self._sqlite_index = None
+            _logger.warning(
+                "Journal projection unavailable for Run %s: %s",
+                self._run_id,
+                exc,
+            )
+
+    async def _project_append_locked(
+        self,
+        record: JournalRecord,
+        path: Path,
+    ) -> None:
+        sqlite_index = self._sqlite_index
+        if sqlite_index is None:
+            return
+        try:
+            fingerprint = await asyncio.to_thread(JournalFingerprint.from_path, path)
+            await asyncio.to_thread(
+                sqlite_index.append,
+                record,
+                fingerprint,
+                len(self._records),
+            )
+        except JournalIndexError as exc:
+            _logger.warning(
+                "Journal projection update failed for Run %s: %s",
+                self._run_id,
+                exc,
+            )
+            await asyncio.to_thread(sqlite_index.close)
+            self._sqlite_index = None
 
     def _load_and_repair(self, path: Path, run_id: str) -> list[JournalRecord]:
         try:
@@ -284,14 +493,21 @@ class JsonlSessionJournal:
             is_last = index == len(chunks)
             try:
                 value = json.loads(chunk)
-                if not isinstance(value, dict):
-                    raise JournalCorruptionError("journal record must be an object")
-                record = JournalRecord.from_dict(value)
-            except (UnicodeDecodeError, json.JSONDecodeError, JournalCorruptionError) as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 if is_last and not ends_with_newline:
                     repair_offset = consumed
                     break
                 raise JournalCorruptionError(f"journal corruption at line {index}") from exc
+            if not isinstance(value, dict):
+                raise JournalCorruptionError(
+                    f"journal corruption at line {index}: record must be an object"
+                )
+            try:
+                record = JournalRecord.from_dict(value)
+            except JournalCorruptionError as exc:
+                raise JournalCorruptionError(
+                    f"journal corruption at line {index}: {exc}"
+                ) from exc
             if record.run_id != run_id:
                 raise JournalCorruptionError(f"journal run_id mismatch at line {index}")
             if record.seq != index:
@@ -328,6 +544,10 @@ def _encode_record(record: JournalRecord) -> bytes:
     except (TypeError, ValueError) as exc:
         raise JournalError("journal payload is not JSON serializable") from exc
     return encoded.encode("utf-8") + b"\n"
+
+
+def _clone_record(record: JournalRecord) -> JournalRecord:
+    return JournalRecord.from_dict(record.to_dict())
 
 
 def _origin_record(record: JournalRecord) -> JournalRecord:
