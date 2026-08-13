@@ -32,7 +32,7 @@ remain read-only and are not dependencies.
 | --- | --- | --- |
 | Turn loop and completion | One immutable async turn, durable Tool lifecycle, deadlines, safe points, typed stop reasons | Complete; preserve with conformance tests |
 | Provider and context | Typed stream/request events, native Responses/Messages/Chat, guarded continuation, canonical transcript | Complete baseline; split oversized implementation without semantic drift after functional gaps |
-| Journal and Session | Canonical JSONL, writer lease, derived per-Run SQLite index, resume/fork | Add a lease-free typed Run catalog, lineage, and nested-fork behavior |
+| Journal and Session | Canonical JSONL, writer lease, derived per-Run SQLite index, lease-free typed catalog, lineage, resume/fork | Complete; keep the journal authoritative and indexes disposable |
 | File and process runtime | Revision-safe files and Run-owned host background processes | Add the same managed contract for a real remote/container backend when its owner is available |
 | Child and Mailbox | Typed Child supervisor and durable safe-point input | Complete baseline; retain one product factory boundary |
 | Skill and resources | Progressive catalog/load/resource tools exist | Audit discovery diagnostics, precedence, reload, and runtime requirements against Pi/Codex |
@@ -58,7 +58,7 @@ Each module plan records:
 
 - [x] Turn transaction, completion policy, model/context recovery, atomic files,
   managed host processes, durable Mailbox, and typed Child lifecycle.
-- [ ] Lease-free Run catalog, lineage, status, and nested fork.
+- [x] Lease-free Run catalog, lineage, status, and nested fork.
 - [ ] Skill/resource alignment.
 - [ ] MCP refresh and admission alignment.
 - [ ] Runtime capability and managed container alignment.
