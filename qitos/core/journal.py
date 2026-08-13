@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -18,6 +19,19 @@ class JournalError(RuntimeError):
 
 class JournalCorruptionError(JournalError):
     """Raised when a journal cannot be replayed without guessing."""
+
+
+class JournalUnsupportedVersionError(JournalError):
+    """Raised when a valid journal uses an unsupported schema version."""
+
+    def __init__(self, found_version: int, supported_version: int) -> None:
+        self.found_version = found_version
+        self.supported_version = supported_version
+        super().__init__(
+            "journal schema version is unsupported: "
+            f"found {found_version}; this QitOS version supports {supported_version}. "
+            "Upgrade QitOS or migrate the journal before replay."
+        )
 
 
 class JournalOwnershipError(JournalError):
@@ -111,7 +125,7 @@ class JournalRecord:
             type=type,
             run_id=run_id,
             timestamp=datetime.now(timezone.utc).isoformat(),
-            payload=copy.deepcopy(dict(payload)),
+            payload=_normalize_json_payload(payload),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -138,8 +152,11 @@ class JournalRecord:
         }
         if set(value) != required:
             raise JournalCorruptionError("journal record fields are invalid")
-        if value["schema_version"] != 1:
-            raise JournalCorruptionError("journal schema version is unsupported")
+        schema_version = value["schema_version"]
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise JournalCorruptionError("journal schema version is invalid")
+        if schema_version != 1:
+            raise JournalUnsupportedVersionError(schema_version, 1)
         seq = value["seq"]
         if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
             raise JournalCorruptionError("journal seq is invalid")
@@ -159,6 +176,12 @@ class JournalRecord:
             record_type = JournalRecordType(str(value["type"]))
         except ValueError as exc:
             raise JournalCorruptionError("journal record type is unsupported") from exc
+        try:
+            canonical_payload = _normalize_json_payload(payload)
+        except JournalError as exc:
+            raise JournalCorruptionError("journal payload is invalid") from exc
+        if not _has_canonical_json_shape(payload):
+            raise JournalCorruptionError("journal payload is not canonical JSON")
         return cls(
             schema_version=1,
             seq=seq,
@@ -166,12 +189,59 @@ class JournalRecord:
             type=record_type,
             run_id=run_id,
             timestamp=timestamp,
-            payload=copy.deepcopy(payload),
+            payload=canonical_payload,
         )
 
     @property
     def position(self) -> JournalPosition:
         return JournalPosition(self.run_id, self.seq, self.record_id)
+
+
+def _normalize_json_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return one isolated JSON representation used by every Journal boundary."""
+
+    if not isinstance(payload, Mapping):
+        raise JournalError("journal payload must be a strict JSON value")
+    try:
+        encoded = json.dumps(
+            dict(payload),
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        normalized = json.loads(encoded)
+    except (OverflowError, RecursionError, TypeError, ValueError) as exc:
+        raise JournalError("journal payload must be a strict JSON value") from exc
+    if not isinstance(normalized, dict):
+        raise JournalError("journal payload must be a strict JSON value")
+    if not _has_only_string_mapping_keys(payload):
+        raise JournalError("journal payload must be a strict JSON value")
+    return normalized
+
+
+def _has_only_string_mapping_keys(value: Any) -> bool:
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _has_only_string_mapping_keys(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return all(_has_only_string_mapping_keys(item) for item in value)
+    return True
+
+
+def _has_canonical_json_shape(value: Any) -> bool:
+    if value is None or type(value) in {bool, int, float, str}:
+        return True
+    if type(value) is list:
+        return all(_has_canonical_json_shape(item) for item in value)
+    if type(value) is dict:
+        return all(
+            type(key) is str and _has_canonical_json_shape(item)
+            for key, item in value.items()
+        )
+    return False
 
 
 class SessionJournal(Protocol):
@@ -231,6 +301,7 @@ __all__ = [
     "JournalRecord",
     "JournalRecordRef",
     "JournalRecordType",
+    "JournalUnsupportedVersionError",
     "SessionJournal",
     "ToolTransaction",
 ]

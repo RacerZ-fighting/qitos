@@ -36,6 +36,7 @@ from .journal import (
     JournalRecord,
     JournalRecordRef,
     JournalRecordType,
+    JournalUnsupportedVersionError,
     SessionJournal,
     ToolTransaction,
 )
@@ -139,6 +140,7 @@ __all__ = [
     "JournalRecord",
     "JournalRecordRef",
     "JournalRecordType",
+    "JournalUnsupportedVersionError",
     "SessionJournal",
     "ToolTransaction",
     "RunSpec",

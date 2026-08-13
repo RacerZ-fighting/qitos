@@ -298,6 +298,13 @@ class CloseFailingJournal(FailingJournal):
         raise RuntimeError("injected close failure")
 
 
+class ForkSourceCloseFailingJournal(JsonlSessionJournal):
+    async def close(self) -> None:
+        await super().close()
+        if self.run_id != "orphan-safe-child":
+            raise RuntimeError("source close failed")
+
+
 @pytest.mark.asyncio
 async def test_tool_does_not_execute_when_started_record_fails(tmp_path: Path) -> None:
     agent = JournalAgent()
@@ -706,6 +713,32 @@ async def test_fork_resumes_from_committed_boundary_independently(
     assert resumed.run_id == "forked-run"
     assert resumed.state.seen == ["canonical"]
     assert resumed.state.final_result == "done"
+
+
+@pytest.mark.asyncio
+async def test_fork_closes_child_when_source_close_fails(tmp_path: Path) -> None:
+    source = JsonlSessionJournal(tmp_path)
+    result = await Engine(agent=JournalAgent(), journal=source).arun("inspect")
+    committed = next(
+        record
+        for record in await source.replay()
+        if record.type is JournalRecordType.STEP_COMMITTED
+    )
+    source_for_fork = ForkSourceCloseFailingJournal(tmp_path)
+
+    with pytest.raises(RuntimeError, match="source close failed"):
+        await Engine(
+            agent=JournalAgent(),
+            journal=source_for_fork,
+        ).afork_journal(
+            result.run_id,
+            committed.position,
+            new_run_id="orphan-safe-child",
+        )
+
+    reopened_child = JsonlSessionJournal(tmp_path)
+    await reopened_child.open("orphan-safe-child")
+    await reopened_child.close()
 
 
 @pytest.mark.asyncio

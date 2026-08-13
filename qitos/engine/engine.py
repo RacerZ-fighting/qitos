@@ -2499,7 +2499,19 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             await self._close_journal_after_error()
             raise
         else:
-            await journal.close()
+            try:
+                await journal.close()
+            except BaseException:
+                try:
+                    await child.close()
+                except BaseException as exc:
+                    _logger.error(
+                        "Forked child Journal close failed while preserving the "
+                        "source close error: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                raise
             return child
 
     async def _close_journal(self) -> None:
