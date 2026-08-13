@@ -198,8 +198,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   conclusion contracts separate persisted Child identity from live Engines. A Run-owned
   async supervisor handles admission, wait, interrupt, terminal state, parent delivery,
   and teardown; durable started/terminal records prevent recovery from replaying a Child,
-  and forks cannot control inherited handles. Shared status, wait, message, and interrupt
-  tools use the same supervisor; `AgentTool` is now a thin launch projection.
+  and forks cannot control inherited handles. Launch policy carries narrowed profile,
+  Tool groups, workspace, and budget, while invocation cleanup owns fresh model
+  resources. Shared status, wait, message, and interrupt tools use the same supervisor;
+  `AgentTool` is now a thin launch projection.
 - **Environment-backed coding tools**: named Env capability groups now let the same
   bounded workspace tools run against host, container, or remote providers. The compact
   workspace profile exposes one lowercase surface (`read_file`, `write_file`,

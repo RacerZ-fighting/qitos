@@ -95,6 +95,10 @@ How to update:
 
 ### Added
 
+- `AgentTool` composition can now populate the Child profile, allowed Tool groups, and
+  working directory in each immutable launch request. `ChildInvocation.cleanup` gives
+  the supervisor explicit async ownership of per-Child model and trace resources across
+  success, failure, and cancellation.
 - Added a reusable Run-owned `ChildSupervisor`. It admits fresh Engines under one async
   concurrency limit, supports non-destructive wait and bounded interrupt, stores
   terminal results before parent delivery, and continues to own delivery tasks until

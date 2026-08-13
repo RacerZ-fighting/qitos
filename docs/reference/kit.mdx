@@ -724,6 +724,9 @@ tool = AgentTool(
     execution_mode="background",
     max_delegate_depth=1,
     child_budget=TaskBudget(max_steps=200),
+    child_profile="restricted",
+    child_allowed_tool_groups=("filesystem.read", "network"),
+    child_working_directory="/workspace",
 )
 registry.register(tool)
 registry.register_toolset(ChildControlToolSet(tool.supervisor), namespace="")
@@ -738,7 +741,9 @@ The result reports output, steps, total tokens, elapsed time, stop reason, and r
 factories receive it on `ChildLaunchRequest.budget`, together with the task, profile,
 allowed tool groups, and working-directory fields needed by a product composition.
 The factory returns a `ChildInvocation`; live Engine objects never enter persisted child
-requests or results.
+requests or results. If the invocation creates a model client, trace, or other live
+resource, set its async `cleanup` callback. The supervisor awaits cleanup after success,
+failure, or cancellation before publishing the terminal result.
 
 `execution_mode` accepts `"foreground"`, `"optional_background"`, or `"background"`.
 The optional mode exposes `run_in_background` to the model. The background mode omits

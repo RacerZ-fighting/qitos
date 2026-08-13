@@ -34,6 +34,9 @@ class AgentTool(BaseTool):
         max_background_workers: int = 4,
         max_delegate_depth: int = 1,
         child_budget: TaskBudget | None = None,
+        child_profile: str = "default",
+        child_allowed_tool_groups: tuple[str, ...] = (),
+        child_working_directory: str | None = None,
         supervisor: ChildSupervisor | None = None,
     ) -> None:
         if max_delegate_depth <= 0:
@@ -43,6 +46,22 @@ class AgentTool(BaseTool):
         )
         if not isinstance(resolved_budget, TaskBudget):
             raise TypeError("child_budget must be a TaskBudget")
+        if not isinstance(child_profile, str) or not child_profile.strip():
+            raise ValueError("child_profile must be a non-empty string")
+        if not isinstance(child_allowed_tool_groups, tuple) or any(
+            not isinstance(group, str) or not group.strip()
+            for group in child_allowed_tool_groups
+        ):
+            raise TypeError(
+                "child_allowed_tool_groups must contain non-empty strings"
+            )
+        if child_working_directory is not None and (
+            not isinstance(child_working_directory, str)
+            or not child_working_directory.strip()
+        ):
+            raise ValueError(
+                "child_working_directory must be a non-empty string or None"
+            )
         if execution_mode not in {
             "foreground",
             "optional_background",
@@ -70,6 +89,15 @@ class AgentTool(BaseTool):
         self._execution_mode = execution_mode
         self._max_delegate_depth = max_delegate_depth
         self._child_budget = resolved_budget
+        self._child_profile = child_profile.strip()
+        self._child_allowed_tool_groups = tuple(
+            dict.fromkeys(group.strip() for group in child_allowed_tool_groups)
+        )
+        self._child_working_directory = (
+            child_working_directory.strip()
+            if child_working_directory is not None
+            else None
+        )
 
         parameters: dict[str, dict[str, Any]] = {
             "description": {
@@ -179,6 +207,9 @@ class AgentTool(BaseTool):
             description=description,
             name=str(args.get("name", "")).strip(),
             agent_type=agent_type,
+            profile=self._child_profile,
+            allowed_tool_groups=self._child_allowed_tool_groups,
+            working_directory=self._child_working_directory,
             budget=self._child_budget,
         )
         try:

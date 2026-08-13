@@ -23,6 +23,10 @@ def _request(task: str = "inspect") -> ChildLaunchRequest:
     return ChildLaunchRequest(task=task, description=f"{task} task")
 
 
+async def _set_event(event: asyncio.Event) -> None:
+    event.set()
+
+
 class _CompletingEngine:
     active_run_id = "child-run"
 
@@ -166,6 +170,7 @@ async def test_terminal_delivery_remains_owned_until_close() -> None:
 async def test_interrupt_waits_for_started_child_cleanup() -> None:
     started = asyncio.Event()
     cleaned = asyncio.Event()
+    resource_closed = asyncio.Event()
 
     class Engine:
         active_run_id = "child-run"
@@ -185,6 +190,7 @@ async def test_interrupt_waits_for_started_child_cleanup() -> None:
         invocation_factory=lambda request, _context: ChildInvocation(
             engine=Engine(),
             task=request.task,
+            cleanup=lambda: _set_event(resource_closed),
         )
     )
     launched = await supervisor.launch(
@@ -200,8 +206,34 @@ async def test_interrupt_waits_for_started_child_cleanup() -> None:
     assert terminal is not None
     assert terminal.status is ChildStatus.CANCELLED
     assert cleaned.is_set()
+    assert resource_closed.is_set()
     assert supervisor.active_count == 0
     assert await supervisor.aclose(wait_seconds=0) == 0
+
+
+@pytest.mark.asyncio
+async def test_invocation_cleanup_failure_is_a_terminal_child_failure() -> None:
+    async def fail_cleanup() -> None:
+        raise RuntimeError("cleanup failed")
+
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: ChildInvocation(
+            engine=_CompletingEngine(),
+            task=request.task,
+            cleanup=fail_cleanup,
+        )
+    )
+
+    result = await supervisor.launch(
+        _request(),
+        {},
+        parent_run_id="parent-run",
+        background=False,
+    )
+
+    assert result.status is ChildStatus.FAILED
+    assert result.error == "cleanup failed"
+    await supervisor.aclose()
 
 
 @pytest.mark.asyncio
