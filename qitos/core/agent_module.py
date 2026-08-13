@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 
@@ -485,10 +486,11 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         if max_steps is None and workspace is None:
             return task
 
-        task_id = f"{self.name}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        objective = str(task)
+        task_digest = hashlib.sha256(objective.encode("utf-8")).hexdigest()[:16]
         return Task(
-            id=task_id,
-            objective=str(task),
+            id=f"task_{task_digest}",
+            objective=objective,
             env_spec=(
                 EnvSpec(type="host", config={"workspace_root": workspace})
                 if workspace is not None and env is not None
