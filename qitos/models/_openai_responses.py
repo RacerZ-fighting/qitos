@@ -10,7 +10,6 @@ from ..core.model_response import ModelResponse
 from .transport import close_async_resource
 from .base import Model, ModelStreamChunk
 
-
 OPENAI_API_MODES = {"chat_completions", "responses"}
 _RESPONSES_REQUIREMENT = (
     "api_mode='responses' requires an OpenAI client and endpoint that "
@@ -234,7 +233,23 @@ def _response_output_text(response: Any, native_items: List[Dict[str, Any]]) -> 
         for block in item.get("content") or []:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") in {"output_text", "text"} and block.get("text"):
+            block_type = str(block.get("type") or "")
+            if block_type in {"output_text", "text"} and block.get("text"):
+                parts.append(str(block["text"]))
+            elif block_type == "refusal" and block.get("refusal"):
+                parts.append(str(block["refusal"]))
+    return "".join(parts)
+
+
+def _response_reasoning_text(native_items: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for item in native_items:
+        if item.get("type") != "reasoning":
+            continue
+        for block in item.get("summary") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in {"summary_text", "text"} and block.get("text"):
                 parts.append(str(block["text"]))
     return "".join(parts)
 
@@ -250,9 +265,14 @@ def _model_response_from_responses(
         if isinstance(native_output, list)
         else []
     )
+    status = _field(response, "status")
+    terminal_status = str(status or "").strip().casefold()
     tool_calls: List[Dict[str, Any]] = []
     for item in native_items:
         if item.get("type") != "function_call":
+            continue
+        item_status = str(item.get("status") or "").strip().casefold()
+        if terminal_status == "incomplete" or item_status not in {"", "completed"}:
             continue
         call_id = str(item.get("call_id") or "").strip()
         name = str(item.get("name") or "").strip()
@@ -272,7 +292,6 @@ def _model_response_from_responses(
                 },
             }
         )
-    status = _field(response, "status")
     incomplete_details = _native_value(_field(response, "incomplete_details"))
     incomplete_reason = (
         str(incomplete_details.get("reason"))
@@ -304,6 +323,7 @@ def _model_response_from_responses(
         ),
         provider=provider,
         metadata=metadata,
+        reasoning_content=_response_reasoning_text(native_items) or None,
         native_items=native_items or None,
     )
 
@@ -351,9 +371,60 @@ def _request_payload(
 def _event_metadata(event: Any) -> Dict[str, Any]:
     return {
         key: value
-        for key in ("sequence_number", "output_index", "content_index", "item_id")
+        for key in (
+            "sequence_number",
+            "output_index",
+            "content_index",
+            "summary_index",
+            "item_id",
+            "call_id",
+        )
         if (value := _field(event, key)) is not None
     }
+
+
+def _event_response_metadata(event: Any) -> Dict[str, Any]:
+    metadata = _event_metadata(event)
+    response = _native_value(_field(event, "response"))
+    if isinstance(response, dict):
+        if response.get("id") is not None:
+            metadata["response_id"] = response["id"]
+        if response.get("status") is not None:
+            metadata["status"] = response["status"]
+    return metadata
+
+
+def _function_event_key(event: Any, item: Dict[str, Any] | None = None) -> str:
+    values = item or {}
+    item_id = str(values.get("id") or _field(event, "item_id") or "").strip()
+    if item_id:
+        return f"item:{item_id}"
+    call_id = str(values.get("call_id") or _field(event, "call_id") or "").strip()
+    if call_id:
+        return f"call:{call_id}"
+    output_index = _field(event, "output_index")
+    if isinstance(output_index, int) and not isinstance(output_index, bool):
+        return f"output:{output_index}"
+    return ""
+
+
+def _missing_stream_suffix(
+    complete: str,
+    streamed: str,
+    *,
+    field_name: str,
+) -> str:
+    if not complete:
+        return ""
+    if not streamed:
+        return complete
+    if complete.startswith(streamed):
+        return complete[len(streamed) :]
+    raise ModelTransportError(
+        f"completed response {field_name} does not match streamed deltas",
+        attempts=1,
+        retryable=False,
+    )
 
 
 def _native_item_identity(item: Dict[str, Any]) -> tuple[str, str] | None:
@@ -414,6 +485,9 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
         self._iterator = events.__aiter__()
         self._provider = provider
         self._completed_items: List[Dict[str, Any]] = []
+        self._function_arguments: Dict[str, str] = {}
+        self._streamed_text = ""
+        self._streamed_reasoning = ""
         self._finished = False
 
     def __aiter__(self) -> _ResponsesEventStream:
@@ -431,11 +505,18 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                     attempts=1,
                     retryable=True,
                 ) from exc
-            event_type = str(_field(event, "type", "") or "")
+            event_type = str(_field(event, "type", "") or "")[:128]
+            if not event_type:
+                raise ModelTransportError(
+                    "model stream emitted an event without a type",
+                    attempts=1,
+                    retryable=False,
+                )
             metadata = _event_metadata(event)
             if event_type == "response.output_text.delta":
                 delta = str(_field(event, "delta", "") or "")
                 if delta:
+                    self._streamed_text += delta
                     return ModelStreamChunk(
                         text=delta,
                         event_type=event_type,
@@ -448,6 +529,7 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
             }:
                 delta = str(_field(event, "delta", "") or "")
                 if delta:
+                    self._streamed_reasoning += delta
                     return ModelStreamChunk(
                         reasoning_content=delta,
                         event_type=event_type,
@@ -458,36 +540,128 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                 "response.function_call_arguments.delta",
                 "response.function_call_arguments.done",
             }:
-                metadata["arguments_delta"] = str(_field(event, "delta", "") or "")
+                key = _function_event_key(event)
+                if not key:
+                    raise ModelTransportError(
+                        f"{event_type} is missing an item identity",
+                        attempts=1,
+                        retryable=False,
+                    )
+                delta = str(_field(event, "delta", "") or "")
+                if event_type.endswith(".delta"):
+                    self._function_arguments[key] = (
+                        self._function_arguments.get(key, "") + delta
+                    )
+                    metadata["arguments_delta"] = delta
                 arguments = _field(event, "arguments")
                 if arguments is not None:
-                    metadata["arguments"] = str(arguments)
+                    completed_arguments = str(arguments)
+                    streamed_arguments = self._function_arguments.get(key, "")
+                    if streamed_arguments and completed_arguments != streamed_arguments:
+                        raise ModelTransportError(
+                            "completed function arguments do not match streamed deltas",
+                            attempts=1,
+                            retryable=False,
+                        )
+                    self._function_arguments[key] = completed_arguments
+                metadata["arguments_chars"] = len(self._function_arguments.get(key, ""))
+                return ModelStreamChunk(
+                    event_type=event_type,
+                    event_metadata=metadata,
+                )
+            if event_type == "response.refusal.delta":
+                delta = str(_field(event, "delta", "") or "")
+                if delta:
+                    self._streamed_text += delta
+                    return ModelStreamChunk(
+                        text=delta,
+                        event_type=event_type,
+                        event_metadata=metadata,
+                    )
+                continue
+            if event_type == "response.output_item.added":
+                item = _native_value(_field(event, "item"))
+                if not isinstance(item, dict):
+                    raise ModelTransportError(
+                        "response.output_item.added is missing a valid item",
+                        attempts=1,
+                        retryable=False,
+                    )
+                metadata["item_type"] = str(item.get("type") or "")
+                if item.get("call_id") is not None:
+                    metadata["call_id"] = item["call_id"]
+                if item.get("type") == "function_call":
+                    key = _function_event_key(event, item)
+                    if key:
+                        self._function_arguments.setdefault(
+                            key, str(item.get("arguments") or "")
+                        )
                 return ModelStreamChunk(
                     event_type=event_type,
                     event_metadata=metadata,
                 )
             if event_type == "response.output_item.done":
                 item = _native_value(_field(event, "item"))
-                if isinstance(item, dict):
-                    native_item = dict(item)
-                    self._completed_items.append(native_item)
-                    return ModelStreamChunk(
-                        native_items=[native_item],
-                        event_type=event_type,
-                        event_metadata=metadata,
+                if not isinstance(item, dict):
+                    raise ModelTransportError(
+                        "response.output_item.done is missing a valid item",
+                        attempts=1,
+                        retryable=False,
                     )
-                continue
+                native_item = dict(item)
+                if native_item.get("type") == "function_call":
+                    key = _function_event_key(event, native_item)
+                    # output_item.done is the authoritative completed item. Delta
+                    # delivery may be coalesced or omitted by compatible endpoints.
+                    if key:
+                        self._function_arguments.pop(key, None)
+                self._completed_items.append(native_item)
+                return ModelStreamChunk(
+                    native_items=[native_item],
+                    event_type=event_type,
+                    event_metadata=metadata,
+                )
             if event_type in {"response.completed", "response.incomplete"}:
+                raw_response = _native_value(_field(event, "response"))
+                if not isinstance(raw_response, dict):
+                    raise ModelTransportError(
+                        f"{event_type} is missing a valid response",
+                        attempts=1,
+                        retryable=False,
+                    )
+                expected_status = (
+                    "completed" if event_type == "response.completed" else "incomplete"
+                )
+                reported_status = str(raw_response.get("status") or "").casefold()
+                if reported_status and reported_status != expected_status:
+                    raise ModelTransportError(
+                        f"{event_type} carries conflicting status {reported_status!r}",
+                        attempts=1,
+                        retryable=False,
+                    )
+                raw_response["status"] = expected_status
                 response = _merge_completed_output(
-                    _field(event, "response"),
+                    raw_response,
                     self._completed_items,
                 )
                 normalized = _model_response_from_responses(
                     response,
                     provider=self._provider,
                 )
+                text_suffix = _missing_stream_suffix(
+                    normalized.text,
+                    self._streamed_text,
+                    field_name="text",
+                )
+                reasoning_suffix = _missing_stream_suffix(
+                    normalized.reasoning_content or "",
+                    self._streamed_reasoning,
+                    field_name="reasoning",
+                )
                 self._finished = True
                 return ModelStreamChunk(
+                    text=text_suffix,
+                    reasoning_content=reasoning_suffix or None,
                     done=True,
                     usage=normalized.usage,
                     tool_calls=normalized.tool_calls,
@@ -499,10 +673,31 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
             if event_type in {"response.failed", "error"}:
                 error = _field(event, "error") or _field(event, "response")
                 raise ModelTransportError(
-                    f"model stream failed: {error}",
+                    f"model stream failed: {str(error)[:1000]}",
                     attempts=1,
                     retryable=False,
                 )
+            if event_type in {
+                "response.created",
+                "response.in_progress",
+                "response.content_part.added",
+                "response.content_part.done",
+                "response.output_text.done",
+                "response.refusal.done",
+                "response.reasoning_summary_part.added",
+                "response.reasoning_summary_part.done",
+                "response.reasoning_summary_text.done",
+                "response.reasoning_text.done",
+            }:
+                return ModelStreamChunk(
+                    event_type=event_type,
+                    event_metadata=_event_response_metadata(event),
+                )
+            metadata["unrecognized_provider_event"] = True
+            return ModelStreamChunk(
+                event_type=event_type,
+                event_metadata=metadata,
+            )
 
     async def aclose(self) -> None:
         self._finished = True

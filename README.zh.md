@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **完整的 Responses 流生命周期**：Responses adapter 现在保留 lifecycle/item
+  事件、refusal、仅出现在终态的文本/reasoning，以及相互独立的交错函数参数。
+  incomplete 或互相矛盾的终态不会变成可执行工具调用。
 - **来源明确的 token 统计**：Engine context telemetry 现在区分 Provider 实测、
   本地估算与缺失 usage。Provider 返回的零值不会被本地估算覆盖；cache read/write
   与 reasoning 子项保持可见，同时不会被重复计入累计总量。

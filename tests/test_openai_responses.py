@@ -15,6 +15,7 @@ import pytest
 from qitos.core import ModelTransportError
 from qitos.core.model_response import ModelResponse
 from qitos.models._openai_responses import (
+    _ResponsesEventStream,
     _model_response_from_responses,
     _to_responses_input,
     _to_responses_tool_choice,
@@ -222,6 +223,260 @@ def test_responses_normalization_preserves_order_ids_and_usage() -> None:
     }
 
 
+def test_responses_normalization_preserves_refusal_content() -> None:
+    refusal = f"refusal-{time.monotonic_ns()}"
+
+    normalized = _model_response_from_responses(
+        {
+            "id": "response-refusal",
+            "status": "completed",
+            "model": "gpt-test",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "message-refusal",
+                    "content": [{"type": "refusal", "refusal": refusal}],
+                }
+            ],
+        },
+        provider="openai",
+    )
+
+    assert normalized.text == refusal
+    assert normalized.native_items is not None
+    assert normalized.native_items[0]["content"][0]["refusal"] == refusal
+
+
+@pytest.mark.asyncio
+async def test_responses_lifecycle_backfills_terminal_only_content() -> None:
+    response_id = f"resp_{time.monotonic_ns()}"
+    answer = f"answer-{time.monotonic_ns()}"
+    reasoning = f"reasoning-{time.monotonic_ns()}"
+    events = _AsyncListStream(
+        [
+            {
+                "type": "response.created",
+                "response": {"id": response_id, "status": "in_progress"},
+            },
+            {
+                "type": "response.in_progress",
+                "response": {"id": response_id, "status": "in_progress"},
+            },
+            {
+                "type": "response.output_item.added",
+                "item": {"type": "message", "id": "message"},
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "id": "reasoning",
+                    "summary": [{"type": "summary_text", "text": reasoning}],
+                },
+            },
+            {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "message",
+                    "id": "message",
+                    "content": [{"type": "output_text", "text": answer}],
+                },
+            },
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": response_id,
+                    "status": "completed",
+                    "model": "gpt-test",
+                    "output": [],
+                },
+            },
+        ]
+    )
+
+    chunks = [chunk async for chunk in _ResponsesEventStream(events, provider="openai")]
+
+    observed_types = {chunk.event_type for chunk in chunks}
+    assert {
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.completed",
+    } <= observed_types
+    assert "".join(chunk.text for chunk in chunks) == answer
+    assert "".join(chunk.reasoning_content or "" for chunk in chunks) == reasoning
+    assert chunks[-1].done is True
+    assert chunks[-1].event_metadata["id"] == response_id
+
+
+@pytest.mark.asyncio
+async def test_responses_interleaved_function_deltas_keep_separate_state() -> None:
+    call_specs = [
+        ("item-a", "call-a", '{"a":', "1}"),
+        ("item-b", "call-b", '{"b":', "2}"),
+    ]
+    events_payload: list[dict[str, Any]] = []
+    for item_id, call_id, _, _ in call_specs:
+        events_payload.append(
+            {
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": item_id,
+                    "call_id": call_id,
+                    "name": "lookup",
+                    "arguments": "",
+                },
+            }
+        )
+    for fragment_index in range(2):
+        for item_id, _, first, second in call_specs:
+            events_payload.append(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item_id,
+                    "delta": (first, second)[fragment_index],
+                }
+            )
+    completed_items = []
+    for item_id, call_id, first, second in call_specs:
+        completed = {
+            "type": "function_call",
+            "id": item_id,
+            "call_id": call_id,
+            "name": "lookup",
+            "arguments": first + second,
+            "status": "completed",
+        }
+        completed_items.append(completed)
+        events_payload.append({"type": "response.output_item.done", "item": completed})
+    events_payload.append(
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "response-tools",
+                "status": "completed",
+                "model": "gpt-test",
+                "output": [],
+            },
+        }
+    )
+
+    chunks = [
+        chunk
+        async for chunk in _ResponsesEventStream(
+            _AsyncListStream(events_payload), provider="openai"
+        )
+    ]
+
+    streamed_arguments: dict[str, str] = {}
+    streamed_lengths: dict[str, int] = {}
+    for chunk in chunks:
+        if chunk.event_type != "response.function_call_arguments.delta":
+            continue
+        item_id = str(chunk.event_metadata.get("item_id"))
+        streamed_arguments[item_id] = streamed_arguments.get(item_id, "") + str(
+            chunk.event_metadata.get("arguments_delta")
+        )
+        streamed_lengths[item_id] = int(chunk.event_metadata["arguments_chars"])
+    expected_arguments = {
+        item_id: first + second for item_id, _, first, second in call_specs
+    }
+    assert streamed_arguments == expected_arguments
+    assert streamed_lengths == {
+        item_id: len(arguments) for item_id, arguments in expected_arguments.items()
+    }
+    terminal = chunks[-1]
+    assert terminal.done is True
+    assert terminal.tool_calls is not None
+    assert {
+        call["id"]: call["function"]["arguments"] for call in terminal.tool_calls
+    } == {call_id: expected_arguments[item_id] for item_id, call_id, _, _ in call_specs}
+
+
+@pytest.mark.asyncio
+async def test_responses_incomplete_does_not_publish_tool_calls() -> None:
+    partial_item = {
+        "type": "function_call",
+        "id": "partial-item",
+        "call_id": "partial-call",
+        "name": "lookup",
+        "arguments": '{"q":',
+        "status": "in_progress",
+    }
+    events = _AsyncListStream(
+        [
+            {"type": "response.output_item.done", "item": partial_item},
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "id": "response-partial",
+                    "status": "incomplete",
+                    "model": "gpt-test",
+                    "output": [partial_item],
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                },
+            },
+        ]
+    )
+
+    chunks = [chunk async for chunk in _ResponsesEventStream(events, provider="openai")]
+
+    terminal = chunks[-1]
+    assert terminal.done is True
+    assert terminal.finish_reason == "max_output_tokens"
+    assert terminal.tool_calls is None
+    assert terminal.native_items == [partial_item]
+
+
+@pytest.mark.asyncio
+async def test_responses_rejects_malformed_terminal_lifecycle_event() -> None:
+    stream = _ResponsesEventStream(
+        _AsyncListStream([{"type": "response.completed"}]),
+        provider="openai",
+    )
+
+    with pytest.raises(ModelTransportError, match="missing a valid response"):
+        await stream.__anext__()
+
+    conflicting = _ResponsesEventStream(
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.incomplete",
+                    "response": {"id": "response", "status": "completed"},
+                }
+            ]
+        ),
+        provider="openai",
+    )
+    with pytest.raises(ModelTransportError, match="conflicting status"):
+        await conflicting.__anext__()
+
+
+@pytest.mark.asyncio
+async def test_responses_failed_event_is_a_terminal_error() -> None:
+    marker = f"provider-failure-{time.monotonic_ns()}"
+    stream = _ResponsesEventStream(
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {"message": marker},
+                    },
+                }
+            ]
+        ),
+        provider="openai",
+    )
+
+    with pytest.raises(ModelTransportError, match=marker):
+        await stream.__anext__()
+
+
 @pytest.mark.asyncio
 async def test_openai_defaults_to_responses_and_streams_one_complete_transaction(
     monkeypatch: pytest.MonkeyPatch,
@@ -320,8 +575,7 @@ async def test_openai_defaults_to_responses_and_streams_one_complete_transaction
     ]
     assert "".join(chunk.text for chunk in chunks) == "answer"
     assert (
-        "".join(chunk.reasoning_content or "" for chunk in chunks)
-        == "check evidence"
+        "".join(chunk.reasoning_content or "" for chunk in chunks) == "check evidence"
     )
     assert [
         chunk.event_metadata["arguments_delta"]

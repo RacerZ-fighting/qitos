@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Complete Responses stream lifecycle**: Responses adapters retain lifecycle and
+  item events, refusals, terminal-only text/reasoning, and independently interleaved
+  function arguments. Incomplete or contradictory terminal responses cannot become
+  executable tool calls.
 - **Source-aware token accounting**: Engine context telemetry now distinguishes
   provider counts, estimates, and absent usage. Provider zeroes remain authoritative;
   cache read/write and reasoning subsets stay visible without being double-counted in
