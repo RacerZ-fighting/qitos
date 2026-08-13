@@ -223,3 +223,39 @@ async def test_host_capability_exposes_recovery_contract(tmp_path: Path) -> None
 
     await capability.aclose()
     await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_reused_shell_toolset_creates_a_fresh_supervisor_for_each_run(
+    tmp_path: Path,
+) -> None:
+    tools = CodingToolSet(workspace_root=str(tmp_path), profile="shell")
+    first = await tools.run_command.execute(
+        {
+            "command": _python_command("import time; time.sleep(60)"),
+            "run_in_background": True,
+        },
+        runtime_context=_runtime_context("run-1"),
+    )
+    await tools.ateardown({})
+
+    second = await tools.run_command.execute(
+        {
+            "command": _python_command("print('second run')"),
+            "run_in_background": True,
+        },
+        runtime_context=_runtime_context("run-2"),
+    )
+    terminal = await tools.process_wait.execute(
+        {"process_id": second["process_id"]},
+        runtime_context=_runtime_context("run-2"),
+    )
+    stale = await tools.process_read.execute(
+        {"process_id": first["process_id"]},
+        runtime_context=_runtime_context("run-2"),
+    )
+
+    assert terminal["status"] == ProcessStatus.EXITED.value
+    assert stale["status"] == "error"
+    assert "unknown process handle" in stale["message"]
+    await tools.ateardown({})
