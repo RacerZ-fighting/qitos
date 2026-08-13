@@ -61,6 +61,10 @@ How to update:
 
 ### Added
 
+- Added stable `JournalRecordRef` locators and read-only committed Tool transaction
+  lookup. Open JSONL journals rebuild the query view from canonical records, return
+  only terminals published by `step.committed`, and preserve origin references across
+  forks without creating another persistence source.
 - Added immutable `ModelCapabilities` snapshots for configured adapters. OpenAI
   Responses, Anthropic Messages, and compatible Chat Completions now report only
   tested transport facts such as native tools, reasoning replay, usage/cache

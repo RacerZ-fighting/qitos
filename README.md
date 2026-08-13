@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Resolvable committed tool transactions**: canonical Journal terminals now have
+  stable `JournalRecordRef` locators. An open JSONL Journal can reconstruct a fresh,
+  typed `ToolTransaction` for a committed terminal; forks retain the origin locator,
+  and uncommitted or unrelated records fail closed without a second database.
 - **Local model latency telemetry**: every completed Engine model transaction now
   records monotonic time to first provider event, first text/reasoning/tool content,
   and terminal completion. The typed timing travels with `ModelResponse` and its local

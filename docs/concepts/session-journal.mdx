@@ -58,5 +58,26 @@ resumed = await Engine(
 Forking accepts only a committed `JournalPosition`. The child journal owns an
 independent inherited prefix and can resume without changing its parent.
 
+## Committed tool lookup
+
+Every canonical action result exposes a `JournalRecordRef` after its terminal record
+is durable. Keep that lightweight origin locator in application state when the result
+must remain discoverable after history compaction:
+
+```python
+from qitos.core.journal import JournalRecordRef
+
+reference = JournalRecordRef(run_id=origin_run_id, record_id=terminal_record_id)
+transaction = journal.find_tool_transaction(reference)
+if transaction is not None:
+    result = transaction.result
+```
+
+The lookup is read-only and returns a fresh typed `ToolTransaction` only after the
+terminal is named by `step.committed`. Opening a journal rebuilds this query view from
+its canonical JSONL records. A fork resolves inherited terminals by the parent's origin
+reference, so the child does not copy the result into a second store. Unknown,
+uncommitted, or child-renamed references return `None`.
+
 Background jobs, mailbox delivery, child-agent lifecycle, and interactive input events
 are not yet journal-recoverable contracts.
