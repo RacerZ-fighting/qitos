@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._adapters import OpenAICompatibleAdapter, adapter_for_kind
+from ._adapters import AnthropicAdapter, OpenAICompatibleAdapter, adapter_for_kind
 from ._presets import known_family_presets, resolve_builtin_preset
 from ._reasoning import (
     ReasoningEffort,
@@ -88,6 +88,7 @@ def build_model_for_preset(
         model_name=model_name,
         api_mode=api_mode,
         requested=reasoning_effort,
+        max_output_tokens=max_tokens,
     )
     # Merge preset recommendations, caller options, then the resolved reasoning
     # contract. Explicit reasoning intent is authoritative for its wire fields.
@@ -134,7 +135,10 @@ def build_model_for_preset(
     metadata["reasoning"] = reasoning.to_dict()
     setattr(llm, "qitos_harness_metadata", metadata)
     setattr(llm, "qitos_family_preset", harness.family_preset.id)
-    setattr(llm, "qitos_protocol", harness.protocol.id)
+    # Keep the resolved protocol object rather than only its registry id. Preset
+    # delivery overrides (for example Anthropic's native API tools on ReAct) are
+    # part of the effective turn contract and would be lost by an id round-trip.
+    setattr(llm, "qitos_protocol", harness.protocol)
     return llm
 
 
@@ -146,7 +150,21 @@ def _merge_request_options(
         if not option:
             continue
         for key, value in option.items():
-            if key in {"extra_body", "reasoning"} and isinstance(value, dict):
+            if key in {
+                "extra_body",
+                "reasoning",
+                "thinking",
+                "output_config",
+            } and isinstance(value, dict):
+                current = merged.get(key)
+                if (
+                    key == "thinking"
+                    and isinstance(current, dict)
+                    and value.get("type") is not None
+                    and value.get("type") != current.get("type")
+                ):
+                    merged[key] = dict(value)
+                    continue
                 nested = dict(merged.get(key) or {})
                 nested.update(value)
                 merged[key] = nested
@@ -157,6 +175,7 @@ def _merge_request_options(
 
 __all__ = [
     "ModelAdapter",
+    "AnthropicAdapter",
     "OpenAICompatibleAdapter",
     "ToolPolicy",
     "ContextPolicy",

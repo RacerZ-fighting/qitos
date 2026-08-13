@@ -54,6 +54,7 @@ class ReasoningResolution:
     resolved: ReasoningEffort
     supported_efforts: tuple[ReasoningEffort, ...]
     request_options: dict[str, Any]
+    effective_budget_tokens: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return trace-safe reasoning metadata."""
@@ -62,6 +63,7 @@ class ReasoningResolution:
             "resolved": self.resolved.value,
             "supported_efforts": [item.value for item in self.supported_efforts],
             "request_configured": bool(self.request_options),
+            "effective_budget_tokens": self.effective_budget_tokens,
         }
 
 
@@ -91,8 +93,20 @@ _GLM_52_POLICY = ReasoningPolicy(
     supported_efforts=(ReasoningEffort.HIGH, ReasoningEffort.MAX),
     wire_format="glm_effort",
 )
+_ANTHROPIC_45_POLICY = ReasoningPolicy(
+    supported_efforts=_EFFORT_ORDER,
+    wire_format="anthropic_manual_thinking",
+)
 _ENABLE_THINKING_POLICY = ReasoningPolicy(wire_format="enable_thinking")
 _THINKING_OBJECT_POLICY = ReasoningPolicy(wire_format="thinking_object")
+
+_ANTHROPIC_MANUAL_BUDGETS = {
+    ReasoningEffort.LOW: 1_024,
+    ReasoningEffort.MEDIUM: 2_048,
+    ReasoningEffort.HIGH: 4_096,
+    ReasoningEffort.XHIGH: 8_192,
+    ReasoningEffort.MAX: 16_384,
+}
 
 
 def parse_reasoning_effort(
@@ -121,19 +135,32 @@ def resolve_reasoning(
     model_name: str,
     api_mode: str,
     requested: ReasoningEffort | str | None,
+    max_output_tokens: int | None = None,
 ) -> ReasoningResolution:
     """Resolve reasoning intent without sending unsupported provider fields."""
     effort = parse_reasoning_effort(requested)
     policy = _policy_for_model(family_id, model_name)
     resolved = policy.resolve(effort)
+    request_options = _request_options(
+        policy.wire_format,
+        resolved,
+        api_mode=api_mode,
+        max_output_tokens=max_output_tokens,
+    )
+    thinking = request_options.get("thinking")
+    effective_budget_tokens = (
+        thinking.get("budget_tokens") if isinstance(thinking, dict) else None
+    )
     return ReasoningResolution(
         requested=effort,
         resolved=resolved,
         supported_efforts=policy.supported_efforts,
-        request_options=_request_options(
-            policy.wire_format,
-            resolved,
-            api_mode=api_mode,
+        request_options=request_options,
+        effective_budget_tokens=(
+            effective_budget_tokens
+            if isinstance(effective_budget_tokens, int)
+            and not isinstance(effective_budget_tokens, bool)
+            else None
         ),
     )
 
@@ -141,6 +168,8 @@ def resolve_reasoning(
 def _policy_for_model(family_id: str, model_name: str) -> ReasoningPolicy:
     family = family_id.strip().lower()
     model = model_name.strip().lower()
+    if family == "anthropic" and "-4-5" in model:
+        return _ANTHROPIC_45_POLICY
     if family == "kimi" and "k3" in model:
         return _KIMI_K3_POLICY
     if family == "kimi" and "k2" in model:
@@ -163,6 +192,7 @@ def _request_options(
     effort: ReasoningEffort,
     *,
     api_mode: str,
+    max_output_tokens: int | None,
 ) -> dict[str, Any]:
     if wire_format == "openai_effort":
         if api_mode.strip().lower() == "responses":
@@ -177,6 +207,16 @@ def _request_options(
         return {"extra_body": {"enable_thinking": True}}
     if wire_format == "thinking_object":
         return {"extra_body": {"thinking": {"type": "enabled"}}}
+    if wire_format == "anthropic_manual_thinking":
+        budget = _ANTHROPIC_MANUAL_BUDGETS[effort]
+        if max_output_tokens is not None:
+            if isinstance(max_output_tokens, bool) or max_output_tokens < 2_048:
+                raise ValueError(
+                    "Anthropic manual thinking requires max_output_tokens >= 2048"
+                )
+            visible_reserve = max(1_024, max_output_tokens // 4)
+            budget = min(budget, max_output_tokens - visible_reserve)
+        return {"thinking": {"type": "enabled", "budget_tokens": budget}}
     return {}
 
 

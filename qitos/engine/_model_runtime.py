@@ -1322,7 +1322,14 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         llm = getattr(self.engine.agent, "llm", None)
         options: Dict[str, Any] = {}
 
-        # Build tool schema options
+        # Model defaults are the baseline. Turn-owned tool projection is applied
+        # afterwards so stale or user-supplied defaults cannot replace the exact
+        # tool exposure frozen for this request.
+        if llm is not None:
+            default_kwargs = getattr(llm, "default_request_kwargs", None)
+            if isinstance(default_kwargs, dict) and default_kwargs:
+                options.update(default_kwargs)
+
         if llm is not None and delivery in {"api_parameter", "hybrid"}:
             build_options = getattr(llm, "build_tool_schema_request_options", None)
             if callable(build_options):
@@ -1335,13 +1342,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     _logger.debug(
                         "build_tool_schema_request_options failed", exc_info=True
                     )
-
-        # Merge default_request_kwargs from the model instance
-        # (e.g. chat_template_kwargs for thinking mode)
-        if llm is not None:
-            default_kwargs = getattr(llm, "default_request_kwargs", None)
-            if isinstance(default_kwargs, dict) and default_kwargs:
-                options.update(default_kwargs)
 
         return options
 

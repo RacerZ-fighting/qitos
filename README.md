@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Native Anthropic preset reasoning**: Anthropic family presets now build the
+  official Messages adapter. Claude 4.5 reasoning effort resolves to a bounded manual
+  thinking budget, request defaults reach the wire payload, and thinking requests omit
+  incompatible temperature overrides. Native API tool delivery is the preset default.
 - **Run-scoped MCP tools**: pass explicit MCP server instances through
   `AgentModule.mcp_servers` and Engine will connect, discover, expose
   `mcp__server__tool` names, execute calls on the transport's owning event loop, and

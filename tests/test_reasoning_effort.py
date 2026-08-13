@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from qitos.harness import build_model_for_preset, resolve_reasoning
+from qitos.models import AnthropicModel
 
 
 class _AsyncStream(AsyncIterator[Any]):
@@ -221,6 +222,106 @@ def test_older_openai_reasoning_policy_does_not_claim_gpt56_max() -> None:
     )
 
     assert resolution.resolved.value == "xhigh"
+
+
+@pytest.mark.parametrize(
+    ("requested", "budget"),
+    [
+        ("low", 1_024),
+        ("medium", 2_048),
+        ("high", 4_096),
+        ("xhigh", 6_144),
+        ("max", 6_144),
+    ],
+)
+def test_anthropic_45_reasoning_effort_maps_to_manual_thinking_budget(
+    requested: str,
+    budget: int,
+) -> None:
+    resolution = resolve_reasoning(
+        family_id="anthropic",
+        model_name="claude-sonnet-4-5",
+        api_mode="messages",
+        requested=requested,
+        max_output_tokens=8_192,
+    )
+
+    assert resolution.resolved.value == requested
+    assert resolution.request_options == {
+        "thinking": {"type": "enabled", "budget_tokens": budget}
+    }
+    assert resolution.effective_budget_tokens == budget
+
+
+def test_anthropic_manual_thinking_preserves_visible_output_room() -> None:
+    with pytest.raises(
+        ValueError,
+        match="Anthropic manual thinking requires max_output_tokens >= 2048",
+    ):
+        resolve_reasoning(
+            family_id="anthropic",
+            model_name="claude-sonnet-4-5",
+            api_mode="messages",
+            requested="low",
+            max_output_tokens=2_047,
+        )
+
+
+def test_anthropic_preset_builds_native_messages_model() -> None:
+    model = build_model_for_preset(
+        family_id="anthropic",
+        model_name="claude-sonnet-4-5",
+        api_key="test-key",
+        reasoning_effort="medium",
+        max_tokens=8_192,
+        max_attempts=1,
+        default_request_kwargs={
+            "thinking": {"type": "disabled", "budget_tokens": 999}
+        },
+    )
+
+    assert isinstance(model, AnthropicModel)
+    assert model.default_request_kwargs == {
+        "thinking": {"type": "enabled", "budget_tokens": 2_048}
+    }
+    assert model.qitos_harness_metadata["adapter_kind"] == "anthropic"
+    assert model.qitos_harness_metadata["reasoning"]["resolved"] == "medium"
+    assert (
+        model.qitos_harness_metadata["reasoning"]["effective_budget_tokens"]
+        == 2_048
+    )
+    assert model.qitos_harness_metadata["native_tool_call_preferred"] is True
+    assert model.qitos_harness_metadata["effective_tool_delivery"] == "api_parameter"
+    assert model.qitos_protocol.tool_schema_delivery == "api_parameter"
+    assert model.build_tool_schema_request_options(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read one file.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            }
+        ],
+        delivery="api_parameter",
+    ) == {
+        "tools": [
+            {
+                "name": "read_file",
+                "description": "Read one file.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            }
+        ]
+    }
 
 
 @pytest.mark.asyncio

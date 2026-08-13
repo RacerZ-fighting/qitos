@@ -19,6 +19,10 @@ How to update:
 
 ### Fixed
 
+- Anthropic presets now build the native Messages adapter, preserve default request
+  options through every construction path, and map Claude 4.5 reasoning effort to a
+  bounded manual thinking budget that reaches the provider payload. Presets prefer
+  native API tool schemas and typed tool calls instead of duplicate prompt injection.
 - MCP tools now execute on the transport's owning event loop and are removed from
   shared registries during Engine cleanup, preventing cross-loop failures and stale
   registrations when an Agent or registry is reused.

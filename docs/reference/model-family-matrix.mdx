@@ -11,7 +11,7 @@ description: "The built-in QitOS v0.4 family presets and their default harness p
 | `gpt-oss` | OpenAI-compatible | `json_decision_v1` | `react_text_v1` | `api_parameter` | 128k | `gpt-oss-120b`, `gpt-oss-20b` |
 | Gemma 4 | OpenAI-compatible | `json_decision_v1` | `react_text_v1` | `prompt_injection` | 128k | `gemma-4-31b-it`, `gemma-4-26b-a4b-it` |
 | OpenAI | OpenAI-compatible | `json_decision_v1` | `react_text_v1` | `api_parameter` | 128k | `gpt-4.1`, `gpt-4o` |
-| Anthropic | OpenAI-compatible | `react_text_v1` | `json_decision_v1` | `prompt_injection` | 200k | `claude-sonnet-4-5` |
+| Anthropic | Native Messages | `react_text_v1` | `json_decision_v1` | `api_parameter` | 200k | `claude-sonnet-4-5` |
 | Gemini | OpenAI-compatible | `xml_decision_v1` | `json_decision_v1 → react_text_v1` | `prompt_injection` | 1M | `gemini-2.5-pro` |
 | DeepSeek | OpenAI-compatible | `json_decision_v1` | `tool_use_xml_v1 → react_text_v1` | `api_parameter` | 128k | `ds-v4-pro`, `ds-v4-flash`, `deepseek-chat` |
 | GLM | OpenAI-compatible | `json_decision_v1` | `xml_decision_v1 → react_text_v1` | `api_parameter` | 200k | `GLM-5.1-sii`, `zai-org/GLM-5.1-FP8` |
@@ -20,7 +20,9 @@ description: "The built-in QitOS v0.4 family presets and their default harness p
 
 The first five families (Qwen, Kimi, MiniMax, `gpt-oss`, Gemma 4) are the **gold presets** — the most thoroughly tested configurations that the QitOS team validates on every release. When you are getting started or running a benchmark comparison, prefer a gold preset.
 
-The remaining five (OpenAI, Anthropic, Gemini, DeepSeek, GLM) are **compatibility presets**. They provide correct protocol and context defaults for their families but may evolve as dedicated adapters are added.
+The remaining families are **supported presets** with different maturity levels.
+Anthropic uses its native Messages adapter. OpenAI, Gemini, DeepSeek, and GLM retain
+compatibility transports and may evolve as dedicated adapters are added.
 
 ## Use the matrix correctly
 

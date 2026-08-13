@@ -11,7 +11,7 @@ description: "QitOS v0.4 内建家族预设的默认适配层策略矩阵。"
 | `gpt-oss` | OpenAI 兼容 | `json_decision_v1` | `react_text_v1` | `api_parameter` | 128k | `gpt-oss-120b`, `gpt-oss-20b` |
 | Gemma 4 | OpenAI 兼容 | `json_decision_v1` | `react_text_v1` | `prompt_injection` | 128k | `gemma-4-31b-it`, `gemma-4-26b-a4b-it` |
 | OpenAI | OpenAI 兼容 | `json_decision_v1` | `react_text_v1` | `api_parameter` | 128k | `gpt-4.1`, `gpt-4o` |
-| Anthropic | OpenAI 兼容 | `react_text_v1` | `json_decision_v1` | `prompt_injection` | 200k | `claude-sonnet-4-5` |
+| Anthropic | 原生 Messages | `react_text_v1` | `json_decision_v1` | `api_parameter` | 200k | `claude-sonnet-4-5` |
 | Gemini | OpenAI 兼容 | `xml_decision_v1` | `json_decision_v1 → react_text_v1` | `prompt_injection` | 1M | `gemini-2.5-pro` |
 | DeepSeek | OpenAI 兼容 | `json_decision_v1` | `tool_use_xml_v1 → react_text_v1` | `api_parameter` | 128k | `ds-v4-pro`, `ds-v4-flash`, `deepseek-chat` |
 | GLM | OpenAI 兼容 | `json_decision_v1` | `xml_decision_v1 → react_text_v1` | `api_parameter` | 200k | `GLM-5.1-sii`, `zai-org/GLM-5.1-FP8` |
@@ -20,7 +20,8 @@ description: "QitOS v0.4 内建家族预设的默认适配层策略矩阵。"
 
 前五个家族（Qwen、Kimi、MiniMax、`gpt-oss`、Gemma 4）是**黄金预设**——QitOS 团队在每次发版时验证得最充分的配置。当你刚上手或需要跑基准对比时，优先选择黄金预设。
 
-后五个（OpenAI、Anthropic、Gemini、DeepSeek、GLM）是**兼容预设**。它们为各自的家族提供了正确的协议和上下文默认值，但随着专用适配器的加入可能会演进。
+其余家族是成熟度不同的**受支持预设**。Anthropic 使用原生 Messages adapter；
+OpenAI、Gemini、DeepSeek 与 GLM 仍保留兼容传输，后续可随专用 adapter 演进。
 
 ## 正确理解这张表
 

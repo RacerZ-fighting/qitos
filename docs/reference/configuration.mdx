@@ -67,6 +67,16 @@ async, and streaming calls. Unsupported values map to the nearest advertised lev
 for example, GPT-5.6 preserves `max`, while the older OpenAI policy caps it at
 `xhigh`.
 
+The Anthropic family preset builds the native Messages adapter. Claude 4.5 models map
+the same effort levels to manual thinking budgets from 1,024 to 16,384 tokens, clamped
+to preserve at least 1,024 tokens and one quarter of `max_tokens` for the visible
+answer. Per-call `thinking` options can override the model defaults. When thinking is
+enabled, QitOS omits `temperature` so the provider uses its compatible
+sampling behavior. Harness metadata reports the clamped value as
+`reasoning.effective_budget_tokens`. The preset delivers the current turn's tool
+schemas through the native Messages API and prefers typed `tool_use` calls over text
+parsing; stale `default_request_kwargs.tools` cannot replace that turn projection.
+
 For official OpenAI Responses requests, QitOS asks for
 `reasoning.encrypted_content`, preserves fields delivered by output-item events, and
 replays the ordered native items on the next tool round. It does not add that

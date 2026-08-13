@@ -53,6 +53,15 @@ Reasoning item 被视为不透明的续接状态。追踪摘要只保留安全�
 流式请求共用解析后的请求默认值。不受支持的级别会映射到最接近的已声明级别；
 例如 GPT-5.6 会保留 `max`，较旧的 OpenAI policy 则上限为 `xhigh`。
 
+Anthropic 家族预设会构造原生 Messages adapter。Claude 4.5 模型把同一组强度
+映射到 1,024 至 16,384 token 的手动 thinking budget，并确保它小于
+`max_tokens`，同时至少为可见答案保留 1,024 token 和总输出上限的四分之一。
+每次调用仍可用 `thinking` 覆盖模型默认值；thinking 启用时，QitOS
+不会发送 `temperature`，让供应商使用兼容的采样行为。Harness metadata 会通过
+`reasoning.effective_budget_tokens` 记录裁剪后的实际值。预设通过原生 Messages API
+交付当前 turn 的 tool schema，并优先使用类型化 `tool_use`，而不是文本解析；过期的
+`default_request_kwargs.tools` 不能覆盖本轮工具投影。
+
 对于官方 OpenAI Responses 请求，QitOS 会请求 `reasoning.encrypted_content`，
 保留 output-item 事件先于最终响应送达的字段，并在下一轮工具调用中按顺序原样重放。
 Kimi 等兼容供应商不会收到这个 OpenAI 专属的 `include` 值。兼容 Chat 返回的

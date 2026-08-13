@@ -182,6 +182,91 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
 
 
 @pytest.mark.asyncio
+async def test_anthropic_request_defaults_reach_payload_and_allow_call_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.messages = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            return _AsyncListStream(
+                [
+                    {
+                        "type": "message_start",
+                        "message": {"id": "msg_1", "usage": {}},
+                    },
+                    {
+                        "type": "message_delta",
+                        "delta": {"stop_reason": "end_turn"},
+                        "usage": {"output_tokens": 1},
+                    },
+                    {"type": "message_stop"},
+                ]
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("anthropic")
+    fake.AsyncAnthropic = Client
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    defaults = {
+        "thinking": {"type": "enabled", "budget_tokens": 2_048},
+        "output_config": {"effort": "medium"},
+    }
+    model = AnthropicModel(
+        api_key="test-key",
+        model="claude-sonnet-4-5",
+        temperature=0.7,
+        default_request_kwargs=defaults,
+        max_attempts=1,
+    )
+
+    await _collect(model, [{"role": "user", "content": "answer"}])
+    await _collect(
+        model,
+        [{"role": "user", "content": "answer"}],
+        thinking={"budget_tokens": 4_096},
+        output_config={"effort": "low"},
+    )
+    await _collect(
+        model,
+        [{"role": "user", "content": "answer"}],
+        thinking={"type": "disabled"},
+    )
+    await _collect(
+        model,
+        [{"role": "user", "content": "answer"}],
+        thinking={"type": "adaptive"},
+    )
+
+    assert requests[0]["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 2_048,
+    }
+    assert requests[0]["output_config"] == {"effort": "medium"}
+    assert "temperature" not in requests[0]
+    assert requests[1]["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": 4_096,
+    }
+    assert requests[1]["output_config"] == {"effort": "low"}
+    assert requests[2]["thinking"] == {"type": "disabled"}
+    assert requests[2]["temperature"] == 0.7
+    assert requests[3]["thinking"] == {"type": "adaptive"}
+    assert "temperature" not in requests[3]
+    assert defaults == {
+        "thinking": {"type": "enabled", "budget_tokens": 2_048},
+        "output_config": {"effort": "medium"},
+    }
+
+
+@pytest.mark.asyncio
 async def test_gemini_uses_native_async_sdk_and_preserves_parts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
