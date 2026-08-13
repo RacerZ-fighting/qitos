@@ -242,7 +242,7 @@ class AgentTool(BaseTool):
             task_id = f"agent-{uuid.uuid4().hex[:8]}"
             cancel_event = asyncio.Event()
             task = asyncio.create_task(
-                self._run_background_request(
+                self._supervise_background_request(
                     request,
                     context,
                     task_id,
@@ -253,38 +253,6 @@ class AgentTool(BaseTool):
             self._background_tasks[task_id] = task
             self._background_cancel[task_id] = cancel_event
             self._background_requests[task_id] = request
-
-            def _on_done(fut: asyncio.Task[AgentResult], tid: str = task_id) -> None:
-                try:
-                    result = fut.result()
-                except asyncio.CancelledError:
-                    result = AgentResult(
-                        agent_type=request.subagent_type,
-                        task=request.prompt,
-                        success=False,
-                        error="Child agent was cancelled.",
-                        name=request.name,
-                        description=request.description,
-                        stop_reason="cancelled_immediate",
-                    )
-                except Exception as exc:  # pragma: no cover - defensive callback
-                    result = AgentResult(
-                        agent_type=request.subagent_type,
-                        task=request.prompt,
-                        success=False,
-                        error=str(exc),
-                        name=request.name,
-                        description=request.description,
-                        stop_reason="error",
-                    )
-                self._background_results[tid] = result
-                self._background_tasks.pop(tid, None)
-                self._background_engines.pop(tid, None)
-                self._background_requests.pop(tid, None)
-                self._background_cancel.pop(tid, None)
-                self._post_completion_event(tid, result, context)
-
-            task.add_done_callback(_on_done)
             return {
                 "status": "running",
                 "task_id": task_id,
@@ -300,6 +268,50 @@ class AgentTool(BaseTool):
                 cancel_event=None,
             )
         )
+
+    async def _supervise_background_request(
+        self,
+        request: AgentRequest,
+        runtime_context: dict[str, Any],
+        task_id: str,
+        cancel_event: asyncio.Event,
+    ) -> AgentResult:
+        """Own one child through terminal state and reliable parent delivery."""
+
+        try:
+            result = await self._run_background_request(
+                request,
+                runtime_context,
+                task_id,
+                cancel_event,
+            )
+        except asyncio.CancelledError:
+            result = AgentResult(
+                agent_type=request.subagent_type,
+                task=request.prompt,
+                success=False,
+                error="Child agent was cancelled.",
+                name=request.name,
+                description=request.description,
+                stop_reason="cancelled_immediate",
+            )
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            result = AgentResult(
+                agent_type=request.subagent_type,
+                task=request.prompt,
+                success=False,
+                error=str(exc),
+                name=request.name,
+                description=request.description,
+                stop_reason="error",
+            )
+        self._background_results[task_id] = result
+        self._background_tasks.pop(task_id, None)
+        self._background_engines.pop(task_id, None)
+        self._background_requests.pop(task_id, None)
+        self._background_cancel.pop(task_id, None)
+        await self._post_completion_event(task_id, result, runtime_context)
+        return result
 
     async def _run_background_request(
         self,
@@ -577,7 +589,7 @@ class AgentTool(BaseTool):
         except (TypeError, ValueError):
             return str(value)
 
-    def _post_completion_event(
+    async def _post_completion_event(
         self,
         task_id: str,
         result: AgentResult,
@@ -589,7 +601,7 @@ class AgentTool(BaseTool):
         payload = self._result_payload(result)
         payload["task_id"] = task_id
         try:
-            post_runtime_event(
+            accepted = await post_runtime_event(
                 RuntimeInput(
                     event_id=f"{task_id}:terminal",
                     kind="agent.child.completed",
@@ -598,7 +610,9 @@ class AgentTool(BaseTool):
                     payload=payload,
                 )
             )
+            if accepted is not True:
+                return
         except Exception:
-            # Completion delivery is best-effort when the parent run has already
-            # closed; the terminal result remains queryable from this tool.
+            # The terminal result remains queryable if its parent has closed or
+            # durable mailbox acceptance fails.
             return

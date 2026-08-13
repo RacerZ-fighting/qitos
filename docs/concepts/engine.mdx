@@ -87,7 +87,7 @@ state:
 ```python
 from qitos import RuntimeInput
 
-accepted = engine.post_runtime_event(
+accepted = await engine.apost_runtime_event(
     RuntimeInput(
         event_id="command:42:terminal",
         kind="command.terminal",
@@ -101,8 +101,18 @@ accepted = engine.post_runtime_event(
 
 Capture `run_id` from `engine.active_run_id` after the run starts. A post returns
 `False` when the event id is a duplicate, the run id does not match, or the run
-has ended. Keep event payloads small. Store full command output behind the tool's
-normal result or read API.
+has ended. On Journal-backed runs, returning `True` means `runtime_input.posted` is
+durable before the Engine wakes. If the process exits before a completed model
+transaction binds the event, resume redelivers it exactly once. Input accepted while a
+final turn is in flight defers completion until that input is processed at the next
+safe point.
+
+`post_runtime_event()` is the synchronous application-boundary form for a different
+thread. It schedules onto the active Engine loop; code already on that loop must await
+`apost_runtime_event()`.
+
+Keep event payloads small. Store full command output behind the tool's normal result or
+read API.
 
 An agent can explicitly enter idle wait with
 `Decision.wait(meta={"runtime_wait": True})`. JSON decision agents can return:
@@ -113,8 +123,9 @@ An agent can explicitly enter idle wait with
 
 While idle, the Engine does not call the model or advance the step. A runtime
 event, cancellation, or runtime deadline wakes it. Events are drained only before
-the next model request and are appended as runtime-sourced user context. QitOS
-does not forge a second tool result for a tool call that has already ended.
+the next model request and are appended as runtime-sourced user context. QitOS does
+not inject input in the middle of a model or Tool batch and does not forge a second
+tool result for a tool call that has already ended.
 
 Unmarked `Decision.wait()` retains its existing immediate-loop behavior for parser
 repair and search backtracking.

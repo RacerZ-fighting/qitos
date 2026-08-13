@@ -107,5 +107,9 @@ its canonical JSONL records. A fork resolves inherited terminals by the parent's
 reference, so the child does not copy the result into a second store. Unknown,
 uncommitted, or child-renamed references return `None`.
 
-Background jobs, mailbox delivery, child-agent lifecycle, and interactive input events
-are not yet journal-recoverable contracts.
+Run-scoped mailbox acceptance is journal-recoverable. `runtime_input.posted` precedes
+in-memory delivery, while `model.completed.runtime_input_ids` binds the exact events
+seen by that transaction. Resume redelivers only local posted events without such a
+binding; forks never inherit pending parent input. Background process state uses its
+own process records. Full child-agent identity and control lifecycle recovery remains a
+separate contract.

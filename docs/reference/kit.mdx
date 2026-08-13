@@ -745,6 +745,10 @@ its launch context without allocating a model, Engine, or trace before it can ru
 child has no final answer, the completion payload contains a bounded projection of its
 recent tool evidence instead of silently dropping useful work.
 
+The Engine supplies an async `runtime_context["post_runtime_event"]` callback. Child
+supervision stores its terminal result before awaiting that callback; on Journal-backed
+parents, successful delivery is durable before the parent wakes.
+
 `active_background_count`, `get_background_result(task_id)`, `cancel_background(task_id)`,
 `snapshot_background_events()`, and `aclose()` expose lifecycle control to the owning
 application. A snapshot projects only the active children's bounded, completed tool

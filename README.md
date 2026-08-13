@@ -210,8 +210,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   public-initial-URL validation, bounded results, and provider failure categories; QitOS
   does not guess a service URL from the selected model.
 - **Runtime input and idle wait**: background work can post a small event to an exact
-  Engine run. Explicit runtime waits sleep without model polling or step growth and
-  wake on input, cancellation, or the run deadline.
+  Engine run through an async, Journal-first mailbox. Explicit runtime waits sleep
+  without model polling or step growth and wake on input, cancellation, or the run
+  deadline. Accepted input survives restart until a completed model transaction binds
+  it, and input racing a final answer is handled on the next turn.
 - **Live OpenAI-compatible streams**: Engine calls use one explicit QitOS retry budget
   with SDK retries disabled. Connection and pre-event failures can retry within a
   300-second recovery window by default; after the first provider event, deltas stay

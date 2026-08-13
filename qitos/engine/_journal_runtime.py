@@ -19,6 +19,7 @@ from ..core.journal import (
     JournalRecordType,
 )
 from ..core.model_request import ModelContinuation, ModelRequest
+from ..core.runtime_input import RuntimeInput
 from ..core.state import StateSchema
 from ..core.state_delta import apply_state_delta, build_state_delta, state_digest
 from ..core.task import Task
@@ -76,8 +77,10 @@ class _JournalRuntime(Generic[StateT, ActionT]):
         engine = self.engine
         journal = engine.journal
         if journal is None:
+            engine._pending_runtime_input_ids.clear()
             return
         history_append = list(engine._journal_pending_history)
+        runtime_input_ids = list(engine._pending_runtime_input_ids)
         engine._last_journal_position = await journal.append(
             JournalRecordType.MODEL_COMPLETED,
             {
@@ -92,10 +95,12 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 "prompt_metadata": dict(record.prompt_metadata),
                 "decision": decision_to_dict(decision),
                 "history_append": history_append,
+                "runtime_input_ids": runtime_input_ids,
             },
             record_id=f"{record.transaction_id}:model",
         )
         del engine._journal_pending_history[: len(history_append)]
+        del engine._pending_runtime_input_ids[: len(runtime_input_ids)]
 
     async def tool_starts(
         self,
@@ -305,6 +310,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
     def replay(self, records: tuple[JournalRecord, ...]) -> Dict[str, Any]:
         engine = self.engine
         effective = effective_journal_records(records)
+        pending_runtime_inputs = recover_pending_runtime_inputs(records)
         task = ""
         task_data: Dict[str, Any] | None = None
         state_data: Dict[str, Any] | None = None
@@ -574,6 +580,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 "canonical_results": canonical_results,
                 "terminal_snapshot_current": False,
                 "continuation": latest_continuation,
+                "pending_runtime_inputs": pending_runtime_inputs,
                 "usage": {
                     "prompt_tokens": usage_prompt_tokens,
                     "completion_tokens": usage_completion_tokens,
@@ -614,25 +621,34 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 working.reduce_update(next_state.to_dict())
             completion_history: list[HistoryMessage] = []
             if decision.mode == "final":
-                assessment = engine.agent.assess_completion(working, decision)
-                if assessment.disposition is CompletionDisposition.CONTINUE:
+                if pending_runtime_inputs:
                     working.final_result = None
-                    working.stop_reason = None
-                    completion_history.append(
-                        HistoryMessage(
-                            role="user",
-                            step_id=int(transaction["step_id"]),
-                            content=assessment.feedback,
-                            metadata={
-                                "source": "completion_assessment",
-                                "reason": assessment.reason,
-                            },
-                        )
-                    )
-                elif assessment.disposition is CompletionDisposition.BLOCKED:
-                    working.set_stop(StopReason.BLOCKED, decision.final_answer)
+                    if working.stop_reason in {
+                        StopReason.FINAL.value,
+                        StopReason.COMPLETED.value,
+                        StopReason.BLOCKED.value,
+                    }:
+                        working.stop_reason = None
                 else:
-                    working.set_stop(StopReason.COMPLETED, decision.final_answer)
+                    assessment = engine.agent.assess_completion(working, decision)
+                    if assessment.disposition is CompletionDisposition.CONTINUE:
+                        working.final_result = None
+                        working.stop_reason = None
+                        completion_history.append(
+                            HistoryMessage(
+                                role="user",
+                                step_id=int(transaction["step_id"]),
+                                content=assessment.feedback,
+                                metadata={
+                                    "source": "completion_assessment",
+                                    "reason": assessment.reason,
+                                },
+                            )
+                        )
+                    elif assessment.disposition is CompletionDisposition.BLOCKED:
+                        working.set_stop(StopReason.BLOCKED, decision.final_answer)
+                    else:
+                        working.set_stop(StopReason.COMPLETED, decision.final_answer)
             if not working.final_result and not working.stop_reason:
                 working.advance_step()
             state_data = working.to_dict()
@@ -683,6 +699,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 and terminal_snapshot_digest == state_digest(state_data)
             ),
             "continuation": latest_continuation,
+            "pending_runtime_inputs": pending_runtime_inputs,
             "usage": {
                 "prompt_tokens": usage_prompt_tokens,
                 "completion_tokens": usage_completion_tokens,
@@ -849,6 +866,41 @@ def tool_result_history_message(
         tool_call_id=action.action_id,
         name=action.name,
         metadata={"source": "journal_recovery", "tool_name": action.name},
+    )
+
+
+def recover_pending_runtime_inputs(
+    records: tuple[JournalRecord, ...],
+) -> tuple[RuntimeInput, ...]:
+    """Return local accepted events that no completed model turn consumed."""
+
+    posted: dict[str, RuntimeInput] = {}
+    consumed: set[str] = set()
+    for record in records:
+        # A fork receives an independent mailbox. Inherited parent events and
+        # their consumption markers never become child input.
+        if record.type is JournalRecordType.RUNTIME_INPUT_POSTED:
+            raw_event = record.payload.get("event")
+            if not isinstance(raw_event, Mapping):
+                raise JournalError("runtime_input.posted is missing event")
+            try:
+                event = RuntimeInput.from_dict(raw_event)
+            except (TypeError, ValueError) as exc:
+                raise JournalError("runtime_input.posted event is invalid") from exc
+            previous = posted.setdefault(event.event_id, event)
+            if previous != event:
+                raise JournalError("runtime input id was reused with different content")
+            continue
+        if record.type is not JournalRecordType.MODEL_COMPLETED:
+            continue
+        raw_ids = record.payload.get("runtime_input_ids", [])
+        if not isinstance(raw_ids, list) or not all(
+            isinstance(event_id, str) and event_id for event_id in raw_ids
+        ):
+            raise JournalError("model.completed runtime_input_ids are invalid")
+        consumed.update(raw_ids)
+    return tuple(
+        event for event_id, event in posted.items() if event_id not in consumed
     )
 
 

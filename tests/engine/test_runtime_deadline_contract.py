@@ -45,7 +45,7 @@ class _RuntimeEngine:
             return None
         return max(0.0, self._deadline_monotonic - time.monotonic())
 
-    def post_runtime_event(self, event: Any, *, run_id: str) -> bool:
+    async def apost_runtime_event(self, event: Any, *, run_id: str) -> bool:
         _ = event, run_id
         return True
 
