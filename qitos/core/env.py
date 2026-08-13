@@ -204,8 +204,23 @@ class CommandCapability(ABC):
     """Command execution capability contract used by env implementations."""
 
     @abstractmethod
+    async def arun(self, command: str, timeout: int = 30) -> Dict[str, Any]:
+        """Run one shell command without blocking the owning event loop."""
+
+    @abstractmethod
+    async def arun_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: int = 30,
+        cwd: str | None = None,
+        stdin: bytes | None = None,
+    ) -> Dict[str, Any]:
+        """Run one argv process asynchronously without shell interpretation."""
+
+    @abstractmethod
     def run(self, command: str, timeout: int = 30) -> Dict[str, Any]:
-        """Run one command and return standardized result payload."""
+        """Compatibility entry point for synchronous environment setup code."""
 
     @abstractmethod
     def run_argv(

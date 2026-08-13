@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import pytest
+
 from qitos.core.action import Action, ActionExecutionPolicy
 from qitos.core.tool import BaseTool, ToolSpec
 from qitos.core.tool_registry import ToolRegistry
@@ -19,7 +21,9 @@ class FakeTool(BaseTool):
         super().__init__(spec)
         self._result = result
 
-    def execute(self, args, runtime_context=None):
+    async def execute(self, args, runtime_context=None):
+        if isinstance(self._result, Exception):
+            raise self._result
         return self._result
 
 
@@ -83,7 +87,8 @@ class TestSpecDrivenClassification:
 
 
 class TestSerialMode:
-    def test_serial_mode_forces_sequential(self):
+    @pytest.mark.asyncio
+    async def test_serial_mode_forces_sequential(self):
         safe_spec = ToolSpec(name="read", description="Read", concurrency_safe=True)
         tool1 = FakeTool("read", spec=safe_spec)
         tool2 = FakeTool(
@@ -96,12 +101,13 @@ class TestSerialMode:
             Action(name="read", args={}),
             Action(name="read2", args={}),
         ]
-        results = executor.execute(actions)
+        results = await executor.execute(actions)
         assert len(results) == 2
 
 
 class TestAutoMode:
-    def test_auto_mode_parallel_safe_tools(self):
+    @pytest.mark.asyncio
+    async def test_auto_mode_parallel_safe_tools(self):
         safe_spec = ToolSpec(name="read", description="Read", concurrency_safe=True)
         tool = FakeTool("read", spec=safe_spec, result="read_result")
         policy = ActionExecutionPolicy(mode="parallel")
@@ -110,10 +116,11 @@ class TestAutoMode:
             Action(name="read", args={}),
             Action(name="read", args={}),
         ]
-        results = executor.execute(actions)
+        results = await executor.execute(actions)
         assert len(results) == 2
 
-    def test_auto_mode_mixed_safe_exclusive(self):
+    @pytest.mark.asyncio
+    async def test_auto_mode_mixed_safe_exclusive(self):
         safe_spec = ToolSpec(name="read", description="Read", concurrency_safe=True)
         exclusive_spec = ToolSpec(name="write", description="Write")
         read_tool = FakeTool("read", spec=safe_spec, result="read_result")
@@ -125,10 +132,11 @@ class TestAutoMode:
             Action(name="write", args={}),
             Action(name="read", args={}),
         ]
-        results = executor.execute(actions)
+        results = await executor.execute(actions)
         assert len(results) == 3
 
-    def test_auto_mode_single_safe_sequential(self):
+    @pytest.mark.asyncio
+    async def test_auto_mode_single_safe_sequential(self):
         """Only one safe action → runs sequentially."""
         safe_spec = ToolSpec(name="read", description="Read", concurrency_safe=True)
         write_spec = ToolSpec(name="write", description="Write")
@@ -140,23 +148,25 @@ class TestAutoMode:
             Action(name="read", args={}),
             Action(name="write", args={}),
         ]
-        results = executor.execute(actions)
+        results = await executor.execute(actions)
         assert len(results) == 2
 
 
 class TestMaxConcurrency:
-    def test_max_concurrency_respected(self):
+    @pytest.mark.asyncio
+    async def test_max_concurrency_respected(self):
         safe_spec = ToolSpec(name="read", description="Read", concurrency_safe=True)
         tool = FakeTool("read", spec=safe_spec)
         policy = ActionExecutionPolicy(mode="parallel", max_concurrency=2)
         executor = _make_executor({"read": tool}, policy=policy)
         actions = [Action(name="read", args={}) for _ in range(5)]
-        results = executor.execute(actions)
+        results = await executor.execute(actions)
         assert len(results) == 5
 
 
 class TestFailFast:
-    def test_fail_fast_cancels_on_error(self):
+    @pytest.mark.asyncio
+    async def test_fail_fast_cancels_on_error(self):
         """When fail_fast=True, errors stop further concurrent execution."""
         safe_spec = ToolSpec(name="read", description="Read", concurrency_safe=True)
         tool = FakeTool("read", spec=safe_spec, result=RuntimeError("fail"))
@@ -164,12 +174,13 @@ class TestFailFast:
         executor = _make_executor({"read": tool}, policy=policy)
         actions = [Action(name="read", args={}) for _ in range(3)]
         # This should not crash even if tools fail
-        results = executor.execute(actions)
+        results = await executor.execute(actions)
         assert len(results) == 3
 
 
 class TestResultOrdering:
-    def test_results_in_original_order(self):
+    @pytest.mark.asyncio
+    async def test_results_in_original_order(self):
         safe_spec = ToolSpec(name="read", description="Read", concurrency_safe=True)
         tool = FakeTool("read", spec=safe_spec, result="read_result")
         policy = ActionExecutionPolicy(mode="parallel")
@@ -179,7 +190,7 @@ class TestResultOrdering:
             Action(name="read", args={"n": 2}),
             Action(name="read", args={"n": 3}),
         ]
-        results = executor.execute(actions)
+        results = await executor.execute(actions)
         assert len(results) == 3
         # All should have the right name
         for r in results:

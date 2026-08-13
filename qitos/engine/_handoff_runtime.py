@@ -254,8 +254,6 @@ class _HandoffRuntime(Generic[StateT, ObservationT, ActionT]):
         self.engine._resolved_protocol = self.engine.resolve_protocol()
         self.engine._last_system_prompt = ""
         self.engine._last_prompt_metadata = {}
-        self.engine._active_tool_exposure = None
-        self.engine._active_tool_exposure_step_id = None
 
         # 6. Record agent_id on step
         record.agent_id = target_name

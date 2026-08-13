@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
 from abc import ABC, abstractmethod
@@ -345,7 +346,7 @@ class ToolMeta:
 
 
 class BaseTool(ABC):
-    """Canonical class-based tool contract."""
+    """Canonical asynchronous class-based tool contract."""
 
     def __init__(self, spec: ToolSpec):
         description = inspect.getdoc(self.execute) or inspect.getdoc(self.__class__)
@@ -392,10 +393,10 @@ class BaseTool(ABC):
         return ""
 
     @abstractmethod
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Any:
-        """Execute one validated tool call with its runtime context."""
+        """Execute one validated tool call with cancellation owned by the caller."""
 
 
 class FunctionTool(BaseTool):
@@ -441,7 +442,7 @@ class FunctionTool(BaseTool):
 
         return self.func(**kwargs)
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Any:
         runtime_context = runtime_context or {}
@@ -459,7 +460,31 @@ class FunctionTool(BaseTool):
             call_kwargs["file_ops"] = ops["file"]
         if "process_ops" in sig.parameters and "process" in ops:
             call_kwargs["process_ops"] = ops["process"]
-        return self.func(**call_kwargs)
+        if inspect.iscoroutinefunction(self.func):
+            return await self.func(**call_kwargs)
+
+        # Compatibility for existing decorated callables is isolated here,
+        # outside the executor.  Cancellation waits for the bounded sync call
+        # to finish so a terminal result is never committed while side effects
+        # may still be running in an abandoned worker.
+        worker = asyncio.create_task(
+            asyncio.to_thread(self.func, **call_kwargs),
+            name=f"qitos-sync-tool-{self.name}",
+        )
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            try:
+                result = await worker
+            except Exception:
+                pass
+            else:
+                if inspect.iscoroutine(result):
+                    result.close()
+            raise
+        if inspect.isawaitable(result):
+            return await result
+        return result
 
 
 def tool(

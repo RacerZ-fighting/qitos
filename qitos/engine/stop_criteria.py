@@ -47,7 +47,7 @@ class FinalResultCriteria(StopCriteria):
     ) -> Tuple[bool, Optional[StopReason], Optional[str]]:
         final_result = getattr(state, "final_result", None)
         if final_result:
-            return True, StopReason.FINAL, "state.final_result is set"
+            return True, StopReason.COMPLETED, "state.final_result is set"
         return False, None, None
 
 

@@ -14,13 +14,17 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 from typing import Any, Dict, List
+
+import pytest
 
 from qitos.core.action import Action, ActionExecutionPolicy, ActionStatus
 from qitos.core.tool import BaseTool, ToolSpec
 from qitos.core.tool_registry import ToolRegistry
 from qitos.engine.action_executor import ActionExecutor
+
+
+pytestmark = pytest.mark.asyncio
 
 
 class _Recorder:
@@ -68,10 +72,12 @@ class TimelineTool(BaseTool):
         self._delay = delay
         self._boom = boom
 
-    def execute(self, args: Dict[str, Any], runtime_context: Any = None) -> Any:
+    async def execute(
+        self, args: Dict[str, Any], runtime_context: Any = None
+    ) -> Any:
         self._recorder.start(self.spec.name)
         try:
-            time.sleep(self._delay)
+            await asyncio.sleep(self._delay)
             if self._boom:
                 raise RuntimeError("boom")
             return f"{self.spec.name}:ok"
@@ -92,14 +98,14 @@ def _executor(tools: Dict[str, BaseTool], **policy_kwargs: Any) -> ActionExecuto
 # ---------------------------------------------------------------------------
 
 
-def test_safe_action_does_not_jump_exclusive_barrier():
+async def test_safe_action_does_not_jump_exclusive_barrier():
     rec = _Recorder()
     tools = {
         "safe_a": TimelineTool("safe_a", rec, concurrency_safe=True),
         "exclusive_b": TimelineTool("exclusive_b", rec),
         "safe_c": TimelineTool("safe_c", rec, concurrency_safe=True),
     }
-    results = _executor(tools, mode="parallel", max_concurrency=2).execute(
+    results = await _executor(tools, mode="parallel", max_concurrency=2).execute(
         [
             Action(name="safe_a"),
             Action(name="exclusive_b"),
@@ -116,14 +122,14 @@ def test_safe_action_does_not_jump_exclusive_barrier():
     assert rec.timeline.index("safe_a:end") < rec.timeline.index("exclusive_b:start")
 
 
-def test_contiguous_safe_actions_still_run_concurrently():
+async def test_contiguous_safe_actions_still_run_concurrently():
     rec = _Recorder()
     tools = {
         "safe_a": TimelineTool("safe_a", rec, concurrency_safe=True),
         "safe_b": TimelineTool("safe_b", rec, concurrency_safe=True),
         "exclusive": TimelineTool("exclusive", rec),
     }
-    results = _executor(tools, mode="parallel", max_concurrency=4).execute(
+    results = await _executor(tools, mode="parallel", max_concurrency=4).execute(
         [Action(name="safe_a"), Action(name="safe_b"), Action(name="exclusive")]
     )
 
@@ -141,14 +147,14 @@ def test_contiguous_safe_actions_still_run_concurrently():
 # ---------------------------------------------------------------------------
 
 
-def test_max_concurrency_peaks_at_limit_with_order_preserved():
+async def test_max_concurrency_peaks_at_limit_with_order_preserved():
     rec = _Recorder()
     tools = {
         f"safe_{i}": TimelineTool(f"safe_{i}", rec, concurrency_safe=True, delay=0.05)
         for i in range(4)
     }
     actions = [Action(name=f"safe_{i}", args={"n": i}) for i in range(4)]
-    results = _executor(tools, mode="parallel", max_concurrency=2).execute(actions)
+    results = await _executor(tools, mode="parallel", max_concurrency=2).execute(actions)
 
     assert rec.peak == 2
     assert [r.name for r in results] == ["safe_0", "safe_1", "safe_2", "safe_3"]
@@ -175,9 +181,9 @@ class AsyncTool(BaseTool):
         return "awaited"
 
 
-def test_async_handler_is_awaited(recwarn):
+async def test_async_handler_is_awaited(recwarn):
     executor = _executor({"async_tool": AsyncTool()})
-    result = executor.execute([Action(name="async_tool")])[0]
+    result = (await executor.execute([Action(name="async_tool")]))[0]
 
     assert result.status == ActionStatus.SUCCESS
     assert result.output == "awaited"
@@ -186,28 +192,30 @@ def test_async_handler_is_awaited(recwarn):
     ), "coroutine leaked without being awaited"
 
 
-def test_tool_spec_timeout_is_enforced():
+async def test_tool_spec_timeout_is_enforced():
     rec = _Recorder()
     tools = {"slow": TimelineTool("slow", rec, delay=0.5, timeout_s=0.01)}
-    result = _executor(tools).execute([Action(name="slow")])[0]
+    result = (await _executor(tools).execute([Action(name="slow")]))[0]
 
     assert result.status == ActionStatus.TIMED_OUT
     assert result.metadata.get("timeout_source") == "tool_spec"
 
 
-def test_async_tool_timeout_is_enforced():
+async def test_async_tool_timeout_is_enforced():
     executor = _executor({"async_tool": AsyncTool(delay=0.5, timeout_s=0.01)})
-    result = executor.execute([Action(name="async_tool")])[0]
+    result = (await executor.execute([Action(name="async_tool")]))[0]
 
     assert result.status == ActionStatus.TIMED_OUT
 
 
-def test_timeout_does_not_claim_thread_was_killed():
+async def test_timeout_awaits_handler_cleanup():
     rec = _Recorder()
     tools = {"slow": TimelineTool("slow", rec, delay=0.3, timeout_s=0.01)}
-    result = _executor(tools).execute([Action(name="slow")])[0]
+    result = (await _executor(tools).execute([Action(name="slow")]))[0]
 
-    assert result.metadata.get("worker_still_running") is True
+    assert result.status is ActionStatus.TIMED_OUT
+    assert "slow:end" in rec.timeline
+    assert result.metadata.get("worker_still_running") is False
 
 
 # ---------------------------------------------------------------------------
@@ -215,7 +223,7 @@ def test_timeout_does_not_claim_thread_was_killed():
 # ---------------------------------------------------------------------------
 
 
-def test_fail_fast_does_not_mislabel_completed_action():
+async def test_fail_fast_cancels_and_drains_in_flight_action():
     rec = _Recorder()
     tools = {
         "running_safe": TimelineTool(
@@ -226,7 +234,7 @@ def test_fail_fast_does_not_mislabel_completed_action():
         ),
         "exclusive": TimelineTool("exclusive", rec, delay=0.01),
     }
-    results = _executor(tools, mode="parallel", fail_fast=True).execute(
+    results = await _executor(tools, mode="parallel", fail_fast=True).execute(
         [
             Action(name="running_safe"),
             Action(name="failing_safe"),
@@ -234,15 +242,16 @@ def test_fail_fast_does_not_mislabel_completed_action():
         ]
     )
 
-    # The action that actually ran to completion must not be recorded as an error.
-    assert results[0].status == ActionStatus.SUCCESS
+    # The in-flight sibling is cancelled and its handler cleanup completes.
+    assert results[0].status == ActionStatus.CANCELLED
+    assert "running_safe:end" in rec.timeline
     assert results[1].status == ActionStatus.ERROR
     # fail_fast must prevent the not-yet-started exclusive action.
     assert results[2].status == ActionStatus.CANCELLED
     assert "exclusive:start" not in rec.timeline
 
 
-def test_fail_fast_disabled_runs_everything():
+async def test_fail_fast_disabled_runs_everything():
     rec = _Recorder()
     tools = {
         "safe_a": TimelineTool("safe_a", rec, concurrency_safe=True, delay=0.01),
@@ -251,7 +260,7 @@ def test_fail_fast_disabled_runs_everything():
         ),
         "exclusive": TimelineTool("exclusive", rec, delay=0.01),
     }
-    results = _executor(tools, mode="parallel", fail_fast=False).execute(
+    results = await _executor(tools, mode="parallel", fail_fast=False).execute(
         [Action(name="safe_a"), Action(name="failing"), Action(name="exclusive")]
     )
 
@@ -268,7 +277,7 @@ def test_fail_fast_disabled_runs_everything():
 # ---------------------------------------------------------------------------
 
 
-def test_cancel_token_prevents_unstarted_actions():
+async def test_cancel_token_prevents_unstarted_actions():
     from qitos.engine.cancellation import CancelToken
 
     rec = _Recorder()
@@ -286,7 +295,9 @@ def test_cancel_token_prevents_unstarted_actions():
         cancel_token=token,
     )
     token.request_cancel("immediate")
-    results = executor.execute([Action(name="safe_a"), Action(name="exclusive")])
+    results = await executor.execute(
+        [Action(name="safe_a"), Action(name="exclusive")]
+    )
 
     assert all(r.status == ActionStatus.CANCELLED for r in results)
     assert results[0].metadata.get("cancel_source") == "cancel_token"
@@ -298,14 +309,16 @@ def test_cancel_token_prevents_unstarted_actions():
 # ---------------------------------------------------------------------------
 
 
-def test_execution_records_policy_and_concurrency_peak():
+async def test_execution_records_policy_and_concurrency_peak():
     rec = _Recorder()
     tools = {
         "safe_a": TimelineTool("safe_a", rec, concurrency_safe=True, delay=0.02),
         "safe_b": TimelineTool("safe_b", rec, concurrency_safe=True, delay=0.02),
     }
     executor = _executor(tools, mode="parallel", max_concurrency=2)
-    results = executor.execute([Action(name="safe_a"), Action(name="safe_b")])
+    results = await executor.execute(
+        [Action(name="safe_a"), Action(name="safe_b")]
+    )
 
     stats = executor.last_execution_stats
     assert stats["policy"]["mode"] == "parallel"
@@ -322,7 +335,7 @@ def test_execution_records_policy_and_concurrency_peak():
 # ---------------------------------------------------------------------------
 
 
-def test_engine_accepts_action_execution_policy():
+async def test_engine_accepts_action_execution_policy():
     from qitos.core.agent_module import AgentModule
     from qitos.core.state import StateSchema
     from qitos.engine.engine import Engine
@@ -340,10 +353,10 @@ def test_engine_accepts_action_execution_policy():
     engine = Engine(agent=_Agent(), action_execution_policy=policy)
 
     assert engine.executor is not None
-    assert engine.executor.policy is policy
+    assert engine.executor.policy == policy
 
 
-def test_policy_survives_handoff_executor_rebuild():
+async def test_policy_survives_handoff_executor_rebuild():
     from qitos.core.agent_module import AgentModule
     from qitos.core.state import StateSchema
     from qitos.core.tool_registry import ToolRegistry
@@ -366,11 +379,11 @@ def test_policy_survives_handoff_executor_rebuild():
     rebuilt = engine._build_action_executor(engine.tool_registry)
 
     assert rebuilt is not None
-    assert rebuilt.policy is policy
+    assert rebuilt.policy == policy
     assert rebuilt._engine is engine
 
 
-def test_engine_exposes_public_cancel():
+async def test_engine_exposes_public_cancel():
     from qitos.core.agent_module import AgentModule
     from qitos.core.state import StateSchema
     from qitos.engine.engine import Engine

@@ -19,6 +19,56 @@ class ModelUsageSource(str, Enum):
     ESTIMATE = "estimate"
 
 
+@dataclass(frozen=True, slots=True)
+class ModelPricing:
+    """Explicit USD prices per million tokens for one run's frozen model."""
+
+    input_usd_per_million: float
+    output_usd_per_million: float
+    cache_read_usd_per_million: float | None = None
+    cache_write_usd_per_million: float | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "input_usd_per_million",
+            "output_usd_per_million",
+            "cache_read_usd_per_million",
+            "cache_write_usd_per_million",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise TypeError(f"{name} must be a non-negative finite number")
+            if not math.isfinite(float(value)) or float(value) < 0:
+                raise ValueError(f"{name} must be a non-negative finite number")
+
+    def cost_usd(self, usage: "ModelUsage") -> float:
+        """Calculate one transaction's cost without model-name guessing."""
+
+        input_tokens = int(usage.input_tokens or 0)
+        output_tokens = int(usage.output_tokens or 0)
+        cache_read = min(input_tokens, int(usage.cache_read_tokens or 0))
+        cache_write = min(
+            max(0, input_tokens - cache_read),
+            int(usage.cache_write_tokens or 0),
+        )
+        uncached = max(0, input_tokens - cache_read - cache_write)
+        input_cost = uncached * float(self.input_usd_per_million)
+        input_cost += cache_read * float(
+            self.cache_read_usd_per_million
+            if self.cache_read_usd_per_million is not None
+            else self.input_usd_per_million
+        )
+        input_cost += cache_write * float(
+            self.cache_write_usd_per_million
+            if self.cache_write_usd_per_million is not None
+            else self.input_usd_per_million
+        )
+        output_cost = output_tokens * float(self.output_usd_per_million)
+        return (input_cost + output_cost) / 1_000_000.0
+
+
 def _duration_ms(value: Any, *, field_name: str) -> float | None:
     if value is None:
         return None
@@ -338,6 +388,7 @@ class ModelResponse:
 
 
 __all__ = [
+    "ModelPricing",
     "ModelResponse",
     "ModelTiming",
     "ModelUsage",

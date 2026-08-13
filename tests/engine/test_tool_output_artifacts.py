@@ -162,7 +162,7 @@ async def test_large_output_is_durable_readable_and_stable_on_resume(
     assert len(model_content) <= context.tool_result_max_chars
     assert original_model_message["tool_call_id"] == call_id
 
-    read_result = ReadFile(str(workspace)).execute(
+    read_result = await ReadFile(str(workspace)).execute(
         {"path": artifact.path, "line_offset": 0, "line_count": 20}
     )
     assert read_result["status"] == "success"

@@ -313,6 +313,9 @@ class _TraceRuntime(Generic[StateT]):
                 "max_steps": engine.budget.max_steps,
                 "max_runtime_seconds": engine.budget.max_runtime_seconds,
                 "max_tokens": engine.budget.max_tokens,
+                "max_cost_usd": engine.budget.max_cost_usd,
+                "max_tool_concurrency": engine.budget.max_tool_concurrency,
+                "max_children": engine.budget.max_children,
                 # Absolute monotonic values are process-local timestamps and
                 # therefore cannot be compared across runs.  Record only the
                 # stable fact that an external deadline constrained this run.
@@ -354,6 +357,7 @@ class _TraceRuntime(Generic[StateT]):
         stop_reason = state.stop_reason
         success = stop_reason in {
             StopReason.SUCCESS.value,
+            StopReason.COMPLETED.value,
             StopReason.FINAL.value,
             StopReason.ENV_TERMINAL.value,
         }
@@ -389,6 +393,7 @@ class _TraceRuntime(Generic[StateT]):
                 "steps": len(self.engine.records),
                 "elapsed_seconds": elapsed_seconds,
                 "token_usage": self.engine._context_runtime.tokens_total,
+                "cost_usd": self.engine._cost_usage_usd,
                 "prompt_tokens_total": self.engine._context_runtime.prompt_tokens_total,
                 "completion_tokens_total": self.engine._context_runtime.completion_tokens_total,
                 "peak_context_occupancy_ratio": self.engine._context_runtime.peak_occupancy_ratio,

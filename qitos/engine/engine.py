@@ -43,12 +43,20 @@ from ..core.journal import (
     SessionJournal,
 )
 from ..core.memory import Memory, MemoryRecord
+from ..core.model_capabilities import ModelCapabilities
+from ..core.model_response import (
+    ModelPricing,
+    ModelUsage,
+    ModelUsageSource,
+    normalize_model_usage,
+)
 from ..core.runtime_input import RuntimeInput
 from ..core.spec import ExperimentSpec, RunSpec
 from ..core.state import StateSchema
 from ..core.task import Task, TaskResult, TaskValidationIssue
 from ..core.tool_result import ToolResult
 from ..core.tool_registry import ToolExposure
+from ..core.turn import TurnBudgetSnapshot, TurnRuntimeCapabilities, TurnSnapshot
 from ..trace import TraceWriter
 from ..protocols import get_protocol, infer_protocol_from_parser
 from ..models.profile_registry import infer_default_protocol, infer_model_profile
@@ -121,6 +129,7 @@ class EngineResult(Generic[StateT]):
     task_result: Optional[TaskResult] = None
     runtime_seconds: float = 0.0
     total_tokens: int = 0
+    total_cost_usd: float = 0.0
     run_id: str = ""
     critic_traces: List[CriticTrace] = field(default_factory=list)
     handoff_traces: List[HandoffTrace] = field(default_factory=list)
@@ -255,6 +264,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         tracing_provider: Optional[Any] = None,
         auto_approve: bool = False,
         action_execution_policy: Optional[ActionExecutionPolicy] = None,
+        model_pricing: ModelPricing | None = None,
         journal: SessionJournal | None = None,
         state_snapshot_interval: int = 16,
     ):
@@ -274,10 +284,23 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
             self.tool_registry = _TR()
         self.budget = budget or RuntimeBudget()
+        if model_pricing is not None and not isinstance(model_pricing, ModelPricing):
+            raise TypeError("model_pricing must be a ModelPricing")
+        configured_pricing = model_pricing
+        if configured_pricing is None:
+            candidate_pricing = getattr(getattr(agent, "llm", None), "pricing", None)
+            if isinstance(candidate_pricing, ModelPricing):
+                configured_pricing = candidate_pricing
+        if self.budget.max_cost_usd is not None and configured_pricing is None:
+            raise ValueError("max_cost_usd requires explicit model_pricing")
+        self.model_pricing = configured_pricing
         self._base_budget = RuntimeBudget(
             max_steps=self.budget.max_steps,
             max_runtime_seconds=self.budget.max_runtime_seconds,
             max_tokens=self.budget.max_tokens,
+            max_cost_usd=self.budget.max_cost_usd,
+            max_tool_concurrency=self.budget.max_tool_concurrency,
+            max_children=self.budget.max_children,
             deadline_monotonic=self.budget.deadline_monotonic,
         )
         self.validation_gate = validation_gate or StateValidationGate()
@@ -335,6 +358,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_env_observation: Optional[EnvObservation] = None
         self._last_env_result: Optional[EnvStepResult] = None
         self._token_usage: int = 0
+        self._cost_usage_usd: float = 0.0
         self._active_run_id: str = ""
         self._runtime_deadline_monotonic: Optional[float] = None
         from ..kit.history import WindowHistory
@@ -358,8 +382,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_prompt_metadata: Dict[str, Any] = {}
         self._last_context_telemetry: Dict[str, Any] = {}
         self._last_runtime_error: Optional[Dict[str, Any]] = None
-        self._active_tool_exposure: ToolExposure | None = None
-        self._active_tool_exposure_step_id: int | None = None
         self._model_runtime: _ModelRuntime[StateT, ObservationT, ActionT] = (
             _ModelRuntime(self)
         )
@@ -423,9 +445,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._active_async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._connected_mcp_servers: List[Any] = []
         self._mcp_tool_names: List[str] = []
-        self._mcp_runtime: Any = None
 
-    def _build_action_executor(self, tool_registry: Any) -> Optional[ActionExecutor]:
+    def _build_action_executor(
+        self,
+        tool_registry: Any,
+        *,
+        turn: TurnSnapshot | None = None,
+    ) -> Optional[ActionExecutor]:
         """Construct an ActionExecutor carrying every engine-level dependency.
 
         Single source of truth for executor construction so that rebuilds
@@ -434,9 +460,24 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         """
         if tool_registry is None:
             return None
+        configured_policy = self._action_execution_policy or ActionExecutionPolicy()
+        max_tool_concurrency = (
+            turn.budget.max_tool_concurrency
+            if turn is not None
+            else self.budget.max_tool_concurrency
+        )
+        policy = ActionExecutionPolicy(
+            mode=configured_policy.mode,
+            fail_fast=configured_policy.fail_fast,
+            max_concurrency=min(
+                int(configured_policy.max_concurrency),
+                int(max_tool_concurrency),
+            ),
+            parallel_tool_names=configured_policy.parallel_tool_names,
+        )
         return ActionExecutor(
             tool_registry=tool_registry,
-            policy=self._action_execution_policy,
+            policy=policy,
             trace_writer=self.trace_writer,
             delegate_depth=self._delegate_depth,
             shared_memory=self._shared_memory,
@@ -445,27 +486,66 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             read_before_write_enforcer=self._rbw_enforcer,
             permission_interaction_callback=self._permission_interaction_callback,
             auto_approve=self.auto_approve,
+            turn_budget=turn.budget if turn is not None else None,
         )
 
-    def _capture_tool_exposure(
+    def _capture_turn(
         self,
         state: StateT,
         step_id: int,
-    ) -> ToolExposure:
+    ) -> TurnSnapshot:
+        """Capture the exact immutable inputs shared by model and tools."""
+
         exposure = self.agent.build_tool_exposure(state, self.tool_registry)
         if not isinstance(exposure, ToolExposure):
             raise TypeError("Agent.build_tool_exposure() must return ToolExposure")
-        self._active_tool_exposure = exposure
-        self._active_tool_exposure_step_id = step_id
-        return exposure
-
-    def _action_executor_for_step(self, step_id: int) -> ActionExecutor | None:
-        if (
-            self._active_tool_exposure is not None
-            and self._active_tool_exposure_step_id == step_id
-        ):
-            return self._build_action_executor(self._active_tool_exposure)
-        return self.executor
+        model = getattr(self.agent, "llm", None)
+        model_capabilities = getattr(model, "capabilities", ModelCapabilities())
+        if not isinstance(model_capabilities, ModelCapabilities):
+            model_capabilities = ModelCapabilities()
+        environment_ops: set[str] = set()
+        for name in exposure.list_tools():
+            description = exposure.describe_tool(name)
+            environment_ops.update(description.get("required_ops") or [])
+            environment_ops.update(description.get("environment_ops") or [])
+        remaining_tokens = (
+            None
+            if self.budget.max_tokens is None
+            else max(0, int(self.budget.max_tokens) - int(self._token_usage))
+        )
+        remaining_cost = (
+            None
+            if self.budget.max_cost_usd is None
+            else max(0.0, float(self.budget.max_cost_usd) - self._cost_usage_usd)
+        )
+        protocol = self.resolve_protocol()
+        return TurnSnapshot(
+            run_id=self._active_run_id,
+            step_id=step_id,
+            model=model,
+            protocol=protocol,
+            protocol_source=self._resolved_protocol_source,
+            history=self._history().snapshot(),
+            tools=exposure,
+            capabilities=TurnRuntimeCapabilities(
+                model=model_capabilities,
+                environment_ops=tuple(sorted(environment_ops)),
+                mailbox=True,
+                child_agents="Agent" in exposure.list_tools(),
+            ),
+            budget=TurnBudgetSnapshot(
+                step=step_id,
+                max_steps=int(self.budget.max_steps),
+                used_tokens=int(self._token_usage),
+                remaining_tokens=remaining_tokens,
+                used_cost_usd=float(self._cost_usage_usd),
+                remaining_cost_usd=remaining_cost,
+                model_pricing=self.model_pricing,
+                deadline_monotonic=self._runtime_deadline_monotonic,
+                max_tool_concurrency=int(self.budget.max_tool_concurrency),
+                max_children=int(self.budget.max_children),
+            ),
+        )
 
     def cancel(self, mode: str = "immediate") -> None:
         """Request cancellation of an in-flight run.
@@ -504,6 +584,26 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         if deadline is None:
             return None
         return max(0.0, deadline - time.monotonic())
+
+    def _record_model_cost(
+        self,
+        usage: ModelUsage | Mapping[str, Any] | None,
+        *,
+        pricing: ModelPricing | None,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> float:
+        if pricing is None:
+            return 0.0
+        normalized = normalize_model_usage(usage) or ModelUsage(
+            input_tokens=max(0, int(input_tokens)),
+            output_tokens=max(0, int(output_tokens)),
+            total_tokens=max(0, int(input_tokens)) + max(0, int(output_tokens)),
+            source=ModelUsageSource.ESTIMATE,
+        )
+        transaction_cost = pricing.cost_usd(normalized)
+        self._cost_usage_usd += transaction_cost
+        return transaction_cost
 
     def _activate_runtime_budget(self, started_at: float) -> None:
         deadlines: List[float] = []
@@ -625,6 +725,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         task_obj, task_text = self._normalize_task(task)
         self._apply_task_budget(task_obj)
+        self.budget.__post_init__()
+        if self.budget.max_cost_usd is not None and self.model_pricing is None:
+            raise ValueError("max_cost_usd requires explicit model_pricing")
+        self.executor = self._build_action_executor(self.tool_registry)
         started_at = time.monotonic()
         self._activate_runtime_budget(started_at)
 
@@ -669,12 +773,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         _reset_interrupt_context()
         step_id = state.current_step
         started_at = time.monotonic()
+        turn = self._capture_turn(state, step_id)
         record = StepRecord(step_id=step_id, agent_id=self.agent.name)
         self.records.append(record)
 
         # DECIDE
         try:
-            decision = await self._run_decide(state, observation, record)
+            decision = await self._run_decide(state, observation, record, turn)
         except EngineInterrupt as ei:
             # Save checkpoint and report interrupt
             cp_id = await self._save_interrupt_checkpoint(step_id, state, ei)
@@ -745,8 +850,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     stop=stop,
                     stop_reason=(
                         StopReason(state.stop_reason)
-                        if state.stop_reason
-                        else StopReason.FINAL
+                        if stop and state.stop_reason
+                        else None
                     ),
                 )
             self._finalize_step(record, state)
@@ -762,7 +867,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         # ACT
         try:
-            action_results = await self._run_act(state, decision, record)
+            action_results = await self._run_act(state, decision, record, turn)
         except Exception as exc:
             failed_phase = self._infer_failed_phase(record)
             if self._recover(state, failed_phase, exc):
@@ -884,7 +989,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         Useful for REPLs that want to handle DECIDE themselves but delegate
         ACT execution to the engine.
         """
-        return await self._run_act(state, decision, record)
+        turn = self._capture_turn(state, record.step_id)
+        return await self._run_act(state, decision, record, turn)
 
     def execute_actions(
         self, state: StateT, decision: Decision[ActionT], record: StepRecord
@@ -985,6 +1091,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         _resume_canonical_results = tuple(
             kwargs.pop("_resume_canonical_results", ())
         )
+        _resume_usage = dict(kwargs.pop("_resume_usage", {}) or {})
 
         self._reset_run_state()
         self._canonical_action_results = list(_resume_canonical_results)
@@ -1012,9 +1119,15 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._apply_task_budget(task_obj)
         started_at = time.monotonic()
         self._activate_runtime_budget(started_at)
-        self._token_usage = 0
+        self._token_usage = int(_resume_usage.get("total_tokens", 0) or 0)
+        self._cost_usage_usd = float(_resume_usage.get("cost_usd", 0.0) or 0.0)
         self._last_context_telemetry = {}
         self._context_runtime.reset()
+        self._context_runtime.restore_usage(
+            prompt_tokens=int(_resume_usage.get("prompt_tokens", 0) or 0),
+            completion_tokens=int(_resume_usage.get("completion_tokens", 0) or 0),
+            total_tokens=self._token_usage,
+        )
         self._resolved_protocol = self.resolve_protocol()
         # Record multi-agent topology in trace metadata
         if self.trace_writer is not None and self.agent_registry is not None:
@@ -1047,7 +1160,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._hydrate_trace_metadata(task_obj=task_obj, task_text=task_text)
 
         try:
-            self._setup_toolsets(
+            await self._asetup_toolsets(
                 {
                     "state": state,
                     "trace_writer": self.trace_writer,
@@ -1130,6 +1243,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 ),
                 runtime_seconds=time.monotonic() - started_at,
                 total_tokens=int(self._token_usage),
+                total_cost_usd=float(self._cost_usage_usd),
                 run_id=self._active_run_id,
                 _cancel_token=self._cancel_token,
             )
@@ -1139,7 +1253,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             self._notify_run_end(result)
             self._clear_active_context()
             self._teardown_env()
-            self._teardown_toolsets(
+            await self._ateardown_toolsets(
                 {
                     "state": state,
                     "trace_writer": self.trace_writer,
@@ -1150,6 +1264,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         step_id = _resume_step if _resume_step is not None else 0
         cancelled = False
+        propagate_cancel = False
         journal_interrupted = False
         try:
             # MCP discovery happens after preflight but before the first model
@@ -1198,6 +1313,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
                 self._drain_runtime_events(step_id)
 
+                # Safe point: external input has been projected and the exact
+                # model/history/tool/config view is now frozen for this turn.
+                turn = self._capture_turn(state, step_id)
+
                 self.validation_gate.before_phase(state, RuntimePhase.DECIDE.value)
 
                 record = StepRecord(step_id=step_id, agent_id=self.agent.name)
@@ -1224,6 +1343,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         state,
                         current_observation,
                         record,
+                        turn,
                     )
                     await self._journal_model_completed(record, decision)
                 except Exception as exc:
@@ -1370,7 +1490,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         RuntimePhase.DECIDE,
                         payload={"stage": "runtime_wait_start"},
                     )
-                    wait_outcome = self._wait_for_runtime_event()
+                    wait_outcome = await self._wait_for_runtime_event()
                     self._emit(
                         step_id,
                         RuntimePhase.DECIDE,
@@ -1482,9 +1602,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         record.observation = observation
                         self._memory_append("observation", observation, record.step_id)
                         self._run_reduce(state, observation, decision, record)
-                        fr = getattr(state, "final_result", None)
-                        if isinstance(fr, str) and fr and state.stop_reason is None:
-                            state.set_stop("final", fr)
                     except Exception as exc:
                         if self.journal is not None:
                             raise
@@ -1531,7 +1648,20 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         continue
                 else:
                     try:
-                        action_results = await self._run_act(state, decision, record)
+                        action_results = await self._run_act(
+                            state, decision, record, turn
+                        )
+                        current_task = asyncio.current_task()
+                        if (
+                            current_task is not None
+                            and current_task.cancelling()
+                            and not self._cancel_token.is_cancel_requested
+                        ):
+                            # The executor has drained started handlers and
+                            # persisted terminal results. Re-surface a caller
+                            # Task.cancel() before reducer/step commit so
+                            # recovery restarts only pure state projection.
+                            raise asyncio.CancelledError
                         observation = self._build_observation_after_action(
                             state=state,
                             step_id=step_id,
@@ -1542,11 +1672,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         record.observation = observation
                         self._memory_append("observation", observation, record.step_id)
                         self._run_reduce(state, observation, decision, record)
-                        # Early exit: if reduce set final_result, set stop reason
-                        # so critics don't override it and FinalResultCriteria catches it
-                        fr = getattr(state, "final_result", None)
-                        if isinstance(fr, str) and fr and state.stop_reason is None:
-                            state.set_stop("final", fr)
                     except Exception as exc:
                         if self.journal is not None:
                             raise
@@ -1715,6 +1840,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     break
         except asyncio.CancelledError:
             cancelled = True
+            propagate_cancel = not self._cancel_token.is_cancel_requested
             self._cancel_token.request_cancel("immediate")
             if state.stop_reason is None:
                 state.set_stop(StopReason.CANCELLED_IMMEDIATE)
@@ -1732,7 +1858,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         finally:
             self._runtime_inbox.close(self._active_run_id)
             self._teardown_env()
-            self._teardown_toolsets(
+            await self._ateardown_toolsets(
                 {
                     "state": state,
                     "trace_writer": self.trace_writer,
@@ -1758,7 +1884,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             # Cleanup MCP servers
             await self._cleanup_mcp_servers()
 
-        if cancelled:
+        if cancelled and propagate_cancel:
             self._clear_active_context()
             raise asyncio.CancelledError
 
@@ -1774,7 +1900,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     "steps": len(self.records),
                     "token_usage": self._context_runtime.tokens_total,
                     "latency_seconds": task_result.metrics.get("elapsed_seconds", 0.0),
-                    "cost": task_result.metrics.get("cost", 0.0),
+                    "cost_usd": task_result.metrics.get("cost_usd", 0.0),
                     "context": self._context_runtime.run_summary(),
                     "parser": self._trace_runtime.parser_summary(),
                     "task_meta": self._task_meta(task_obj),
@@ -1804,6 +1930,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             ),
             runtime_seconds=time.monotonic() - started_at,
             total_tokens=int(self._token_usage),
+            total_cost_usd=float(self._cost_usage_usd),
             run_id=self._active_run_id,
             critic_traces=_critic_traces,
             handoff_traces=_handoff_traces,
@@ -1921,15 +2048,47 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self.budget.max_steps = self._base_budget.max_steps
         self.budget.max_runtime_seconds = self._base_budget.max_runtime_seconds
         self.budget.max_tokens = self._base_budget.max_tokens
+        self.budget.max_cost_usd = self._base_budget.max_cost_usd
+        self.budget.max_tool_concurrency = self._base_budget.max_tool_concurrency
+        self.budget.max_children = self._base_budget.max_children
         self.budget.deadline_monotonic = self._base_budget.deadline_monotonic
         if task_obj is not None:
             budget = task_obj.budget
             if budget.max_steps is not None:
-                self.budget.max_steps = int(budget.max_steps)
+                self.budget.max_steps = min(
+                    self.budget.max_steps, int(budget.max_steps)
+                )
             if budget.max_runtime_seconds is not None:
-                self.budget.max_runtime_seconds = float(budget.max_runtime_seconds)
+                requested_runtime = float(budget.max_runtime_seconds)
+                self.budget.max_runtime_seconds = (
+                    requested_runtime
+                    if self.budget.max_runtime_seconds is None
+                    else min(self.budget.max_runtime_seconds, requested_runtime)
+                )
             if budget.max_tokens is not None:
-                self.budget.max_tokens = int(budget.max_tokens)
+                requested_tokens = int(budget.max_tokens)
+                self.budget.max_tokens = (
+                    requested_tokens
+                    if self.budget.max_tokens is None
+                    else min(self.budget.max_tokens, requested_tokens)
+                )
+            if budget.max_cost_usd is not None:
+                requested_cost = float(budget.max_cost_usd)
+                self.budget.max_cost_usd = (
+                    requested_cost
+                    if self.budget.max_cost_usd is None
+                    else min(self.budget.max_cost_usd, requested_cost)
+                )
+            if budget.max_tool_concurrency is not None:
+                self.budget.max_tool_concurrency = min(
+                    self.budget.max_tool_concurrency,
+                    int(budget.max_tool_concurrency),
+                )
+            if budget.max_children is not None:
+                self.budget.max_children = min(
+                    self.budget.max_children,
+                    int(budget.max_children),
+                )
         if self._uses_default_stop_criteria:
             self.stop_criteria = [FinalResultCriteria()]
 
@@ -2018,7 +2177,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         )
 
     async def _run_decide(
-        self, state: StateT, observation: ObservationT, record: StepRecord
+        self,
+        state: StateT,
+        observation: ObservationT,
+        record: StepRecord,
+        turn: TurnSnapshot,
     ) -> Decision[ActionT]:
         # Propagate streaming callback to model runtime
         self._model_runtime.stream_callback = self.stream_callback
@@ -2027,6 +2190,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 state,
                 observation,
                 record,
+                turn,
             )
         finally:
             self._model_runtime.stream_callback = None
@@ -2040,9 +2204,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         return self._model_runtime.select_branch(state, observation, branch_decision)
 
     async def _run_act(
-        self, state: StateT, decision: Decision[ActionT], record: StepRecord
+        self,
+        state: StateT,
+        decision: Decision[ActionT],
+        record: StepRecord,
+        turn: TurnSnapshot,
     ) -> List[Any]:
-        return await self._action_runtime.run_act(state, decision, record)
+        return await self._action_runtime.run_act(state, decision, record, turn)
 
     def _run_reduce(
         self,
@@ -2124,9 +2292,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             payload={"stage": "runtime_input", **payload},
         )
 
-    def _wait_for_runtime_event(self) -> RuntimeWaitOutcome:
+    async def _wait_for_runtime_event(self) -> RuntimeWaitOutcome:
         timeout_seconds = self.remaining_runtime_seconds()
-        return self._runtime_inbox.wait(
+        return await self._runtime_inbox.wait(
             self._active_run_id,
             timeout_seconds=timeout_seconds,
             cancelled=lambda: self._cancel_token.is_cancel_requested,
@@ -2184,10 +2352,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         error_log = os.environ.get("QITOS_ERROR_LOG", "").strip()
         if not error_log:
-            trace_dir = (
-                os.environ.get("QITOS_TRACE_DIR", "").strip()
-                or os.environ.get("CYBERGYM_TASK_TRACE_DIR", "").strip()
-            )
+            trace_dir = os.environ.get("QITOS_TRACE_DIR", "").strip()
             if trace_dir:
                 error_log = str(Path(trace_dir) / "step_error.log")
         if error_log:
@@ -2425,6 +2590,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             self._active_task = task_text
             self._active_task_obj = task if isinstance(task, Task) else None
             self._active_state = state
+            self._token_usage = int(replay["usage"]["total_tokens"])
+            self._cost_usage_usd = float(replay["usage"]["cost_usd"])
+            self._context_runtime.restore_usage(
+                prompt_tokens=int(replay["usage"]["prompt_tokens"]),
+                completion_tokens=int(replay["usage"]["completion_tokens"]),
+                total_tokens=self._token_usage,
+            )
             replayed_records = await journal.replay()
             self._last_journal_position = replayed_records[-1].position
             self._reset_history(history)
@@ -2438,6 +2610,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 records=replay["records"],
                 events=[],
                 step_count=len(replay["records"]),
+                total_tokens=self._token_usage,
+                total_cost_usd=self._cost_usage_usd,
                 run_id=run_id,
             )
             self._notify_run_end(result)
@@ -2465,6 +2639,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             _resume_run_id=run_id,
             _resume_journal=True,
             _resume_canonical_results=replay["canonical_results"],
+            _resume_usage=replay["usage"],
         )
 
     def resume_from_journal(self, run_id: str) -> EngineResult[StateT]:
@@ -2990,12 +3165,39 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 "toolset_setup_error", context, ok=False, error=str(exc)
             )
 
+    async def _asetup_toolsets(self, context: Dict[str, Any]) -> None:
+        if not hasattr(self.tool_registry, "asetup"):
+            self._setup_toolsets(context)
+            return
+        self._write_lifecycle_event("toolset_setup_start", context)
+        try:
+            await self.tool_registry.asetup(context)
+            self._write_lifecycle_event("toolset_setup_end", context)
+        except Exception as exc:
+            self._write_lifecycle_event(
+                "toolset_setup_error", context, ok=False, error=str(exc)
+            )
+            raise
+
     def _teardown_toolsets(self, context: Dict[str, Any]) -> None:
         if not hasattr(self.tool_registry, "teardown"):
             return
         self._write_lifecycle_event("toolset_teardown_start", context)
         try:
             self.tool_registry.teardown(context)
+            self._write_lifecycle_event("toolset_teardown_end", context)
+        except Exception as exc:
+            self._write_lifecycle_event(
+                "toolset_teardown_error", context, ok=False, error=str(exc)
+            )
+
+    async def _ateardown_toolsets(self, context: Dict[str, Any]) -> None:
+        if not hasattr(self.tool_registry, "ateardown"):
+            self._teardown_toolsets(context)
+            return
+        self._write_lifecycle_event("toolset_teardown_start", context)
+        try:
+            await self.tool_registry.ateardown(context)
             self._write_lifecycle_event("toolset_teardown_end", context)
         except Exception as exc:
             self._write_lifecycle_event(
@@ -3067,9 +3269,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._resolved_protocol = None
         self._resolved_protocol_source = ""
         self._last_prompt_metadata = {}
-        self._active_tool_exposure = None
-        self._active_tool_exposure_step_id = None
         self._runtime_deadline_monotonic = None
+        self._cost_usage_usd = 0.0
         self._last_checkpoint_id = None
         self._canonical_action_results = []
         self._journal_pending_history = []
@@ -3087,15 +3288,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     async def _connect_mcp_servers(self) -> None:
         """Connect all configured MCP servers and bridge their tools."""
         from ..mcp.bridge import mcp_server_to_function_tools
-        from ..mcp.runtime import MCPEventLoopRuntime
 
         servers = list(getattr(self.agent, "mcp_servers", None) or [])
         if not servers:
             return
 
-        runtime = MCPEventLoopRuntime()
-        runtime.start()
-        self._mcp_runtime = runtime
         used_names = set(
             self.tool_registry.list_tools() if self.tool_registry is not None else []
         )
@@ -3115,7 +3312,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         )
                 if hasattr(server, "cleanup"):
                     try:
-                        await runtime.run(server.cleanup())
+                        await server.cleanup()
                     except Exception as cleanup_exc:
                         _logger.warning(
                             "MCP server cleanup after setup failure failed: %s",
@@ -3124,16 +3321,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
             try:
                 if hasattr(server, "connect"):
-                    await runtime.run(server.connect())
+                    await server.connect()
                 # Bridge MCP tools into the engine's tool registry
                 if self.tool_registry is not None:
-                    tools = await runtime.run(
-                        mcp_server_to_function_tools(
-                            server,
-                            name_prefix=f"mcp__{server.name}",
-                            call_runner=runtime.run_sync,
-                            used_names=used_names,
-                        )
+                    tools = await mcp_server_to_function_tools(
+                        server,
+                        name_prefix=f"mcp__{server.name}",
+                        used_names=used_names,
                     )
                     for tool in tools:
                         if hasattr(self.tool_registry, "register"):
@@ -3153,12 +3347,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     exc,
                 )
 
-        if not self._connected_mcp_servers:
-            await runtime.close()
-            self._mcp_runtime = None
-
     async def _cleanup_mcp_servers(self) -> None:
-        """Remove run-scoped MCP tools and cleanup their transport loop."""
+        """Remove run-scoped MCP tools and close transports on this loop."""
         for name in reversed(self._mcp_tool_names):
             try:
                 if self.tool_registry is not None:
@@ -3167,22 +3357,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 _logger.warning("MCP tool cleanup failed for %s: %s", name, exc)
         self._mcp_tool_names = []
 
-        runtime = self._mcp_runtime
         for server in self._connected_mcp_servers:
             try:
                 if hasattr(server, "cleanup"):
-                    if runtime is not None:
-                        await runtime.run(server.cleanup())
-                    else:
-                        await server.cleanup()
+                    await server.cleanup()
             except Exception as exc:
                 _logger.warning("MCP server cleanup failed: %s", exc)
         self._connected_mcp_servers = []
-        if runtime is not None:
-            try:
-                await runtime.close()
-            finally:
-                self._mcp_runtime = None
 
     # -- Handoff tool helpers --
 

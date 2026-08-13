@@ -109,7 +109,8 @@ class _TestAgent(AgentModule):
 class TestNeedsApproval:
     """Tests for needs_approval marker in ActionExecutor."""
 
-    def test_needs_approval_raises_interrupt(self):
+    @pytest.mark.asyncio
+    async def test_needs_approval_raises_interrupt(self):
         """ActionExecutor._execute_one raises EngineInterrupt for needs_approval=True tools."""
         ts = _TestToolSet()
         registry = ToolRegistry().register_toolset(ts, namespace="")
@@ -117,19 +118,21 @@ class TestNeedsApproval:
 
         action = Action(name="approval_action", args={"command": "rm -rf /"})
         with pytest.raises(EngineInterrupt):
-            executor._execute_one(action)
+            await executor._execute_one(action)
 
-    def test_needs_approval_auto_approve_skips_interrupt(self):
+    @pytest.mark.asyncio
+    async def test_needs_approval_auto_approve_skips_interrupt(self):
         """With auto_approve=True, needs_approval tools execute without interrupt."""
         ts = _TestToolSet()
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=True)
 
         action = Action(name="approval_action", args={"command": "echo hello"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 
-    def test_both_markers_triggers_interrupt(self):
+    @pytest.mark.asyncio
+    async def test_both_markers_triggers_interrupt(self):
         """A tool with both read_only and needs_approval still triggers interrupt."""
         ts = _TestToolSet()
         registry = ToolRegistry().register_toolset(ts, namespace="")
@@ -137,9 +140,10 @@ class TestNeedsApproval:
 
         action = Action(name="read_and_approve", args={"path": "/etc/passwd"})
         with pytest.raises(EngineInterrupt):
-            executor._execute_one(action)
+            await executor._execute_one(action)
 
-    def test_permission_pipeline_replaces_static_approval_fallback(self):
+    @pytest.mark.asyncio
+    async def test_permission_pipeline_replaces_static_approval_fallback(self):
         """A configured pipeline owns parameter-level approval decisions."""
         ts = _TestToolSet()
         registry = ToolRegistry().register_toolset(ts, namespace="")
@@ -150,11 +154,12 @@ class TestNeedsApproval:
         )
 
         action = Action(name="approval_action", args={"command": "echo hello"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
 
         assert result.status is ActionStatus.SUCCESS
 
-    def test_permission_pipeline_can_deny_static_approval_tool(self):
+    @pytest.mark.asyncio
+    async def test_permission_pipeline_can_deny_static_approval_tool(self):
         ts = _TestToolSet()
         registry = ToolRegistry().register_toolset(ts, namespace="")
         context = ToolPermissionContext(
@@ -174,7 +179,7 @@ class TestNeedsApproval:
         )
 
         action = Action(name="approval_action", args={"command": "echo blocked"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
 
         assert result.status is ActionStatus.DENIED
         assert result.metadata["executed"] is False
@@ -184,14 +189,15 @@ class TestNeedsApproval:
 class TestReadOnly:
     """Tests for read_only marker in ActionExecutor."""
 
-    def test_read_only_tool_no_interrupt(self):
+    @pytest.mark.asyncio
+    async def test_read_only_tool_no_interrupt(self):
         """A read_only tool (without needs_approval) does not trigger interrupt."""
         ts = _TestToolSet()
         registry = ToolRegistry().register_toolset(ts, namespace="")
         executor = ActionExecutor(tool_registry=registry, auto_approve=False)
 
         action = Action(name="read_only_query", args={"query": "test"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 
     def test_read_only_tool_requires_an_explicit_concurrency_declaration(self):
@@ -215,7 +221,8 @@ class TestReadOnly:
         executor = ActionExecutor(tool_registry=registry)
         assert executor._is_concurrency_safe("read_and_approve") is False
 
-    def test_no_marker_tool_default(self):
+    @pytest.mark.asyncio
+    async def test_no_marker_tool_default(self):
         """A tool without markers is not concurrency-safe and doesn't trigger interrupt."""
         ts = _TestToolSet()
         registry = ToolRegistry().register_toolset(ts, namespace="")
@@ -226,7 +233,7 @@ class TestReadOnly:
 
         # No needs_approval → no interrupt
         action = Action(name="basic_tool", args={"value": "test"})
-        result = executor._execute_one(action)
+        result = await executor._execute_one(action)
         assert result.status == ActionStatus.SUCCESS
 
 
@@ -248,7 +255,7 @@ class TestEngineIntegration:
         result = engine.run("test", max_steps=5, return_state=True)
         # Engine recovers from interrupt and continues
         # The SequenceModel provides "Final Answer: Done." on next step
-        assert result.state.stop_reason == "final"
+        assert result.state.stop_reason == "completed"
         assert result.step_count >= 2  # At least interrupt step + final step
 
     def test_auto_approve_in_engine_loop(self):
@@ -263,7 +270,7 @@ class TestEngineIntegration:
         agent = _TestAgent(llm=llm, auto_approve=True)
         engine = Engine(agent=agent, auto_approve=True)
         result = engine.run("test", max_steps=3, return_state=True)
-        assert result.state.stop_reason == "final"
+        assert result.state.stop_reason == "completed"
 
     def test_read_only_tool_executes_normally(self):
         """A read_only tool (without needs_approval) runs without interrupt."""
@@ -277,7 +284,7 @@ class TestEngineIntegration:
         agent = _TestAgent(llm=llm, auto_approve=False)
         engine = Engine(agent=agent, auto_approve=False)
         result = engine.run("test", max_steps=3, return_state=True)
-        assert result.state.stop_reason == "final"
+        assert result.state.stop_reason == "completed"
 
 
 class TestSpecMarkers:

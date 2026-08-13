@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import threading
 import time
 from dataclasses import dataclass
@@ -143,10 +144,10 @@ def test_background_agent_completion_wakes_parent_runtime_wait() -> None:
     class ChildEngine:
         active_run_id = "child-run"
 
-        def run(self, task: str, **kwargs: Any) -> Any:
+        async def arun(self, task: str, **kwargs: Any) -> Any:
             _ = kwargs
             child_started.set()
-            assert release_child.wait(timeout=1)
+            assert await asyncio.to_thread(release_child.wait, 1)
             return SimpleNamespace(
                 state=SimpleNamespace(
                     final_result=f"validated:{task}",
@@ -228,7 +229,6 @@ def test_background_agent_completion_wakes_parent_runtime_wait() -> None:
 
     release_child.set()
     thread.join(timeout=1)
-    agent_tool.close(wait_seconds=1)
 
     assert not thread.is_alive()
     assert parent.calls == 3
