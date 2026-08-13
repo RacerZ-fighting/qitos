@@ -291,6 +291,88 @@ async def test_terminal_append_failure_does_not_commit_reduced_state(
 
 
 @pytest.mark.asyncio
+async def test_finalizer_failure_aborts_the_uncommitted_transaction(
+    tmp_path: Path,
+) -> None:
+    class BrokenFinalizerAgent(JournalAgent):
+        def finalize_action_result(
+            self,
+            state: JournalState,
+            action: Action,
+            result: ToolResult,
+            *,
+            step_id: int,
+            context: ActionResultContext,
+        ) -> ToolResult:
+            _ = state, action, result, step_id, context
+            raise RuntimeError("finalizer failed")
+
+    agent = BrokenFinalizerAgent()
+    journal = JsonlSessionJournal(tmp_path)
+
+    with pytest.raises(RuntimeError, match="finalizer failed"):
+        await Engine(agent=agent, journal=journal).arun("inspect")
+
+    record_types = [record.type for record in await journal.replay()]
+    assert agent.executions == 1
+    assert JournalRecordType.TOOL_STARTED in record_types
+    assert JournalRecordType.TOOL_TERMINAL not in record_types
+    assert JournalRecordType.STEP_COMMITTED not in record_types
+
+    resumed_agent = JournalAgent()
+    resumed_journal = JsonlSessionJournal(tmp_path)
+    resumed = await Engine(
+        agent=resumed_agent,
+        journal=resumed_journal,
+    ).aresume_from_journal(journal.run_id)
+
+    assert resumed_agent.executions == 0
+    assert resumed.state.final_result == "done"
+    terminal = next(
+        record
+        for record in await resumed_journal.replay()
+        if record.type is JournalRecordType.TOOL_TERMINAL
+    )
+    assert terminal.payload["result"]["metadata"]["side_effect"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_reducer_failure_preserves_terminal_for_resume(tmp_path: Path) -> None:
+    class BrokenReducerAgent(JournalAgent):
+        def reduce_action_result(
+            self,
+            state: JournalState,
+            action: Action,
+            result: ToolResult,
+            *,
+            step_id: int,
+        ) -> JournalState:
+            _ = state, action, result, step_id
+            raise RuntimeError("reducer failed")
+
+    agent = BrokenReducerAgent()
+    journal = JsonlSessionJournal(tmp_path)
+
+    with pytest.raises(RuntimeError, match="reducer failed"):
+        await Engine(agent=agent, journal=journal).arun("inspect")
+
+    record_types = [record.type for record in await journal.replay()]
+    assert agent.executions == 1
+    assert JournalRecordType.TOOL_TERMINAL in record_types
+    assert JournalRecordType.STEP_COMMITTED not in record_types
+
+    resumed_agent = JournalAgent()
+    resumed = await Engine(
+        agent=resumed_agent,
+        journal=JsonlSessionJournal(tmp_path),
+    ).aresume_from_journal(journal.run_id)
+
+    assert resumed_agent.executions == 0
+    assert resumed.state.seen == ["canonical"]
+    assert resumed.state.final_result == "done"
+
+
+@pytest.mark.asyncio
 async def test_resume_closes_started_tool_without_replaying_unknown_side_effect(
     tmp_path: Path,
 ) -> None:

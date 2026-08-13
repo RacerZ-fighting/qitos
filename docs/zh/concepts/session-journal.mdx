@@ -22,6 +22,9 @@ Engine 按以下顺序写入：
 只持久化一次，History 和 Reducer 使用同一个值。多调用 batch 中，每个 terminal 会先完成 Reducer，
 再生成下一个结果；显式声明并发安全的 Handler 仍可并发执行。
 
+Finalizer 或 Reducer 失败会中止当前未提交事务。恢复只依据 durable started/terminal 边界，
+不会在缺少结果时发布 step。
+
 恢复时，如果只有 `tool.started` 而没有 `tool.terminal`，Engine 会补写一个“副作用未知”的明确
 error 终态，绝不重放 Handler。没有获得 `tool.started` 的调用会补成“无副作用”的 cancelled 终态。
 如果 terminal 已完整而 `step.committed` 缺失，恢复只重跑纯 Reducer。

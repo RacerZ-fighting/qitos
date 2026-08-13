@@ -1457,7 +1457,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         if isinstance(fr, str) and fr and state.stop_reason is None:
                             state.set_stop("final", fr)
                     except Exception as exc:
-                        if isinstance(exc, JournalError):
+                        if self.journal is not None:
                             raise
                         failed_phase = self._infer_failed_phase(record)
                         if not self._recover(state, failed_phase, exc):
@@ -1519,7 +1519,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         if isinstance(fr, str) and fr and state.stop_reason is None:
                             state.set_stop("final", fr)
                     except Exception as exc:
-                        if isinstance(exc, JournalError):
+                        if self.journal is not None:
                             raise
                         failed_phase = self._infer_failed_phase(record)
                         if not self._recover(state, failed_phase, exc):

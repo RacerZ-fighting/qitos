@@ -47,6 +47,8 @@ How to update:
   neither path replays a handler. Engines also reject Journal/checkpoint dual writes.
 - Multi-action Journal batches now reduce each durable terminal before finalizing the
   next result, so later state-aware finalizers observe earlier tool outcomes.
+- Journal-backed finalizer and reducer failures now abort the uncommitted transaction
+  instead of entering legacy in-memory ACT recovery and publishing invalid state.
 - MCP tools now execute on the transport's owning event loop and are removed from
   shared registries during Engine cleanup, preventing cross-loop failures and stale
   registrations when an Agent or registry is reused.

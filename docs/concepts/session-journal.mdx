@@ -24,6 +24,9 @@ not invoked. The finalized terminal result is persisted once and is the same val
 by History and reducers. In a multi-action batch, each terminal is reduced before the
 next result is finalized. Explicitly concurrency-safe handlers may still run concurrently.
 
+Finalizer or reducer failure aborts the current uncommitted transaction. Recovery uses
+the durable started/terminal boundary; it never publishes a step around a missing result.
+
 If recovery finds `tool.started` without `tool.terminal`, it writes an explicit error
 terminal with unknown side effects and never runs the handler again. A call that never
 received `tool.started` is closed as cancelled with no side effect. If all terminal
