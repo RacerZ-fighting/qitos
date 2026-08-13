@@ -20,9 +20,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 - **One async turn transaction**: every model turn now captures an immutable model,
   protocol, complete History, Tool exposure, capability, deadline, pricing, and budget
-  view. Engine, Tool, Mailbox, MCP, and Child calls stay on the caller's event loop;
-  cancellation drains started handlers and journals one ordered terminal result per
-  call before it propagates.
+  view. Full runs and interactive steps share this one transaction; parser and optional
+  critic/handoff policies compose around it instead of adding another loop. Engine,
+  Tool, Mailbox, MCP, and Child calls stay on the caller's event loop; cancellation
+  drains started handlers and journals one ordered terminal result per call before it
+  propagates.
 - **Product-owned completion and bounded Runs**: `AgentModule.assess_completion()` can
   accept a final answer, request another evidence-gathering turn, or classify a concrete
   blocker. Runtime and Task budgets now cover steps, time, tokens, cost, Tool
