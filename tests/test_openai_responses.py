@@ -21,7 +21,11 @@ from qitos.models._openai_responses import (
     _to_responses_tool_choice,
     _to_responses_tools,
 )
-from qitos.models.openai import OpenAICompatibleModel, OpenAIModel
+from qitos.models.openai import (
+    ChatStreamAccumulator,
+    OpenAICompatibleModel,
+    OpenAIModel,
+)
 
 
 class _AsyncListStream(AsyncIterator[Any]):
@@ -884,6 +888,44 @@ async def test_chat_compatibility_streams_reasoning_parallel_tool_calls_and_usag
     }
     assert events.closed is True
     assert captured["client_closed"] is True
+
+
+def test_chat_output_limit_does_not_publish_partial_tool_calls() -> None:
+    accumulator = ChatStreamAccumulator(provider="compatible", model="model")
+    call_id = f"call-{time.monotonic_ns()}"
+    accumulator.consume(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content="",
+                        reasoning_content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=call_id,
+                                type="function",
+                                function=SimpleNamespace(
+                                    name="lookup",
+                                    arguments='{"query":',
+                                ),
+                            )
+                        ],
+                    ),
+                    finish_reason="length",
+                )
+            ],
+            usage=None,
+        )
+    )
+
+    terminal = accumulator.complete()
+
+    assert terminal.done is True
+    assert terminal.tool_calls is None
+    invalid = terminal.event_metadata["invalid_tool_calls"]
+    assert invalid[0]["call_id"] == call_id
+    assert invalid[0]["code"] == "tool_call_unexpected_finish_reason"
 
 
 @pytest.mark.asyncio

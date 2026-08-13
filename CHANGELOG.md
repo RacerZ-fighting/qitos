@@ -19,6 +19,10 @@ How to update:
 
 ### Fixed
 
+- Native tool calls now require a complete protocol terminal before execution. Chat
+  drops calls on output-limit/non-tool finishes; Anthropic keeps interleaved block
+  arguments isolated and records, but does not replay or execute, unclosed, malformed,
+  non-object, or non-`tool_use` terminal blocks.
 - Responses streams now preserve lifecycle/item events and refusals, backfill text or
   reasoning that appears only in terminal output, and keep interleaved function-call
   argument state separate. Incomplete responses cannot publish executable tool calls;

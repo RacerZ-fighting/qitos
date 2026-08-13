@@ -143,6 +143,12 @@ Existing Engine stream handlers keep `on_start/on_delta/on_end`; richer handlers
 optionally implement `on_chunk(chunk)` and `on_error(exc)` without changing the required
 protocol.
 
+Native calls are complete-before-execute. Chat exposes calls only for a tool-call finish
+reason. Anthropic additionally requires a closed `tool_use` block whose accumulated JSON
+is an object and whose message stops with `tool_use`. Output-limit, unclosed, malformed,
+or contradictory calls are listed in terminal `invalid_tool_calls` metadata and are not
+published as executable calls or replayed as native items.
+
 ```python
 from qitos.models import OpenAICompatibleModel
 

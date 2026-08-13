@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **工具调用完整后才执行**：兼容 Chat 与 Anthropic Messages 只有在各自协议终态
+  证明调用完整后才发布原生 ToolCall。因输出上限截断、block 未闭合或参数畸形的调用
+  只保留诊断，不会进入工具 handler，也不会在 Provider replay 中复活。
 - **完整的 Responses 流生命周期**：Responses adapter 现在保留 lifecycle/item
   事件、refusal、仅出现在终态的文本/reasoning，以及相互独立的交错函数参数。
   incomplete 或互相矛盾的终态不会变成可执行工具调用。
