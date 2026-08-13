@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
@@ -16,6 +17,60 @@ class ModelUsageSource(str, Enum):
 
     PROVIDER = "provider"
     ESTIMATE = "estimate"
+
+
+def _duration_ms(value: Any, *, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise TypeError(f"{field_name} must be a non-negative finite number or None")
+    normalized = float(value)
+    if not math.isfinite(normalized) or normalized < 0:
+        raise ValueError(f"{field_name} must be a non-negative finite number")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class ModelTiming:
+    """Local monotonic timing for one completed model transaction."""
+
+    total_ms: float
+    time_to_first_event_ms: float | None = None
+    time_to_first_content_ms: float | None = None
+
+    def __post_init__(self) -> None:
+        total_ms = _duration_ms(self.total_ms, field_name="total_ms")
+        first_event_ms = _duration_ms(
+            self.time_to_first_event_ms,
+            field_name="time_to_first_event_ms",
+        )
+        first_content_ms = _duration_ms(
+            self.time_to_first_content_ms,
+            field_name="time_to_first_content_ms",
+        )
+        assert total_ms is not None
+        if first_event_ms is not None and first_event_ms > total_ms:
+            raise ValueError("time_to_first_event_ms must not exceed total_ms")
+        if first_content_ms is not None and first_content_ms > total_ms:
+            raise ValueError("time_to_first_content_ms must not exceed total_ms")
+        if (
+            first_event_ms is not None
+            and first_content_ms is not None
+            and first_content_ms < first_event_ms
+        ):
+            raise ValueError(
+                "time_to_first_content_ms must not precede time_to_first_event_ms"
+            )
+        object.__setattr__(self, "total_ms", total_ms)
+        object.__setattr__(self, "time_to_first_event_ms", first_event_ms)
+        object.__setattr__(self, "time_to_first_content_ms", first_content_ms)
+
+    def to_dict(self) -> Dict[str, float | None]:
+        return {
+            "total_ms": self.total_ms,
+            "time_to_first_event_ms": self.time_to_first_event_ms,
+            "time_to_first_content_ms": self.time_to_first_content_ms,
+        }
 
 
 def _token_count(value: Any, *, field_name: str) -> int | None:
@@ -233,6 +288,7 @@ class ModelResponse:
     metadata: Dict[str, Any] = field(default_factory=dict)
     reasoning_content: Optional[str] = None
     native_items: Optional[List[Dict[str, Any]]] = None
+    timing: ModelTiming | None = None
 
     def __post_init__(self) -> None:
         """Reject responses that still carry provider SDK objects."""
@@ -244,6 +300,8 @@ class ModelResponse:
             raise TypeError("ModelResponse.tool_calls must be a list or None")
         if self.native_items is not None and not isinstance(self.native_items, list):
             raise TypeError("ModelResponse.native_items must be a list or None")
+        if self.timing is not None and not isinstance(self.timing, ModelTiming):
+            raise TypeError("ModelResponse.timing must be a ModelTiming or None")
 
     def to_summary_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -272,6 +330,7 @@ class ModelResponse:
                 if isinstance(self.native_items, list)
                 else None
             ),
+            "timing": self.timing.to_dict() if self.timing is not None else None,
         }
         if self.reasoning_content:
             d["reasoning_content"] = self.reasoning_content
@@ -280,6 +339,7 @@ class ModelResponse:
 
 __all__ = [
     "ModelResponse",
+    "ModelTiming",
     "ModelUsage",
     "ModelUsageSource",
     "normalize_model_usage",

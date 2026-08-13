@@ -23,7 +23,7 @@ from .state import (
 )
 from .memory import Memory, MemoryRecord
 from .model_capabilities import ModelAPI, ModelCapabilities, ReasoningCapability
-from .model_response import ModelResponse, ModelUsage, ModelUsageSource
+from .model_response import ModelResponse, ModelTiming, ModelUsage, ModelUsageSource
 from .runtime_input import RuntimeInput
 from .history import History, HistoryMessage, HistoryPolicy, HistorySnapshot
 from .observation import Observation
@@ -107,6 +107,7 @@ __all__ = [
     "ModelAPI",
     "ModelCapabilities",
     "ModelResponse",
+    "ModelTiming",
     "ModelUsage",
     "ModelUsageSource",
     "ReasoningCapability",

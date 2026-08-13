@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Local model latency telemetry**: every completed Engine model transaction now
+  records monotonic time to first provider event, first text/reasoning/tool content,
+  and terminal completion. The typed timing travels with `ModelResponse` and its local
+  trace summary without an exporter or an extra provider request.
 - **Complete-before-execute tool calls**: compatible Chat and Anthropic Messages now
   publish native calls only after their protocol-specific terminal proves completion.
   Output-limit, unclosed, or malformed calls remain diagnostic and never reach a tool
