@@ -63,6 +63,8 @@ runtime dependencies.
 - [x] Capture immutable turn inputs and remove Agent `_runtime_*` turn attributes.
 - [x] Await ActionExecutor and mailbox on the caller's event loop.
 - [x] Journal mailbox acceptance and restore only events not bound to a completed turn.
+- [x] Let synchronous Engine hooks defer runtime input for async persistence at the
+  next turn safe point without spawning an unowned Task.
 - [x] Add async host and Docker command operations with process-group cleanup.
 - [x] Complete tool and child lifecycle cleanup and migrate tests.
 - [x] Add completion assessment, complete budget accounting, and journal restoration.
