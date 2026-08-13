@@ -396,6 +396,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._runtime_inbox = _RuntimeInbox()
         self._active_async_task: Optional[asyncio.Task[Any]] = None
         self._active_async_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._connected_mcp_servers: List[Any] = []
+        self._mcp_tool_names: List[str] = []
+        self._mcp_runtime: Any = None
 
     def _build_action_executor(self, tool_registry: Any) -> Optional[ActionExecutor]:
         """Construct an ActionExecutor carrying every engine-level dependency.
@@ -944,11 +947,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             }
             self.trace_writer.metadata["agent_name"] = self.agent.name
 
-        # Connect MCP servers and bridge their tools
-        self._connected_mcp_servers: List[Any] = []
-        if getattr(self.agent, "mcp_servers", None):
-            await self._connect_mcp_servers()
-
         # State initialization: fresh or resumed
         if _resume_state is not None:
             state = _resume_state
@@ -1067,11 +1065,15 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             return result
 
         step_id = _resume_step if _resume_step is not None else 0
-        current_observation = self._build_initial_observation(
-            state, step_id, started_at
-        )
         cancelled = False
         try:
+            # MCP discovery happens after preflight but before the first model
+            # turn. Empty configuration creates no thread or connection.
+            if getattr(self.agent, "mcp_servers", None):
+                await self._connect_mcp_servers()
+            current_observation = self._build_initial_observation(
+                state, step_id, started_at
+            )
             if _resume_state is None and _resume_step is None:
                 await self._save_checkpoint(
                     step_id,
@@ -2607,31 +2609,102 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     async def _connect_mcp_servers(self) -> None:
         """Connect all configured MCP servers and bridge their tools."""
         from ..mcp.bridge import mcp_server_to_function_tools
+        from ..mcp.runtime import MCPEventLoopRuntime
 
-        for server in self.agent.mcp_servers:
+        servers = list(getattr(self.agent, "mcp_servers", None) or [])
+        if not servers:
+            return
+
+        runtime = MCPEventLoopRuntime()
+        runtime.start()
+        self._mcp_runtime = runtime
+        used_names = set(
+            self.tool_registry.list_tools() if self.tool_registry is not None else []
+        )
+
+        for server in servers:
+            registered_names: List[str] = []
+
+            async def _rollback_setup() -> None:
+                for name in reversed(registered_names):
+                    try:
+                        self.tool_registry.unregister(name)
+                    except Exception as unregister_exc:
+                        _logger.warning(
+                            "MCP tool rollback failed for %s: %s",
+                            name,
+                            unregister_exc,
+                        )
+                if hasattr(server, "cleanup"):
+                    try:
+                        await runtime.run(server.cleanup())
+                    except Exception as cleanup_exc:
+                        _logger.warning(
+                            "MCP server cleanup after setup failure failed: %s",
+                            cleanup_exc,
+                        )
+
             try:
                 if hasattr(server, "connect"):
-                    await server.connect()
-                self._connected_mcp_servers.append(server)
+                    await runtime.run(server.connect())
                 # Bridge MCP tools into the engine's tool registry
                 if self.tool_registry is not None:
-                    tools = await mcp_server_to_function_tools(server)
+                    tools = await runtime.run(
+                        mcp_server_to_function_tools(
+                            server,
+                            name_prefix=f"mcp__{server.name}",
+                            call_runner=runtime.run_sync,
+                            used_names=used_names,
+                        )
+                    )
                     for tool in tools:
                         if hasattr(self.tool_registry, "register"):
                             self.tool_registry.register(tool)
+                            registered_names.append(tool.name)
+                self._connected_mcp_servers.append(server)
+                self._mcp_tool_names.extend(registered_names)
+            except asyncio.CancelledError:
+                await _rollback_setup()
+                raise
             except Exception as exc:
-                # Log but don't fail the entire run for one bad MCP server
-                _logger.debug("MCP server connection failed: %s", exc)
+                await _rollback_setup()
+                # One optional server must not prevent the remaining run.
+                _logger.warning(
+                    "MCP server %s could not be exposed: %s",
+                    getattr(server, "name", "<unknown>"),
+                    exc,
+                )
+
+        if not self._connected_mcp_servers:
+            await runtime.close()
+            self._mcp_runtime = None
 
     async def _cleanup_mcp_servers(self) -> None:
-        """Cleanup all connected MCP servers."""
+        """Remove run-scoped MCP tools and cleanup their transport loop."""
+        for name in reversed(self._mcp_tool_names):
+            try:
+                if self.tool_registry is not None:
+                    self.tool_registry.unregister(name)
+            except Exception as exc:
+                _logger.warning("MCP tool cleanup failed for %s: %s", name, exc)
+        self._mcp_tool_names = []
+
+        runtime = self._mcp_runtime
         for server in self._connected_mcp_servers:
             try:
                 if hasattr(server, "cleanup"):
-                    await server.cleanup()
+                    if runtime is not None:
+                        await runtime.run(server.cleanup())
+                    else:
+                        await server.cleanup()
             except Exception as exc:
-                _logger.debug("MCP server cleanup failed: %s", exc)
+                _logger.warning("MCP server cleanup failed: %s", exc)
         self._connected_mcp_servers = []
+        if runtime is not None:
+            try:
+                await runtime.close()
+            finally:
+                self._mcp_runtime = None
 
     # -- Handoff tool helpers --
 

@@ -116,6 +116,22 @@ def test_register_name_override_does_not_mutate_source_tool(tmp_path):
     assert coding.edit_file.spec.name == "edit_file"
 
 
+def test_unregister_removes_exact_dynamic_tool():
+    @tool(name="temporary")
+    def temporary() -> str:
+        return "ok"
+
+    registry = ToolRegistry()
+    registry.register(temporary)
+
+    removed = registry.unregister("temporary")
+
+    assert removed.name == "temporary"
+    assert registry.get("temporary") is None
+    with pytest.raises(ValueError, match="not found"):
+        registry.unregister("temporary")
+
+
 def test_curated_toolsets_register_cleanly(tmp_path):
     toolsets = [
         NotebookToolSet(workspace_root=str(tmp_path)),

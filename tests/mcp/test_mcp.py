@@ -36,6 +36,7 @@ from qitos.mcp.schema_convert import (
     _resolve_refs,
     convert_mcp_schema_to_tool_spec,
 )
+from qitos.mcp.runtime import MCPEventLoopRuntime
 
 
 # --------------------------------------------------------------------------- #
@@ -528,6 +529,65 @@ class TestBridge:
         assert len(result) == 1
         assert result[0].name == "db__search"
         assert result[0].spec.name == "db__search"
+
+    @pytest.mark.asyncio
+    async def test_bridge_sanitizes_model_name_but_calls_raw_name(self) -> None:
+        server = _MockMCPServer(
+            name="server.one",
+            tools=[
+                MCPToolInfo(
+                    name="tool.two-three",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                    },
+                )
+            ],
+        )
+        runtime = MCPEventLoopRuntime()
+        runtime.start()
+        try:
+            bridged = await runtime.run(
+                mcp_server_to_function_tools(
+                    server,
+                    name_prefix=f"mcp__{server.name}",
+                    call_runner=runtime.run_sync,
+                )
+            )
+            result = await asyncio.to_thread(
+                bridged[0].execute,
+                {"value": "evidence"},
+            )
+        finally:
+            await runtime.close()
+
+        assert bridged[0].name == "mcp__server_one__tool_two_three"
+        assert result == {
+            "status": "success",
+            "tool": "tool.two-three",
+            "arguments": {"value": "evidence"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_bridge_disambiguates_and_bounds_model_names(self) -> None:
+        server = _MockMCPServer(
+            tools=[
+                MCPToolInfo(name="tool-name"),
+                MCPToolInfo(name="tool_name"),
+                MCPToolInfo(name="x" * 100),
+            ]
+        )
+        names_in_use = {"mcp__mock__tool_name"}
+        bridged = await mcp_server_to_function_tools(
+            server,
+            name_prefix="mcp__mock",
+            used_names=names_in_use,
+        )
+
+        model_names = [tool.name for tool in bridged]
+        assert len(model_names) == len(set(model_names))
+        assert all(len(name) <= 64 for name in model_names)
+        assert all(name in names_in_use for name in model_names)
 
     @pytest.mark.asyncio
     async def test_bridge_tool_spec_has_correct_schema(self) -> None:
