@@ -2,7 +2,7 @@
 
 ## Status
 
-Active on `refactor/model-continuation`.
+Completed on QitOS `main` on 2026-08-14.
 
 This plan replaces the earlier proposal to build a parallel typed model stack.
 QitOS already owns model content, responses, providers, retries, Engine model
@@ -213,7 +213,7 @@ git diff --check
 - [x] Persist and validate Responses continuation with full-request fallback.
 - [x] Replace ambiguous stream chunks with discriminated typed events.
 - [x] Prove long-history projection, resume, fork, Provider switch, and invalid-handle behavior.
-- [ ] Run the complete QitOS gate and merge the feature branch into `main`.
+- [x] Run the complete QitOS gate and merge the feature branch into `main`.
 
 Run from PentestAgent only after the QitOS commit and gitlink update:
 
