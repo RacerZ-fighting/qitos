@@ -10,6 +10,7 @@ import pytest
 from qitos import Action, Decision, ToolRegistry
 from qitos.cli import main as qit_main
 from qitos.kit.skill import SkillHubProvider, SkillManager, SkillRegistry, SkilledAgent
+from qitos.kit.tool import BundledSkillSnapshot
 from qitos.kit.tool.skill_tools import SkillToolSet
 
 
@@ -265,10 +266,121 @@ def test_bundled_skill_tools_list_stably_and_load_complete_content(
     assert second_content in loaded["content"]
     assert loaded["content"].startswith("---\nname: second-skill\n")
     assert loaded["source"].endswith("z-directory/SKILL.md")
+    assert loaded["content_sha256"]
+    assert isinstance(loaded["resources"], list)
     assert not workspace.exists()
     tool_names = {tool.spec.name for tool in toolset.tools()}
     assert "list_skills" in tool_names
     assert "load_skill" in tool_names
+    assert "read_skill_resource" in tool_names
+
+
+def test_bundled_skill_snapshot_and_relative_resource_round_trip(
+    tmp_path: Path,
+) -> None:
+    skill_dir = _write_skill_dir(
+        tmp_path / "bundled" / "skill",
+        name="resource-skill",
+        description="Workflow with a linked reference.",
+    )
+    reference = skill_dir / "references" / "guide.md"
+    reference.parent.mkdir()
+    reference.write_text("evidence workflow", encoding="utf-8")
+    toolset = SkillToolSet(bundled_roots=[tmp_path / "bundled"])
+
+    loaded = toolset.load_skill(name="resource-skill")
+    snapshot = BundledSkillSnapshot.from_dict(loaded)
+    resource = toolset.read_skill_resource(
+        name="resource-skill", path="references/guide.md"
+    )
+
+    assert toolset.bundled_skill_snapshots() == (snapshot,)
+    assert "references/guide.md" in snapshot.resources
+    assert resource["content"] == "evidence workflow"
+    assert resource["next_cursor"] is None
+
+
+def test_bundled_skill_resource_pages_large_utf8_content(tmp_path: Path) -> None:
+    skill_dir = _write_skill_dir(
+        tmp_path / "bundled" / "skill",
+        name="paged-skill",
+        description="Workflow with a large reference.",
+    )
+    reference = skill_dir / "references" / "large.md"
+    reference.parent.mkdir()
+    expected = "证据" * 120_000
+    reference.write_text(expected, encoding="utf-8")
+    toolset = SkillToolSet(bundled_roots=[tmp_path / "bundled"])
+
+    first = toolset.read_skill_resource(name="paged-skill", path="references/large.md")
+    second = toolset.read_skill_resource(
+        name="paged-skill",
+        path="references/large.md",
+        cursor=first["next_cursor"],
+    )
+
+    assert first["next_cursor"]
+    assert first["content"] + second["content"] == expected
+    assert second["next_cursor"] is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../outside.md", "/outside.md", r"C:\\outside.md"],
+)
+def test_bundled_skill_resource_rejects_escaping_paths(
+    tmp_path: Path, path: str
+) -> None:
+    skill_dir = _write_skill_dir(
+        tmp_path / "bundled" / "skill",
+        name="bounded-skill",
+        description="Workflow with bounded resources.",
+    )
+    reference = skill_dir / "reference.md"
+    reference.write_text("inside", encoding="utf-8")
+    toolset = SkillToolSet(bundled_roots=[tmp_path / "bundled"])
+
+    with pytest.raises(ValueError, match="relative path|not found"):
+        toolset.read_skill_resource(name="bounded-skill", path=path)
+
+
+def test_bundled_skill_resource_rechecks_symlink_boundary(tmp_path: Path) -> None:
+    skill_dir = _write_skill_dir(
+        tmp_path / "bundled" / "skill",
+        name="symlink-skill",
+        description="Workflow with a replaceable resource.",
+    )
+    reference = skill_dir / "reference.md"
+    reference.write_text("inside", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside", encoding="utf-8")
+    toolset = SkillToolSet(bundled_roots=[tmp_path / "bundled"])
+    reference.unlink()
+    reference.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="escapes"):
+        toolset.read_skill_resource(name="symlink-skill", path="reference.md")
+
+
+def test_bundled_skill_refresh_changes_content_revision(tmp_path: Path) -> None:
+    skill_dir = _write_skill_dir(
+        tmp_path / "bundled" / "skill",
+        name="revision-skill",
+        description="Workflow with a stable revision.",
+    )
+    toolset = SkillToolSet(bundled_roots=[tmp_path / "bundled"])
+    before = toolset.bundled_skill_snapshots()[0]
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(
+        skill_path.read_text(encoding="utf-8") + "\nUpdated instructions.\n",
+        encoding="utf-8",
+    )
+
+    toolset.refresh_bundled_skills()
+
+    after = toolset.bundled_skill_snapshots()[0]
+    assert after.name == before.name
+    assert after.content_sha256 != before.content_sha256
 
 
 def test_bundled_skill_load_requires_an_exact_catalog_name(tmp_path: Path) -> None:
@@ -344,3 +456,4 @@ def test_skill_toolset_without_bundled_roots_preserves_provider_tool_surface() -
 
     assert "list_skills" not in names
     assert "load_skill" not in names
+    assert "read_skill_resource" not in names

@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from .toolset import SkillToolSet
+from .toolset import BundledSkillSnapshot, SkillToolSet
 
-__all__ = ["SkillToolSet"]
+__all__ = ["BundledSkillSnapshot", "SkillToolSet"]

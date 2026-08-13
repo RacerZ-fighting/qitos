@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **渐进式 bundled Skill**：应用可以给 `SkillToolSet` 配置只读资源根目录，先暴露
+  有界目录，再按精确名称加载完整 `SKILL.md`。加载结果带可持久化的内容 revision；
+  `read_skill_resource` 通过受 Skill 根目录约束、绑定内容哈希的游标按需读取 UTF-8
+  reference，无需调用 provider 或写安装 registry。
 - **强类型 WorkPlan**：`WorkPlanState` 与 `update_plan` 提供经过校验、可随
   checkpoint 恢复的轻量清单，并带有纯 reducer 和确定性 Markdown 投影。coding preset
   不再直接修改自由格式的 todo metadata。
