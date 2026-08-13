@@ -1,19 +1,13 @@
-"""Agent tool — generic sub-agent spawning for QitOS."""
+"""Tool projection for QitOS child Agent lifecycle contracts."""
 
 from .agent_tool import (
-    DEFAULT_SUBAGENT_MAX_TURNS,
     AgentExecutionMode,
-    AgentInvocation,
-    AgentRequest,
-    AgentResult,
+    ChildInvocationFactory,
     AgentTool,
 )
 
 __all__ = [
-    "DEFAULT_SUBAGENT_MAX_TURNS",
     "AgentExecutionMode",
-    "AgentInvocation",
-    "AgentRequest",
-    "AgentResult",
+    "ChildInvocationFactory",
     "AgentTool",
 ]

@@ -709,20 +709,21 @@ Launch a fresh child-agent run from a normal tool call. The owning application m
 inject an invocation factory that constructs the child from its run-scoped resources.
 
 ```python
-from qitos.kit.tool.agent import AgentInvocation, AgentTool
+from qitos.core import ChildInvocation, TaskBudget
+from qitos.kit.tool.agent import AgentTool
 
 def build_child(request, runtime_context):
     child_engine = make_fresh_engine(
         delegate_depth=runtime_context["delegate_depth"] + 1,
     )
-    return AgentInvocation(engine=child_engine, task=request.prompt)
+    return ChildInvocation(engine=child_engine, task=request.task)
 
 tool = AgentTool(
     invocation_factory=build_child,
     execution_scope=acquire_run_scoped_slot,
     execution_mode="background",
     max_delegate_depth=1,
-    max_turns=200,
+    child_budget=TaskBudget(max_steps=200),
 )
 ```
 
@@ -731,13 +732,15 @@ The model-facing arguments are `description`, `prompt`, optional `name`, and opt
 AgentModule, history, or model client between concurrent children is unsupported.
 `execution_scope` can enforce an application-owned concurrency or lifecycle boundary.
 The result reports output, steps, total tokens, elapsed time, stop reason, and run id.
-`max_turns` is a tool-level safety ceiling and defaults to the exported
-`DEFAULT_SUBAGENT_MAX_TURNS` value of 200. Invocation factories receive that value on
-`AgentRequest.max_turns`.
+`child_budget` is an immutable `TaskBudget` and defaults to 200 steps. Invocation
+factories receive it on `ChildLaunchRequest.budget`, together with the task, profile,
+allowed tool groups, and working-directory fields needed by a product composition.
+The factory returns a `ChildInvocation`; live Engine objects never enter persisted child
+requests or results.
 
 `execution_mode` accepts `"foreground"`, `"optional_background"`, or `"background"`.
 The optional mode exposes `run_in_background` to the model. The background mode omits
-that argument, always returns a running receipt with a task id, and posts an
+that argument, always returns a running receipt with a parent-scoped `ChildHandle`, and posts an
 `agent.child.completed` `RuntimeInput` to the exact parent Engine run when the child
 terminates. `AgentTool` snapshots the parent history at launch, but does not call the
 invocation factory until `execution_scope` admits the task. Queued work therefore retains
@@ -749,9 +752,14 @@ The Engine supplies an async `runtime_context["post_runtime_event"]` callback. C
 supervision stores its terminal result before awaiting that callback; on Journal-backed
 parents, successful delivery is durable before the parent wakes.
 
-`active_background_count`, `get_background_result(task_id)`, `cancel_background(task_id)`,
+`active_background_count`, `child_result(handle)`, `cancel_child(handle)`,
 `snapshot_background_events()`, and `aclose()` expose lifecycle control to the owning
-application. A snapshot projects only the active children's bounded, completed tool
+application. `ChildResult` uses one stable status vocabulary for running, completion,
+blocking, budget exhaustion, failure, cancellation, interruption, and unknown handles.
+Tool payloads keep that value in `child_status`; their top-level `status` remains the
+canonical Tool execution status (`success`, `partial`, `running`, `error`, or
+`cancelled`).
+A snapshot projects only the active children's bounded, completed tool
 results into `agent.child.snapshot` runtime events; it does not expose model responses or
 reasoning. This lets an owner preserve evidence immediately before a forced conclusion.
 `aclose()` cooperatively cancels outstanding child Engines; applications with run-scoped

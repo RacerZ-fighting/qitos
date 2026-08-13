@@ -8,37 +8,26 @@ import time
 import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
-from dataclasses import dataclass, field
+from dataclasses import replace
 from typing import Any, Literal
 
+from ....core.child import (
+    DEFAULT_CHILD_MAX_STEPS,
+    AgentConclusion,
+    ChildHandle,
+    ChildInvocation,
+    ChildLaunchRequest,
+    ChildResult,
+    ChildStatus,
+)
 from ....core.runtime_input import RuntimeInput
+from ....core.task import TaskBudget
 from ....core.tool import BaseTool, ToolPermission, ToolSpec
 from ....core.tool_result import ToolResult
 
-DEFAULT_SUBAGENT_MAX_TURNS = 200
-
-
-@dataclass(frozen=True)
-class AgentRequest:
-    """One parent-authored child-agent assignment."""
-
-    prompt: str
-    description: str = ""
-    name: str = ""
-    subagent_type: str = "general-purpose"
-    max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
-
-
-@dataclass(frozen=True)
-class AgentInvocation:
-    """A fresh child engine plus the exact task it should run."""
-
-    engine: Any
-    task: str
-    run_kwargs: dict[str, Any] = field(default_factory=dict)
-
-
-AgentInvocationFactory = Callable[[AgentRequest, dict[str, Any]], AgentInvocation]
+ChildInvocationFactory = Callable[
+    [ChildLaunchRequest, dict[str, Any]], ChildInvocation
+]
 AgentExecutionScope = Callable[
     [dict[str, Any]],
     AbstractContextManager[Any] | AbstractAsyncContextManager[Any],
@@ -47,24 +36,6 @@ AgentExecutionMode = Literal["foreground", "optional_background", "background"]
 
 _PARTIAL_RESULT_MAX_ITEMS = 12
 _PARTIAL_RESULT_MAX_CHARS = 16_000
-
-
-@dataclass
-class AgentResult:
-    """Normalized result from one child-agent run."""
-
-    agent_type: str
-    task: str
-    success: bool
-    output: Any = None
-    error: str | None = None
-    run_id: str | None = None
-    name: str = ""
-    description: str = ""
-    steps: int = 0
-    total_tokens: int = 0
-    elapsed_seconds: float = 0.0
-    stop_reason: str = ""
 
 
 class AgentTool(BaseTool):
@@ -77,19 +48,22 @@ class AgentTool(BaseTool):
     def __init__(
         self,
         *,
-        invocation_factory: AgentInvocationFactory,
+        invocation_factory: ChildInvocationFactory,
         execution_scope: AgentExecutionScope | None = None,
         execution_mode: AgentExecutionMode = "foreground",
         max_background_workers: int = 4,
         max_delegate_depth: int = 1,
-        max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS,
+        child_budget: TaskBudget | None = None,
     ) -> None:
         if max_background_workers <= 0:
             raise ValueError("max_background_workers must be positive")
         if max_delegate_depth <= 0:
             raise ValueError("max_delegate_depth must be positive")
-        if max_turns <= 0:
-            raise ValueError("max_turns must be positive")
+        resolved_budget = child_budget or TaskBudget(
+            max_steps=DEFAULT_CHILD_MAX_STEPS
+        )
+        if not isinstance(resolved_budget, TaskBudget):
+            raise TypeError("child_budget must be a TaskBudget")
         if execution_mode not in {
             "foreground",
             "optional_background",
@@ -100,17 +74,17 @@ class AgentTool(BaseTool):
         self._execution_scope = execution_scope
         self._execution_mode = execution_mode
         self._max_delegate_depth = max_delegate_depth
-        self._max_turns = max_turns
+        self._child_budget = resolved_budget
         self._max_background_workers = max_background_workers
         self._background_limit = asyncio.Semaphore(max_background_workers)
         self._child_limit_lock = asyncio.Lock()
         self._children_started = 0
         self._closed = False
-        self._background_tasks: dict[str, asyncio.Task[AgentResult]] = {}
-        self._background_results: dict[str, AgentResult] = {}
-        self._background_engines: dict[str, Any] = {}
-        self._background_requests: dict[str, AgentRequest] = {}
-        self._background_cancel: dict[str, asyncio.Event] = {}
+        self._background_tasks: dict[ChildHandle, asyncio.Task[ChildResult]] = {}
+        self._background_results: dict[ChildHandle, ChildResult] = {}
+        self._background_engines: dict[ChildHandle, Any] = {}
+        self._background_requests: dict[ChildHandle, ChildLaunchRequest] = {}
+        self._background_cancel: dict[ChildHandle, asyncio.Event] = {}
 
         parameters: dict[str, dict[str, Any]] = {
             "description": {
@@ -142,11 +116,12 @@ class AgentTool(BaseTool):
             "foreground": "This runtime waits for the child result before continuing. ",
             "optional_background": (
                 "Set run_in_background=true for an asynchronous child; its completion "
-                "is delivered as a later runtime event. "
+                "is delivered as a later runtime event with a stable child handle. "
             ),
             "background": (
                 "This runtime always starts the child asynchronously and immediately "
-                "returns a task id. Completion is delivered as a later runtime event. "
+                "returns a child handle. Completion is delivered as a later runtime "
+                "event. "
             ),
         }[execution_mode]
         description = execution_description + (
@@ -195,6 +170,12 @@ class AgentTool(BaseTool):
         description = str(args.get("description", "")).strip()
         if not description:
             return {"status": "error", "error": "description is required"}
+        parent_run_id = str(context.get("parent_run_id") or "").strip()
+        if not parent_run_id:
+            return {
+                "status": "error",
+                "error": "parent_run_id is required for child ownership",
+            }
 
         current_depth = int(context.get("delegate_depth", 0))
         if current_depth >= self._max_delegate_depth:
@@ -206,12 +187,12 @@ class AgentTool(BaseTool):
                 ),
             }
 
-        request = AgentRequest(
-            prompt=prompt,
+        request = ChildLaunchRequest(
+            task=prompt,
             description=description,
             name=str(args.get("name", "")).strip(),
-            subagent_type=subagent_type,
-            max_turns=self._max_turns,
+            agent_type=subagent_type,
+            budget=self._child_budget,
         )
         requested_background = bool(args.get("run_in_background", False))
         if requested_background and self._execution_mode == "foreground":
@@ -238,25 +219,30 @@ class AgentTool(BaseTool):
         run_in_background = self._execution_mode == "background" or (
             self._execution_mode == "optional_background" and requested_background
         )
+        handle = ChildHandle(
+            child_id=f"child-{uuid.uuid4().hex[:12]}",
+            parent_run_id=parent_run_id,
+        )
         if run_in_background:
-            task_id = f"agent-{uuid.uuid4().hex[:8]}"
             cancel_event = asyncio.Event()
             task = asyncio.create_task(
                 self._supervise_background_request(
                     request,
                     context,
-                    task_id,
+                    handle,
                     cancel_event,
                 ),
-                name=f"qitos-child-{task_id}",
+                name=f"qitos-{handle.child_id}",
             )
-            self._background_tasks[task_id] = task
-            self._background_cancel[task_id] = cancel_event
-            self._background_requests[task_id] = request
+            self._background_tasks[handle] = task
+            self._background_cancel[handle] = cancel_event
+            self._background_requests[handle] = request
             return {
                 "status": "running",
-                "task_id": task_id,
-                "agent_type": request.subagent_type,
+                "child_status": ChildStatus.RUNNING.value,
+                "handle": handle.to_dict(),
+                "child_id": handle.child_id,
+                "agent_type": request.agent_type,
                 "description": request.description,
             }
 
@@ -264,77 +250,75 @@ class AgentTool(BaseTool):
             await self._run_request(
                 request,
                 context,
-                task_id=None,
+                handle=handle,
                 cancel_event=None,
             )
         )
 
     async def _supervise_background_request(
         self,
-        request: AgentRequest,
+        request: ChildLaunchRequest,
         runtime_context: dict[str, Any],
-        task_id: str,
+        handle: ChildHandle,
         cancel_event: asyncio.Event,
-    ) -> AgentResult:
+    ) -> ChildResult:
         """Own one child through terminal state and reliable parent delivery."""
 
         try:
             result = await self._run_background_request(
                 request,
                 runtime_context,
-                task_id,
+                handle,
                 cancel_event,
             )
         except asyncio.CancelledError:
-            result = AgentResult(
-                agent_type=request.subagent_type,
-                task=request.prompt,
-                success=False,
+            result = ChildResult(
+                handle=handle,
+                request=request,
+                status=ChildStatus.CANCELLED,
+                conclusion=AgentConclusion(
+                    failure_paths=("Child agent was cancelled.",),
+                ),
                 error="Child agent was cancelled.",
-                name=request.name,
-                description=request.description,
-                stop_reason="cancelled_immediate",
             )
         except Exception as exc:  # pragma: no cover - defensive boundary
-            result = AgentResult(
-                agent_type=request.subagent_type,
-                task=request.prompt,
-                success=False,
+            result = ChildResult(
+                handle=handle,
+                request=request,
+                status=ChildStatus.FAILED,
+                conclusion=AgentConclusion(failure_paths=(str(exc),)),
                 error=str(exc),
-                name=request.name,
-                description=request.description,
-                stop_reason="error",
             )
-        self._background_results[task_id] = result
-        self._background_tasks.pop(task_id, None)
-        self._background_engines.pop(task_id, None)
-        self._background_requests.pop(task_id, None)
-        self._background_cancel.pop(task_id, None)
-        await self._post_completion_event(task_id, result, runtime_context)
+        self._background_results[handle] = result
+        self._background_tasks.pop(handle, None)
+        self._background_engines.pop(handle, None)
+        self._background_requests.pop(handle, None)
+        self._background_cancel.pop(handle, None)
+        await self._post_completion_event(handle, result, runtime_context)
         return result
 
     async def _run_background_request(
         self,
-        request: AgentRequest,
+        request: ChildLaunchRequest,
         runtime_context: dict[str, Any],
-        task_id: str,
+        handle: ChildHandle,
         cancel_event: asyncio.Event,
-    ) -> AgentResult:
+    ) -> ChildResult:
         async with self._background_limit:
             return await self._run_request(
                 request,
                 runtime_context,
-                task_id=task_id,
+                handle=handle,
                 cancel_event=cancel_event,
             )
 
     async def _run_request(
         self,
-        request: AgentRequest,
+        request: ChildLaunchRequest,
         runtime_context: dict[str, Any],
-        task_id: str | None,
+        handle: ChildHandle,
         cancel_event: asyncio.Event | None,
-    ) -> AgentResult:
+    ) -> ChildResult:
         started = time.monotonic()
         scoped_context = dict(runtime_context)
         if cancel_event is not None:
@@ -345,13 +329,13 @@ class AgentTool(BaseTool):
             else nullcontext()
         )
 
-        async def _run_in_scope() -> AgentResult:
+        async def _run_in_scope() -> ChildResult:
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("Child agent was cancelled before it started")
             return await self._run_invocation(
                 request,
                 scoped_context,
-                task_id=task_id,
+                handle=handle,
             )
 
         try:
@@ -364,39 +348,40 @@ class AgentTool(BaseTool):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            result = AgentResult(
-                agent_type=request.subagent_type,
-                task=request.prompt,
-                success=False,
-                error=str(exc),
-                name=request.name,
-                description=request.description,
-                stop_reason=(
-                    "cancelled_immediate"
-                    if cancel_event is not None and cancel_event.is_set()
-                    else "budget_time"
-                    if isinstance(exc, TimeoutError)
-                    else "error"
-                ),
+            status = (
+                ChildStatus.CANCELLED
+                if cancel_event is not None and cancel_event.is_set()
+                else ChildStatus.BUDGET_EXHAUSTED
+                if isinstance(exc, TimeoutError)
+                else ChildStatus.FAILED
             )
-        result.elapsed_seconds = max(0.0, time.monotonic() - started)
-        return result
+            result = ChildResult(
+                handle=handle,
+                request=request,
+                status=status,
+                conclusion=AgentConclusion(failure_paths=(str(exc),)),
+                error=str(exc),
+            )
+        return replace(
+            result,
+            elapsed_seconds=max(0.0, time.monotonic() - started),
+        )
 
     async def _run_invocation(
         self,
-        request: AgentRequest,
+        request: ChildLaunchRequest,
         runtime_context: dict[str, Any],
         *,
-        task_id: str | None,
-    ) -> AgentResult:
+        handle: ChildHandle,
+    ) -> ChildResult:
         invocation = self._invocation_factory(request, runtime_context)
-        if not isinstance(invocation, AgentInvocation):
-            raise TypeError("invocation_factory must return AgentInvocation")
-        if task_id is not None:
+        if not isinstance(invocation, ChildInvocation):
+            raise TypeError("invocation_factory must return ChildInvocation")
+        if handle in self._background_tasks:
             if self._closed:
                 invocation.engine.cancel("immediate")
                 raise RuntimeError("Agent runtime closed before child start")
-            self._background_engines[task_id] = invocation.engine
+            self._background_engines[handle] = invocation.engine
         engine_result = await invocation.engine.arun(
             invocation.task,
             **dict(invocation.run_kwargs),
@@ -404,54 +389,76 @@ class AgentTool(BaseTool):
         state = getattr(engine_result, "state", None)
         raw_stop_reason = getattr(state, "stop_reason", "") or ""
         stop_reason = str(getattr(raw_stop_reason, "value", raw_stop_reason))
-        final_result = getattr(state, "final_result", "") or ""
-        output = final_result or self._partial_result(engine_result)
-        return AgentResult(
-            agent_type=request.subagent_type,
-            task=request.prompt,
-            success=stop_reason in {"completed", "final", "success"},
-            output=output,
-            run_id=str(
+        summary = str(getattr(state, "final_result", "") or "")
+        summary = summary or self._partial_result(engine_result)
+        status = self._child_status(stop_reason)
+        return ChildResult(
+            handle=handle,
+            request=request,
+            status=status,
+            conclusion=AgentConclusion(
+                summary=summary,
+                failure_paths=(stop_reason,) if status is ChildStatus.FAILED else (),
+                unknowns=(stop_reason,)
+                if status is ChildStatus.BUDGET_EXHAUSTED
+                else (),
+            ),
+            child_run_id=str(
                 getattr(engine_result, "run_id", "")
                 or getattr(invocation.engine, "active_run_id", "")
                 or ""
             ),
-            name=request.name,
-            description=request.description,
             steps=int(getattr(engine_result, "step_count", 0) or 0),
             total_tokens=int(getattr(engine_result, "total_tokens", 0) or 0),
-            stop_reason=stop_reason,
         )
 
     @staticmethod
-    def _result_payload(result: AgentResult) -> dict[str, Any]:
-        status = (
-            "success" if result.success else "partial" if result.output else "error"
-        )
+    def _result_payload(result: ChildResult) -> dict[str, Any]:
+        execution_status = AgentTool._execution_status(result)
         return {
-            "status": status,
-            "agent_type": result.agent_type,
-            "name": result.name,
-            "description": result.description,
-            "output": AgentTool._json_safe(result.output),
+            "status": execution_status,
+            "child_status": result.status.value,
+            "ready": result.ready,
+            "handle": result.handle.to_dict(),
+            "child_id": result.handle.child_id,
+            "agent_type": result.request.agent_type,
+            "name": result.request.name,
+            "description": result.request.description,
+            "output": AgentTool._json_safe(result.conclusion.summary),
+            "conclusion": result.conclusion.to_dict(),
             "error": result.error,
             "steps": result.steps,
             "total_tokens": result.total_tokens,
             "elapsed_seconds": result.elapsed_seconds,
-            "stop_reason": result.stop_reason,
-            "run_id": result.run_id,
+            "stop_reason": result.status.value,
+            "run_id": result.child_run_id,
         }
 
-    def get_background_result(self, task_id: str) -> dict[str, Any] | None:
-        """Return one completed background result, or its running status."""
+    def child_result(self, handle: ChildHandle) -> ChildResult | None:
+        """Return one owned child's current immutable result."""
 
-        result = self._background_results.get(task_id)
-        future = self._background_tasks.get(task_id)
+        if not isinstance(handle, ChildHandle):
+            raise TypeError("handle must be a ChildHandle")
+        result = self._background_results.get(handle)
+        future = self._background_tasks.get(handle)
         if result is None:
             if future is not None:
-                return {"status": "running", "task_id": task_id}
+                request = self._background_requests[handle]
+                return ChildResult(
+                    handle=handle,
+                    request=request,
+                    status=ChildStatus.RUNNING,
+                    child_run_id=str(
+                        getattr(
+                            self._background_engines.get(handle),
+                            "active_run_id",
+                            "",
+                        )
+                        or ""
+                    ),
+                )
             return None
-        return self._result_payload(result)
+        return result
 
     @property
     def active_background_count(self) -> int:
@@ -468,25 +475,26 @@ class AgentTool(BaseTool):
         """
 
         active = [
-            (task_id, self._background_requests[task_id], engine)
-            for task_id, engine in self._background_engines.items()
-            if task_id in self._background_tasks
-            and not self._background_tasks[task_id].done()
+            (handle, self._background_requests[handle], engine)
+            for handle, engine in self._background_engines.items()
+            if handle in self._background_tasks
+            and not self._background_tasks[handle].done()
         ]
 
         events: list[RuntimeInput] = []
-        for task_id, request, engine in active:
+        for handle, request, engine in active:
             records = list(getattr(engine, "records", []) or [])
             events.append(
                 RuntimeInput(
-                    event_id=f"{task_id}:conclude-snapshot",
+                    event_id=f"{handle.child_id}:conclude-snapshot",
                     kind="agent.child.snapshot",
-                    correlation_id=task_id,
+                    correlation_id=handle.child_id,
                     source="qitos.agent",
                     payload={
-                        "task_id": task_id,
+                        "handle": handle.to_dict(),
+                        "child_id": handle.child_id,
                         "status": "running",
-                        "agent_type": request.subagent_type,
+                        "agent_type": request.agent_type,
                         "name": request.name,
                         "description": request.description,
                         "output": self._partial_result(engine),
@@ -498,12 +506,14 @@ class AgentTool(BaseTool):
             )
         return events
 
-    def cancel_background(self, task_id: str) -> bool:
+    def cancel_child(self, handle: ChildHandle) -> bool:
         """Cooperatively cancel one background child if it is still active."""
 
-        future = self._background_tasks.get(task_id)
-        engine = self._background_engines.get(task_id)
-        cancel_event = self._background_cancel.get(task_id)
+        if not isinstance(handle, ChildHandle):
+            raise TypeError("handle must be a ChildHandle")
+        future = self._background_tasks.get(handle)
+        engine = self._background_engines.get(handle)
+        cancel_event = self._background_cancel.get(handle)
         if future is None or future.done():
             return False
         if cancel_event is not None:
@@ -591,21 +601,20 @@ class AgentTool(BaseTool):
 
     async def _post_completion_event(
         self,
-        task_id: str,
-        result: AgentResult,
+        handle: ChildHandle,
+        result: ChildResult,
         runtime_context: dict[str, Any],
     ) -> None:
         post_runtime_event = runtime_context.get("post_runtime_event")
         if not callable(post_runtime_event):
             return
         payload = self._result_payload(result)
-        payload["task_id"] = task_id
         try:
             accepted = await post_runtime_event(
                 RuntimeInput(
-                    event_id=f"{task_id}:terminal",
+                    event_id=f"{handle.child_id}:terminal",
                     kind="agent.child.completed",
-                    correlation_id=task_id,
+                    correlation_id=handle.child_id,
                     source="qitos.agent",
                     payload=payload,
                 )
@@ -616,3 +625,29 @@ class AgentTool(BaseTool):
             # The terminal result remains queryable if its parent has closed or
             # durable mailbox acceptance fails.
             return
+
+    @staticmethod
+    def _child_status(stop_reason: str) -> ChildStatus:
+        if stop_reason in {"completed", "final", "success"}:
+            return ChildStatus.COMPLETED
+        if stop_reason == "blocked":
+            return ChildStatus.BLOCKED
+        if stop_reason.startswith("budget_"):
+            return ChildStatus.BUDGET_EXHAUSTED
+        if stop_reason.startswith("cancelled"):
+            return ChildStatus.CANCELLED
+        if stop_reason.startswith("interrupt"):
+            return ChildStatus.INTERRUPTED
+        return ChildStatus.FAILED
+
+    @staticmethod
+    def _execution_status(result: ChildResult) -> str:
+        if result.status is ChildStatus.COMPLETED:
+            return "success"
+        if result.status in {ChildStatus.PENDING, ChildStatus.RUNNING}:
+            return "running"
+        if result.status in {ChildStatus.CANCELLED, ChildStatus.INTERRUPTED}:
+            return "cancelled"
+        if result.conclusion.summary:
+            return "partial"
+        return "error"

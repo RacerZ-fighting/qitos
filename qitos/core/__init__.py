@@ -35,6 +35,18 @@ from .model_response import (
     ModelUsageSource,
 )
 from .runtime_input import RuntimeInput
+from .child import (
+    DEFAULT_CHILD_MAX_STEPS,
+    AgentConclusion,
+    ChildEngine,
+    ChildHandle,
+    ChildInvocation,
+    ChildLaunchRequest,
+    ChildResult,
+    ChildRunResult,
+    ChildStateView,
+    ChildStatus,
+)
 from .process import (
     ProcessError,
     ProcessHandle,
@@ -155,6 +167,16 @@ __all__ = [
     "ModelUsageSource",
     "ReasoningCapability",
     "RuntimeInput",
+    "DEFAULT_CHILD_MAX_STEPS",
+    "AgentConclusion",
+    "ChildEngine",
+    "ChildHandle",
+    "ChildInvocation",
+    "ChildLaunchRequest",
+    "ChildResult",
+    "ChildRunResult",
+    "ChildStateView",
+    "ChildStatus",
     "ProcessError",
     "ProcessHandle",
     "ProcessNotFoundError",

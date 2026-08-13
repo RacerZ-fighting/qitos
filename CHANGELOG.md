@@ -19,6 +19,12 @@ How to update:
 
 ### Breaking
 
+- `AgentRequest`, `AgentInvocation`, and `AgentResult` have been replaced by the
+  immutable core `ChildLaunchRequest`, `ChildInvocation`, `ChildHandle`, `ChildResult`,
+  `ChildStatus`, and `AgentConclusion` contracts. `AgentTool` now accepts a complete
+  `TaskBudget`, returns parent-scoped handles, and exposes typed `child_result(handle)`
+  and `cancel_child(handle)` lifecycle operations. Tool execution status remains
+  separate from the child task's `child_status`.
 - `CommandCapability.start()` has been replaced by the async typed
   `astart()`/`apoll()`/`aread()`/`awrite()`/`await_process()`/`aterminate()` lifecycle.
   Environment cleanup now awaits `Env.ateardown()` so managed subprocess readers and
@@ -89,6 +95,9 @@ How to update:
 
 ### Added
 
+- Added canonical Child Agent contracts that keep persisted launch intent, stable
+  identity, lifecycle status, bounded conclusions, evidence references, and live Engine
+  ownership separate. The contracts round-trip without serializing a runnable Agent.
 - Added durable run-scoped mailbox acceptance. Journal-backed events append
   `runtime_input.posted` before waking the Engine, bind to the next completed model
   transaction, and are redelivered exactly once on resume if that transaction was not

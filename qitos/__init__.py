@@ -17,6 +17,14 @@ from .core.model_response import ModelResponse, ModelTiming
 from .core.model_request import ModelContinuation, ModelRequest
 from .core.model_stream import ModelStreamEvent, ModelStreamEventType
 from .core.runtime_input import RuntimeInput
+from .core.child import (
+    DEFAULT_CHILD_MAX_STEPS,
+    AgentConclusion,
+    ChildHandle,
+    ChildLaunchRequest,
+    ChildResult,
+    ChildStatus,
+)
 from .core.process import (
     ProcessError,
     ProcessHandle,
@@ -78,6 +86,12 @@ __all__ = [
     "EventStream",
     "EngineResult",
     "RuntimeInput",
+    "DEFAULT_CHILD_MAX_STEPS",
+    "AgentConclusion",
+    "ChildHandle",
+    "ChildLaunchRequest",
+    "ChildResult",
+    "ChildStatus",
     "ProcessError",
     "ProcessHandle",
     "ProcessNotFoundError",

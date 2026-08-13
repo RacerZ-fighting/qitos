@@ -24,7 +24,8 @@ from qitos import (
 from qitos.engine import RuntimeBudget
 from qitos.kit.history import WindowHistory
 from qitos.kit.parser import JsonDecisionParser
-from qitos.kit.tool.agent import AgentInvocation, AgentTool
+from qitos.core.child import ChildInvocation
+from qitos.kit.tool.agent import AgentTool
 
 
 @dataclass
@@ -172,9 +173,9 @@ def test_background_agent_completion_wakes_parent_runtime_wait() -> None:
             release_child.set()
 
     agent_tool = AgentTool(
-        invocation_factory=lambda request, _context: AgentInvocation(
+        invocation_factory=lambda request, _context: ChildInvocation(
             engine=ChildEngine(),
-            task=request.prompt,
+            task=request.task,
         ),
         execution_mode="background",
     )
