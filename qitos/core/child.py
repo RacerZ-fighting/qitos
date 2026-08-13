@@ -171,16 +171,29 @@ class ChildLaunchRequest:
 
 
 class ChildStateView(Protocol):
-    final_result: Any
-    stop_reason: Any
+    @property
+    def final_result(self) -> Any:
+        ...
+
+    @property
+    def stop_reason(self) -> Any:
+        ...
 
 
 class ChildRunResult(Protocol):
-    state: ChildStateView
-    records: Sequence[Any]
     step_count: int
     total_tokens: int
     run_id: str
+
+    @property
+    def state(self) -> ChildStateView:
+        """Return the Child's terminal state through the minimal read view."""
+        ...
+
+    @property
+    def records(self) -> Sequence[Any]:
+        """Return the completed steps as a covariant read-only view."""
+        ...
 
 
 class ChildEngine(Protocol):
