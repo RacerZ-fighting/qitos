@@ -67,6 +67,9 @@ How to update:
   in-memory replay, reopened replay, stable record IDs, JSONL, and projection digests
   consistent. Unsupported schema versions now have a dedicated upgrade error, and a
   failed source close during fork no longer leaks the unreturned child's writer lease.
+- Nested Journal forks now resolve inherited records to their canonical origin across
+  every ancestor. A fork-of-fork can resume independently without replaying a
+  completed Tool, and inconsistent inherited identity fails closed.
 - Plain-text Task coercion now derives a stable task ID from content instead of wall
   time. Trace provenance preserves explicit structured Task IDs in an independent
   `task_hash` without mixing task data into `run_config_hash`; qita requires the task
@@ -120,6 +123,10 @@ How to update:
 
 ### Added
 
+- Added immutable `RunHandle`/`RunStatus` contracts and a lease-free
+  `JsonlRunCatalog` for inspect, deterministic listing, validated lineage, and direct
+  children. Catalog reads use only an exact read-only SQLite projection or canonical
+  JSONL prefix and never acquire ownership, repair, or rebuild storage.
 - `AgentTool` composition can now populate the Child profile, allowed Tool groups, and
   working directory in each immutable launch request. `ChildInvocation.cleanup` gives
   the supervisor explicit async ownership of per-Child model and trace resources across

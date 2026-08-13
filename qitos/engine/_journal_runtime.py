@@ -17,6 +17,7 @@ from ..core.journal import (
     JournalRecord,
     JournalRecordRef,
     JournalRecordType,
+    resolve_inherited_record,
 )
 from ..core.model_request import ModelContinuation, ModelRequest
 from ..core.runtime_input import RuntimeInput
@@ -907,16 +908,7 @@ def recover_pending_runtime_inputs(
 def effective_journal_records(
     records: tuple[JournalRecord, ...],
 ) -> tuple[JournalRecord, ...]:
-    effective: list[JournalRecord] = []
-    for record in records:
-        if record.type is not JournalRecordType.INHERITED:
-            effective.append(record)
-            continue
-        raw_record = record.payload.get("record")
-        if not isinstance(raw_record, Mapping):
-            raise JournalError("journal.inherited is missing its origin record")
-        effective.append(JournalRecord.from_dict(raw_record))
-    return tuple(effective)
+    return tuple(resolve_inherited_record(record) for record in records)
 
 
 __all__ = ["_JournalRuntime", "history_message_to_dict"]

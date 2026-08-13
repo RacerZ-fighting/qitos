@@ -18,6 +18,12 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Lease-free Run discovery and lineage**: `JsonlRunCatalog` now returns immutable
+  typed summaries, deterministic listings, validated ancestors, and direct children
+  while an Engine still owns the writer lease. Reads never repair canonical JSONL or
+  rebuild its disposable SQLite projection. Inherited committed boundaries support
+  nested forks, whose Engine recovery no longer depends on ancestor files or replays
+  completed tools.
 - **Revision-safe atomic file tools**: bounded reads now return a SHA-256 revision for
   the complete UTF-8 file. Host and Docker filesystem capabilities replace files
   atomically, serialize same-path mutations per environment, and support compare-and-

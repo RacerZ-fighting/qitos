@@ -33,7 +33,7 @@ from qitos.core import (
 )
 from qitos.core.journal import JournalError, JournalRecordRef
 from qitos.checkpoint import InMemoryCheckpointStore
-from qitos.kit.journal import JsonlSessionJournal
+from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 from qitos.kit.parser import ReActTextParser
 from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos.engine.critic import Critic
@@ -928,6 +928,47 @@ async def test_fork_closes_child_when_source_close_fails(tmp_path: Path) -> None
     reopened_child = JsonlSessionJournal(tmp_path)
     await reopened_child.open("orphan-safe-child")
     await reopened_child.close()
+
+
+@pytest.mark.asyncio
+async def test_nested_terminal_fork_recovers_without_replaying_tools(
+    tmp_path: Path,
+) -> None:
+    original_journal = JsonlSessionJournal(tmp_path)
+    original = await Engine(
+        agent=JournalAgent(),
+        journal=original_journal,
+    ).arun("inspect")
+    terminal_boundary = next(
+        record
+        for record in reversed(await original_journal.replay())
+        if record.type is JournalRecordType.STATE_SNAPSHOT
+    )
+
+    source = JsonlSessionJournal(tmp_path)
+    await source.open(original.run_id)
+    child = await source.fork(terminal_boundary.position, "child-run")
+    child_boundary = (await JsonlRunCatalog(tmp_path).inspect_run("child-run"))
+    assert child_boundary.committed_position is not None
+    grandchild = await child.fork(
+        child_boundary.committed_position,
+        "grandchild-run",
+    )
+    await grandchild.close()
+    await child.close()
+    await source.close()
+    (tmp_path / original.run_id / "journal.jsonl").unlink()
+    (tmp_path / "child-run" / "journal.jsonl").unlink()
+
+    resumed_agent = JournalAgent()
+    resumed = await Engine(
+        agent=resumed_agent,
+        journal=JsonlSessionJournal(tmp_path),
+    ).aresume_from_journal("grandchild-run")
+
+    assert resumed_agent.executions == 0
+    assert resumed.state.seen == ["canonical"]
+    assert resumed.state.final_result == "done"
 
 
 @pytest.mark.asyncio
