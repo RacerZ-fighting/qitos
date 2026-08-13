@@ -438,6 +438,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._state_snapshot_interval = int(state_snapshot_interval)
         self._journal_pending_history: list[dict[str, Any]] = []
         self._pending_runtime_input_ids: list[str] = []
+        self._deferred_runtime_inputs: list[RuntimeInput] = []
         self._journal_terminal_record_ids: dict[str, list[str]] = {}
         self._canonical_action_results: list[CanonicalActionResult] = []
         self._last_journal_position: JournalPosition | None = None
@@ -687,6 +688,38 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             return False
         return bool(future.result())
 
+    def defer_runtime_event(self, event: RuntimeInput, *, run_id: str) -> bool:
+        """Queue an event from a synchronous Engine hook for the next safe point.
+
+        This method is intentionally limited to a hook running on this Engine's
+        active event loop. It performs no I/O and creates no Task. The next safe-point
+        drain persists queued events through :meth:`apost_runtime_event` before making
+        them model-visible. Async producers should await that method directly.
+        """
+
+        if not isinstance(event, RuntimeInput):
+            raise TypeError("event must be a RuntimeInput")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        loop = self._active_async_loop
+        if loop is None or not loop.is_running():
+            return False
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        if current_loop is not loop or run_id != self._active_run_id:
+            return False
+        if not self._runtime_inbox.accepts(run_id, event.event_id):
+            return False
+        if any(
+            queued.event_id == event.event_id
+            for queued in self._deferred_runtime_inputs
+        ):
+            return False
+        self._deferred_runtime_inputs.append(event)
+        return True
+
     async def _close_runtime_inbox(self, run_id: str | None = None) -> None:
         """Close after every in-flight durable post has reached a known boundary."""
 
@@ -827,7 +860,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         runtime with transactional advancement and persistence enabled.
         """
 
-        self._drain_runtime_events(state.current_step)
+        await self._drain_runtime_events(state.current_step)
         execution = await self._turn_runtime.execute(
             state,
             observation,
@@ -1228,7 +1261,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 # External input is accepted only here. The turn runtime then
                 # captures one immutable provider/tool/config view and commits
                 # one complete transaction before control returns.
-                self._drain_runtime_events(step_id)
+                await self._drain_runtime_events(step_id)
                 execution = await self._turn_runtime.execute(
                     state,
                     current_observation,
@@ -1716,7 +1749,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     def _budget_exhausted(self, step_id: int, state: StateT) -> bool:
         return self._control_runtime.budget_exhausted(step_id, state)
 
-    def _drain_runtime_events(self, step_id: int) -> None:
+    async def _drain_runtime_events(self, step_id: int) -> None:
+        deferred = self._deferred_runtime_inputs
+        self._deferred_runtime_inputs = []
+        for event in deferred:
+            await self.apost_runtime_event(event, run_id=self._active_run_id)
         events = self._runtime_inbox.drain(self._active_run_id)
         if not events:
             return
@@ -2723,6 +2760,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._canonical_action_results = []
         self._journal_pending_history = []
         self._pending_runtime_input_ids = []
+        self._deferred_runtime_inputs = []
         self._journal_terminal_record_ids = {}
         self._last_journal_position = None
         if self._tool_loop_detector is not None:

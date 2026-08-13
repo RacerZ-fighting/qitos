@@ -57,6 +57,9 @@ How to update:
   in-memory replay, reopened replay, stable record IDs, JSONL, and projection digests
   consistent. Unsupported schema versions now have a dedicated upgrade error, and a
   failed source close during fork no longer leaks the unreturned child's writer lease.
+- Synchronous Engine hooks can now defer runtime input for durable async acceptance at
+  the next turn safe point instead of calling the external sync mailbox bridge from
+  the Engine event loop.
 - Inferred model protocols are now resolved from each immutable turn snapshot instead
   of being cached for the whole Run, so a model change takes effect on the next turn.
 - Native tool calls now require a complete protocol terminal before execution. Chat
