@@ -551,10 +551,14 @@ class ChildSupervisor:
             raise RuntimeError("child supervisor closed before child start")
         owned.engine = invocation.engine
         owned.engine_ready.set()
-        engine_result = await invocation.engine.arun(
-            invocation.task,
-            **dict(invocation.run_kwargs),
-        )
+        try:
+            engine_result = await invocation.engine.arun(
+                invocation.task,
+                **dict(invocation.run_kwargs),
+            )
+        finally:
+            if invocation.cleanup is not None:
+                await invocation.cleanup()
         state = engine_result.state
         raw_stop_reason = state.stop_reason or ""
         stop_reason = str(getattr(raw_stop_reason, "value", raw_stop_reason))

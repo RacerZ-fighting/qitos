@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
@@ -13,6 +13,7 @@ from .journal import JournalRecordRef
 from .task import TaskBudget
 
 DEFAULT_CHILD_MAX_STEPS = 200
+ChildInvocationCleanup = Callable[[], Awaitable[None]]
 
 
 class ChildPersistenceError(RuntimeError):
@@ -203,12 +204,15 @@ class ChildInvocation:
     engine: ChildEngine
     task: str
     run_kwargs: Mapping[str, Any] = field(default_factory=dict)
+    cleanup: ChildInvocationCleanup | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.task, str) or not self.task.strip():
             raise ValueError("ChildInvocation.task must be a non-empty string")
         if not isinstance(self.run_kwargs, Mapping):
             raise TypeError("ChildInvocation.run_kwargs must be a mapping")
+        if self.cleanup is not None and not callable(self.cleanup):
+            raise TypeError("ChildInvocation.cleanup must be async callable or None")
         object.__setattr__(
             self,
             "run_kwargs",
@@ -417,6 +421,7 @@ __all__ = [
     "ChildEngine",
     "ChildHandle",
     "ChildInvocation",
+    "ChildInvocationCleanup",
     "ChildLaunchRequest",
     "ChildPersistenceError",
     "ChildResult",

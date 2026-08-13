@@ -47,4 +47,5 @@ Those projects remain design references, not runtime dependencies.
 - [x] Add status, wait, active-message, and interrupt projections.
 - [ ] Let a product resume a terminal Child Session for follow-up work.
 - [x] Journal lifecycle facts and define resume/fork behavior.
+- [x] Carry narrowed launch policy and await per-invocation resource cleanup.
 - [ ] Adopt the canonical lifecycle directly in PentestAgent `GeneralAgent`.

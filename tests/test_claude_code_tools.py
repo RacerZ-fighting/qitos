@@ -291,6 +291,9 @@ class TestAgentTool:
         def build_invocation(request, runtime_context):
             assert runtime_context["delegate_depth"] == 0
             assert request.budget.max_steps == 200
+            assert request.profile == "restricted"
+            assert request.allowed_tool_groups == ("files", "network")
+            assert request.working_directory == "workspace"
             engine = FakeEngine()
             engines.append(engine)
             return ChildInvocation(engine=engine, task=f"seeded:{request.task}")
@@ -308,6 +311,9 @@ class TestAgentTool:
             invocation_factory=build_invocation,
             execution_scope=execution_scope,
             execution_mode="foreground",
+            child_profile="restricted",
+            child_allowed_tool_groups=("files", "network"),
+            child_working_directory="workspace",
         )
         first = await tool.execute(
             {"description": "first task", "prompt": "one"},
