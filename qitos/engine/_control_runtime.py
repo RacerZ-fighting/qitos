@@ -287,6 +287,25 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
         )
 
         if decision.mode == "final":
+            if engine._runtime_inbox.has_events(engine.active_run_id):
+                state.final_result = None
+                if state.stop_reason in {
+                    StopReason.FINAL.value,
+                    StopReason.COMPLETED.value,
+                    StopReason.BLOCKED.value,
+                }:
+                    state.stop_reason = None
+                self._finish_check_stop(
+                    step_id=step_id,
+                    state=state,
+                    decision=decision,
+                    stop=False,
+                    extra_payload={
+                        "completion_disposition": "continue",
+                        "completion_reason": "runtime_input_pending",
+                    },
+                )
+                return False
             assessment = engine.agent.assess_completion(state, decision)
             disposition = assessment.disposition
             if disposition is CompletionDisposition.CONTINUE:

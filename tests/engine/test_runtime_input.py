@@ -93,6 +93,14 @@ def test_runtime_input_rejects_non_json_payload(payload: dict[str, Any]) -> None
         )
 
 
+def test_runtime_input_round_trips_its_strict_journal_shape() -> None:
+    event = _event()
+
+    assert RuntimeInput.from_dict(event.to_dict()) == event
+    with pytest.raises(ValueError, match="fields are invalid"):
+        RuntimeInput.from_dict({**event.to_dict(), "unexpected": True})
+
+
 def test_runtime_wait_sleeps_until_event_and_delivers_it_at_safe_point() -> None:
     agent = _WaitAgent()
     engine = Engine(agent, budget=RuntimeBudget(max_steps=4))

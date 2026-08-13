@@ -437,6 +437,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             raise ValueError("state_snapshot_interval must be positive")
         self._state_snapshot_interval = int(state_snapshot_interval)
         self._journal_pending_history: list[dict[str, Any]] = []
+        self._pending_runtime_input_ids: list[str] = []
         self._journal_terminal_record_ids: dict[str, list[str]] = {}
         self._canonical_action_results: list[CanonicalActionResult] = []
         self._last_journal_position: JournalPosition | None = None
@@ -451,6 +452,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         # Cancellation token — shared with EngineResult for external cancel
         self._cancel_token = CancelToken()
         self._runtime_inbox = _RuntimeInbox()
+        self._runtime_input_post_lock = asyncio.Lock()
         self._active_async_task: Optional[asyncio.Task[Any]] = None
         self._active_async_loop: Optional[asyncio.AbstractEventLoop] = None
         self._connected_mcp_servers: List[Any] = []
@@ -629,14 +631,67 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         return self._active_run_id
 
-    def post_runtime_event(self, event: RuntimeInput, *, run_id: str) -> bool:
-        """Post one idempotent event to the exact active run."""
+    async def apost_runtime_event(
+        self, event: RuntimeInput, *, run_id: str
+    ) -> bool:
+        """Durably post one idempotent event to the exact active run.
+
+        Journal-backed runs append the event before making it visible to the
+        in-memory inbox. A failed append therefore never wakes the run.
+        """
 
         if not isinstance(event, RuntimeInput):
             raise TypeError("event must be a RuntimeInput")
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
-        return self._runtime_inbox.post(run_id, event)
+        async with self._runtime_input_post_lock:
+            if not self._runtime_inbox.accepts(run_id, event.event_id):
+                return False
+            if self.journal is not None:
+                self._last_journal_position = await self.journal.append(
+                    JournalRecordType.RUNTIME_INPUT_POSTED,
+                    {"event": event.to_dict()},
+                    record_id=f"{run_id}:runtime-input:{event.event_id}",
+                )
+            return self._runtime_inbox.post(run_id, event)
+
+    def post_runtime_event(self, event: RuntimeInput, *, run_id: str) -> bool:
+        """Post from a synchronous caller outside the Engine event loop.
+
+        Async callers must await :meth:`apost_runtime_event`. This compatibility
+        boundary schedules onto the active Engine loop without creating another
+        event loop.
+        """
+
+        if not isinstance(event, RuntimeInput):
+            raise TypeError("event must be a RuntimeInput")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        loop = self._active_async_loop
+        if loop is None or not loop.is_running():
+            return False
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is loop:
+            raise RuntimeError(
+                "post_runtime_event() cannot run on the Engine event loop; "
+                "await apost_runtime_event() instead"
+            )
+        post = self.apost_runtime_event(event, run_id=run_id)
+        try:
+            future = asyncio.run_coroutine_threadsafe(post, loop)
+        except RuntimeError:
+            post.close()
+            return False
+        return bool(future.result())
+
+    async def _close_runtime_inbox(self, run_id: str | None = None) -> None:
+        """Close after every in-flight durable post has reached a known boundary."""
+
+        async with self._runtime_input_post_lock:
+            self._runtime_inbox.close(run_id)
 
     def resolve_protocol(self) -> Any:
         """Resolve the protocol from the configuration visible to this turn."""
@@ -928,6 +983,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         )
         _resume_usage = dict(kwargs.pop("_resume_usage", {}) or {})
         _resume_continuation = kwargs.pop("_resume_continuation", None)
+        _resume_runtime_inputs = tuple(kwargs.pop("_resume_runtime_inputs", ()))
+        if not all(isinstance(item, RuntimeInput) for item in _resume_runtime_inputs):
+            raise TypeError("_resume_runtime_inputs must contain RuntimeInput values")
 
         self._reset_run_state()
         self._canonical_action_results = list(_resume_canonical_results)
@@ -1021,7 +1079,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             self._active_state = type(state).from_dict(state.to_dict())
         elif self.journal is not None:
             self._active_state = type(state).from_dict(state.to_dict())
-        self._runtime_inbox.open(self._active_run_id)
+        self._runtime_inbox.open(
+            self._active_run_id,
+            recovered=_resume_runtime_inputs,
+        )
         harness_diagnostics = self._harness_mismatch_diagnostics()
         self._emit(
             0,
@@ -1047,7 +1108,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 task_obj=task_obj, workspace=kwargs.get("workspace")
             )
         except BaseException:
-            self._runtime_inbox.close(self._active_run_id)
+            await self._close_runtime_inbox(self._active_run_id)
             raise
         if preflight_issues:
             has_task_issue = any(
@@ -1088,7 +1149,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 run_id=self._active_run_id,
                 _cancel_token=self._cancel_token,
             )
-            self._runtime_inbox.close(self._active_run_id)
+            await self._close_runtime_inbox(self._active_run_id)
             self._notify_run_end(result)
             self._clear_active_context()
             preflight_cleanup_error: BaseException | None = None
@@ -1217,7 +1278,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             )
             journal_interrupted = True
         finally:
-            self._runtime_inbox.close(self._active_run_id)
+            await self._close_runtime_inbox(self._active_run_id)
             cleanup_error: BaseException | None = None
             try:
                 await self._teardown_env()
@@ -1656,6 +1717,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         events = self._runtime_inbox.drain(self._active_run_id)
         if not events:
             return
+        self._pending_runtime_input_ids.extend(event.event_id for event in events)
         payload = {"runtime_events": [event.to_dict() for event in events]}
         self._history_append(
             "user",
@@ -2018,6 +2080,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             _resume_canonical_results=replay["canonical_results"],
             _resume_usage=replay["usage"],
             _resume_continuation=replay["continuation"],
+            _resume_runtime_inputs=replay["pending_runtime_inputs"],
         )
 
     def resume_from_journal(self, run_id: str) -> EngineResult[StateT]:
@@ -2644,6 +2707,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
     def _reset_run_state(self) -> None:
         self._runtime_inbox.close()
+        self._runtime_input_post_lock = asyncio.Lock()
         self._trace_runtime.reset_run_state()
         self._last_runtime_error = None
         self._resolved_protocol = None
@@ -2655,6 +2719,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_checkpoint_id = None
         self._canonical_action_results = []
         self._journal_pending_history = []
+        self._pending_runtime_input_ids = []
         self._journal_terminal_record_ids = {}
         self._last_journal_position = None
         if self._tool_loop_detector is not None:

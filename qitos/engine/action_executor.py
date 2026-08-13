@@ -1359,10 +1359,15 @@ class ActionExecutor:
             else ""
         )
 
-        def _post_runtime_event(event: Any) -> bool:
+        async def _post_runtime_event(event: Any) -> bool:
             if self._engine is None or not active_run_id:
                 return False
-            return bool(self._engine.post_runtime_event(event, run_id=active_run_id))
+            return bool(
+                await self._engine.apost_runtime_event(
+                    event,
+                    run_id=active_run_id,
+                )
+            )
 
         def _record_runtime_event(phase: str, payload: Dict[str, Any]) -> None:
             if self._engine is None:

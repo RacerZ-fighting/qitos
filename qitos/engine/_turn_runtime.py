@@ -266,21 +266,34 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
                 managed_run=managed_run,
             )
 
-        stop = engine._run_check_stop(state, record.decision, current_step, started_at)
-        engine.validation_gate.after_phase(state, RuntimePhase.CHECK_STOP.value)
-        engine._finalize_step(record, state)
-        if not stop and managed_run:
-            state.advance_step()
-        if managed_run:
-            if engine.journal is not None:
-                await engine._journal_commit_step(
-                    record,
-                    before=step_before,
-                    state=state,
-                    terminal=stop,
-                )
-            else:
-                await engine._save_checkpoint(current_step, state, task)
+        # Linearize stop/commit with mailbox acceptance. An event accepted before
+        # this boundary defers a final answer to the next turn; a post that loses
+        # the race observes the sealed inbox and is rejected.
+        async with engine._runtime_input_post_lock:
+            stop = engine._run_check_stop(
+                state,
+                record.decision,
+                current_step,
+                started_at,
+            )
+            engine.validation_gate.after_phase(
+                state, RuntimePhase.CHECK_STOP.value
+            )
+            engine._finalize_step(record, state)
+            if not stop and managed_run:
+                state.advance_step()
+            if managed_run:
+                if engine.journal is not None:
+                    await engine._journal_commit_step(
+                        record,
+                        before=step_before,
+                        state=state,
+                        terminal=stop,
+                    )
+                else:
+                    await engine._save_checkpoint(current_step, state, task)
+            if stop:
+                engine._runtime_inbox.close(engine.active_run_id)
         self._after_step_hook(
             state, record, task=task, phase=RuntimePhase.CHECK_STOP
         )

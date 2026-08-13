@@ -35,6 +35,9 @@ How to update:
   capabilities and their concrete adapters are async as well. Synchronous decorated
   functions remain supported through one explicit compatibility boundary, but code
   inside an active event loop must await Tool and Engine APIs.
+- Runtime components now await `Engine.apost_runtime_event()`. The synchronous
+  `post_runtime_event()` entry remains only for callers outside the Engine event loop
+  and schedules onto that loop without creating a temporary loop.
 
 ### Fixed
 
@@ -86,6 +89,11 @@ How to update:
 
 ### Added
 
+- Added durable run-scoped mailbox acceptance. Journal-backed events append
+  `runtime_input.posted` before waking the Engine, bind to the next completed model
+  transaction, and are redelivered exactly once on resume if that transaction was not
+  durable. Final completion is linearized with mailbox acceptance, so input accepted
+  during a final turn is processed on a following turn instead of being silently lost.
 - Added a Run-owned host process supervisor with opaque `ProcessHandle` values,
   immutable snapshots, incremental bounded UTF-8 output, complete workspace logs,
   stdin and POSIX PTY interaction, active-process limits, and graceful process-group

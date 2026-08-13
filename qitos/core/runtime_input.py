@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -42,6 +43,24 @@ class RuntimeInput:
             "source": self.source,
             "payload": dict(self.payload),
         }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "RuntimeInput":
+        """Restore one event from its strict journal representation."""
+
+        expected = {"event_id", "kind", "correlation_id", "source", "payload"}
+        if set(value) != expected:
+            raise ValueError("RuntimeInput fields are invalid")
+        payload = value["payload"]
+        if not isinstance(payload, Mapping):
+            raise TypeError("RuntimeInput.payload must be a mapping")
+        return cls(
+            event_id=value["event_id"],
+            kind=value["kind"],
+            correlation_id=value["correlation_id"],
+            source=value["source"],
+            payload=dict(payload),
+        )
 
 
 __all__ = ["RuntimeInput"]

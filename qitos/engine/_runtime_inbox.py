@@ -26,8 +26,13 @@ class _RuntimeInbox:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._wake_event: asyncio.Event | None = None
 
-    def open(self, run_id: str) -> None:
-        """Open an empty inbox for exactly one run."""
+    def open(
+        self,
+        run_id: str,
+        *,
+        recovered: tuple[RuntimeInput, ...] = (),
+    ) -> None:
+        """Open an inbox for one run, optionally with durable pending events."""
 
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("run_id must be a non-empty string")
@@ -38,8 +43,8 @@ class _RuntimeInbox:
         with self._lock:
             self._run_id = run_id
             self._open = True
-            self._events.clear()
-            self._seen_event_ids.clear()
+            self._events = deque(recovered)
+            self._seen_event_ids = {event.event_id for event in recovered}
             self._loop = loop
             self._wake_event = asyncio.Event() if loop is not None else None
 
@@ -56,6 +61,16 @@ class _RuntimeInbox:
             self._notify_waiter_locked()
             return True
 
+    def accepts(self, run_id: str, event_id: str) -> bool:
+        """Return whether a post could currently enter this run's queue."""
+
+        with self._lock:
+            return (
+                self._open
+                and run_id == self._run_id
+                and event_id not in self._seen_event_ids
+            )
+
     def drain(self, run_id: str) -> list[RuntimeInput]:
         """Remove all events queued for the active run."""
 
@@ -67,6 +82,12 @@ class _RuntimeInbox:
             if self._wake_event is not None:
                 self._wake_event.clear()
             return events
+
+    def has_events(self, run_id: str) -> bool:
+        """Return whether the active run has input waiting at its next safe point."""
+
+        with self._lock:
+            return self._open and run_id == self._run_id and bool(self._events)
 
     async def wait(
         self,

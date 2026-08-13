@@ -428,7 +428,8 @@ class TestAgentTool:
             execution_mode="background",
             max_background_workers=2,
         )
-        def post_runtime_event(event):
+
+        async def post_runtime_event(event):
             events.append(event)
             if len(events) == 2:
                 completed.set()
@@ -571,9 +572,10 @@ class TestAgentTool:
             def cancel(self, mode):
                 _ = mode
 
-        def post_runtime_event(_event):
+        async def post_runtime_event(_event):
             assert tool.active_background_count == 0
             delivery_started.set()
+            return True
 
         tool = AgentTool(
             invocation_factory=lambda request, _context: AgentInvocation(
@@ -637,7 +639,8 @@ class TestAgentTool:
             ),
             execution_mode="background",
         )
-        def post_runtime_event(event):
+
+        async def post_runtime_event(event):
             events.append(event)
             completed.set()
             return True
