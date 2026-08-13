@@ -399,11 +399,13 @@ class JsonlSessionJournal:
         run_id: str,
     ) -> tuple[list[JournalRecord], SqliteJournalIndex | None]:
         index_path = path.parent / _INDEX_FILENAME
+        records = self._load_and_repair(path, run_id)
         try:
-            loaded = SqliteJournalIndex.load_if_current(
+            sqlite_index = SqliteJournalIndex.load_if_current(
                 index_path,
                 path,
                 run_id,
+                records,
             )
         except JournalIndexError as exc:
             _logger.warning(
@@ -411,11 +413,9 @@ class JsonlSessionJournal:
                 run_id,
                 exc,
             )
-            loaded = None
-        if loaded is not None:
-            sqlite_index, records = loaded
+            sqlite_index = None
+        if sqlite_index is not None:
             return records, sqlite_index
-        records = self._load_and_repair(path, run_id)
         try:
             sqlite_index = SqliteJournalIndex.rebuild(
                 index_path,

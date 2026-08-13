@@ -141,6 +141,9 @@ How to update:
 
 ### Changed
 
+- Journal replay now always parses and validates canonical JSONL before consulting the
+  disposable SQLite projection. A projection is retained only when its record digests
+  match the validated JSONL; drift rebuilds the projection and can never override replay.
 - Journal records now deep-copy nested payloads at construction and projection
   boundaries. Replay and committed-tool queries return isolated values.
 - Engine run and resume entry points now own and close their configured Journal on

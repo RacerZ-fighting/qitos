@@ -10,9 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from ...core.journal import JournalCorruptionError, JournalRecord, JournalRecordType
+from ...core.journal import JournalRecord
 
-_INDEX_SCHEMA_VERSION = 1
+_INDEX_SCHEMA_VERSION = 2
 
 
 class JournalIndexError(RuntimeError):
@@ -59,11 +59,13 @@ class SqliteJournalIndex:
         path: Path,
         journal_path: Path,
         run_id: str,
-    ) -> tuple["SqliteJournalIndex", list[JournalRecord]] | None:
-        """Load a projection only when it exactly represents the canonical file."""
+        records: Iterable[JournalRecord],
+    ) -> "SqliteJournalIndex" | None:
+        """Open a projection only when it matches validated canonical records."""
 
         if not path.is_file():
             return None
+        canonical_records = list(records)
         connection: sqlite3.Connection | None = None
         try:
             connection = _connect(path)
@@ -95,18 +97,23 @@ class SqliteJournalIndex:
             if tuple(row[:5]) != expected_source:
                 connection.close()
                 return None
-            records = _load_records(connection, run_id)
             record_count = int(row[5])
             last_record_id = str(row[6])
-            if len(records) != record_count:
+            if len(canonical_records) != record_count:
                 raise JournalIndexError("Journal projection record count is invalid")
-            if not records or records[-1].record_id != last_record_id:
+            if (
+                not canonical_records
+                or canonical_records[-1].record_id != last_record_id
+            ):
                 raise JournalIndexError("Journal projection tail identity is invalid")
-            return cls(path, run_id, connection), records
+            if not _matches_canonical_records(connection, canonical_records):
+                raise JournalIndexError(
+                    "Journal projection content differs from canonical JSONL"
+                )
+            return cls(path, run_id, connection)
         except (
             OSError,
             sqlite3.Error,
-            JournalCorruptionError,
             JournalIndexError,
             ValueError,
         ) as exc:
@@ -135,15 +142,14 @@ class SqliteJournalIndex:
                 connection.executemany(
                     """
                     INSERT INTO journal_record(
-                        seq, record_id, record_type, record_json, record_sha256
-                    ) VALUES (?, ?, ?, ?, ?)
+                        seq, record_id, record_type, record_sha256
+                    ) VALUES (?, ?, ?, ?)
                     """,
                     (
                         (
                             record.seq,
                             record.record_id,
                             record.type.value,
-                            _record_json(record),
                             _record_sha256(record),
                         )
                         for record in materialized
@@ -180,14 +186,13 @@ class SqliteJournalIndex:
                 self._connection.execute(
                     """
                     INSERT INTO journal_record(
-                        seq, record_id, record_type, record_json, record_sha256
-                    ) VALUES (?, ?, ?, ?, ?)
+                        seq, record_id, record_type, record_sha256
+                    ) VALUES (?, ?, ?, ?)
                     """,
                     (
                         record.seq,
                         record.record_id,
                         record.type.value,
-                        _record_json(record),
                         _record_sha256(record),
                     ),
                 )
@@ -236,7 +241,6 @@ def _initialize_schema(connection: sqlite3.Connection) -> None:
             seq INTEGER PRIMARY KEY,
             record_id TEXT NOT NULL UNIQUE,
             record_type TEXT NOT NULL,
-            record_json TEXT NOT NULL,
             record_sha256 TEXT NOT NULL
         );
         CREATE INDEX journal_record_type_seq
@@ -276,50 +280,41 @@ def _replace_source(
     )
 
 
-def _load_records(
+def _matches_canonical_records(
     connection: sqlite3.Connection,
-    run_id: str,
-) -> list[JournalRecord]:
+    canonical_records: list[JournalRecord],
+) -> bool:
     rows = connection.execute(
-        "SELECT seq, record_json, record_sha256 FROM journal_record ORDER BY seq"
+        """
+        SELECT seq, record_id, record_type, record_sha256
+        FROM journal_record
+        ORDER BY seq
+        """
     ).fetchall()
-    records: list[JournalRecord] = []
-    record_ids: set[str] = set()
-    for expected_seq, (stored_seq, encoded, stored_digest) in enumerate(rows, start=1):
+    if len(rows) != len(canonical_records):
+        return False
+    for canonical, row in zip(canonical_records, rows):
+        stored_seq, record_id, record_type, stored_digest = row
         if (
-            stored_seq != expected_seq
-            or not isinstance(encoded, str)
+            stored_seq != canonical.seq
+            or record_id != canonical.record_id
+            or record_type != canonical.type.value
             or not isinstance(stored_digest, str)
-            or hashlib.sha256(encoded.encode("utf-8")).hexdigest() != stored_digest
+            or stored_digest != _record_sha256(canonical)
         ):
-            raise JournalIndexError("Journal projection sequence is invalid")
-        value = json.loads(encoded)
-        if not isinstance(value, dict):
-            raise JournalIndexError("Journal projection record is invalid")
-        record = JournalRecord.from_dict(value)
-        if record.run_id != run_id or record.seq != expected_seq:
-            raise JournalIndexError("Journal projection Run identity is invalid")
-        if record.record_id in record_ids:
-            raise JournalIndexError("Journal projection record_id is duplicated")
-        records.append(record)
-        record_ids.add(record.record_id)
-    if not records or records[0].type is not JournalRecordType.RUN_STARTED:
-        raise JournalIndexError("Journal projection is missing run.started")
-    return records
+            return False
+    return True
 
 
-def _record_json(record: JournalRecord) -> str:
-    return json.dumps(
+def _record_sha256(record: JournalRecord) -> str:
+    encoded = json.dumps(
         record.to_dict(),
         ensure_ascii=False,
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
-    )
-
-
-def _record_sha256(record: JournalRecord) -> str:
-    return hashlib.sha256(_record_json(record).encode("utf-8")).hexdigest()
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _user_version(connection: sqlite3.Connection) -> int:
