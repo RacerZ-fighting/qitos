@@ -11,7 +11,12 @@ from ..core.agent_module import ActionResultContext, CanonicalActionResult
 from ..core.decision import Decision
 from ..core.errors import StopReason
 from ..core.history import HistoryMessage
-from ..core.journal import JournalError, JournalRecord, JournalRecordType
+from ..core.journal import (
+    JournalError,
+    JournalRecord,
+    JournalRecordRef,
+    JournalRecordType,
+)
 from ..core.state import StateSchema
 from ..core.state_delta import apply_state_delta, build_state_delta, state_digest
 from ..core.task import Task
@@ -119,6 +124,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
         for index, (action, raw_result) in enumerate(
             zip(actions, results, strict=True)
         ):
+            terminal: JournalRecordRef | None = None
             result = ToolResult.from_value(
                 engine.agent.finalize_action_result(
                     state,
@@ -144,9 +150,10 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                     record_id=record_id,
                 )
                 terminal_ids.append(record_id)
+                terminal = JournalRecordRef(engine.journal.run_id, record_id)
             finalized.append(result)
             engine._canonical_action_results.append(
-                CanonicalActionResult(record.step_id, action, result)
+                CanonicalActionResult(record.step_id, action, result, terminal)
             )
             self.reduce_action_results(
                 state,
@@ -400,6 +407,10 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                         step_id,
                         Action.from_dict(dict(action_payload)),
                         terminal_result,
+                        JournalRecordRef(
+                            journal_record.run_id,
+                            journal_record.record_id,
+                        ),
                     )
                 )
                 continue

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import sys
+import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -15,8 +17,12 @@ from ...core.journal import (
     JournalError,
     JournalPosition,
     JournalRecord,
+    JournalRecordRef,
     JournalRecordType,
+    ToolTransaction,
 )
+from ...core.action import Action
+from ...core.tool_result import ToolResult
 
 FileSync = Callable[[int, str], None]
 DirectorySync = Callable[[Path], None]
@@ -39,6 +45,9 @@ class JsonlSessionJournal:
         self._path: Path | None = None
         self._records: list[JournalRecord] = []
         self._lock = asyncio.Lock()
+        self._query_lock = threading.RLock()
+        self._terminal_records: dict[JournalRecordRef, JournalRecord] = {}
+        self._terminal_commits: dict[JournalRecordRef, JournalRecord] = {}
 
     @property
     def run_id(self) -> str:
@@ -59,6 +68,7 @@ class JsonlSessionJournal:
             self._run_id = run_id
             self._path = self.root / run_id / "journal.jsonl"
             self._records = []
+            self._rebuild_tool_transaction_index(())
             return await self._append_locked(
                 JournalRecordType.RUN_STARTED,
                 dict(metadata),
@@ -84,6 +94,7 @@ class JsonlSessionJournal:
             self._run_id = run_id
             self._path = path
             self._records = records
+            self._rebuild_tool_transaction_index(records)
 
     async def append(
         self,
@@ -129,6 +140,7 @@ class JsonlSessionJournal:
         encoded = _encode_record(record)
         await asyncio.to_thread(self._write_sync, self._path, encoded)
         self._records.append(record)
+        self._index_tool_transaction_record(record)
         return record.position
 
     def _write_sync(self, path: Path, encoded: bytes) -> None:
@@ -140,6 +152,61 @@ class JsonlSessionJournal:
     async def replay(self) -> tuple[JournalRecord, ...]:
         async with self._lock:
             return tuple(self._records)
+
+    def find_tool_transaction(
+        self,
+        reference: JournalRecordRef,
+    ) -> ToolTransaction | None:
+        """Return a fresh typed view of one committed Tool terminal."""
+
+        if not isinstance(reference, JournalRecordRef):
+            raise TypeError("reference must be a JournalRecordRef")
+        with self._query_lock:
+            terminal = self._terminal_records.get(reference)
+            committed = self._terminal_commits.get(reference)
+            if terminal is None or committed is None:
+                return None
+            return _tool_transaction(terminal, committed)
+
+    def _rebuild_tool_transaction_index(
+        self,
+        records: tuple[JournalRecord, ...] | list[JournalRecord],
+    ) -> None:
+        with self._query_lock:
+            self._terminal_records = {}
+            self._terminal_commits = {}
+            for record in records:
+                self._index_tool_transaction_record_locked(record)
+
+    def _index_tool_transaction_record(self, record: JournalRecord) -> None:
+        with self._query_lock:
+            self._index_tool_transaction_record_locked(record)
+
+    def _index_tool_transaction_record_locked(self, record: JournalRecord) -> None:
+        effective = _origin_record(record)
+        if effective.type is JournalRecordType.TOOL_TERMINAL:
+            reference = JournalRecordRef(effective.run_id, effective.record_id)
+            existing = self._terminal_records.get(reference)
+            if existing is not None and existing.to_dict() != effective.to_dict():
+                raise JournalCorruptionError(
+                    "conflicting inherited Tool terminal reference"
+                )
+            self._terminal_records[reference] = effective
+            return
+        if effective.type is not JournalRecordType.STEP_COMMITTED:
+            return
+        raw_terminal_ids = effective.payload.get("terminal_record_ids", [])
+        if not isinstance(raw_terminal_ids, list) or any(
+            not isinstance(record_id, str) or not record_id
+            for record_id in raw_terminal_ids
+        ):
+            raise JournalCorruptionError(
+                "step.committed terminal_record_ids are invalid"
+            )
+        for record_id in raw_terminal_ids:
+            reference = JournalRecordRef(effective.run_id, record_id)
+            if reference in self._terminal_records:
+                self._terminal_commits[reference] = effective
 
     async def flush(self) -> None:
         async with self._lock:
@@ -261,6 +328,55 @@ def _encode_record(record: JournalRecord) -> bytes:
     except (TypeError, ValueError) as exc:
         raise JournalError("journal payload is not JSON serializable") from exc
     return encoded.encode("utf-8") + b"\n"
+
+
+def _origin_record(record: JournalRecord) -> JournalRecord:
+    current = record
+    for _ in range(64):
+        if current.type is not JournalRecordType.INHERITED:
+            return current
+        raw_record = current.payload.get("record")
+        if not isinstance(raw_record, Mapping):
+            raise JournalCorruptionError(
+                "journal.inherited is missing its origin record"
+            )
+        current = JournalRecord.from_dict(raw_record)
+    raise JournalCorruptionError("journal.inherited nesting is too deep")
+
+
+def _tool_transaction(
+    terminal: JournalRecord,
+    committed: JournalRecord,
+) -> ToolTransaction:
+    payload = terminal.payload
+    step_id = payload.get("step_id")
+    action_index = payload.get("action_index")
+    raw_action = payload.get("action")
+    raw_result = payload.get("result")
+    if (
+        isinstance(step_id, bool)
+        or not isinstance(step_id, int)
+        or step_id < 0
+        or isinstance(action_index, bool)
+        or not isinstance(action_index, int)
+        or action_index < 0
+        or not isinstance(raw_action, Mapping)
+        or not isinstance(raw_result, Mapping)
+    ):
+        raise JournalCorruptionError("tool.terminal payload is invalid")
+    try:
+        action = Action.from_dict(copy.deepcopy(dict(raw_action)))
+        result = ToolResult.from_value(copy.deepcopy(dict(raw_result)))
+    except (TypeError, ValueError) as exc:
+        raise JournalCorruptionError("tool.terminal payload is invalid") from exc
+    return ToolTransaction(
+        terminal=JournalRecordRef(terminal.run_id, terminal.record_id),
+        committed_at=committed.position,
+        step_id=step_id,
+        action_index=action_index,
+        action=action,
+        result=result,
+    )
 
 
 def _validate_run_id(run_id: str) -> None:

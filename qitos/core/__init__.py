@@ -32,8 +32,10 @@ from .journal import (
     JournalError,
     JournalPosition,
     JournalRecord,
+    JournalRecordRef,
     JournalRecordType,
     SessionJournal,
+    ToolTransaction,
 )
 from .env import (
     Env,
@@ -131,8 +133,10 @@ __all__ = [
     "JournalError",
     "JournalPosition",
     "JournalRecord",
+    "JournalRecordRef",
     "JournalRecordType",
     "SessionJournal",
+    "ToolTransaction",
     "RunSpec",
     "ExperimentSpec",
     "BenchmarkRunResult",

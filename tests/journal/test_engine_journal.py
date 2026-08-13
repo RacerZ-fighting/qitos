@@ -23,7 +23,7 @@ from qitos import (
 from qitos.core.action import ActionExecutionPolicy
 from qitos.core.agent_module import ActionResultContext
 from qitos.core import JournalRecordType, ToolResult
-from qitos.core.journal import JournalError
+from qitos.core.journal import JournalError, JournalRecordRef
 from qitos.checkpoint import InMemoryCheckpointStore
 from qitos.kit.journal import JsonlSessionJournal
 from qitos.kit.parser import ReActTextParser
@@ -112,6 +112,9 @@ async def test_each_terminal_is_reduced_before_the_next_finalizer(
         def __init__(self) -> None:
             super().__init__()
             self.finalizer_seen: list[tuple[str, ...]] = []
+            self.finalizer_terminals: list[
+                tuple[JournalRecordRef | None, ...]
+            ] = []
 
         def decide(
             self,
@@ -139,6 +142,9 @@ async def test_each_terminal_is_reduced_before_the_next_finalizer(
         ) -> ToolResult:
             _ = action, result, step_id, context
             self.finalizer_seen.append(tuple(state.seen))
+            self.finalizer_terminals.append(
+                tuple(item.terminal for item in context.prior_results)
+            )
             return ToolResult(output=f"canonical-{len(self.finalizer_seen)}")
 
     agent = OrderedAgent()
@@ -149,6 +155,12 @@ async def test_each_terminal_is_reduced_before_the_next_finalizer(
     ).arun("inspect")
 
     assert agent.finalizer_seen == [(), ("canonical-1",)]
+    assert agent.finalizer_terminals[0] == ()
+    assert len(agent.finalizer_terminals[1]) == 1
+    first_terminal = agent.finalizer_terminals[1][0]
+    assert first_terminal is not None
+    assert first_terminal.run_id == result.run_id
+    assert first_terminal.record_id.endswith(":tool:0:terminal")
     assert result.state.seen == ["canonical-1", "canonical-2"]
 
 

@@ -7,6 +7,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping, Protocol
 
+from .action import Action
+from .tool_result import ToolResult
+
 
 class JournalError(RuntimeError):
     """Base error raised by Run journal implementations."""
@@ -35,6 +38,41 @@ class JournalPosition:
     run_id: str
     seq: int
     record_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class JournalRecordRef:
+    """Stable origin identity for one canonical Journal record."""
+
+    run_id: str
+    record_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.run_id, str) or not self.run_id:
+            raise ValueError("Journal record run_id must be non-empty")
+        if not isinstance(self.record_id, str) or not self.record_id:
+            raise ValueError("Journal record_id must be non-empty")
+
+    def to_dict(self) -> dict[str, str]:
+        return {"run_id": self.run_id, "record_id": self.record_id}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "JournalRecordRef":
+        if set(value) != {"run_id", "record_id"}:
+            raise ValueError("Journal record reference fields are invalid")
+        return cls(run_id=value["run_id"], record_id=value["record_id"])
+
+
+@dataclass(frozen=True, slots=True)
+class ToolTransaction:
+    """One committed canonical Tool terminal reconstructed from a Journal."""
+
+    terminal: JournalRecordRef
+    committed_at: JournalPosition
+    step_id: int
+    action_index: int
+    action: Action
+    result: ToolResult
 
 
 @dataclass(frozen=True)
@@ -154,6 +192,13 @@ class SessionJournal(Protocol):
     async def replay(self) -> tuple[JournalRecord, ...]:
         ...
 
+    def find_tool_transaction(
+        self, reference: JournalRecordRef
+    ) -> ToolTransaction | None:
+        """Return one committed Tool terminal from the currently open Run view."""
+
+        ...
+
     async def flush(self) -> None:
         ...
 
@@ -168,6 +213,8 @@ __all__ = [
     "JournalError",
     "JournalPosition",
     "JournalRecord",
+    "JournalRecordRef",
     "JournalRecordType",
     "SessionJournal",
+    "ToolTransaction",
 ]

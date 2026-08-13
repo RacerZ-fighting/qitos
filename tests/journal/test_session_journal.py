@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from qitos.core.journal import JournalCorruptionError, JournalRecordType
+from qitos.core.journal import (
+    JournalCorruptionError,
+    JournalRecordRef,
+    JournalRecordType,
+)
 from qitos.kit.journal import JsonlSessionJournal
 from qitos.kit.journal import jsonl as jsonl_module
 
@@ -159,3 +163,126 @@ async def test_fork_creates_an_independently_replayable_journal(tmp_path: Path) 
     assert json.loads(child.path.read_text(encoding="utf-8").splitlines()[0])[
         "run_id"
     ] == "child"
+
+
+@pytest.mark.asyncio
+async def test_committed_tool_transaction_lookup_rebuilds_and_isolated(
+    tmp_path: Path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    await journal.create("run-1", {})
+    terminal_id = "transaction-1:tool:0:terminal"
+    reference = JournalRecordRef("run-1", terminal_id)
+    await journal.append(
+        JournalRecordType.TOOL_TERMINAL,
+        {
+            "step_id": 3,
+            "transaction_id": "transaction-1",
+            "action_index": 0,
+            "action": {
+                "name": "inspect",
+                "args": {"target": "service"},
+                "action_id": "call-1",
+                "metadata": {},
+            },
+            "result": {
+                "status": "success",
+                "output": {"reachable": True},
+                "error": None,
+                "metadata": {"evidence_id": "evidence-1"},
+                "model_output": "service is reachable",
+            },
+        },
+        record_id=terminal_id,
+    )
+
+    assert journal.find_tool_transaction(reference) is None
+
+    committed = await journal.append(
+        JournalRecordType.STEP_COMMITTED,
+        {
+            "step_id": 3,
+            "transaction_id": "transaction-1",
+            "terminal_record_ids": [terminal_id],
+        },
+        record_id="transaction-1:committed",
+    )
+    transaction = journal.find_tool_transaction(reference)
+
+    assert transaction is not None
+    assert transaction.terminal == reference
+    assert transaction.committed_at == committed
+    assert transaction.step_id == 3
+    assert transaction.action_index == 0
+    assert transaction.action.name == "inspect"
+    assert transaction.result.model_visible_output == "service is reachable"
+
+    transaction.action.args["target"] = "mutated"
+    transaction.result.metadata["evidence_id"] = "mutated"
+    reread = journal.find_tool_transaction(reference)
+    assert reread is not None
+    assert reread.action.args == {"target": "service"}
+    assert reread.result.metadata == {"evidence_id": "evidence-1"}
+
+    reopened = JsonlSessionJournal(tmp_path)
+    await reopened.open("run-1")
+    restored = reopened.find_tool_transaction(reference)
+    assert restored is not None
+    assert restored.result.model_visible_output == "service is reachable"
+
+
+@pytest.mark.asyncio
+async def test_fork_resolves_inherited_committed_tool_origin(
+    tmp_path: Path,
+) -> None:
+    parent = JsonlSessionJournal(tmp_path)
+    await parent.create("parent", {})
+    terminal_id = "transaction-1:tool:0:terminal"
+    reference = JournalRecordRef("parent", terminal_id)
+    await parent.append(
+        JournalRecordType.TOOL_TERMINAL,
+        {
+            "step_id": 0,
+            "transaction_id": "transaction-1",
+            "action_index": 0,
+            "action": {
+                "name": "inspect",
+                "args": {},
+                "action_id": "call-1",
+                "metadata": {},
+            },
+            "result": {
+                "status": "success",
+                "output": "canonical",
+                "error": None,
+                "metadata": {},
+            },
+        },
+        record_id=terminal_id,
+    )
+    position = await parent.append(
+        JournalRecordType.STEP_COMMITTED,
+        {
+            "step_id": 0,
+            "transaction_id": "transaction-1",
+            "terminal_record_ids": [terminal_id],
+        },
+        record_id="transaction-1:committed",
+    )
+
+    child = await parent.fork(position, "child")
+    parent.path.unlink()
+
+    inherited = child.find_tool_transaction(reference)
+    assert inherited is not None
+    assert inherited.terminal.run_id == "parent"
+    assert inherited.result.model_visible_output == "canonical"
+    assert (
+        child.find_tool_transaction(JournalRecordRef("child", terminal_id)) is None
+    )
+
+    reopened = JsonlSessionJournal(tmp_path)
+    await reopened.open("child")
+    restored = reopened.find_tool_transaction(reference)
+    assert restored is not None
+    assert restored.result.model_visible_output == "canonical"

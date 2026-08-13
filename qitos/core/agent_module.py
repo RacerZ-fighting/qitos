@@ -12,6 +12,7 @@ from .action import Action
 from .decision import Decision
 from .env import EnvSpec
 from .history import History
+from .journal import JournalRecordRef
 from .memory import Memory
 from .model_response import ModelResponse
 from .spec import ExperimentSpec, RunSpec
@@ -32,6 +33,7 @@ class CanonicalActionResult:
     step_id: int
     action: Action
     result: ToolResult
+    terminal: JournalRecordRef | None = None
 
 
 @dataclass(frozen=True, slots=True)
