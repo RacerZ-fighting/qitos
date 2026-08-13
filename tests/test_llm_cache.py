@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -16,6 +17,7 @@ from qitos.cache import CachedModel, DiskCache, InMemoryCache
 from qitos.core import ModelUsage, ModelUsageSource
 from qitos.engine import RuntimeBudget
 from qitos.models import Model, ModelStreamChunk
+from qitos.trace import TraceWriter
 
 
 @dataclass
@@ -294,3 +296,69 @@ class TestEngineCacheIntegration:
         ).run("test task")
 
         assert result.state.final_result == "from_cache"
+
+    def test_cache_hit_recomputes_timing_and_trace_is_observational(
+        self, tmp_path: Path
+    ) -> None:
+        class ModelAgent(DemoAgent):
+            def __init__(self, model: Model) -> None:
+                super().__init__()
+                self.llm = model
+
+            def decide(
+                self, state: DemoState, observation: dict[str, Any]
+            ) -> Decision[Action] | None:
+                _ = state, observation
+                return None
+
+        backend = InMemoryCache()
+        first_model = _StubModel(answer="cached")
+        trace_writer = TraceWriter(str(tmp_path), "cache-miss")
+        first_engine = Engine(
+            agent=ModelAgent(first_model),
+            budget=RuntimeBudget(max_steps=2),
+            cache_backend=backend,
+            trace_writer=trace_writer,
+        )
+
+        first = first_engine.run("same request")
+
+        second_model = _StubModel(answer="provider-should-not-run")
+        second_engine = Engine(
+            agent=ModelAgent(second_model),
+            budget=RuntimeBudget(max_steps=2),
+            cache_backend=backend,
+        )
+        second = second_engine.run("same request")
+
+        assert first_model.call_count == 1
+        assert second_model.call_count == 0
+        assert first.state.final_result == second.state.final_result == "cached"
+        assert first.total_tokens == second.total_tokens
+
+        first_response = dict(first.records[0].model_response)
+        second_response = dict(second.records[0].model_response)
+        first_timing = first_response.pop("timing")
+        second_timing = second_response.pop("timing")
+        assert first_response == second_response
+        for timing in (first_timing, second_timing):
+            assert timing["time_to_first_event_ms"] >= 0
+            assert (
+                timing["time_to_first_event_ms"]
+                <= timing["time_to_first_content_ms"]
+                <= timing["total_ms"]
+            )
+
+        events = [
+            json.loads(line)
+            for line in (tmp_path / "cache-miss" / "events.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        traced_response = next(
+            event["payload"]["model_response"]
+            for event in events
+            if event.get("payload", {}).get("stage") == "model_output"
+        )
+        assert traced_response["timing"] == first_timing
