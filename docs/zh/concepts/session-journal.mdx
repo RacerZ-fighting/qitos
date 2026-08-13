@@ -19,7 +19,8 @@ Engine 按以下顺序写入：
 7. `step.committed`
 
 `tool.started` 是持久化执行许可；写入失败时不能执行 Handler。Finalizer 生成的 terminal result
-只持久化一次，History 和 Reducer 使用同一个值。
+只持久化一次，History 和 Reducer 使用同一个值。多调用 batch 中，每个 terminal 会先完成 Reducer，
+再生成下一个结果；显式声明并发安全的 Handler 仍可并发执行。
 
 恢复时，如果只有 `tool.started` 而没有 `tool.terminal`，Engine 会补写一个“副作用未知”的明确
 error 终态，绝不重放 Handler。没有获得 `tool.started` 的调用会补成“无副作用”的 cancelled 终态。

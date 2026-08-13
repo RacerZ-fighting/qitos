@@ -105,6 +105,54 @@ class JournalAgent(AgentModule[JournalState, dict[str, Any], Action]):
 
 
 @pytest.mark.asyncio
+async def test_each_terminal_is_reduced_before_the_next_finalizer(
+    tmp_path: Path,
+) -> None:
+    class OrderedAgent(JournalAgent):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finalizer_seen: list[tuple[str, ...]] = []
+
+        def decide(
+            self,
+            state: JournalState,
+            observation: dict[str, Any],
+        ) -> Decision[Action]:
+            _ = observation
+            if state.current_step == 0:
+                return Decision.act(
+                    [
+                        Action("inspect", action_id="first"),
+                        Action("inspect", action_id="second"),
+                    ]
+                )
+            return Decision.final("done")
+
+        def finalize_action_result(
+            self,
+            state: JournalState,
+            action: Action,
+            result: ToolResult,
+            *,
+            step_id: int,
+            context: ActionResultContext,
+        ) -> ToolResult:
+            _ = action, result, step_id, context
+            self.finalizer_seen.append(tuple(state.seen))
+            return ToolResult(output=f"canonical-{len(self.finalizer_seen)}")
+
+    agent = OrderedAgent()
+
+    result = await Engine(
+        agent=agent,
+        journal=JsonlSessionJournal(tmp_path),
+    ).arun("inspect")
+
+    assert agent.finalizer_seen == [(), ("canonical-1",)]
+    assert result.state.seen == ["canonical-1", "canonical-2"]
+
+
+@pytest.mark.asyncio
 async def test_engine_persists_one_finalized_terminal_result(tmp_path: Path) -> None:
     agent = JournalAgent()
     journal = JsonlSessionJournal(tmp_path)

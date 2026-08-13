@@ -58,7 +58,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Canonical per-Run journals**: opt an Engine into one durable append-only JSONL
   source for complete model/tool transactions, committed state deltas, crash recovery,
   terminal resume, and committed-boundary fork. Tools execute only after a durable
-  permit, and unknown in-flight side effects are closed explicitly without replay.
+  permit; ordered terminal results are reduced one by one, and unknown in-flight side
+  effects are closed explicitly without replay.
 - **Run-scoped MCP tools**: pass explicit MCP server instances through
   `AgentModule.mcp_servers` and Engine will connect, discover, expose
   `mcp__server__tool` names, execute calls on the transport's owning event loop, and

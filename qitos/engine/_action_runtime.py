@@ -229,9 +229,6 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             for blocked_item in blocked_only_results:
                 engine._memory_append("action_result", blocked_item, record.step_id)
             self._commit_tool_result_history(actions, blocked_only_results, record)
-            engine._reduce_action_results(
-                state, actions, blocked_only_results, record.step_id
-            )
             engine._dispatch_hook(
                 "on_after_act",
                 engine._hook_context(
@@ -399,9 +396,6 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 )
 
         self._commit_tool_result_history(actions, results, record)
-        engine._reduce_action_results(
-            state, actions, results[: len(actions)], record.step_id
-        )
         engine._emit(
             record.step_id,
             RuntimePhase.ACT,

@@ -45,6 +45,8 @@ How to update:
 - Journal recovery now closes interrupted tool calls with explicit terminal results:
   started calls retain unknown-side-effect status, unstarted calls are cancelled, and
   neither path replays a handler. Engines also reject Journal/checkpoint dual writes.
+- Multi-action Journal batches now reduce each durable terminal before finalizing the
+  next result, so later state-aware finalizers observe earlier tool outcomes.
 - MCP tools now execute on the transport's owning event loop and are removed from
   shared registries during Engine cleanup, preventing cross-loop failures and stale
   registrations when an Agent or registry is reused.

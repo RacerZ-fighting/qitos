@@ -148,6 +148,12 @@ class _JournalRuntime(Generic[StateT, ActionT]):
             engine._canonical_action_results.append(
                 CanonicalActionResult(record.step_id, action, result)
             )
+            self.reduce_action_results(
+                state,
+                [action],
+                [result],
+                record.step_id,
+            )
         if engine.journal is not None:
             engine._journal_terminal_record_ids[record.transaction_id] = terminal_ids
         return finalized

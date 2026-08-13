@@ -21,7 +21,8 @@ The Engine writes each tool transaction in this order:
 
 `tool.started` is a durable execution permit. If it cannot be written, the handler is
 not invoked. The finalized terminal result is persisted once and is the same value used
-by History and reducers.
+by History and reducers. In a multi-action batch, each terminal is reduced before the
+next result is finalized. Explicitly concurrency-safe handlers may still run concurrently.
 
 If recovery finds `tool.started` without `tool.terminal`, it writes an explicit error
 terminal with unknown side effects and never runs the handler again. A call that never
