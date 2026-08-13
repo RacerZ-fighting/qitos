@@ -6,11 +6,10 @@ Keep long-running QitOS agents below a predictable provider input boundary witho
 splitting tool exchanges, silently deleting canonical history, or relying on a
 provider overflow as the normal trigger.
 
-The design synthesizes the small multi-level controller used by CoreCoder with the
-transaction boundaries and bounded shrink retries used by Kimi Code, the
-clone/project-then-replace discipline used by Codex, and the staged compaction behavior
-verified in the local Claude Code reference. QitOS does not copy or depend on those
-projects.
+The design combines the transaction boundaries and bounded shrink retries used by
+Kimi Code, the clone/project-then-replace discipline used by Codex, and the staged
+compaction behavior verified in the local Claude Code reference. QitOS does not copy
+or depend on those projects.
 
 ## Success criteria
 
