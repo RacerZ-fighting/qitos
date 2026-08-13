@@ -32,7 +32,8 @@
 - Test: `tests/test_native_tool_calling_runtime.py`
 
 **Interfaces:**
-- Produces: `ModelResponse.native_items`, `HistoryMessage.native_items`, and `ModelStreamChunk.event_type/event_metadata/native_item`.
+- Produces: `ModelResponse.native_items`, `HistoryMessage.native_items`, and
+  `ModelStreamEvent.event_type/event_metadata/native_items`.
 - Consumes: existing Chat-shaped `tool_calls` and Engine history APIs.
 
 - [x] **Step 1: Write failing contract tests**

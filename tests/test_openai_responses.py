@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from qitos.core import ModelTransportError
+from qitos.core import ModelRequest, ModelStreamEventType, ModelTransportError
 from qitos.core.model_response import ModelResponse
 from qitos.models._openai_responses import (
     _ResponsesEventStream,
@@ -53,7 +53,38 @@ class _AsyncListStream(AsyncIterator[Any]):
 async def _collect(
     model: Any, messages: list[dict[str, Any]], **kwargs: Any
 ) -> list[Any]:
-    return [chunk async for chunk in model.stream(messages, **kwargs)]
+    deadline = kwargs.pop("deadline_monotonic", None)
+    request = ModelRequest(
+        run_id="openai-test",
+        transaction_id="openai-test:0",
+        provider=model.provider_name,
+        model=model.model,
+        protocol=model.capabilities.api.value,
+        messages=tuple(messages),
+        options=kwargs,
+        deadline_monotonic=deadline,
+    )
+    return [chunk async for chunk in model.stream(request)]
+
+
+def _request_for(
+    model: Any,
+    messages: list[dict[str, Any]],
+    *,
+    run_id: str = "continuation-run",
+    continuation: Any = None,
+    **options: Any,
+) -> ModelRequest:
+    return ModelRequest(
+        run_id=run_id,
+        transaction_id=f"{run_id}:request",
+        provider=model.provider_name,
+        model=model.model,
+        protocol=model.capabilities.api.value,
+        messages=tuple(messages),
+        options=options,
+        continuation=continuation,
+    )
 
 
 def test_model_response_summary_redacts_opaque_reasoning_state() -> None:
@@ -477,7 +508,13 @@ async def test_responses_failed_event_is_a_terminal_error() -> None:
         provider="openai",
     )
 
-    with pytest.raises(ModelTransportError, match=marker):
+    terminal = await stream.__anext__()
+
+    assert terminal.type is ModelStreamEventType.FAILED
+    assert marker in str(terminal.error)
+    assert terminal.is_final is True
+    assert terminal.done is False
+    with pytest.raises(StopAsyncIteration):
         await stream.__anext__()
 
 
@@ -651,6 +688,357 @@ async def test_responses_incomplete_is_a_terminal_transaction(
     assert chunks[-1].done is True
     assert chunks[-1].finish_reason == "max_output_tokens"
     assert chunks[-1].event_metadata["status"] == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_responses_continuation_sends_only_verified_canonical_delta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    streams = [
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "model": "gpt-test",
+                        "output": [
+                            {
+                                "type": "message",
+                                "id": "msg_1",
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "output_text", "text": "first"}
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ]
+        ),
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_2",
+                        "status": "completed",
+                        "model": "gpt-test",
+                        "output": [
+                            {
+                                "type": "message",
+                                "id": "msg_2",
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "output_text", "text": "second"}
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ]
+        ),
+    ]
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            return streams.pop(0)
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    prior_messages: list[dict[str, Any]] = []
+    for index in range(32):
+        prior_messages.extend(
+            [
+                {"role": "user", "content": f"question-{index}"},
+                {
+                    "role": "assistant",
+                    "content": f"answer-{index}",
+                    "native_items": [
+                        {
+                            "type": "message",
+                            "id": f"history-{index}",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": f"answer-{index}",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ]
+        )
+    prior_messages.append({"role": "user", "content": "question"})
+    first_request = _request_for(
+        model,
+        prior_messages,
+    )
+    first = [chunk async for chunk in model.stream(first_request)]
+    continuation = first[-1].continuation
+    assert continuation is not None
+
+    second_request = _request_for(
+        model,
+        [
+            *prior_messages,
+            {
+                "role": "assistant",
+                "content": "first",
+                "native_items": first[-1].native_items,
+            },
+            {"role": "user", "content": "follow up"},
+        ],
+        continuation=continuation,
+    )
+    second = [chunk async for chunk in model.stream(second_request)]
+
+    assert requests[0]["input"] == _to_responses_input(prior_messages)
+    assert requests[1]["previous_response_id"] == "resp_1"
+    assert requests[1]["input"] == [{"role": "user", "content": "follow up"}]
+    assert second[-1].event_metadata["continuation_applied"] is True
+    assert second[-1].continuation is not None
+    assert second[-1].continuation.response_id == "resp_2"
+
+
+@pytest.mark.parametrize(
+    ("current_messages", "current_options", "expected_reason"),
+    [
+        (
+            [{"role": "user", "content": "compacted summary"}],
+            {},
+            "canonical_prefix_changed",
+        ),
+        (
+            [{"role": "user", "content": "original evidence"}],
+            {"max_output_tokens": 4096},
+            "request_settings_changed",
+        ),
+    ],
+)
+def test_responses_continuation_rejects_context_or_settings_drift(
+    current_messages: list[dict[str, Any]],
+    current_options: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    from qitos.core.model_request import ModelContinuation, model_json_digest
+    from qitos.models._openai_responses import (
+        _apply_continuation,
+        _continuation_settings,
+        _request_payload,
+    )
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    original_messages = [{"role": "user", "content": "original evidence"}]
+    original_request = _request_for(model, original_messages)
+    original_payload = _request_payload(
+        model,
+        original_messages,
+        {},
+        provider="openai",
+    )
+    continuation = ModelContinuation(
+        run_id=original_request.run_id,
+        provider=original_request.provider,
+        model=original_request.model,
+        protocol=original_request.protocol,
+        response_id="resp-original",
+        prefix_items=len(original_payload["input"]),
+        prefix_digest=model_json_digest(original_payload["input"]),
+        settings_digest=model_json_digest(
+            _continuation_settings(original_payload)
+        ),
+    )
+    request = _request_for(
+        model,
+        current_messages,
+        continuation=continuation,
+        **current_options,
+    )
+    current_payload = _request_payload(
+        model,
+        request.message_dicts(),
+        request.option_dict(),
+        provider="openai",
+    )
+
+    outbound, applied, reason = _apply_continuation(request, current_payload)
+
+    assert applied is False
+    assert reason == expected_reason
+    assert outbound == current_payload
+    assert "previous_response_id" not in outbound
+
+
+@pytest.mark.asyncio
+async def test_responses_invalid_continuation_falls_back_to_full_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    terminal_stream = _AsyncListStream(
+        [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_2",
+                    "status": "completed",
+                    "model": "gpt-test",
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": "msg_2",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "second"}],
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+
+    class InvalidContinuationError(Exception):
+        status_code = 400
+        body = {"error": "previous_response_id is invalid or expired"}
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            if kwargs.get("previous_response_id"):
+                raise InvalidContinuationError(
+                    "previous_response_id is invalid or expired"
+                )
+            return terminal_stream
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    prior_input = [{"role": "user", "content": "question"}]
+    prior_output = {
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "first"}],
+    }
+    from qitos.core.model_request import ModelContinuation, model_json_digest
+    from qitos.models._openai_responses import _continuation_settings, _request_payload
+
+    base = _request_for(model, prior_input)
+    payload = _request_payload(model, prior_input, {}, provider="openai")
+    prefix = list(payload["input"]) + [prior_output]
+    continuation = ModelContinuation(
+        run_id=base.run_id,
+        provider=base.provider,
+        model=base.model,
+        protocol=base.protocol,
+        response_id="resp_1",
+        prefix_items=len(prefix),
+        prefix_digest=model_json_digest(prefix),
+        settings_digest=model_json_digest(_continuation_settings(payload)),
+    )
+    request = _request_for(
+        model,
+        [
+            *prior_input,
+            {"role": "assistant", "content": "first", "native_items": [prior_output]},
+            {"role": "user", "content": "follow up"},
+        ],
+        continuation=continuation,
+    )
+
+    chunks = [chunk async for chunk in model.stream(request)]
+
+    assert requests[0]["previous_response_id"] == "resp_1"
+    assert "previous_response_id" not in requests[1]
+    assert requests[1]["input"] == [
+        {"role": "user", "content": "question"},
+        prior_output,
+        {"role": "user", "content": "follow up"},
+    ]
+    assert chunks[-1].event_metadata["continuation_fallback"] is True
+
+
+@pytest.mark.asyncio
+async def test_responses_forked_request_discards_parent_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    stream = _AsyncListStream(
+        [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_child",
+                    "status": "completed",
+                    "model": "gpt-test",
+                    "output": [],
+                },
+            }
+        ]
+    )
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return stream
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    from qitos.core import ModelContinuation
+
+    continuation = ModelContinuation(
+        run_id="parent-run",
+        provider="openai",
+        model="gpt-test",
+        protocol="responses",
+        response_id="resp_parent",
+        prefix_items=1,
+        prefix_digest="unused",
+        settings_digest="unused",
+    )
+    request = _request_for(
+        model,
+        [{"role": "user", "content": "forked"}],
+        run_id="child-run",
+        continuation=continuation,
+    )
+
+    chunks = [chunk async for chunk in model.stream(request)]
+
+    assert "previous_response_id" not in captured
+    assert captured["input"] == [{"role": "user", "content": "forked"}]
+    assert chunks[-1].event_metadata["continuation_reason"] == (
+        "request_identity_changed"
+    )
 
 
 @pytest.mark.asyncio

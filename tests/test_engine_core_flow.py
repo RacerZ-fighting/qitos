@@ -24,7 +24,7 @@ from qitos.kit.parser import ReActTextParser
 from qitos.core.memory import Memory, MemoryRecord
 from qitos.engine import RuntimeBudget
 from qitos.engine.states import ContextConfig
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos.trace import runtime_step_to_trace
 
 
@@ -38,7 +38,7 @@ class _ChunkSequenceModel(Model):
 
     def __init__(
         self,
-        transactions: list[list[ModelStreamChunk]],
+        transactions: list[list[ModelStreamEvent]],
         *,
         model: str = "test-model",
         provider: str = "test",
@@ -58,14 +58,11 @@ class _ChunkSequenceModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        messages = request.message_dicts()
         self.calls.append([dict(message) for message in messages])
-        self.request_options.append(dict(kwargs))
+        self.request_options.append(request.option_dict())
         if not self.transactions:
             raise AssertionError("no scripted model transaction remains")
         for chunk in self.transactions.pop(0):
@@ -127,9 +124,16 @@ def test_engine_records_local_model_stream_timing(monkeypatch):
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(event_type="response.created"),
-                ModelStreamChunk(text="Final Answer: done", event_type="text.delta"),
-                ModelStreamChunk(done=True, finish_reason="stop"),
+                ModelStreamEvent(
+                    type=ModelStreamEventType.LIFECYCLE,
+                    event_type="response.created",
+                ),
+                ModelStreamEvent(
+                    type=ModelStreamEventType.TEXT_DELTA,
+                    text="Final Answer: done",
+                    event_type="text.delta",
+                ),
+                ModelStreamEvent(type=ModelStreamEventType.COMPLETED, finish_reason="stop"),
             ]
         ]
     )
@@ -557,9 +561,9 @@ def test_engine_interpret_model_response_bypasses_parser_and_records_summary():
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
+                ModelStreamEvent(
                     text="model said to use the add tool",
-                    done=True,
+                    type=ModelStreamEventType.COMPLETED,
                     usage={
                         "prompt_tokens": 12,
                         "completion_tokens": 5,
@@ -655,9 +659,9 @@ def test_engine_interpret_model_response_can_fall_back_to_parser():
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
+                ModelStreamEvent(
                     text="Final Answer: 42",
-                    done=True,
+                    type=ModelStreamEventType.COMPLETED,
                     usage={
                         "prompt_tokens": 9,
                         "completion_tokens": 3,
@@ -865,7 +869,7 @@ def test_memory_and_history_streams_are_strictly_separated():
 
 def test_engine_records_context_telemetry_and_defaults_to_compact_runtime_history():
     model = _ChunkSequenceModel(
-        [[ModelStreamChunk(text="Final Answer: ok", done=True)]],
+        [[ModelStreamEvent(text="Final Answer: ok", type=ModelStreamEventType.COMPLETED)]],
         model="dummy-context",
         max_tokens=128,
         context_window=4096,
@@ -900,9 +904,9 @@ def test_engine_prefers_provider_usage_for_context_totals():
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
+                ModelStreamEvent(
                     text="Final Answer: exact",
-                    done=True,
+                    type=ModelStreamEventType.COMPLETED,
                     usage={
                         "prompt_tokens": 123,
                         "completion_tokens": 17,
@@ -956,9 +960,9 @@ def test_engine_preserves_zero_provider_input_usage() -> None:
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
+                ModelStreamEvent(
                     text="Final Answer: exact",
-                    done=True,
+                    type=ModelStreamEventType.COMPLETED,
                     usage={
                         "prompt_tokens": 0,
                         "completion_tokens": 3,
@@ -1007,7 +1011,7 @@ def test_engine_keeps_estimated_usage_distinct_from_provider_usage() -> None:
         source=ModelUsageSource.ESTIMATE,
     )
     model = _ChunkSequenceModel(
-        [[ModelStreamChunk(text="Final Answer: estimate", done=True, usage=usage)]],
+        [[ModelStreamEvent(text="Final Answer: estimate", type=ModelStreamEventType.COMPLETED, usage=usage)]],
         model="dummy-estimated-usage",
         max_tokens=128,
         context_window=8192,
@@ -1048,8 +1052,8 @@ def test_engine_accumulates_each_provider_transaction_once() -> None:
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
-                    done=True,
+                ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
                     tool_calls=[
                         {
                             "id": "call_usage",
@@ -1069,9 +1073,9 @@ def test_engine_accumulates_each_provider_transaction_once() -> None:
                 )
             ],
             [
-                ModelStreamChunk(
+                ModelStreamEvent(
                     text="Final Answer: 42",
-                    done=True,
+                    type=ModelStreamEventType.COMPLETED,
                     usage=ModelUsage(
                         input_tokens=second_input,
                         output_tokens=second_output,
@@ -1112,7 +1116,8 @@ def test_engine_uses_model_stream_native_tool_calls_before_parser():
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
+                ModelStreamEvent(
+                    type=ModelStreamEventType.TOOL_CALL_DELTA,
                     text="",
                     event_type="tool_call.delta",
                     event_metadata={
@@ -1121,8 +1126,8 @@ def test_engine_uses_model_stream_native_tool_calls_before_parser():
                         "arguments_delta": '{"a": 20',
                     },
                 ),
-                ModelStreamChunk(
-                    done=True,
+                ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
                     tool_calls=[
                         {
                             "id": "call_1",
@@ -1184,7 +1189,7 @@ def test_engine_uses_model_stream_native_tool_calls_before_parser():
         def on_delta(self, text: str) -> None:
             self.events.append(text)
 
-        def on_chunk(self, chunk: ModelStreamChunk) -> None:
+        def on_chunk(self, chunk: ModelStreamEvent) -> None:
             self.events.append((chunk.event_type, dict(chunk.event_metadata)))
 
         def on_end(self) -> None:
@@ -1230,9 +1235,12 @@ def test_engine_preserves_streamed_reasoning_for_trace_and_tool_follow_up():
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(reasoning_content=reasoning),
-                ModelStreamChunk(
-                    done=True,
+                ModelStreamEvent(
+                    type=ModelStreamEventType.REASONING_DELTA,
+                    reasoning_content=reasoning,
+                ),
+                ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
                     tool_calls=[
                         {
                             "id": "call_1",
@@ -1246,7 +1254,7 @@ def test_engine_preserves_streamed_reasoning_for_trace_and_tool_follow_up():
                     finish_reason="tool_calls",
                 ),
             ],
-            [ModelStreamChunk(text="Final Answer: done", done=True)],
+            [ModelStreamEvent(text="Final Answer: done", type=ModelStreamEventType.COMPLETED)],
         ],
         model="kimi-k3",
         provider="openai-compatible",
@@ -1294,8 +1302,8 @@ def test_engine_sanitizes_submit_poc_native_tool_history_without_mutating_result
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
-                    done=True,
+                ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
                     tool_calls=[
                         {
                             "id": "call_submit",
@@ -1310,9 +1318,9 @@ def test_engine_sanitizes_submit_poc_native_tool_history_without_mutating_result
                 )
             ],
             [
-                ModelStreamChunk(
+                ModelStreamEvent(
                     text="Final Answer: done",
-                    done=True,
+                    type=ModelStreamEventType.COMPLETED,
                     finish_reason="stop",
                 )
             ],
@@ -1397,8 +1405,8 @@ def test_engine_agent_can_block_disallowed_actions_before_execution():
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
-                    done=True,
+                ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
                     tool_calls=[
                         {
                             "id": "call_blocked",
@@ -1465,14 +1473,14 @@ def test_engine_salvages_glm_text_tool_call_markup_before_parser():
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
+                ModelStreamEvent(
                     text=(
                         "<tool_call>add"
                         "<arg_key>a</arg_key><arg_value>20</arg_value>"
                         "<arg_key>b</arg_key><arg_value>22</arg_value>"
                         "</tool_call>"
                     ),
-                    done=True,
+                    type=ModelStreamEventType.COMPLETED,
                     finish_reason="tool_calls",
                 )
             ]
@@ -1521,9 +1529,9 @@ def test_engine_native_tool_call_lane_returns_paired_error_on_bad_arguments():
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
+                ModelStreamEvent(
                     text="Final Answer: must not bypass the invalid call",
-                    done=True,
+                    type=ModelStreamEventType.COMPLETED,
                     tool_calls=[
                         {
                             "id": "call_1",
@@ -1537,7 +1545,7 @@ def test_engine_native_tool_call_lane_returns_paired_error_on_bad_arguments():
                     finish_reason="tool_calls",
                 )
             ],
-            [ModelStreamChunk(text="Final Answer: recovered", done=True)],
+            [ModelStreamEvent(text="Final Answer: recovered", type=ModelStreamEventType.COMPLETED)],
         ],
         model="qwen-plus",
     )
@@ -1586,8 +1594,8 @@ def test_engine_native_tool_call_lane_repairs_control_chars_in_arguments():
     model = _ChunkSequenceModel(
         [
             [
-                ModelStreamChunk(
-                    done=True,
+                ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
                     tool_calls=[
                         {
                             "id": "call_1",

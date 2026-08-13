@@ -19,6 +19,12 @@ How to update:
 
 ### Breaking
 
+- `ModelStreamChunk` has been replaced by the discriminated `ModelStreamEvent`.
+  Provider implementations must emit exactly one explicit event kind and terminate
+  with `COMPLETED` or `FAILED`; only `COMPLETED` is a successful transaction.
+- `Model.stream()` now accepts one immutable `ModelRequest` instead of mutable
+  `messages + **kwargs`. Provider implementations read isolated message and option
+  projections from that request; the Engine is the only owner that assembles it.
 - Class-based tools now implement `async execute(args, runtime_context)`. Managed Web
   capabilities and their concrete adapters are async as well. Synchronous decorated
   functions remain supported through one explicit compatibility boundary, but code
@@ -30,6 +36,8 @@ How to update:
   in-memory replay, reopened replay, stable record IDs, JSONL, and projection digests
   consistent. Unsupported schema versions now have a dedicated upgrade error, and a
   failed source close during fork no longer leaks the unreturned child's writer lease.
+- Inferred model protocols are now resolved from each immutable turn snapshot instead
+  of being cached for the whole Run, so a model change takes effect on the next turn.
 - Native tool calls now require a complete protocol terminal before execution. Chat
   drops calls on output-limit/non-tool finishes; Anthropic keeps interleaved block
   arguments isolated and records, but does not replay or execute, unclosed, malformed,
@@ -72,6 +80,12 @@ How to update:
 
 ### Added
 
+- Added durable model request snapshots and guarded OpenAI Responses continuation.
+  `model.completed` records the exact credential-redacted Provider input plus an
+  optional Run-bound handle. Resume reuses a handle only when provider, model,
+  protocol, request settings, and canonical input prefix still match; fork, Provider
+  changes, compaction drift, and rejected/expired handles fall back to the complete
+  local transcript without replaying a tool.
 - Added one immutable `TurnSnapshot` for every model transaction. It freezes the model
   reference, protocol, transaction-complete History view, Tool definitions, runtime
   capabilities, absolute deadline, explicit pricing, and remaining step/token/cost,
@@ -98,8 +112,9 @@ How to update:
 - Added immutable `ModelCapabilities` snapshots for configured adapters. OpenAI
   Responses, Anthropic Messages, and compatible Chat Completions now report only
   tested transport facts such as native tools, reasoning replay, usage/cache
-  reporting, and multimodal input; continuation and hosted tools remain disabled
-  until their runtime contracts are complete. Completed model transactions now
+  reporting, and multimodal input. Responses additionally reports its guarded
+  continuation contract; hosted tools remain disabled until their runtime contracts
+  are complete. Completed model transactions now
   normalize token counts into typed `ModelUsage` while retaining the lossless
   provider usage mapping for cache, trace, and compatibility consumers.
 - Added a durable per-Run JSONL journal for canonical model/tool transactions,

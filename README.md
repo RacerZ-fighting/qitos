@@ -18,13 +18,23 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Discriminated model stream events**: every Provider event now declares whether it
+  is text, reasoning, a ToolCall delta, a native output item, usage, lifecycle,
+  successful completion, or failure. The ambiguous `ModelStreamChunk` field bag is
+  gone; Engine treats `FAILED` as an error terminal and commits only `COMPLETED`.
+- **Recoverable model requests and guarded continuation**: the Engine now sends one
+  immutable `ModelRequest` and journals its exact credential-redacted snapshot.
+  Responses reuses `previous_response_id` only when the Run, Provider, model,
+  protocol, request settings, and canonical input prefix all match. Resume may keep
+  that optimization; fork, Provider changes, compaction drift, or an expired handle
+  automatically use the complete local transcript.
 - **One async turn transaction**: every model turn now captures an immutable model,
   protocol, complete History, Tool exposure, capability, deadline, pricing, and budget
   view. Full runs and interactive steps share this one transaction; parser and optional
   critic/handoff policies compose around it instead of adding another loop. Engine,
   Tool, Mailbox, MCP, and Child calls stay on the caller's event loop; cancellation
   drains started handlers and journals one ordered terminal result per call before it
-  propagates.
+  propagates. Model changes re-resolve inferred protocol only for the next turn.
 - **Product-owned completion and bounded Runs**: `AgentModule.assess_completion()` can
   accept a final answer, request another evidence-gathering turn, or classify a concrete
   blocker. Runtime and Task budgets now cover steps, time, tokens, cost, Tool
@@ -66,7 +76,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Truthful model capability snapshots**: configured adapters expose immutable
   `ModelCapabilities`. Responses, Anthropic Messages, and compatible Chat report
   tested native-tool, reasoning/replay, usage/cache, and multimodal behavior without
-  claiming unfinished continuation or hosted-tool support. Their terminal token
+  claiming unfinished hosted-tool support. Responses also declares its guarded
+  continuation behavior. Their terminal token
   counts are normalized into typed `ModelUsage` without discarding provider details.
 - **Family and wire can be selected independently**: one Kimi family configuration can
   use compatible Chat Completions or Anthropic Messages without leaking wire-specific
@@ -133,10 +144,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   tools, environment, context policy, budget, source revision, and experiment
   provenance first. Mismatched or incomplete pairs are explicitly descriptive rather
   than causal; matching pairs remain subject to provider and environment nondeterminism.
-- **Truthful typed model streams**: Chat, Responses, and Anthropic streams now retain
+- **Truthful typed model streams**: Chat, Responses, and Anthropic streams retain
   provider finish reasons, reasoning and tool-call deltas, completed tool calls, and
-  usage through one `ModelStreamChunk` contract. Incomplete streams fail instead of
-  fabricating completion, and Engine handlers no longer receive `on_end` after an error.
+  usage. Incomplete streams fail instead of fabricating completion, and Engine handlers
+  no longer receive `on_end` after an error.
 - **Call-accurate qita tool statistics**: tool counts and failures now come from the
   canonical action/result pairing instead of applying one step-level error to every
   call. Exact lifecycle counts and unmatched trace evidence remain visible for audits.

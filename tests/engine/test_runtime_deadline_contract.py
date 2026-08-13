@@ -24,7 +24,9 @@ from qitos.core.tool import (
 from qitos.engine.action_executor import ActionExecutor
 from qitos.engine.cancellation import CancelToken
 from qitos.engine.states import RuntimeBudget
-from qitos.models.base import Model, ModelStreamChunk
+from qitos.models import ModelRequest
+from qitos.models import ModelStreamEventType
+from qitos.models.base import Model, ModelStreamEvent
 
 
 class _RuntimeEngine:
@@ -428,19 +430,19 @@ class _BlockingModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        _ = request
         self.entered.set()
         try:
             await asyncio.Event().wait()
         finally:
             self.closed.set()
         if False:  # pragma: no cover - preserve async-generator typing
-            yield ModelStreamChunk()
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.LIFECYCLE,
+                event_type="unreachable",
+            )
 
 
 @dataclass
@@ -474,12 +476,18 @@ async def test_model_request_deadline_cancels_provider_and_closes_stream() -> No
 
     with pytest.raises(ModelRequestDeadlineExceeded):
         await asyncio.wait_for(
-                engine._model_runtime._call_llm(
-                    model,
-                    [],
-                    {},
+            engine._model_runtime._call_llm(
+                model,
+                ModelRequest(
+                    run_id="deadline-run",
+                    transaction_id="deadline-run:0",
+                    provider=model.provider_name,
+                    model=model.model,
+                    protocol=model.capabilities.api.value,
+                    messages=(),
                     deadline_monotonic=engine.runtime_deadline_monotonic,
                 ),
+            ),
             timeout=1.0,
         )
 
@@ -509,14 +517,14 @@ class _BlockingStreamModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        _ = request
         try:
-            yield ModelStreamChunk(text="before deadline")
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.TEXT_DELTA,
+                text="before deadline",
+            )
             self.entered.set()
             await asyncio.Event().wait()
         finally:
@@ -567,13 +575,13 @@ def test_model_stream_reports_error_without_normal_end() -> None:
 
         async def stream(
             self,
-            messages: list[dict[str, Any]],
-            *,
-            deadline_monotonic: float | None = None,
-            **kwargs: Any,
-        ) -> AsyncIterator[ModelStreamChunk]:
-            _ = messages, deadline_monotonic, kwargs
-            yield ModelStreamChunk(text="partial")
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            _ = request
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.TEXT_DELTA,
+                text="partial",
+            )
             raise ModelTransportError(
                 "stream broke",
                 attempts=1,
@@ -581,7 +589,7 @@ def test_model_stream_reports_error_without_normal_end() -> None:
             )
 
     class _DetailedStreamHandler(_RecordingStreamHandler):
-        def on_chunk(self, chunk: ModelStreamChunk) -> None:
+        def on_chunk(self, chunk: ModelStreamEvent) -> None:
             self.events.append(("chunk", chunk.event_type))
 
         def on_error(self, exc: Exception) -> None:
@@ -601,5 +609,45 @@ def test_model_stream_reports_error_without_normal_end() -> None:
         ("start", None),
         ("chunk", None),
         ("delta", "partial"),
+        ("error", "ModelTransportError"),
+    ]
+
+
+def test_model_failed_terminal_reports_error_without_normal_end() -> None:
+    class _FailedStreamModel(Model):
+        def __init__(self) -> None:
+            super().__init__(model="failed-stream-model", temperature=None)
+
+        async def stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            _ = request
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.FAILED,
+                event_type="provider.failed",
+                error="provider rejected the transaction",
+            )
+
+    class _DetailedStreamHandler(_RecordingStreamHandler):
+        def on_chunk(self, chunk: ModelStreamEvent) -> None:
+            self.events.append(("chunk", chunk.event_type))
+
+        def on_error(self, exc: Exception) -> None:
+            self.events.append(("error", type(exc).__name__))
+
+    handler = _DetailedStreamHandler()
+    engine = Engine(
+        _ModelDeadlineAgent(_FailedStreamModel()),
+        budget=RuntimeBudget(max_steps=1),
+    )
+    engine.stream_callback = handler
+
+    result = engine.run("stream")
+
+    assert result.state.stop_reason == "unrecoverable_error"
+    assert handler.events == [
+        ("start", None),
+        ("chunk", "provider.failed"),
         ("error", "ModelTransportError"),
     ]

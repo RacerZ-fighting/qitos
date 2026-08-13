@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from qitos.core import ModelResponse, ModelTiming, ModelUsage, ModelUsageSource
-from qitos.models import ModelStreamChunk
+from qitos.models import ModelStreamEvent, ModelStreamEventType
 
 
 def test_usage_mapping_normalizes_typed_fields_without_losing_provider_details() -> (
@@ -67,7 +67,7 @@ def test_usage_rejects_invalid_token_counts(value: object) -> None:
 
 def test_model_transactions_normalize_compatible_usage_mappings() -> None:
     response = ModelResponse(text="done", usage={"prompt_tokens": 2})
-    chunk = ModelStreamChunk(done=True, usage={"completion_tokens": 1})
+    chunk = ModelStreamEvent(type=ModelStreamEventType.COMPLETED, usage={"completion_tokens": 1})
 
     assert isinstance(response.usage, ModelUsage)
     assert response.usage.input_tokens == 2
@@ -81,7 +81,7 @@ def test_model_transaction_preserves_estimated_usage_source() -> None:
     usage = ModelUsage(input_tokens=2, source=ModelUsageSource.ESTIMATE)
 
     response = ModelResponse(text="done", usage=usage)
-    chunk = ModelStreamChunk(done=True, usage=usage)
+    chunk = ModelStreamEvent(type=ModelStreamEventType.COMPLETED, usage=usage)
 
     assert response.usage is usage
     assert chunk.usage is usage

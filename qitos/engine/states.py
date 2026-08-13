@@ -8,6 +8,8 @@ from enum import Enum
 import math
 from typing import Any, Dict, List, Optional
 
+from ..core.model_request import ModelRequest
+
 
 class RuntimePhase(str, Enum):
     INIT = "INIT"
@@ -167,6 +169,7 @@ class StepRecord:
     phase_events: List[RuntimeEvent] = field(default_factory=list)
     observation: Any = None
     decision: Any = None
+    model_request: ModelRequest | None = None
     model_response: Dict[str, Any] = field(default_factory=dict)
     actions: List[Any] = field(default_factory=list)
     action_results: List[Any] = field(default_factory=list)

@@ -121,7 +121,8 @@ repair and search backtracking.
 
 ## Protocol resolution
 
-`Engine` resolves the model protocol once per run using the following precedence:
+`Engine` resolves the model protocol while capturing each immutable turn, using the
+following precedence:
 
 1. The `protocol` passed directly to `Engine`.
 2. `agent.model_protocol`.
@@ -131,6 +132,9 @@ repair and search backtracking.
 6. The framework default, `react_text_v1`.
 
 The model-level declarations in step 4 are attached by `build_model_for_preset(...)`. This means direct construction such as `Engine(agent=agent)` preserves an explicitly selected family preset even when the provider model name is an alias that QitOS cannot infer. Unknown model-level protocol identifiers are ignored so the existing model-name and framework fallbacks remain available. Traces record `model_qitos_protocol` or `model_harness_metadata` as the resolution source when either declaration is selected.
+
+The selected protocol stays fixed for that turn. Configuration or model changes made
+while it runs are resolved only when the next turn snapshot is captured.
 
 ## Empty model responses
 
@@ -317,9 +321,30 @@ q2 = stream.subscribe()  # asyncio.Queue for consumer 2
 
 ### Model streams
 
-All model providers implement the canonical async `Model.stream()` contract. The Engine
-consumes provider-neutral stream chunks and preserves cancellation and request deadlines
-throughout the transaction.
+All model providers implement the canonical async `Model.stream(request)` contract.
+The Engine assembles one immutable `ModelRequest` after History projection and passes
+that exact value to the Provider. Its message and option projections are isolated from
+mutation, while its absolute deadline is shared by connection, stream, retry, and
+cleanup work. A Journal-backed run stores the credential-redacted request snapshot in
+`model.completed` before any tool can start.
+
+OpenAI Responses may return a Run-bound continuation handle. The next request sends
+`previous_response_id` and only the incremental input when the Provider, model,
+protocol, non-input settings, and full canonical prefix all still match. A resumed Run
+can reuse that handle. A fork has a different Run id, and Provider/model changes,
+compaction changes, or an invalid/expired handle send the complete local transcript.
+History remains the recovery source; continuation is never required to resume.
+
+Anthropic Messages persists its message id, thinking signature, native content blocks,
+and usage in the canonical response/history representation. It does not advertise a
+server-side continuation handle because Messages replay is transcript-based.
+
+Each Provider yields discriminated `ModelStreamEvent` values. Text, reasoning,
+ToolCall deltas, native output items, usage, and lifecycle notifications have distinct
+event kinds, so a consumer never infers semantics from a combination of optional
+fields. Every transaction ends with exactly one `COMPLETED` or `FAILED` event. Only a
+`COMPLETED` event can contribute finish state, final ToolCalls, or a continuation;
+`FAILED` is an error terminal and is never committed as a model response.
 
 Class tools implement `async execute(...)`. A legacy synchronous decorated function is
 run in the isolated compatibility boundary and cancellation waits for that call to reach

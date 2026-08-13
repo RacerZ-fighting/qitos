@@ -18,6 +18,7 @@ from ..core.journal import (
     JournalRecordRef,
     JournalRecordType,
 )
+from ..core.model_request import ModelContinuation, ModelRequest
 from ..core.state import StateSchema
 from ..core.state_delta import apply_state_delta, build_state_delta, state_digest
 from ..core.task import Task
@@ -82,6 +83,11 @@ class _JournalRuntime(Generic[StateT, ActionT]):
             {
                 "step_id": record.step_id,
                 "transaction_id": record.transaction_id,
+                "model_request": (
+                    record.model_request.to_dict()
+                    if record.model_request is not None
+                    else None
+                ),
                 "model_response": dict(record.model_response),
                 "prompt_metadata": dict(record.prompt_metadata),
                 "decision": decision_to_dict(decision),
@@ -314,6 +320,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
         usage_completion_tokens = 0
         usage_total_tokens = 0
         usage_cost_usd = 0.0
+        latest_continuation: ModelContinuation | None = None
         for journal_record in effective:
             payload = journal_record.payload
             if journal_record.type is JournalRecordType.INPUT_ACCEPTED:
@@ -348,6 +355,12 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 raw_response = payload.get("model_response")
                 record.model_response = (
                     dict(raw_response) if isinstance(raw_response, Mapping) else {}
+                )
+                raw_request = payload.get("model_request")
+                record.model_request = (
+                    ModelRequest.from_dict(raw_request)
+                    if isinstance(raw_request, Mapping)
+                    else None
                 )
                 raw_usage = record.model_response.get("usage")
                 if isinstance(raw_usage, Mapping):
@@ -479,6 +492,22 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 if transaction is None:
                     raise JournalError("step.committed has no model transaction")
                 transaction["committed"] = True
+                model_record = step_records.get(transaction_id)
+                raw_continuation = (
+                    model_record.model_response.get("continuation")
+                    if model_record is not None
+                    else None
+                )
+                try:
+                    latest_continuation = (
+                        ModelContinuation.from_dict(raw_continuation)
+                        if isinstance(raw_continuation, Mapping)
+                        else None
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise JournalError(
+                        "step.committed has an invalid model continuation"
+                    ) from exc
                 history.extend(history_append_from_payload(payload))
                 continue
             if journal_record.type is JournalRecordType.RUN_INTERRUPTED:
@@ -544,6 +573,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 "recovered_steps": [],
                 "canonical_results": canonical_results,
                 "terminal_snapshot_current": False,
+                "continuation": latest_continuation,
                 "usage": {
                     "prompt_tokens": usage_prompt_tokens,
                     "completion_tokens": usage_completion_tokens,
@@ -652,6 +682,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 bool(terminal_snapshot_digest)
                 and terminal_snapshot_digest == state_digest(state_data)
             ),
+            "continuation": latest_continuation,
             "usage": {
                 "prompt_tokens": usage_prompt_tokens,
                 "completion_tokens": usage_completion_tokens,

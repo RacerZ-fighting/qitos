@@ -11,12 +11,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, cast
 
-from ..core.errors import ModelTransportError
+from ..core.errors import ModelContinuationRejected, ModelTransportError
 from ..core.model_capabilities import (
     ModelAPI,
     ModelCapabilities,
     ReasoningCapability,
 )
+from ..core.model_request import ModelRequest
+from ..core.model_stream import ModelStreamEventType
 from ..core.multimodal import (
     content_to_text,
     ensure_data_url,
@@ -39,7 +41,7 @@ from .transport import (
 )
 from .base import (
     Model,
-    ModelStreamChunk,
+    ModelStreamEvent,
 )
 
 GLM_TOKENIZER_ENV_VARS = ("QITOS_GLM_TOKENIZER_PATH", "GLM_TOKENIZER_PATH")
@@ -81,8 +83,8 @@ class ChatStreamAccumulator:
         self._usage: Optional[Dict[str, Any]] = None
         self._finish_reason: Optional[str] = None
 
-    def consume(self, chunk: Any) -> List[ModelStreamChunk]:
-        events: List[ModelStreamChunk] = []
+    def consume(self, chunk: Any) -> List[ModelStreamEvent]:
+        events: List[ModelStreamEvent] = []
         choices = list(_field(chunk, "choices", []) or [])
         if not choices:
             usage = _usage_payload(_field(chunk, "usage"))
@@ -94,12 +96,20 @@ class ChatStreamAccumulator:
         delta = _field(choice, "delta", {})
         text = str(_field(delta, "content", "") or "")
         reasoning = _field(delta, "reasoning_content")
-        if text or reasoning:
+        if text:
             events.append(
-                ModelStreamChunk(
+                ModelStreamEvent(
+                    type=ModelStreamEventType.TEXT_DELTA,
                     text=text,
-                    reasoning_content=str(reasoning) if reasoning else None,
-                    event_type=("text.delta" if text else "reasoning.delta"),
+                    event_type="text.delta",
+                )
+            )
+        if reasoning:
+            events.append(
+                ModelStreamEvent(
+                    type=ModelStreamEventType.REASONING_DELTA,
+                    reasoning_content=str(reasoning),
+                    event_type="reasoning.delta",
                 )
             )
         events.extend(self._accumulate_tool_calls(_field(delta, "tool_calls")))
@@ -112,7 +122,7 @@ class ChatStreamAccumulator:
             self._usage = usage
         return events
 
-    def complete(self) -> ModelStreamChunk:
+    def complete(self) -> ModelStreamEvent:
         if self._finish_reason is None:
             raise ModelTransportError(
                 "model stream ended before a terminal finish reason",
@@ -145,8 +155,8 @@ class ChatStreamAccumulator:
                 for index, item in enumerate(complete_tool_calls)
             )
             complete_tool_calls = []
-        return ModelStreamChunk(
-            done=True,
+        return ModelStreamEvent(
+            type=ModelStreamEventType.COMPLETED,
             usage=self._usage,
             tool_calls=complete_tool_calls or None,
             event_type="chat.completion.completed",
@@ -159,8 +169,8 @@ class ChatStreamAccumulator:
             finish_reason=self._finish_reason,
         )
 
-    def _accumulate_tool_calls(self, deltas: Any) -> List[ModelStreamChunk]:
-        events: List[ModelStreamChunk] = []
+    def _accumulate_tool_calls(self, deltas: Any) -> List[ModelStreamEvent]:
+        events: List[ModelStreamEvent] = []
         for item in list(deltas or []):
             raw_index = _field(item, "index", len(self._tool_calls))
             index = raw_index if isinstance(raw_index, int) else len(self._tool_calls)
@@ -200,7 +210,8 @@ class ChatStreamAccumulator:
             }
             if len(metadata) > 1:
                 events.append(
-                    ModelStreamChunk(
+                    ModelStreamEvent(
+                        type=ModelStreamEventType.TOOL_CALL_DELTA,
                         event_type="tool_call.delta",
                         event_metadata=metadata,
                     )
@@ -208,7 +219,7 @@ class ChatStreamAccumulator:
         return events
 
 
-class ChatEventStream(AsyncIterator[ModelStreamChunk]):
+class ChatEventStream(AsyncIterator[ModelStreamEvent]):
     """Own one connected Chat Completions stream and its client."""
 
     def __init__(
@@ -217,7 +228,7 @@ class ChatEventStream(AsyncIterator[ModelStreamChunk]):
         self._response = response
         self._client = client
         self._iterator = response.__aiter__()
-        self._pending: Deque[ModelStreamChunk] = deque()
+        self._pending: Deque[ModelStreamEvent] = deque()
         self._accumulator = ChatStreamAccumulator(provider=provider, model=model)
         self._finished = False
         self._closed = False
@@ -225,7 +236,7 @@ class ChatEventStream(AsyncIterator[ModelStreamChunk]):
     def __aiter__(self) -> ChatEventStream:
         return self
 
-    async def __anext__(self) -> ModelStreamChunk:
+    async def __anext__(self) -> ModelStreamEvent:
         if self._pending:
             return self._pending.popleft()
         if self._finished:
@@ -249,10 +260,10 @@ class ChatEventStream(AsyncIterator[ModelStreamChunk]):
         await close_async_resource(self._client)
 
 
-class _OwnedEventStream(AsyncIterator[ModelStreamChunk]):
+class _OwnedEventStream(AsyncIterator[ModelStreamEvent]):
     """Attach an SDK client lifecycle to a protocol event stream."""
 
-    def __init__(self, stream: AsyncIterator[ModelStreamChunk], client: Any) -> None:
+    def __init__(self, stream: AsyncIterator[ModelStreamEvent], client: Any) -> None:
         self._stream = stream
         self._client = client
         self._closed = False
@@ -260,7 +271,7 @@ class _OwnedEventStream(AsyncIterator[ModelStreamChunk]):
     def __aiter__(self) -> _OwnedEventStream:
         return self
 
-    async def __anext__(self) -> ModelStreamChunk:
+    async def __anext__(self) -> ModelStreamEvent:
         return await self._stream.__anext__()
 
     async def aclose(self) -> None:
@@ -576,6 +587,7 @@ class OpenAICompatibleModel(Model):
                     ReasoningCapability.OPAQUE_REPLAY,
                 ),
                 opaque_replay=True,
+                continuation=True,
                 usage=True,
                 prompt_cache_usage=True,
                 multimodal_input=True,
@@ -645,7 +657,7 @@ class OpenAICompatibleModel(Model):
     async def _open_chat_stream(
         self,
         request_kwargs: Dict[str, Any],
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         client = self._new_client(timeout=float(request_kwargs["timeout"]))
         try:
             try:
@@ -671,14 +683,13 @@ class OpenAICompatibleModel(Model):
 
     async def _open_stream(
         self,
-        messages: List[Dict[str, Any]],
+        request: ModelRequest,
         request_kwargs: Dict[str, Any],
-        *,
-        deadline_monotonic: float | None,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
+        deadline_monotonic = request.deadline_monotonic
         if self.api_mode == "chat_completions":
             chat_request = self._chat_stream_request(
-                messages,
+                request.message_dicts(),
                 request_kwargs,
                 deadline_monotonic=deadline_monotonic,
             )
@@ -693,7 +704,7 @@ class OpenAICompatibleModel(Model):
             stream = await _open_responses_stream(
                 self,
                 client,
-                messages,
+                request,
                 provider=self.provider_name,
                 request_kwargs=self._attempt_request_kwargs(
                     request_kwargs,
@@ -707,31 +718,56 @@ class OpenAICompatibleModel(Model):
 
     async def stream(
         self,
-        messages: List[Dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
         """Stream one committed Responses or Chat transaction."""
 
-        request_kwargs = self._request_kwargs(dict(kwargs))
+        self.validate_request(request)
+        effective_request = request
+        continuation_fallback = False
+        while True:
+            request_kwargs = self._request_kwargs(effective_request.option_dict())
 
-        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
-            return await self._open_stream(
-                messages,
-                dict(request_kwargs),
-                deadline_monotonic=deadline_monotonic,
-            )
+            async def create_stream() -> AsyncIterator[ModelStreamEvent]:
+                return await self._open_stream(
+                    effective_request,
+                    dict(request_kwargs),
+                )
 
-        async for chunk in transactional_stream_with_retry(
-            create_stream,
-            policy=self.retry_policy,
-            connection_timeout_seconds=self.timeout,
-            event_idle_timeout_seconds=self.stream_idle_timeout,
-            deadline_monotonic=deadline_monotonic,
-            is_terminal=lambda item: item.done,
-        ):
-            yield chunk
+            published_content = False
+            try:
+                async for chunk in transactional_stream_with_retry(
+                    create_stream,
+                    policy=self.retry_policy,
+                    connection_timeout_seconds=self.timeout,
+                    event_idle_timeout_seconds=self.stream_idle_timeout,
+                    deadline_monotonic=effective_request.deadline_monotonic,
+                    is_terminal=lambda item: item.is_final,
+                ):
+                    if (
+                        chunk.text
+                        or chunk.reasoning_content
+                        or chunk.tool_calls
+                        or chunk.native_items
+                        or "function_call" in str(chunk.event_type or "")
+                    ):
+                        published_content = True
+                    if (
+                        chunk.type is ModelStreamEventType.COMPLETED
+                        and continuation_fallback
+                    ):
+                        chunk.event_metadata["continuation_fallback"] = True
+                    yield chunk
+                return
+            except ModelContinuationRejected:
+                if (
+                    published_content
+                    or effective_request.continuation is None
+                    or continuation_fallback
+                ):
+                    raise
+                effective_request = effective_request.without_continuation()
+                continuation_fallback = True
 
     def supports_tool_schema_delivery(
         self, delivery: str, protocol: Any = None

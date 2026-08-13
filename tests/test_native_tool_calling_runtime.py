@@ -15,7 +15,7 @@ from qitos import (
 )
 from qitos.engine import RuntimeBudget
 from qitos.kit import ReActTextParser
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos.models._openai_responses import _to_responses_input
 
 
@@ -40,10 +40,10 @@ class _NativeToolModel(Model):
             "protocol": "react_text_v1",
         }
 
-    def _chunk_for_call(self, call_index: int) -> ModelStreamChunk:
+    def _chunk_for_call(self, call_index: int) -> ModelStreamEvent:
         if call_index == 0:
-            return ModelStreamChunk(
-                done=True,
+            return ModelStreamEvent(
+                type=ModelStreamEventType.COMPLETED,
                 tool_calls=[
                     {
                         "id": "call_native_1",
@@ -54,21 +54,18 @@ class _NativeToolModel(Model):
                 finish_reason="tool_calls",
                 event_type="test.completed",
             )
-        return ModelStreamChunk(
+        return ModelStreamEvent(
             text="Final Answer: done",
-            done=True,
+            type=ModelStreamEventType.COMPLETED,
             finish_reason="stop",
             event_type="test.completed",
         )
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic, kwargs
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        messages = request.message_dicts()
         self.seen_messages.append(list(messages))
         call_index = self.calls
         self.calls += 1
@@ -116,15 +113,12 @@ class _HarnessAwareModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = messages, deadline_monotonic, kwargs
-        yield ModelStreamChunk(
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        _ = request
+        yield ModelStreamEvent(
             text="Final Answer: auto harness parser worked",
-            done=True,
+            type=ModelStreamEventType.COMPLETED,
             finish_reason="stop",
             event_type="test.completed",
         )
@@ -172,10 +166,10 @@ def test_native_tool_chain_preserves_tool_call_history_and_non_json_result() -> 
 
 def test_native_tool_timeout_remains_timed_out_in_result_trace_and_history() -> None:
     class _SlowToolModel(_NativeToolModel):
-        def _chunk_for_call(self, call_index: int) -> ModelStreamChunk:
+        def _chunk_for_call(self, call_index: int) -> ModelStreamEvent:
             if call_index == 0:
-                return ModelStreamChunk(
-                    done=True,
+                return ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
                     tool_calls=[
                         {
                             "id": "call_slow_1",
@@ -273,12 +267,9 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
 
         async def stream(
             self,
-            messages: list[dict[str, Any]],
-            *,
-            deadline_monotonic: float | None = None,
-            **kwargs: Any,
-        ) -> AsyncIterator[ModelStreamChunk]:
-            _ = deadline_monotonic, kwargs
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            messages = request.message_dicts()
             assistant_ids = {
                 str(tool_call["id"])
                 for message in messages
@@ -296,17 +287,17 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
             call_index = self.calls
             self.calls += 1
             if call_index >= 8:
-                yield ModelStreamChunk(
+                yield ModelStreamEvent(
                     text="Final Answer: done",
-                    done=True,
+                    type=ModelStreamEventType.COMPLETED,
                     finish_reason="stop",
                     event_type="test.completed",
                 )
                 return
 
             tool_call_count = 3 if call_index == 0 else 1
-            yield ModelStreamChunk(
-                done=True,
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.COMPLETED,
                 tool_calls=[
                     {
                         "id": f"call_{call_index}_{offset}",
@@ -382,10 +373,10 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
 
 def test_responses_native_items_survive_engine_tool_round() -> None:
     class _ResponsesNativeModel(_NativeToolModel):
-        def _chunk_for_call(self, call_index: int) -> ModelStreamChunk:
+        def _chunk_for_call(self, call_index: int) -> ModelStreamEvent:
             if call_index == 0:
-                return ModelStreamChunk(
-                    done=True,
+                return ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
                     tool_calls=[
                         {
                             "id": "call_native_1",

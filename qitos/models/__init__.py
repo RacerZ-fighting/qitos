@@ -10,11 +10,12 @@ from ..core.model_capabilities import (
     ModelCapabilities,
     ReasoningCapability,
 )
+from ..core.model_request import ModelContinuation, ModelRequest
+from ..core.model_stream import ModelStreamEvent, ModelStreamEventType
 from .anthropic import AnthropicModel
 from .base import (
     Model,
     ModelFactory,
-    ModelStreamChunk,
 )
 from .context_registry import infer_context_window
 from .gemini import GeminiModel
@@ -82,9 +83,12 @@ __all__ = [
     "Model",
     "ModelAPI",
     "ModelCapabilities",
+    "ModelContinuation",
     "ModelFactory",
     "ModelProfile",
-    "ModelStreamChunk",
+    "ModelRequest",
+    "ModelStreamEvent",
+    "ModelStreamEventType",
     "ReasoningCapability",
     "OllamaModel",
     "OpenAICompatibleModel",

@@ -32,6 +32,8 @@ from ..core.history import (
     message_tool_result_ids,
     select_recent_history,
 )
+from ..core.model_request import ModelContinuation, ModelRequest
+from ..core.model_stream import ModelStreamEventType
 from ..core.model_response import ModelResponse, ModelTiming
 from ..core.multimodal import (
     content_to_text,
@@ -46,7 +48,7 @@ from ..core.multimodal import (
 )
 from ..core.observation import Observation
 from ..harness._types import native_tool_calls_preferred
-from ..models.base import Model, ModelStreamChunk
+from ..models.base import Model, ModelStreamEvent
 from ..core.state import StateSchema
 from ..core.turn import TurnSnapshot
 from ._context_runtime import (
@@ -69,7 +71,7 @@ ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
 
 
-def _chunk_has_model_content(chunk: ModelStreamChunk) -> bool:
+def _chunk_has_model_content(chunk: ModelStreamEvent) -> bool:
     """Return whether a stream chunk contains user-visible or actionable content."""
 
     if chunk.text or chunk.reasoning_content or chunk.tool_calls or chunk.native_items:
@@ -285,12 +287,18 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             content: Any = (
                 model_response.text if str(model_response.text or "").strip() else None
             )
-            if content is not None:
+            if (
+                content is not None
+                or model_response.reasoning_content
+                or model_response.native_items
+            ):
                 engine._history_append(
                     "assistant",
                     content,
                     record.step_id,
                     metadata={"source": "engine"},
+                    reasoning_content=model_response.reasoning_content,
+                    native_items=model_response.native_items,
                 )
         record.decision = decision
         record.actions = list(decision.actions)
@@ -904,15 +912,44 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 "runtime_context_display": runtime_context_display,
             },
         )
-        response = self._normalize_model_response(
-            await self._call_llm(
-                llm,
-                llm_messages,
-                request_options,
-                deadline_monotonic=turn.budget.deadline_monotonic,
+        provider = str(getattr(llm, "provider_name", None) or "model")
+        model_name = str(getattr(llm, "model", None) or "default")
+        protocol_id = str(getattr(protocol, "id", None) or "unknown")
+        continuation = engine._model_continuation
+        continuation_eligible = bool(
+            continuation is not None
+            and continuation.run_id == turn.run_id
+            and continuation.provider == provider
+            and continuation.model == model_name
+            and continuation.protocol == protocol_id
+            and turn.capabilities.model.continuation
+        )
+        model_request = ModelRequest(
+            run_id=turn.run_id,
+            transaction_id=record.transaction_id,
+            provider=provider,
+            model=model_name,
+            protocol=protocol_id,
+            messages=tuple(llm_messages),
+            options=request_options,
+            deadline_monotonic=turn.budget.deadline_monotonic,
+            continuation=continuation if continuation_eligible else None,
+        )
+        record.model_request = model_request
+        record.prompt_metadata["provider_continuation"] = {
+            "available": continuation is not None,
+            "eligible": continuation_eligible,
+            "response_id": (
+                continuation.response_id
+                if continuation_eligible and continuation is not None
+                else None
             ),
+        }
+        response = self._normalize_model_response(
+            await self._call_llm(llm, model_request),
             llm=llm,
         )
+        engine._model_continuation = response.continuation
         post_context = context_runtime.finalize_output(
             llm=llm,
             telemetry=pre_context,
@@ -1356,10 +1393,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
     async def _call_llm(
         self,
         llm: Any,
-        messages: List[Dict[str, Any]],
-        request_options: Dict[str, Any],
-        *,
-        deadline_monotonic: float | None,
+        request: ModelRequest,
     ) -> ModelResponse:
         """Consume the one canonical model stream into a completed response."""
 
@@ -1376,17 +1410,16 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         final_native_items: Optional[List[Dict[str, Any]]] = None
         final_finish_reason: Optional[str] = None
         final_metadata: Dict[str, Any] = {}
+        final_continuation: ModelContinuation | None = None
         started = False
         terminal_seen = False
+        terminal_error: str | None = None
         stream_error: Exception | None = None
         request_started_at = time.monotonic()
         first_event_at: float | None = None
         first_content_at: float | None = None
-        stream_iter: AsyncIterator[ModelStreamChunk] = llm.stream(
-            messages,
-            deadline_monotonic=deadline_monotonic,
-            **request_options,
-        )
+        deadline_monotonic = request.deadline_monotonic
+        stream_iter: AsyncIterator[ModelStreamEvent] = llm.stream(request)
 
         iterator = stream_iter.__aiter__()
         try:
@@ -1411,8 +1444,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     raise ModelRequestDeadlineExceeded(
                         "model request deadline expired"
                     ) from exc
-                if not isinstance(chunk, ModelStreamChunk):
-                    raise TypeError("Model.stream() must yield ModelStreamChunk values")
+                if not isinstance(chunk, ModelStreamEvent):
+                    raise TypeError("Model.stream() must yield ModelStreamEvent values")
                 chunk_received_at = time.monotonic()
                 if first_event_at is None:
                     first_event_at = chunk_received_at
@@ -1420,17 +1453,17 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     first_content_at = chunk_received_at
                 text = chunk.text
                 reasoning = chunk.reasoning_content
-                done = chunk.done
                 usage = chunk.usage
                 tool_calls = chunk.tool_calls
                 native_items = chunk.native_items
                 event_type = chunk.event_type
                 finish_reason = chunk.finish_reason
+                continuation = chunk.continuation
 
                 observable = bool(
                     text
                     or reasoning
-                    or done
+                    or chunk.is_final
                     or tool_calls
                     or native_items
                     or event_type
@@ -1462,14 +1495,17 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 if reasoning:
                     accumulated_reasoning.append(str(reasoning))
 
-                if done:
+                if chunk.is_final:
                     if terminal_seen:
                         raise ModelTransportError(
-                            "model stream emitted more than one terminal chunk",
+                            "model stream emitted more than one terminal event",
                             attempts=1,
                             retryable=False,
                         )
                     terminal_seen = True
+                    if chunk.type is ModelStreamEventType.FAILED:
+                        terminal_error = str(chunk.error or "model stream failed")
+                        continue
                     if usage is not None and isinstance(usage, Mapping):
                         final_usage = usage
                     if tool_calls is not None and isinstance(tool_calls, list):
@@ -1478,12 +1514,19 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         final_native_items = native_items
                     if finish_reason is not None:
                         final_finish_reason = str(finish_reason)
+                    final_continuation = continuation
                     final_metadata = dict(chunk.event_metadata)
             if not terminal_seen:
                 raise ModelTransportError(
-                    "model stream ended before a terminal chunk",
+                    "model stream ended before a terminal event",
                     attempts=1,
                     retryable=True,
+                )
+            if terminal_error is not None:
+                raise ModelTransportError(
+                    terminal_error,
+                    attempts=1,
+                    retryable=False,
                 )
         except asyncio.CancelledError:
             raise
@@ -1543,6 +1586,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     else None
                 ),
             ),
+            continuation=final_continuation,
         )
 
     def _build_current_user_message(
@@ -1997,6 +2041,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             reasoning_content=response.reasoning_content,
             native_items=response.native_items,
             timing=response.timing,
+            continuation=response.continuation,
         )
 
     def _extract_text_tool_call_markup(self, text: str) -> List[Dict[str, Any]] | None:

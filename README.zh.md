@@ -18,10 +18,19 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **带判别类型的模型流事件**：每个 Provider 事件现在都会明确声明它是文本、reasoning、
+  ToolCall 增量、原生输出项、usage、生命周期、成功终态还是失败终态。含混的
+  `ModelStreamChunk` 字段集合已经删除；Engine 把 `FAILED` 视为错误，只提交
+  `COMPLETED` 事务。
+- **可恢复模型请求与受校验的 continuation**：Engine 现在只向 Provider 传递一份
+  不可变 `ModelRequest`，并把精确、已脱敏的请求快照写入 Journal。Responses 只有在
+  Run、Provider、model、protocol、请求设置和 canonical input 前缀全部一致时才使用
+  `previous_response_id`；resume 可以保留这项优化，fork、Provider 切换、压缩漂移或
+  句柄过期都会回退到完整本地 transcript。
 - **同一个异步 turn 事务**：完整 Run 与交互式 step 现在共用一份不可变 turn
   事务。Parser、Critic 与 handoff 作为组合策略接入，不再各自占据或复制 Agent loop；
   Tool、Mailbox、MCP 与 Child 始终运行在调用方 event loop，取消会先等待已启动 handler
-  清理并按输入顺序写完 terminal 结果。
+  清理并按输入顺序写完 terminal 结果。模型变化只会让下一 turn 重新解析推断协议。
 - **Session Journal 只有一个 owner**：每个 Run 现在使用进程安全的 JSONL writer lease
   和明确的终止生命周期。replay 始终先验证 canonical JSONL；可丢弃的 SQLite 读取投影只有
   在与 JSONL 一致时才会保留，并会在过期或损坏后重建。payload 在 append 前先通过唯一的
@@ -43,8 +52,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   与 reasoning 子项保持可见，同时不会被重复计入累计总量。
 - **真实的模型能力快照**：模型 adapter 现在暴露不可变的 `ModelCapabilities`。
   Responses、Anthropic Messages 与兼容 Chat 只声明已经通过测试的原生工具、
-  reasoning/replay、usage/cache 与多模态能力，不提前宣称尚未闭环的 continuation
-  或 hosted tool；终态 token 用量会收敛为类型化 `ModelUsage`，同时保留 Provider
+  reasoning/replay、usage/cache 与多模态能力，不提前宣称 hosted tool；Responses
+  还会声明已通过契约测试的受校验 continuation。终态 token 用量会收敛为类型化
+  `ModelUsage`，同时保留 Provider
   原始明细。
 - **模型家族与 wire 可独立选择**：同一 Kimi 家族配置可使用兼容 Chat Completions
   或 Anthropic Messages，且不会把一种 adapter 的请求默认值泄漏到另一种 wire。
@@ -91,10 +101,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 - **qita 同规格对比预检**：compare 页面会先核对模型、提示词、工具、环境、
   上下文策略、预算、源码版本与实验来源。配置不同或来源信息不完整的结果会明确标为
   只能描述、不能用于因果判断；配置一致也不会掩盖供应商或外部环境的非确定性。
-- **真实且类型化的模型流**：Chat、Responses 与 Anthropic 流现在通过同一个
-  `ModelStreamChunk` 契约保留供应商终止原因、reasoning 与工具调用分片、完整工具调用
-  及 usage。不完整的流会明确失败，不再伪造完成；发生错误后 Engine handler 也不会
-  再收到正常 `on_end`。
+- **真实且类型化的模型流**：Chat、Responses 与 Anthropic 流会保留供应商终止原因、
+  reasoning 与工具调用分片、完整工具调用及 usage。不完整的流会明确失败，不再伪造
+  完成；发生错误后 Engine handler 也不会再收到正常 `on_end`。
 - **按调用准确统计 qita 工具状态**：工具次数与失败数现在来自 canonical action/result
   配对，不会再把同一步中的一个失败错误归到所有调用上。精确生命周期计数以及无法配对
   的 trace 证据都会保留供审计。

@@ -11,6 +11,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Dict, List, Optional, cast
 
+from .model_request import ModelContinuation
+
 
 class ModelUsageSource(str, Enum):
     """Origin of token counts carried by a model transaction."""
@@ -339,6 +341,7 @@ class ModelResponse:
     reasoning_content: Optional[str] = None
     native_items: Optional[List[Dict[str, Any]]] = None
     timing: ModelTiming | None = None
+    continuation: ModelContinuation | None = None
 
     def __post_init__(self) -> None:
         """Reject responses that still carry provider SDK objects."""
@@ -352,6 +355,10 @@ class ModelResponse:
             raise TypeError("ModelResponse.native_items must be a list or None")
         if self.timing is not None and not isinstance(self.timing, ModelTiming):
             raise TypeError("ModelResponse.timing must be a ModelTiming or None")
+        if self.continuation is not None and not isinstance(
+            self.continuation, ModelContinuation
+        ):
+            raise TypeError("continuation must be a ModelContinuation or None")
 
     def to_summary_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -381,6 +388,11 @@ class ModelResponse:
                 else None
             ),
             "timing": self.timing.to_dict() if self.timing is not None else None,
+            "continuation": (
+                self.continuation.to_dict()
+                if self.continuation is not None
+                else None
+            ),
         }
         if self.reasoning_content:
             d["reasoning_content"] = self.reasoning_content

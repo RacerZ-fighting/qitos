@@ -14,7 +14,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from qitos.core import TerminalCapability
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import (
+    Model,
+    ModelRequest,
+    ModelStreamEvent,
+    ModelStreamEventType,
+)
 
 
 class SequenceModel(Model):
@@ -32,12 +37,9 @@ class SequenceModel(Model):
 
     async def stream(
         self,
-        messages: list[dict[str, Any]],
-        *,
-        deadline_monotonic: float | None = None,
-        **_: Any,
-    ) -> AsyncIterator[ModelStreamChunk]:
-        _ = deadline_monotonic
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        messages = request.message_dicts()
         self.calls.append(list(messages))
         if not self.outputs:
             text = "Final Answer: smoke complete"
@@ -45,9 +47,13 @@ class SequenceModel(Model):
             item = self.outputs.pop(0)
             text = item(messages) if callable(item) else str(item)
         if text:
-            yield ModelStreamChunk(text=text, event_type="text.delta")
-        yield ModelStreamChunk(
-            done=True,
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.TEXT_DELTA,
+                text=text,
+                event_type="text.delta",
+            )
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.COMPLETED,
             event_type="scripted.completed",
             event_metadata={"provider": self.provider_name, "model": self.model},
             finish_reason="stop",

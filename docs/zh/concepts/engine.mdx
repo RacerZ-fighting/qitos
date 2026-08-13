@@ -72,7 +72,7 @@ engine = Engine(
 
 ## 协议解析
 
-`Engine` 在每次运行中按照以下优先级解析模型协议：
+`Engine` 在捕获每个不可变 turn 时，按照以下优先级解析模型协议：
 
 1. 直接传给 `Engine` 的 `protocol`。
 2. `agent.model_protocol`。
@@ -82,6 +82,9 @@ engine = Engine(
 6. 框架默认协议 `react_text_v1`。
 
 第 4 步中的模型声明由 `build_model_for_preset(...)` 写入。因此，即使服务商使用了 QitOS 无法从名称识别的模型别名，直接调用 `Engine(agent=agent)` 也会保留显式选择的 family preset。无法识别的模型级协议声明会被忽略，原有的模型名称推断和框架默认回退仍然有效。选择这些声明时，trace 会将解析来源记录为 `model_qitos_protocol` 或 `model_harness_metadata`。
+
+选定协议在当前 turn 内保持不变。运行期间发生的配置或模型变化只会在捕获下一份 turn
+snapshot 时重新解析。
 
 ## 空模型响应
 
@@ -254,8 +257,14 @@ q2 = stream.subscribe()  # 消费者 2 的 asyncio.Queue
 
 ### 模型流
 
-所有模型 Provider 都实现唯一的异步 `Model.stream()` 契约。Engine 消费 Provider 无关的
-流式 chunk，并在整个事务中保留取消和请求截止时间。
+所有模型 Provider 都实现唯一的异步 `Model.stream(request)` 契约。Engine 在 History
+投影后组装一份不可变 `ModelRequest`，并把同一份绝对 deadline 传给连接、流读取、重试和
+清理过程。
+
+Provider 返回带判别类型的 `ModelStreamEvent`。文本、reasoning、ToolCall 增量、原生输出项、
+usage 和生命周期分别使用不同事件类型，消费方无需再从可选字段组合猜测语义。每个事务只能以
+一个 `COMPLETED` 或 `FAILED` 事件结束；只有 `COMPLETED` 能携带最终 ToolCall、finish state
+和 continuation，`FAILED` 始终进入错误路径，不会被提交为模型响应。
 
 ```python
 from qitos.models import OpenAICompatibleModel
