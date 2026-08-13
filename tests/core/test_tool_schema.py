@@ -36,7 +36,9 @@ class TestTypeToJsonSchema:
 
     def test_optional_str(self) -> None:
         result = type_to_json_schema(Optional[str])
-        assert result == {"type": "string", "nullable": True}
+        assert result == {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+        }
 
     def test_list_int(self) -> None:
         result = type_to_json_schema(list[int])
@@ -44,7 +46,7 @@ class TestTypeToJsonSchema:
 
     def test_dict_str_any(self) -> None:
         result = type_to_json_schema(dict[str, Any])
-        assert result == {"type": "object"}
+        assert result == {"type": "object", "additionalProperties": True}
 
     def test_literal_strings(self) -> None:
         result = type_to_json_schema(Literal["a", "b"])
@@ -60,7 +62,14 @@ class TestTypeToJsonSchema:
 
     def test_annotated_optional_str(self) -> None:
         result = type_to_json_schema(Annotated[Optional[str], "desc"])
-        assert result == {"type": "string", "nullable": True}
+        assert result == {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+        }
+
+    def test_pep_604_union(self) -> None:
+        assert type_to_json_schema(str | int) == {
+            "anyOf": [{"type": "string"}, {"type": "integer"}],
+        }
 
     def test_bare_list(self) -> None:
         assert type_to_json_schema(list) == {"type": "array"}

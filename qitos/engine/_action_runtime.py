@@ -301,11 +301,12 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             record.action_execution = exec_stats
         results: List[ToolResult] = []
         for item in execution:
-            result_metadata = {
+            result_metadata = dict(item.metadata)
+            result_metadata.update({
                 "tool_name": item.name,
                 "latency_ms": item.latency_ms,
                 "attempts": item.attempts,
-            }
+            })
             results.append(
                 ToolResult(
                     status=item.status.value,

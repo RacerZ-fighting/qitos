@@ -613,6 +613,7 @@ class TestBridge:
         assert "name" in spec.parameters
         assert spec.parameters["name"]["type"] == "string"
         assert spec.required == ["name"]
+        assert spec.input_schema["additionalProperties"] is False
 
     @pytest.mark.asyncio
     async def test_bridge_empty_tools(self) -> None:

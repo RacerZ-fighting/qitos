@@ -24,6 +24,7 @@ from ..core.tool import (
     ToolPermissionDecision,
     ToolValidationResult,
 )
+from ..core.tool_schema import tool_input_schema_errors
 from ._daemon_pool import DaemonTaskPool
 from .interrupt import EngineInterrupt
 from .states import RuntimeEvent, RuntimePhase
@@ -1502,6 +1503,16 @@ class ActionExecutor:
         args: Dict[str, Any],
         runtime_context: Dict[str, Any],
     ) -> ToolValidationResult:
+        schema_errors = tool_input_schema_errors(
+            tool.spec.input_schema or {},
+            dict(args),
+        )
+        if schema_errors:
+            return ToolValidationResult.fail(
+                "Tool arguments do not match input_schema:\n"
+                + "\n".join(f"- {error}" for error in schema_errors),
+                code="invalid_tool_arguments",
+            )
         return tool.validate_input(dict(args), runtime_context=runtime_context)
 
     def _check_permissions(

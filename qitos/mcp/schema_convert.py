@@ -20,6 +20,7 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional, Set
 
 from ..core.tool import ToolSpec
+from ..core.tool_schema import normalize_tool_input_schema
 from .server import MCPToolInfo
 
 
@@ -71,6 +72,11 @@ def convert_mcp_schema_to_tool_spec(
     # Preserve additionalProperties if present.
     if "additionalProperties" in schema:
         input_schema["additionalProperties"] = schema["additionalProperties"]
+    input_schema = normalize_tool_input_schema(
+        input_schema,
+        parameters=parameters,
+        required=required_list,
+    )
 
     return ToolSpec(
         name=tool_name,

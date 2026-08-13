@@ -185,6 +185,49 @@ async def test_engine_persists_one_finalized_terminal_result(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_invalid_tool_arguments_commit_unexecuted_terminal(
+    tmp_path: Path,
+) -> None:
+    class InvalidArgumentsAgent(JournalAgent):
+        def decide(
+            self,
+            state: JournalState,
+            observation: dict[str, Any],
+        ) -> Decision[Action]:
+            _ = observation
+            if state.current_step == 0:
+                return Decision.act(
+                    [
+                        Action(
+                            "inspect",
+                            args={"unknown": True},
+                            action_id="invalid-call",
+                        )
+                    ]
+                )
+            return Decision.final("done")
+
+    agent = InvalidArgumentsAgent()
+    journal = JsonlSessionJournal(tmp_path)
+
+    result = await Engine(agent=agent, journal=journal).arun("inspect")
+    records = await journal.replay()
+    terminal = next(
+        record for record in records if record.type is JournalRecordType.TOOL_TERMINAL
+    )
+
+    assert agent.executions == 0
+    assert terminal.payload["result"]["status"] == "error"
+    assert terminal.payload["result"]["metadata"]["executed"] is False
+    assert (
+        terminal.payload["result"]["metadata"]["error_category"]
+        == "invalid_tool_arguments"
+    )
+    assert result.records[0].action_results[0].status == "error"
+    assert any(record.type is JournalRecordType.STEP_COMMITTED for record in records)
+
+
+@pytest.mark.asyncio
 async def test_terminal_run_resumes_without_model_or_tool_replay(tmp_path: Path) -> None:
     original_agent = JournalAgent()
     original_journal = JsonlSessionJournal(tmp_path)

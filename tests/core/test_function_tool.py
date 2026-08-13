@@ -1,6 +1,6 @@
 """Tests for qitos.core.function_tool_decorator — @function_tool decorator."""
 
-from typing import Optional
+from typing import Literal, Optional
 
 from qitos.core.function_tool_decorator import function_tool
 from qitos.core.tool import FunctionTool, RetryPolicy, tool
@@ -112,10 +112,31 @@ class TestFunctionToolDecorator:
             """
             return y or "default"
 
-        # The parameter y should have nullable in its schema from tool_schema
         assert "y" in fn_with_optional.spec.parameters
+        assert fn_with_optional.spec.parameters["y"]["anyOf"] == [
+            {"type": "string"},
+            {"type": "null"},
+        ]
         assert "x" in fn_with_optional.spec.required
         assert "y" not in fn_with_optional.spec.required
+
+    def test_generated_schema_is_closed_and_preserves_literal(self) -> None:
+        @function_tool
+        def choose(mode: Literal["safe", "fast"]) -> str:
+            return mode
+
+        assert choose.spec.input_schema == {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "type": "string",
+                    "enum": ["safe", "fast"],
+                    "description": "",
+                }
+            },
+            "required": ["mode"],
+            "additionalProperties": False,
+        }
 
 
 class TestExistingToolDecoratorStillWorks:

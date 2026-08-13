@@ -59,6 +59,7 @@ class TimelineTool(BaseTool):
             ToolSpec(
                 name=name,
                 description=name,
+                parameters={"n": {"type": "integer"}},
                 concurrency_safe=concurrency_safe,
                 timeout_s=timeout_s,
             )

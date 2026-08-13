@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import inspect
 import re
+import types
 from typing import (
     Annotated,
     Any,
@@ -15,6 +17,90 @@ from typing import (
     get_origin,
     get_type_hints,
 )
+
+from jsonschema.exceptions import SchemaError
+from jsonschema.validators import validator_for
+
+
+_MAX_VALIDATION_ERRORS = 8
+_MAX_VALIDATION_ERROR_CHARS = 500
+
+
+def normalize_tool_input_schema(
+    input_schema: Optional[Dict[str, Any]],
+    *,
+    parameters: Optional[Dict[str, Dict[str, Any]]] = None,
+    required: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Return one detached, closed, valid object schema for a tool call.
+
+    Tool protocols always deliver a JSON object. QitOS therefore closes the
+    root argument object by default while preserving an explicit
+    ``additionalProperties`` declaration for tools that intentionally accept a
+    free-form mapping. The returned schema is both the model projection and the
+    executor's validation authority.
+    """
+
+    if input_schema is not None and not isinstance(input_schema, dict):
+        raise TypeError("tool input_schema must be a JSON Schema object")
+
+    schema: Dict[str, Any]
+    if input_schema:
+        schema = deepcopy(input_schema)
+    else:
+        schema = {
+            "type": "object",
+            "properties": deepcopy(parameters or {}),
+            "required": list(required or []),
+        }
+
+    schema_type = schema.setdefault("type", "object")
+    if schema_type != "object":
+        raise ValueError("tool input_schema root type must be 'object'")
+
+    properties = schema.setdefault("properties", {})
+    if not isinstance(properties, dict):
+        raise ValueError("tool input_schema properties must be an object")
+
+    required_fields = schema.setdefault("required", [])
+    if not isinstance(required_fields, list) or not all(
+        isinstance(item, str) for item in required_fields
+    ):
+        raise ValueError("tool input_schema required must be a list of strings")
+
+    schema.setdefault("additionalProperties", False)
+    try:
+        validator_for(schema).check_schema(schema)
+    except SchemaError as exc:
+        raise ValueError(f"tool input_schema is invalid: {exc.message}") from exc
+    return schema
+
+
+def tool_input_schema_errors(
+    schema: Dict[str, Any],
+    arguments: Dict[str, Any],
+) -> tuple[str, ...]:
+    """Return bounded JSON Schema violations for one tool argument object."""
+
+    validator_class = validator_for(schema)
+    validator_class.check_schema(schema)
+    errors = sorted(
+        validator_class(schema).iter_errors(arguments),
+        key=lambda error: tuple(str(part) for part in error.absolute_path),
+    )
+    rendered: List[str] = []
+    for error in errors[:_MAX_VALIDATION_ERRORS]:
+        path = "$" + "".join(
+            f"[{part}]" if isinstance(part, int) else f".{part}"
+            for part in error.absolute_path
+        )
+        message = " ".join(error.message.split())
+        if len(message) > _MAX_VALIDATION_ERROR_CHARS:
+            message = f"{message[:_MAX_VALIDATION_ERROR_CHARS]}..."
+        rendered.append(f"{path}: {message}")
+    if len(errors) > len(rendered):
+        rendered.append(f"$:{len(errors) - len(rendered)} more validation error(s)")
+    return tuple(rendered)
 
 
 def function_schema(func: Any) -> Dict[str, Any]:
@@ -135,7 +221,7 @@ def type_to_json_schema(annotation: Any) -> Dict[str, Any]:
 
     Supported types:
       - Basic: str, int, float, bool -> {type: string|integer|number|boolean}
-      - Optional[X] -> {type: X, nullable: true}
+      - Optional[X] -> standard JSON Schema union with ``null``
       - list[X] -> {type: array, items: X}
       - dict[K,V] -> {type: object}
       - Literal[...] -> {type: X, enum: [...]}
@@ -145,6 +231,25 @@ def type_to_json_schema(annotation: Any) -> Dict[str, Any]:
     if annotation is inspect.Parameter.empty or annotation is None:
         return {}
 
+    if annotation is type(None):
+        return {"type": "null"}
+
+    if isinstance(annotation, str):
+        normalized = annotation.strip().removeprefix("typing.")
+        schema_type = {
+            "str": "string",
+            "int": "integer",
+            "float": "number",
+            "bool": "boolean",
+            "dict": "object",
+            "Dict": "object",
+            "list": "array",
+            "List": "array",
+            "None": "null",
+            "NoneType": "null",
+        }.get(normalized)
+        return {"type": schema_type} if schema_type is not None else {}
+
     # Unwrap Annotated — transparent passthrough to inner type
     origin = get_origin(annotation)
     if origin is Annotated:
@@ -152,27 +257,13 @@ def type_to_json_schema(annotation: Any) -> Dict[str, Any]:
         if args:
             return type_to_json_schema(args[0])
 
-    # Handle Optional[X] — Union[X, None]
-    if origin is Optional:
-        args = get_args(annotation)
-        if args:
-            inner = type_to_json_schema(args[0])
-            result = dict(inner)
-            result["nullable"] = True
-            return result
-
-    # Handle Union[X, None] explicitly (same as Optional but written differently)
+    # Handle both typing.Union and PEP 604 ``X | Y``.
     import typing
 
-    if origin is getattr(typing, "Union", None):
+    if origin in {getattr(typing, "Union", None), types.UnionType}:
         args = get_args(annotation)
-        if args:
-            non_none = [a for a in args if a is not type(None)]
-            if len(non_none) == 1:
-                inner = type_to_json_schema(non_none[0])
-                result = dict(inner)
-                result["nullable"] = True
-                return result
+        variants = [type_to_json_schema(arg) for arg in args]
+        return {"anyOf": variants} if variants else {}
 
     # Handle Literal[...]
     if origin is Literal:
@@ -202,7 +293,12 @@ def type_to_json_schema(annotation: Any) -> Dict[str, Any]:
 
     # Handle dict[K, V]
     if origin is dict:
-        return {"type": "object"}
+        args = get_args(annotation)
+        value_schema = type_to_json_schema(args[1]) if len(args) == 2 else {}
+        return {
+            "type": "object",
+            "additionalProperties": value_schema or True,
+        }
 
     # Basic types
     basic: Dict[type, str] = {

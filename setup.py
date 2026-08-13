@@ -61,6 +61,7 @@ setup(
     install_requires=[
         "requests>=2.31.0",
         "beautifulsoup4>=4.12.3",
+        "jsonschema>=4.23,<5",
         "rich>=13.7.0",
         "pyyaml>=6.0",
     ],

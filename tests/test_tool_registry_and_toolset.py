@@ -168,6 +168,9 @@ def test_curated_toolsets_register_cleanly(tmp_path):
 
 
 def test_tool_schemas_resolve_future_annotations_to_valid_json_types(tmp_path):
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import ValidationError
+
     def _future_annotated(path):
         return {"path": path}
 
@@ -185,12 +188,15 @@ def test_tool_schemas_resolve_future_annotations_to_valid_json_types(tmp_path):
         synthetic_spec.input_schema["properties"]["path"]["type"]
         == "string"
     )
-    assert (
-        specs["audit_hotspots"]["function"]["parameters"]["properties"]["findings"][
-            "type"
-        ]
-        != "any"
-    )
+    findings_schema = specs["audit_hotspots"]["function"]["parameters"][
+        "properties"
+    ]["findings"]
+    Draft202012Validator.check_schema(findings_schema)
+    validator = Draft202012Validator(findings_schema)
+    validator.validate(None)
+    validator.validate([{"file": "src/example.py"}])
+    with pytest.raises(ValidationError):
+        validator.validate("not-a-finding-list")
 
 
 def test_tool_package_does_not_export_uncurated_cyber_toolsets():

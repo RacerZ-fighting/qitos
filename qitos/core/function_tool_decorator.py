@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 from .tool import FunctionTool, ToolMeta, RetryPolicy
-from .tool_schema import function_schema
 
 
 def function_tool(
@@ -49,53 +48,12 @@ def function_tool(
         for key, value in extra_meta.items():
             setattr(meta, key, value)
 
-        # Build spec using enhanced schema from tool_schema
         import inspect
 
-        from .tool import build_tool_spec
-
-        schema_info = function_schema(fn)
-        spec = build_tool_spec(fn, meta)
-
-        # Override parameters with enriched schema from tool_schema
-        for param_name, param_schema in schema_info["parameters"].items():
-            if param_name in spec.parameters:
-                # Merge: keep existing keys but enrich with description and richer types
-                merged = dict(spec.parameters[param_name])
-                # If tool_schema produced a richer type (dict with keys), replace the simple "type" string
-                for k, v in param_schema.items():
-                    if k == "type" and isinstance(v, str) and merged.get("type") == "any":
-                        merged[k] = v
-                    elif k != "type":
-                        merged[k] = v
-                    elif k == "type" and isinstance(v, str) and merged.get("type") != v and v != "any":
-                        merged[k] = v
-                # If tool_schema produced a dict type (e.g. with nullable, items, enum), merge those
-                if isinstance(param_schema, dict):
-                    for k, v in param_schema.items():
-                        if k not in ("description", "default") and not (k == "type" and isinstance(v, str)):
-                            merged[k] = v
-                spec.parameters[param_name] = merged
-
-        # Update the input_schema as well
-        if spec.input_schema is not None:
-            spec.input_schema = {
-                "type": "object",
-                "properties": dict(spec.parameters),
-                "required": spec.required,
-            }
-
-        tool_instance = FunctionTool.__new__(FunctionTool)
-        tool_instance.func = fn
-        tool_instance.meta = meta
-        tool_instance.spec = spec
+        tool_instance = FunctionTool(fn, meta)
         # Description: explicit meta.description overrides docstring
         if meta.description:
-            spec.description = inspect.cleandoc(meta.description)
-        else:
-            desc = inspect.getdoc(fn) or ""
-            if desc:
-                spec.description = inspect.cleandoc(desc)
+            tool_instance.spec.description = inspect.cleandoc(meta.description)
 
         return tool_instance
 

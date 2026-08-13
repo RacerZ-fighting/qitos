@@ -9,6 +9,8 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, cast, get_type_hints
 
+from .tool_schema import normalize_tool_input_schema, type_to_json_schema
+
 
 @dataclass
 class ToolPermission:
@@ -305,12 +307,11 @@ class BaseTool(ABC):
         description = inspect.getdoc(self.execute) or inspect.getdoc(self.__class__)
         if description:
             spec.description = inspect.cleandoc(description)
-        if spec.input_schema is None:
-            spec.input_schema = {
-                "type": "object",
-                "properties": dict(spec.parameters),
-                "required": list(spec.required),
-            }
+        spec.input_schema = normalize_tool_input_schema(
+            spec.input_schema,
+            parameters=spec.parameters,
+            required=spec.required,
+        )
         self.spec = spec
 
     @property
@@ -582,10 +583,11 @@ def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
         }:
             continue
         annotation = resolved_hints.get(name, p.annotation)
-        params[name] = {
-            "type": _type_to_json(annotation),
-            "description": param_descs.get(name, ""),
-        }
+        param_schema = type_to_json_schema(annotation)
+        param_schema["description"] = param_descs.get(name, "")
+        if p.default is not inspect.Parameter.empty:
+            param_schema["default"] = p.default
+        params[name] = param_schema
         if p.default is inspect.Parameter.empty:
             required.append(name)
 
@@ -605,12 +607,11 @@ def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
         permissions=meta.permissions,
         required_ops=list(meta.required_ops),
         environment_ops=list(meta.environment_ops),
-        input_schema=meta.input_schema
-        or {
-            "type": "object",
-            "properties": params,
-            "required": required,
-        },
+        input_schema=normalize_tool_input_schema(
+            meta.input_schema,
+            parameters=params,
+            required=required,
+        ),
         output_schema=meta.output_schema,
         read_only=meta.read_only,
         concurrency_safe=meta.concurrency_safe,
@@ -622,52 +623,6 @@ def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
         rule_scope_builder=meta.rule_scope_builder,
         prompt=meta.prompt,
     )
-
-
-def _type_to_json(annotation: Any) -> str:
-    if annotation in {inspect.Parameter.empty, inspect.Signature.empty}:
-        return "string"
-
-    if isinstance(annotation, str):
-        normalized = annotation.strip().removeprefix("typing.")
-        return {
-            "str": "string",
-            "int": "integer",
-            "float": "number",
-            "bool": "boolean",
-            "dict": "object",
-            "Dict": "object",
-            "list": "array",
-            "List": "array",
-            "None": "null",
-            "NoneType": "null",
-        }.get(normalized, "string")
-
-    if annotation is Any:
-        return "object"
-
-    mapping = {
-        str: "string",
-        int: "integer",
-        float: "number",
-        bool: "boolean",
-        dict: "object",
-        list: "array",
-    }
-    result = mapping.get(annotation)
-    if result is not None:
-        return result
-    # Fallback to type_to_json_schema for complex types
-    from .tool_schema import type_to_json_schema
-
-    schema = type_to_json_schema(annotation)
-    if (
-        isinstance(schema, dict)
-        and "type" in schema
-        and isinstance(schema["type"], str)
-    ):
-        return schema["type"]
-    return "object"
 
 
 __all__ = [
