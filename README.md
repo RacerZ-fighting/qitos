@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Strict tool inputs share one authority**: the exact JSON Schema projected to the
+  model is now enforced before every handler. Generated root objects reject unknown
+  fields by default, and missing fields, wrong types, enums, or bounds produce a
+  durable unexecuted terminal result instead of reaching custom tool code.
 - **Resolvable committed tool transactions**: canonical Journal terminals now have
   stable `JournalRecordRef` locators. An open JSONL Journal can reconstruct a fresh,
   typed `ToolTransaction` for a committed terminal; forks retain the origin locator,

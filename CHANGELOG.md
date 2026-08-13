@@ -134,6 +134,12 @@ How to update:
 
 ### Changed
 
+- Tool calls now use one strict JSON Schema at model projection and execution.
+  Generated argument objects reject undeclared fields by default; missing fields,
+  wrong types, enums, and bounds fail before custom validation or handler execution
+  and commit an `invalid_tool_arguments` terminal result with `executed=false`.
+  Tools that intentionally accept arbitrary root keys must declare
+  `additionalProperties` explicitly.
 - Model transports now publish non-terminal text, reasoning, and tool-call deltas
   immediately. Retries remain available before the first provider event, but an
   observable attempt is never replayed; its terminal chunk is committed only after

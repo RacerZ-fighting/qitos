@@ -185,6 +185,24 @@ registry.register(DatabaseTool(db_path="data.db"))
 
 `FunctionTool` is the wrapper that `register()` creates automatically when you pass a plain callable. You rarely need to instantiate it directly.
 
+### Strict input schemas
+
+Every registered tool has one canonical `input_schema`. QitOS projects that exact
+schema to the model and validates the final, permission-adjusted arguments against it
+before calling `validate_input()` or `execute()`. Validation does not coerce values:
+a string such as `"2"` does not satisfy an integer field.
+
+Generated root object schemas set `additionalProperties: false`. They reject unknown
+arguments as well as missing required fields, invalid types, enum values, and JSON
+Schema bounds. If a tool intentionally accepts arbitrary root keys, declare an
+explicit `additionalProperties` schema (or `true`). Invalid schema definitions fail
+when the tool is constructed.
+
+`BaseTool.validate_input()` remains the hook for domain rules that JSON Schema cannot
+express. It runs only after schema validation succeeds. Either validation layer can
+return a terminal error without executing the handler; schema failures use
+`error_category="invalid_tool_arguments"`, `attempts=0`, and `executed=false`.
+
 Class-based tools have one execution entry: `execute(args, runtime_context)`. The
 registry resolves only the exact registered name and does not execute tools itself.
 There are no `run`/`call` adapters, short aliases, separator aliases, or case repair.

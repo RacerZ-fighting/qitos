@@ -177,6 +177,21 @@ registry.register(DatabaseTool(db_path="data.db"))
 
 当你向 `register()` 传入普通可调用对象时，QitOS 内部会自动把它包装成 `FunctionTool`。大多数情况下你无需显式实例化它。
 
+### 严格输入 Schema
+
+每个已注册工具只有一份 canonical `input_schema`。QitOS 会把这份 Schema 原样投影给
+模型，并在权限层完成参数调整后、调用 `validate_input()` 或 `execute()` 前，用它校验
+最终参数。校验不会做类型强转，例如字符串 `"2"` 不能满足 integer 字段。
+
+自动生成的根对象 Schema 默认带 `additionalProperties: false`，因此未知参数、缺失的
+required 字段、错误类型、非法枚举值和 JSON Schema 边界都会被拒绝。确实需要接受任意
+根键的工具必须显式声明 `additionalProperties` Schema（或 `true`）。非法 Schema 会在
+工具构造时直接失败。
+
+`BaseTool.validate_input()` 继续承载 JSON Schema 无法表达的领域规则，但只有 Schema
+校验通过后才会运行。任一校验层失败都不会执行 handler；Schema 失败会生成
+`error_category="invalid_tool_arguments"`、`attempts=0`、`executed=false` 的终态结果。
+
 类式工具只有一个执行入口：`execute(args, runtime_context)`。注册表只接受精确的
 已注册名称，本身不负责执行；不存在 `run`/`call` 适配、短名称别名、分隔符别名或
 大小写修复。需要权限、超时、重试和结果归一化时，应通过 `Engine` 使用
