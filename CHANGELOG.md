@@ -61,6 +61,9 @@ How to update:
 
 ### Added
 
+- Added one process-safe writer lease per Run and a disposable SQLite Journal read
+  projection. JSONL remains the only canonical source; stale, corrupt, missing, or
+  unsupported projections rebuild without changing canonical recovery semantics.
 - Added revisioned, read-only per-turn `ToolExposure` snapshots. The model projection
   and action dispatcher now share one exact tool surface, while completed Journal
   model transactions retain its names, schema digest, and application selection
@@ -138,6 +141,11 @@ How to update:
 
 ### Changed
 
+- Journal records now deep-copy nested payloads at construction and projection
+  boundaries. Replay and committed-tool queries return isolated values.
+- Engine run and resume entry points now own and close their configured Journal on
+  success, failure, or cancellation. Journal fork closes the source and transfers an
+  open child Journal to the caller.
 - Applications can assign tools to exposure `group` values and override
   `AgentModule.build_tool_exposure()` to select the current turn's tools. A configured
   `PermissionPipeline` now owns parameter-level allow/deny/ask admission instead of
@@ -335,6 +343,8 @@ How to update:
 
 ### Breaking
 
+- Custom `SessionJournal` implementations must provide async `close()`. A concrete
+  Journal instance is terminal after close and cannot be reopened or mutated.
 - Model implementations must provide the asynchronous `Model.stream(...)` contract.
   Applications in an event loop must call `Engine.arun()` or `Engine.astep()`; the
   synchronous wrappers no longer emulate async execution with worker threads.

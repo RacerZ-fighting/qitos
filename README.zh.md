@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **Session Journal 只有一个 owner**：每个 Run 现在使用进程安全的 JSONL writer lease
+  和明确的终止生命周期。JSONL 始终是 canonical 真源；可丢弃的 SQLite 读取投影用于加速
+  reopen，并会在过期或损坏后重建。嵌套 payload 与 replay 结果也不再共享可变引用。
 - **每 turn 冻结工具 exposure**：模型请求和动作分发器现在共用一份带 revision 的
   只读 `ToolExposure`。应用可以按 group 或策略筛选；registry 的后续变化只影响下一
   turn；Journal 会记录精确名称与 Schema 摘要，便于 replay 审计。

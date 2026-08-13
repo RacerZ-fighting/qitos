@@ -6,6 +6,11 @@ description: 持久化完整模型与工具事务，并支持恢复和分叉。
 QitOS 可以为每个 Run 保存一份 append-only JSONL Journal。启用后，它是模型历史、工具事务、
 状态恢复、resume 和 fork 的唯一真源。同一个 Engine 不得同时配置 checkpoint store。
 
+每个 Journal 实例都是唯一的存储 owner。`create()` 或 `open()` 会取得该 Run 的操作系统级
+writer lease；其他进程或 Engine 若尝试同时写入，会得到 `JournalOwnershipError`，而不是打开
+第二个 writer。`Engine.arun()` 和 `Engine.aresume_from_journal()` 会在所有终止路径关闭其
+Journal。关闭后的实例永久拒绝修改，但仍可从隔离的内存值 replay 或查询已提交工具事务，便于诊断。
+
 ## 工具事务顺序
 
 Engine 按以下顺序写入：
@@ -37,6 +42,11 @@ error 终态，绝不重放 Handler。没有获得 `tool.started` 的调用会�
 JSONL writer 会等待每条记录 durable 后返回。Darwin 使用 `F_FULLFSYNC`，其他 POSIX 系统优先
 使用 `fdatasync`。
 
+canonical 文件旁的 `journal.index.sqlite3` 只是可丢弃的读取投影。QitOS 只在 JSONL 写入 durable
+后更新它；投影缺失、过期、损坏或 schema 不受支持时，会从已验证的 JSONL 记录重建。投影失败
+不会让 canonical append 失败或回滚，删除 SQLite 文件也不会丢失 Run 状态。语法完整但 schema
+未知或语义无效的 JSONL 记录会 fail closed；恢复时只截断语法未完成的 torn tail。
+
 ```python
 from qitos import Engine
 from qitos.kit.journal import JsonlSessionJournal
@@ -51,6 +61,8 @@ resumed = await Engine(
 ```
 
 Fork 只接受 committed `JournalPosition`。Child Journal 拥有独立的继承前缀，不会修改 Parent。
+Fork 会关闭 source Journal，并返回仍处于 open 状态的 Child；接收 Child 的调用方负责其生命周期，
+直至 Engine run 消费它或显式调用 `close()`。
 
 ## 查询已提交的工具事务
 
