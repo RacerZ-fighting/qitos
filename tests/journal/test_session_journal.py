@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -14,7 +15,6 @@ from qitos.core.journal import (
     JournalClosedError,
     JournalCorruptionError,
     JournalOwnershipError,
-    JournalRecord,
     JournalRecordRef,
     JournalRecordType,
 )
@@ -181,9 +181,8 @@ async def test_projection_close_failure_still_releases_writer_ownership(
 
 
 @pytest.mark.asyncio
-async def test_current_sqlite_projection_avoids_jsonl_reparse(
+async def test_current_sqlite_projection_remains_available_after_reopen(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     journal = JsonlSessionJournal(tmp_path)
     await journal.create("run-1", {})
@@ -196,11 +195,6 @@ async def test_current_sqlite_projection_avoids_jsonl_reparse(
     await journal.close()
 
     reopened = JsonlSessionJournal(tmp_path)
-
-    def fail_jsonl_reparse(path: Path, run_id: str) -> list[JournalRecord]:
-        raise AssertionError(f"unexpected JSONL reparse: {path} {run_id}")
-
-    monkeypatch.setattr(reopened, "_load_and_repair", fail_jsonl_reparse)
     await reopened.open("run-1")
 
     assert index_path.is_file()
@@ -208,6 +202,33 @@ async def test_current_sqlite_projection_avoids_jsonl_reparse(
         "run-1:start",
         "input-1",
     ]
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_uses_jsonl_when_current_projection_content_diverges(
+    tmp_path: Path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    await journal.create("run-1", {})
+    await journal.append(
+        JournalRecordType.INPUT_ACCEPTED,
+        {"content": "one"},
+        record_id="input-1",
+    )
+    path = journal.path
+    await journal.close()
+    source_stat = path.stat()
+    path.write_bytes(path.read_bytes().replace(b'"one"', b'"two"'))
+    os.utime(
+        path,
+        ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns),
+    )
+
+    reopened = JsonlSessionJournal(tmp_path)
+    await reopened.open("run-1")
+
+    assert (await reopened.replay())[-1].payload == {"content": "two"}
     await reopened.close()
 
 
@@ -232,16 +253,14 @@ async def test_broken_sqlite_projection_rebuilds_from_jsonl(
     else:
         with sqlite3.connect(index_path) as connection:
             connection.execute(
-                "UPDATE journal_record SET record_json = ? WHERE seq = 1",
-                ("{}",),
+                "UPDATE journal_record SET record_sha256 = ? WHERE seq = 1",
+                ("not-the-canonical-digest",),
             )
 
     reopened = JsonlSessionJournal(tmp_path)
     await reopened.open("run-1")
 
     assert [record.record_id for record in await reopened.replay()] == ["run-1:start"]
-    with sqlite3.connect(index_path) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone() == (1,)
     await reopened.close()
 
 

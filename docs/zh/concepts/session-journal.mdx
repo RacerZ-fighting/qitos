@@ -44,8 +44,10 @@ JSONL writer 会等待每条记录 durable 后返回。Darwin 使用 `F_FULLFSYN
 
 canonical 文件旁的 `journal.index.sqlite3` 只是可丢弃的读取投影。QitOS 只在 JSONL 写入 durable
 后更新它；投影缺失、过期、损坏或 schema 不受支持时，会从已验证的 JSONL 记录重建。投影失败
-不会让 canonical append 失败或回滚，删除 SQLite 文件也不会丢失 Run 状态。语法完整但 schema
-未知或语义无效的 JSONL 记录会 fail closed；恢复时只截断语法未完成的 torn tail。
+不会让 canonical append 失败或回滚。open 和 replay 始终先解析 canonical JSONL，SQLite 不提供
+replay record；只有逐条摘要与 canonical record 一致时才会保留该投影。删除 SQLite 文件不会
+丢失 Run 状态。语法完整但 schema 未知或语义无效的 JSONL 记录会 fail closed；恢复时只截断
+语法未完成的 torn tail。
 
 ```python
 from qitos import Engine

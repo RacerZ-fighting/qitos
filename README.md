@@ -19,9 +19,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 ## What's New
 
 - **Single-owner Session journals**: each Run now has one process-safe JSONL writer
-  lease and an explicit terminal lifecycle. JSONL remains canonical while a disposable
-  SQLite read projection accelerates reopen and rebuilds after drift or corruption;
-  nested payloads and replay results no longer share mutable references.
+  lease and an explicit terminal lifecycle. Replay always validates canonical JSONL;
+  the disposable SQLite read projection is retained only when it matches JSONL and
+  rebuilds after drift or corruption. Nested payloads and replay results no longer
+  share mutable references.
 - **Frozen per-turn tool exposure**: each model request and its action dispatcher now
   share one revisioned, read-only `ToolExposure`. Applications can select by tool
   group or policy, later registry changes wait until the next turn, and the Journal
