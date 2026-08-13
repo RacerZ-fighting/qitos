@@ -109,14 +109,15 @@ remaining time, retry backoff observes both deadline and cancellation, and no ne
 attempt starts after either becomes terminal. Provider cancellation propagates through
 the async stream instead of detaching work onto a daemon thread.
 
-The Engine uses a transactional stream for OpenAI-compatible models: text and tool-call
-deltas stay private until a terminal event completes the attempt. A retryable failure
-after partial output closes that stream, discards its buffered deltas, and retries within
+The Engine publishes non-terminal text, reasoning, and tool-call deltas immediately.
+Connection failures and stream failures before the first provider event may retry within
 both the `max_attempts` budget and `retry_window_seconds`, measured from the first
-retryable failure. A healthy long response may run beyond `timeout` while events
+retryable failure. Once an event has arrived, QitOS never replays that attempt: a later
+failure closes the stream and surfaces the error, so visible output and tool-call deltas
+cannot be duplicated. The terminal chunk is held until provider EOF confirms that no
+late event follows it. A healthy long response may run beyond `timeout` while events
 continue only when no earlier Engine deadline applies; `stream_idle_timeout` detects a
-stalled response. Direct callers use the same `stream()` transaction and therefore see
-only chunks from a completed attempt.
+stalled response. Direct callers use the same live `stream()` contract.
 
 All model stream paths use `ModelStreamChunk` as the normalized contract. Its terminal
 chunk retains the provider's actual `finish_reason`; text, reasoning, typed event

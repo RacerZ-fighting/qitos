@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Actually live model deltas**: model transports now publish text, reasoning, and
+  tool-call deltas as they arrive. Retries are limited to failures before the first
+  provider event, preventing duplicate visible output or tool calls; success remains
+  transactional because the terminal chunk is held until provider EOF.
 - **Native Anthropic preset reasoning**: Anthropic family presets now build the
   official Messages adapter. Claude 4.5 reasoning effort resolves to a bounded manual
   thinking budget, request defaults reach the wire payload, and thinking requests omit
@@ -127,10 +131,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Runtime input and idle wait**: background work can post a small event to an exact
   Engine run. Explicit runtime waits sleep without model polling or step growth and
   wake on input, cancellation, or the run deadline.
-- **Transactional OpenAI-compatible streams**: Engine calls use one explicit QitOS
-  retry budget with SDK retries disabled. Retryable mid-stream failures discard partial
-  text and tool calls before retrying within a 300-second recovery window by default,
-  and an event-idle timeout detects stalled streams
+- **Live OpenAI-compatible streams**: Engine calls use one explicit QitOS retry budget
+  with SDK retries disabled. Connection and pre-event failures can retry within a
+  300-second recovery window by default; after the first provider event, deltas stay
+  live and failures stop without replay. An event-idle timeout detects stalled streams
   without cutting off healthy long responses.
 - **Readable tool evidence**: tools can now project a compact `model_summary`
   into native tool-call history without discarding their full structured result

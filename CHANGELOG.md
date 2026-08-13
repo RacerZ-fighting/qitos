@@ -90,6 +90,10 @@ How to update:
 
 ### Changed
 
+- Model transports now publish non-terminal text, reasoning, and tool-call deltas
+  immediately. Retries remain available before the first provider event, but an
+  observable attempt is never replayed; its terminal chunk is committed only after
+  provider EOF confirms that no late event follows it.
 - **Breaking:** Removed the `read_only` and `allow_destructive` model arguments from
   `run_command`. Applications that need command admission enforce it before execution.
 - Oversized tool results now retain canonical output for reducers and traces while
@@ -157,10 +161,10 @@ How to update:
   delegated in one response for concurrent execution, while dependent steps and cheap
   mechanical variants remain in the parent. Explicit tool guidance is no longer replaced
   by the `execute()` implementation docstring during initialization.
-- Model calls now use transactional streaming. Retryable mid-stream failures discard
-  the failed attempt's partial text and tool calls before retrying within the
-  QitOS-owned attempt budget and absolute request deadline; active streams use a
-  bounded event-idle timeout.
+- Model calls use one live streaming transaction. Connection and pre-event failures
+  may retry within the QitOS-owned attempt budget and absolute request deadline;
+  observable attempts are never replayed, and active streams use a bounded event-idle
+  timeout.
 - OpenAI-compatible clients now disable OpenAI SDK retries on paths where QitOS owns the
   retry budget, preventing multiplicative retry delays.
 - Raised the optional OpenAI SDK floor to `openai>=1.66.0` and taught compact history to preserve active Responses function-call rounds atomically.

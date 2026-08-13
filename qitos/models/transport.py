@@ -313,13 +313,20 @@ async def transactional_stream_with_retry(
     deadline_monotonic: float | None,
     is_terminal: Callable[[EventT], bool],
 ) -> AsyncIterator[EventT]:
-    """Publish only a complete stream attempt and discard failed attempts."""
+    """Publish live deltas and retry only before an attempt becomes observable.
+
+    Non-terminal events are yielded immediately. The single terminal event is held
+    until provider EOF so callers never observe a successful terminal followed by a
+    late provider event. Once any event has arrived, failure ends the request instead
+    of replaying the attempt and duplicating visible output or tool-call deltas.
+    """
 
     retry_deadline: float | None = None
     for attempt in range(1, policy.max_attempts + 1):
         ensure_request_active(deadline_monotonic)
         stream: AsyncIterator[EventT] | None = None
-        buffered: list[EventT] = []
+        terminal: list[EventT] = []
+        published = False
         terminal_seen = False
         try:
             stream = await await_with_deadline(
@@ -352,8 +359,12 @@ async def transactional_stream_with_retry(
                         attempts=1,
                         retryable=False,
                     )
-                buffered.append(event)
                 terminal_seen = is_terminal(event)
+                if terminal_seen:
+                    terminal.append(event)
+                    continue
+                published = True
+                yield event
             if not terminal_seen:
                 raise _IncompleteStreamError(
                     "model stream ended before its terminal event"
@@ -364,12 +375,14 @@ async def transactional_stream_with_retry(
             raise
         except Exception as exc:
             ensure_request_active(deadline_monotonic)
-            delay, retry_deadline = _next_retry(
-                exc,
-                failed_attempt=attempt,
-                policy=policy,
-                retry_deadline=retry_deadline,
-            )
+            delay = None
+            if not published and not terminal_seen:
+                delay, retry_deadline = _next_retry(
+                    exc,
+                    failed_attempt=attempt,
+                    policy=policy,
+                    retry_deadline=retry_deadline,
+                )
             if delay is None:
                 if not _is_transport_failure(exc):
                     raise
@@ -386,8 +399,7 @@ async def transactional_stream_with_retry(
             await close_async_resource(stream)
 
         ensure_request_active(deadline_monotonic)
-        for event in buffered:
-            yield event
+        yield terminal[0]
         return
     raise AssertionError("unreachable retry loop")
 

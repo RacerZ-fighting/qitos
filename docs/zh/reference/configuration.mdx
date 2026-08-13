@@ -75,6 +75,11 @@ OpenAI SDK 的内置重试固定关闭，`ModelRetryPolicy` 是唯一重试 owne
 时间收紧 provider timeout，backoff 同时响应 deadline 与立即取消。Provider 取消会沿异步流向下传播，
 不再把工作分离到 daemon 线程。
 
+非终态的文本、reasoning 与工具调用分片会在到达后立即发布。连接失败或首个 provider
+event 之前的断流可以在 attempt 与恢复窗口内重试；一旦已经收到 event，本次 attempt
+不会重放，后续失败会关闭流并直接报错，避免重复可见输出或工具调用。terminal chunk
+会保留到 provider EOF，确认没有终态后的迟到 event 再提交。
+
 所有模型流都使用 `ModelStreamChunk` 作为统一契约。终态 chunk 会保留供应商实际的
 `finish_reason`，文本、reasoning、类型化事件元数据、完整工具调用、原生 item 与 usage
 保持为独立字段。Chat 工具参数分片使用 `event_type="tool_call.delta"`；Responses 则
