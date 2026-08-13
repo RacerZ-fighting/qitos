@@ -8,10 +8,12 @@ import pytest
 from qitos import AgentModule, StateSchema
 from qitos.core.action import Action, ActionStatus
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool import ToolPermissionContext, ToolPermissionRule
 from qitos.core.tool_registry import ToolRegistry
 from qitos.engine.action_executor import ActionExecutor
 from qitos.engine.engine import Engine
 from qitos.engine.interrupt import EngineInterrupt
+from qitos.kit.permission import PermissionPipeline
 
 
 # --- Test tools ---
@@ -136,6 +138,47 @@ class TestNeedsApproval:
         action = Action(name="read_and_approve", args={"path": "/etc/passwd"})
         with pytest.raises(EngineInterrupt):
             executor._execute_one(action)
+
+    def test_permission_pipeline_replaces_static_approval_fallback(self):
+        """A configured pipeline owns parameter-level approval decisions."""
+        ts = _TestToolSet()
+        registry = ToolRegistry().register_toolset(ts, namespace="")
+        executor = ActionExecutor(
+            tool_registry=registry,
+            auto_approve=False,
+            permission_pipeline=PermissionPipeline(),
+        )
+
+        action = Action(name="approval_action", args={"command": "echo hello"})
+        result = executor._execute_one(action)
+
+        assert result.status is ActionStatus.SUCCESS
+
+    def test_permission_pipeline_can_deny_static_approval_tool(self):
+        ts = _TestToolSet()
+        registry = ToolRegistry().register_toolset(ts, namespace="")
+        context = ToolPermissionContext(
+            deny_rules=[
+                ToolPermissionRule(
+                    effect="deny",
+                    tool_name="approval_action",
+                    scope="echo blocked",
+                    message="blocked by policy",
+                )
+            ]
+        )
+        executor = ActionExecutor(
+            tool_registry=registry,
+            auto_approve=True,
+            permission_pipeline=PermissionPipeline(context=context),
+        )
+
+        action = Action(name="approval_action", args={"command": "echo blocked"})
+        result = executor._execute_one(action)
+
+        assert result.status is ActionStatus.DENIED
+        assert result.metadata["executed"] is False
+        assert result.metadata["error_category"] == "permission_denied"
 
 
 class TestReadOnly:

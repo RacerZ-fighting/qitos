@@ -12,6 +12,7 @@ def function_tool(
     *,
     name: Optional[str] = None,
     description: Optional[str] = None,
+    group: str = "default",
     timeout_s: Optional[float] = None,
     retry_policy: Optional[RetryPolicy] = None,
     on_failure: Optional[Callable] = None,
@@ -37,6 +38,7 @@ def function_tool(
         meta = ToolMeta(
             name=name,
             description=description,
+            group=group,
             timeout_s=timeout_s,
             retry_policy=retry_policy,
             on_failure=on_failure,

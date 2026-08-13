@@ -18,6 +18,7 @@ from .model_response import ModelResponse
 from .spec import ExperimentSpec, RunSpec
 from .task import Task, TaskBudget
 from .tool_result import ToolResult
+from .tool_registry import ToolExposure, ToolRegistry
 from ..prompting import PromptBuildResult, PromptBuilder, PromptSpec
 
 
@@ -196,13 +197,32 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         """Return the prompt builder instance used for default prompt assembly."""
         return PromptBuilder()
 
+    def build_tool_exposure(
+        self,
+        state: StateT,
+        tool_registry: ToolRegistry,
+    ) -> ToolExposure:
+        """Freeze the tools available to one model turn and its actions.
+
+        Product agents may override this to select a subset. The returned
+        exposure is the single source for both model projection and dispatch.
+        """
+
+        _ = state
+        return tool_registry.freeze()
+
+    def _prompt_tool_registry(self) -> Any:
+        exposure = getattr(self, "_runtime_tool_exposure", None)
+        return exposure if isinstance(exposure, ToolExposure) else self.tool_registry
+
     def render_tool_schema(self, protocol: Any = None) -> str:
-        if self.tool_registry is None:
+        tool_registry = self._prompt_tool_registry()
+        if tool_registry is None:
             return ""
         resolved = protocol if protocol is not None else self.active_protocol()
-        if hasattr(self.tool_registry, "render_tool_schema"):
-            return self.tool_registry.render_tool_schema(protocol=resolved)
-        return self.tool_registry.get_tool_descriptions(protocol=resolved)
+        if hasattr(tool_registry, "render_tool_schema"):
+            return tool_registry.render_tool_schema(protocol=resolved)
+        return tool_registry.get_tool_descriptions(protocol=resolved)
 
     def compose_system_prompt(self, base_prompt: str, protocol: Any = None) -> str:
         resolved = protocol if protocol is not None else self.active_protocol()
@@ -211,7 +231,7 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
             result = self.prompt_builder().build(
                 spec=spec,
                 protocol=resolved,
-                tool_registry=self.tool_registry,
+                tool_registry=self._prompt_tool_registry(),
                 llm=self.llm,
                 resolution_source="compose_system_prompt",
             )
@@ -247,7 +267,7 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
             scaffold = builder.build(
                 spec=scaffold_spec,
                 protocol=self.active_protocol(),
-                tool_registry=self.tool_registry,
+                tool_registry=self._prompt_tool_registry(),
                 llm=self.llm,
                 state=state,
                 resolution_source="agent_override",
@@ -285,7 +305,7 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         return self.prompt_builder().build(
             spec=spec,
             protocol=self.active_protocol(),
-            tool_registry=self.tool_registry,
+            tool_registry=self._prompt_tool_registry(),
             llm=self.llm,
             state=state,
             resolution_source=str(resolution_source or "agent_default"),

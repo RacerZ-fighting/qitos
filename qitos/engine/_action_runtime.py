@@ -47,7 +47,8 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 payload={"stage": "skipped", "reason": "decision_not_act"},
             )
             return []
-        if engine.executor is None:
+        executor = engine._action_executor_for_step(record.step_id)
+        if executor is None:
             raise RuntimeError("No tool registry configured for action execution")
 
         actions: List[Action] = []
@@ -257,12 +258,12 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             record,
         )
         execution = await asyncio.to_thread(
-            engine.executor.execute,
+            executor.execute,
             executable_actions,
             env=engine.env,
             state=state,
         )
-        exec_stats = dict(getattr(engine.executor, "last_execution_stats", {}) or {})
+        exec_stats = dict(getattr(executor, "last_execution_stats", {}) or {})
         # Build tool_invocations from execution results (executable only)
         exec_invocations = [
             {

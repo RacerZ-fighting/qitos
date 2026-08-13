@@ -48,6 +48,7 @@ from ..core.spec import ExperimentSpec, RunSpec
 from ..core.state import StateSchema
 from ..core.task import Task, TaskResult, TaskValidationIssue
 from ..core.tool_result import ToolResult
+from ..core.tool_registry import ToolExposure
 from ..trace import TraceWriter
 from ..protocols import get_protocol, infer_protocol_from_parser
 from ..models.profile_registry import infer_default_protocol, infer_model_profile
@@ -357,6 +358,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_prompt_metadata: Dict[str, Any] = {}
         self._last_context_telemetry: Dict[str, Any] = {}
         self._last_runtime_error: Optional[Dict[str, Any]] = None
+        self._active_tool_exposure: ToolExposure | None = None
+        self._active_tool_exposure_step_id: int | None = None
         self._model_runtime: _ModelRuntime[StateT, ObservationT, ActionT] = (
             _ModelRuntime(self)
         )
@@ -443,6 +446,26 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             permission_interaction_callback=self._permission_interaction_callback,
             auto_approve=self.auto_approve,
         )
+
+    def _capture_tool_exposure(
+        self,
+        state: StateT,
+        step_id: int,
+    ) -> ToolExposure:
+        exposure = self.agent.build_tool_exposure(state, self.tool_registry)
+        if not isinstance(exposure, ToolExposure):
+            raise TypeError("Agent.build_tool_exposure() must return ToolExposure")
+        self._active_tool_exposure = exposure
+        self._active_tool_exposure_step_id = step_id
+        return exposure
+
+    def _action_executor_for_step(self, step_id: int) -> ActionExecutor | None:
+        if (
+            self._active_tool_exposure is not None
+            and self._active_tool_exposure_step_id == step_id
+        ):
+            return self._build_action_executor(self._active_tool_exposure)
+        return self.executor
 
     def cancel(self, mode: str = "immediate") -> None:
         """Request cancellation of an in-flight run.
@@ -2996,6 +3019,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._resolved_protocol = None
         self._resolved_protocol_source = ""
         self._last_prompt_metadata = {}
+        self._active_tool_exposure = None
+        self._active_tool_exposure_step_id = None
         self._runtime_deadline_monotonic = None
         self._last_checkpoint_id = None
         self._canonical_action_results = []

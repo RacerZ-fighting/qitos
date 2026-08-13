@@ -205,6 +205,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         self, state: StateT, observation: ObservationT, record: StepRecord
     ) -> Decision[ActionT]:
         engine = self.engine
+        engine._capture_tool_exposure(state, record.step_id)
         engine._dispatch_hook(
             "on_before_decide",
             engine._hook_context(
@@ -367,6 +368,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         setattr(
             engine.agent, "_runtime_protocol_source", engine._resolved_protocol_source
         )
+        setattr(engine.agent, "_runtime_tool_exposure", engine._active_tool_exposure)
         try:
             prompt_bundle = engine.agent.build_prompt_bundle(state)
             system_prompt = prompt_bundle.system_prompt
@@ -380,6 +382,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 delattr(engine.agent, "_runtime_protocol")
             if hasattr(engine.agent, "_runtime_protocol_source"):
                 delattr(engine.agent, "_runtime_protocol_source")
+            if hasattr(engine.agent, "_runtime_tool_exposure"):
+                delattr(engine.agent, "_runtime_tool_exposure")
         prompt_metadata = dict(getattr(prompt_bundle, "metadata", {}) or {})
         engine._last_prompt_metadata = dict(prompt_metadata)
         if engine.trace_writer is not None:

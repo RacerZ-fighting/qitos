@@ -32,11 +32,18 @@ class ToolPermissionSpec:
     concurrency_safe: Optional[bool] = None
     required_ops: List[str] = field(default_factory=list)
     environment_ops: List[str] = field(default_factory=list)
+    group: str = "default"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.group, str) or not self.group.strip():
+            raise ValueError("group must be a non-empty string")
+        object.__setattr__(self, "group", self.group.strip())
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "description": self.description,
+            "group": self.group,
             "permissions": asdict(self.permissions),
             "needs_approval": self.needs_approval,
             "read_only": self.read_only,
@@ -77,6 +84,19 @@ class ToolPermissionRule:
     tool_family: str = ""
     scope: str = ""
     message: str = ""
+
+    def __post_init__(self) -> None:
+        if self.effect not in {"allow", "deny", "ask"}:
+            raise ValueError("effect must be 'allow', 'deny', or 'ask'")
+
+    def to_dict(self) -> Dict[str, str]:
+        return {
+            "effect": self.effect,
+            "tool_name": self.tool_name,
+            "tool_family": self.tool_family,
+            "scope": self.scope,
+            "message": self.message,
+        }
 
     def matches(self, tool_name: str, scope: str = "") -> bool:
         normalized_tool = str(tool_name or "")
@@ -144,6 +164,25 @@ class ToolPermissionContext:
     ask_rules: List[ToolPermissionRule] = field(default_factory=list)
     default_decision: str = "allow"
 
+    def __post_init__(self) -> None:
+        if self.default_decision not in {"allow", "deny", "ask"}:
+            raise ValueError("default_decision must be 'allow', 'deny', or 'ask'")
+        for expected, rules in (
+            ("allow", self.allow_rules),
+            ("deny", self.deny_rules),
+            ("ask", self.ask_rules),
+        ):
+            if any(rule.effect != expected for rule in rules):
+                raise ValueError(f"{expected}_rules must contain {expected!r} rules")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "allow_rules": [rule.to_dict() for rule in self.allow_rules],
+            "deny_rules": [rule.to_dict() for rule in self.deny_rules],
+            "ask_rules": [rule.to_dict() for rule in self.ask_rules],
+            "default_decision": self.default_decision,
+        }
+
     def evaluate(self, tool_name: str, scope: str = "") -> ToolPermissionDecision:
         for rule in self.deny_rules:
             if rule.matches(tool_name, scope):
@@ -176,7 +215,7 @@ class ToolPermissionContext:
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "ToolPermissionContext":
-        def _rules(items: Any) -> List[ToolPermissionRule]:
+        def _rules(items: Any, expected_effect: str) -> List[ToolPermissionRule]:
             rules: List[ToolPermissionRule] = []
             for item in list(items or []):
                 if isinstance(item, ToolPermissionRule):
@@ -186,7 +225,7 @@ class ToolPermissionContext:
                     continue
                 rules.append(
                     ToolPermissionRule(
-                        effect=str(item.get("effect", "")),
+                        effect=str(item.get("effect") or expected_effect),
                         tool_name=str(item.get("tool_name", "")),
                         tool_family=str(item.get("tool_family", "")),
                         scope=str(item.get("scope", "")),
@@ -196,9 +235,9 @@ class ToolPermissionContext:
             return rules
 
         return cls(
-            allow_rules=_rules(payload.get("allow_rules")),
-            deny_rules=_rules(payload.get("deny_rules")),
-            ask_rules=_rules(payload.get("ask_rules")),
+            allow_rules=_rules(payload.get("allow_rules"), "allow"),
+            deny_rules=_rules(payload.get("deny_rules"), "deny"),
+            ask_rules=_rules(payload.get("ask_rules"), "ask"),
             default_decision=str(payload.get("default_decision", "allow")),
         )
 
@@ -265,8 +304,12 @@ class ToolSpec:
     produces_artifact: bool = False
     rule_scope_builder: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None
     prompt: str = ""
+    group: str = "default"
 
     def __post_init__(self) -> None:
+        if not isinstance(self.group, str) or not self.group.strip():
+            raise ValueError("group must be a non-empty string")
+        self.group = self.group.strip()
         if self.timeout_s is not None and self.timeout_s <= 0:
             raise ValueError("timeout_s must be positive or None")
         if not isinstance(self.needs_approval, bool):
@@ -298,6 +341,7 @@ class ToolMeta:
     result_max_chars: Optional[int] = None
     produces_artifact: bool = False
     rule_scope_builder: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None
+    group: str = "default"
 
 
 class BaseTool(ABC):
@@ -438,6 +482,7 @@ def tool(
     result_max_chars: Optional[int] = None,
     produces_artifact: bool = False,
     rule_scope_builder: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
+    group: str = "default",
 ):
     """Decorator that marks a callable as a QitOS tool without changing binding semantics."""
 
@@ -445,6 +490,7 @@ def tool(
         meta = ToolMeta(
             name=name,
             description=description,
+            group=group,
             prompt=prompt,
             timeout_s=timeout_s,
             retry_policy=retry_policy,
@@ -599,6 +645,7 @@ def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
     return ToolSpec(
         name=cast(str, tool_name),
         description=inspect.cleandoc(desc) if desc else "",
+        group=meta.group,
         parameters=params,
         required=required,
         timeout_s=meta.timeout_s,

@@ -76,7 +76,7 @@ from .tool_schema import function_schema, type_to_json_schema, parse_docstring
 from .function_tool_decorator import function_tool
 from .channel import Append, Replace, Ephemeral, last_value, append_list, dict_merge, add_messages
 from .field_reducers import FieldReducerRegistry
-from .tool_registry import ToolRegistry
+from .tool_registry import ToolExposure, ToolRegistry
 from .work_plan import (
     MAX_WORK_PLAN_EXPLANATION_CHARS,
     MAX_WORK_PLAN_ITEMS,
@@ -190,6 +190,7 @@ __all__ = [
     "add_messages",
     "FieldReducerRegistry",
     "ToolRegistry",
+    "ToolExposure",
     "MAX_WORK_PLAN_EXPLANATION_CHARS",
     "MAX_WORK_PLAN_ITEMS",
     "MAX_WORK_PLAN_STEP_CHARS",

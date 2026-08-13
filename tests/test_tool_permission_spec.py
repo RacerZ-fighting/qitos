@@ -6,7 +6,12 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from qitos.core.tool import ToolPermission, ToolPermissionSpec
+from qitos.core.tool import (
+    ToolPermission,
+    ToolPermissionContext,
+    ToolPermissionRule,
+    ToolPermissionSpec,
+)
 from qitos.core.tool_registry import ToolRegistry
 
 
@@ -114,3 +119,28 @@ class TestToolRegistryExportPermissions:
         names = [s.name for s in specs]
         assert "tool_a" in names
         assert "tool_b" in names
+
+
+def test_permission_context_round_trips_without_shared_rules() -> None:
+    source = ToolPermissionContext(
+        deny_rules=[
+            ToolPermissionRule(
+                effect="deny",
+                tool_name="write_file",
+                scope="blocked.txt",
+            )
+        ],
+        default_decision="ask",
+    )
+
+    restored = ToolPermissionContext.from_dict(source.to_dict())
+    restored.deny_rules[0].scope = "changed.txt"
+
+    assert source.deny_rules[0].scope == "blocked.txt"
+    assert restored.default_decision == "ask"
+
+
+@pytest.mark.parametrize("decision", ["", "approve", "DENY"])
+def test_permission_context_rejects_unknown_default(decision: str) -> None:
+    with pytest.raises(ValueError, match="default_decision"):
+        ToolPermissionContext(default_decision=decision)

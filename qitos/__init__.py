@@ -47,7 +47,7 @@ from .core.tool import (
     ToolValidationResult,
     tool,
 )
-from .core.tool_registry import ToolRegistry
+from .core.tool_registry import ToolExposure, ToolRegistry
 from .core.agent_spec import (
     AgentSpec,
     AgentRegistry,
@@ -110,6 +110,7 @@ __all__ = [
     "ToolPermissionRule",
     "ToolValidationResult",
     "ToolRegistry",
+    "ToolExposure",
     "AgentSpec",
     "AgentRegistry",
     "ContextStrategy",

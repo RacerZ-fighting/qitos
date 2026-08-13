@@ -821,9 +821,10 @@ class ActionExecutor:
         if stop_result is not None:
             return stop_result
 
-        # 2. Check needs_approval — triggers interrupt() for human approval
+        # A configured permission pipeline owns parameter-level allow/deny/ask.
+        # Static needs_approval remains the fallback for simpler callers.
         _auto_approved = False
-        if tool.spec.needs_approval:
+        if tool.spec.needs_approval and self._pipeline is None:
             if self.auto_approve:
                 _auto_approved = True
             else:
@@ -845,7 +846,10 @@ class ActionExecutor:
                         tool_meta=tool_meta,
                         output={"message": "User denied approval"},
                         error="User denied approval",
-                        extra_metadata={"error_category": "approval_denied"},
+                        extra_metadata={
+                            "error_category": "approval_denied",
+                            "executed": False,
+                        },
                     )
 
         stop_result = self._action_stop_result(
@@ -898,6 +902,7 @@ class ActionExecutor:
                 extra_metadata={
                     **ordering_meta,
                     "error_category": "permission_denied",
+                    "executed": False,
                     "permission": self._permission_payload(permission),
                 },
             )
@@ -952,6 +957,7 @@ class ActionExecutor:
                         extra_metadata={
                             **ordering_meta,
                             "error_category": "permission_denied",
+                            "executed": False,
                             "permission": self._permission_payload(permission),
                         },
                     )
@@ -973,6 +979,7 @@ class ActionExecutor:
                     extra_metadata={
                         **ordering_meta,
                         "error_category": "permission_ask",
+                        "executed": False,
                         "permission": self._permission_payload(permission),
                     },
                 )

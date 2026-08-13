@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
+import json
 import re
+from copy import copy, deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional
 
 from .tool import BaseTool, FunctionTool, ToolMeta, get_tool_meta
 
@@ -13,7 +16,7 @@ if TYPE_CHECKING:
     from .tool import ToolPermissionSpec
 
 
-@dataclass
+@dataclass(frozen=True)
 class ToolOrigin:
     source: str  # function | toolset
     toolset_name: Optional[str] = None
@@ -28,16 +31,35 @@ class ToolRegistry:
         self._origins: Dict[str, ToolOrigin] = {}
         self._toolsets: List[Any] = []
         self._setup_done: bool = False
+        self._revision: int = 0
+
+    @property
+    def revision(self) -> int:
+        """Return the monotonic revision of this registry's membership."""
+
+        return self._revision
+
+    def freeze(
+        self,
+        names: Iterable[str] | None = None,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "ToolExposure":
+        """Capture an immutable model-and-execution view of selected tools."""
+
+        selected = self.list_tools() if names is None else sorted(set(names))
+        missing = [name for name in selected if name not in self._tools]
+        if missing:
+            raise ValueError(f"Cannot expose unknown tools: {missing}")
+        return ToolExposure._capture(self, selected, metadata=metadata)
 
     def register(
         self, item: Any, name: Optional[str] = None, meta: Optional[ToolMeta] = None
     ) -> "ToolRegistry":
         tool_obj = self._to_tool(item, meta=meta)
         if name is not None:
-            from copy import copy
-
             tool_obj = copy(tool_obj)
-            tool_obj.spec = copy(tool_obj.spec)
+            tool_obj.spec = deepcopy(tool_obj.spec)
             tool_obj.spec.name = str(name)
         self._register_tool_object(tool_obj, origin=ToolOrigin(source="function"))
         return self
@@ -62,9 +84,8 @@ class ToolRegistry:
             # Create a shallow copy to avoid mutating the original tool's spec
             # when adding the namespace prefix. Without this, registering the
             # same toolset under different namespaces would corrupt the spec.
-            from copy import copy
             named_tool = copy(tool_obj)
-            named_tool.spec = copy(tool_obj.spec)
+            named_tool.spec = deepcopy(tool_obj.spec)
             named_tool.spec.name = full_name
             self._register_tool_object(
                 named_tool,
@@ -127,6 +148,7 @@ class ToolRegistry:
             raise ValueError(f"Tool '{name}' not found")
         tool = self._tools.pop(name)
         self._origins.pop(name, None)
+        self._revision += 1
         return tool
 
     def suggest(self, name: str, limit: int = 3) -> List[str]:
@@ -174,11 +196,12 @@ class ToolRegistry:
         return {
             "name": tool.name,
             "description": tool.spec.description,
+            "group": tool.spec.group,
             "prompt": tool.spec.prompt,
             "required_ops": list(tool.spec.required_ops),
             "environment_ops": list(tool.spec.environment_ops),
-            "input_schema": dict(tool.spec.input_schema or {}),
-            "output_schema": dict(tool.spec.output_schema or {}),
+            "input_schema": deepcopy(tool.spec.input_schema or {}),
+            "output_schema": deepcopy(tool.spec.output_schema or {}),
             "read_only": bool(tool.spec.read_only),
             "concurrency_safe": bool(tool.spec.concurrency_safe),
             "requires_user_interaction": bool(tool.spec.requires_user_interaction),
@@ -231,6 +254,8 @@ class ToolRegistry:
                 lines.append(
                     f"Environment Ops: {', '.join(tool.spec.environment_ops)}"
                 )
+            if tool.spec.group != "default":
+                lines.append(f"Group: {tool.spec.group}")
             if origin.toolset_name:
                 lines.append(f"ToolSet: {origin.toolset_name}@{origin.toolset_version}")
             lines.append("Parameters:")
@@ -254,14 +279,15 @@ class ToolRegistry:
                     "function": {
                         "name": tool.spec.name,
                         "description": tool.spec.description,
-                        "parameters": tool.spec.input_schema
+                        "parameters": deepcopy(tool.spec.input_schema)
                         or {
                             "type": "object",
-                            "properties": tool.spec.parameters,
-                            "required": tool.spec.required,
+                            "properties": deepcopy(tool.spec.parameters),
+                            "required": list(tool.spec.required),
                         },
-                        "output_schema": tool.spec.output_schema,
+                        "output_schema": deepcopy(tool.spec.output_schema),
                     },
+                    "group": tool.spec.group,
                     "origin": {
                         "source": origin.source,
                         "toolset_name": origin.toolset_name,
@@ -305,7 +331,8 @@ class ToolRegistry:
                 ToolPermissionSpec(
                     name=tool.spec.name,
                     description=tool.spec.description,
-                    permissions=tool.spec.permissions,
+                    group=tool.spec.group,
+                    permissions=deepcopy(tool.spec.permissions),
                     needs_approval=tool.spec.needs_approval,
                     read_only=tool.spec.read_only,
                     concurrency_safe=tool.spec.concurrency_safe,
@@ -327,6 +354,7 @@ class ToolRegistry:
             raise ValueError(f"Tool name collision: '{tool_obj.name}'")
         self._tools[tool_obj.name] = tool_obj
         self._origins[tool_obj.name] = origin
+        self._revision += 1
 
     def _include_toolset_item(self, item: Any) -> None:
         if item is None:
@@ -378,4 +406,111 @@ class ToolRegistry:
         return re.sub(r"[.\-_=]+", "", text)
 
 
-__all__ = ["ToolOrigin", "ToolRegistry"]
+class ToolExposure(ToolRegistry):
+    """Read-only registry snapshot shared by one model turn and its dispatch."""
+
+    _selection_metadata: Dict[str, Any]
+
+    def __init__(self) -> None:
+        raise TypeError("ToolExposure instances are created by ToolRegistry.freeze()")
+
+    @classmethod
+    def _capture(
+        cls,
+        source: ToolRegistry,
+        names: List[str],
+        *,
+        metadata: Mapping[str, Any] | None,
+    ) -> "ToolExposure":
+        exposure = object.__new__(cls)
+        exposure._tools = {}
+        exposure._origins = {}
+        exposure._toolsets = []
+        exposure._setup_done = True
+        exposure._revision = source.revision
+        exposure._selection_metadata = json.loads(
+            json.dumps(
+                dict(metadata or {}),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        for name in names:
+            tool = copy(source._tools[name])
+            tool.spec = deepcopy(source._tools[name].spec)
+            if hasattr(tool, "meta"):
+                tool.meta = deepcopy(tool.meta)
+            exposure._tools[name] = tool
+            exposure._origins[name] = deepcopy(
+                source._origins.get(name, ToolOrigin(source="function"))
+            )
+        return exposure
+
+    @property
+    def source_registry_revision(self) -> int:
+        return self._revision
+
+    @property
+    def selection_metadata(self) -> Dict[str, Any]:
+        return deepcopy(self._selection_metadata)
+
+    def audit_metadata(self) -> Dict[str, Any]:
+        """Return a stable, serializable identity for this frozen exposure."""
+
+        schemas = self.get_all_specs()
+        serialized = json.dumps(
+            schemas,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return {
+            "registry_revision": self.source_registry_revision,
+            "tool_names": self.list_tools(),
+            "schema_sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+            "selection": self.selection_metadata,
+        }
+
+    def get(self, name: str) -> Optional[BaseTool]:
+        tool = self._tools.get(name)
+        if tool is None:
+            return None
+        isolated = copy(tool)
+        isolated.spec = deepcopy(tool.spec)
+        if hasattr(isolated, "meta"):
+            isolated.meta = deepcopy(isolated.meta)
+        return isolated
+
+    def register(
+        self, item: Any, name: Optional[str] = None, meta: Optional[ToolMeta] = None
+    ) -> "ToolRegistry":
+        _ = item, name, meta
+        raise TypeError("ToolExposure is immutable")
+
+    def register_toolset(
+        self, toolset: Any, namespace: Optional[str] = None
+    ) -> "ToolRegistry":
+        _ = toolset, namespace
+        raise TypeError("ToolExposure is immutable")
+
+    def include_toolset(self, items: Any) -> "ToolRegistry":
+        _ = items
+        raise TypeError("ToolExposure is immutable")
+
+    def include(self, obj: Any) -> "ToolRegistry":
+        _ = obj
+        raise TypeError("ToolExposure is immutable")
+
+    def unregister(self, name: str) -> BaseTool:
+        _ = name
+        raise TypeError("ToolExposure is immutable")
+
+    def setup(self, context: Optional[Dict[str, Any]] = None) -> None:
+        _ = context
+
+    def teardown(self, context: Optional[Dict[str, Any]] = None) -> None:
+        _ = context
+
+
+__all__ = ["ToolExposure", "ToolOrigin", "ToolRegistry"]

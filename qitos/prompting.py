@@ -197,6 +197,9 @@ class PromptBuilder:
             "user_content_block_count": len(getattr(spec, "metadata", {}).get("user_content_blocks", []) or []),
             "state_kind": state.__class__.__name__ if state is not None else None,
         }
+        exposure_audit = getattr(tool_registry, "audit_metadata", None)
+        if callable(exposure_audit):
+            metadata["tool_exposure"] = exposure_audit()
         if spec.metadata:
             metadata["spec"] = dict(spec.metadata)
         return PromptBuildResult(

@@ -82,6 +82,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 "step_id": record.step_id,
                 "transaction_id": record.transaction_id,
                 "model_response": dict(record.model_response),
+                "prompt_metadata": dict(record.prompt_metadata),
                 "decision": decision_to_dict(decision),
                 "history_append": history_append,
             },
@@ -342,6 +343,12 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 raw_response = payload.get("model_response")
                 record.model_response = (
                     dict(raw_response) if isinstance(raw_response, Mapping) else {}
+                )
+                raw_prompt_metadata = payload.get("prompt_metadata")
+                record.prompt_metadata = (
+                    dict(raw_prompt_metadata)
+                    if isinstance(raw_prompt_metadata, Mapping)
+                    else {}
                 )
                 raw_decision = payload.get("decision")
                 if not isinstance(raw_decision, Mapping):
