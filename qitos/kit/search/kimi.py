@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-import requests
+import httpx
 
 from .capability import (
     WebSearchError,
@@ -35,7 +35,7 @@ class KimiWebSearchCapability:
         api_key: str,
         search_url: str = DEFAULT_KIMI_SEARCH_URL,
         timeout_seconds: float = 30.0,
-        session: requests.Session | None = None,
+        client: Any = None,
     ) -> None:
         if not api_key.strip():
             raise ValueError("Kimi web search requires a non-empty API key")
@@ -46,13 +46,16 @@ class KimiWebSearchCapability:
         self._api_key = api_key
         self._search_url = search_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
-        self._session = session or requests.Session()
+        self._owns_client = client is None
+        self._client = client or httpx.AsyncClient()
 
-    def search(self, query: str, *, max_results: int = 8) -> WebSearchResponse:
+    async def search(
+        self, query: str, *, max_results: int = 8
+    ) -> WebSearchResponse:
         normalized_query = _validate_query(query)
         normalized_limit = _validate_limit(max_results)
         try:
-            response = self._session.post(
+            response = await self._client.post(
                 self._search_url,
                 headers={
                     "Authorization": f"Bearer {self._api_key}",
@@ -61,9 +64,9 @@ class KimiWebSearchCapability:
                 json={"text_query": normalized_query},
                 timeout=self._timeout_seconds,
             )
-        except requests.Timeout as exc:
+        except httpx.TimeoutException as exc:
             raise WebSearchError("timeout", "Kimi web search timed out") from exc
-        except requests.RequestException as exc:
+        except httpx.RequestError as exc:
             raise WebSearchError("network", "Kimi web search request failed") from exc
 
         if response.status_code in {401, 403}:
@@ -104,6 +107,10 @@ class KimiWebSearchCapability:
             sources=sources,
         )
 
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
 
 class KimiBuiltinWebSearchCapability:
     """Run Kimi Open Platform's ``$web_search`` sidecar protocol."""
@@ -128,6 +135,7 @@ class KimiBuiltinWebSearchCapability:
         self._base_url = base_url
         self._timeout_seconds = timeout_seconds
         self._client = client
+        self._owns_client = client is None
 
     def _client_for_request(self) -> Any:
         if self._client is None:
@@ -137,7 +145,7 @@ class KimiBuiltinWebSearchCapability:
                 raise RuntimeError(
                     "Kimi builtin web search requires the qitos models extra"
                 ) from exc
-            self._client = openai.OpenAI(
+            self._client = openai.AsyncOpenAI(
                 api_key=self._api_key,
                 base_url=self._base_url,
                 timeout=self._timeout_seconds,
@@ -145,7 +153,9 @@ class KimiBuiltinWebSearchCapability:
             )
         return self._client
 
-    def search(self, query: str, *, max_results: int = 8) -> WebSearchResponse:
+    async def search(
+        self, query: str, *, max_results: int = 8
+    ) -> WebSearchResponse:
         normalized_query = _validate_query(query)
         normalized_limit = _validate_limit(max_results)
         messages: list[dict[str, Any]] = [
@@ -160,7 +170,7 @@ class KimiBuiltinWebSearchCapability:
         ]
         sources: list[WebSource] = []
         for _round in range(_MAX_TOOL_ROUNDS):
-            choice = self._completion(messages)
+            choice = await self._completion(messages)
             message = choice.message
             tool_calls = list(getattr(message, "tool_calls", None) or [])
             if tool_calls:
@@ -212,9 +222,9 @@ class KimiBuiltinWebSearchCapability:
             "protocol", "Kimi web search exceeded the builtin tool round limit"
         )
 
-    def _completion(self, messages: list[dict[str, Any]]) -> Any:
+    async def _completion(self, messages: list[dict[str, Any]]) -> Any:
         try:
-            completion = self._client_for_request().chat.completions.create(
+            completion = await self._client_for_request().chat.completions.create(
                 model=self._model,
                 messages=messages,
                 tools=[
@@ -234,6 +244,10 @@ class KimiBuiltinWebSearchCapability:
                 "protocol", "Kimi web search returned no completion choice"
             )
         return choices[0]
+
+    async def aclose(self) -> None:
+        if self._owns_client and self._client is not None:
+            await self._client.close()
 
 
 def _validate_query(query: str) -> str:

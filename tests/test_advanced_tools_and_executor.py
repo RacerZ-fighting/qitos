@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import threading
 import time
 from uuid import uuid4
+
+import pytest
 
 from qitos import Action, StateSchema, ToolPermissionContext, ToolPermissionRule, ToolRegistry
 from qitos.core.action import ActionExecutionPolicy, ActionStatus
@@ -21,6 +24,9 @@ from qitos.kit.tool import (
 )
 from qitos.kit.tool.file import EditFile, ReadFile
 from qitos.kit.tool.shell import RunCommand
+
+
+pytestmark = pytest.mark.asyncio
 
 
 class _EchoTool(BaseTool):
@@ -42,7 +48,7 @@ class _EchoTool(BaseTool):
             return ToolValidationResult.fail("bad input", code="bad_input")
         return ToolValidationResult.ok()
 
-    def execute(self, args, runtime_context=None):
+    async def execute(self, args, runtime_context=None):
         _ = runtime_context
         return {"result": args["value"]}
 
@@ -64,11 +70,11 @@ class _SleepReadTool(BaseTool):
             )
         )
 
-    def execute(self, args, runtime_context=None):
+    async def execute(self, args, runtime_context=None):
         _ = runtime_context
         with self._lock:
             self.starts.append(time.perf_counter())
-        time.sleep(self.delay)
+        await asyncio.sleep(self.delay)
         return {"value": args["value"]}
 
 
@@ -89,11 +95,11 @@ class _UnsafeSleepTool(BaseTool):
             )
         )
 
-    def execute(self, args, runtime_context=None):
+    async def execute(self, args, runtime_context=None):
         _ = runtime_context
         with self._lock:
             self.starts.append(time.perf_counter())
-        time.sleep(self.delay)
+        await asyncio.sleep(self.delay)
         return {"value": args["value"]}
 
 
@@ -101,7 +107,7 @@ class _MissingResultTool(BaseTool):
     def __init__(self) -> None:
         super().__init__(ToolSpec(name="MISSING", description="returns nothing"))
 
-    def execute(self, args, runtime_context=None):
+    async def execute(self, args, runtime_context=None):
         _ = args, runtime_context
         return None
 
@@ -118,20 +124,20 @@ class _CandidateReadyState(StateSchema):
     workspace_root: str = ""
 
 
-def test_action_executor_applies_validation_permission_and_truncation():
+async def test_action_executor_applies_validation_permission_and_truncation():
     registry = ToolRegistry().register(_EchoTool())
     executor = ActionExecutor(registry)
     state = _ExecutorState(task="demo")
 
-    ok = executor.execute(
+    ok = (await executor.execute(
         [Action(name="echo_tool", args={"value": "1234567890"})], state=state
-    )[0]
+    ))[0]
     assert ok.status == ActionStatus.SUCCESS
     assert ok.output["result"].endswith("[truncated]")
 
-    invalid = executor.execute(
+    invalid = (await executor.execute(
         [Action(name="echo_tool", args={"value": "bad"})], state=state
-    )[0]
+    ))[0]
     assert invalid.status == ActionStatus.ERROR
     assert invalid.metadata["error_category"] == "bad_input"
 
@@ -140,9 +146,9 @@ def test_action_executor_applies_validation_permission_and_truncation():
             ToolPermissionRule(effect="deny", tool_name="echo_tool", message="blocked")
         ]
     )
-    denied = executor.execute(
+    denied = (await executor.execute(
         [Action(name="echo_tool", args={"value": "ok"})], state=state
-    )[0]
+    ))[0]
     assert denied.status == ActionStatus.DENIED
     assert denied.output["message"] == "blocked"
 
@@ -153,18 +159,18 @@ def test_action_executor_applies_validation_permission_and_truncation():
             )
         ]
     )
-    ask = executor.execute(
+    ask = (await executor.execute(
         [Action(name="echo_tool", args={"value": "ok"})], state=state
-    )[0]
+    ))[0]
     assert ask.status == ActionStatus.NEEDS_APPROVAL
     assert ask.output["message"] == "need approval"
 
 
-def test_action_executor_reports_unknown_tool_without_name_repair():
+async def test_action_executor_reports_unknown_tool_without_name_repair():
     registry = ToolRegistry().register(_EchoTool(name="GREP"))
     executor = ActionExecutor(registry)
 
-    result = executor.execute([Action(name="Grep", args={"value": "x"})])[0]
+    result = (await executor.execute([Action(name="Grep", args={"value": "x"})]))[0]
 
     assert result.status == ActionStatus.ERROR
     assert result.metadata["error_category"] == "tool_not_found"
@@ -173,7 +179,7 @@ def test_action_executor_reports_unknown_tool_without_name_repair():
     assert "`GREP`" in result.output
 
 
-def test_action_executor_invokes_only_execute():
+async def test_action_executor_invokes_only_execute():
     tool = _EchoTool()
 
     def forbidden_entry(*args, **kwargs):
@@ -184,18 +190,20 @@ def test_action_executor_invokes_only_execute():
     setattr(tool, "run", forbidden_entry)
     registry = ToolRegistry().register(tool)
 
-    result = ActionExecutor(registry).execute(
-        [Action(name="echo_tool", args={"value": "ok"})]
+    result = (
+        await ActionExecutor(registry).execute(
+            [Action(name="echo_tool", args={"value": "ok"})]
+        )
     )[0]
 
     assert result.status == ActionStatus.SUCCESS
     assert result.output == {"result": "ok"}
 
 
-def test_action_executor_reports_missing_result_instead_of_none():
+async def test_action_executor_reports_missing_result_instead_of_none():
     executor = ActionExecutor(ToolRegistry().register(_MissingResultTool()))
 
-    result = executor.execute([Action(name="MISSING", args={})])[0]
+    result = (await executor.execute([Action(name="MISSING", args={})]))[0]
 
     assert result.status == ActionStatus.ERROR
     assert result.output is not None
@@ -203,7 +211,7 @@ def test_action_executor_reports_missing_result_instead_of_none():
     assert result.metadata["error_category"] == "tool_result_missing"
 
 
-def test_action_executor_does_not_embed_agent_specific_candidate_policy(tmp_path):
+async def test_action_executor_does_not_embed_agent_specific_candidate_policy(tmp_path):
     (tmp_path / "poc.bin").write_bytes(b"candidate")
     registry = ToolRegistry().register(_EchoTool()).register(_EchoTool(name="submit_poc"))
     executor = ActionExecutor(registry)
@@ -214,20 +222,20 @@ def test_action_executor_does_not_embed_agent_specific_candidate_policy(tmp_path
         candidate_ready_for_submit=True,
     )
 
-    blocked = executor.execute(
+    blocked = (await executor.execute(
         [Action(name="echo_tool", args={"value": "ignored"})],
         state=state,
-    )[0]
-    allowed = executor.execute(
+    ))[0]
+    allowed = (await executor.execute(
         [Action(name="submit_poc", args={"value": "poc.bin"})],
         state=state,
-    )[0]
+    ))[0]
 
     assert blocked.status == ActionStatus.SUCCESS
     assert allowed.status == ActionStatus.SUCCESS
 
 
-def test_action_executor_allows_regeneration_when_ready_candidate_file_missing(tmp_path):
+async def test_action_executor_allows_regeneration_when_ready_candidate_file_missing(tmp_path):
     registry = ToolRegistry().register(_EchoTool())
     executor = ActionExecutor(registry)
     state = _CandidateReadyState(
@@ -237,15 +245,15 @@ def test_action_executor_allows_regeneration_when_ready_candidate_file_missing(t
         candidate_ready_for_submit=True,
     )
 
-    result = executor.execute(
+    result = (await executor.execute(
         [Action(name="echo_tool", args={"value": "regenerate"})],
         state=state,
-    )[0]
+    ))[0]
 
     assert result.status == ActionStatus.SUCCESS
 
 
-def test_action_executor_runs_concurrency_safe_read_only_tools_in_parallel():
+async def test_action_executor_runs_concurrency_safe_read_only_tools_in_parallel():
     tool = _SleepReadTool()
     registry = ToolRegistry().register(tool)
     executor = ActionExecutor(
@@ -254,7 +262,7 @@ def test_action_executor_runs_concurrency_safe_read_only_tools_in_parallel():
     )
 
     started = time.perf_counter()
-    results = executor.execute(
+    results = await executor.execute(
         [
             Action(name="sleep_read_tool", args={"value": "a"}),
             Action(name="sleep_read_tool", args={"value": "b"}),
@@ -269,7 +277,7 @@ def test_action_executor_runs_concurrency_safe_read_only_tools_in_parallel():
     assert max(tool.starts) - min(tool.starts) < 0.08
 
 
-def test_action_executor_keeps_non_concurrency_safe_tools_serial_even_in_parallel_mode():
+async def test_action_executor_keeps_non_concurrency_safe_tools_serial_even_in_parallel_mode():
     tool = _UnsafeSleepTool()
     registry = ToolRegistry().register(tool)
     executor = ActionExecutor(
@@ -278,7 +286,7 @@ def test_action_executor_keeps_non_concurrency_safe_tools_serial_even_in_paralle
     )
 
     started = time.perf_counter()
-    results = executor.execute(
+    results = await executor.execute(
         [
             Action(name="unsafe_sleep_tool", args={"value": "a"}),
             Action(name="unsafe_sleep_tool", args={"value": "b"}),
@@ -293,63 +301,63 @@ def test_action_executor_keeps_non_concurrency_safe_tools_serial_even_in_paralle
     assert tool.starts[1] - tool.starts[0] >= 0.04
 
 
-def test_run_command_executes_in_workspace(tmp_path):
+async def test_run_command_executes_in_workspace(tmp_path):
     tool = RunCommand(workspace_root=str(tmp_path))
-    result = tool.execute({"command": "pwd"})
+    result = await tool.execute({"command": "pwd"})
     assert result["status"] == "success"
     assert str(tmp_path) in result["stdout"]
 
 
-def test_run_command_executes_compound_shell_syntax_after_admission(tmp_path):
+async def test_run_command_executes_compound_shell_syntax_after_admission(tmp_path):
     first = uuid4().hex
     second = uuid4().hex
     tool = RunCommand(workspace_root=str(tmp_path))
 
-    result = tool.execute({"command": f"printf {first} && printf {second}"})
+    result = await tool.execute({"command": f"printf {first} && printf {second}"})
 
     assert result["status"] == "success"
     assert result["stdout"] == first + second
 
 
-def test_run_command_does_not_repeat_permission_checks(tmp_path):
+async def test_run_command_does_not_repeat_permission_checks(tmp_path):
     name = uuid4().hex
     target = tmp_path / name
     target.write_text(uuid4().hex, encoding="utf-8")
     tool = RunCommand(workspace_root=str(tmp_path))
 
-    result = tool.execute({"command": f"rm -rf {name}"})
+    result = await tool.execute({"command": f"rm -rf {name}"})
 
     assert result["status"] == "success"
     assert not target.exists()
 
 
-def test_read_and_edit_file_preserve_line_endings(tmp_path):
+async def test_read_and_edit_file_preserve_line_endings(tmp_path):
     path = tmp_path / "demo.txt"
     path.write_bytes(b"hello\r\nworld\r\n")
 
     reader = ReadFile(workspace_root=str(tmp_path))
-    read_out = reader.execute({"path": "demo.txt"})
+    read_out = await reader.execute({"path": "demo.txt"})
     assert read_out["status"] == "success"
     assert "hello" in read_out["content"]
 
     editor = EditFile(workspace_root=str(tmp_path))
-    edit_out = editor.execute(
+    edit_out = await editor.execute(
         {"path": "demo.txt", "old_text": "world", "new_text": "qitos"}
     )
     assert edit_out["status"] == "success"
     assert b"\r\n" in path.read_bytes()
 
-    replaced = editor.execute(
+    replaced = await editor.execute(
         {"path": "demo.txt", "old_text": "qitos", "new_text": "done"}
     )
     assert replaced["status"] == "success"
     assert "done" in path.read_text(encoding="utf-8")
 
 
-def test_web_fetch_handles_redirect_and_text_extraction(monkeypatch):
+async def test_web_fetch_handles_redirect_and_text_extraction(monkeypatch):
     tool = CodingToolSet()
 
-    def _redirect(
+    async def _redirect(
         url: str,
         params=None,
         headers=None,
@@ -371,10 +379,10 @@ def test_web_fetch_handles_redirect_and_text_extraction(monkeypatch):
         }
 
     monkeypatch.setattr(tool, "http_get", _redirect)
-    redirect = tool.web_fetch(url="https://example.com/doc")
+    redirect = await tool.web_fetch(url="https://example.com/doc")
     assert redirect["redirect_url"] == "https://redirected.example.com/doc"
 
-    def _content(
+    async def _content(
         url: str,
         params=None,
         headers=None,
@@ -397,46 +405,46 @@ def test_web_fetch_handles_redirect_and_text_extraction(monkeypatch):
         }
 
     monkeypatch.setattr(tool, "http_get", _content)
-    out = tool.web_fetch(url="https://github.com/openai/example")
+    out = await tool.web_fetch(url="https://github.com/openai/example")
     assert out["status"] == "success"
     assert "tool search" in out["content"].lower()
     assert out["auth_hint"]
 
 
-def test_session_tools_and_tool_search(tmp_path):
+async def test_session_tools_and_tool_search(tmp_path):
     registry = advanced_coding_tools(str(tmp_path), enable_lsp=False, enable_web=False)
     state = _ExecutorState(task="advanced")
     ctx = {"state": state, "tool_registry": registry}
 
-    todo = UpdateWorkPlanTool().execute(
+    todo = await UpdateWorkPlanTool().execute(
         {"plan": [{"step": "ship", "status": "pending"}]},
         runtime_context=ctx,
     )
     assert len(todo["plan"]) == 1
 
-    plan_enter = registry.get("enter_plan_mode").execute(
+    plan_enter = await registry.get("enter_plan_mode").execute(
         {"reason": "decompose"}, runtime_context=ctx
     )
     assert plan_enter["current_mode"] == "plan"
 
-    create = registry.get("task_create").execute(
+    create = await registry.get("task_create").execute(
         {"subject": "Implement", "description": "Do the work"}, runtime_context=ctx
     )
-    listed = registry.get("task_list").execute({}, runtime_context=ctx)
+    listed = await registry.get("task_list").execute({}, runtime_context=ctx)
     assert create["status"] == "success"
     assert listed["count"] == 1
 
-    search = ToolSearchTool().execute({"query": "plan"}, runtime_context=ctx)
+    search = await ToolSearchTool().execute({"query": "plan"}, runtime_context=ctx)
     assert search["count"] >= 1
 
 
-def test_lsp_query_and_mcp_resource_tools():
+async def test_lsp_query_and_mcp_resource_tools():
     class _FakeLSP:
         def query(self, **kwargs):
             return {"status": "success", "kwargs": kwargs}
 
     lsp = LSPQueryTool()
-    out = lsp.execute(
+    out = await lsp.execute(
         {"operation": "definition", "symbol": "demo"},
         runtime_context={"ops": {"lsp": _FakeLSP()}},
     )
@@ -449,21 +457,21 @@ def test_lsp_query_and_mcp_resource_tools():
             {"uri": "memo://two", "text": "beta"},
         ]
     }
-    listed = MCPListResourcesTool().execute(
+    listed = await MCPListResourcesTool().execute(
         {}, runtime_context={"mcp_resources": resources}
     )
     assert "docs" in listed["resources"]
 
-    read = MCPReadResourceTool().execute(
+    read = await MCPReadResourceTool().execute(
         {"server": "docs", "uri": "memo://two"},
         runtime_context={"mcp_resources": resources},
     )
     assert read["resource"]["text"] == "beta"
 
 
-def test_ask_user_choice_returns_needs_input_without_answers():
+async def test_ask_user_choice_returns_needs_input_without_answers():
     tool = AskUserChoiceTool()
-    out = tool.execute(
+    out = await tool.execute(
         {
             "questions": [
                 {

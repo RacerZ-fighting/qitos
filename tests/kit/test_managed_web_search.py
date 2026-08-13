@@ -28,17 +28,18 @@ class _Response:
 
 
 @dataclass
-class _Session:
+class _Client:
     response: _Response
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def post(self, url: str, **kwargs: Any) -> _Response:
+    async def post(self, url: str, **kwargs: Any) -> _Response:
         self.calls.append({"url": url, **kwargs})
         return self.response
 
 
-def test_kimi_search_uses_managed_contract_and_bounds_results() -> None:
-    session = _Session(
+@pytest.mark.asyncio
+async def test_kimi_search_uses_managed_contract_and_bounds_results() -> None:
+    client = _Client(
         _Response(
             200,
             {
@@ -62,15 +63,15 @@ def test_kimi_search_uses_managed_contract_and_bounds_results() -> None:
     capability = KimiWebSearchCapability(
         api_key="secret",
         search_url="https://api.example/search",
-        session=session,  # type: ignore[arg-type]
+        client=client,
     )
 
-    result = capability.search("product 1.2 CVE", max_results=1)
+    result = await capability.search("product 1.2 CVE", max_results=1)
 
     assert [source.title for source in result.sources] == ["Vendor advisory"]
-    assert session.calls[0]["url"] == "https://api.example/search"
-    assert session.calls[0]["json"] == {"text_query": "product 1.2 CVE"}
-    assert session.calls[0]["headers"]["Authorization"] == "Bearer secret"
+    assert client.calls[0]["url"] == "https://api.example/search"
+    assert client.calls[0]["json"] == {"text_query": "product 1.2 CVE"}
+    assert client.calls[0]["headers"]["Authorization"] == "Bearer secret"
 
 
 @pytest.mark.parametrize(
@@ -82,26 +83,28 @@ def test_kimi_search_uses_managed_contract_and_bounds_results() -> None:
         (503, "provider"),
     ],
 )
-def test_kimi_search_preserves_failure_kind(status: int, kind: str) -> None:
+@pytest.mark.asyncio
+async def test_kimi_search_preserves_failure_kind(status: int, kind: str) -> None:
     capability = KimiWebSearchCapability(
         api_key="secret",
-        session=_Session(_Response(status, {})),  # type: ignore[arg-type]
+        client=_Client(_Response(status, {})),
     )
 
     with pytest.raises(WebSearchError) as error:
-        capability.search("query")
+        await capability.search("query")
 
     assert error.value.kind == kind
 
 
-def test_kimi_search_rejects_invalid_protocol_response() -> None:
+@pytest.mark.asyncio
+async def test_kimi_search_rejects_invalid_protocol_response() -> None:
     capability = KimiWebSearchCapability(
         api_key="secret",
-        session=_Session(_Response(200, {"search_results": "wrong"})),  # type: ignore[arg-type]
+        client=_Client(_Response(200, {"search_results": "wrong"})),
     )
 
     with pytest.raises(WebSearchError) as error:
-        capability.search("query")
+        await capability.search("query")
 
     assert error.value.kind == "protocol"
 
@@ -141,12 +144,13 @@ class _Completions:
     responses: list[Any]
     calls: list[dict[str, Any]] = field(default_factory=list)
 
-    def create(self, **kwargs: Any) -> Any:
+    async def create(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         return self.responses.pop(0)
 
 
-def test_kimi_builtin_search_round_trips_server_arguments() -> None:
+@pytest.mark.asyncio
+async def test_kimi_builtin_search_round_trips_server_arguments() -> None:
     arguments = (
         '{"results":[{"title":"Advisory","url":"https://vendor.example/a",'
         '"snippet":"Affected versions"}],"usage":{"total_tokens":42}}'
@@ -176,7 +180,7 @@ def test_kimi_builtin_search_round_trips_server_arguments() -> None:
         client=client,
     )
 
-    result = capability.search("product advisory")
+    result = await capability.search("product advisory")
 
     assert result.text == "Current details: https://vendor.example/a"
     assert [source.url for source in result.sources] == ["https://vendor.example/a"]
@@ -199,7 +203,8 @@ def test_kimi_builtin_search_round_trips_server_arguments() -> None:
     }
 
 
-def test_kimi_builtin_search_keeps_sources_when_final_text_is_empty() -> None:
+@pytest.mark.asyncio
+async def test_kimi_builtin_search_keeps_sources_when_final_text_is_empty() -> None:
     arguments = (
         '{"results":[{"title":"Advisory","url":"https://vendor.example/a",'
         '"snippet":"Affected versions"}]}'
@@ -235,7 +240,7 @@ def test_kimi_builtin_search_keeps_sources_when_final_text_is_empty() -> None:
         client=SimpleNamespace(chat=SimpleNamespace(completions=completions)),
     )
 
-    result = capability.search("product advisory")
+    result = await capability.search("product advisory")
 
     assert result.text == (
         "Kimi returned public web search sources without a synthesized answer."
@@ -243,10 +248,11 @@ def test_kimi_builtin_search_keeps_sources_when_final_text_is_empty() -> None:
     assert [source.url for source in result.sources] == ["https://vendor.example/a"]
 
 
-def test_managed_tool_is_read_only_and_returns_structured_sources() -> None:
+@pytest.mark.asyncio
+async def test_managed_tool_is_read_only_and_returns_structured_sources() -> None:
     capability = KimiWebSearchCapability(
         api_key="secret",
-        session=_Session(
+        client=_Client(
             _Response(
                 200,
                 {
@@ -259,11 +265,11 @@ def test_managed_tool_is_read_only_and_returns_structured_sources() -> None:
                     ]
                 },
             )
-        ),  # type: ignore[arg-type]
+        ),
     )
     tool = ManagedWebSearchTool(capability)
 
-    result = tool.execute({"query": "docs"})
+    result = await tool.execute({"query": "docs"})
 
     assert tool.spec.read_only is True
     assert tool.spec.concurrency_safe is True

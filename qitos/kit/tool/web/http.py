@@ -7,8 +7,7 @@ import re
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
-import requests
-from requests.adapters import HTTPAdapter
+import httpx
 
 from qitos.core.tool import BaseTool, RetryPolicy, ToolPermission, ToolSpec
 
@@ -32,10 +31,8 @@ class HTTPRequest(BaseTool):
         if "User-Agent" not in self._headers:
             self._headers["User-Agent"] = user_agent
         self._timeout = timeout
-        self._session = requests.Session()
-        adapter = HTTPAdapter(max_retries=0)
-        self._session.mount("http://", adapter)
-        self._session.mount("https://", adapter)
+        self._client = httpx.AsyncClient()
+        self._insecure_client: httpx.AsyncClient | None = None
         super().__init__(
             ToolSpec(
                 name="http_request",
@@ -59,7 +56,7 @@ class HTTPRequest(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -99,7 +96,12 @@ class HTTPRequest(BaseTool):
         if headers:
             merged_headers.update(headers)
 
-        response = self._session.request(
+        client = self._client
+        if not verify_tls:
+            if self._insecure_client is None:
+                self._insecure_client = httpx.AsyncClient(verify=False)
+            client = self._insecure_client
+        response = await client.request(
             method=method,
             url=url,
             params=params,
@@ -107,7 +109,6 @@ class HTTPRequest(BaseTool):
             json=json_data,
             headers=merged_headers,
             timeout=int(timeout or self._timeout),
-            verify=verify_tls,
             allow_redirects=allow_redirects,
         )
         content = self._safe_text(response)
@@ -135,6 +136,11 @@ class HTTPRequest(BaseTool):
             payload["json"] = parsed_json
         return payload
 
+    async def aclose(self) -> None:
+        await self._client.aclose()
+        if self._insecure_client is not None:
+            await self._insecure_client.aclose()
+
     def _validate_url(self, url: str) -> Optional[str]:
         if not url:
             return "URL cannot be empty"
@@ -145,11 +151,12 @@ class HTTPRequest(BaseTool):
             return "URL host is missing"
         return None
 
-    def _safe_text(self, response: requests.Response) -> str:
-        response.encoding = response.encoding or response.apparent_encoding
+    def _safe_text(self, response: Any) -> str:
+        if not response.encoding:
+            response.encoding = "utf-8"
         return response.text
 
-    def _try_parse_json(self, response: requests.Response) -> Any:
+    def _try_parse_json(self, response: Any) -> Any:
         ctype = (response.headers.get("Content-Type") or "").lower()
         if "application/json" not in ctype and "json" not in ctype:
             return None
@@ -199,7 +206,7 @@ class HTTPGet(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -212,7 +219,7 @@ class HTTPGet(BaseTool):
         :param verify_tls: Whether TLS certificates should be verified.
         :param allow_redirects: Whether redirects should be followed automatically.
         """
-        return self._request.execute(
+        return await self._request.execute(
             {
                 "method": "GET",
                 "url": str(args.get("url", "")),
@@ -224,6 +231,9 @@ class HTTPGet(BaseTool):
             },
             runtime_context=runtime_context,
         )
+
+    async def aclose(self) -> None:
+        await self._request.aclose()
 
 
 class HTTPPost(BaseTool):
@@ -264,7 +274,7 @@ class HTTPPost(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -278,7 +288,7 @@ class HTTPPost(BaseTool):
         :param verify_tls: Whether TLS certificates should be verified.
         :param allow_redirects: Whether redirects should be followed automatically.
         """
-        return self._request.execute(
+        return await self._request.execute(
             {
                 "method": "POST",
                 "url": str(args.get("url", "")),
@@ -291,6 +301,9 @@ class HTTPPost(BaseTool):
             },
             runtime_context=runtime_context,
         )
+
+    async def aclose(self) -> None:
+        await self._request.aclose()
 
 
 class HTMLExtractText(BaseTool):
@@ -311,7 +324,7 @@ class HTMLExtractText(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """

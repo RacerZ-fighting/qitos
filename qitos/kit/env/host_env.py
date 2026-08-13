@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import stat as stat_module
@@ -21,6 +22,7 @@ from qitos.core.env import (
     FileSystemCapability,
     TextFileChunk,
 )
+from qitos.kit.env._async_process import run_process
 
 
 class HostFSCapability(FileSystemCapability):
@@ -232,6 +234,69 @@ class HostCommandCapability(CommandCapability):
     ):
         self.cwd = str(Path(cwd).resolve())
         self._env = dict(env) if env is not None else None
+
+    async def arun(self, command: str, timeout: int = 30) -> Dict[str, Any]:
+        if not command or not command.strip():
+            return {"status": "error", "error": "empty command"}
+        try:
+            result = await run_process(
+                shell_command=command,
+                cwd=self.cwd,
+                env=self._env,
+                timeout=float(timeout),
+            )
+            return {
+                "status": "success" if result.returncode == 0 else "partial",
+                "returncode": result.returncode,
+                "stdout": result.stdout.decode("utf-8", errors="replace"),
+                "stderr": result.stderr.decode("utf-8", errors="replace"),
+                "cwd": self.cwd,
+                "command": command,
+            }
+        except asyncio.TimeoutError:
+            return {
+                "status": "error",
+                "error": f"command timed out after {timeout} seconds",
+                "command": command,
+                "cwd": self.cwd,
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return {
+                "status": "error",
+                "error": str(exc),
+                "command": command,
+                "cwd": self.cwd,
+            }
+
+    async def arun_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        timeout: int = 30,
+        cwd: str | None = None,
+        stdin: bytes | None = None,
+    ) -> Dict[str, Any]:
+        args = [str(item) for item in argv]
+        if not args or not args[0].strip():
+            raise ValueError("argv must contain a non-empty executable")
+        effective_cwd = self._resolve_cwd(cwd)
+        result = await run_process(
+            argv=args,
+            cwd=effective_cwd,
+            env=self._env,
+            stdin=stdin,
+            timeout=float(timeout),
+        )
+        return {
+            "status": "success" if result.returncode == 0 else "partial",
+            "returncode": result.returncode,
+            "stdout": result.stdout.decode("utf-8", errors="replace"),
+            "stderr": result.stderr.decode("utf-8", errors="replace"),
+            "cwd": effective_cwd,
+            "argv": args,
+        }
 
     def run(self, command: str, timeout: int = 30) -> Dict[str, Any]:
         if not command or not command.strip():

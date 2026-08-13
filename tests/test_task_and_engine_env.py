@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
+import pytest
+
 from examples._support import SequenceModel
 
 from qitos import (
@@ -128,6 +130,22 @@ def test_task_budget_overrides_engine_budget():
     result = Engine(agent=agent, budget=RuntimeBudget(max_steps=5)).run(task)
     assert result.state.stop_reason == StopReason.BUDGET_STEPS.value
     assert result.step_count == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_steps", 0),
+        ("max_runtime_seconds", -1.0),
+        ("max_tokens", 0),
+        ("max_cost_usd", -1.0),
+        ("max_tool_concurrency", 0),
+        ("max_children", 0),
+    ],
+)
+def test_task_budget_rejects_non_positive_limits(field, value):
+    with pytest.raises(ValueError, match=field):
+        TaskBudget(**{field: value})
 
 
 def test_agent_run_accepts_task_object():

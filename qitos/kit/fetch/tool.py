@@ -40,7 +40,7 @@ class ManagedWebFetchTool(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
@@ -49,7 +49,12 @@ class ManagedWebFetchTool(BaseTool):
         url = args.get("url")
         if not isinstance(url, str):
             raise TypeError("web fetch URL must be a string")
-        return self._capability.fetch(url).to_dict()
+        return (await self._capability.fetch(url)).to_dict()
+
+    async def aclose(self) -> None:
+        close = getattr(self._capability, "aclose", None)
+        if callable(close):
+            await close()
 
 
 __all__ = ["ManagedWebFetchTool"]

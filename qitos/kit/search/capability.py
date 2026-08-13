@@ -55,7 +55,10 @@ class WebSearchResponse:
 class WebSearchCapability(Protocol):
     """Search public information through one configured provider."""
 
-    def search(self, query: str, *, max_results: int = 8) -> WebSearchResponse: ...
+    async def search(
+        self, query: str, *, max_results: int = 8
+    ) -> WebSearchResponse:
+        ...
 
 
 __all__ = [

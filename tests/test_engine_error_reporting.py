@@ -39,8 +39,7 @@ def test_report_runtime_exception_uses_trace_directory_fallback(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.delenv("QITOS_ERROR_LOG", raising=False)
-    monkeypatch.delenv("QITOS_TRACE_DIR", raising=False)
-    monkeypatch.setenv("CYBERGYM_TASK_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("QITOS_TRACE_DIR", str(tmp_path))
 
     engine = object.__new__(Engine)
     engine._last_runtime_error = None

@@ -160,7 +160,7 @@ class CreateTask(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -222,7 +222,7 @@ class ListTaskBoard(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -265,7 +265,7 @@ class GetTask(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -319,7 +319,7 @@ class UpdateTask(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
@@ -421,7 +421,7 @@ class AppendTaskNote(BaseTool):
             )
         )
 
-    def execute(
+    async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """

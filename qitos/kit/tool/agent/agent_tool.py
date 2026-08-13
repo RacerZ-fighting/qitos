@@ -2,20 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import CancelledError, Future, wait
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from ....core.runtime_input import RuntimeInput
 from ....core.tool import BaseTool, ToolPermission, ToolSpec
 from ....core.tool_result import ToolResult
-from ....engine._daemon_pool import DaemonTaskPool
 
 DEFAULT_SUBAGENT_MAX_TURNS = 200
 
@@ -41,7 +39,10 @@ class AgentInvocation:
 
 
 AgentInvocationFactory = Callable[[AgentRequest, dict[str, Any]], AgentInvocation]
-AgentExecutionScope = Callable[[dict[str, Any]], AbstractContextManager[Any]]
+AgentExecutionScope = Callable[
+    [dict[str, Any]],
+    AbstractContextManager[Any] | AbstractAsyncContextManager[Any],
+]
 AgentExecutionMode = Literal["foreground", "optional_background", "background"]
 
 _PARTIAL_RESULT_MAX_ITEMS = 12
@@ -100,17 +101,16 @@ class AgentTool(BaseTool):
         self._execution_mode = execution_mode
         self._max_delegate_depth = max_delegate_depth
         self._max_turns = max_turns
-        self._executor = DaemonTaskPool(
-            max_workers=max_background_workers,
-            thread_name_prefix="qitos-agent",
-        )
-        self._lock = threading.RLock()
+        self._max_background_workers = max_background_workers
+        self._background_limit = asyncio.Semaphore(max_background_workers)
+        self._child_limit_lock = asyncio.Lock()
+        self._children_started = 0
         self._closed = False
-        self._background_tasks: dict[str, Future[AgentResult]] = {}
+        self._background_tasks: dict[str, asyncio.Task[AgentResult]] = {}
         self._background_results: dict[str, AgentResult] = {}
         self._background_engines: dict[str, Any] = {}
         self._background_requests: dict[str, AgentRequest] = {}
-        self._background_cancel: dict[str, threading.Event] = {}
+        self._background_cancel: dict[str, asyncio.Event] = {}
 
         parameters: dict[str, dict[str, Any]] = {
             "description": {
@@ -170,10 +170,10 @@ class AgentTool(BaseTool):
         super().__init__(spec=tool_spec)
         self.spec.description = description
 
-    def execute(
+    async def execute(
         self, args: dict[str, Any], runtime_context: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Run one child synchronously, or start a configured background run."""
+        """Await one child, or register an event-loop-owned background child."""
 
         context = dict(runtime_context or {})
         parent_agent = context.get("agent")
@@ -219,33 +219,45 @@ class AgentTool(BaseTool):
                 "status": "error",
                 "error": "Background child agents are disabled in this runtime.",
             }
+        if self._closed:
+            return {
+                "status": "error",
+                "error": "This Agent runtime has already closed.",
+            }
+        max_children = int(context.get("max_children", 0) or 0)
+        async with self._child_limit_lock:
+            if max_children > 0 and self._children_started >= max_children:
+                return {
+                    "status": "error",
+                    "error": (
+                        "Run child-agent budget exhausted: "
+                        f"max_children={max_children}."
+                    ),
+                }
+            self._children_started += 1
         run_in_background = self._execution_mode == "background" or (
             self._execution_mode == "optional_background" and requested_background
         )
         if run_in_background:
             task_id = f"agent-{uuid.uuid4().hex[:8]}"
-            cancel_event = threading.Event()
-            with self._lock:
-                if self._closed:
-                    return {
-                        "status": "error",
-                        "error": "This Agent runtime has already closed.",
-                    }
-                future = self._executor.submit(
-                    self._run_request,
+            cancel_event = asyncio.Event()
+            task = asyncio.create_task(
+                self._run_background_request(
                     request,
                     context,
                     task_id,
                     cancel_event,
-                )
-                self._background_tasks[task_id] = future
-                self._background_cancel[task_id] = cancel_event
-                self._background_requests[task_id] = request
+                ),
+                name=f"qitos-child-{task_id}",
+            )
+            self._background_tasks[task_id] = task
+            self._background_cancel[task_id] = cancel_event
+            self._background_requests[task_id] = request
 
-            def _on_done(fut: Future[AgentResult], tid: str = task_id) -> None:
+            def _on_done(fut: asyncio.Task[AgentResult], tid: str = task_id) -> None:
                 try:
                     result = fut.result()
-                except CancelledError:
+                except asyncio.CancelledError:
                     result = AgentResult(
                         agent_type=request.subagent_type,
                         task=request.prompt,
@@ -265,15 +277,14 @@ class AgentTool(BaseTool):
                         description=request.description,
                         stop_reason="error",
                     )
-                with self._lock:
-                    self._background_results[tid] = result
-                    self._background_tasks.pop(tid, None)
-                    self._background_engines.pop(tid, None)
-                    self._background_requests.pop(tid, None)
-                    self._background_cancel.pop(tid, None)
+                self._background_results[tid] = result
+                self._background_tasks.pop(tid, None)
+                self._background_engines.pop(tid, None)
+                self._background_requests.pop(tid, None)
+                self._background_cancel.pop(tid, None)
                 self._post_completion_event(tid, result, context)
 
-            future.add_done_callback(_on_done)
+            task.add_done_callback(_on_done)
             return {
                 "status": "running",
                 "task_id": task_id,
@@ -282,7 +293,7 @@ class AgentTool(BaseTool):
             }
 
         return self._result_payload(
-            self._run_request(
+            await self._run_request(
                 request,
                 context,
                 task_id=None,
@@ -290,12 +301,27 @@ class AgentTool(BaseTool):
             )
         )
 
-    def _run_request(
+    async def _run_background_request(
+        self,
+        request: AgentRequest,
+        runtime_context: dict[str, Any],
+        task_id: str,
+        cancel_event: asyncio.Event,
+    ) -> AgentResult:
+        async with self._background_limit:
+            return await self._run_request(
+                request,
+                runtime_context,
+                task_id=task_id,
+                cancel_event=cancel_event,
+            )
+
+    async def _run_request(
         self,
         request: AgentRequest,
         runtime_context: dict[str, Any],
         task_id: str | None,
-        cancel_event: threading.Event | None,
+        cancel_event: asyncio.Event | None,
     ) -> AgentResult:
         started = time.monotonic()
         scoped_context = dict(runtime_context)
@@ -306,15 +332,25 @@ class AgentTool(BaseTool):
             if self._execution_scope is not None
             else nullcontext()
         )
+
+        async def _run_in_scope() -> AgentResult:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Child agent was cancelled before it started")
+            return await self._run_invocation(
+                request,
+                scoped_context,
+                task_id=task_id,
+            )
+
         try:
-            with scope:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise RuntimeError("Child agent was cancelled before it started")
-                result = self._run_invocation(
-                    request,
-                    scoped_context,
-                    task_id=task_id,
-                )
+            if isinstance(scope, AbstractAsyncContextManager):
+                async with scope:
+                    result = await _run_in_scope()
+            else:
+                with scope:
+                    result = await _run_in_scope()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             result = AgentResult(
                 agent_type=request.subagent_type,
@@ -334,7 +370,7 @@ class AgentTool(BaseTool):
         result.elapsed_seconds = max(0.0, time.monotonic() - started)
         return result
 
-    def _run_invocation(
+    async def _run_invocation(
         self,
         request: AgentRequest,
         runtime_context: dict[str, Any],
@@ -345,12 +381,11 @@ class AgentTool(BaseTool):
         if not isinstance(invocation, AgentInvocation):
             raise TypeError("invocation_factory must return AgentInvocation")
         if task_id is not None:
-            with self._lock:
-                if self._closed:
-                    invocation.engine.cancel("immediate")
-                    raise RuntimeError("Agent runtime closed before child start")
-                self._background_engines[task_id] = invocation.engine
-        engine_result = invocation.engine.run(
+            if self._closed:
+                invocation.engine.cancel("immediate")
+                raise RuntimeError("Agent runtime closed before child start")
+            self._background_engines[task_id] = invocation.engine
+        engine_result = await invocation.engine.arun(
             invocation.task,
             **dict(invocation.run_kwargs),
         )
@@ -362,7 +397,7 @@ class AgentTool(BaseTool):
         return AgentResult(
             agent_type=request.subagent_type,
             task=request.prompt,
-            success=stop_reason == "final",
+            success=stop_reason in {"completed", "final", "success"},
             output=output,
             run_id=str(
                 getattr(engine_result, "run_id", "")
@@ -398,9 +433,8 @@ class AgentTool(BaseTool):
     def get_background_result(self, task_id: str) -> dict[str, Any] | None:
         """Return one completed background result, or its running status."""
 
-        with self._lock:
-            result = self._background_results.get(task_id)
-            future = self._background_tasks.get(task_id)
+        result = self._background_results.get(task_id)
+        future = self._background_tasks.get(task_id)
         if result is None:
             if future is not None:
                 return {"status": "running", "task_id": task_id}
@@ -411,8 +445,7 @@ class AgentTool(BaseTool):
     def active_background_count(self) -> int:
         """Return the number of submitted children that have not reached terminal state."""
 
-        with self._lock:
-            return len(self._background_tasks)
+        return len(self._background_tasks)
 
     def snapshot_background_events(self) -> list[RuntimeInput]:
         """Project active child tool evidence into bounded runtime events.
@@ -422,12 +455,12 @@ class AgentTool(BaseTool):
         emitted terminal completion events.
         """
 
-        with self._lock:
-            active = [
-                (task_id, self._background_requests[task_id], engine)
-                for task_id, engine in self._background_engines.items()
-                if not self._background_tasks[task_id].done()
-            ]
+        active = [
+            (task_id, self._background_requests[task_id], engine)
+            for task_id, engine in self._background_engines.items()
+            if task_id in self._background_tasks
+            and not self._background_tasks[task_id].done()
+        ]
 
         events: list[RuntimeInput] = []
         for task_id, request, engine in active:
@@ -456,10 +489,9 @@ class AgentTool(BaseTool):
     def cancel_background(self, task_id: str) -> bool:
         """Cooperatively cancel one background child if it is still active."""
 
-        with self._lock:
-            future = self._background_tasks.get(task_id)
-            engine = self._background_engines.get(task_id)
-            cancel_event = self._background_cancel.get(task_id)
+        future = self._background_tasks.get(task_id)
+        engine = self._background_engines.get(task_id)
+        cancel_event = self._background_cancel.get(task_id)
         if future is None or future.done():
             return False
         if cancel_event is not None:
@@ -469,28 +501,43 @@ class AgentTool(BaseTool):
         future.cancel()
         return True
 
-    def close(self, *, wait_seconds: float = 5.0) -> int:
-        """Cancel remaining children and return how many did not stop in time."""
+    def setup(self, context: dict[str, Any] | None = None) -> None:
+        """Open this run-scoped child registry for a fresh parent run."""
+
+        _ = context
+        if self._background_tasks:
+            raise RuntimeError("cannot reopen AgentTool with active children")
+        self._background_limit = asyncio.Semaphore(self._max_background_workers)
+        self._child_limit_lock = asyncio.Lock()
+        self._closed = False
+        self._children_started = 0
+
+    async def asetup(self, context: dict[str, Any] | None = None) -> None:
+        self.setup(context)
+
+    async def aclose(self, *, wait_seconds: float = 5.0) -> int:
+        """Cancel children, await cleanup, and return the remaining task count."""
 
         if wait_seconds < 0:
             raise ValueError("wait_seconds must be non-negative")
-        with self._lock:
-            self._closed = True
-            futures = list(self._background_tasks.values())
-            engines = list(self._background_engines.values())
-            cancel_events = list(self._background_cancel.values())
-            for cancel_event in cancel_events:
-                cancel_event.set()
-            for engine in engines:
-                engine.cancel("immediate")
-            for future in futures:
-                future.cancel()
-        _, pending = wait(futures, timeout=wait_seconds) if futures else (set(), set())
-        self._executor.shutdown(
-            wait_for_workers=False,
-            cancel_futures=True,
-        )
-        return len(pending)
+        self._closed = True
+        tasks = list(self._background_tasks.values())
+        for cancel_event in self._background_cancel.values():
+            cancel_event.set()
+        for engine in self._background_engines.values():
+            engine.cancel("immediate")
+        for task in tasks:
+            task.cancel()
+        if not tasks:
+            return 0
+        done, pending = await asyncio.wait(tasks, timeout=wait_seconds)
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        return sum(1 for task in tasks if not task.done())
 
     @staticmethod
     def _partial_result(engine_result: Any) -> str:

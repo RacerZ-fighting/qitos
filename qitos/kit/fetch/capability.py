@@ -35,7 +35,8 @@ class WebFetchResponse:
 class WebFetchCapability(Protocol):
     """Fetch one public URL through a configured managed provider."""
 
-    def fetch(self, url: str) -> WebFetchResponse: ...
+    async def fetch(self, url: str) -> WebFetchResponse:
+        ...
 
 
 __all__ = ["WebFetchCapability", "WebFetchError", "WebFetchResponse"]

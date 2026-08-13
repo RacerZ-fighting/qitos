@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from qitos.core.tool_registry import ToolRegistry
 from qitos.kit.tool.advanced import AdvancedCodingToolSet
 from qitos.kit.tool.experimental.security_research import (
@@ -26,7 +28,8 @@ from qitos.kit.tool import (
 from qitos.kit.tool.tools import advanced_coding_tools
 
 
-def test_codebase_toolset_glob_grep_and_read(tmp_path):
+@pytest.mark.asyncio
+async def test_codebase_toolset_glob_grep_and_read(tmp_path):
     root = tmp_path
     (root / "src").mkdir()
     (root / "src" / "a.py").write_text(
@@ -43,11 +46,11 @@ def test_codebase_toolset_glob_grep_and_read(tmp_path):
         profile="codebase",
     )
 
-    glob_out = toolset.glob(pattern="*.py")
+    glob_out = await toolset.glob(pattern="*.py")
     assert glob_out["status"] == "success"
     assert glob_out["files"] == ["src/a.py"]
 
-    grep_out = toolset.grep(pattern="hello", glob="*.md", regex=False)
+    grep_out = await toolset.grep(pattern="hello", glob="*.md", regex=False)
     assert grep_out["status"] == "success"
     assert grep_out["match_count"] == 2
     assert grep_out["matches"][0]["path"] == "src/b.md"
@@ -59,7 +62,8 @@ def test_codebase_toolset_glob_grep_and_read(tmp_path):
     assert "return a + b" in read_out["content"]
 
 
-def test_notebook_toolset_read_replace_insert(tmp_path):
+@pytest.mark.asyncio
+async def test_notebook_toolset_read_replace_insert(tmp_path):
     nb = {
         "cells": [
             {"cell_type": "markdown", "metadata": {}, "source": ["# Title\n"]},
@@ -79,16 +83,16 @@ def test_notebook_toolset_read_replace_insert(tmp_path):
     path.write_text(json.dumps(nb), encoding="utf-8")
 
     toolset = NotebookToolSet(workspace_root=str(tmp_path))
-    read_out = toolset.read_notebook.execute({"path": "demo.ipynb"})
+    read_out = await toolset.read_notebook.execute({"path": "demo.ipynb"})
     assert read_out["status"] == "success"
     assert read_out["cells"][0]["cell_type"] == "markdown"
 
-    replace_out = toolset.replace_notebook_cell.execute(
+    replace_out = await toolset.replace_notebook_cell.execute(
         {"path": "demo.ipynb", "cell_index": 1, "source": "print('bye')\n"}
     )
     assert replace_out["status"] == "success"
 
-    insert_out = toolset.insert_notebook_cell.execute(
+    insert_out = await toolset.insert_notebook_cell.execute(
         {
             "path": "demo.ipynb",
             "cell_type": "markdown",
@@ -104,12 +108,13 @@ def test_notebook_toolset_read_replace_insert(tmp_path):
     assert "".join(updated["cells"][2]["source"]) == "print('bye')\n"
 
 
-def test_web_fetch_extracts_text(monkeypatch):
+@pytest.mark.asyncio
+async def test_web_fetch_extracts_text(monkeypatch):
     toolset = CodingToolSet(
         include_notebook=False, enable_lsp=False, enable_tasks=False, enable_web=True
     )
 
-    def _fake_get(
+    async def _fake_get(
         url: str,
         params=None,
         headers=None,
@@ -132,7 +137,7 @@ def test_web_fetch_extracts_text(monkeypatch):
         }
 
     monkeypatch.setattr(toolset, "http_get", _fake_get)
-    out = toolset.web_fetch(url="https://example.com")
+    out = await toolset.web_fetch(url="https://example.com")
     assert out["status"] == "success"
     assert out["title"] == "Demo"
     assert "Hello" in out["content"]
@@ -285,10 +290,11 @@ def test_tool_package_only_exposes_canonical_toolsets():
     assert "WriteFile" not in exported
 
 
-def test_task_toolset_persists_board_updates(tmp_path):
+@pytest.mark.asyncio
+async def test_task_toolset_persists_board_updates(tmp_path):
     toolset = TaskToolSet(workspace_root=str(tmp_path))
 
-    create = toolset.task_create.execute(
+    create = await toolset.task_create.execute(
         {
             "subject": "Implement planner",
             "description": "Break the work into phases",
@@ -297,7 +303,7 @@ def test_task_toolset_persists_board_updates(tmp_path):
     assert create["status"] == "success"
     task_id = create["task"]["id"]
 
-    update = toolset.task_update.execute(
+    update = await toolset.task_update.execute(
         {
             "task_id": task_id,
             "status": "in_progress",
@@ -310,7 +316,7 @@ def test_task_toolset_persists_board_updates(tmp_path):
     assert update["task"]["blocks"] == ["child-a"]
     assert update["task"]["metadata"]["priority"] == "high"
 
-    note = toolset.task_append_note.execute(
+    note = await toolset.task_append_note.execute(
         {
             "task_id": task_id,
             "text": "Initial decomposition finished",
@@ -319,11 +325,11 @@ def test_task_toolset_persists_board_updates(tmp_path):
     )
     assert note["status"] == "success"
 
-    fetched = toolset.task_get.execute({"task_id": task_id})
+    fetched = await toolset.task_get.execute({"task_id": task_id})
     assert fetched["status"] == "success"
     assert fetched["task"]["notes"][0]["kind"] == "progress"
 
-    listing = toolset.task_list.execute({"include_completed": False})
+    listing = await toolset.task_list.execute({"include_completed": False})
     assert listing["status"] == "success"
     assert listing["count"] == 1
 

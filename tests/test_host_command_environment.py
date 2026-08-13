@@ -5,6 +5,8 @@ import shlex
 import sys
 from pathlib import Path
 
+import pytest
+
 from qitos.kit.env.host_env import HostCommandCapability
 from qitos.kit.tool.shell import RunCommand
 
@@ -61,7 +63,8 @@ def test_explicit_environment_reaches_all_host_command_paths(
     )
 
 
-def test_run_command_accepts_an_explicit_process_environment(
+@pytest.mark.asyncio
+async def test_run_command_accepts_an_explicit_process_environment(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -73,10 +76,10 @@ def test_run_command_accepts_an_explicit_process_environment(
         process_env={configured_name: "configured"},
     )
 
-    configured_result = tool.execute(
+    configured_result = await tool.execute(
         {"command": shlex.join(_print_environment(configured_name))}
     )
-    filtered_result = tool.execute(
+    filtered_result = await tool.execute(
         {"command": shlex.join(_print_environment(inherited_name))}
     )
 

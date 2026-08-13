@@ -287,8 +287,8 @@ class TestEngineAsync:
 
         engine.cancel()
 
-        with pytest.raises(asyncio.CancelledError):
-            await run_task
+        result = await run_task
+        assert result.state.stop_reason == "cancelled_immediate"
         assert model.cancelled.is_set()
 
     @pytest.mark.asyncio
@@ -318,5 +318,5 @@ class TestEngineAsync:
             await engine.arun("second")
 
         engine.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await first_run
+        result = await first_run
+        assert result.state.stop_reason == "cancelled_immediate"

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from qitos.kit.env import TextWebEnv
 from qitos.kit.tool import FindInPage, FindNext, PageDown, PageUp
 
@@ -13,7 +15,8 @@ def test_text_web_env_exposes_web_browser_ops():
     assert "active_url" in summary
 
 
-def test_text_web_atomic_tools_use_ops_context():
+@pytest.mark.asyncio
+async def test_text_web_atomic_tools_use_ops_context():
     env = TextWebEnv(workspace_root=".")
     env.reset()
     ops = env.get_ops("web_browser")
@@ -22,17 +25,17 @@ def test_text_web_atomic_tools_use_ops_context():
     ops.state.title = "Example"  # type: ignore[attr-defined]
 
     ctx = {"ops": {"web_browser": ops}, "env": env}
-    down = PageDown().execute({"lines": 20}, runtime_context=ctx)
+    down = await PageDown().execute({"lines": 20}, runtime_context=ctx)
     assert down["status"] == "success"
     assert down["line_start"] == 20
 
-    up = PageUp().execute({"lines": 10}, runtime_context=ctx)
+    up = await PageUp().execute({"lines": 10}, runtime_context=ctx)
     assert up["status"] == "success"
     assert up["line_start"] == 10
 
-    find = FindInPage().execute({"keyword": "line 42"}, runtime_context=ctx)
+    find = await FindInPage().execute({"keyword": "line 42"}, runtime_context=ctx)
     assert find["status"] == "success"
     assert find["matched_line"] == 42
 
-    next_match = FindNext().execute({}, runtime_context=ctx)
+    next_match = await FindNext().execute({}, runtime_context=ctx)
     assert next_match["status"] == "error"

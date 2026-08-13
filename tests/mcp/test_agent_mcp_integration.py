@@ -104,7 +104,7 @@ class TestAgentModuleMCPServers:
 
         await engine._connect_mcp_servers()
 
-        assert engine._mcp_runtime is None
+        assert engine._connected_mcp_servers == []
         assert engine._connected_mcp_servers == []
         assert engine.tool_registry.list_tools() == []
 
@@ -153,16 +153,14 @@ class TestAgentModuleMCPServers:
         first = await Engine(agent).arun("first")
         second = await Engine(agent).arun("second")
 
-        assert first.state.stop_reason == "final"
-        assert second.state.stop_reason == "final"
+        assert first.state.stop_reason == "completed"
+        assert second.state.stop_reason == "completed"
         assert server.calls == [
             ("tool.two-three", {"value": "evidence"}),
             ("tool.two-three", {"value": "evidence"}),
         ]
         assert len(server.lifecycle_threads) == 6
-        assert len(set(server.lifecycle_threads[:3])) == 1
-        assert len(set(server.lifecycle_threads[3:])) == 1
-        assert server.lifecycle_threads[0] != threading.get_ident()
+        assert set(server.lifecycle_threads) == {threading.get_ident()}
         assert registry.list_tools() == []
         assert server.cleaned_up
 

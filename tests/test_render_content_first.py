@@ -496,7 +496,7 @@ def test_model_runtime_digest_matches_actual_messages(tmp_path) -> None:
     assert digest1["message_count"] == 3
     assert digest1["role_counts"] == {"assistant": 1, "system": 1, "tool": 1}
     assert digest1["tool_call_count"] == 1
-    assert digest1["sections"]["runtime_context"] is True
+    assert digest1["messages"][0]["content_len"] > 0
     assert digest1["sidecar_path"].endswith("assembled_messages.json")
 
 

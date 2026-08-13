@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from qitos import (
     Action,
@@ -75,49 +77,54 @@ class TestFanOutToolCreation:
         registry = _make_registry()
         tool = registry.get_fanout_tool()
         assert tool.spec.concurrency_safe is True
-        assert tool.spec.supports_background is True
+        assert tool.spec.supports_background is False
 
 
 # ── FanOutTool execution tests ───────────────────────────────────────────
 
 
 class TestFanOutToolExecution:
-    def test_empty_tasks_returns_error(self):
+    @pytest.mark.asyncio
+    async def test_empty_tasks_returns_error(self):
         registry = _make_registry()
         tool = registry.get_fanout_tool()
-        result = tool.execute({"tasks": []})
+        result = await tool.execute({"tasks": []})
         assert result["status"] == "error"
         assert "tasks" in result["message"]
 
-    def test_depth_guard(self):
+    @pytest.mark.asyncio
+    async def test_depth_guard(self):
         registry = _make_registry()
         tool = registry.get_fanout_tool()
-        result = tool.execute(
+        result = await tool.execute(
             {"tasks": [{"agent": "worker", "task": "do something"}]},
             runtime_context={"delegate_depth": MAX_DELEGATE_DEPTH},
         )
         assert result["status"] == "error"
         assert "Maximum delegate depth" in result["message"]
 
-    def test_invalid_agent_name(self):
+    @pytest.mark.asyncio
+    async def test_invalid_agent_name(self):
         registry = _make_registry()
         tool = registry.get_fanout_tool()
-        result = tool.execute(
+        result = await tool.execute(
             {"tasks": [{"agent": "nonexistent", "task": "do something"}]},
         )
         assert result["status"] == "error"
         assert "nonexistent" in str(result["results"])
 
-    def test_missing_task_field(self):
+    @pytest.mark.asyncio
+    async def test_missing_task_field(self):
         registry = _make_registry()
         tool = registry.get_fanout_tool()
-        result = tool.execute(
+        result = await tool.execute(
             {"tasks": [{"agent": "worker"}]},
         )
         # Invalid task spec should produce error in results
         assert "invalid_0" in result.get("results", {}) or result["status"] == "error"
 
-    def test_parallel_execution_with_mock(self):
+    @pytest.mark.asyncio
+    async def test_parallel_execution_with_mock(self):
         registry = _make_registry()
         tool = registry.get_fanout_tool()
 
@@ -127,8 +134,8 @@ class TestFanOutToolExecution:
         mock_result.step_count = 2
 
         with patch("qitos.engine.engine.Engine") as MockEngine:
-            MockEngine.return_value.run.return_value = mock_result
-            result = tool.execute({
+            MockEngine.return_value.arun = AsyncMock(return_value=mock_result)
+            result = await tool.execute({
                 "tasks": [
                     {"agent": "worker", "task": "explore /auth"},
                     {"agent": "worker", "task": "explore /api"},
@@ -143,7 +150,8 @@ class TestFanOutToolExecution:
             assert r["status"] == "success"
             assert r["final_result"] == "found 3 files"
 
-    def test_aggregation_summary(self):
+    @pytest.mark.asyncio
+    async def test_aggregation_summary(self):
         registry = _make_registry()
         tool = registry.get_fanout_tool()
 
@@ -153,8 +161,8 @@ class TestFanOutToolExecution:
         mock_result.step_count = 2
 
         with patch("qitos.engine.engine.Engine") as MockEngine:
-            MockEngine.return_value.run.return_value = mock_result
-            result = tool.execute({
+            MockEngine.return_value.arun = AsyncMock(return_value=mock_result)
+            result = await tool.execute({
                 "tasks": [
                     {"agent": "worker", "task": "explore /auth"},
                     {"agent": "worker", "task": "explore /api"},
@@ -174,17 +182,21 @@ class TestFanOutToolExecution:
         sub_engine = tool._build_sub_engine(spec, runtime_context, depth=1, idx=0)
         assert sub_engine._delegate_depth == 2
 
-    def test_per_task_timeout_returns_error(self):
+    @pytest.mark.asyncio
+    async def test_per_task_timeout_returns_error(self):
         """A sub-agent whose task_deadline has passed should return timeout error."""
         import time
         registry = _make_registry()
         tool = registry.get_fanout_tool(per_task_timeout=0.001)
 
         spec = registry.resolve("worker")
-        # Use a deadline that's already in the past
-        result = tool._run_sub_agent(
-            spec, "test task", {}, 0, 0,
-            task_deadline=time.monotonic() - 1.0,  # already expired
+        # Use a parent deadline that's already in the past.
+        result = await tool._run_sub_agent(
+            spec,
+            "test task",
+            {"deadline_monotonic": time.monotonic() - 1.0},
+            0,
+            0,
         )
         assert result["status"] == "error"
         assert "timed out" in result["message"]

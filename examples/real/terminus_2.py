@@ -88,7 +88,13 @@ class Terminus2Agent(AgentModule[TerminusState, dict[str, Any], dict[str, Any]])
         return TERMINUS_BASE_PROMPT
 
     def prepare(self, state: TerminusState) -> str:
-        observation = getattr(self, "_runtime_observation", None)
+        return self._prepare_with_observation(state, None)
+
+    def prepare_turn(self, state, observation, turn) -> str:
+        _ = turn
+        return self._prepare_with_observation(state, observation)
+
+    def _prepare_with_observation(self, state: TerminusState, observation: Any) -> str:
         terminal = self._extract_terminal_payload(observation) or {
             "output": state.terminal_output,
             "screen": state.terminal_screen,
