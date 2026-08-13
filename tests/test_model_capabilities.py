@@ -11,7 +11,8 @@ from qitos.models import (
     ModelAPI,
     ModelCapabilities,
     ModelRequest,
-    ModelStreamChunk,
+    ModelStreamEvent,
+    ModelStreamEventType,
     OpenAICompatibleModel,
     OpenAIModel,
     ReasoningCapability,
@@ -22,9 +23,9 @@ class _LegacyModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         _ = request
-        yield ModelStreamChunk(done=True)
+        yield ModelStreamEvent(type=ModelStreamEventType.COMPLETED)
 
 
 def test_unclassified_model_reports_conservative_capabilities() -> None:

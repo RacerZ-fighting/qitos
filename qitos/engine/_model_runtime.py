@@ -33,6 +33,7 @@ from ..core.history import (
     select_recent_history,
 )
 from ..core.model_request import ModelContinuation, ModelRequest
+from ..core.model_stream import ModelStreamEventType
 from ..core.model_response import ModelResponse, ModelTiming
 from ..core.multimodal import (
     content_to_text,
@@ -47,7 +48,7 @@ from ..core.multimodal import (
 )
 from ..core.observation import Observation
 from ..harness._types import native_tool_calls_preferred
-from ..models.base import Model, ModelStreamChunk
+from ..models.base import Model, ModelStreamEvent
 from ..core.state import StateSchema
 from ..core.turn import TurnSnapshot
 from ._context_runtime import (
@@ -70,7 +71,7 @@ ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
 
 
-def _chunk_has_model_content(chunk: ModelStreamChunk) -> bool:
+def _chunk_has_model_content(chunk: ModelStreamEvent) -> bool:
     """Return whether a stream chunk contains user-visible or actionable content."""
 
     if chunk.text or chunk.reasoning_content or chunk.tool_calls or chunk.native_items:
@@ -1412,12 +1413,13 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         final_continuation: ModelContinuation | None = None
         started = False
         terminal_seen = False
+        terminal_error: str | None = None
         stream_error: Exception | None = None
         request_started_at = time.monotonic()
         first_event_at: float | None = None
         first_content_at: float | None = None
         deadline_monotonic = request.deadline_monotonic
-        stream_iter: AsyncIterator[ModelStreamChunk] = llm.stream(request)
+        stream_iter: AsyncIterator[ModelStreamEvent] = llm.stream(request)
 
         iterator = stream_iter.__aiter__()
         try:
@@ -1442,8 +1444,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     raise ModelRequestDeadlineExceeded(
                         "model request deadline expired"
                     ) from exc
-                if not isinstance(chunk, ModelStreamChunk):
-                    raise TypeError("Model.stream() must yield ModelStreamChunk values")
+                if not isinstance(chunk, ModelStreamEvent):
+                    raise TypeError("Model.stream() must yield ModelStreamEvent values")
                 chunk_received_at = time.monotonic()
                 if first_event_at is None:
                     first_event_at = chunk_received_at
@@ -1451,7 +1453,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     first_content_at = chunk_received_at
                 text = chunk.text
                 reasoning = chunk.reasoning_content
-                done = chunk.done
                 usage = chunk.usage
                 tool_calls = chunk.tool_calls
                 native_items = chunk.native_items
@@ -1462,7 +1463,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 observable = bool(
                     text
                     or reasoning
-                    or done
+                    or chunk.is_final
                     or tool_calls
                     or native_items
                     or event_type
@@ -1494,14 +1495,17 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 if reasoning:
                     accumulated_reasoning.append(str(reasoning))
 
-                if done:
+                if chunk.is_final:
                     if terminal_seen:
                         raise ModelTransportError(
-                            "model stream emitted more than one terminal chunk",
+                            "model stream emitted more than one terminal event",
                             attempts=1,
                             retryable=False,
                         )
                     terminal_seen = True
+                    if chunk.type is ModelStreamEventType.FAILED:
+                        terminal_error = str(chunk.error or "model stream failed")
+                        continue
                     if usage is not None and isinstance(usage, Mapping):
                         final_usage = usage
                     if tool_calls is not None and isinstance(tool_calls, list):
@@ -1514,9 +1518,15 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     final_metadata = dict(chunk.event_metadata)
             if not terminal_seen:
                 raise ModelTransportError(
-                    "model stream ended before a terminal chunk",
+                    "model stream ended before a terminal event",
                     attempts=1,
                     retryable=True,
+                )
+            if terminal_error is not None:
+                raise ModelTransportError(
+                    terminal_error,
+                    attempts=1,
+                    retryable=False,
                 )
         except asyncio.CancelledError:
             raise

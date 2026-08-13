@@ -21,7 +21,7 @@ from qitos.kit.parser import (
     ToolUseXmlParser,
     XmlDecisionParser,
 )
-from qitos.models import Model, ModelRequest, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 
 
 class _ResponseSequenceModel(Model):
@@ -46,16 +46,16 @@ class _ResponseSequenceModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         messages = request.message_dicts()
         self.calls += 1
         self.seen_messages.append([dict(message) for message in messages])
         if not self.responses:
             raise AssertionError("no scripted model response remains")
         response = self.responses.pop(0)
-        yield ModelStreamChunk(
+        yield ModelStreamEvent(
             text=response.text,
-            done=True,
+            type=ModelStreamEventType.COMPLETED,
             usage=response.usage,
             tool_calls=response.tool_calls,
             native_items=response.native_items,

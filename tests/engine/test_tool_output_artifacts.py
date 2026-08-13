@@ -14,7 +14,7 @@ from qitos.core.tool_registry import ToolRegistry
 from qitos.engine import ContextConfig, RuntimeBudget
 from qitos.kit import FileArtifactStore, ReActTextParser
 from qitos.kit.tool.file import ReadFile
-from qitos.models import Model, ModelRequest, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos import tool
 
 
@@ -39,13 +39,13 @@ class _ToolModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         messages = request.message_dicts()
         self.inputs.append(list(messages))
         if self.calls == 0:
             self.calls += 1
-            yield ModelStreamChunk(
-                done=True,
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.COMPLETED,
                 tool_calls=[
                     {
                         "id": self.call_id,
@@ -57,7 +57,7 @@ class _ToolModel(Model):
             )
             return
         self.calls += 1
-        yield ModelStreamChunk(text="Final Answer: complete", done=True)
+        yield ModelStreamEvent(text="Final Answer: complete", type=ModelStreamEventType.COMPLETED)
 
 
 class _FinalModel(Model):
@@ -68,10 +68,10 @@ class _FinalModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         messages = request.message_dicts()
         self.inputs.append(list(messages))
-        yield ModelStreamChunk(text="Final Answer: resumed", done=True)
+        yield ModelStreamEvent(text="Final Answer: resumed", type=ModelStreamEventType.COMPLETED)
 
 
 class _Agent(AgentModule[_State, Observation, Action]):

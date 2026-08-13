@@ -6,50 +6,13 @@ import json
 import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ..core.model_capabilities import ModelCapabilities
 from ..core.model_request import ModelRequest
-from ..core.model_request import ModelContinuation
+from ..core.model_stream import ModelStreamEvent, ModelStreamEventType
 from ..core.multimodal import normalize_messages
-from ..core.model_response import ModelUsage, normalize_model_usage
 from .context_registry import infer_context_window
-
-
-@dataclass(slots=True)
-class ModelStreamChunk:
-    """One provider-neutral model stream event.
-
-    A normally completed stream ends with exactly one chunk whose ``done``
-    field is true. Provider adapters raise transport failures and re-raise
-    ``asyncio.CancelledError``; they do not manufacture successful terminal
-    chunks after an error or cancellation.
-    """
-
-    text: str = ""
-    done: bool = False
-    usage: ModelUsage | Mapping[str, Any] | None = None
-    tool_calls: Optional[List[Dict[str, Any]]] = None
-    native_items: Optional[List[Dict[str, Any]]] = None
-    event_type: Optional[str] = None
-    event_metadata: Dict[str, Any] = field(default_factory=dict)
-    reasoning_content: Optional[str] = None
-    finish_reason: Optional[str] = None
-    continuation: ModelContinuation | None = None
-
-    def __post_init__(self) -> None:
-        self.usage = normalize_model_usage(self.usage)
-        if self.continuation is not None and not isinstance(
-            self.continuation, ModelContinuation
-        ):
-            raise TypeError("continuation must be a ModelContinuation or None")
-
-    @property
-    def is_final(self) -> bool:
-        """Return whether this is the stream's terminal chunk."""
-
-        return self.done
 
 
 class Model(ABC):
@@ -85,7 +48,7 @@ class Model(ABC):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         """Yield one complete logical model transaction.
 
         Implementations own retry and transport cleanup. A retrying adapter
@@ -93,7 +56,10 @@ class Model(ABC):
         """
 
         if False:  # pragma: no cover - keeps this an async-generator contract
-            yield ModelStreamChunk()
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.LIFECYCLE,
+                event_type="unreachable",
+            )
 
     async def close(self) -> None:
         """Release model-owned resources.
@@ -302,4 +268,4 @@ class ModelFactory:
         return tuple(sorted(self._providers))
 
 
-__all__ = ["Model", "ModelFactory", "ModelStreamChunk"]
+__all__ = ["Model", "ModelFactory"]

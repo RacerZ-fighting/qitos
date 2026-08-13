@@ -16,7 +16,7 @@ from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegist
 from qitos.cache import CachedModel, DiskCache, InMemoryCache
 from qitos.core import ModelRequest, ModelUsage, ModelUsageSource
 from qitos.engine import RuntimeBudget
-from qitos.models import Model, ModelStreamChunk
+from qitos.models import Model, ModelStreamEvent, ModelStreamEventType
 from qitos.trace import TraceWriter
 
 
@@ -71,16 +71,21 @@ class _StubModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         _ = request
         self.call_count += 1
-        yield ModelStreamChunk(
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.TEXT_DELTA,
             text=f"Final Answer: {self.answer}",
-            reasoning_content="checked",
             event_type="text.delta",
         )
-        yield ModelStreamChunk(
-            done=True,
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.REASONING_DELTA,
+            reasoning_content="checked",
+            event_type="reasoning.delta",
+        )
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.COMPLETED,
             usage={"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
             native_items=[{"type": "message", "id": "msg_1"}],
             event_type="model.completed",
@@ -93,7 +98,7 @@ async def _collect(
     model: Model,
     messages: list[dict[str, Any]],
     **kwargs: Any,
-) -> list[ModelStreamChunk]:
+) -> list[ModelStreamEvent]:
     deadline = kwargs.pop("deadline_monotonic", None)
     request = ModelRequest(
         run_id="cache-test",
@@ -217,10 +222,13 @@ class TestCachedModel:
             async def stream(
                 self,
                 request: ModelRequest,
-            ) -> AsyncIterator[ModelStreamChunk]:
+            ) -> AsyncIterator[ModelStreamEvent]:
                 self.call_count += 1
                 if self.call_count == 1:
-                    yield ModelStreamChunk(text="discarded")
+                    yield ModelStreamEvent(
+                        type=ModelStreamEventType.TEXT_DELTA,
+                        text="discarded",
+                    )
                     raise TimeoutError("stream failed")
                 async for chunk in super().stream(
                     request,

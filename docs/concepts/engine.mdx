@@ -335,6 +335,13 @@ Anthropic Messages persists its message id, thinking signature, native content b
 and usage in the canonical response/history representation. It does not advertise a
 server-side continuation handle because Messages replay is transcript-based.
 
+Each Provider yields discriminated `ModelStreamEvent` values. Text, reasoning,
+ToolCall deltas, native output items, usage, and lifecycle notifications have distinct
+event kinds, so a consumer never infers semantics from a combination of optional
+fields. Every transaction ends with exactly one `COMPLETED` or `FAILED` event. Only a
+`COMPLETED` event can contribute finish state, final ToolCalls, or a continuation;
+`FAILED` is an error terminal and is never committed as a model response.
+
 Class tools implement `async execute(...)`. A legacy synchronous decorated function is
 run in the isolated compatibility boundary and cancellation waits for that call to reach
 a known side-effect boundary. Native subprocess, managed Web, MCP, Mailbox, and Child

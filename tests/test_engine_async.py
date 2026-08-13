@@ -24,7 +24,7 @@ from qitos import (
 from qitos.engine import RuntimeBudget
 from qitos.engine.states import RuntimePhase
 from qitos.kit.parser import ReActTextParser
-from qitos.models import Model, ModelRequest, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 
 
 @dataclass
@@ -82,7 +82,7 @@ class WaitingModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         _ = request
         self.started.set()
         try:
@@ -90,7 +90,10 @@ class WaitingModel(Model):
         finally:
             self.cancelled.set()
         if False:  # pragma: no cover - preserve the async-generator contract
-            yield ModelStreamChunk()
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.LIFECYCLE,
+                event_type="unreachable",
+            )
 
 
 class ModelAgent(AgentModule[DemoState, dict[str, Any], Action]):

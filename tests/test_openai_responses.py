@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from qitos.core import ModelRequest, ModelTransportError
+from qitos.core import ModelRequest, ModelStreamEventType, ModelTransportError
 from qitos.core.model_response import ModelResponse
 from qitos.models._openai_responses import (
     _ResponsesEventStream,
@@ -508,7 +508,13 @@ async def test_responses_failed_event_is_a_terminal_error() -> None:
         provider="openai",
     )
 
-    with pytest.raises(ModelTransportError, match=marker):
+    terminal = await stream.__anext__()
+
+    assert terminal.type is ModelStreamEventType.FAILED
+    assert marker in str(terminal.error)
+    assert terminal.is_final is True
+    assert terminal.done is False
+    with pytest.raises(StopAsyncIteration):
         await stream.__anext__()
 
 

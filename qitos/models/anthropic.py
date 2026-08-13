@@ -15,6 +15,7 @@ from ..core.model_capabilities import (
     ReasoningCapability,
 )
 from ..core.model_request import ModelRequest
+from ..core.model_stream import ModelStreamEventType
 from ..core.multimodal import content_to_text, normalize_content_block
 from .transport import (
     ModelRetryPolicy,
@@ -24,7 +25,7 @@ from .transport import (
 )
 from .base import (
     Model,
-    ModelStreamChunk,
+    ModelStreamEvent,
 )
 
 _ANTHROPIC_BLOCK_TYPES = {
@@ -134,7 +135,7 @@ def _merge_anthropic_request_kwargs(
     return merged
 
 
-class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
+class _AnthropicEventStream(AsyncIterator[ModelStreamEvent]):
     """Normalize and own one connected Anthropic message stream."""
 
     def __init__(self, events: Any, client: Any, *, provider: str, model: str) -> None:
@@ -156,7 +157,7 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
     def __aiter__(self) -> _AnthropicEventStream:
         return self
 
-    async def __anext__(self) -> ModelStreamChunk:
+    async def __anext__(self) -> ModelStreamEvent:
         if self._finished:
             raise StopAsyncIteration
         while True:
@@ -187,7 +188,8 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
                     self._blocks[index] = dict(block)
                     if block.get("type") == "tool_use":
                         self._input_json[index] = ""
-                        return ModelStreamChunk(
+                        return ModelStreamEvent(
+                            type=ModelStreamEventType.TOOL_CALL_DELTA,
                             event_type="tool_call.start",
                             event_metadata={
                                 "index": index,
@@ -205,7 +207,8 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
                     text = str(_field(delta, "text", "") or "")
                     block["text"] = str(block.get("text") or "") + text
                     if text:
-                        return ModelStreamChunk(
+                        return ModelStreamEvent(
+                            type=ModelStreamEventType.TEXT_DELTA,
                             text=text,
                             event_type="text.delta",
                             event_metadata={"index": index},
@@ -215,7 +218,8 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
                     thinking = str(_field(delta, "thinking", "") or "")
                     block["thinking"] = str(block.get("thinking") or "") + thinking
                     if thinking:
-                        return ModelStreamChunk(
+                        return ModelStreamEvent(
+                            type=ModelStreamEventType.REASONING_DELTA,
                             reasoning_content=thinking,
                             event_type="reasoning.delta",
                             event_metadata={"index": index},
@@ -230,7 +234,8 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
                     self._input_json[index] = (
                         self._input_json.get(index, "") + arguments
                     )
-                    return ModelStreamChunk(
+                    return ModelStreamEvent(
+                        type=ModelStreamEventType.TOOL_CALL_DELTA,
                         event_type="tool_call.delta",
                         event_metadata={
                             "index": index,
@@ -264,10 +269,11 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
                 return self._terminal_chunk()
 
             if event_type == "error":
-                raise ModelTransportError(
-                    f"Anthropic stream failed: {_field(event, 'error')}",
-                    attempts=1,
-                    retryable=False,
+                self._finished = True
+                return ModelStreamEvent(
+                    type=ModelStreamEventType.FAILED,
+                    event_type="message.error",
+                    error=f"Anthropic stream failed: {_field(event, 'error')}",
                 )
 
     def _finish_block(self, index: int, *, completed: bool) -> None:
@@ -324,7 +330,7 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
             "cache_read_input_tokens": cache_read,
         }
 
-    def _terminal_chunk(self) -> ModelStreamChunk:
+    def _terminal_chunk(self) -> ModelStreamEvent:
         native_items: List[Dict[str, Any]] = []
         tool_calls: List[Dict[str, Any]] = []
         invalid_tool_calls: List[Dict[str, Any]] = []
@@ -366,8 +372,8 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamChunk]):
                     },
                 }
             )
-        return ModelStreamChunk(
-            done=True,
+        return ModelStreamEvent(
+            type=ModelStreamEventType.COMPLETED,
             usage=self._normalized_usage(),
             tool_calls=tool_calls or None,
             native_items=native_items or None,
@@ -577,7 +583,7 @@ class AnthropicModel(Model):
         request_kwargs: Dict[str, Any],
         *,
         deadline_monotonic: float | None,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         try:
             import anthropic
         except ImportError as exc:
@@ -629,7 +635,7 @@ class AnthropicModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         """Stream one committed Anthropic Messages transaction."""
 
         self.validate_request(request)
@@ -638,7 +644,7 @@ class AnthropicModel(Model):
             request.option_dict(),
         )
 
-        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+        async def create_stream() -> AsyncIterator[ModelStreamEvent]:
             return await self._open_stream(
                 request.message_dicts(),
                 dict(request_kwargs),
@@ -651,7 +657,7 @@ class AnthropicModel(Model):
             connection_timeout_seconds=self.timeout,
             event_idle_timeout_seconds=self.stream_idle_timeout,
             deadline_monotonic=request.deadline_monotonic,
-            is_terminal=lambda item: item.done,
+            is_terminal=lambda item: item.is_final,
         ):
             yield chunk
 

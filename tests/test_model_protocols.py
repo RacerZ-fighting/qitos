@@ -10,7 +10,7 @@ from qitos.engine import Engine
 from qitos.harness import build_model_for_preset
 from qitos.kit import MiniMaxToolCallParser
 from qitos.kit.parser import ReActTextParser
-from qitos.models import Model, ModelRequest, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos.models.profile_registry import infer_default_protocol, infer_model_profile
 from qitos.protocols import ModelProtocol, get_protocol
 
@@ -94,13 +94,17 @@ class _DummyModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         messages = request.message_dicts()
         self.calls.append(list(messages))
         self.request_options.append(request.option_dict())
-        yield ModelStreamChunk(text=self.output, event_type="text.delta")
-        yield ModelStreamChunk(
-            done=True,
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.TEXT_DELTA,
+            text=self.output,
+            event_type="text.delta",
+        )
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.COMPLETED,
             event_type="test.completed",
             finish_reason="stop",
         )
@@ -283,13 +287,14 @@ def test_preset_model_protocol_delivers_tools_to_direct_engine_model_call() -> N
 
     async def stream(
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         calls.append(request.option_dict())
-        yield ModelStreamChunk(
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.TEXT_DELTA,
             text='{"thought":"done","final_answer":"ok"}',
             event_type="text.delta",
         )
-        yield ModelStreamChunk(done=True, event_type="test.completed")
+        yield ModelStreamEvent(type=ModelStreamEventType.COMPLETED, event_type="test.completed")
 
     llm.stream = stream
     agent = _ProtocolAgent(llm=llm)

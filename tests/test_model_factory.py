@@ -12,7 +12,8 @@ from qitos.models import (
     Model,
     ModelFactory,
     ModelRequest,
-    ModelStreamChunk,
+    ModelStreamEvent,
+    ModelStreamEventType,
     OpenAICompatibleModel,
     OpenAIModel,
     builtin_model_factory,
@@ -23,9 +24,9 @@ class _TestModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         _ = request
-        yield ModelStreamChunk(done=True, finish_reason="stop")
+        yield ModelStreamEvent(type=ModelStreamEventType.COMPLETED, finish_reason="stop")
 
 
 def test_factory_instances_are_isolated_and_duplicate_registration_fails() -> None:

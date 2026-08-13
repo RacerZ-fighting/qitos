@@ -211,7 +211,7 @@ git diff --check
 - [x] Prove the current Provider, Engine, History, Journal, and trace call graph.
 - [x] Replace `messages + **kwargs` dispatch with one immutable request value.
 - [x] Persist and validate Responses continuation with full-request fallback.
-- [ ] Replace ambiguous stream chunks with discriminated typed events.
+- [x] Replace ambiguous stream chunks with discriminated typed events.
 - [ ] Prove long-history projection, resume, fork, Provider switch, and invalid-handle behavior.
 - [ ] Run the complete QitOS gate and merge the feature branch into `main`.
 

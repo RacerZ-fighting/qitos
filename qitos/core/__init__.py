@@ -26,6 +26,7 @@ from .state import (
 from .memory import Memory, MemoryRecord
 from .model_capabilities import ModelAPI, ModelCapabilities, ReasoningCapability
 from .model_request import ModelContinuation, ModelRequest
+from .model_stream import ModelStreamEvent, ModelStreamEventType
 from .model_response import (
     ModelPricing,
     ModelResponse,
@@ -137,6 +138,8 @@ __all__ = [
     "ModelContinuation",
     "ModelPricing",
     "ModelRequest",
+    "ModelStreamEvent",
+    "ModelStreamEventType",
     "ModelResponse",
     "ModelTiming",
     "ModelUsage",

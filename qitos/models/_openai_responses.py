@@ -11,9 +11,10 @@ from ..core.model_request import (
     ModelRequest,
     model_json_digest,
 )
+from ..core.model_stream import ModelStreamEventType
 from ..core.model_response import ModelResponse
 from .transport import close_async_resource
-from .base import Model, ModelStreamChunk
+from .base import Model, ModelStreamEvent
 
 OPENAI_API_MODES = {"chat_completions", "responses"}
 _RESPONSES_REQUIREMENT = (
@@ -538,7 +539,7 @@ def _merge_completed_output(
     return payload
 
 
-class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
+class _ResponsesEventStream(AsyncIterator[ModelStreamEvent]):
     """Own and normalize one already-connected Responses stream."""
 
     def __init__(
@@ -569,7 +570,7 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
     def __aiter__(self) -> _ResponsesEventStream:
         return self
 
-    async def __anext__(self) -> ModelStreamChunk:
+    async def __anext__(self) -> ModelStreamEvent:
         if self._finished:
             raise StopAsyncIteration
         while True:
@@ -593,7 +594,8 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                 delta = str(_field(event, "delta", "") or "")
                 if delta:
                     self._streamed_text += delta
-                    return ModelStreamChunk(
+                    return ModelStreamEvent(
+                        type=ModelStreamEventType.TEXT_DELTA,
                         text=delta,
                         event_type=event_type,
                         event_metadata=metadata,
@@ -606,7 +608,8 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                 delta = str(_field(event, "delta", "") or "")
                 if delta:
                     self._streamed_reasoning += delta
-                    return ModelStreamChunk(
+                    return ModelStreamEvent(
+                        type=ModelStreamEventType.REASONING_DELTA,
                         reasoning_content=delta,
                         event_type=event_type,
                         event_metadata=metadata,
@@ -641,7 +644,8 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                         )
                     self._function_arguments[key] = completed_arguments
                 metadata["arguments_chars"] = len(self._function_arguments.get(key, ""))
-                return ModelStreamChunk(
+                return ModelStreamEvent(
+                    type=ModelStreamEventType.TOOL_CALL_DELTA,
                     event_type=event_type,
                     event_metadata=metadata,
                 )
@@ -649,7 +653,8 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                 delta = str(_field(event, "delta", "") or "")
                 if delta:
                     self._streamed_text += delta
-                    return ModelStreamChunk(
+                    return ModelStreamEvent(
+                        type=ModelStreamEventType.TEXT_DELTA,
                         text=delta,
                         event_type=event_type,
                         event_metadata=metadata,
@@ -672,7 +677,12 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                         self._function_arguments.setdefault(
                             key, str(item.get("arguments") or "")
                         )
-                return ModelStreamChunk(
+                return ModelStreamEvent(
+                    type=(
+                        ModelStreamEventType.TOOL_CALL_DELTA
+                        if item.get("type") == "function_call"
+                        else ModelStreamEventType.LIFECYCLE
+                    ),
                     event_type=event_type,
                     event_metadata=metadata,
                 )
@@ -692,7 +702,8 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                     if key:
                         self._function_arguments.pop(key, None)
                 self._completed_items.append(native_item)
-                return ModelStreamChunk(
+                return ModelStreamEvent(
+                    type=ModelStreamEventType.OUTPUT_ITEM,
                     native_items=[native_item],
                     event_type=event_type,
                     event_metadata=metadata,
@@ -756,10 +767,10 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                         "continuation_reason": self._continuation_reason,
                     }
                 )
-                return ModelStreamChunk(
+                return ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
                     text=text_suffix,
                     reasoning_content=reasoning_suffix or None,
-                    done=True,
                     usage=normalized.usage,
                     tool_calls=normalized.tool_calls,
                     native_items=normalized.native_items,
@@ -772,10 +783,12 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                 error = _field(event, "error") or _field(event, "response")
                 if self._continuation_applied and _continuation_rejected(error):
                     raise ModelContinuationRejected(str(error)[:1000])
-                raise ModelTransportError(
-                    f"model stream failed: {str(error)[:1000]}",
-                    attempts=1,
-                    retryable=False,
+                self._finished = True
+                return ModelStreamEvent(
+                    type=ModelStreamEventType.FAILED,
+                    event_type=event_type,
+                    event_metadata=metadata,
+                    error=f"model stream failed: {str(error)[:1000]}",
                 )
             if event_type in {
                 "response.created",
@@ -789,12 +802,14 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamChunk]):
                 "response.reasoning_summary_text.done",
                 "response.reasoning_text.done",
             }:
-                return ModelStreamChunk(
+                return ModelStreamEvent(
+                    type=ModelStreamEventType.LIFECYCLE,
                     event_type=event_type,
                     event_metadata=_event_response_metadata(event),
                 )
             metadata["unrecognized_provider_event"] = True
-            return ModelStreamChunk(
+            return ModelStreamEvent(
+                type=ModelStreamEventType.LIFECYCLE,
                 event_type=event_type,
                 event_metadata=metadata,
             )
@@ -811,7 +826,7 @@ async def _open_responses_stream(
     *,
     provider: str,
     request_kwargs: Dict[str, Any],
-) -> AsyncIterator[ModelStreamChunk]:
+) -> AsyncIterator[ModelStreamEvent]:
     """Establish one Responses stream and return its owning iterator."""
 
     full_payload = _request_payload(

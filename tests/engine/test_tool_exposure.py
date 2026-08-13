@@ -11,7 +11,7 @@ from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegist
 from qitos.core import JournalRecordType, ToolExposure
 from qitos.kit import ReActTextParser
 from qitos.kit.journal import JsonlSessionJournal
-from qitos.models import Model, ModelRequest, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos.protocols import ModelProtocol
 
 
@@ -114,7 +114,7 @@ class _ExposureModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         schemas = list(request.option_dict().get("tools") or [])
         self.tool_names_by_call.append(
             [str(item["function"]["name"]) for item in schemas]
@@ -129,8 +129,8 @@ class _ExposureModel(Model):
                 return "late"
 
             self.registry.register(late)
-            yield ModelStreamChunk(
-                done=True,
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.COMPLETED,
                 tool_calls=[
                     {
                         "id": "call-late",
@@ -142,9 +142,9 @@ class _ExposureModel(Model):
                 event_type="test.completed",
             )
             return
-        yield ModelStreamChunk(
+        yield ModelStreamEvent(
             text="Final Answer: done",
-            done=True,
+            type=ModelStreamEventType.COMPLETED,
             finish_reason="stop",
             event_type="test.completed",
         )

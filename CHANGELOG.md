@@ -19,6 +19,9 @@ How to update:
 
 ### Breaking
 
+- `ModelStreamChunk` has been replaced by the discriminated `ModelStreamEvent`.
+  Provider implementations must emit exactly one explicit event kind and terminate
+  with `COMPLETED` or `FAILED`; only `COMPLETED` is a successful transaction.
 - `Model.stream()` now accepts one immutable `ModelRequest` instead of mutable
   `messages + **kwargs`. Provider implementations read isolated message and option
   projections from that request; the Engine is the only owner that assembles it.

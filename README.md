@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Discriminated model stream events**: every Provider event now declares whether it
+  is text, reasoning, a ToolCall delta, a native output item, usage, lifecycle,
+  successful completion, or failure. The ambiguous `ModelStreamChunk` field bag is
+  gone; Engine treats `FAILED` as an error terminal and commits only `COMPLETED`.
 - **Recoverable model requests and guarded continuation**: the Engine now sends one
   immutable `ModelRequest` and journals its exact credential-redacted snapshot.
   Responses reuses `previous_response_id` only when the Run, Provider, model,
@@ -140,10 +144,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   tools, environment, context policy, budget, source revision, and experiment
   provenance first. Mismatched or incomplete pairs are explicitly descriptive rather
   than causal; matching pairs remain subject to provider and environment nondeterminism.
-- **Truthful typed model streams**: Chat, Responses, and Anthropic streams now retain
+- **Truthful typed model streams**: Chat, Responses, and Anthropic streams retain
   provider finish reasons, reasoning and tool-call deltas, completed tool calls, and
-  usage through one `ModelStreamChunk` contract. Incomplete streams fail instead of
-  fabricating completion, and Engine handlers no longer receive `on_end` after an error.
+  usage. Incomplete streams fail instead of fabricating completion, and Engine handlers
+  no longer receive `on_end` after an error.
 - **Call-accurate qita tool statistics**: tool counts and failures now come from the
   canonical action/result pairing instead of applying one step-level error to every
   call. Exact lifecycle counts and unmatched trace evidence remain visible for audits.

@@ -11,7 +11,7 @@ from .transport import (
     effective_request_timeout,
     transactional_stream_with_retry,
 )
-from .base import Model, ModelStreamChunk
+from .base import Model, ModelStreamEvent
 from ..core.model_request import ModelRequest
 from .openai import ChatEventStream, _to_openai_messages
 
@@ -65,7 +65,7 @@ class LiteLLMModel(Model):
         request_kwargs: Dict[str, Any],
         *,
         deadline_monotonic: float | None,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         try:
             import litellm
         except ImportError as exc:
@@ -110,13 +110,13 @@ class LiteLLMModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         """Stream one committed LiteLLM transaction."""
 
         self.validate_request(request)
         request_kwargs = request.option_dict()
 
-        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+        async def create_stream() -> AsyncIterator[ModelStreamEvent]:
             return await self._open_stream(
                 request.message_dicts(),
                 dict(request_kwargs),
@@ -129,7 +129,7 @@ class LiteLLMModel(Model):
             connection_timeout_seconds=self.timeout,
             event_idle_timeout_seconds=self.stream_idle_timeout,
             deadline_monotonic=request.deadline_monotonic,
-            is_terminal=lambda item: item.done,
+            is_terminal=lambda item: item.is_final,
         ):
             yield chunk
 

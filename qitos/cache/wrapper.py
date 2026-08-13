@@ -12,8 +12,9 @@ from typing import Any, Dict, List, Optional
 from ..core.errors import ModelTransportError
 from ..core.model_capabilities import ModelCapabilities
 from ..core.model_request import ModelRequest
+from ..core.model_stream import ModelStreamEventType
 from ..core.model_response import ModelUsage, ModelUsageSource
-from ..models.base import Model, ModelStreamChunk
+from ..models.base import Model, ModelStreamEvent
 from .backends import CacheBackend
 
 _logger = logging.getLogger(__name__)
@@ -70,7 +71,7 @@ class CachedModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         """Yield a cached complete stream or commit one successful miss."""
 
         self.validate_request(request)
@@ -99,7 +100,7 @@ class CachedModel(Model):
                 return
 
         self._misses += 1
-        committed_chunks: List[ModelStreamChunk] = []
+        committed_chunks: List[ModelStreamEvent] = []
         async for chunk in self._wrapped.stream(request):
             committed_chunks.append(chunk)
         _validate_complete_chunks(committed_chunks)
@@ -162,8 +163,12 @@ class CachedModel(Model):
         return {"hits": self._hits, "misses": self._misses}
 
 
-def _validate_complete_chunks(chunks: List[ModelStreamChunk]) -> None:
-    terminal_indexes = [index for index, chunk in enumerate(chunks) if chunk.done]
+def _validate_complete_chunks(chunks: List[ModelStreamEvent]) -> None:
+    terminal_indexes = [
+        index
+        for index, chunk in enumerate(chunks)
+        if chunk.type is ModelStreamEventType.COMPLETED
+    ]
     if terminal_indexes != [len(chunks) - 1]:
         raise ModelTransportError(
             "cached model transaction must end with exactly one terminal chunk",
@@ -172,7 +177,7 @@ def _validate_complete_chunks(chunks: List[ModelStreamChunk]) -> None:
         )
 
 
-def _decode_chunks(payload: bytes) -> List[ModelStreamChunk]:
+def _decode_chunks(payload: bytes) -> List[ModelStreamEvent]:
     raw = json.loads(payload.decode("utf-8"))
     if not isinstance(raw, list):
         raise TypeError("cached model transaction must be a list")
@@ -183,11 +188,11 @@ def _decode_chunks(payload: bytes) -> List[ModelStreamChunk]:
     return chunks
 
 
-def _encode_chunk(chunk: ModelStreamChunk) -> Dict[str, Any]:
+def _encode_chunk(chunk: ModelStreamEvent) -> Dict[str, Any]:
     usage = chunk.usage
     return {
+        "type": chunk.type.value,
         "text": chunk.text,
-        "done": chunk.done,
         "usage": usage.to_dict() if isinstance(usage, ModelUsage) else usage,
         "usage_source": usage.source.value if isinstance(usage, ModelUsage) else None,
         "tool_calls": chunk.tool_calls,
@@ -196,11 +201,16 @@ def _encode_chunk(chunk: ModelStreamChunk) -> Dict[str, Any]:
         "event_metadata": chunk.event_metadata,
         "reasoning_content": chunk.reasoning_content,
         "finish_reason": chunk.finish_reason,
+        "error": chunk.error,
     }
 
 
-def _decode_chunk(item: Dict[str, Any]) -> ModelStreamChunk:
+def _decode_chunk(item: Dict[str, Any]) -> ModelStreamEvent:
     values = dict(item)
+    try:
+        values["type"] = ModelStreamEventType(str(values.get("type") or ""))
+    except ValueError as exc:
+        raise ValueError("cached model stream event type is invalid") from exc
     source_value = values.pop("usage_source", None)
     usage = values.get("usage")
     if isinstance(usage, dict) and source_value is not None:
@@ -209,7 +219,7 @@ def _decode_chunk(item: Dict[str, Any]) -> ModelStreamChunk:
         except ValueError as exc:
             raise ValueError("cached model usage source is invalid") from exc
         values["usage"] = ModelUsage.from_mapping(usage, source=source)
-    return ModelStreamChunk(**values)
+    return ModelStreamEvent(**values)
 
 
 def _json_safe(obj: Any) -> Any:

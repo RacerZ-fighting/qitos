@@ -35,7 +35,7 @@ from qitos.core.journal import JournalError, JournalRecordRef
 from qitos.checkpoint import InMemoryCheckpointStore
 from qitos.kit.journal import JsonlSessionJournal
 from qitos.kit.parser import ReActTextParser
-from qitos.models import Model, ModelRequest, ModelStreamChunk
+from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
 from qitos.engine.critic import Critic
 from qitos.engine.states import RuntimeBudget
 
@@ -264,12 +264,12 @@ async def test_terminal_resume_restores_model_usage_and_cost(tmp_path: Path) -> 
         async def stream(
             self,
             request: ModelRequest,
-        ) -> AsyncIterator[ModelStreamChunk]:
+        ) -> AsyncIterator[ModelStreamEvent]:
             _ = request
             self.calls += 1
-            yield ModelStreamChunk(
+            yield ModelStreamEvent(
                 text="finished",
-                done=True,
+                type=ModelStreamEventType.COMPLETED,
                 usage=ModelUsage(
                     input_tokens=7,
                     output_tokens=3,
@@ -358,20 +358,20 @@ async def test_resume_reuses_only_the_last_committed_model_continuation(
         async def stream(
             self,
             request: ModelRequest,
-        ) -> AsyncIterator[ModelStreamChunk]:
+        ) -> AsyncIterator[ModelStreamEvent]:
             self.requests.append(request)
             if request.continuation is not None:
                 if self.block_continuation:
                     second_request_started.set()
                     await asyncio.Event().wait()
-                yield ModelStreamChunk(
+                yield ModelStreamEvent(
                     text="Final Answer: resumed",
-                    done=True,
+                    type=ModelStreamEventType.COMPLETED,
                     finish_reason="stop",
                 )
                 return
-            yield ModelStreamChunk(
-                done=True,
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.COMPLETED,
                 tool_calls=[
                     {
                         "id": "call-1",
@@ -821,14 +821,14 @@ async def test_cancel_appends_interruption_and_resume_uses_committed_state(
         async def stream(
             self,
             request: ModelRequest,
-        ) -> AsyncIterator[ModelStreamChunk]:
+        ) -> AsyncIterator[ModelStreamEvent]:
             _ = request
             if self._wait:
                 started.set()
                 await asyncio.Event().wait()
-            yield ModelStreamChunk(
+            yield ModelStreamEvent(
                 text="Final Answer: resumed",
-                done=True,
+                type=ModelStreamEventType.COMPLETED,
                 finish_reason="stop",
             )
 

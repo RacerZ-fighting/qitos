@@ -16,8 +16,9 @@ from .transport import (
     effective_request_timeout,
     transactional_stream_with_retry,
 )
-from .base import Model, ModelStreamChunk
+from .base import Model, ModelStreamEvent
 from ..core.model_request import ModelRequest
+from ..core.model_stream import ModelStreamEventType
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -45,7 +46,7 @@ def _ollama_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return projected
 
 
-class _OllamaEventStream(AsyncIterator[ModelStreamChunk]):
+class _OllamaEventStream(AsyncIterator[ModelStreamEvent]):
     """Normalize and own one connected Ollama chat stream."""
 
     def __init__(self, responses: Any, client: Any, *, model: str) -> None:
@@ -53,7 +54,7 @@ class _OllamaEventStream(AsyncIterator[ModelStreamChunk]):
         self._client = client
         self._iterator = responses.__aiter__()
         self._model = model
-        self._pending: Deque[ModelStreamChunk] = deque()
+        self._pending: Deque[ModelStreamEvent] = deque()
         self._tool_calls: List[Dict[str, Any]] = []
         self._finished = False
         self._closed = False
@@ -61,7 +62,7 @@ class _OllamaEventStream(AsyncIterator[ModelStreamChunk]):
     def __aiter__(self) -> _OllamaEventStream:
         return self
 
-    async def __anext__(self) -> ModelStreamChunk:
+    async def __anext__(self) -> ModelStreamEvent:
         while True:
             if self._pending:
                 return self._pending.popleft()
@@ -80,12 +81,20 @@ class _OllamaEventStream(AsyncIterator[ModelStreamChunk]):
             message = _field(response, "message", {})
             text = str(_field(message, "content", "") or "")
             reasoning = str(_field(message, "thinking", "") or "")
-            if text or reasoning:
+            if text:
                 self._pending.append(
-                    ModelStreamChunk(
+                    ModelStreamEvent(
+                        type=ModelStreamEventType.TEXT_DELTA,
                         text=text,
-                        reasoning_content=reasoning or None,
-                        event_type=("text.delta" if text else "reasoning.delta"),
+                        event_type="text.delta",
+                    )
+                )
+            if reasoning:
+                self._pending.append(
+                    ModelStreamEvent(
+                        type=ModelStreamEventType.REASONING_DELTA,
+                        reasoning_content=reasoning,
+                        event_type="reasoning.delta",
                     )
                 )
             for raw_call in list(_field(message, "tool_calls", []) or []):
@@ -114,7 +123,8 @@ class _OllamaEventStream(AsyncIterator[ModelStreamChunk]):
                     }
                 )
                 self._pending.append(
-                    ModelStreamChunk(
+                    ModelStreamEvent(
+                        type=ModelStreamEventType.TOOL_CALL_DELTA,
                         event_type="tool_call.done",
                         event_metadata={
                             "index": len(self._tool_calls) - 1,
@@ -138,8 +148,8 @@ class _OllamaEventStream(AsyncIterator[ModelStreamChunk]):
                     }
                 self._finished = True
                 self._pending.append(
-                    ModelStreamChunk(
-                        done=True,
+                    ModelStreamEvent(
+                        type=ModelStreamEventType.COMPLETED,
                         usage=usage,
                         tool_calls=self._tool_calls or None,
                         event_type="ollama.chat.completed",
@@ -215,7 +225,7 @@ class OllamaModel(Model):
         request_kwargs: Dict[str, Any],
         *,
         deadline_monotonic: float | None,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         try:
             import ollama
         except ImportError as exc:
@@ -253,13 +263,13 @@ class OllamaModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         """Stream one committed Ollama chat transaction."""
 
         self.validate_request(request)
         request_kwargs = request.option_dict()
 
-        async def create_stream() -> AsyncIterator[ModelStreamChunk]:
+        async def create_stream() -> AsyncIterator[ModelStreamEvent]:
             return await self._open_stream(
                 request.message_dicts(),
                 dict(request_kwargs),
@@ -272,7 +282,7 @@ class OllamaModel(Model):
             connection_timeout_seconds=self.timeout,
             event_idle_timeout_seconds=self.stream_idle_timeout,
             deadline_monotonic=request.deadline_monotonic,
-            is_terminal=lambda item: item.done,
+            is_terminal=lambda item: item.is_final,
         ):
             yield chunk
 

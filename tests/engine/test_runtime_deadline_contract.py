@@ -25,7 +25,8 @@ from qitos.engine.action_executor import ActionExecutor
 from qitos.engine.cancellation import CancelToken
 from qitos.engine.states import RuntimeBudget
 from qitos.models import ModelRequest
-from qitos.models.base import Model, ModelStreamChunk
+from qitos.models import ModelStreamEventType
+from qitos.models.base import Model, ModelStreamEvent
 
 
 class _RuntimeEngine:
@@ -430,7 +431,7 @@ class _BlockingModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         _ = request
         self.entered.set()
         try:
@@ -438,7 +439,10 @@ class _BlockingModel(Model):
         finally:
             self.closed.set()
         if False:  # pragma: no cover - preserve async-generator typing
-            yield ModelStreamChunk()
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.LIFECYCLE,
+                event_type="unreachable",
+            )
 
 
 @dataclass
@@ -514,10 +518,13 @@ class _BlockingStreamModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         _ = request
         try:
-            yield ModelStreamChunk(text="before deadline")
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.TEXT_DELTA,
+                text="before deadline",
+            )
             self.entered.set()
             await asyncio.Event().wait()
         finally:
@@ -569,9 +576,12 @@ def test_model_stream_reports_error_without_normal_end() -> None:
         async def stream(
             self,
             request: ModelRequest,
-        ) -> AsyncIterator[ModelStreamChunk]:
+        ) -> AsyncIterator[ModelStreamEvent]:
             _ = request
-            yield ModelStreamChunk(text="partial")
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.TEXT_DELTA,
+                text="partial",
+            )
             raise ModelTransportError(
                 "stream broke",
                 attempts=1,
@@ -579,7 +589,7 @@ def test_model_stream_reports_error_without_normal_end() -> None:
             )
 
     class _DetailedStreamHandler(_RecordingStreamHandler):
-        def on_chunk(self, chunk: ModelStreamChunk) -> None:
+        def on_chunk(self, chunk: ModelStreamEvent) -> None:
             self.events.append(("chunk", chunk.event_type))
 
         def on_error(self, exc: Exception) -> None:
@@ -599,5 +609,45 @@ def test_model_stream_reports_error_without_normal_end() -> None:
         ("start", None),
         ("chunk", None),
         ("delta", "partial"),
+        ("error", "ModelTransportError"),
+    ]
+
+
+def test_model_failed_terminal_reports_error_without_normal_end() -> None:
+    class _FailedStreamModel(Model):
+        def __init__(self) -> None:
+            super().__init__(model="failed-stream-model", temperature=None)
+
+        async def stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            _ = request
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.FAILED,
+                event_type="provider.failed",
+                error="provider rejected the transaction",
+            )
+
+    class _DetailedStreamHandler(_RecordingStreamHandler):
+        def on_chunk(self, chunk: ModelStreamEvent) -> None:
+            self.events.append(("chunk", chunk.event_type))
+
+        def on_error(self, exc: Exception) -> None:
+            self.events.append(("error", type(exc).__name__))
+
+    handler = _DetailedStreamHandler()
+    engine = Engine(
+        _ModelDeadlineAgent(_FailedStreamModel()),
+        budget=RuntimeBudget(max_steps=1),
+    )
+    engine.stream_callback = handler
+
+    result = engine.run("stream")
+
+    assert result.state.stop_reason == "unrecoverable_error"
+    assert handler.events == [
+        ("start", None),
+        ("chunk", "provider.failed"),
         ("error", "ModelTransportError"),
     ]

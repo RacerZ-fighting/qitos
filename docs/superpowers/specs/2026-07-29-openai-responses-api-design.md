@@ -59,7 +59,7 @@ The OpenAI adapter owns all endpoint-specific conversion:
 - Responses output items to canonical `ModelResponse`
 - QitOS tool-result messages to Responses `function_call_output` items
 - Responses usage fields to QitOS usage fields
-- Responses typed stream events to `ModelStreamChunk`
+- Responses typed stream events to `ModelStreamEvent`
 
 The Engine must not branch on OpenAI model names or provider-specific response
 classes.
@@ -186,9 +186,9 @@ The adapter must support:
 - response completion and usage;
 - provider error events.
 
-`ModelStreamChunk` receives optional event metadata sufficient to preserve item
-type, item id, output index, and sequence number. Existing consumers continue
-to use `text`, `tool_calls`, `usage`, and `done`.
+`ModelStreamEvent` receives a stable semantic discriminant plus event metadata
+sufficient to preserve item type, item id, output index, and sequence number.
+Existing consumers continue to use `text`, `tool_calls`, `usage`, and `done`.
 
 Synchronous, asynchronous, and streaming OpenAI model classes share the same
 pure conversion helpers so endpoint semantics do not drift between paths.

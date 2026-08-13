@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **带判别类型的模型流事件**：每个 Provider 事件现在都会明确声明它是文本、reasoning、
+  ToolCall 增量、原生输出项、usage、生命周期、成功终态还是失败终态。含混的
+  `ModelStreamChunk` 字段集合已经删除；Engine 把 `FAILED` 视为错误，只提交
+  `COMPLETED` 事务。
 - **可恢复模型请求与受校验的 continuation**：Engine 现在只向 Provider 传递一份
   不可变 `ModelRequest`，并把精确、已脱敏的请求快照写入 Journal。Responses 只有在
   Run、Provider、model、protocol、请求设置和 canonical input 前缀全部一致时才使用
@@ -97,10 +101,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 - **qita 同规格对比预检**：compare 页面会先核对模型、提示词、工具、环境、
   上下文策略、预算、源码版本与实验来源。配置不同或来源信息不完整的结果会明确标为
   只能描述、不能用于因果判断；配置一致也不会掩盖供应商或外部环境的非确定性。
-- **真实且类型化的模型流**：Chat、Responses 与 Anthropic 流现在通过同一个
-  `ModelStreamChunk` 契约保留供应商终止原因、reasoning 与工具调用分片、完整工具调用
-  及 usage。不完整的流会明确失败，不再伪造完成；发生错误后 Engine handler 也不会
-  再收到正常 `on_end`。
+- **真实且类型化的模型流**：Chat、Responses 与 Anthropic 流会保留供应商终止原因、
+  reasoning 与工具调用分片、完整工具调用及 usage。不完整的流会明确失败，不再伪造
+  完成；发生错误后 Engine handler 也不会再收到正常 `on_end`。
 - **按调用准确统计 qita 工具状态**：工具次数与失败数现在来自 canonical action/result
   配对，不会再把同一步中的一个失败错误归到所有调用上。精确生命周期计数以及无法配对
   的 trace 证据都会保留供审计。

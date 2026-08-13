@@ -37,8 +37,8 @@ from qitos.kit.prompts.computer_use import (
     computer_use_task_policy,
 )
 from qitos.kit.toolset.computer_use import ComputerUseToolSet
-from qitos.models import Model, ModelStreamChunk
-from qitos.core import ModelRequest
+from qitos.models import Model, ModelStreamEvent
+from qitos.core import ModelRequest, ModelStreamEventType
 
 
 TASK_TEXT = "Open the target desktop workflow, interact with the visible UI, and report the grounded outcome."
@@ -70,7 +70,7 @@ class _SequenceModel(Model):
     async def stream(
         self,
         request: ModelRequest,
-    ) -> AsyncIterator[ModelStreamChunk]:
+    ) -> AsyncIterator[ModelStreamEvent]:
         messages = request.message_dicts()
         self.calls.append(list(messages))
         if not self.outputs:
@@ -79,9 +79,13 @@ class _SequenceModel(Model):
             item = self.outputs.pop(0)
             text = item(messages) if callable(item) else str(item)
         if text:
-            yield ModelStreamChunk(text=text, event_type="text.delta")
-        yield ModelStreamChunk(
-            done=True,
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.TEXT_DELTA,
+                text=text,
+                event_type="text.delta",
+            )
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.COMPLETED,
             event_type="scripted.completed",
             event_metadata={"provider": self.provider_name, "model": self.model},
             finish_reason="stop",

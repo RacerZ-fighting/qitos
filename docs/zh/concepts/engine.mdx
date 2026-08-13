@@ -254,8 +254,14 @@ q2 = stream.subscribe()  # 消费者 2 的 asyncio.Queue
 
 ### 模型流
 
-所有模型 Provider 都实现唯一的异步 `Model.stream()` 契约。Engine 消费 Provider 无关的
-流式 chunk，并在整个事务中保留取消和请求截止时间。
+所有模型 Provider 都实现唯一的异步 `Model.stream(request)` 契约。Engine 在 History
+投影后组装一份不可变 `ModelRequest`，并把同一份绝对 deadline 传给连接、流读取、重试和
+清理过程。
+
+Provider 返回带判别类型的 `ModelStreamEvent`。文本、reasoning、ToolCall 增量、原生输出项、
+usage 和生命周期分别使用不同事件类型，消费方无需再从可选字段组合猜测语义。每个事务只能以
+一个 `COMPLETED` 或 `FAILED` 事件结束；只有 `COMPLETED` 能携带最终 ToolCall、finish state
+和 continuation，`FAILED` 始终进入错误路径，不会被提交为模型响应。
 
 ```python
 from qitos.models import OpenAICompatibleModel

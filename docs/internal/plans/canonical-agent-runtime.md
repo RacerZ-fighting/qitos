@@ -84,10 +84,10 @@ the budget; streams close on every exit path, and late output cannot update call
 history, actions, or final state.
 
 Progress (2026-08-12): Chat, Responses, and Anthropic streams now retain their real
-finish reason, reasoning/tool-call deltas, completed calls, and usage through one
-`ModelStreamChunk`. Providers reuse the canonical accumulator, incomplete streams no
-longer fabricate completion, and rich handlers receive optional normalized chunk/error
-callbacks without changing the required stream-handler protocol.
+finish reason, reasoning/tool-call deltas, completed calls, and usage through
+discriminated `ModelStreamEvent` values. Providers reuse the canonical accumulator,
+incomplete streams no longer fabricate completion, and rich handlers receive optional
+normalized event/error callbacks without changing the required stream-handler protocol.
 
 ### 3. Context, compression, and reasoning
 
