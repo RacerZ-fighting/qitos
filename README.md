@@ -39,7 +39,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   Responses reuses `previous_response_id` only when the Run, Provider, model,
   protocol, request settings, and canonical input prefix all match. Resume may keep
   that optimization; fork, Provider changes, compaction drift, or an expired handle
-  automatically use the complete local transcript.
+  automatically use the complete local transcript. Recovery coverage now follows a
+  multi-turn Run through compaction, cancellation, committed-boundary fork, and resume
+  while proving that the canonical ToolCall/ToolResult transcript remains complete.
 - **One async turn transaction**: every model turn now captures an immutable model,
   protocol, complete History, Tool exposure, capability, deadline, pricing, and budget
   view. Full runs and interactive steps share this one transaction; parser and optional

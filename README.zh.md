@@ -30,7 +30,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   不可变 `ModelRequest`，并把精确、已脱敏的请求快照写入 Journal。Responses 只有在
   Run、Provider、model、protocol、请求设置和 canonical input 前缀全部一致时才使用
   `previous_response_id`；resume 可以保留这项优化，fork、Provider 切换、压缩漂移或
-  句柄过期都会回退到完整本地 transcript。
+  句柄过期都会回退到完整本地 transcript。恢复回归现在会让多轮 Run 依次经历压缩、
+  取消、从 committed boundary fork 和 resume，并验证 canonical ToolCall/ToolResult
+  transcript 始终完整。
 - **同一个异步 turn 事务**：完整 Run 与交互式 step 现在共用一份不可变 turn
   事务。Parser、Critic 与 handoff 作为组合策略接入，不再各自占据或复制 Agent loop；
   Tool、Mailbox、MCP 与 Child 始终运行在调用方 event loop，取消会先等待已启动 handler

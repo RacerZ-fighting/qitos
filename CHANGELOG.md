@@ -19,6 +19,9 @@ How to update:
 
 ### Changed
 
+- Context recovery coverage now exercises compaction, cancellation, committed-boundary
+  fork, and resume as one Run. It verifies ordered ToolCall/ToolResult parity in the
+  canonical Journal while resume alone may retain a matching Provider continuation.
 - Canonical `write_file` and `edit_file` now commit through the selected environment's
   atomic replacement operation. Reads expose a complete-file SHA-256 revision;
   explicit and implicit compare-and-swap guards turn concurrent changes into a stable
