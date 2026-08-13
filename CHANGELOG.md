@@ -95,6 +95,10 @@ How to update:
 
 ### Added
 
+- Added a reusable Run-owned `ChildSupervisor`. It admits fresh Engines under one async
+  concurrency limit, supports non-destructive wait and bounded interrupt, stores
+  terminal results before parent delivery, and continues to own delivery tasks until
+  shutdown drains them. `AgentTool` is now only the model-facing launch projection.
 - Added canonical Child Agent contracts that keep persisted launch intent, stable
   identity, lifecycle status, bounded conclusions, evidence references, and live Engine
   ownership separate. The contracts round-trip without serializing a runnable Agent.

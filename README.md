@@ -195,10 +195,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   framework action contract, and every accepted, rejected, or malformed call commits one
   ordered result with the original call id. Malformed arguments never execute a tool.
 - **Typed child-agent lifecycle**: immutable launch, handle, status, result, budget, and
-  conclusion contracts separate persisted Child identity from live Engines. `AgentTool`
-  snapshots parent history at launch, admits child Engines only when a concurrency slot
-  opens, records terminal state before waking the parent, and drains every owned task at
-  teardown.
+  conclusion contracts separate persisted Child identity from live Engines. A Run-owned
+  async supervisor handles admission, wait, interrupt, terminal state, parent delivery,
+  and teardown; `AgentTool` is now a thin model-facing launch projection.
 - **Environment-backed coding tools**: named Env capability groups now let the same
   bounded workspace tools run against host, container, or remote providers. The compact
   workspace profile exposes one lowercase surface (`read_file`, `write_file`,
