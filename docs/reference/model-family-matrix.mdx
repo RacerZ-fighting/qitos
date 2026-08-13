@@ -73,7 +73,9 @@ Completed Engine transactions also expose local monotonic timing through
 `time_to_first_content_ms` waits for text, reasoning, or a tool-call event, and
 `total_ms` ends only after the terminal stream transaction is complete. These fields
 are retained in local trace summaries and require neither a remote telemetry exporter
-nor an additional provider request.
+nor an additional provider request. Model caches retain the completed normalized stream,
+not historical latency: a cache hit receives fresh Engine timing for that consumption
+while preserving the same response, usage, native items, and business result.
 
 ## Select a family and wire independently
 
