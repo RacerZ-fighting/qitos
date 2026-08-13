@@ -47,4 +47,4 @@ dependencies.
 - [x] Route full runs and public single-step execution through it.
 - [x] Preserve legacy control behavior through existing composed runtimes.
 - [x] Pass focused and full QitOS validation.
-- [ ] Merge into QitOS `main` and update PentestAgent.
+- [x] Merge into QitOS `main` and update PentestAgent.

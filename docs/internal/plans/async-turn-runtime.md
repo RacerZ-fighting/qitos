@@ -67,4 +67,4 @@ runtime dependencies.
 - [x] Add completion assessment, complete budget accounting, and journal restoration.
 - [x] Update docs, changelog, and README news.
 - [x] Pass focused and full QitOS validation.
-- [ ] Merge the QitOS feature branch and update the PentestAgent consumer.
+- [x] Merge the QitOS feature branch and update the PentestAgent consumer.
