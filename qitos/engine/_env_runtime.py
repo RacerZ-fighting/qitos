@@ -405,11 +405,16 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             _logger.warning("Env teardown failed: %s", exc)
 
     def run_env_step(
-        self, decision: Decision[ActionT], action_results: List[Any]
+        self,
+        decision: Decision[ActionT],
+        action_results: List[Any],
+        *,
+        state: StateT | None = None,
     ) -> Optional[EnvStepResult]:
         engine = self.engine
         if engine.env is None:
             return None
+        active_state = state if state is not None else engine._active_state
         try:
             result = engine.env.step(
                 action={
@@ -418,7 +423,7 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
                     "final_answer": decision.final_answer,
                     "action_results": action_results,
                 },
-                state=engine._active_state,
+                state=active_state,
             )
             if not isinstance(result, EnvStepResult):
                 result = EnvStepResult(
@@ -428,8 +433,8 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             engine._last_env_observation = result.observation
             engine._emit(
                 (
-                    engine._active_state.current_step
-                    if engine._active_state is not None
+                    active_state.current_step
+                    if active_state is not None
                     else 0
                 ),
                 RuntimePhase.ACT,
@@ -449,8 +454,8 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             engine._last_env_observation = err.observation
             engine._emit(
                 (
-                    engine._active_state.current_step
-                    if engine._active_state is not None
+                    active_state.current_step
+                    if active_state is not None
                     else 0
                 ),
                 RuntimePhase.ACT,

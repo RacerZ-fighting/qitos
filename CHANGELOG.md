@@ -42,6 +42,9 @@ How to update:
   options through every construction path, and map Claude 4.5 reasoning effort to a
   bounded manual thinking budget that reaches the provider payload. Presets prefer
   native API tool schemas and typed tool calls instead of duplicate prompt injection.
+- Journal recovery now closes interrupted tool calls with explicit terminal results:
+  started calls retain unknown-side-effect status, unstarted calls are cancelled, and
+  neither path replays a handler. Engines also reject Journal/checkpoint dual writes.
 - MCP tools now execute on the transport's owning event loop and are removed from
   shared registries during Engine cleanup, preventing cross-loop failures and stale
   registrations when an Agent or registry is reused.
@@ -61,6 +64,13 @@ How to update:
   until their runtime contracts are complete. Completed model transactions now
   normalize token counts into typed `ModelUsage` while retaining the lossless
   provider usage mapping for cache, trace, and compatibility consumers.
+- Added a durable per-Run JSONL journal for canonical model/tool transactions,
+  incremental state commits, terminal resume, and independent committed-boundary
+  forks. Tool execution is permitted only after `tool.started` is durable, while
+  terminal results are finalized once before persistence and reduction.
+- Added typed `AgentModule.finalize_action_result` and `reduce_action_result`
+  contracts, including ordered access to prior durable action results for products
+  that build evidence-backed domain state.
 - `AgentModule.mcp_servers` now forms a complete opt-in Engine lifecycle: an empty
   list is inert, while configured servers connect after preflight, expose bounded
   `mcp__server__tool` names for the first model turn, and close at run end.
@@ -124,6 +134,11 @@ How to update:
   function during compaction. It uses the bounded heuristic projection and records
   `summarizer_mode=heuristic_async_model`; explicit synchronous summarizers keep their
   existing failure and circuit-breaker semantics.
+- Journal-backed action execution is async-native at the Engine boundary and retains
+  explicit `concurrency_safe` parallel segments with input-ordered terminal commits.
+- Journal state persistence uses deterministic JSON Patch deltas plus full snapshots
+  at initial, periodic, terminal, and fork-safe boundaries. Darwin uses
+  `F_FULLFSYNC`; other POSIX systems prefer `fdatasync`.
 - **Breaking:** Removed the `read_only` and `allow_destructive` model arguments from
   `run_command`. Applications that need command admission enforce it before execution.
 - Oversized tool results now retain canonical output for reducers and traces while

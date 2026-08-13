@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Generic, List, Optional, TypeVar
 
+from .action import Action
 from .decision import Decision
 from .env import EnvSpec
 from .history import History
@@ -14,12 +16,29 @@ from .memory import Memory
 from .model_response import ModelResponse
 from .spec import ExperimentSpec, RunSpec
 from .task import Task, TaskBudget
+from .tool_result import ToolResult
 from ..prompting import PromptBuildResult, PromptBuilder, PromptSpec
 
 
 StateT = TypeVar("StateT")
 ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalActionResult:
+    """One finalized tool transaction available to later action finalizers."""
+
+    step_id: int
+    action: Action
+    result: ToolResult
+
+
+@dataclass(frozen=True, slots=True)
+class ActionResultContext:
+    """Ordered canonical results already durable in the current Run."""
+
+    prior_results: tuple[CanonicalActionResult, ...] = ()
 
 
 class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
@@ -124,6 +143,36 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         decision: Decision[ActionT],
     ) -> StateT:
         """Reduce observation (including action/env outputs) into next state."""
+
+    def restore_state(self, state: StateT) -> StateT:
+        """Revalidate or refresh runtime-derived fields after durable replay."""
+
+        return state
+
+    def finalize_action_result(
+        self,
+        state: StateT,
+        action: Action,
+        result: ToolResult,
+        *,
+        step_id: int,
+        context: ActionResultContext,
+    ) -> ToolResult:
+        """Return the immutable canonical result persisted for one action."""
+        _ = state, action, step_id, context
+        return ToolResult.from_value(result)
+
+    def reduce_action_result(
+        self,
+        state: StateT,
+        action: Action,
+        result: ToolResult,
+        *,
+        step_id: int,
+    ) -> StateT:
+        """Purely reduce one already-finalized action result into state."""
+        _ = action, result, step_id
+        return state
 
     def should_stop(self, state: StateT) -> bool:
         """Optional additional stop condition."""
@@ -759,4 +808,4 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         return {}
 
 
-__all__ = ["AgentModule"]
+__all__ = ["ActionResultContext", "AgentModule", "CanonicalActionResult"]
