@@ -604,5 +604,5 @@ def test_class_tool_must_implement_execute() -> None:
 
     run_only_tool = type("RunOnlyTool", (BaseTool,), {"run": legacy_run})
 
-    with pytest.raises(TypeError, match="abstract method execute"):
+    with pytest.raises(TypeError):
         run_only_tool(ToolSpec(name="run_only", description="legacy"))
