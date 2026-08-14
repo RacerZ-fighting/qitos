@@ -18,6 +18,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One runtime configuration path**: the disconnected `qitos.config` YAML builder,
+  parallel `qitos.experiment` runner, and `qit experiment` command are gone. They
+  bypassed canonical Agent runs, Journals, and traces while silently ignoring most
+  declared configuration. Applications now construct Providers and Agents explicitly;
+  reproducible benchmark runs continue through `qit bench` and canonical Run specs.
 - **One maintained HTML parser**: Text Web, coding Web fetch, standalone extraction,
   and EPUB reading now use the required Beautiful Soup parser through one shared
   policy. Optional-dependency branches and regex HTML fallbacks are gone, and search
@@ -65,7 +70,7 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   sessions. Stdio and Streamable HTTP now use the official Python SDK and protocol
   models; one dedicated task owns each SDK context through shutdown while QitOS keeps
   bounded catalog publication and stable ToolResult errors. PTYs use `ptyprocess`, and
-  YAML configuration uses strict Pydantic boundary validation. ToolCalls from
+  official MCP protocol models retain their Pydantic validation. ToolCalls from
   incomplete or failed model terminals are retained only as diagnostics and never
   execute.
 - **Terminal facts recover completion delivery**: Background Child and managed-process completion
@@ -329,7 +334,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **Window-safe native tool history**: model requests now discard orphan tool results when a message window evicts their assistant declaration, preventing long-running parallel-tool agents from sending invalid `tool_call_id` chains while preserving complete rounds and existing recovery behavior.
 - **Preset-aware direct Engine construction**: `Engine(agent=...)` now honors protocols attached by `build_model_for_preset(...)`, so provider aliases such as Kimi K3 keep JSON/native API tool delivery instead of silently falling back to text ReAct.
 - **Bounded empty-response recovery**: model responses with neither usable text nor tool calls are now classified as traceable `model_error` failures, retried once, and stopped cleanly if they repeat instead of consuming the full agent step budget as parser waits.
-- **Optional OpenAI Responses API transport**: set `api_mode="responses"` (or YAML `api_mode: responses`) to preserve typed output items, parallel function calls, `call_id` tool results, streaming events, and replayable tool context. Existing Chat Completions behavior remains the default.
+- **Optional OpenAI Responses API transport**: construct a model with
+  `api_mode="responses"` to preserve typed output items, parallel function calls,
+  `call_id` tool results, streaming events, and replayable tool context. Existing Chat
+  Completions behavior remains the default.
 - **Native response extraction hardening**: null-content OpenAI-compatible messages no longer surface SDK repr strings as final answers.
 - **OpenAI-compatible request hardening**: forced tool-call requests now avoid provider thinking-mode conflicts, and JSON/tool-call parsing repairs bare control characters inside string values.
 - **More robust JSON salvage**: JSON-like parser recovery now ignores apostrophes in surrounding prose, so contractions before a valid payload no longer hide the object.

@@ -9,6 +9,7 @@ def test_qit_help_does_not_list_product_apps(capsys) -> None:
     assert rc == 1
     assert "demo" in output
     assert "bench" in output
+    assert "experiment" not in output
     assert "qitos-coder" not in output
     assert "qitos-cyber-agent" not in output
     assert "pentagi" not in output
@@ -36,3 +37,11 @@ def test_qit_bench_help_remains_available(capsys) -> None:
     assert "benchmark" in output
     assert "run" in output
     assert "eval" in output
+
+
+def test_qit_rejects_removed_experiment_command(capsys) -> None:
+    rc = qit_main(["experiment"])
+    output = capsys.readouterr().out.lower()
+
+    assert rc == 1
+    assert "experiment" not in output

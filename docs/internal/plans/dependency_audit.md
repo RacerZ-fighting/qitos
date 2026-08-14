@@ -23,11 +23,11 @@ Extras:
 
 | Dependency | Classification | Notes |
 | --- | --- | --- |
-| `pyyaml` | core runtime dependency | Used by config/skill manifests; currently small enough to keep. |
+| `pyyaml` | core runtime dependency | Used by Skill manifests; keep while `SKILL.md` frontmatter remains YAML. |
 | `rich` | core/runtime UX dependency | Used by render and REPL helpers. Keep unless render becomes optional. |
 | `httpx[socks]` | core runtime dependency | Canonical sync/async HTTP client for MCP, managed Web, controller, and benchmark traffic. |
 | `mcp` | core runtime dependency | Official MCP SDK and protocol model owner. |
-| `pydantic` | core runtime dependency | Strict external configuration boundary validation. |
+| `pydantic` | core runtime dependency | Used directly for official MCP protocol validation errors and models. |
 | `ptyprocess` | platform runtime dependency | Official PTY process primitive on supported POSIX platforms. |
 | `beautifulsoup4` | default runtime dependency | Canonical HTML parser for Web, coding fetch, and EPUB text extraction. |
 | `openai` | optional model/provider dependency | Already in `[models]`. |
@@ -49,8 +49,10 @@ Extras:
 The convergence recorded in
 [`httpx-skill-convergence.md`](httpx-skill-convergence.md) removed the duplicate HTTP
 dependency and old network-backed Skill/Search paths. Maintained HTML consumers now
-share the required Beautiful Soup parser instead of carrying regex fallbacks. A later
-packaging change may still consider:
+share the required Beautiful Soup parser instead of carrying regex fallbacks. The
+disconnected YAML Agent builder and experiment runner are also gone; PyYAML remains
+for Skill manifests, while Pydantic remains part of the official MCP protocol boundary.
+A later packaging change may still consider:
 
 - `qitos[models]`: provider SDKs.
 - `qitos[benchmarks]`: benchmark runners and dataset SDKs.

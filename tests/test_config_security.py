@@ -1,39 +1,15 @@
-"""Tests for config security — API key masking and tracing redaction."""
+"""Tests for trace, render, and benchmark redaction."""
 
 from __future__ import annotations
 
 import json
 
-from qitos.config.loader import ModelConfig
 from qitos.benchmark.common import write_benchmark_results
 from qitos.core.spec import BenchmarkRunResult
 from qitos.render import ClaudeStyleHook
 from qitos.trace.events import TraceEvent
 from qitos.trace.redaction import REDACTED_FIELDS, REDACTED_MARKER, redact_mapping
 from qitos.trace.writer import TraceWriter
-
-
-def test_model_config_to_dict_masks_api_key():
-    """ModelConfig.to_dict() masks non-empty api_key."""
-    cfg = ModelConfig(api_key="sk-12345-secret")
-    d = cfg.to_dict()
-    assert d["api_key"] == "***REDACTED***"
-
-
-def test_model_config_to_dict_empty_api_key():
-    """ModelConfig.to_dict() returns empty string for empty api_key."""
-    cfg = ModelConfig(api_key="")
-    d = cfg.to_dict()
-    assert d["api_key"] == ""
-
-
-def test_model_config_preserves_other_fields():
-    """Other fields are not affected by api_key masking."""
-    cfg = ModelConfig(provider="anthropic", model="claude-3", api_key="sk-test")
-    d = cfg.to_dict()
-    assert d["provider"] == "anthropic"
-    assert d["model"] == "claude-3"
-    assert d["api_key"] == "***REDACTED***"
 
 
 def test_redacted_fields_includes_sensitive_names():

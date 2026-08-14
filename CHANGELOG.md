@@ -19,6 +19,11 @@ How to update:
 
 ### Removed
 
+- **Breaking:** Removed `qitos.config`, `qitos.experiment`, and the `qit experiment`
+  command. The YAML builder and parameter-sweep runner formed a parallel runtime that
+  bypassed canonical Agent runs, Journals, and traces while ignoring most declared
+  settings. Construct models through provider classes or `ModelFactory`, and run
+  reproducible benchmark tasks through `qit bench` and canonical Run specs.
 - **Breaking:** Removed the fixed `qitos.kit.patterns` Manager/Worker,
   Planner/Executor, Proposer/Verifier, Debate, MoA, and DAG workflow templates.
   They formed a synchronous parallel orchestration layer with no production caller
@@ -118,9 +123,6 @@ How to update:
 - Host PTY creation now uses `ptyprocess` for the platform PTY/fork/exec boundary while
   QitOS retains async incremental I/O, process-group termination, Journal recovery,
   terminal notification, and owner-scoped cleanup.
-- YAML Agent configuration now uses private Pydantic input models for strict nested
-  validation, unknown-field rejection, positive runtime limits, and standard structured
-  validation errors. Public runtime configuration remains framework-neutral dataclasses.
 - Bundled Skill roots now use recursive nearest-root discovery, deterministic
   first-root-wins precedence, and typed non-fatal diagnostics. Explicit refresh
   replaces the catalog atomically; bundle revisions cover both `SKILL.md` and resource

@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **运行配置只保留一条主线**：未接入主运行时的 `qitos.config` YAML builder、平行的
+  `qitos.experiment` runner 和 `qit experiment` 命令已删除。它们会绕过 canonical Agent
+  run、Journal 与 trace，同时静默忽略大部分声明配置。应用现在显式构造 Provider 与 Agent；
+  可复现 benchmark 继续使用 `qit bench` 和 canonical Run spec。
 - **HTML 只保留一套成熟 parser**：Text Web、coding Web fetch、独立 HTML 提取和
   EPUB 阅读现在通过同一策略直接使用必装的 Beautiful Soup。无效的可选依赖分支和正则
   HTML fallback 已删除，搜索结果链接也改为从解析后的 DOM 中选择。
@@ -51,8 +55,8 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   `Engine.astep()` 懒启动并持续持有同一生命周期；同步 `step()` 会明确拒绝 MCP
   session。Stdio 与 Streamable HTTP 现在直接使用官方 Python SDK 和协议类型；每个
   SDK context 由一个专用 task 持有到关闭，QitOS 继续负责有界目录发布和稳定
-  ToolResult 错误。PTY 改由 `ptyprocess` 建立，YAML 配置入口使用严格的 Pydantic
-  边界校验。来自 incomplete 或 failed 模型终态的 ToolCall 只保留诊断，不会执行。
+  ToolResult 错误。PTY 改由 `ptyprocess` 建立，官方 MCP 协议模型继续使用 Pydantic
+  校验。来自 incomplete 或 failed 模型终态的 ToolCall 只保留诊断，不会执行。
 - **从 terminal fact 恢复完成通知**：后台 Child 与受管进程的完成输入现在都是 canonical Journal
   terminal 的确定性投影。Resume 无需第二份存储即可补上 terminal 到 Mailbox 之间的崩溃窗口，也不会重复投递前台 Child ToolResult；
   已消费 event id 保持幂等，Fork 继承的事实也不会变成新输入。canonical `ToolResult` 同时保存
@@ -196,7 +200,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 - **窗口安全的原生工具历史**：当消息窗口裁掉 assistant 调用声明时，模型请求会移除对应的孤立工具结果，避免长时并行工具 Agent 发送非法 `tool_call_id` 链，同时保持完整轮次和原有恢复行为不变。
 - **直接构造 Engine 时保留 preset 协议**：`Engine(agent=...)` 现在会采用 `build_model_for_preset(...)` 写入模型的协议，使 Kimi K3 等服务商别名继续使用 JSON/原生 API 工具交付，而不会静默回退到文本 ReAct。
 - **空模型响应有界恢复**：既无有效文本也无工具调用的模型响应现在会被记录为可追踪的 `model_error`，重试一次后若仍为空则明确停止，不再伪装成 parser `wait` 并耗尽 Agent 步数预算。
-- **可选 OpenAI Responses API 传输**：通过 `api_mode="responses"`（或 YAML `api_mode: responses`）保留类型化输出项、并行函数调用、`call_id` 工具结果、流式事件和可重放工具上下文。现有 Chat Completions 行为仍是默认值。
+- **可选 OpenAI Responses API 传输**：构造模型时设置 `api_mode="responses"`，即可
+  保留类型化输出项、并行函数调用、`call_id` 工具结果、流式事件和可重放工具上下文。
+  现有 Chat Completions 行为仍是默认值。
 
 ## v0.5.0 最新进展
 

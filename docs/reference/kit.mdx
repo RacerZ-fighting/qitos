@@ -1200,19 +1200,21 @@ defaults. Ollama uses its native asynchronous adapter.
 
 <Accordion title="ModelFactory">
 
-Resolve environment configuration separately, then construct from an explicit factory.
+Construct models from an explicit, instance-scoped factory. Applications own any
+environment or file configuration that supplies these arguments.
 
 ```python
-from qitos.config import ModelConfig, build_model
+import os
 
-config = ModelConfig.from_env()
-if config is None:
-    raise RuntimeError("No model provider configured")
-llm = build_model(config)
+from qitos.models import builtin_model_factory
+
+factory = builtin_model_factory()
+llm = factory.create(
+    "openai",
+    model=os.getenv("QITOS_MODEL", "gpt-5"),
+    api_key=os.environ["OPENAI_API_KEY"],
+)
 ```
-
-`ModelConfig.from_env()` reads provider environment variables; `build_model()` uses an
-isolated built-in factory unless one is supplied explicitly.
 
 Register a custom backend:
 

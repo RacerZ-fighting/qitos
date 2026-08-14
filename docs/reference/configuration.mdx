@@ -11,22 +11,6 @@ QitOS is configured through three overlapping layers:
 
 ---
 
-## YAML validation
-
-`load_agent_config(path)` parses YAML with `yaml.safe_load()`, resolves explicit
-`${ENV_VAR}` placeholders, and validates the complete document through private
-Pydantic input models. Unknown fields, wrong nested types, empty Tool paths, and
-non-positive step, token, or context-window limits raise a standard
-`pydantic.ValidationError` with structured field locations. QitOS then converts the
-validated input into the public `AgentConfig`, `ModelConfig`, and `DatasetItem`
-dataclasses; Pydantic models do not become runtime state.
-
-Configuration is strict about YAML scalar types. Write `max_steps: 10`, not
-`max_steps: "10"`. Arbitrary application values remain allowed inside the explicit
-`environment` and `metadata` mappings.
-
----
-
 ## OpenAI transport mode
 
 `OpenAIModel`, `OpenAICompatibleModel`, and their async variants support two
@@ -37,16 +21,7 @@ explicit transport modes:
 | `chat_completions` | Default. Uses `/v1/chat/completions` and preserves existing QitOS behavior |
 | `responses` | Opt-in. Uses `/v1/responses`, preserves ordered native output items, and correlates function calls and outputs with `call_id` |
 
-Configure the mode in YAML:
-
-```yaml
-model:
-  provider: openai
-  model: gpt-5
-  api_mode: responses
-```
-
-Or construct a model directly:
+Construct a model directly:
 
 ```python
 from qitos.models import OpenAIModel
@@ -302,8 +277,8 @@ the outer absolute deadline is retained.
 |----------|----------|-------------|
 | `OPENAI_API_KEY` | Yes (for OpenAI / compatible APIs) | API key sent in the `Authorization` header. Used by `OpenAIModel` and `OpenAICompatibleModel` |
 | `OPENAI_BASE_URL` | Yes (for compatible APIs) | Base URL of the API endpoint. Required by `OpenAICompatibleModel`; optional for `OpenAIModel` (defaults to `https://api.openai.com/v1`) |
-| `QITOS_API_KEY` | No | Compatibility API key read by `ModelConfig.from_env()` when `OPENAI_API_KEY` is not set |
-| `QITOS_MODEL` | No | Default model identifier read by `ModelConfig.from_env()` |
+| `QITOS_API_KEY` | No | Compatibility API key used by packaged demos and benchmark recipes when `OPENAI_API_KEY` is not set |
+| `QITOS_MODEL` | No | Default model identifier used by packaged demos and benchmark recipes |
 | `AZURE_OPENAI_API_KEY` | Only for Azure | API key for Azure OpenAI. Used by `AzureOpenAIModel` |
 | `AZURE_OPENAI_ENDPOINT` | Only for Azure | Endpoint URL for Azure OpenAI |
 | `AZURE_OPENAI_DEPLOYMENT` | No | Deployment name for Azure OpenAI |

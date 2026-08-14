@@ -39,13 +39,13 @@ Suspected boundary problems:
 
 | Package/file | Classification | Notes and action |
 | --- | --- | --- |
-| `qitos.__init__.py` | CORE_STABLE | Top-level public surface. Slim to core contracts and run specs; do not export product, cache/config/experiment conveniences by default. |
+| `qitos.__init__.py` | CORE_STABLE | Top-level public surface. Slim to core contracts and run specs; do not export product or runtime-support conveniences by default. |
 | `qitos.core` | CORE_STABLE | Agent, state, decision, action, tool, env, task, memory/history contracts. Keep. |
 | `qitos.engine` | CORE_STABLE | Runtime loop, parser/model/action/control/env/handoff internals, hooks, recovery. Keep and repair regressions. |
 | `qitos.trace` | CORE_STABLE | Trace artifacts and writer contracts. Keep. |
 | `qitos.qita` | OBSERVABILITY | First-class trace inspection. Keep. |
 | `qitos.demo` | DEMO | Keep only `minimal` as canonical first run. |
-| `qitos.cli.py` | FRAMEWORK_EXTENSION | Keep `demo minimal`, `bench`, `experiment`, `skill`; do not add product app demos. |
+| `qitos.cli.py` | FRAMEWORK_EXTENSION | Keep `demo minimal`, `bench`, leaderboard, and artifact commands; do not add product app demos or parallel runtimes. |
 | `qitos.kit` | FRAMEWORK_EXTENSION | Generic curated building blocks. Remove security-specific default exports from flat `qitos.kit`. |
 | `qitos.kit.tool` | FRAMEWORK_EXTENSION | Atomic and preset tools. Security research must require explicit module paths. |
 | `qitos.kit.tool.experimental.security_research` | EXPERIMENTAL | Explicit opt-in only; not imported by `qitos` or default demos. |
@@ -61,7 +61,8 @@ Suspected boundary problems:
 | `qitos.func` | REMOVED | Unused decorators executed host functions outside Engine transactions and exposed a nonfunctional `AgentModule` adapter. |
 | `qitos.checkpoint.fork` | REMOVED | Snapshot copying did not create canonical Run transactions or resumable Journal lineage. |
 | `qitos.engine.run_state` | REMOVED | Whole-result JSON snapshots duplicated recovery state but were not consumable by any Engine resume path. |
-| `qitos.cache`, `qitos.checkpoint`, `qitos.config`, `qitos.experiment` | FRAMEWORK_EXTENSION | Useful runtime support but not top-level public API for this boundary pass. |
+| `qitos.cache`, `qitos.checkpoint` | FRAMEWORK_EXTENSION | Runtime support outside the top-level public API. |
+| `qitos.config`, `qitos.experiment` | REMOVED | Disconnected YAML builder and parallel runner bypassed canonical Agent, Journal, and trace ownership. |
 | `qitos.examples.pentagi` | SHOULD_MOVE_TO_ZOO | Full PentAGI-inspired cybersecurity product app. Exclude from packaging and stage under `qitos-cyber-agent`. |
 
 ## Concrete Actions Taken
@@ -75,6 +76,8 @@ Suspected boundary problems:
 - Removed the deprecated security-audit Agent template and forwarding tool/toolset
   packages; explicit research imports now have one owner and no default import side
   effects.
+- Removed the disconnected YAML Agent builder, parallel experiment runner, and
+  `qit experiment`; canonical benchmark specs and `qit bench` remain.
 - Added migration banners to product-like `examples/real` files that remain temporarily.
 - Repaired engine final/wait handling so finalization, parser feedback, hooks, checkpoints, and memory records follow the normal loop.
 
@@ -97,7 +100,8 @@ that obsolete path is absent.
 ## Public API Changes
 
 - `qitos.__init__` now focuses on kernel/public contracts.
-- Cache/config/checkpoint/experiment convenience imports remain available from their package paths, but are no longer top-level defaults.
+- Cache and checkpoint imports remain available from their package paths. The
+  disconnected config and experiment packages are removed.
 - `qitos.kit` and `qitos.kit.tool` no longer export security-audit surfaces from the broad default import list.
 
 ## Dependency Changes

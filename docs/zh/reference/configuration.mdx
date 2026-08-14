@@ -9,17 +9,6 @@ QitOS 的配置主要分三层：
 2. **`Engine` 构造函数参数**：更底层的运行时控制
 3. **环境变量**：供应商凭证与模型默认值
 
-## YAML 校验
-
-`load_agent_config(path)` 会使用 `yaml.safe_load()` 解析 YAML，解析显式的
-`${ENV_VAR}` 占位符，再通过私有 Pydantic 输入模型校验完整文档。未知字段、嵌套类型错误、
-空 Tool 路径，以及非正数的 step、token 或 context-window 限制，都会抛出带结构化字段位置的
-标准 `pydantic.ValidationError`。校验完成后，QitOS 会转换为公开的 `AgentConfig`、
-`ModelConfig` 和 `DatasetItem` dataclass；Pydantic model 不会进入运行时状态。
-
-YAML scalar 类型采用严格校验，应写 `max_steps: 10`，而不是 `max_steps: "10"`。
-显式的 `environment` 和 `metadata` mapping 仍允许承载应用自定义值。
-
 ## OpenAI 传输模式
 
 `OpenAIModel`、`OpenAICompatibleModel` 及其异步版本支持两种显式传输模式：
@@ -29,16 +18,7 @@ YAML scalar 类型采用严格校验，应写 `max_steps: 10`，而不是 `max_s
 | `chat_completions` | 默认值。使用 `/v1/chat/completions`，保持现有 QitOS 行为 |
 | `responses` | 可选启用。使用 `/v1/responses`，保留有序原生输出项，并通过 `call_id` 关联函数调用与工具结果 |
 
-YAML 配置示例：
-
-```yaml
-model:
-  provider: openai
-  model: gpt-5
-  api_mode: responses
-```
-
-也可以直接构造模型：
+直接构造模型：
 
 ```python
 from qitos.models import OpenAIModel
@@ -205,8 +185,8 @@ class RuntimeBudget:
 |---|---|
 | `OPENAI_API_KEY` | OpenAI / OpenAI 兼容 API 密钥 |
 | `OPENAI_BASE_URL` | OpenAI 兼容端点基础 URL |
-| `QITOS_API_KEY` | `ModelConfig.from_env()` 在未设置 `OPENAI_API_KEY` 时读取的兼容密钥 |
-| `QITOS_MODEL` | 默认模型 ID |
+| `QITOS_API_KEY` | packaged demo 与 benchmark recipe 在未设置 `OPENAI_API_KEY` 时使用的兼容密钥 |
+| `QITOS_MODEL` | packaged demo 与 benchmark recipe 使用的默认模型 ID |
 | `AZURE_OPENAI_API_KEY` | Azure OpenAI 密钥 |
 | `AZURE_OPENAI_ENDPOINT` | Azure OpenAI 端点 |
 | `AZURE_OPENAI_DEPLOYMENT` | Azure 部署名称 |
