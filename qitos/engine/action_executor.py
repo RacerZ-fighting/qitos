@@ -1419,6 +1419,11 @@ class ActionExecutor:
                 if self._engine is not None
                 else None
             ),
+            "budget_ledger": (
+                getattr(self._engine, "budget_ledger", None)
+                if self._engine is not None
+                else None
+            ),
             "max_children": max_children,
             "post_runtime_event": _post_runtime_event,
             "record_runtime_event": _record_runtime_event,

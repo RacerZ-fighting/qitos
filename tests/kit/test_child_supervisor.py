@@ -237,6 +237,29 @@ async def test_invocation_cleanup_failure_is_a_terminal_child_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_invocation_factory_can_finish_async_resource_construction() -> None:
+    factory_finished = asyncio.Event()
+
+    async def invocation_factory(request, _context):
+        await asyncio.sleep(0)
+        factory_finished.set()
+        return ChildInvocation(engine=_CompletingEngine(), task=request.task)
+
+    supervisor = ChildSupervisor(invocation_factory=invocation_factory)
+
+    result = await supervisor.launch(
+        _request(),
+        {},
+        parent_run_id="parent-run",
+        background=False,
+    )
+
+    assert factory_finished.is_set()
+    assert result.status is ChildStatus.COMPLETED
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_close_terminalizes_child_cancelled_before_task_start() -> None:
     factory_called = False
 
@@ -289,6 +312,7 @@ async def test_child_lifecycle_journals_started_before_terminal(tmp_path) -> Non
         JournalRecordType.CHILD_TERMINAL,
     ]
     assert child_records[0].payload["handle"] == result.handle.to_dict()
+    assert child_records[0].payload["background"] is False
     assert child_records[1].payload == result.to_dict()
     await supervisor.aclose()
     await journal.close()
@@ -386,6 +410,12 @@ async def test_terminal_record_failure_is_visible_and_not_delivered(tmp_path) ->
     assert "not persisted" in str(terminal.error)
     assert terminal.conclusion.summary == "done:inspect"
     assert delivered is False
+    started = next(
+        record
+        for record in await journal.replay()
+        if record.type is JournalRecordType.CHILD_STARTED
+    )
+    assert started.payload["background"] is True
     await supervisor.aclose()
     await journal.close()
 

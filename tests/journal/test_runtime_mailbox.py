@@ -11,7 +11,16 @@ from typing import Any
 import pytest
 
 from qitos import AgentModule, Decision, Engine, RuntimeInput, StateSchema, ToolRegistry
-from qitos.core.journal import JournalError, JournalRecordType
+from qitos.core.child import ChildHandle, ChildLaunchRequest, ChildResult, ChildStatus
+from qitos.core.journal import JournalError, JournalRecord, JournalRecordType
+from qitos.core.process import (
+    ProcessHandle,
+    ProcessOutput,
+    ProcessSnapshot,
+    ProcessStatus,
+)
+from qitos.core.tool import BaseTool, ToolSpec
+from qitos.engine._journal_runtime import recover_pending_runtime_inputs
 from qitos.engine import RuntimeBudget
 from qitos.kit.history import WindowHistory
 from qitos.kit.journal import JsonlSessionJournal
@@ -124,6 +133,48 @@ class _FinalRaceAgent(_WaitThenFinish):
         return decision
 
 
+class _ChildTerminalOnSetup(BaseTool):
+    def __init__(self, result: ChildResult) -> None:
+        super().__init__(
+            ToolSpec(
+                name="terminal_on_setup",
+                description="Append one recovered child terminal during setup.",
+            )
+        )
+        self._result = result
+
+    async def asetup(self, context: dict[str, Any]) -> None:
+        journal = context["journal"]
+        await journal.append(
+            JournalRecordType.CHILD_STARTED,
+            {
+                "handle": self._result.handle.to_dict(),
+                "request": self._result.request.to_dict(),
+                "background": True,
+            },
+            record_id=(
+                f"{self._result.handle.parent_run_id}:child:"
+                f"{self._result.handle.child_id}:started"
+            ),
+        )
+        await journal.append(
+            JournalRecordType.CHILD_TERMINAL,
+            self._result.to_dict(),
+            record_id=(
+                f"{self._result.handle.parent_run_id}:child:"
+                f"{self._result.handle.child_id}:terminal"
+            ),
+        )
+
+    async def execute(
+        self,
+        args: dict[str, Any],
+        runtime_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        _ = args, runtime_context
+        return {}
+
+
 def _event(event_id: str = "job-1:terminal") -> RuntimeInput:
     return RuntimeInput(
         event_id=event_id,
@@ -132,6 +183,150 @@ def _event(event_id: str = "job-1:terminal") -> RuntimeInput:
         source="test",
         payload={"status": "completed"},
     )
+
+
+def _terminal_record(
+    seq: int,
+    record_type: JournalRecordType,
+    payload: dict[str, Any],
+) -> JournalRecord:
+    return JournalRecord.create(
+        seq=seq,
+        record_id=f"terminal-{seq}",
+        type=record_type,
+        run_id="run-1",
+        payload=payload,
+    )
+
+
+def _child_started_record(
+    seq: int,
+    result: ChildResult,
+    *,
+    background: bool,
+) -> JournalRecord:
+    return JournalRecord.create(
+        seq=seq,
+        record_id=f"child-started-{seq}",
+        type=JournalRecordType.CHILD_STARTED,
+        run_id="run-1",
+        payload={
+            "handle": result.handle.to_dict(),
+            "request": result.request.to_dict(),
+            "background": background,
+        },
+    )
+
+
+def test_terminal_facts_rebuild_pending_child_and_process_inputs() -> None:
+    child = ChildResult(
+        handle=ChildHandle("child-1", "run-1"),
+        request=ChildLaunchRequest(task="inspect", description="inspect target"),
+        status=ChildStatus.COMPLETED,
+        child_run_id="child-run-1",
+    )
+    process = ProcessSnapshot(
+        handle=ProcessHandle("process-1", "run-1"),
+        status=ProcessStatus.EXITED,
+        command="probe",
+        cwd="/workspace",
+        pid=1,
+        tty=False,
+        started_at="2026-01-01T00:00:00+00:00",
+        ended_at="2026-01-01T00:00:01+00:00",
+        exit_code=0,
+        output=ProcessOutput(
+            content="x" * 9_000,
+            cursor=0,
+            next_cursor=9_000,
+            total_bytes=9_000,
+            omitted_bytes=0,
+            truncated=False,
+            log_path="processes/process-1.log",
+        ),
+    )
+
+    pending = recover_pending_runtime_inputs(
+        (
+            _child_started_record(1, child, background=True),
+            _terminal_record(2, JournalRecordType.CHILD_TERMINAL, child.to_dict()),
+            _terminal_record(3, JournalRecordType.PROCESS_TERMINAL, process.to_dict()),
+        )
+    )
+
+    assert [(event.event_id, event.kind) for event in pending] == [
+        ("child-1:terminal", "agent.child.completed"),
+        ("process-1:terminal", "process.completed"),
+    ]
+    assert pending[1].payload["output"]["notification_truncated"] is True
+
+
+def test_foreground_child_terminal_does_not_become_runtime_input() -> None:
+    child = ChildResult(
+        handle=ChildHandle("child-foreground", "run-1"),
+        request=ChildLaunchRequest(task="inspect", description="inspect target"),
+        status=ChildStatus.COMPLETED,
+    )
+
+    pending = recover_pending_runtime_inputs(
+        (
+            _child_started_record(1, child, background=False),
+            _terminal_record(2, JournalRecordType.CHILD_TERMINAL, child.to_dict()),
+        )
+    )
+
+    assert pending == ()
+    assert recover_pending_runtime_inputs(
+        (_terminal_record(1, JournalRecordType.CHILD_TERMINAL, child.to_dict()),)
+    ) == ()
+
+
+def test_terminal_derived_inputs_are_idempotent_consumable_and_not_forked() -> None:
+    child = ChildResult(
+        handle=ChildHandle("child-1", "run-1"),
+        request=ChildLaunchRequest(task="inspect", description="inspect target"),
+        status=ChildStatus.COMPLETED,
+    )
+    terminal = _terminal_record(
+        2,
+        JournalRecordType.CHILD_TERMINAL,
+        child.to_dict(),
+    )
+    started = _child_started_record(1, child, background=True)
+    event = recover_pending_runtime_inputs((started, terminal))[0]
+    posted = JournalRecord.create(
+        seq=3,
+        record_id="posted",
+        type=JournalRecordType.RUNTIME_INPUT_POSTED,
+        run_id="run-1",
+        payload={"event": event.to_dict()},
+    )
+    consumed = JournalRecord.create(
+        seq=4,
+        record_id="model",
+        type=JournalRecordType.MODEL_COMPLETED,
+        run_id="run-1",
+        payload={"runtime_input_ids": [event.event_id]},
+    )
+    inherited = JournalRecord.create(
+        seq=1,
+        record_id="inherited",
+        type=JournalRecordType.INHERITED,
+        run_id="fork-1",
+        payload={
+            "origin_run_id": terminal.run_id,
+            "origin_seq": terminal.seq,
+            "origin_record_id": terminal.record_id,
+            "record": terminal.to_dict(),
+        },
+    )
+
+    assert recover_pending_runtime_inputs((started, terminal, posted)) == (event,)
+    assert recover_pending_runtime_inputs((terminal, posted)) == (event,)
+    assert recover_pending_runtime_inputs(
+        (started, terminal, posted, consumed)
+    ) == ()
+    assert recover_pending_runtime_inputs((inherited,)) == ()
 
 
 @pytest.mark.asyncio
@@ -269,3 +464,57 @@ async def test_resume_redelivers_only_an_unconsumed_runtime_input(
         and record.payload["runtime_input_ids"] == ["job-1:terminal"]
         for record in records
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_replays_terminal_created_during_tool_setup(
+    tmp_path: Path,
+) -> None:
+    failing_journal = _FailSecondModelJournal(tmp_path)
+    first_agent = _WaitThenFinish()
+    first_engine = Engine(
+        first_agent,
+        journal=failing_journal,
+        budget=RuntimeBudget(max_steps=4),
+    )
+    running = asyncio.create_task(first_engine.arun("wait"))
+    await asyncio.wait_for(first_agent.first_decision.wait(), timeout=1)
+    run_id = first_engine.active_run_id
+    assert await first_engine.apost_runtime_event(_event(), run_id=run_id) is True
+    with pytest.raises(JournalError, match="second model completion failure"):
+        await running
+
+    child = ChildResult(
+        handle=ChildHandle("child-recovered", run_id),
+        request=ChildLaunchRequest(task="inspect", description="inspect target"),
+        status=ChildStatus.INTERRUPTED,
+        error="parent process exited",
+    )
+    resumed_agent = _WaitThenFinish(finish_immediately=True)
+    resumed_agent.tool_registry.register(_ChildTerminalOnSetup(child))
+    journal = JsonlSessionJournal(tmp_path)
+
+    result = await Engine(
+        resumed_agent,
+        journal=journal,
+        budget=RuntimeBudget(max_steps=4),
+    ).aresume_from_journal(run_id)
+
+    assert result.state.final_result == "done"
+    child_events = [
+        event
+        for event in resumed_agent.seen_runtime_events
+        if event["event_id"] == "child-recovered:terminal"
+    ]
+    assert len(child_events) == 1
+    records = await journal.replay()
+    assert not any(
+        record.type is JournalRecordType.RUNTIME_INPUT_POSTED
+        and record.payload["event"]["event_id"] == "child-recovered:terminal"
+        for record in records
+    )
+    assert any(
+        record.type is JournalRecordType.MODEL_COMPLETED
+        and "child-recovered:terminal" in record.payload["runtime_input_ids"]
+        for record in records
+    )

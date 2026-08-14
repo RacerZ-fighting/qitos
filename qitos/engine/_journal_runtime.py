@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from ..core.action import Action
 from ..core.agent_module import ActionResultContext, CanonicalActionResult
+from ..core.child import ChildHandle, ChildResult
 from ..core.decision import Decision
 from ..core.completion import CompletionDisposition
 from ..core.errors import StopReason
@@ -20,7 +21,12 @@ from ..core.journal import (
     resolve_inherited_record,
 )
 from ..core.model_request import ModelContinuation, ModelRequest
-from ..core.runtime_input import RuntimeInput
+from ..core.process import ProcessSnapshot
+from ..core.runtime_input import (
+    RuntimeInput,
+    child_terminal_runtime_input,
+    process_terminal_runtime_input,
+)
 from ..core.state import StateSchema
 from ..core.state_delta import apply_state_delta, build_state_delta, state_digest
 from ..core.task import Task
@@ -55,6 +61,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
             engine._active_run_id,
             {"agent": engine.agent.name},
         )
+        engine._prepare_owned_budget_ledger(await journal.replay())
         engine._last_journal_position = await journal.append(
             JournalRecordType.INPUT_ACCEPTED,
             {
@@ -139,17 +146,21 @@ class _JournalRuntime(Generic[StateT, ActionT]):
             zip(actions, results, strict=True)
         ):
             terminal: JournalRecordRef | None = None
+            expected_call_id = _action_call_id(action, record.step_id, index)
+            input_result = ToolResult.from_value(raw_result)
+            input_result.call_id = expected_call_id
             result = ToolResult.from_value(
                 engine.agent.finalize_action_result(
                     state,
                     action,
-                    ToolResult.from_value(raw_result),
+                    input_result,
                     step_id=record.step_id,
                     context=ActionResultContext(
                         prior_results=tuple(engine._canonical_action_results)
                     ),
                 )
             )
+            result.call_id = expected_call_id
             if engine.journal is not None:
                 record_id = f"{record.transaction_id}:tool:{index}:terminal"
                 engine._last_journal_position = await engine.journal.append(
@@ -327,6 +338,8 @@ class _JournalRuntime(Generic[StateT, ActionT]):
         usage_completion_tokens = 0
         usage_total_tokens = 0
         usage_cost_usd = 0.0
+        usage_complete = True
+        cost_complete = True
         latest_continuation: ModelContinuation | None = None
         for journal_record in effective:
             payload = journal_record.payload
@@ -370,6 +383,14 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                     else None
                 )
                 raw_usage = record.model_response.get("usage")
+                record_usage_complete = bool(
+                    record.model_response.get("usage_complete", False)
+                )
+                record_cost_complete = bool(
+                    record.model_response.get("cost_complete", False)
+                )
+                usage_complete = usage_complete and record_usage_complete
+                cost_complete = cost_complete and record_cost_complete
                 if isinstance(raw_usage, Mapping):
                     prompt_tokens = raw_usage.get(
                         "prompt_tokens", raw_usage.get("input_tokens", 0)
@@ -467,10 +488,16 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 action_payload = payload.get("action")
                 if not isinstance(action_payload, Mapping):
                     raise JournalError("tool.terminal is missing action")
+                action = Action.from_dict(dict(action_payload))
+                expected_call_id = _action_call_id(action, step_id, action_index)
+                if terminal_result.call_id is None:
+                    terminal_result.call_id = expected_call_id
+                elif terminal_result.call_id != expected_call_id:
+                    raise JournalError("tool.terminal call_id does not match action")
                 canonical_results.append(
                     CanonicalActionResult(
                         step_id,
-                        Action.from_dict(dict(action_payload)),
+                        action,
                         terminal_result,
                         JournalRecordRef(
                             journal_record.run_id,
@@ -542,6 +569,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                     continue
                 was_started = index in started
                 result = ToolResult(
+                    call_id=_action_call_id(action, int(transaction["step_id"]), index),
                     status="error" if was_started else "cancelled",
                     output=None,
                     error=(
@@ -587,6 +615,8 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                     "completion_tokens": usage_completion_tokens,
                     "total_tokens": usage_total_tokens,
                     "cost_usd": usage_cost_usd,
+                    "usage_complete": usage_complete,
+                    "cost_complete": cost_complete,
                 },
             }
         for transaction_id, transaction in transactions.items():
@@ -706,6 +736,8 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 "completion_tokens": usage_completion_tokens,
                 "total_tokens": usage_total_tokens,
                 "cost_usd": usage_cost_usd,
+                "usage_complete": usage_complete,
+                "cost_complete": cost_complete,
             },
         }
 
@@ -864,7 +896,7 @@ def tool_result_history_message(
         role="tool",
         step_id=step_id,
         content=content,
-        tool_call_id=action.action_id,
+        tool_call_id=result.call_id or action.action_id,
         name=action.name,
         metadata={"source": "journal_recovery", "tool_name": action.name},
     )
@@ -877,9 +909,36 @@ def recover_pending_runtime_inputs(
 
     posted: dict[str, RuntimeInput] = {}
     consumed: set[str] = set()
+    background_children = _background_child_handles(records)
     for record in records:
         # A fork receives an independent mailbox. Inherited parent events and
         # their consumption markers never become child input.
+        if record.type is JournalRecordType.CHILD_TERMINAL:
+            try:
+                result = ChildResult.from_dict(record.payload)
+                if result.handle.parent_run_id != record.run_id:
+                    raise ValueError("child.terminal parent is inconsistent")
+                if result.handle not in background_children:
+                    continue
+                event = child_terminal_runtime_input(result)
+            except (TypeError, ValueError) as exc:
+                raise JournalError(
+                    "child.terminal event projection is invalid"
+                ) from exc
+            _add_runtime_input(posted, event)
+            continue
+        if record.type is JournalRecordType.PROCESS_TERMINAL:
+            try:
+                snapshot = ProcessSnapshot.from_dict(record.payload)
+                if snapshot.handle.owner_run_id != record.run_id:
+                    raise ValueError("process.terminal owner is inconsistent")
+                event = process_terminal_runtime_input(snapshot)
+            except (TypeError, ValueError) as exc:
+                raise JournalError(
+                    "process.terminal event projection is invalid"
+                ) from exc
+            _add_runtime_input(posted, event)
+            continue
         if record.type is JournalRecordType.RUNTIME_INPUT_POSTED:
             raw_event = record.payload.get("event")
             if not isinstance(raw_event, Mapping):
@@ -888,9 +947,7 @@ def recover_pending_runtime_inputs(
                 event = RuntimeInput.from_dict(raw_event)
             except (TypeError, ValueError) as exc:
                 raise JournalError("runtime_input.posted event is invalid") from exc
-            previous = posted.setdefault(event.event_id, event)
-            if previous != event:
-                raise JournalError("runtime input id was reused with different content")
+            _add_runtime_input(posted, event)
             continue
         if record.type is not JournalRecordType.MODEL_COMPLETED:
             continue
@@ -902,6 +959,47 @@ def recover_pending_runtime_inputs(
         consumed.update(raw_ids)
     return tuple(
         event for event_id, event in posted.items() if event_id not in consumed
+    )
+
+
+def _add_runtime_input(posted: dict[str, RuntimeInput], event: RuntimeInput) -> None:
+    previous = posted.setdefault(event.event_id, event)
+    if previous != event:
+        raise JournalError("runtime input id was reused with different content")
+
+
+def _background_child_handles(
+    records: tuple[JournalRecord, ...],
+) -> set[ChildHandle]:
+    modes: dict[ChildHandle, bool] = {}
+    for record in records:
+        if record.type is not JournalRecordType.CHILD_STARTED:
+            continue
+        raw_background = record.payload.get("background")
+        if raw_background is None:
+            continue
+        raw_handle = record.payload.get("handle")
+        if not isinstance(raw_background, bool) or not isinstance(
+            raw_handle, Mapping
+        ):
+            raise JournalError("child.started delivery policy is invalid")
+        try:
+            handle = ChildHandle.from_dict(raw_handle)
+        except (TypeError, ValueError) as exc:
+            raise JournalError("child.started delivery policy is invalid") from exc
+        if handle.parent_run_id != record.run_id:
+            raise JournalError("child.started parent is inconsistent")
+        previous = modes.setdefault(handle, raw_background)
+        if previous is not raw_background:
+            raise JournalError("child.started delivery policy changed")
+    return {handle for handle, background in modes.items() if background}
+
+
+def _action_call_id(action: Action, step_id: int, action_index: int) -> str:
+    return (
+        str(action.action_id)
+        if action.action_id not in (None, "")
+        else f"call_{step_id}_{action_index}"
     )
 
 

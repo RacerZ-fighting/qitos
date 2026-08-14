@@ -19,6 +19,15 @@ How to update:
 
 ### Changed
 
+- Root Engines and every descendant can now share one journal-backed `BudgetLedger`.
+  Completed model transactions atomically settle token and cost usage into the Root
+  JSONL, while `EngineResult` and `ChildResult` preserve local totals and usage
+  completeness for audit. Local Child ceilings further narrow, rather than duplicate,
+  the shared Run allowance.
+- Canonical `ToolResult` now carries the model ToolCall `call_id`, assigned by the
+  Engine before application finalization and reconstructed for older Journal records.
+  Child invocation factories may complete async resource construction while existing
+  synchronous factories remain supported.
 - Bundled Skill roots now use recursive nearest-root discovery, deterministic
   first-root-wins precedence, and typed non-fatal diagnostics. Explicit refresh
   replaces the catalog atomically; bundle revisions cover both `SKILL.md` and resource
@@ -68,6 +77,10 @@ How to update:
 
 ### Fixed
 
+- Resume now derives idempotent background Child and process completion inputs from local
+  terminal facts. A crash between `child.terminal` / `process.terminal` and mailbox
+  acceptance no longer loses the notification; foreground Child results are not
+  redelivered, consumed ids stay consumed, and forks do not receive inherited completions.
 - Session Journal payloads now cross one strict JSON boundary before append, keeping
   in-memory replay, reopened replay, stable record IDs, JSONL, and projection digests
   consistent. Unsupported schema versions now have a dedicated upgrade error, and a

@@ -63,6 +63,9 @@ def test_child_result_preserves_scoped_handle_and_evidence() -> None:
         child_run_id="child-run",
         steps=3,
         total_tokens=900,
+        total_cost_usd=0.75,
+        usage_complete=False,
+        cost_complete=True,
         elapsed_seconds=1.25,
     )
 
@@ -72,6 +75,29 @@ def test_child_result_preserves_scoped_handle_and_evidence() -> None:
     assert restored.ready is True
     assert restored.succeeded is False
     assert restored.handle.parent_run_id == "parent-1"
+    assert restored.total_cost_usd == pytest.approx(0.75)
+    assert restored.usage_complete is False
+    assert restored.cost_complete is True
+
+
+def test_legacy_child_result_marks_usage_incomplete() -> None:
+    result = ChildResult(
+        handle=ChildHandle(child_id="child-1", parent_run_id="parent-1"),
+        request=_request(),
+        status=ChildStatus.COMPLETED,
+        total_tokens=900,
+    )
+    payload = result.to_dict()
+    payload.pop("total_cost_usd")
+    payload.pop("usage_complete")
+    payload.pop("cost_complete")
+
+    restored = ChildResult.from_dict(payload)
+
+    assert restored.total_tokens == result.total_tokens
+    assert restored.total_cost_usd == 0.0
+    assert restored.usage_complete is False
+    assert restored.cost_complete is False
 
 
 @pytest.mark.parametrize(

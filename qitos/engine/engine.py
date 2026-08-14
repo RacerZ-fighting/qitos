@@ -27,6 +27,7 @@ from ..checkpoint.store import (
 from ..core.agent_module import AgentModule, CanonicalActionResult
 from ..core.action import Action, ActionExecutionPolicy
 from ..core.artifact import ArtifactStore
+from ..core.budget import BudgetLedger, BudgetSnapshot
 from ..core.decision import Decision
 from ..core.errors import ErrorCategory, StopReason
 from ..core.env import Env, EnvObservation, EnvStepResult
@@ -39,6 +40,7 @@ from ..core.history import (
 from ..core.journal import (
     JournalError,
     JournalPosition,
+    JournalRecord,
     JournalRecordType,
     SessionJournal,
 )
@@ -69,7 +71,11 @@ from ._env_runtime import _EnvRuntime
 from ._loop_detector import ToolCallLoopDetector
 from ._model_runtime import _ModelRuntime
 from ._handoff_runtime import _HandoffRuntime
-from ._journal_runtime import _JournalRuntime, history_message_to_dict
+from ._journal_runtime import (
+    _JournalRuntime,
+    history_message_to_dict,
+    recover_pending_runtime_inputs,
+)
 from ._trace_runtime import _TraceRuntime
 from ._turn_runtime import _TurnRuntime
 from .action_executor import ActionExecutor
@@ -99,8 +105,17 @@ from .validation import StateValidationGate
 StateT = TypeVar("StateT", bound=StateSchema)
 ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
+NumberT = TypeVar("NumberT", int, float)
 
 RecoveryHandler = Callable[[StateT, RuntimePhase, Exception], None]
+
+
+def _minimum_optional(first: NumberT | None, second: NumberT | None) -> NumberT | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return min(first, second)
 
 
 @dataclass
@@ -133,10 +148,22 @@ class EngineResult(Generic[StateT]):
     runtime_seconds: float = 0.0
     total_tokens: int = 0
     total_cost_usd: float = 0.0
+    local_total_tokens: int = -1
+    local_total_cost_usd: float = -1.0
+    usage_complete: bool = False
+    cost_complete: bool = False
+    local_usage_complete: bool = False
+    local_cost_complete: bool = False
     run_id: str = ""
     critic_traces: List[CriticTrace] = field(default_factory=list)
     handoff_traces: List[HandoffTrace] = field(default_factory=list)
     _cancel_token: Optional[CancelToken] = None
+
+    def __post_init__(self) -> None:
+        if self.local_total_tokens < 0:
+            self.local_total_tokens = int(self.total_tokens)
+        if self.local_total_cost_usd < 0:
+            self.local_total_cost_usd = float(self.total_cost_usd)
 
     def cancel(self, mode: str = "immediate") -> None:
         """Request cancellation of the running Engine.
@@ -220,6 +247,13 @@ class EngineResult(Generic[StateT]):
             "step_count": self.step_count,
             "runtime_seconds": self.runtime_seconds,
             "total_tokens": self.total_tokens,
+            "total_cost_usd": self.total_cost_usd,
+            "local_total_tokens": self.local_total_tokens,
+            "local_total_cost_usd": self.local_total_cost_usd,
+            "usage_complete": self.usage_complete,
+            "cost_complete": self.cost_complete,
+            "local_usage_complete": self.local_usage_complete,
+            "local_cost_complete": self.local_cost_complete,
             "tool_calls_by_name": self.tool_calls_by_name,
             "success_rate": self.success_rate,
             "step_summaries": [item.to_dict() for item in self.step_summaries],
@@ -269,6 +303,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         action_execution_policy: Optional[ActionExecutionPolicy] = None,
         model_pricing: ModelPricing | None = None,
         journal: SessionJournal | None = None,
+        budget_ledger: BudgetLedger | None = None,
         state_snapshot_interval: int = 16,
     ):
         if journal is not None and checkpoint_store is not None:
@@ -305,6 +340,15 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             max_tool_concurrency=self.budget.max_tool_concurrency,
             max_children=self.budget.max_children,
             deadline_monotonic=self.budget.deadline_monotonic,
+        )
+        if budget_ledger is not None and not isinstance(
+            budget_ledger, BudgetLedger
+        ):
+            raise TypeError("budget_ledger must be a BudgetLedger")
+        self._owns_budget_ledger = budget_ledger is None
+        self._budget_ledger = budget_ledger or BudgetLedger(
+            max_tokens=self.budget.max_tokens,
+            max_cost_usd=self.budget.max_cost_usd,
         )
         self.validation_gate = validation_gate or StateValidationGate()
         self.recovery_handler = recovery_handler
@@ -362,6 +406,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_env_result: Optional[EnvStepResult] = None
         self._token_usage: int = 0
         self._cost_usage_usd: float = 0.0
+        self._usage_complete = True
+        self._cost_complete = True
         self._model_continuation: ModelContinuation | None = None
         self._active_run_id: str = ""
         self._runtime_deadline_monotonic: Optional[float] = None
@@ -521,15 +567,24 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             description = exposure.describe_tool(name)
             environment_ops.update(description.get("required_ops") or [])
             environment_ops.update(description.get("environment_ops") or [])
-        remaining_tokens = (
+        local_remaining_tokens = (
             None
             if self.budget.max_tokens is None
             else max(0, int(self.budget.max_tokens) - int(self._token_usage))
         )
-        remaining_cost = (
+        local_remaining_cost = (
             None
             if self.budget.max_cost_usd is None
             else max(0.0, float(self.budget.max_cost_usd) - self._cost_usage_usd)
+        )
+        run_budget = self._budget_ledger.snapshot()
+        remaining_tokens = _minimum_optional(
+            local_remaining_tokens,
+            run_budget.remaining_tokens,
+        )
+        remaining_cost = _minimum_optional(
+            local_remaining_cost,
+            run_budget.remaining_cost_usd,
         )
         protocol = self.resolve_protocol()
         return TurnSnapshot(
@@ -549,9 +604,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             budget=TurnBudgetSnapshot(
                 step=step_id,
                 max_steps=int(self.budget.max_steps),
-                used_tokens=int(self._token_usage),
+                used_tokens=int(run_budget.total_tokens),
                 remaining_tokens=remaining_tokens,
-                used_cost_usd=float(self._cost_usage_usd),
+                used_cost_usd=float(run_budget.total_cost_usd),
                 remaining_cost_usd=remaining_cost,
                 model_pricing=self.model_pricing,
                 deadline_monotonic=self._runtime_deadline_monotonic,
@@ -598,6 +653,54 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             return None
         return max(0.0, deadline - time.monotonic())
 
+    @property
+    def budget_ledger(self) -> BudgetLedger:
+        """Return the shared Root/Child usage owner for this Run tree."""
+
+        return self._budget_ledger
+
+    def _run_budget_snapshot(self) -> BudgetSnapshot:
+        return self._budget_ledger.snapshot()
+
+    async def _settle_model_usage(
+        self,
+        *,
+        transaction_id: str,
+        tokens: int,
+        cost_usd: float,
+        usage_complete: bool,
+        cost_complete: bool,
+    ) -> BudgetSnapshot:
+        snapshot = await self._budget_ledger.commit(
+            origin_run_id=self._active_run_id,
+            transaction_id=transaction_id,
+            tokens=tokens,
+            cost_usd=cost_usd,
+            usage_complete=usage_complete,
+            cost_complete=cost_complete,
+        )
+        self._usage_complete = self._usage_complete and usage_complete
+        self._cost_complete = self._cost_complete and cost_complete
+        return snapshot
+
+    def _prepare_owned_budget_ledger(
+        self,
+        records: tuple[JournalRecord, ...] = (),
+    ) -> None:
+        if not self._owns_budget_ledger:
+            return
+        self._budget_ledger.reset()
+        self._budget_ledger.configure_limits(
+            max_tokens=self.budget.max_tokens,
+            max_cost_usd=self.budget.max_cost_usd,
+        )
+        if self.journal is not None and self.journal.run_id:
+            self._budget_ledger.attach(
+                self.journal,
+                root_run_id=self._active_run_id,
+                records=records,
+            )
+
     def _record_model_cost(
         self,
         usage: ModelUsage | Mapping[str, Any] | None,
@@ -608,13 +711,39 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     ) -> float:
         if pricing is None:
             return 0.0
-        normalized = normalize_model_usage(usage) or ModelUsage(
-            input_tokens=max(0, int(input_tokens)),
-            output_tokens=max(0, int(output_tokens)),
-            total_tokens=max(0, int(input_tokens)) + max(0, int(output_tokens)),
-            source=ModelUsageSource.ESTIMATE,
+        normalized = normalize_model_usage(usage)
+        effective_usage = ModelUsage(
+            input_tokens=(
+                normalized.input_tokens
+                if normalized is not None and normalized.input_tokens is not None
+                else max(0, int(input_tokens))
+            ),
+            output_tokens=(
+                normalized.output_tokens
+                if normalized is not None and normalized.output_tokens is not None
+                else max(0, int(output_tokens))
+            ),
+            total_tokens=(
+                normalized.total_tokens
+                if normalized is not None and normalized.total_tokens is not None
+                else max(0, int(input_tokens)) + max(0, int(output_tokens))
+            ),
+            cache_read_tokens=(
+                normalized.cache_read_tokens if normalized is not None else None
+            ),
+            cache_write_tokens=(
+                normalized.cache_write_tokens if normalized is not None else None
+            ),
+            reasoning_tokens=(
+                normalized.reasoning_tokens if normalized is not None else None
+            ),
+            source=(
+                normalized.source
+                if normalized is not None
+                else ModelUsageSource.ESTIMATE
+            ),
         )
-        transaction_cost = pricing.cost_usd(normalized)
+        transaction_cost = pricing.cost_usd(effective_usage)
         self._cost_usage_usd += transaction_cost
         return transaction_cost
 
@@ -823,6 +952,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         task_obj, task_text = self._normalize_task(task)
         self._apply_task_budget(task_obj)
+        self._prepare_owned_budget_ledger()
         self.budget.__post_init__()
         if self.budget.max_cost_usd is not None and self.model_pricing is None:
             raise ValueError("max_cost_usd requires explicit model_pricing")
@@ -1015,6 +1145,11 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             kwargs.pop("_resume_canonical_results", ())
         )
         _resume_usage = dict(kwargs.pop("_resume_usage", {}) or {})
+        _resume_budget_records = tuple(kwargs.pop("_resume_budget_records", ()))
+        if not all(
+            isinstance(item, JournalRecord) for item in _resume_budget_records
+        ):
+            raise TypeError("_resume_budget_records must contain JournalRecord values")
         _resume_continuation = kwargs.pop("_resume_continuation", None)
         _resume_runtime_inputs = tuple(kwargs.pop("_resume_runtime_inputs", ()))
         if not all(isinstance(item, RuntimeInput) for item in _resume_runtime_inputs):
@@ -1044,10 +1179,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_prompt_metadata = {}
         task_obj, task_text = self._normalize_task(task)
         self._apply_task_budget(task_obj)
+        self._prepare_owned_budget_ledger(_resume_budget_records)
         started_at = time.monotonic()
         self._activate_runtime_budget(started_at)
         self._token_usage = int(_resume_usage.get("total_tokens", 0) or 0)
         self._cost_usage_usd = float(_resume_usage.get("cost_usd", 0.0) or 0.0)
+        self._usage_complete = bool(_resume_usage.get("usage_complete", True))
+        self._cost_complete = bool(_resume_usage.get("cost_complete", True))
         self._model_continuation = (
             _resume_continuation
             if isinstance(_resume_continuation, ModelContinuation)
@@ -1105,6 +1243,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         except Exception as exc:
             self._report_runtime_exception("SETUP_TOOLSETS", 0, exc, emit=False)
             raise
+        if _resume_journal and self.journal is not None:
+            _resume_runtime_inputs = recover_pending_runtime_inputs(
+                await self.journal.replay()
+            )
         try:
             self._setup_env(task_obj=task_obj, state=state, kwargs=kwargs)
         except Exception as exc:
@@ -1171,6 +1313,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     "issues": [self._task_issue_to_dict(x) for x in preflight_issues],
                 },
             )
+            run_usage = self._run_budget_snapshot()
             result = EngineResult(
                 state=state,
                 records=self.records,
@@ -1180,8 +1323,14 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     state, task_obj=task_obj, started_at=started_at
                 ),
                 runtime_seconds=time.monotonic() - started_at,
-                total_tokens=int(self._token_usage),
-                total_cost_usd=float(self._cost_usage_usd),
+                total_tokens=int(run_usage.total_tokens),
+                total_cost_usd=float(run_usage.total_cost_usd),
+                local_total_tokens=int(self._token_usage),
+                local_total_cost_usd=float(self._cost_usage_usd),
+                usage_complete=run_usage.usage_complete,
+                cost_complete=run_usage.cost_complete,
+                local_usage_complete=self._usage_complete,
+                local_cost_complete=self._cost_complete,
                 run_id=self._active_run_id,
                 _cancel_token=self._cancel_token,
             )
@@ -1392,6 +1541,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         if self.journal is not None and not journal_interrupted:
             await self._journal_finish_run(state)
 
+        run_usage = self._run_budget_snapshot()
         result = EngineResult(
             state=state,
             records=self.records,
@@ -1401,8 +1551,14 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 state, task_obj=task_obj, started_at=started_at
             ),
             runtime_seconds=time.monotonic() - started_at,
-            total_tokens=int(self._token_usage),
-            total_cost_usd=float(self._cost_usage_usd),
+            total_tokens=int(run_usage.total_tokens),
+            total_cost_usd=float(run_usage.total_cost_usd),
+            local_total_tokens=int(self._token_usage),
+            local_total_cost_usd=float(self._cost_usage_usd),
+            usage_complete=run_usage.usage_complete,
+            cost_complete=run_usage.cost_complete,
+            local_usage_complete=self._usage_complete,
+            local_cost_complete=self._cost_complete,
             run_id=self._active_run_id,
             critic_traces=_critic_traces,
             handoff_traces=_handoff_traces,
@@ -2030,7 +2186,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 raise JournalError("journal is already open for another Run")
         else:
             await journal.open(run_id)
-        replay = self._journal_runtime.replay(await journal.replay())
+        journal_records = await journal.replay()
+        replay = self._journal_runtime.replay(journal_records)
         for recovery in replay["recovered_terminals"]:
             self._last_journal_position = await journal.append(
                 JournalRecordType.TOOL_TERMINAL,
@@ -2038,7 +2195,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 record_id=recovery["record_id"],
             )
         if replay["recovered_terminals"]:
-            replay = self._journal_runtime.replay(await journal.replay())
+            journal_records = await journal.replay()
+            replay = self._journal_runtime.replay(journal_records)
         task_text = replay["task"]
         task_data = replay["task_data"]
         task: str | Task = (
@@ -2066,11 +2224,15 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             replay["completed"] = True
         if replay["completed"]:
             self._active_run_id = run_id
+            self._apply_task_budget(task if isinstance(task, Task) else None)
+            self._prepare_owned_budget_ledger(await journal.replay())
             self._active_task = task_text
             self._active_task_obj = task if isinstance(task, Task) else None
             self._active_state = state
             self._token_usage = int(replay["usage"]["total_tokens"])
             self._cost_usage_usd = float(replay["usage"]["cost_usd"])
+            self._usage_complete = bool(replay["usage"]["usage_complete"])
+            self._cost_complete = bool(replay["usage"]["cost_complete"])
             self._context_runtime.restore_usage(
                 prompt_tokens=int(replay["usage"]["prompt_tokens"]),
                 completion_tokens=int(replay["usage"]["completion_tokens"]),
@@ -2084,13 +2246,20 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 task_text=task_text,
             )
             self._notify_run_start(task_text, state)
+            run_usage = self._run_budget_snapshot()
             result = EngineResult(
                 state=state,
                 records=replay["records"],
                 events=[],
                 step_count=len(replay["records"]),
-                total_tokens=self._token_usage,
-                total_cost_usd=self._cost_usage_usd,
+                total_tokens=run_usage.total_tokens,
+                total_cost_usd=run_usage.total_cost_usd,
+                local_total_tokens=self._token_usage,
+                local_total_cost_usd=self._cost_usage_usd,
+                usage_complete=run_usage.usage_complete,
+                cost_complete=run_usage.cost_complete,
+                local_usage_complete=self._usage_complete,
+                local_cost_complete=self._cost_complete,
                 run_id=run_id,
             )
             self._notify_run_end(result)
@@ -2119,6 +2288,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             _resume_journal=True,
             _resume_canonical_results=replay["canonical_results"],
             _resume_usage=replay["usage"],
+            _resume_budget_records=await journal.replay(),
             _resume_continuation=replay["continuation"],
             _resume_runtime_inputs=replay["pending_runtime_inputs"],
         )
@@ -2755,6 +2925,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._last_prompt_metadata = {}
         self._runtime_deadline_monotonic = None
         self._cost_usage_usd = 0.0
+        self._usage_complete = True
+        self._cost_complete = True
         self._model_continuation = None
         self._last_checkpoint_id = None
         self._canonical_action_results = []

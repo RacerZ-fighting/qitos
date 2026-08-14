@@ -94,6 +94,7 @@ def test_tool_result_treats_a_dict_without_lifecycle_status_as_output() -> None:
 
 def test_tool_result_round_trip_preserves_domain_output() -> None:
     result = ToolResult(
+        call_id="call-report",
         status="success",
         output={"path": "report.json", "content": "done"},
         metadata={"tool_name": "report"},
@@ -102,9 +103,18 @@ def test_tool_result_round_trip_preserves_domain_output() -> None:
     restored = ToolResult.from_value(result.to_dict())
 
     assert restored.status == result.status
+    assert restored.call_id == result.call_id
     assert restored.output == result.output
     assert restored.error == result.error
     assert restored.metadata == result.metadata
+
+
+def test_tool_result_restores_legacy_payload_without_call_id() -> None:
+    restored = ToolResult.from_value(
+        {"status": "success", "output": "done", "metadata": {}}
+    )
+
+    assert restored.call_id is None
 
 
 @pytest.mark.asyncio

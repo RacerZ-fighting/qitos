@@ -725,8 +725,10 @@ inject an invocation factory that constructs the child from its run-scoped resou
 from qitos.core import ChildInvocation, TaskBudget
 from qitos.kit.tool.agent import AgentTool, ChildControlToolSet
 
-def build_child(request, runtime_context):
+async def build_child(request, runtime_context):
+    model = await make_fresh_model()
     child_engine = make_fresh_engine(
+        model=model,
         delegate_depth=runtime_context["delegate_depth"] + 1,
     )
     return ChildInvocation(engine=child_engine, task=request.task)
@@ -753,10 +755,13 @@ The result reports output, steps, total tokens, elapsed time, stop reason, and r
 `child_budget` is an immutable `TaskBudget` and defaults to 200 steps. Invocation
 factories receive it on `ChildLaunchRequest.budget`, together with the task, profile,
 allowed tool groups, and working-directory fields needed by a product composition.
-The factory returns a `ChildInvocation`; live Engine objects never enter persisted child
-requests or results. If the invocation creates a model client, trace, or other live
-resource, set its async `cleanup` callback. The supervisor awaits cleanup after success,
-failure, or cancellation before publishing the terminal result.
+The factory may await run-scoped resource construction and returns a `ChildInvocation`;
+existing synchronous factories remain accepted. Live Engine objects never enter
+persisted child requests or results. If the invocation creates a model client, trace, or
+other live resource, set its async `cleanup` callback. The supervisor awaits cleanup
+after success, failure, or cancellation before publishing the terminal result. If
+construction fails before returning the invocation, the factory still owns and must
+asynchronously close anything it already created before propagating that error.
 
 `execution_mode` accepts `"foreground"`, `"optional_background"`, or `"background"`.
 The optional mode exposes `run_in_background` to the model. The background mode omits
@@ -776,6 +781,9 @@ It also appends `child.started` before constructing the child Engine and
 `child.terminal` before delivery. Resume converts a started child without a terminal
 record to `interrupted` without replaying the Engine. Fork recovery ignores inherited
 parent lifecycle records, so a fork cannot query or interrupt the parent's live Child.
+If execution stops between `child.terminal` and mailbox acceptance, resume derives the
+same stable completion input from the terminal fact and delivers it once for a background
+invocation. Foreground results are returned only through the original Agent ToolResult.
 
 `active_background_count`, `child_result(handle)`, `wait_child(handle)`,
 `interrupt_child(handle)`, `cancel_child(handle)`,

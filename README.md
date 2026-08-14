@@ -18,6 +18,12 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Terminal facts recover completion delivery**: Background Child and managed-process completion
+  inputs are now deterministic projections of canonical Journal terminals. Resume
+  closes the terminal-to-mailbox crash window without a second store, does not redeliver
+  foreground Child results, keeps consumed event ids idempotent, and never turns inherited fork facts into new input. Canonical
+  `ToolResult` values also carry their model `call_id`, and Child factories may finish
+  async resource construction safely.
 - **Lease-free Run discovery and lineage**: `JsonlRunCatalog` now returns immutable
   typed summaries, deterministic listings, validated ancestors, and direct children
   while an Engine still owns the writer lease. Reads never repair canonical JSONL or
@@ -61,6 +67,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   accept a final answer, request another evidence-gathering turn, or classify a concrete
   blocker. Runtime and Task budgets now cover steps, time, tokens, cost, Tool
   concurrency, and Child count, with token/cost usage restored on Journal resume.
+- **One Root/Child usage ledger**: product runtimes can pass one `BudgetLedger` to
+  descendant Engines. Every completed model transaction settles token and cost into
+  the Root JSONL exactly once; Child budgets only narrow the remaining Run allowance.
+  Results expose both shared and local totals plus completeness. Enforcement stops the
+  next turn after settlement; it does not reserve tokens for concurrent requests.
 - **Single-owner Session journals**: each Run now has one process-safe JSONL writer
   lease and an explicit terminal lifecycle. Replay always validates canonical JSONL;
   the disposable SQLite read projection is retained only when it matches JSONL and

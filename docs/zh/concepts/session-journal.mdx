@@ -34,6 +34,27 @@ Finalizer 或 Reducer 失败会中止当前未提交事务。恢复只依据 dur
 error 终态，绝不重放 Handler。没有获得 `tool.started` 的调用会补成“无副作用”的 cancelled 终态。
 如果 terminal 已完整而 `step.committed` 缺失，恢复只重跑纯 Reducer。
 
+Engine 会在 Finalizer 前从 canonical Action 绑定 `ToolResult.call_id`，replay 时继续校验同一
+身份；旧 terminal 记录没有该字段时，会从相邻 Action 恢复，不需要迁移 Journal。
+
+## Root/Child 共享预算
+
+默认情况下 Engine 创建并拥有一个 `BudgetLedger`；产品运行时也可以把 Root 的 ledger 传给
+每个 Child Engine，让完整 Run tree 共同消耗一份 token 与 cost 额度。每个 Engine 自己的
+`RuntimeBudget` 仍是本地上限，因此 Child 可以更严格，但不能获得第二份全局额度。
+
+Provider 事务完成后，Engine 会先向 Root JSONL append 一条幂等的 `budget.committed`，再推进
+内存总账。记录包含来源 Run、模型事务、token/cost 用量以及完整性。Root resume 与 fork 只从
+这些 canonical JSONL 记录重建共享总量，不依赖 SQLite。旧 Journal 没有预算记录时，会从
+`model.completed` 恢复 Root 用量，并从 `child.terminal` 恢复已完成 Child 的用量。
+
+`EngineResult.total_*` 表示共享 Run 总量，`local_total_*` 表示当前 Engine 自身用量；
+`ChildResult` 始终保存 Child 本地值，Parent 不应再次把它加回总账。本地估算 token 仍会消耗
+额度，但会把 usage 标记为 incomplete；cost 完整还要求显式 pricing 和可用的输入/输出计数。
+
+首版会串行结算，但不会在 Provider 请求前预留估算额度。已经通过准入的并发请求可能一起越过
+上限；总量达到限制后，下一 turn 会停止。
+
 ## 状态提交
 
 `step.committed` 保存带前后摘要的确定性 JSON Patch 子集。该记录 durable 之前，Engine 只暴露上
@@ -98,8 +119,14 @@ if transaction is not None:
 origin reference 解析继承结果，不把 ToolResult 复制到第二个存储。未知、未提交或改写成 Child
 run id 的引用都返回 `None`。
 
-Run Mailbox 使用 `runtime_input.posted` 持久化尚未被模型事务消费的输入。后台进程和 Child
-分别使用自己的生命周期记录：Child 在构造 Engine 前写入 `child.started`，在通知 Parent 前写入
-`child.terminal`。Resume 会恢复终态，并把缺少 terminal 的 started Child 补成 `interrupted`，
-不会重新连接或重放 Child Engine；Fork 只继承审计事实，不获得 Parent Handle 的控制权。终态
-Child 的 follow-up 恢复仍由应用层 Session 负责。
+Run Mailbox 使用 `runtime_input.posted` 持久化外部输入，并用
+`model.completed.runtime_input_ids` 记录模型已经消费的 event id。后台 Child 与后台进程的完成输入则可
+由本 Run 的 `child.terminal` / `process.terminal` 确定性重建；`child.started` 会记录是否后台执行，
+因此前台 Child 的 ToolResult 不会在 resume 后被 Mailbox 重复投递。如果进程在 terminal durable 后、
+`runtime_input.posted` 前退出，resume 会补回同一个稳定事件；已有消费记录时不会重复投递。Fork
+不会把继承来的 Parent terminal 或 pending input 变成自己的输入。
+
+Child 在构造 Engine 前写入 `child.started`，在通知 Parent 前写入 `child.terminal`。Resume 会恢复
+终态，并把缺少 terminal 的 started Child 补成 `interrupted`；恢复期间新生成的 terminal 也会在
+inbox 打开前进入投影。QitOS 不会重新连接或重放 Child Engine，Fork 也不获得 Parent Handle 的
+控制权。终态 Child 的 follow-up 恢复仍由应用层 Session 负责。

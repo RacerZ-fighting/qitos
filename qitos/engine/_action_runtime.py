@@ -443,7 +443,9 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             if isinstance(payload, dict) and set(payload.keys()) == {"env"}:
                 continue
             tool_name = actions[idx].name if idx < len(actions) else ""
-            tool_call_id = actions[idx].action_id if idx < len(actions) else None
+            tool_call_id = result.call_id
+            if not tool_call_id and idx < len(actions):
+                tool_call_id = actions[idx].action_id
             if not tool_call_id:
                 tool_call_id = f"call_{record.step_id}_{idx}"
             model_payload = result.model_visible_output

@@ -38,6 +38,7 @@ class ToolResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
     artifacts: tuple[ArtifactRef, ...] = ()
     model_output: str | None = None
+    call_id: str | None = None
 
     def __post_init__(self) -> None:
         raw_status = str(self.status).strip()
@@ -49,6 +50,10 @@ class ToolResult:
                 self.error = f"unknown tool result status: {raw_status}"
         if self.status == "success" and self.error not in (None, ""):
             self.status = "error"
+        if self.call_id is not None and (
+            not isinstance(self.call_id, str) or not self.call_id
+        ):
+            raise ValueError("tool result call_id must be non-empty text or null")
 
     @property
     def is_success(self) -> bool:
@@ -84,6 +89,8 @@ class ToolResult:
             payload["artifacts"] = [item.to_dict() for item in self.artifacts]
         if self.model_output is not None:
             payload["model_output"] = self.model_output
+        if self.call_id is not None:
+            payload["call_id"] = self.call_id
         return payload
 
     def to_model_dict(self) -> Dict[str, Any]:
@@ -95,6 +102,8 @@ class ToolResult:
         }
         if self.artifacts:
             payload["artifacts"] = [item.to_dict() for item in self.artifacts]
+        if self.call_id is not None:
+            payload["call_id"] = self.call_id
         return payload
 
     @classmethod
@@ -107,6 +116,7 @@ class ToolResult:
                 metadata=dict(payload.metadata),
                 artifacts=tuple(payload.artifacts),
                 model_output=payload.model_output,
+                call_id=payload.call_id,
             )
         if isinstance(payload, dict):
             if "status" not in payload:
@@ -131,6 +141,7 @@ class ToolResult:
                     "metadata",
                     "artifacts",
                     "model_output",
+                    "call_id",
                 }
             }
             output = (
@@ -157,6 +168,11 @@ class ToolResult:
                 raw_model_output, str
             ):
                 raise ValueError("tool result model_output must be text or null")
+            raw_call_id = payload.get("call_id")
+            if raw_call_id is not None and (
+                not isinstance(raw_call_id, str) or not raw_call_id
+            ):
+                raise ValueError("tool result call_id must be non-empty text or null")
             return cls(
                 status=cast(ToolResultStatus, raw_status),
                 output=output,
@@ -168,6 +184,7 @@ class ToolResult:
                 ),
                 artifacts=artifacts,
                 model_output=raw_model_output,
+                call_id=raw_call_id,
             )
         if isinstance(payload, str):
             return cls(status="success", output=payload)

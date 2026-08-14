@@ -83,7 +83,10 @@ completed. `CodingToolSet` binds that notifier to the active Engine's durable
 `RuntimeInput` mailbox and posts one stable `process.completed` event containing the
 bounded terminal snapshot. The watcher never calls the model or mutates Agent state;
 delivery happens at the next turn safe point. A closed or failed mailbox leaves the
-terminal snapshot queryable through the process controls.
+terminal snapshot queryable through the process controls. If the Run stops after
+`process.terminal` but before mailbox acceptance, resume derives the same bounded event
+from that terminal fact; a completed model transaction that already consumed its stable
+event id prevents duplicate delivery.
 
 Register `CodingToolSet(profile="shell")` to expose the shared managed lifecycle to a
 model. `run_command(..., run_in_background=True)` returns a process id, and

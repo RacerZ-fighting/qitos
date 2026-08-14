@@ -87,6 +87,7 @@ class JournalAgent(AgentModule[JournalState, dict[str, Any], Action]):
         finalized = ToolResult.from_value(result)
         finalized.metadata["evidence_id"] = "evidence-1"
         finalized.model_output = "canonical"
+        finalized.call_id = "finalizer-cannot-rewrite-identity"
         return finalized
 
     def reduce_action_result(
@@ -187,6 +188,8 @@ async def test_engine_persists_one_finalized_terminal_result(tmp_path: Path) -> 
     assert journal.closed is True
     assert agent.executions == 1
     assert terminal.payload["result"] == history_result.to_dict()
+    assert terminal.payload["result"]["call_id"] == "call-1"
+    assert history_result.call_id == "call-1"
     assert terminal.payload["result"]["model_output"] == "canonical"
     assert terminal.payload["result"]["metadata"]["evidence_id"] == "evidence-1"
     assert result.state.seen == ["canonical"]
@@ -311,6 +314,10 @@ async def test_terminal_resume_restores_model_usage_and_cost(tmp_path: Path) -> 
         model_pricing=pricing,
         journal=JsonlSessionJournal(tmp_path),
     ).arun("usage")
+    reader = JsonlSessionJournal(tmp_path)
+    await reader.open(original.run_id)
+    original_records = await reader.replay()
+    await reader.close()
 
     resumed_model = UsageModel()
     resumed_engine = Engine(
@@ -323,10 +330,20 @@ async def test_terminal_resume_restores_model_usage_and_cost(tmp_path: Path) -> 
 
     assert original.total_tokens == 10
     assert original.total_cost_usd == pytest.approx(10.0)
+    budget_commit = next(
+        record
+        for record in original_records
+        if record.type is JournalRecordType.BUDGET_COMMITTED
+    )
+    assert budget_commit.payload["tokens"] == original.total_tokens
+    assert budget_commit.payload["cost_usd"] == pytest.approx(
+        original.total_cost_usd
+    )
     assert resumed.total_tokens == original.total_tokens
     assert resumed.total_cost_usd == pytest.approx(original.total_cost_usd)
     assert resumed_engine._token_usage == original.total_tokens
     assert resumed_engine._cost_usage_usd == pytest.approx(original.total_cost_usd)
+    assert resumed_engine.budget_ledger.snapshot().total_tokens == original.total_tokens
     assert resumed_model.calls == 0
 
 

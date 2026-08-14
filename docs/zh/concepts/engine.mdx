@@ -167,6 +167,11 @@ engine.clear_hooks()
 对应值，并写出 `END` 事件。`RuntimeBudget` 也统一限制 Tool 并发和 Child 数量。
 费用限制必须配合显式 `ModelPricing`，不会根据模型名称猜价。
 
+Root Engine 拥有一份 `BudgetLedger`。产品运行时创建 Child Engine 时，应原样传入
+`parent_engine.budget_ledger`。有效的 token/cost 余额取共享 Run 余额与 Engine 本地
+`RuntimeBudget` 余额中更小的值。结果里的 `total_*` 是共享总量，`local_total_*` 保留
+当前 Engine 的审计值；结算与恢复语义见 [Session Journal](/zh/concepts/session-journal)。
+
 ```python
 from qitos.engine.states import RuntimeBudget
 
