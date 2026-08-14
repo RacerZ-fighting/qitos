@@ -19,6 +19,11 @@ How to update:
 
 ### Removed
 
+- **Breaking:** Removed deprecated compatibility import paths under `qitos.kit.tool`
+  (`taskboard`, `report_toolset`, `text_web_browser`, `skill_tools`,
+  `network_toolset`, `web_test_toolset`, and `tools`). Use the canonical tool and
+  toolset packages instead; the experimental security-research modules remain
+  available only from their explicit opt-in package.
 - **Breaking:** Removed the unused `qitos.func` decorator and composition package.
   Its `@agent`/`@task` callables bypassed Engine transactions, while its advertised
   `AgentModule` conversion never executed the wrapped function. Applications now use

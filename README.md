@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Canonical tool imports only**: seven deprecated `qitos.kit.tool.*` forwarding
+  modules are gone. Applications now import tools and toolset builders from their
+  maintained `qitos.kit.tool` or `qitos.kit.toolset` owners; experimental security
+  research tools remain explicit opt-ins.
 - **Removed dead compatibility surfaces**: the superseded in-repo zoo staging,
   Snowl-specific adapters, unused `RunState` snapshot, and source-only scaffold CLI are
   gone. Product applications live in the independent `qitos-zoo` repository; QitOS

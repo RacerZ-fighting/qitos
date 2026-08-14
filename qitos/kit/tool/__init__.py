@@ -46,16 +46,14 @@ from .skill import (
     SkillToolSet,
 )
 from .workspace_aware import WorkspaceAwareMixin
-from .tools import (
-    math_tools,
-    editor_tools,
-    codebase_tools,
-    notebook_tools,
-    web_tools,
-    coding_tools,
-    task_tools,
-    report_tools,
-)
+from qitos.kit.toolset.builders import math_tools
+from qitos.kit.toolset.codebase import codebase_tools
+from qitos.kit.toolset.coding import coding_tools
+from qitos.kit.toolset.editor import editor_tools
+from qitos.kit.toolset.notebook import notebook_tools
+from qitos.kit.toolset.report import report_tools
+from qitos.kit.toolset.task import task_tools
+from qitos.kit.toolset.web import web_tools
 
 __all__ = [
     "AskUserChoiceTool",

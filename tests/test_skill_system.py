@@ -18,7 +18,7 @@ from qitos.kit.skill import (
     SkilledAgent,
 )
 from qitos.kit.tool import BundledSkillSnapshot
-from qitos.kit.tool.skill_tools import SkillToolSet
+from qitos.kit.tool.skill import SkillToolSet
 
 
 def _write_skill_dir(

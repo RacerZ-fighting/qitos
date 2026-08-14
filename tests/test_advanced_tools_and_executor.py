@@ -12,7 +12,7 @@ from qitos import Action, StateSchema, ToolPermissionContext, ToolPermissionRule
 from qitos.core.action import ActionExecutionPolicy, ActionStatus
 from qitos.core.tool import BaseTool, ToolPermission, ToolSpec, ToolValidationResult
 from qitos.engine.action_executor import ActionExecutor
-from qitos.kit.tool.tools import advanced_coding_tools
+from qitos.kit.toolset import advanced_coding_tools
 from qitos.kit.tool import (
     AskUserChoiceTool,
     CodingToolSet,
