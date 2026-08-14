@@ -79,15 +79,12 @@ Engine 层的一等语义对象。它可以包含动作，也可以直接给出�
 
 `FamilyPreset` 上的可选字段（`recommended_max_steps`、`recommended_max_tokens`、`recommended_retry_budget`、`recommended_temperature`），记录经过测试的基线值。这些仅供参考——引擎不会自动应用它们。
 
-## 追踪集成术语
+## 追踪术语
 
-### WandbTraceProcessor
+### TraceWriter
 
-`TraceProcessor` 的实现，将 QitOS 运行指标（token 用量、步数、评估器分数、工具调用、停止原因）流式传输到 Weights & Biases 项目。需要 `wandb` 包（`pip install qitos[wandb]`）。
-
-### MlflowTraceProcessor
-
-`TraceProcessor` 的实现，将 QitOS 运行指标流式传输到 MLflow 追踪服务器。支持自定义 `tracking_uri` 连接远程服务器。需要 `mlflow` 包（`pip install qitos[mlflow]`）。
+QitOS canonical append-only writer，负责持久化 Run manifest、运行时事件和已完成的 step
+事务。`qita` 基于这些产物提供检查、回放和比较。
 
 ## Engine 导出术语
 

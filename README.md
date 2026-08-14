@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One canonical observability path**: the duplicate process-global tracing provider
+  and its W&B/MLflow processors are gone. Runtime events, `TraceWriter`, the Session
+  Journal, and `qita` now form one explicit trace and replay path; handoffs remain
+  visible through canonical `HANDOFF_START`/`HANDOFF_END` events.
 - **Truthful Runtime capability snapshots**: initialized environments now expose one
   immutable backend, working-directory, operation-group, facility, verified-command,
   and limitation snapshot. Engine freezes it with each turn, removes Tools whose ops
@@ -308,7 +312,6 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 - **12 method templates**: ReAct, PlanAct, SWE-Agent, Voyager, Debate, Manager-Worker, Planner-Executor, Self-Refine, Reflexion, LATS, MoA, and Magentic-One — each with paper.md, config.yaml, and recipe implementations.
 - **`qit new` CLI**: Scaffold a new agent project from built-in templates with `qit new --template <name>`.
 - **Export APIs**: `EngineConfig`, `ToolPermissionSpec`, `CriticTrace`, and `HandoffTrace` for programmatic access to engine configuration and trace data.
-- **Tracing integrations**: W&B (`WandbTraceProcessor`) and MLflow (`MlflowTraceProcessor`) for experiment tracking.
 - **FamilyPreset extensibility**: `override()`, `recommended_*` advisory fields, and `MaxTokensCriteria` stop criterion.
 - **qita cost panel**: Token usage and cost metrics in the run overview.
 
@@ -490,7 +493,7 @@ QitOS is currently **Beta**.
 - Core-only install: `pip install qitos`
 - Repo source install: `pip install -r requirements.txt`
 - Full contributor install: `pip install -r requirements-dev.txt`
-- Optional extras: `qitos[wandb]`, `qitos[mlflow]`, `qitos[cookiecutter]`, `qitos[all]`
+- Optional extras: `qitos[models]`, `qitos[benchmarks]`, `qitos[cookiecutter]`, `qitos[all]`
 - Installation guide: [Installation](https://qitor.mintlify.app/installation)
 
 ## Contributing

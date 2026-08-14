@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **只保留一条 canonical 可观测路径**：重复的进程级 tracing provider 及其 W&B/MLflow
+  processors 已删除。运行时事件、`TraceWriter`、Session Journal 和 `qita` 现在组成一条
+  明确的 trace/replay 路径；Handoff 仍通过 canonical `HANDOFF_START`/`HANDOFF_END`
+  事件完整可见。
 - **完整 Run 与交互式 Run 共用官方 MCP 生命周期**：独立 server 会在固定并发与 timeout
   下连接并发现目录，再按 factory 顺序确定性发布成功目录。交互式 session 由
   `Engine.astep()` 懒启动并持续持有同一生命周期；同步 `step()` 会明确拒绝 MCP
@@ -174,7 +178,6 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 - **12 个方法模板**：ReAct、PlanAct、SWE-Agent、Voyager、Debate、Manager-Worker、Planner-Executor、Self-Refine、Reflexion、LATS、MoA 和 Magentic-One — 每个都包含 paper.md、config.yaml 和 recipe 实现。
 - **`qit new` CLI**：使用 `qit new --template <name>` 从内建模板脚手架新 agent 项目。
 - **导出 API**：`EngineConfig`、`ToolPermissionSpec`、`CriticTrace` 和 `HandoffTrace` 用于程序化访问引擎配置和 trace 数据。
-- **Tracing 集成**：W&B (`WandbTraceProcessor`) 和 MLflow (`MlflowTraceProcessor`) 实验追踪。
 - **FamilyPreset 可扩展性**：`override()`、`recommended_*` 建议字段、`MaxTokensCriteria` 停止条件。
 - **qita 成本面板**：运行概览中的 token 用量和成本指标。
 
@@ -356,7 +359,7 @@ QitOS 当前处于 **Beta**。
 - 仅核心安装：`pip install qitos`
 - 仓库源码安装：`pip install -r requirements.txt`
 - 完整开发安装：`pip install -r requirements-dev.txt`
-- 可选扩展：`qitos[wandb]`、`qitos[mlflow]`、`qitos[cookiecutter]`、`qitos[all]`
+- 可选扩展：`qitos[models]`、`qitos[benchmarks]`、`qitos[cookiecutter]`、`qitos[all]`
 - 安装说明： [安装](https://qitor.mintlify.app/zh/installation)
 
 ## 参与贡献

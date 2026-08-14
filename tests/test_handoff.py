@@ -205,6 +205,22 @@ class TestHandoffRuntime:
         assert result.to_agent == "receiver"
         assert engine.agent is receiver
         assert record.agent_id == "receiver"
+        handoff_events = [
+            event
+            for event in engine.events
+            if event.phase in {RuntimePhase.HANDOFF_START, RuntimePhase.HANDOFF_END}
+        ]
+        assert [event.phase for event in handoff_events] == [
+            RuntimePhase.HANDOFF_START,
+            RuntimePhase.HANDOFF_END,
+        ]
+        start_event, end_event = handoff_events
+        assert start_event.payload["from"] == result.from_agent
+        assert start_event.payload["to"] == result.to_agent
+        assert start_event.payload["context_strategy"] == result.context_strategy
+        assert start_event.payload["messages_passed"] == result.messages_passed
+        assert end_event.payload["agent"] == result.to_agent
+        assert end_event.payload["context_strategy"] == result.context_strategy
 
     def test_execute_handoff_without_registry_raises(self):
         handoffer = HandoffAgent()

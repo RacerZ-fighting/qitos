@@ -267,7 +267,7 @@ class EngineConfig:
     critic_names: List[str] = field(default_factory=list)
     stop_criteria_names: List[str] = field(default_factory=list)
     has_checkpoint_store: bool = False
-    has_tracing_provider: bool = False
+    has_trace_writer: bool = False
     protocol_id: Optional[str] = None
     delegate_depth: int = 0
     has_shared_memory: bool = False

@@ -87,21 +87,4 @@ This split solves three real problems:
 
 This separation keeps QitOS viable as a research-first framework.
 
-### W&B integration
-
-To stream benchmark metrics to Weights & Biases alongside recipe execution:
-
-```python
-from qitos.tracing import add_trace_processor
-from qitos.tracing.wandb_processor import WandbTraceProcessor
-
-processor = WandbTraceProcessor(
-    project="qitos-benchmarks",
-    tags=["gaia", "eval"],
-)
-add_trace_processor(processor)
-```
-
-See [W&B Integration](/guides/wandb-integration) for full documentation.
-
 If you are adding a new benchmark family, continue with [Third-party benchmark integration](/guides/third-party-benchmark-integration).

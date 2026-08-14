@@ -11,18 +11,17 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, IO, List, Optional, cast
 
-from qitos.tracing.config import _REDACTED_FIELDS, _redact_dict
-
 from .events import TraceEvent, TraceStep
+from .redaction import REDACTED_FIELDS, redact_mapping
 from .schema import TraceSchemaValidator
 
-_TRACE_REDACTED_FIELDS = _REDACTED_FIELDS - {"model_response"}
+_TRACE_REDACTED_FIELDS = REDACTED_FIELDS - {"model_response"}
 
 
 def _redact_trace_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     """Redact secrets while retaining the canonical model transaction."""
 
-    return _redact_dict(data, fields=_TRACE_REDACTED_FIELDS)
+    return redact_mapping(data, fields=_TRACE_REDACTED_FIELDS)
 
 
 class _BufferedJsonlWriter:

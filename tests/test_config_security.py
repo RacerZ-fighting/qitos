@@ -9,8 +9,8 @@ from qitos.benchmark.common import write_benchmark_results
 from qitos.core.spec import BenchmarkRunResult
 from qitos.render import ClaudeStyleHook
 from qitos.trace.events import TraceEvent
+from qitos.trace.redaction import REDACTED_FIELDS, REDACTED_MARKER, redact_mapping
 from qitos.trace.writer import TraceWriter
-from qitos.tracing.config import _REDACTED_FIELDS, _REDACTED_MARKER, _redact_dict
 
 
 def test_model_config_to_dict_masks_api_key():
@@ -37,7 +37,7 @@ def test_model_config_preserves_other_fields():
 
 
 def test_redacted_fields_includes_sensitive_names():
-    """_REDACTED_FIELDS includes common sensitive field names."""
+    """The default field set includes common sensitive names."""
     expected = {
         "api_key",
         "authorization",
@@ -49,49 +49,51 @@ def test_redacted_fields_includes_sensitive_names():
         "private_key",
         "credentials",
     }
-    assert expected.issubset(_REDACTED_FIELDS)
+    assert expected.issubset(REDACTED_FIELDS)
 
 
-def test_redact_dict_masks_sensitive_fields():
-    """_redact_dict replaces sensitive field values with the redaction marker."""
+def test_redact_mapping_masks_sensitive_fields():
+    """Sensitive field values are replaced with the redaction marker."""
     data = {
         "tool_args": {"command": "ls"},
         "api_key": "sk-12345",
         "authorization": "Bearer abc",
         "safe_field": "visible",
     }
-    result = _redact_dict(data)
-    assert result["tool_args"] == _REDACTED_MARKER
-    assert result["api_key"] == _REDACTED_MARKER
-    assert result["authorization"] == _REDACTED_MARKER
+    result = redact_mapping(data)
+    assert result["tool_args"] == REDACTED_MARKER
+    assert result["api_key"] == REDACTED_MARKER
+    assert result["authorization"] == REDACTED_MARKER
     assert result["safe_field"] == "visible"
 
 
-def test_redact_dict_handles_nested_dicts():
-    """_redact_dict recursively redacts nested dicts."""
+def test_redact_mapping_handles_nested_dicts():
+    """Nested mappings are redacted recursively."""
     data = {
         "outer": {
             "password": "secret123",
             "name": "test",
         }
     }
-    result = _redact_dict(data)
-    assert result["outer"]["password"] == _REDACTED_MARKER
+    result = redact_mapping(data)
+    assert result["outer"]["password"] == REDACTED_MARKER
     assert result["outer"]["name"] == "test"
 
 
-def test_redact_dict_handles_lists_of_dicts():
-    """_redact_dict recursively redacts dicts inside lists."""
+def test_redact_mapping_handles_lists_of_dicts():
+    """Mappings inside lists are redacted recursively."""
     data = {
         "items": [
             {"token": "abc", "value": 1},
             {"token": "def", "value": 2},
+            [{"secret": "nested", "value": 3}],
         ]
     }
-    result = _redact_dict(data)
-    assert result["items"][0]["token"] == _REDACTED_MARKER
-    assert result["items"][1]["token"] == _REDACTED_MARKER
+    result = redact_mapping(data)
+    assert result["items"][0]["token"] == REDACTED_MARKER
+    assert result["items"][1]["token"] == REDACTED_MARKER
     assert result["items"][0]["value"] == 1
+    assert result["items"][2][0]["secret"] == REDACTED_MARKER
 
 
 def test_trace_writer_redacts_sensitive_manifest_and_events(tmp_path):
@@ -130,9 +132,9 @@ def test_trace_writer_redacts_sensitive_manifest_and_events(tmp_path):
     assert "sk-raw-secret" not in manifest_text
     assert "raw-token" not in manifest_text
     assert "Bearer raw-secret" not in event_text
-    assert manifest["run_spec"]["environment"]["api_key"] == _REDACTED_MARKER
-    assert manifest["run_spec"]["environment"]["nested"]["token"] == _REDACTED_MARKER
-    assert event["payload"]["authorization"] == _REDACTED_MARKER
+    assert manifest["run_spec"]["environment"]["api_key"] == REDACTED_MARKER
+    assert manifest["run_spec"]["environment"]["nested"]["token"] == REDACTED_MARKER
+    assert event["payload"]["authorization"] == REDACTED_MARKER
     assert event["payload"]["safe"] == "visible"
 
 
@@ -170,7 +172,7 @@ def test_trace_writer_retains_model_transaction_facts(tmp_path):
     assert response["finish_reason"] == "stop"
     assert response["usage"] == {"total_tokens": 7}
     assert response["usage_source"] == "provider"
-    assert response["metadata"]["api_key"] == _REDACTED_MARKER
+    assert response["metadata"]["api_key"] == REDACTED_MARKER
 
 
 def test_benchmark_result_writer_redacts_sensitive_metadata(tmp_path):
@@ -208,11 +210,11 @@ def test_benchmark_result_writer_redacts_sensitive_metadata(tmp_path):
     assert "row-token" not in text
     assert (
         payload["metadata"]["execution"]["run_spec"]["environment"]["api_key"]
-        == _REDACTED_MARKER
+        == REDACTED_MARKER
     )
     assert (
         payload["metadata"]["execution"]["run_spec"]["environment"]["nested"]["token"]
-        == _REDACTED_MARKER
+        == REDACTED_MARKER
     )
 
 
@@ -243,5 +245,5 @@ def test_render_jsonl_redacts_sensitive_payload(tmp_path):
     assert "sk-render-secret" not in text
     assert "render-token" not in text
     env = payload["payload"]["run_meta"]["run_spec"]["environment"]
-    assert env["api_key"] == _REDACTED_MARKER
-    assert env["nested"]["token"] == _REDACTED_MARKER
+    assert env["api_key"] == REDACTED_MARKER
+    assert env["nested"]["token"] == REDACTED_MARKER

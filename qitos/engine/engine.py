@@ -300,7 +300,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         read_before_write_enforcer: Optional[Any] = None,
         permission_interaction_callback: Optional[Any] = None,
         loop_detector: Optional[ToolCallLoopDetector] = None,
-        tracing_provider: Optional[Any] = None,
         auto_approve: bool = False,
         action_execution_policy: Optional[ActionExecutionPolicy] = None,
         model_pricing: ModelPricing | None = None,
@@ -496,8 +495,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._journal_terminal_record_ids: dict[str, list[str]] = {}
         self._canonical_action_results: list[CanonicalActionResult] = []
         self._last_journal_position: JournalPosition | None = None
-
-        self._tracing_provider = tracing_provider
 
         # Handoff tools: auto-register if agent declares handoff_targets
         self._handoff_tools: List[Any] = []
@@ -1203,11 +1200,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         """Return the latest durably appended journal position, if configured."""
 
         return self._last_journal_position
-
-    @property
-    def tracing_provider(self) -> Any:
-        """Return the configured TracingProvider, if any."""
-        return self._tracing_provider
 
     async def arun(
         self,
@@ -1995,7 +1987,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             critic_names=[type(c).__name__ for c in self.critics],
             stop_criteria_names=[type(s).__name__ for s in self.stop_criteria],
             has_checkpoint_store=self._checkpoint_store is not None,
-            has_tracing_provider=self._tracing_provider is not None,
+            has_trace_writer=self.trace_writer is not None,
             protocol_id=getattr(self, "_resolved_protocol_id", None),
             delegate_depth=self._delegate_depth,
             has_shared_memory=self._shared_memory is not None,

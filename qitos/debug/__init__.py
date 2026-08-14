@@ -2,14 +2,14 @@
 
 .. deprecated::
     ``qitos.debug`` is deprecated and will be removed in a future release.
-    Use ``qitos.tracing`` and ``qitos.qita`` for run inspection and replay.
+    Use ``qitos.trace`` and ``qitos.qita`` for run inspection and replay.
 """
 
 import warnings
 
 warnings.warn(
     "qitos.debug is deprecated and will be removed in a future release. "
-    "Use qitos.tracing and qitos.qita for run inspection and replay.",
+    "Use qitos.trace and qitos.qita for run inspection and replay.",
     DeprecationWarning,
     stacklevel=2,
 )

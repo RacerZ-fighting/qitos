@@ -20,7 +20,7 @@ class TestEngineConfig:
         assert config.critic_names == []
         assert config.stop_criteria_names == []
         assert config.has_checkpoint_store is False
-        assert config.has_tracing_provider is False
+        assert config.has_trace_writer is False
         assert config.protocol_id is None
         assert config.delegate_depth == 0
         assert config.has_shared_memory is False
@@ -38,14 +38,14 @@ class TestEngineConfig:
             model_id="gpt-4o",
             budget_max_steps=20,
             critic_names=["ScoreCritic"],
-            has_tracing_provider=True,
+            has_trace_writer=True,
         )
         d = config.to_dict()
         assert d["agent_name"] == "my-agent"
         assert d["model_id"] == "gpt-4o"
         assert d["budget_max_steps"] == 20
         assert d["critic_names"] == ["ScoreCritic"]
-        assert d["has_tracing_provider"] is True
+        assert d["has_trace_writer"] is True
         # All fields should be present
         assert "stop_criteria_names" in d
         assert "tool_count" in d

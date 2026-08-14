@@ -14,7 +14,7 @@ from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.text import Text
 
-from qitos.tracing.config import _redact_dict
+from qitos.trace.redaction import redact_mapping
 
 from ..core.action import Action
 from ..engine.hooks import EngineHook, HookContext
@@ -363,7 +363,7 @@ class RenderStreamHook(RenderHook):
         )
         self.events.append(evt)
         if self._path is not None:
-            line = json.dumps(_redact_dict(evt.to_dict()), ensure_ascii=False) + "\n"
+            line = json.dumps(redact_mapping(evt.to_dict()), ensure_ascii=False) + "\n"
             self._jsonl_buffer.append(line)
             if len(self._jsonl_buffer) >= self._jsonl_flush_every:
                 self._flush_jsonl()

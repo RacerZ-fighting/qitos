@@ -127,14 +127,9 @@ spec = AgentSpec(
 
 Handoff 事件自动记录在追踪中：
 
-- `HANDOFF_START` — 记录源 Agent、目标 Agent、上下文策略
+- `HANDOFF_START` — 记录源 Agent、目标 Agent、上下文策略和传递的消息数
 - `HANDOFF_END` — 记录目标 Agent 确认
 
-启用 `TracingProvider` 后，Handoff 会创建 `HandoffSpanData` 跨度记录：
-
-```python
-from qitos.tracing import TracingProvider
-
-provider = TracingProvider()
-engine = Engine(agent=my_agent, tracing_provider=provider)
-```
+这些 canonical `RuntimeEvent` 同时生成 `EngineResult.handoff_traces`，并与模型、工具和
+生命周期事件一起由同一个 `TraceWriter` 持久化，不需要再配置单独的 Handoff tracing
+provider。

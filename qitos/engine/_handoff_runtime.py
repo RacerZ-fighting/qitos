@@ -278,48 +278,12 @@ class _HandoffRuntime(Generic[StateT, ObservationT, ActionT]):
             },
         )
 
-        # 8. Write HandoffSpanData to TracingProvider if available
-        self._write_handoff_span(
-            old_agent_name, target_name, strategy_str, messages_passed
-        )
-
         return HandoffResult(
             from_agent=old_agent_name,
             to_agent=target_name,
             context_strategy=strategy_str,
             messages_passed=messages_passed,
         )
-
-    def _write_handoff_span(
-        self,
-        from_agent: str,
-        to_agent: str,
-        context_strategy: str,
-        messages_passed: int,
-    ) -> None:
-        """Write a HandoffSpanData to the TracingProvider if configured."""
-        provider = getattr(self.engine, "_tracing_provider", None)
-        if provider is None:
-            return
-
-        try:
-            from ..tracing.models import HandoffSpanData, SpanType
-
-            span_data = HandoffSpanData(
-                from_agent=from_agent,
-                to_agent=to_agent,
-                context_strategy=context_strategy,
-                messages_passed=messages_passed,
-            )
-            with provider.create_trace(
-                name=f"handoff:{from_agent}->{to_agent}"
-            ) as trace:
-                span = trace.create_span(SpanType.HANDOFF, span_data)
-                span.start()
-                span.finish()
-        except Exception:
-            # Tracing is best-effort; never block handoff on trace failures
-            pass
 
     def _setup_shared_memory_namespace(
         self, old_agent_name: str, target_name: str

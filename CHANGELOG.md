@@ -17,6 +17,14 @@ How to update:
 
 ## Unreleased
 
+### Removed
+
+- **Breaking:** Removed the process-global `qitos.tracing` provider/processor
+  hierarchy, the `Engine(..., tracing_provider=...)` argument, and the W&B/MLflow
+  extras. Canonical runtime events, `TraceWriter`, the Session Journal, and `qita`
+  now form the single observability and replay path. `EngineConfig` reports this
+  path through `has_trace_writer`.
+
 ### Changed
 
 - Run handles now expose a stable lineage id, immediate parent, latest committed

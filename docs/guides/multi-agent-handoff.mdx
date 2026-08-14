@@ -127,14 +127,10 @@ spec = AgentSpec(
 
 Handoff events are automatically recorded in the trace:
 
-- `HANDOFF_START` — records source agent, target agent, context strategy
-- `HANDOFF_END` — records target agent confirmation
+- `HANDOFF_START` — records the source agent, target agent, context strategy, and
+  number of messages passed
+- `HANDOFF_END` — records target-agent confirmation
 
-With `TracingProvider` enabled, handoff creates `HandoffSpanData` spans:
-
-```python
-from qitos.tracing import TracingProvider
-
-provider = TracingProvider()
-engine = Engine(agent=my_agent, tracing_provider=provider)
-```
+These canonical `RuntimeEvent` values feed `EngineResult.handoff_traces` and are
+persisted by the same `TraceWriter` as model, tool, and lifecycle events. There is no
+separate handoff tracing provider to configure.

@@ -154,15 +154,12 @@ A stop criterion that halts the Engine when cumulative token usage exceeds a bud
 
 Optional fields on `FamilyPreset` (`recommended_max_steps`, `recommended_max_tokens`, `recommended_retry_budget`, `recommended_temperature`) that document tested baseline values. These are advisory only — the engine does not auto-apply them.
 
-## Tracing integration terms
+## Tracing terms
 
-### WandbTraceProcessor
+### TraceWriter
 
-A `TraceProcessor` implementation that streams QitOS run metrics (token usage, step counts, critic scores, tool calls, stop reason) to a Weights & Biases project. Requires the `wandb` package (`pip install qitos[wandb]`).
-
-### MlflowTraceProcessor
-
-A `TraceProcessor` implementation that streams QitOS run metrics to an MLflow tracking server. Supports custom `tracking_uri` for remote servers. Requires the `mlflow` package (`pip install qitos[mlflow]`).
+The canonical append-only writer for QitOS run manifests, runtime events, and completed
+step transactions. `qita` reads these artifacts for inspection, replay, and comparison.
 
 ## Engine export terms
 

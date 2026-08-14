@@ -89,8 +89,6 @@
                   "guides/critics-and-stop-criteria",
                   "guides/method-templates",
                   "guides/observability",
-                  "guides/wandb-integration",
-                  "guides/mlflow-integration",
                   "guides/snowl-integration"
                 ]
               },
@@ -216,7 +214,6 @@
                   "zh/guides/critics-and-stop-criteria",
                   "zh/guides/method-templates",
                   "zh/guides/observability",
-                  "zh/guides/wandb-integration",
                   "zh/guides/snowl-integration",
                   "zh/guides/multi-agent-patterns"
                 ]
