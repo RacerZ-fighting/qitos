@@ -19,6 +19,10 @@ How to update:
 
 ### Removed
 
+- **Breaking:** Removed the deprecated product-level `SecurityAuditAgent` template and
+  redundant security-audit Tool/ToolSet forwarding packages. Security research remains
+  available from the explicit `qitos.kit.tool.experimental.security_research` owner,
+  which is no longer loaded as a side effect of importing the generic kit.
 - Removed the unexported `WorktreeManager` helper and its self-only tests. No runtime
   called it, and its fallback created an invalid pseudo-worktree instead of an isolated
   repository. Applications that need isolation should own a real workspace runtime.

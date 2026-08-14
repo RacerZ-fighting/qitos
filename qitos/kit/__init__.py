@@ -82,7 +82,6 @@ from .patterns import (
 )
 
 _LAZY_MODULE_EXPORTS = {
-    "agent",
     "critic",
     "env",
     "evaluate",
@@ -122,7 +121,6 @@ __all__ = [
     "state",
     "tool",
     "toolset",
-    "agent",
     "ReActTextParser",
     "JsonDecisionParser",
     "MiniMaxToolCallParser",

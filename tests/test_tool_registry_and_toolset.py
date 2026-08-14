@@ -30,7 +30,6 @@ from qitos.kit.toolset import (
 )
 from qitos.kit.toolset import editor_tools as editor_tools_builder
 from qitos.kit.toolset import report_tools as report_tools_builder
-from qitos.kit.toolset import security_audit_tools as security_audit_tools_builder
 from qitos.kit.tool.experimental.security_research import SecurityAuditToolSet
 
 
@@ -489,7 +488,6 @@ async def test_new_tool_domains_and_toolset_surface_are_importable(tmp_path):
 
     assert "edit_file" in editor_tools_builder(str(tmp_path)).list_tools()
     assert "glob" in coding_tools_builder(str(tmp_path)).list_tools()
-    assert "audit_inventory" in security_audit_tools_builder(str(tmp_path)).list_tools()
     assert "click" in computer_use_tools_builder().list_tools()
 
 

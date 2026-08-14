@@ -3,10 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from examples._support import SequenceModel
 from qitos.core.memory import MemoryRecord
 from qitos.kit import MemdirMemory
-from qitos.kit.agent import SecurityAuditAgent
 from qitos.kit.planning import PhaseEngine, PhaseSpec, TransitionRule
 from qitos.kit.tool import WorkspaceAwareMixin
 
@@ -87,23 +85,3 @@ def test_workspace_aware_mixin_allows_workspace_owned_symlink(tmp_path: Path) ->
     assert helper.resolve_path(str(tmp_path / "shared" / "shared.txt")) == str(target)
     with pytest.raises(PermissionError):
         helper.resolve_path(str(outside / "shared.txt"))
-
-
-def test_security_audit_agent_template_runs_minimal_path(tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(parents=True, exist_ok=True)
-    (workspace / "app.py").write_text("print('hello')\n", encoding="utf-8")
-    agent = SecurityAuditAgent(
-        llm=SequenceModel(["Final Answer: audit complete"]),
-        workspace_root=str(workspace),
-    )
-    result = agent.run(
-        task="audit this repo",
-        workspace=str(workspace),
-        max_steps=2,
-        trace=False,
-        render=False,
-        return_state=True,
-    )
-    assert result.state.final_result == "audit complete"
-    assert result.state.stop_reason == "completed"

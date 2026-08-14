@@ -22,8 +22,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   `SKILL.md`。旧 SkillHub installer、可变 registry、自安装 Tool 和孤立 search adapter
   已删除；仍维护的同步/异步 HTTP 路径统一直接使用支持 SOCKS 的 `httpx`。
 - **Tool 只保留 canonical import**：7 个已废弃的 `qitos.kit.tool.*` 转发模块已删除。
-  应用统一从仍在维护的 `qitos.kit.tool` 或 `qitos.kit.toolset` owner 导入；实验性
-  security research 工具仍需显式选择。
+  产品级 security-audit Agent 模板及其重复的 Tool/ToolSet 转发层也已删除。应用统一从
+  canonical owner 导入仍在维护的工具；实验性 security research 只保留显式 opt-in 包，
+  导入通用 kit 不再隐式加载它。
 - **删除失效兼容面**：仓库内已被取代的 zoo staging、Snowl 专属 adapter、未使用的
   `RunState` snapshot、仅源码可见的 scaffold CLI 和未接入运行时的伪 worktree helper 已删除。
   产品应用由独立 `qitos-zoo` 仓库维护；QitOS 恢复只使用 canonical Session Journal 或

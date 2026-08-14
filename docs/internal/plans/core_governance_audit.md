@@ -49,8 +49,8 @@ Suspected boundary problems:
 | `qitos.kit` | FRAMEWORK_EXTENSION | Generic curated building blocks. Remove security-specific default exports from flat `qitos.kit`. |
 | `qitos.kit.tool` | FRAMEWORK_EXTENSION | Atomic and preset tools. Security research must require explicit module paths. |
 | `qitos.kit.tool.experimental.security_research` | EXPERIMENTAL | Explicit opt-in only; not imported by `qitos` or default demos. |
-| `qitos.kit.toolset` | FRAMEWORK_EXTENSION | Scenario builders. Review security and product-like presets before stabilizing. |
-| `qitos.kit.agent.security_audit_agent` | SHOULD_MOVE_TO_ZOO | Product-like defensive audit agent template. Keep only temporarily behind explicit imports; stage related apps for zoo. |
+| `qitos.kit.toolset` | FRAMEWORK_EXTENSION | Generic scenario builders. Security research is available only from its explicit experimental owner. |
+| `qitos.kit.agent.security_audit_agent` | REMOVED | Deprecated product template duplicated the independent zoo example and pulled experimental security code into the generic kit surface. |
 | `qitos.models` | FRAMEWORK_EXTENSION | Provider adapters and model contracts. Optional dependencies belong in extras. |
 | `qitos.render` | OBSERVABILITY | Terminal/qita-adjacent rendering. Keep generic; rename product-styled hooks later if needed. |
 | `qitos.harness` | FRAMEWORK_EXTENSION | Model family presets and policy adapters. Keep generic. |
@@ -72,6 +72,9 @@ Suspected boundary problems:
 - Excluded `qitos.examples*` from packaging.
 - Slimmed `qitos.__init__` to core/public contracts.
 - Removed security-audit exports from default `qitos.kit` and `qitos.kit.tool` flat surfaces.
+- Removed the deprecated security-audit Agent template and forwarding tool/toolset
+  packages; explicit research imports now have one owner and no default import side
+  effects.
 - Added migration banners to product-like `examples/real` files that remain temporarily.
 - Repaired engine final/wait handling so finalization, parser feedback, hooks, checkpoints, and memory records follow the normal loop.
 

@@ -23,9 +23,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   mutable registry, self-install Tools, and orphaned search adapters are gone; all
   maintained sync/async HTTP paths use SOCKS-capable `httpx` directly.
 - **Canonical tool imports only**: seven deprecated `qitos.kit.tool.*` forwarding
-  modules are gone. Applications now import tools and toolset builders from their
-  maintained `qitos.kit.tool` or `qitos.kit.toolset` owners; experimental security
-  research tools remain explicit opt-ins.
+  modules, the product-level security-audit Agent template, and its redundant Tool and
+  ToolSet shims are gone. Applications now import maintained tools from their canonical
+  owners; experimental security research remains available only through its explicit
+  opt-in package and is not loaded by generic kit imports.
 - **Removed dead compatibility surfaces**: the superseded in-repo zoo staging,
   Snowl-specific adapters, unused `RunState` snapshot, source-only scaffold CLI, and
   unwired pseudo-worktree helper are gone. Product applications live in the independent

@@ -43,12 +43,6 @@ def math_tools() -> ToolRegistry:
     return registry
 
 
-def security_audit_tools(*args, **kwargs):
-    from .security_audit import security_audit_tools as _security_audit_tools
-
-    return _security_audit_tools(*args, **kwargs)
-
-
 __all__ = [
     "advanced_coding_tools",
     "codebase_tools",
@@ -57,7 +51,6 @@ __all__ = [
     "math_tools",
     "notebook_tools",
     "report_tools",
-    "security_audit_tools",
     "task_tools",
     "web_tools",
 ]
