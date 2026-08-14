@@ -21,6 +21,8 @@ from qitos.core.env import (
     CommandCapability,
     FileRevisionConflictError,
     FileSystemCapability,
+    RuntimeCapabilitySnapshot,
+    RuntimeCapabilityUnavailableError,
 )
 from qitos.core.function_tool_decorator import function_tool
 from qitos.core.process import (
@@ -423,6 +425,7 @@ class CodingToolSet:
         runtime_context: Optional[Dict[str, Any]],
     ) -> tuple[CommandCapability, str]:
         context = runtime_context or {}
+        self._require_runtime_facility(context, "process.background")
         run_id = str(context.get("run_id") or "").strip()
         if not run_id:
             raise RuntimeError("managed process tools require an active Run")
@@ -436,6 +439,42 @@ class CodingToolSet:
                 raise RuntimeError("managed process journal belongs to another Run")
             await process_ops.arecover(owner_run_id=run_id, journal=journal)
         return process_ops, run_id
+
+    @staticmethod
+    def _require_runtime_facility(
+        runtime_context: Mapping[str, Any],
+        facility: str,
+    ) -> None:
+        snapshot = runtime_context.get("runtime_capabilities")
+        if snapshot is None:
+            return
+        if not isinstance(snapshot, RuntimeCapabilitySnapshot):
+            raise TypeError("runtime_capabilities must be a RuntimeCapabilitySnapshot")
+        if not snapshot.has_facility(facility):
+            raise RuntimeCapabilityUnavailableError(
+                facility,
+                backend=snapshot.backend,
+            )
+
+    @staticmethod
+    def _process_error_payload(
+        exc: Exception,
+        **fields: Any,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "status": "error",
+            "message": str(exc),
+            **fields,
+        }
+        if isinstance(exc, RuntimeCapabilityUnavailableError):
+            payload.update(
+                {
+                    "error_category": "capability_unavailable",
+                    "backend": exc.backend,
+                    "facility": exc.facility,
+                }
+            )
+        return payload
 
     @staticmethod
     def _process_handle(process_id: str, owner_run_id: str) -> ProcessHandle:
@@ -795,6 +834,11 @@ class CodingToolSet:
         try:
             process_ops = self._process_ops(runtime_context)
             if run_in_background:
+                if tty:
+                    self._require_runtime_facility(
+                        runtime_context or {},
+                        "process.pty",
+                    )
                 process_ops, run_id = await self._managed_process_ops(runtime_context)
                 context = runtime_context or {}
                 snapshot = await process_ops.astart(
@@ -805,6 +849,10 @@ class CodingToolSet:
                     terminal_notifier=self._process_terminal_notifier(context),
                 )
                 return snapshot.to_dict()
+            self._require_runtime_facility(
+                runtime_context or {},
+                "process.foreground",
+            )
             if tty:
                 return {
                     "status": "error",
@@ -823,7 +871,7 @@ class CodingToolSet:
                 }
             return await process_ops.arun(text, timeout=timeout)
         except Exception as exc:
-            return {"status": "error", "message": str(exc), "command": text}
+            return self._process_error_payload(exc, command=text)
 
     @function_tool(
         name="process_list",
@@ -845,7 +893,7 @@ class CodingToolSet:
                 "processes": [snapshot.to_dict() for snapshot in snapshots],
             }
         except Exception as exc:
-            return {"status": "error", "message": str(exc)}
+            return self._process_error_payload(exc)
 
     @function_tool(
         name="process_read",
@@ -875,11 +923,7 @@ class CodingToolSet:
             )
             return snapshot.to_dict()
         except Exception as exc:
-            return {
-                "status": "error",
-                "message": str(exc),
-                "process_id": process_id,
-            }
+            return self._process_error_payload(exc, process_id=process_id)
 
     @function_tool(
         name="process_write",
@@ -903,11 +947,7 @@ class CodingToolSet:
             )
             return snapshot.to_dict()
         except Exception as exc:
-            return {
-                "status": "error",
-                "message": str(exc),
-                "process_id": process_id,
-            }
+            return self._process_error_payload(exc, process_id=process_id)
 
     @function_tool(
         name="process_wait",
@@ -939,11 +979,7 @@ class CodingToolSet:
             )
             return snapshot.to_dict()
         except Exception as exc:
-            return {
-                "status": "error",
-                "message": str(exc),
-                "process_id": process_id,
-            }
+            return self._process_error_payload(exc, process_id=process_id)
 
     @function_tool(
         name="process_terminate",
@@ -964,11 +1000,7 @@ class CodingToolSet:
             )
             return snapshot.to_dict()
         except Exception as exc:
-            return {
-                "status": "error",
-                "message": str(exc),
-                "process_id": process_id,
-            }
+            return self._process_error_payload(exc, process_id=process_id)
 
     def _read_file_chunk(
         self,

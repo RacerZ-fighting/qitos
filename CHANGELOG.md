@@ -19,6 +19,13 @@ How to update:
 
 ### Changed
 
+- Environments now publish one typed, immutable `RuntimeCapabilitySnapshot` with
+  backend identity, working directory, operation groups, optional facilities,
+  verified commands, and stable limitations. Engine captures that exact snapshot in
+  each turn, filters Tools whose operation groups are unavailable, and passes the same
+  snapshot to Tool execution. Environment initialization and health probes now run
+  through awaited lifecycle methods; local host and ordinary-container processes share
+  the managed file, foreground, background, PTY, stdin, and shutdown contracts.
 - Root Engines and every descendant can now share one journal-backed `BudgetLedger`.
   Completed model transactions atomically settle token and cost usage into the Root
   JSONL, while `EngineResult` and `ChildResult` preserve local totals and usage
@@ -57,6 +64,12 @@ How to update:
 
 ### Breaking
 
+- `CapabilityEnv(attestation=...)` has been replaced by
+  `CapabilityEnv(snapshot=RuntimeCapabilitySnapshot(...))`.
+  `TurnRuntimeCapabilities` now stores the complete Runtime snapshot; its
+  `environment_ops` property remains a derived read-only view. Environment subclasses
+  that allocate asynchronously may override `ainitialize()` and `ahealth_check()`;
+  legacy synchronous hooks run in a worker thread by default.
 - Live MCP transports no longer belong to `AgentModule.mcp_servers`. Applications pass
   `Engine(mcp_server_factory=...)` a construction-only factory that returns fresh,
   unconnected transports for each Run, preventing Root, Child, resumed, or repeated

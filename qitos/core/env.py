@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Sequence
 
 from .process import ProcessHandle, ProcessSnapshot, ProcessTerminalNotifier
 
@@ -117,6 +117,199 @@ class FileRevisionConflictError(RuntimeError):
         )
 
 
+def _runtime_strings(values: Sequence[str], field_name: str) -> tuple[str, ...]:
+    normalized = tuple(values)
+    if any(not isinstance(value, str) or not value.strip() for value in normalized):
+        raise TypeError(f"{field_name} must contain non-empty strings")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"{field_name} must not contain duplicates")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeCommand:
+    """One command whose availability was verified inside a runtime backend."""
+
+    name: str
+    executable: str
+    available: bool
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("runtime command name must be non-empty")
+        if not isinstance(self.executable, str) or not self.executable.strip():
+            raise ValueError("runtime command executable must be non-empty")
+        if not isinstance(self.available, bool):
+            raise TypeError("runtime command available must be a boolean")
+        if not isinstance(self.detail, str):
+            raise TypeError("runtime command detail must be a string")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "executable": self.executable,
+            "available": self.available,
+            "detail": self.detail,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeCommand":
+        name = payload.get("name")
+        executable = payload.get("executable")
+        available = payload.get("available")
+        detail = payload.get("detail", "")
+        if not isinstance(name, str):
+            raise TypeError("runtime command name must be a string")
+        if not isinstance(executable, str):
+            raise TypeError("runtime command executable must be a string")
+        if not isinstance(available, bool):
+            raise TypeError("runtime command available must be a boolean")
+        if not isinstance(detail, str):
+            raise TypeError("runtime command detail must be a string")
+        return cls(name, executable, available, detail)
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeLimitation:
+    """Stable machine-readable reason a backend omits or bounds a facility."""
+
+    code: str
+    detail: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.code, str) or not self.code.strip():
+            raise ValueError("runtime limitation code must be non-empty")
+        if not isinstance(self.detail, str) or not self.detail.strip():
+            raise ValueError("runtime limitation detail must be non-empty")
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"code": self.code, "detail": self.detail}
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeLimitation":
+        code = payload.get("code")
+        detail = payload.get("detail")
+        if not isinstance(code, str):
+            raise TypeError("runtime limitation code must be a string")
+        if not isinstance(detail, str):
+            raise TypeError("runtime limitation detail must be a string")
+        return cls(code=code, detail=detail)
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeCapabilitySnapshot:
+    """Immutable facts verified for one initialized execution backend."""
+
+    backend: str
+    working_directory: str
+    operation_groups: tuple[str, ...] = ()
+    facilities: tuple[str, ...] = ()
+    commands: tuple[RuntimeCommand, ...] = ()
+    limitations: tuple[RuntimeLimitation, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.backend, str) or not self.backend.strip():
+            raise ValueError("runtime backend must be non-empty")
+        if (
+            not isinstance(self.working_directory, str)
+            or not self.working_directory.strip()
+        ):
+            raise ValueError("runtime working_directory must be non-empty")
+        if not isinstance(self.operation_groups, tuple):
+            raise TypeError("runtime operation_groups must be a tuple")
+        if not isinstance(self.facilities, tuple):
+            raise TypeError("runtime facilities must be a tuple")
+        if not isinstance(self.commands, tuple) or not all(
+            isinstance(command, RuntimeCommand) for command in self.commands
+        ):
+            raise TypeError("runtime commands must be a tuple of RuntimeCommand")
+        if not isinstance(self.limitations, tuple) or not all(
+            isinstance(item, RuntimeLimitation) for item in self.limitations
+        ):
+            raise TypeError("runtime limitations must be a tuple of RuntimeLimitation")
+        _runtime_strings(self.operation_groups, "runtime operation_groups")
+        _runtime_strings(self.facilities, "runtime facilities")
+        _runtime_strings(
+            tuple(command.name for command in self.commands),
+            "runtime command names",
+        )
+        _runtime_strings(
+            tuple(item.code for item in self.limitations),
+            "runtime limitation codes",
+        )
+
+    def has_operation_group(self, group: str) -> bool:
+        return group in self.operation_groups
+
+    def has_facility(self, facility: str) -> bool:
+        return facility in self.facilities
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "backend": self.backend,
+            "working_directory": self.working_directory,
+            "operation_groups": list(self.operation_groups),
+            "facilities": list(self.facilities),
+            "commands": [command.to_dict() for command in self.commands],
+            "limitations": [item.to_dict() for item in self.limitations],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "RuntimeCapabilitySnapshot":
+        backend = payload.get("backend")
+        working_directory = payload.get("working_directory")
+        raw_groups = payload.get("operation_groups", [])
+        raw_facilities = payload.get("facilities", [])
+        raw_commands = payload.get("commands", [])
+        raw_limitations = payload.get("limitations", [])
+        if not isinstance(backend, str):
+            raise TypeError("runtime backend must be a string")
+        if not isinstance(working_directory, str):
+            raise TypeError("runtime working_directory must be a string")
+        for value, name in (
+            (raw_groups, "operation_groups"),
+            (raw_facilities, "facilities"),
+            (raw_commands, "commands"),
+            (raw_limitations, "limitations"),
+        ):
+            if not isinstance(value, list):
+                raise TypeError(f"runtime {name} must be an array")
+        if any(not isinstance(value, str) for value in raw_groups):
+            raise TypeError("runtime operation_groups must contain strings")
+        if any(not isinstance(value, str) for value in raw_facilities):
+            raise TypeError("runtime facilities must contain strings")
+        if any(not isinstance(value, Mapping) for value in raw_commands):
+            raise TypeError("runtime commands must contain objects")
+        if any(not isinstance(value, Mapping) for value in raw_limitations):
+            raise TypeError("runtime limitations must contain objects")
+        return cls(
+            backend=backend,
+            working_directory=working_directory,
+            operation_groups=tuple(raw_groups),
+            facilities=tuple(raw_facilities),
+            commands=tuple(RuntimeCommand.from_dict(value) for value in raw_commands),
+            limitations=tuple(
+                RuntimeLimitation.from_dict(value) for value in raw_limitations
+            ),
+        )
+
+
+class RuntimeCapabilityUnavailableError(RuntimeError):
+    """Raised when a selected backend does not provide a required facility."""
+
+    def __init__(self, facility: str, *, backend: str) -> None:
+        if not isinstance(facility, str) or not facility.strip():
+            raise ValueError("facility must be non-empty")
+        if not isinstance(backend, str) or not backend.strip():
+            raise ValueError("backend must be non-empty")
+        self.facility = facility
+        self.backend = backend
+        super().__init__(
+            f"runtime backend {backend!r} does not provide facility {facility!r}"
+        )
+
+
 class Env(ABC):
     """Canonical environment interface for agent-world interaction."""
 
@@ -146,6 +339,52 @@ class Env(ABC):
     def health_check(self) -> Dict[str, Any]:
         """Return health probe result used by runtime preflight."""
         return {"ok": True}
+
+    async def ainitialize(
+        self, task: Any = None, workspace: Optional[str] = None, **kwargs: Any
+    ) -> EnvObservation:
+        """Initialize the backend without blocking the owning event loop."""
+
+        def _initialize() -> EnvObservation:
+            self.setup(task=task, workspace=workspace, **kwargs)
+            return self.reset(task=task, workspace=workspace, **kwargs)
+
+        initialization = asyncio.create_task(asyncio.to_thread(_initialize))
+        try:
+            return await asyncio.shield(initialization)
+        except asyncio.CancelledError as cancellation:
+            # A worker thread cannot be stopped safely. Settle initialization
+            # before propagating cancellation so the Engine cannot tear down an
+            # Env while its legacy setup hook is still allocating resources.
+            while not initialization.done():
+                try:
+                    await asyncio.shield(initialization)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            try:
+                initialization.result()
+            except BaseException as exc:
+                raise cancellation from exc
+            raise
+
+    async def ahealth_check(self) -> Dict[str, Any]:
+        """Run the backend health probe outside the owning event loop."""
+
+        return await asyncio.to_thread(self.health_check)
+
+    def capability_snapshot(self) -> RuntimeCapabilitySnapshot | None:
+        """Return immutable facts when this backend declares them.
+
+        Existing Env implementations may still expose operations through
+        ``get_ops`` without having adopted runtime capability snapshots. In
+        that case ``None`` preserves the established operation resolution
+        path; concrete backends that return an empty snapshot explicitly
+        declare that no operation groups are available.
+        """
+
+        return None
 
     def get_ops(self, group: str) -> Any:
         """Return concrete ops implementation for one capability group."""
@@ -462,4 +701,8 @@ __all__ = [
     "GUIControllerCapability",
     "OCRCapability",
     "GroundingCapability",
+    "RuntimeCapabilitySnapshot",
+    "RuntimeCapabilityUnavailableError",
+    "RuntimeCommand",
+    "RuntimeLimitation",
 ]

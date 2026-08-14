@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .history import HistorySnapshot
+from .env import RuntimeCapabilitySnapshot
 from .model_capabilities import ModelCapabilities
 from .tool_registry import ToolExposure
 
@@ -40,9 +41,17 @@ class TurnRuntimeCapabilities:
     """Provider and runtime facts that cannot change during one turn."""
 
     model: ModelCapabilities
-    environment_ops: tuple[str, ...] = ()
+    runtime: RuntimeCapabilitySnapshot | None = None
     mailbox: bool = True
     child_agents: bool = False
+
+    @property
+    def environment_ops(self) -> tuple[str, ...]:
+        """Operation groups verified by the initialized backend."""
+
+        if self.runtime is None:
+            return ()
+        return self.runtime.operation_groups
 
 
 @dataclass(frozen=True, slots=True)

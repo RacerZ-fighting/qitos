@@ -872,7 +872,11 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     },
                     "runtime_capabilities": {
                         "model_api": turn.capabilities.model.api.value,
-                        "environment_ops": list(turn.capabilities.environment_ops),
+                        "environment": (
+                            turn.capabilities.runtime.to_dict()
+                            if turn.capabilities.runtime is not None
+                            else None
+                        ),
                         "mailbox": turn.capabilities.mailbox,
                         "child_agents": turn.capabilities.child_agents,
                     },

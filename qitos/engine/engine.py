@@ -562,6 +562,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             auto_approve=self.auto_approve,
             cancel_token=self._cancel_token,
             turn_budget=turn.budget if turn is not None else None,
+            runtime_capabilities=(
+                turn.capabilities.runtime if turn is not None else None
+            ),
         )
 
     def _capture_turn(
@@ -574,15 +577,35 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         exposure = self.agent.build_tool_exposure(state, self.tool_registry)
         if not isinstance(exposure, ToolExposure):
             raise TypeError("Agent.build_tool_exposure() must return ToolExposure")
+        runtime_snapshot = self._env_runtime.capability_snapshot()
+        if runtime_snapshot is not None:
+            available_groups = set(runtime_snapshot.operation_groups)
+            selected: list[str] = []
+            unavailable: dict[str, list[str]] = {}
+            for name in exposure.list_tools():
+                description = exposure.describe_tool(name)
+                required_groups = {
+                    str(group)
+                    for group in (
+                        list(description.get("required_ops") or [])
+                        + list(description.get("environment_ops") or [])
+                    )
+                    if str(group)
+                }
+                missing = sorted(required_groups - available_groups)
+                if missing:
+                    unavailable[name] = missing
+                    continue
+                selected.append(name)
+            metadata = exposure.selection_metadata
+            metadata["runtime"] = runtime_snapshot.to_dict()
+            if unavailable:
+                metadata["unavailable_tools"] = unavailable
+            exposure = exposure.freeze(selected, metadata=metadata)
         model = getattr(self.agent, "llm", None)
         model_capabilities = getattr(model, "capabilities", ModelCapabilities())
         if not isinstance(model_capabilities, ModelCapabilities):
             model_capabilities = ModelCapabilities()
-        environment_ops: set[str] = set()
-        for name in exposure.list_tools():
-            description = exposure.describe_tool(name)
-            environment_ops.update(description.get("required_ops") or [])
-            environment_ops.update(description.get("environment_ops") or [])
         local_remaining_tokens = (
             None
             if self.budget.max_tokens is None
@@ -613,7 +636,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             tools=exposure,
             capabilities=TurnRuntimeCapabilities(
                 model=model_capabilities,
-                environment_ops=tuple(sorted(environment_ops)),
+                runtime=runtime_snapshot,
                 mailbox=True,
                 child_agents="Agent" in exposure.list_tools(),
             ),
@@ -1433,7 +1456,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 )
             environment_started = True
             try:
-                self._setup_env(task_obj=task_obj, state=state, kwargs=kwargs)
+                await self._setup_env(task_obj=task_obj, state=state, kwargs=kwargs)
             except Exception as exc:
                 self._report_runtime_exception("SETUP_ENV", 0, exc, emit=False)
                 raise
@@ -1467,7 +1490,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     payload={"stage": "harness_mismatch", **harness_diagnostics},
                 )
             self._notify_run_start(task_text, state)
-            preflight_issues = self._preflight_validate(
+            preflight_issues = await self._preflight_validate(
                 task_obj=task_obj, workspace=kwargs.get("workspace")
             )
         except BaseException:
@@ -2935,7 +2958,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             return task, task.objective
         return None, str(task)
 
-    def _preflight_validate(
+    async def _preflight_validate(
         self, task_obj: Optional[Task], workspace: Any = None
     ) -> List[TaskValidationIssue]:
         issues: List[TaskValidationIssue] = []
@@ -2970,7 +2993,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     ),
                 )
             )
-        health = self._validate_env_health()
+        health = await self._validate_env_health()
         if health is not None:
             issues.append(
                 TaskValidationIssue(
@@ -2994,14 +3017,14 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     def _collect_required_ops(self) -> set[str]:
         return self._env_runtime.collect_required_ops()
 
-    def _validate_env_health(self) -> Optional[Dict[str, Any]]:
-        return self._env_runtime.validate_env_health()
+    async def _validate_env_health(self) -> Optional[Dict[str, Any]]:
+        return await self._env_runtime.validate_env_health()
 
-    def _setup_env(
+    async def _setup_env(
         self, task_obj: Optional[Task], state: StateT, kwargs: Dict[str, Any]
     ) -> None:
         self._env_cleanup_required = True
-        self._env_runtime.setup_env(task_obj, state, kwargs)
+        await self._env_runtime.setup_env(task_obj, state, kwargs)
 
     def _build_env_from_spec(
         self, env_spec: Any, fallback_workspace: Any = None

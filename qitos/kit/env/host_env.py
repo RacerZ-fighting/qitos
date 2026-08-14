@@ -23,6 +23,9 @@ from qitos.core.env import (
     FileRevisionConflictError,
     FileStat,
     FileSystemCapability,
+    RuntimeCapabilitySnapshot,
+    RuntimeCommand,
+    RuntimeLimitation,
     TextFileChunk,
 )
 from qitos.core.journal import SessionJournal
@@ -633,10 +636,28 @@ class HostEnv(Env):
         workspace_root: str = ".",
         fs: Optional[FileSystemCapability] = None,
         cmd: Optional[CommandCapability] = None,
+        *,
+        backend: str = "local",
+        command_environment: Mapping[str, str] | None = None,
+        commands: Sequence[RuntimeCommand] = (),
+        limitations: Sequence[RuntimeLimitation] = (),
     ):
+        if not isinstance(backend, str) or not backend.strip():
+            raise ValueError("backend must be a non-empty string")
+        if cmd is not None and command_environment is not None:
+            raise ValueError("cmd and command_environment are mutually exclusive")
         self.workspace_root = str(Path(workspace_root).resolve())
         self.fs = fs or HostFSCapability(self.workspace_root)
-        self.cmd = cmd or HostCommandCapability(self.workspace_root)
+        self._command_environment = (
+            dict(command_environment) if command_environment is not None else None
+        )
+        self.cmd = cmd or HostCommandCapability(
+            self.workspace_root,
+            env=self._command_environment,
+        )
+        self.backend = backend.strip()
+        self.commands = tuple(commands)
+        self.limitations = tuple(limitations)
         self._last_error: Optional[str] = None
 
     def setup(
@@ -645,7 +666,10 @@ class HostEnv(Env):
         if workspace:
             self.workspace_root = str(Path(workspace).resolve())
             self.fs = HostFSCapability(self.workspace_root)
-            self.cmd = HostCommandCapability(self.workspace_root)
+            self.cmd = HostCommandCapability(
+                self.workspace_root,
+                env=self._command_environment,
+            )
         Path(self.workspace_root).mkdir(parents=True, exist_ok=True)
 
     def reset(
@@ -654,7 +678,10 @@ class HostEnv(Env):
         if workspace:
             self.workspace_root = str(Path(workspace).resolve())
             self.fs = HostFSCapability(self.workspace_root)
-            self.cmd = HostCommandCapability(self.workspace_root)
+            self.cmd = HostCommandCapability(
+                self.workspace_root,
+                env=self._command_environment,
+            )
         Path(self.workspace_root).mkdir(parents=True, exist_ok=True)
         self._last_error = None
         return self.observe(state=None)
@@ -706,6 +733,22 @@ class HostEnv(Env):
         if group == "process":
             return self.cmd
         return None
+
+    def capability_snapshot(self) -> RuntimeCapabilitySnapshot:
+        return RuntimeCapabilitySnapshot(
+            backend=self.backend,
+            working_directory=self.workspace_root,
+            operation_groups=("file", "process"),
+            facilities=(
+                "file.atomic-write",
+                "process.background",
+                "process.foreground",
+                "process.pty",
+                "process.stdin",
+            ),
+            commands=self.commands,
+            limitations=self.limitations,
+        )
 
     async def ateardown(self) -> None:
         await self.cmd.aclose()

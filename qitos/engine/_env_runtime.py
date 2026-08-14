@@ -10,7 +10,13 @@ from typing import TYPE_CHECKING, Any, Dict, Generic, List, Optional, TypeVar
 _logger = logging.getLogger("qitos.engine._env_runtime")
 
 from ..core.decision import Decision
-from ..core.env import Env, EnvObservation, EnvSpec, EnvStepResult
+from ..core.env import (
+    Env,
+    EnvObservation,
+    EnvSpec,
+    EnvStepResult,
+    RuntimeCapabilitySnapshot,
+)
 from ..core.observation import Observation
 from ..core.state import StateSchema
 from ..core.task import Task
@@ -136,20 +142,26 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
                     "details": {"required_ops": sorted(required)},
                 }
             ]
-        missing = [group for group in sorted(required) if not engine.env.has_ops(group)]
-        if not missing:
+        snapshot = self.capability_snapshot()
+        if snapshot is None:
+            return []
+        invalid = [
+            group
+            for group in snapshot.operation_groups
+            if engine.env.get_ops(group) is None
+        ]
+        if not invalid:
             return []
         return [
             {
-                "code": "ENV_OPS_GROUP_MISSING",
-                "message": "Env is missing required ops groups",
+                "code": "ENV_CAPABILITY_SNAPSHOT_INVALID",
+                "message": "Env snapshot advertises unavailable ops groups",
                 "field": "env",
                 "details": {
                     "env_name": getattr(
                         engine.env, "name", engine.env.__class__.__name__
                     ),
-                    "missing_ops": missing,
-                    "required_ops": sorted(required),
+                    "invalid_ops": invalid,
                 },
             }
         ]
@@ -181,12 +193,14 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             return required
         return required
 
-    def validate_env_health(self) -> Optional[Dict[str, Any]]:
+    async def validate_env_health(self) -> Optional[Dict[str, Any]]:
         engine = self.engine
         if engine.env is None:
             return None
         try:
-            probe = engine.env.health_check()
+            probe = await engine.env.ahealth_check()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             return {
                 "code": "ENV_HEALTH_CHECK_EXCEPTION",
@@ -209,7 +223,7 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             "details": probe,
         }
 
-    def setup_env(
+    async def setup_env(
         self, task_obj: Optional[Task], state: StateT, kwargs: Dict[str, Any]
     ) -> None:
         engine = self.engine
@@ -231,21 +245,35 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             else []
         )
         try:
-            engine.env.setup(task=reset_task, workspace=workspace, resources=resources)
-            first = engine.env.reset(
+            first = await engine.env.ainitialize(
                 task=reset_task, workspace=workspace, resources=resources
             )
             if not isinstance(first, EnvObservation):
-                first = EnvObservation(data={"value": first})
+                raise TypeError("Env.ainitialize() must return EnvObservation")
             engine._last_env_observation = first
             engine._last_env_result = EnvStepResult(
                 observation=first, done=False, info={"source": "reset"}
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             engine._last_env_observation = EnvObservation(data={"error": str(exc)})
             engine._last_env_result = EnvStepResult(
                 observation=engine._last_env_observation, done=False, error=str(exc)
             )
+            raise RuntimeError("environment initialization failed") from exc
+
+    def capability_snapshot(self) -> RuntimeCapabilitySnapshot | None:
+        if self.engine.env is None:
+            return None
+        snapshot = self.engine.env.capability_snapshot()
+        if snapshot is None:
+            return None
+        if not isinstance(snapshot, RuntimeCapabilitySnapshot):
+            raise TypeError(
+                "Env.capability_snapshot() must return RuntimeCapabilitySnapshot"
+            )
+        return snapshot
 
     def build_env_from_spec(
         self, env_spec: EnvSpec, fallback_workspace: Any = None
@@ -436,11 +464,7 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             engine._last_env_result = result
             engine._last_env_observation = result.observation
             engine._emit(
-                (
-                    active_state.current_step
-                    if active_state is not None
-                    else 0
-                ),
+                (active_state.current_step if active_state is not None else 0),
                 RuntimePhase.ACT,
                 payload={
                     "stage": "env_step",
@@ -457,11 +481,7 @@ class _EnvRuntime(Generic[StateT, ObservationT, ActionT]):
             engine._last_env_result = err
             engine._last_env_observation = err.observation
             engine._emit(
-                (
-                    active_state.current_step
-                    if active_state is not None
-                    else 0
-                ),
+                (active_state.current_step if active_state is not None else 0),
                 RuntimePhase.ACT,
                 ok=False,
                 payload={"stage": "env_step_error"},

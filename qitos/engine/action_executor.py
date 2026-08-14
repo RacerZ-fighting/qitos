@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from ..core.action import Action, ActionExecutionPolicy, ActionResult, ActionStatus
 from ..core.budget import BudgetLedger
-from ..core.env import Env
+from ..core.env import Env, RuntimeCapabilitySnapshot
 from ..core.journal import SessionJournal
 from ..core.runtime_input import RuntimeInput
 from ..core.tool_result import ToolResult
@@ -116,6 +116,7 @@ class ActionExecutor:
         auto_approve: bool = False,
         cancel_token: Optional[CancelToken] = None,
         turn_budget: TurnBudgetSnapshot | None = None,
+        runtime_capabilities: RuntimeCapabilitySnapshot | None = None,
     ):
         self.tool_registry = tool_registry
         self.policy = policy or ActionExecutionPolicy()
@@ -129,6 +130,7 @@ class ActionExecutor:
         self.auto_approve = auto_approve
         self._cancel_token = cancel_token
         self._turn_budget = turn_budget
+        self._runtime_capabilities = runtime_capabilities
         # Populated by execute(); consumed by the trace layer.
         self.last_execution_stats: Dict[str, Any] = {}
 
@@ -1436,8 +1438,10 @@ class ActionExecutor:
 
         return {
             "env": env,
-            "environment_attestation": (
-                dict(getattr(env, "attestation", {}) or {}) if env is not None else {}
+            "runtime_capabilities": (
+                self._runtime_capabilities
+                if self._runtime_capabilities is not None
+                else (env.capability_snapshot() if env is not None else None)
             ),
             "state": state,
             "ops": self._resolve_ops(required_ops, env)

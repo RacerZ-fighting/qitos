@@ -18,6 +18,13 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Truthful Runtime capability snapshots**: initialized environments now expose one
+  immutable backend, working-directory, operation-group, facility, verified-command,
+  and limitation snapshot. Engine freezes it with each turn, removes Tools whose ops
+  are unavailable, and gives execution the same facts. Local host and ordinary-
+  container runs use the same managed file, foreground, background, PTY, stdin, and
+  cleanup primitives; Docker exec advertises foreground-only process support instead
+  of silently detaching untracked work.
 - **Bounded MCP lifecycle for full and interactive Runs**: independent servers now
   connect and discover concurrently under fixed limits, then publish successful
   catalogs in deterministic factory order. `Engine.astep()` lazily owns the same MCP

@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from qitos.core.action import Action
-from qitos.core.env import Env, EnvObservation, EnvStepResult, TerminalCapability
+from qitos.core.env import (
+    Env,
+    EnvObservation,
+    EnvStepResult,
+    RuntimeCapabilitySnapshot,
+    TerminalCapability,
+)
 
 
 class TmuxTerminalCapability(TerminalCapability):
@@ -291,6 +297,14 @@ class TmuxEnv(Env):
         if group == "terminal":
             return self.terminal
         return None
+
+    def capability_snapshot(self) -> RuntimeCapabilitySnapshot:
+        return RuntimeCapabilitySnapshot(
+            backend="tmux",
+            working_directory=self.workspace_root,
+            operation_groups=("terminal",),
+            facilities=("terminal.interactive",),
+        )
 
     def teardown(self) -> None:
         close = getattr(self.terminal, "close_session", None)

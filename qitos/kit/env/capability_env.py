@@ -5,7 +5,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from qitos.core.env import Env, EnvObservation, EnvStepResult
+from qitos.core.env import (
+    Env,
+    EnvObservation,
+    EnvStepResult,
+    RuntimeCapabilitySnapshot,
+)
 
 
 class CapabilityEnv(Env):
@@ -18,7 +23,10 @@ class CapabilityEnv(Env):
     Args:
         ops: Mapping from capability group names to concrete providers.
         name: Human-readable environment name used by traces and diagnostics.
-        attestation: Optional immutable-by-convention environment metadata.
+        snapshot: Immutable facts for the initialized backend. Its operation
+            groups must match the supplied providers exactly.
+        attestation: Legacy environment metadata retained for callers that
+            still record attempt identity separately from runtime facts.
     """
 
     version = "1.0"
@@ -28,6 +36,7 @@ class CapabilityEnv(Env):
         ops: Mapping[str, Any],
         *,
         name: str = "capability_env",
+        snapshot: RuntimeCapabilitySnapshot | None = None,
         attestation: Mapping[str, Any] | None = None,
     ) -> None:
         normalized_name = str(name or "").strip()
@@ -44,8 +53,17 @@ class CapabilityEnv(Env):
             normalized_ops[group] = provider
 
         self.name = normalized_name
-        self.attestation = dict(attestation or {})
         self._ops = normalized_ops
+        self.attestation = dict(attestation or {})
+        self._snapshot = snapshot or RuntimeCapabilitySnapshot(
+            backend=normalized_name,
+            working_directory=".",
+            operation_groups=tuple(sorted(normalized_ops)),
+        )
+        if set(self._snapshot.operation_groups) != set(normalized_ops):
+            raise ValueError(
+                "Runtime snapshot operation groups must match capability providers"
+            )
         self._last_action: str | None = None
 
     @property
@@ -127,6 +145,11 @@ class CapabilityEnv(Env):
         """Return the exact provider registered for a capability group."""
 
         return self._ops.get(str(group))
+
+    def capability_snapshot(self) -> RuntimeCapabilitySnapshot:
+        """Return the exact immutable snapshot bound to these providers."""
+
+        return self._snapshot
 
 
 def _action_name(action: Any) -> str | None:

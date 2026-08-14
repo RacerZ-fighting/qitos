@@ -9,6 +9,7 @@ behavior reusable across a local workspace, a container, or a remote runner.
 `CapabilityEnv` maps a group name to one provider object:
 
 ```python
+from qitos.core.env import RuntimeCapabilitySnapshot
 from qitos.kit.env import CapabilityEnv
 
 env = CapabilityEnv(
@@ -17,13 +18,29 @@ env = CapabilityEnv(
         "process": my_process_provider,
     },
     name="remote_attempt",
-    attestation={"workspace": "/workspace"},
+    snapshot=RuntimeCapabilitySnapshot(
+        backend="remote-attempt",
+        working_directory="/workspace",
+        operation_groups=("file", "process"),
+        facilities=("process.foreground",),
+    ),
 )
 ```
+
+The snapshot is the Runtime fact used by Tool exposure, per-turn model metadata, and
+execution. Product profiles may select or narrow that Runtime, but they do not replace
+the backend snapshot. A Tool whose required operation group is absent is removed from
+the next turn's exposure. Mode-specific facilities can also fail with the stable
+`capability_unavailable` category; for example, foreground-only process providers do
+not pretend to support managed background work or PTY input.
 
 Providers retain their own lifecycle. The application that creates the container,
 remote session, or host resource must close it after the Engine finishes; composing a
 `CapabilityEnv` does not transfer ownership.
+
+Engine awaits `Env.ainitialize()`, `Env.ahealth_check()`, and `Env.ateardown()`.
+Synchronous legacy hooks are moved off the event loop by the default implementations;
+backends with native async allocation can override them without a sync/async bridge.
 
 The stable filesystem and process contracts live in `qitos.core.env` and
 `qitos.core.process`.

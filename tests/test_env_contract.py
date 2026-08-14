@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
+
+import pytest
 
 from qitos.core import Env, EnvObservation, EnvSpec, EnvStepResult
 from qitos.kit.env import DesktopEnv, ScreenshotEnv
@@ -50,6 +54,7 @@ def test_env_contract_lifecycle_and_terminal_default():
     env = _DummyEnv()
     env.setup(task="fix bug", workspace="/tmp/work")
     assert env.health_check().get("ok") is True
+    assert env.capability_snapshot() is None
     obs0 = env.reset(task="fix bug", workspace="/tmp/work")
     assert obs0.data["event"] == "reset"
     assert obs0.data["task"] == "fix bug"
@@ -68,6 +73,31 @@ def test_env_contract_lifecycle_and_terminal_default():
 
     env.teardown()
     assert env.closed is True
+
+
+@pytest.mark.asyncio
+async def test_async_initialization_settles_legacy_thread_before_cancellation() -> None:
+    setup_started = threading.Event()
+    allow_setup_to_finish = threading.Event()
+
+    class BlockingEnv(_DummyEnv):
+        def setup(self, task=None, workspace=None, **kwargs):
+            _ = task, workspace, kwargs
+            setup_started.set()
+            allow_setup_to_finish.wait(timeout=1.0)
+
+    env = BlockingEnv()
+    initialization = asyncio.create_task(env.ainitialize())
+    assert await asyncio.to_thread(setup_started.wait, 1.0)
+
+    initialization.cancel()
+    await asyncio.sleep(0)
+    assert not initialization.done()
+
+    allow_setup_to_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await initialization
+    assert env.counter == 0
 
 
 def test_screenshot_env_exposes_multimodal_observation(tmp_path: Path):

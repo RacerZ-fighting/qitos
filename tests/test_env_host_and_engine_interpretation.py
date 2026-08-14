@@ -73,6 +73,35 @@ def test_host_env_edit_file_and_command(tmp_path: Path):
     assert int(run.get("returncode", 1)) == 0
 
 
+def test_host_env_reports_the_backend_it_executes(tmp_path: Path) -> None:
+    env = HostEnv(workspace_root=str(tmp_path), backend="ordinary-container")
+
+    snapshot = env.capability_snapshot()
+
+    assert snapshot.backend == "ordinary-container"
+    assert snapshot.working_directory == str(tmp_path)
+    assert snapshot.has_operation_group("file")
+    assert snapshot.has_operation_group("process")
+    assert snapshot.has_facility("process.background")
+    assert snapshot.has_facility("process.pty")
+
+
+def test_host_env_preserves_scoped_command_environment_on_workspace_reset(
+    tmp_path: Path,
+) -> None:
+    configured = {"PENTESTAGENT_SCOPED_MARKER": "kept"}
+    env = HostEnv(
+        workspace_root=str(tmp_path),
+        command_environment=configured,
+    )
+
+    env.setup(workspace=str(tmp_path))
+    result = env.cmd.run("printf '%s' \"$PENTESTAGENT_SCOPED_MARKER\"")
+
+    assert result["returncode"] == 0
+    assert result["stdout"] == "kept"
+
+
 def test_host_file_capability_is_binary_safe_and_symlink_confined(tmp_path: Path):
     root = tmp_path / "root"
     root.mkdir()

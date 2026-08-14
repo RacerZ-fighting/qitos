@@ -6,6 +6,13 @@ from .docker_env import DockerEnv, DockerEnvScheduler
 from .host_env import HostEnv
 from .managed_process import ManagedHostProcessRuntime
 from .repo_env import RepoEnv
+from .runtime_profile import (
+    RuntimeCommandProbe,
+    RuntimeProfile,
+    aprobe_runtime_commands,
+    load_runtime_profile,
+    probe_runtime_commands,
+)
 from .screenshot_env import ScreenshotEnv, ScreenshotObserverOps, MockGUIControllerOps
 from .text_web_env import TextWebEnv, TextWebBrowserOps
 from .tmux_env import TmuxEnv, TmuxTerminalCapability
@@ -21,6 +28,11 @@ __all__ = [
     "DockerEnv",
     "DockerEnvScheduler",
     "RepoEnv",
+    "RuntimeCommandProbe",
+    "RuntimeProfile",
+    "aprobe_runtime_commands",
+    "load_runtime_profile",
+    "probe_runtime_commands",
     "ScreenshotEnv",
     "ScreenshotObserverOps",
     "MockGUIControllerOps",

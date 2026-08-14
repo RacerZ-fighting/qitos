@@ -9,7 +9,7 @@ from typing import Any, Dict, Sequence
 import pytest
 
 from qitos.core.action import Action, ActionStatus
-from qitos.core.env import CommandCapability
+from qitos.core.env import CommandCapability, RuntimeCapabilitySnapshot
 from qitos.core.tool_registry import ToolRegistry
 from qitos.engine.action_executor import ActionExecutor
 from qitos.kit.env import CapabilityEnv
@@ -171,6 +171,61 @@ async def test_coding_tools_use_selected_environment_instead_of_local_fallback(
     assert not (local / "src" / "new.txt").exists()
     assert all(call[0][0] == "rg" for call in process.calls)
     assert all(call[1] == "src" for call in process.calls)
+
+
+@pytest.mark.asyncio
+async def test_managed_process_reports_stable_unavailable_for_limited_backend(
+    tmp_path: Path,
+) -> None:
+    process = _RecordingProcess()
+    context = _tool_context(tmp_path, process)
+    context.update(
+        {
+            "run_id": "run-limited",
+            "runtime_capabilities": RuntimeCapabilitySnapshot(
+                backend="container-exec",
+                working_directory="/workspace",
+                operation_groups=("file", "process"),
+                facilities=("process.foreground",),
+            ),
+        }
+    )
+    tools = CodingToolSet(workspace_root=str(tmp_path), include_notebook=False)
+
+    result = await tools.run_command.execute(
+        {"command": "serve", "run_in_background": True},
+        runtime_context=context,
+    )
+
+    assert result["status"] == "error"
+    assert result["error_category"] == "capability_unavailable"
+    assert result["backend"] == "container-exec"
+    assert result["facility"] == "process.background"
+
+
+@pytest.mark.asyncio
+async def test_foreground_process_reports_stable_unavailable_without_facility(
+    tmp_path: Path,
+) -> None:
+    process = _RecordingProcess()
+    context = _tool_context(tmp_path, process)
+    context["runtime_capabilities"] = RuntimeCapabilitySnapshot(
+        backend="file-only-process-provider",
+        working_directory="/workspace",
+        operation_groups=("file", "process"),
+    )
+    tools = CodingToolSet(workspace_root=str(tmp_path), include_notebook=False)
+
+    result = await tools.run_command.execute(
+        {"command": "pwd"},
+        runtime_context=context,
+    )
+
+    assert result["status"] == "error"
+    assert result["error_category"] == "capability_unavailable"
+    assert result["backend"] == "file-only-process-provider"
+    assert result["facility"] == "process.foreground"
+    assert process.calls == []
 
 
 @pytest.mark.asyncio

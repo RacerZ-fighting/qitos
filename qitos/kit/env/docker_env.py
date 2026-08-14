@@ -18,6 +18,8 @@ from qitos.core.env import (
     FileRevisionConflictError,
     FileStat,
     FileSystemCapability,
+    RuntimeCapabilitySnapshot,
+    RuntimeLimitation,
     TextFileChunk,
 )
 from qitos.kit.env._async_process import run_process
@@ -573,7 +575,21 @@ class DockerEnv(HostEnv):
         cmd = DockerCommandCapability(
             container=self.container or "", workdir=workspace_root
         )
-        super().__init__(workspace_root=workspace_root, fs=fs, cmd=cmd)
+        super().__init__(
+            workspace_root=workspace_root,
+            fs=fs,
+            cmd=cmd,
+            backend="docker",
+            limitations=(
+                RuntimeLimitation(
+                    code="managed-process-unavailable",
+                    detail=(
+                        "Docker exec supports foreground commands only; managed "
+                        "background processes and PTY input are unavailable."
+                    ),
+                ),
+            ),
+        )
 
     def setup(
         self, task: Any = None, workspace: Optional[str] = None, **kwargs: Any
@@ -626,6 +642,15 @@ class DockerEnv(HostEnv):
             "container": self.container,
             "workspace_root": self.workspace_root,
         }
+
+    def capability_snapshot(self) -> RuntimeCapabilitySnapshot:
+        return RuntimeCapabilitySnapshot(
+            backend="docker",
+            working_directory=self.container_workspace,
+            operation_groups=("file", "process"),
+            facilities=("file.atomic-write", "process.foreground"),
+            limitations=self.limitations,
+        )
 
     def close(self) -> None:
         if not self.container:

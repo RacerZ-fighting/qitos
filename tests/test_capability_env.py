@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from qitos.core.env import RuntimeCapabilitySnapshot
 from qitos.kit.env import CapabilityEnv
 
 
@@ -24,6 +25,11 @@ def test_capability_env_exposes_stable_named_ops() -> None:
         {"process": process_ops, "file": file_ops},
         name="attempt",
         attestation={"attempt_id": "a-1"},
+        snapshot=RuntimeCapabilitySnapshot(
+            backend="remote-attempt",
+            working_directory="/workspace",
+            operation_groups=("file", "process"),
+        ),
     )
 
     assert env.capability_groups == ("file", "process")
@@ -31,6 +37,8 @@ def test_capability_env_exposes_stable_named_ops() -> None:
     assert env.get_ops("process") is process_ops
     assert env.get_ops("missing") is None
     assert env.has_ops("file") is True
+    assert env.capability_snapshot().backend == "remote-attempt"
+    assert env.capability_snapshot().working_directory == "/workspace"
     assert env.attestation == {"attempt_id": "a-1"}
 
 
@@ -41,6 +49,15 @@ def test_capability_env_rejects_invalid_composition() -> None:
         CapabilityEnv({"": object()})
     with pytest.raises(ValueError, match="provider must be non-null: file"):
         CapabilityEnv({"file": None})
+    with pytest.raises(ValueError, match="operation groups must match"):
+        CapabilityEnv(
+            {"file": object()},
+            snapshot=RuntimeCapabilitySnapshot(
+                backend="attempt",
+                working_directory="/workspace",
+                operation_groups=("process",),
+            ),
+        )
 
 
 def test_capability_env_observation_tracks_only_action_identity() -> None:

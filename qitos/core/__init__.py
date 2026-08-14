@@ -97,6 +97,10 @@ from .env import (
     GUIControllerCapability,
     OCRCapability,
     GroundingCapability,
+    RuntimeCapabilitySnapshot,
+    RuntimeCapabilityUnavailableError,
+    RuntimeCommand,
+    RuntimeLimitation,
 )
 from .spec import BenchmarkRunResult, ExperimentSpec, RunSpec
 from .task import (
@@ -274,6 +278,10 @@ __all__ = [
     "GUIControllerCapability",
     "OCRCapability",
     "GroundingCapability",
+    "RuntimeCapabilitySnapshot",
+    "RuntimeCapabilityUnavailableError",
+    "RuntimeCommand",
+    "RuntimeLimitation",
     "Task",
     "TaskResource",
     "TaskBudget",
