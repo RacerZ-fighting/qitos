@@ -92,7 +92,6 @@ Trace artifacts and qita views are part of the framework contract, not an aftert
 - `tests/`: regression and behavior tests
 - `docs/`: Mintlify documentation content
 - `examples/`: canonical patterns and reference agents
-- `templates/`: starter agent layouts
 
 ## Repository Layers
 
@@ -127,7 +126,7 @@ These APIs are useful framework extensions, but they are not all equally stable.
 
 `qitos.recipes` may contain reusable research baselines or canonical benchmark methods. Recipes should be callable from thin examples instead of duplicated inside examples.
 
-`qitos.benchmark` (deprecated, migrating to `qitos.recipes.benchmarks` and Snowl-evals) may contain framework-level adapters, runners, scorers, and dataset-neutral glue. They must not vendor benchmark datasets, large external assets, or product-specific workflows.
+`qitos.benchmark` (deprecated, migrating to `qitos.recipes.benchmarks`) may contain framework-level adapters, runners, scorers, and dataset-neutral glue. They must not vendor benchmark datasets, large external assets, or product-specific workflows.
 
 ### Examples Policy
 

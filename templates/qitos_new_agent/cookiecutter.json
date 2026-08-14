@@ -1,7 +1,0 @@
-{
-    "agent_name": "my_agent",
-    "agent_description": "A new QitOS agent",
-    "author": "contributor",
-    "default_model": "qwen-plus",
-    "max_steps": 50
-}

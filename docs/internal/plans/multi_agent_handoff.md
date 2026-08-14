@@ -410,7 +410,7 @@ if decision.mode == "handoff":
 1. 实现 manager-worker 模板
 2. 实现 planner-executor 模板
 3. 实现 proposer-verifier 模板
-4. 在 `templates/` 下新增 multi-agent 模板
+4. 在 `qitos.recipes` 下新增可复用的 multi-agent recipe
 5. 编写"构建第一个多智能体系统"教程
 6. qita 增加 handoff timeline 视图
 

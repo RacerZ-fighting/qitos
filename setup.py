@@ -50,7 +50,6 @@ setup(
         exclude=[
             "tests*",
             "examples*",
-            "templates*",
             "docs*",
             "plans*",
             "qitos.examples*",
@@ -79,7 +78,6 @@ setup(
         ],
         "yaml": ["pyyaml>=6.0"],
         "benchmarks": ["datasets>=2.20.0", "huggingface_hub>=0.24.0"],
-        "cookiecutter": ["cookiecutter>=2.1.0"],
         "hf": ["huggingface_hub>=0.24.0"],
         "web": ["playwright>=1.40.0"],
         "dev": [
@@ -102,7 +100,6 @@ setup(
             "pyyaml>=6.0",
             "datasets>=2.20.0",
             "huggingface_hub>=0.24.0",
-            "cookiecutter>=2.1.0",
         ],
     },
     package_data={

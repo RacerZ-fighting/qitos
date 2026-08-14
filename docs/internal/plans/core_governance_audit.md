@@ -4,7 +4,7 @@
 
 Branch: `chore/core-governance-zoo-split`.
 
-Top-level structure includes framework source (`qitos/`), tests (`tests/`), docs (`docs/`), canonical examples (`examples/`), plans (`plans/`), templates (`templates/`), assets (`assets/`), playground/runs, and local assistant metadata.
+Top-level structure includes framework source (`qitos/`), tests (`tests/`), docs (`docs/`), canonical examples (`examples/`), plans (`plans/`), assets (`assets/`), playground/runs, and local assistant metadata.
 
 `qitos/*` packages currently visible:
 
@@ -60,14 +60,16 @@ Suspected boundary problems:
 | `qitos.debug` | REMOVED | Deprecated replay helpers duplicated qita and exposed a non-canonical trace-file fork. |
 | `qitos.func` | REMOVED | Unused decorators executed host functions outside Engine transactions and exposed a nonfunctional `AgentModule` adapter. |
 | `qitos.checkpoint.fork` | REMOVED | Snapshot copying did not create canonical Run transactions or resumable Journal lineage. |
+| `qitos.engine.run_state` | REMOVED | Whole-result JSON snapshots duplicated recovery state but were not consumable by any Engine resume path. |
 | `qitos.cache`, `qitos.checkpoint`, `qitos.config`, `qitos.experiment` | FRAMEWORK_EXTENSION | Useful runtime support but not top-level public API for this boundary pass. |
 | `qitos.examples.pentagi` | SHOULD_MOVE_TO_ZOO | Full PentAGI-inspired cybersecurity product app. Exclude from packaging and stage under `qitos-cyber-agent`. |
 
 ## Concrete Actions Taken
 
 - Added `CORE_BOUNDARY.md`.
-- Staged zoo candidates under `plans/qitos_zoo_migration/`.
-- Excluded `qitos.examples*` and `plans/qitos_zoo_migration` from packaging.
+- Seeded the independent `qitos-zoo` repository, then removed the superseded temporary
+  migration staging from QitOS.
+- Excluded `qitos.examples*` from packaging.
 - Slimmed `qitos.__init__` to core/public contracts.
 - Removed security-audit exports from default `qitos.kit` and `qitos.kit.tool` flat surfaces.
 - Added migration banners to product-like `examples/real` files that remain temporarily.
@@ -83,11 +85,11 @@ Suspected boundary problems:
 - `python -m pip install -e .`: build-isolation path could not fetch `setuptools>=68` because network/DNS is restricted and escalation was rejected by the environment.
 - `python -m pip install -e . --no-build-isolation`: built editable metadata/wheel locally, then failed to write into user site-packages with `Operation not permitted`.
 
-## Files Moved Or Staged For qitos-zoo
+## qitos-zoo outcome
 
-- `plans/qitos_zoo_migration/apps/qitos-coder/`
-- `plans/qitos_zoo_migration/apps/qitos-cyber-agent/`
-- `plans/qitos_zoo_migration/apps/experimental/`
+Product applications now live in the independent `qitos-zoo` repository. QitOS no
+longer carries a second staging copy or a workflow that silently skips validation when
+that obsolete path is absent.
 
 ## Public API Changes
 
@@ -98,13 +100,13 @@ Suspected boundary problems:
 ## Dependency Changes
 
 - No new runtime dependencies were added.
-- `qitos.examples*` and `plans*` are excluded from installable packages.
+- `qitos.examples*` is excluded from installable packages.
 
 ## Remaining Risks
 
 - `qitos.benchmark.cybench`, `cybergym`, and `pentagi_e2e` need a follow-up safety/API review.
 - Some docs still describe product-like tutorials; this pass redirects top-level docs and examples policy, but full Mintlify pruning may need a dedicated docs PR.
-- Zoo-staged files preserve source layout and may need package/import adaptation in the future `qitos-zoo` repository.
+- Product application compatibility and packaging are owned by `qitos-zoo`.
 - Editable install could not complete because this sandbox cannot write to the user site-packages path.
 
 ## Suggested Next PR

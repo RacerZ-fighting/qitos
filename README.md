@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Removed dead compatibility surfaces**: the superseded in-repo zoo staging,
+  Snowl-specific adapters, unused `RunState` snapshot, and source-only scaffold CLI are
+  gone. Product applications live in the independent `qitos-zoo` repository; QitOS
+  recovery uses only canonical Session Journals or checkpoint stores.
 - **One executable Agent path**: the unused `qitos.func` decorator/compose package is
   gone. Its direct calls bypassed Engine transactions, and its apparent `AgentModule`
   adapter never ran the wrapped function. Agents now use `AgentModule + Engine`;
@@ -315,8 +319,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New in v0.5.0
 
-- **12 method templates**: ReAct, PlanAct, SWE-Agent, Voyager, Debate, Manager-Worker, Planner-Executor, Self-Refine, Reflexion, LATS, MoA, and Magentic-One — each with paper.md, config.yaml, and recipe implementations.
-- **`qit new` CLI**: Scaffold a new agent project from built-in templates with `qit new --template <name>`.
+- **Method recipes**: Self-Refine, Reflexion, LATS, MoA, and Magentic-One are available
+  as importable `qitos.recipes` implementations.
 - **Export APIs**: `EngineConfig`, `ToolPermissionSpec`, `CriticTrace`, and `HandoffTrace` for programmatic access to engine configuration and trace data.
 - **FamilyPreset extensibility**: `override()`, `recommended_*` advisory fields, and `MaxTokensCriteria` stop criterion.
 - **qita cost panel**: Token usage and cost metrics in the run overview.
@@ -361,31 +365,25 @@ Then go deeper:
 - Want ReAct? See [`examples/patterns/react.py`](examples/patterns/react.py)
 - Want a coding agent? See [`examples/real/coding_agent.py`](examples/real/coding_agent.py)
 - Want benchmarks? Start with the [benchmark guides](https://qitor.mintlify.app/benchmarks/overview)
-- Want method templates? See [Method Templates Guide](https://qitor.mintlify.app/guides/method-templates)
+- Want method recipes? See [Method Recipes Guide](https://qitor.mintlify.app/guides/method-templates)
 
 ## Why QitOS
 
 | If you want... | QitOS gives you... |
 |---|---|
 | reproducible agent research | a stable `AgentModule + Engine` kernel |
-| method = Agent + Critic | 12 built-in method templates with paper mappings |
+| method = Agent + Critic | maintained method recipes with explicit state and critics |
 | observability | `qita` board, replay, export, and trace artifacts |
 | benchmark workflows | GAIA, Tau-Bench, and CyBench adapters |
 | less framework glue code | one canonical execution loop |
 
-## Method Templates
+## Method Recipes
 
-QitOS ships 12 method templates — each is an Agent + Critic pair implementing a well-known agentic reasoning pattern:
+QitOS ships five maintained method recipes. Each is an Agent + Critic pair implementing
+a well-known agentic reasoning pattern:
 
-| Template | Pattern | Paper |
+| Recipe | Pattern | Paper |
 |----------|---------|-------|
-| ReAct | Reason + Act | Yao et al. 2023 |
-| PlanAct | Plan then Execute | — |
-| SWE-Agent | Software Engineering | Princeton 2024 |
-| Voyager | Open-ended Exploration | Wang et al. 2023 |
-| Debate | Multi-agent Debate | — |
-| Manager-Worker | Orchestration with Delegation | — |
-| Planner-Executor | Plan Decomposition | — |
 | Self-Refine | Generate → Critique → Refine | Madaan et al. 2023 |
 | Reflexion | Act → Reflect → Retry | Shinn et al. 2023 |
 | LATS | Monte Carlo Tree Search | Zhou et al. 2023 |
@@ -404,14 +402,6 @@ result = agent.run(
     max_steps=15,
     return_state=True,
 )
-```
-
-Or scaffold a new agent from any template:
-
-```bash
-pip install qitos[cookiecutter]
-qit new --agent-name my_agent --agent-description "My custom agent"
-qit list-templates
 ```
 
 ## Tooling Layout
@@ -499,12 +489,12 @@ QitOS is currently **Beta**.
 - Core-only install: `pip install qitos`
 - Repo source install: `pip install -r requirements.txt`
 - Full contributor install: `pip install -r requirements-dev.txt`
-- Optional extras: `qitos[models]`, `qitos[benchmarks]`, `qitos[cookiecutter]`, `qitos[all]`
+- Optional extras: `qitos[models]`, `qitos[benchmarks]`, `qitos[all]`
 - Installation guide: [Installation](https://qitor.mintlify.app/installation)
 
 ## Contributing
 
-Contributions are welcome, especially around method templates, benchmark adapters, memory/history workflows, qita UX, and framework contracts. Product-grade agents should target `qitos-zoo`. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for the PR process, [DEVELOPMENT.md](DEVELOPMENT.md) for the local workflow, [ARCHITECTURE.md](ARCHITECTURE.md) for system design, [SECURITY.md](SECURITY.md) for disclosure guidance, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
+Contributions are welcome, especially around method recipes, benchmark adapters, memory/history workflows, qita UX, and framework contracts. Product-grade agents should target `qitos-zoo`. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for the PR process, [DEVELOPMENT.md](DEVELOPMENT.md) for the local workflow, [ARCHITECTURE.md](ARCHITECTURE.md) for system design, [SECURITY.md](SECURITY.md) for disclosure guidance, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
 
 ## License
 

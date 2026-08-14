@@ -1,13 +1,15 @@
 ---
-title: "Method Templates"
-description: "Use built-in method templates (Self-Refine, Reflexion, LATS, MoA, Magentic-One) to implement proven agent patterns with minimal boilerplate."
+title: "Method Recipes"
+description: "Use maintained method recipes (Self-Refine, Reflexion, LATS, MoA, Magentic-One) to implement proven agent patterns with minimal boilerplate."
 ---
 
-QitOS provides **method templates** — ready-made Agent + Critic pairs that implement well-known agentic reasoning patterns. Each template packages a specialized state, critic, and agent so you can apply the pattern without rewriting the control loop.
+QitOS provides **method recipes** — importable Agent + Critic pairs that implement
+well-known agentic reasoning patterns. Each recipe packages a specialized state,
+critic, and agent so you can apply the pattern without rewriting the control loop.
 
-## What is a method template?
+## What is a method recipe?
 
-A method template combines:
+A method recipe combines:
 
 | Component | Role |
 |---|---|
@@ -305,38 +307,9 @@ print(result.state.completed_tasks)  # finished subtasks
 | `specialist_calls` | `int` | Number of specialist delegations |
 | `current_subtask` | `str` | Currently active subtask |
 
-## Scaffolding a new agent
+## Building your own method recipe
 
-Use the `qit new` CLI command to scaffold a new agent project from the built-in cookiecutter template:
-
-```bash
-# Create a new agent with default settings
-pip install qitos[cookiecutter]
-qit new --agent-name my_agent --agent-description "My custom agent"
-
-# List available templates
-qit list-templates
-
-# Create with full customization
-qit new \
-  --agent-name code_reviewer \
-  --agent-description "Reviews code for security issues" \
-  --author "My Team" \
-  --default-model qwen-plus \
-  --max-steps 20
-```
-
-The scaffolded project includes:
-
-- `src/agent.py` — Agent class with State, init_state, build_system_prompt, reduce
-- `configs/default.yaml` — Default model and step configuration
-- `tests/test_agent.py` — Basic smoke tests
-- `snowl_compat.py` — Snowl evaluation compatibility adapter
-- `eval_config.yaml` — Evaluation configuration
-
-## Building your own method template
-
-To create a custom method template, follow the same Agent + Critic pattern:
+To create a custom method recipe, follow the same Agent + Critic pattern:
 
 1. **Define a state** that extends `StateSchema` with your pattern's tracking fields
 2. **Implement a critic** that returns `retry` with `instruction_patch` and `state_patch` when the pattern requires iteration

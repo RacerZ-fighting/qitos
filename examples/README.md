@@ -53,4 +53,5 @@ Full applications live in `qitos-zoo`, including:
 - `qitos-coder`: a Claude Code-inspired coding agent built with QitOS.
 - `qitos-cyber-agent`: a PentAGI-inspired cybersecurity agent built with QitOS.
 
-Some product-like files remain temporarily in `examples/real/` with migration banners while the zoo repository is seeded from `plans/qitos_zoo_migration/`.
+Some product-like files remain temporarily in `examples/real/` with migration banners;
+the independent `qitos-zoo` repository owns maintained product applications.

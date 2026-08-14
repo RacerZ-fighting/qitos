@@ -28,6 +28,13 @@ How to update:
   `list_fork_history()`. Copying a checkpoint snapshot did not create a canonical Run
   transaction or resumable lineage. Checkpoint persistence and snapshot resume remain;
   executable branching uses `SessionJournal.fork()` at a committed position.
+- **Breaking:** Removed the unused `qitos.engine.run_state` whole-result snapshot,
+  Snowl-specific adapters/docs, and the source-only template/scaffold CLI. No Engine
+  resume path consumed `RunState`, and packaged distributions never contained the
+  templates required by `qit new` or `qit list-templates`. Canonical recovery remains
+  owned by Session Journals or checkpoint stores. The completed temporary zoo migration
+  staging and its no-op workflow were also removed now that product applications live
+  in the independent `qitos-zoo` repository.
 - **Breaking:** Removed the process-global `qitos.tracing` provider/processor
   hierarchy, the `Engine(..., tracing_provider=...)` argument, and the W&B/MLflow
   extras. Canonical runtime events, `TraceWriter`, the Session Journal, and `qita`

@@ -1,13 +1,14 @@
 ---
-title: "方法模板"
-description: "使用内置方法模板（Self-Refine、Reflexion、LATS、MoA、Magentic-One）以最少的样板代码实现经过验证的智能体模式。"
+title: "方法 Recipe"
+description: "使用受维护的方法 recipe（Self-Refine、Reflexion、LATS、MoA、Magentic-One）以最少的样板代码实现经过验证的智能体模式。"
 ---
 
-QitOS 提供**方法模板**——即现成的 Agent + Critic 组合，实现了知名的智能体推理模式。每个模板封装了专用的状态、评论器和智能体，让你无需重写控制循环即可应用该模式。
+QitOS 提供**方法 recipe**——即可直接 import 的 Agent + Critic 组合，实现知名的智能体推理
+模式。每个 recipe 封装专用状态、评论器和智能体，让你无需重写控制循环即可应用该模式。
 
-## 什么是方法模板？
+## 什么是方法 recipe？
 
-方法模板由以下部分组成：
+方法 recipe 由以下部分组成：
 
 | 组件 | 角色 |
 |---|---|
@@ -240,38 +241,9 @@ print(result.state.completed_tasks)  # 已完成的子任务
 | `stall_count` | `int` | 连续无进展步数 |
 | `specialist_calls` | `int` | 专家委派次数 |
 
-## 脚手架工具
+## 构建自定义方法 recipe
 
-使用 `qit new` CLI 命令从内置 cookiecutter 模板脚手架生成新智能体项目：
-
-```bash
-# 使用默认设置创建新智能体
-pip install qitos[cookiecutter]
-qit new --agent-name my_agent --agent-description "我的自定义智能体"
-
-# 列出可用模板
-qit list-templates
-
-# 完全自定义创建
-qit new \
-  --agent-name code_reviewer \
-  --agent-description "审查代码中的安全问题" \
-  --author "我的团队" \
-  --default-model qwen-plus \
-  --max-steps 20
-```
-
-脚手架生成的项目包括：
-
-- `src/agent.py` — 包含 State、init_state、build_system_prompt、reduce 的 Agent 类
-- `configs/default.yaml` — 默认模型和步骤配置
-- `tests/test_agent.py` — 基本冒烟测试
-- `snowl_compat.py` — Snowl 评估兼容适配器
-- `eval_config.yaml` — 评估配置
-
-## 构建自定义方法模板
-
-要创建自定义方法模板，请遵循相同的 Agent + Critic 模式：
+要创建自定义方法 recipe，请遵循相同的 Agent + Critic 模式：
 
 1. **定义状态**，扩展 `StateSchema` 并添加模式的跟踪字段
 2. **实现评论器**，当模式需要迭代时返回带有 `instruction_patch` 和 `state_patch` 的 `retry`

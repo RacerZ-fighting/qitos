@@ -90,18 +90,13 @@ PRs are reviewed for:
 - test coverage for new behavior
 - consistency with existing architecture boundaries
 
-## Method Template Contribution
+## Method Recipe Contribution
 
-Add a new method template — an Agent + Critic pair implementing an agentic reasoning pattern.
+Add a reusable Agent + Critic recipe implementing an agentic reasoning pattern.
 
 **Directory structure:**
 ```
 qitos/recipes/<method_name>/__init__.py   # AgentModule + Critic subclasses + State dataclass
-templates/<method_name>/                   # Template assets
-  __init__.py
-  agent.py                                # Config dataclass + build_registry()
-  config.yaml                             # Default configuration
-  paper.md                                # Pattern description and QitOS mapping
 tests/test_<method_name>.py               # Unit tests for Agent, Critic, State
 ```
 
@@ -115,55 +110,26 @@ tests/test_<method_name>.py               # Unit tests for Agent, Critic, State
 - Use `action="continue" | "stop" | "retry"` with `instruction_patch` for guidance
 - Implement method-specific stopping conditions (e.g., max reflections, quality threshold, stall detection)
 
-**paper.md format:**
-```markdown
-# <Method Name> Template Notes
+**Documentation requirements:**
 
-## Source idea
-<Brief description of the original paper's algorithm>
-
-## Mapping in QitOS
-- `<Method>Agent` manages ... with `build_system_prompt()` ...
-- `<Method>Critic` detects ... and returns ...
-- `<Method>State` tracks ...
-
-## Key differences from the paper
-- <Notable adaptations or simplifications>
-
-## Scope in this template
-<What the template covers and what extensions users might add>
-```
-
-**config.yaml format:**
-```yaml
-name: <method_name>_template
-max_steps: 15
-<method-specific parameters>
-model:
-  provider: openai_compatible
-  base_url: https://api.siliconflow.cn/v1/
-  api_key: ${OPENAI_API_KEY}
-  model: Qwen/Qwen3-8B
-  model_name: Qwen/Qwen3-8B
-  temperature: 0.0
-  max_tokens: 2048
-```
+- Cite the source idea and explain its mapping to `AgentModule`, State, and Critic.
+- Describe deliberate differences from the source method and the recipe's supported scope.
+- Keep executable defaults in typed Python configuration or the owning benchmark recipe;
+  do not add a second scaffold-only configuration surface.
 
 **Test requirements:**
 - Test `Agent.build_system_prompt()` returns non-empty prompt
 - Test `Agent.reduce()` updates state correctly from `Decision`
 - Test `Critic.evaluate()` returns correct `CriticResult.action` for continue/stop/retry cases
 - Test edge cases: max iterations, empty state, error conditions
-- At least 15 tests per method template
+- Cover the recipe's public behavior and boundary conditions without fixed test-count quotas.
 
 **PR checklist:**
 - [ ] Agent subclasses `AgentModule` with `build_system_prompt()` and `reduce()`
 - [ ] Critic subclasses `Critic` with `evaluate()` returning `CriticResult`
 - [ ] State dataclass with method-specific fields
-- [ ] `templates/<method_name>/` has `__init__.py`, `agent.py`, `config.yaml`, `paper.md`
-- [ ] Method name added to `_METHOD_TEMPLATES` in `qitos/cli.py`
 - [ ] Tests cover Agent, Critic, and State with edge cases
-- [ ] paper.md explains mapping from paper to QitOS and key differences
+- [ ] Public documentation explains the source mapping, differences, and scope
 
 ---
 
@@ -228,7 +194,7 @@ QitOS maintains bilingual documentation in `docs/` (English) and `docs/zh/` (Chi
 - benchmark docs
 - toolset ergonomics
 - qita UX improvements
-- method template examples and docs
+- method recipe examples and docs
 
 ---
 

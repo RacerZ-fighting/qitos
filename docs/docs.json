@@ -88,8 +88,7 @@
                   "guides/memory-and-history",
                   "guides/critics-and-stop-criteria",
                   "guides/method-templates",
-                  "guides/observability",
-                  "guides/snowl-integration"
+                  "guides/observability"
                 ]
               },
               {
@@ -116,8 +115,7 @@
               {
                 "group": "Contributing",
                 "pages": [
-                  "contributing/development",
-                  "contributing/writing-a-method-template"
+                  "contributing/development"
                 ]
               }
             ]
@@ -214,7 +212,6 @@
                   "zh/guides/critics-and-stop-criteria",
                   "zh/guides/method-templates",
                   "zh/guides/observability",
-                  "zh/guides/snowl-integration",
                   "zh/guides/multi-agent-patterns"
                 ]
               },
@@ -243,8 +240,7 @@
               {
                 "group": "贡献",
                 "pages": [
-                  "zh/contributing/development",
-                  "zh/contributing/writing-a-method-template"
+                  "zh/contributing/development"
                 ]
               }
             ]

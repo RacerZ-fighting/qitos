@@ -1,8 +1,0 @@
-planner_name: planner
-executor_name: executor
-max_subtasks: 5
-context_strategy: summary
-shared_memory_fields:
-  - plan
-  - step_result
-  - overall_result

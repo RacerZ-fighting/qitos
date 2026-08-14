@@ -92,49 +92,6 @@ Benchmark recipes share a common execution pipeline in `recipes.benchmarks._shar
 
 Every benchmark recipe's `main()` uses this pipeline: load records, build work items, pass them to `execute_example_jobs()` with a recipe-specific runner, then print the summary.
 
-## eval_config.yaml
-
-Agents in `qitos_zoo/` declare their benchmark capabilities through `eval_config.yaml` files. These configs specify:
-
-- **agent** -- name, factory function, required tools, and environment type
-- **benchmarks** -- which benchmark suites the agent supports, with dataset, split, max_steps, eval_metric, categories, and timeout
-- **serialization** -- output format (e.g. `runstate_json`) and schema version
-- **defaults** -- fallback model, max_steps, and temperature
-
-Example (`qitos_zoo/qitos_cyber/eval_config.yaml`):
-
-```yaml
-agent:
-  name: qitos_cyber
-  factory: qitos_zoo.qitos_cyber.snowl_compat.create_snowl_agent
-  required_tools:
-    - shell
-    - search_network
-  required_env:
-    type: host
-    capabilities:
-      - filesystem
-      - command
-      - network
-
-benchmarks:
-  cybench:
-    dataset: cybench/cybench-v1
-    split: test
-    max_steps: 200
-    eval_metric: completion_rate
-  cybergym:
-    dataset: cybergym/cybergym-v1
-    split: test
-    max_steps: 150
-    eval_metric: task_completion
-
-defaults:
-  model: null
-  max_steps: 200
-  temperature: 0.0
-```
-
 ## Relationship to FamilyPreset
 
 Recipes that use the harness layer (desktop, and any recipe calling `build_model_for_preset`) resolve model configuration through `FamilyPreset` objects. A `FamilyPreset` captures the recommended protocol, tool delivery mode, context window, and default hyperparameters for a model family:

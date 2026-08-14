@@ -35,7 +35,7 @@ Extras:
 ## Packaging Changes
 
 - `qitos.examples*` is excluded from installable packages.
-- `plans*` and `plans/qitos_zoo_migration` are excluded from packages/sdists.
+- The completed temporary zoo migration staging is no longer part of this repository.
 
 ## Recommended Next Split
 

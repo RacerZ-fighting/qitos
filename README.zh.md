@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **删除失效兼容面**：仓库内已被取代的 zoo staging、Snowl 专属 adapter、未使用的
+  `RunState` snapshot 和仅源码可见的 scaffold CLI 已删除。产品应用由独立 `qitos-zoo`
+  仓库维护；QitOS 恢复只使用 canonical Session Journal 或 checkpoint store。
 - **Agent 只保留一条可执行主线**：未被使用的 `qitos.func` decorator/compose 包已删除。
   它的直接调用会绕过 Engine 事务，表面上的 `AgentModule` adapter 也不会执行被包装函数。
   Agent 统一使用 `AgentModule + Engine`；普通 Python callable Tool 继续使用已维护的
@@ -181,8 +184,8 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## v0.5.0 最新进展
 
-- **12 个方法模板**：ReAct、PlanAct、SWE-Agent、Voyager、Debate、Manager-Worker、Planner-Executor、Self-Refine、Reflexion、LATS、MoA 和 Magentic-One — 每个都包含 paper.md、config.yaml 和 recipe 实现。
-- **`qit new` CLI**：使用 `qit new --template <name>` 从内建模板脚手架新 agent 项目。
+- **方法 recipe**：Self-Refine、Reflexion、LATS、MoA 和 Magentic-One 作为可直接
+  import 的 `qitos.recipes` 实现提供。
 - **导出 API**：`EngineConfig`、`ToolPermissionSpec`、`CriticTrace` 和 `HandoffTrace` 用于程序化访问引擎配置和 trace 数据。
 - **FamilyPreset 可扩展性**：`override()`、`recommended_*` 建议字段、`MaxTokensCriteria` 停止条件。
 - **qita 成本面板**：运行概览中的 token 用量和成本指标。
@@ -227,31 +230,25 @@ export QITOS_MODEL="Qwen/Qwen3-8B"
 - 想看 ReAct：见 [`examples/patterns/react.py`](examples/patterns/react.py)
 - 想看 coding agent：见 [`examples/real/coding_agent.py`](examples/real/coding_agent.py)
 - 想看 benchmark：从 [评测总览](https://qitor.mintlify.app/zh/benchmarks/overview) 开始
-- 想看方法模板：见 [方法模板指南](https://qitor.mintlify.app/zh/guides/method-templates)
+- 想看方法 recipe：见 [方法 Recipe 指南](https://qitor.mintlify.app/zh/guides/method-templates)
 
 ## 为什么是 QitOS
 
 | 如果你想要... | QitOS 提供... |
 |---|---|
 | 可复现的 agent 研究 | 稳定的 `AgentModule + Engine` 内核 |
-| 方法 = Agent + Critic | 12 个内建方法模板，映射经典论文 |
+| 方法 = Agent + Critic | 具有显式状态和 critic 的受维护 recipe |
 | 强可观测性 | `qita` board、replay、export 与 trace 工件 |
 | benchmark 工作流 | GAIA、Tau-Bench、CyBench 适配器 |
 | 更少框架胶水 | 一条 canonical 执行主线 |
 
-## 方法模板
+## 方法 Recipe
 
-QitOS 内置 12 个方法模板 — 每个都是实现经典 agentic 推理模式的 Agent + Critic 组合：
+QitOS 提供五个受维护的方法 recipe，每个都是实现经典 agentic 推理模式的 Agent + Critic
+组合：
 
-| 模板 | 模式 | 论文 |
+| Recipe | 模式 | 论文 |
 |------|------|------|
-| ReAct | 推理 + 行动 | Yao et al. 2023 |
-| PlanAct | 先规划再执行 | — |
-| SWE-Agent | 软件工程 | Princeton 2024 |
-| Voyager | 开放探索 | Wang et al. 2023 |
-| Debate | 多 Agent 辩论 | — |
-| Manager-Worker | 编排与委派 | — |
-| Planner-Executor | 计划分解 | — |
 | Self-Refine | 生成 → 批评 → 改进 | Madaan et al. 2023 |
 | Reflexion | 行动 → 反思 → 重试 | Shinn et al. 2023 |
 | LATS | 蒙特卡洛树搜索 | Zhou et al. 2023 |
@@ -270,14 +267,6 @@ result = agent.run(
     max_steps=15,
     return_state=True,
 )
-```
-
-或从任意模板脚手架新 agent：
-
-```bash
-pip install qitos[cookiecutter]
-qit new --agent-name my_agent --agent-description "My custom agent"
-qit list-templates
 ```
 
 ## 工具层布局
@@ -311,7 +300,7 @@ registry = ToolRegistry().include_toolset(
 - 第一条成功路径： [快速开始](https://qitor.mintlify.app/zh/quickstart)
 - 安装方式： [安装](https://qitor.mintlify.app/zh/installation)
 - 写自己的最小 coding agent： [构建第一个 Agent](https://qitor.mintlify.app/zh/guides/build-your-first-agent)
-- 方法模板： [方法模板指南](https://qitor.mintlify.app/zh/guides/method-templates)
+- 方法 recipe： [方法 Recipe 指南](https://qitor.mintlify.app/zh/guides/method-templates)
 - 理解运行时： [AgentModule](https://qitor.mintlify.app/zh/concepts/agent-module) / [Engine](https://qitor.mintlify.app/zh/concepts/engine)
 - 看 trace： [可观测性](https://qitor.mintlify.app/zh/guides/observability)
 - 走完整课程： [教程](https://qitor.mintlify.app/zh/tutorials)
@@ -365,12 +354,12 @@ QitOS 当前处于 **Beta**。
 - 仅核心安装：`pip install qitos`
 - 仓库源码安装：`pip install -r requirements.txt`
 - 完整开发安装：`pip install -r requirements-dev.txt`
-- 可选扩展：`qitos[models]`、`qitos[benchmarks]`、`qitos[cookiecutter]`、`qitos[all]`
+- 可选扩展：`qitos[models]`、`qitos[benchmarks]`、`qitos[all]`
 - 安装说明： [安装](https://qitor.mintlify.app/zh/installation)
 
 ## 参与贡献
 
-欢迎贡献方法模板、benchmark adapters、memory/history 工作流、qita UX 与核心框架能力。产品级 agent 应优先进入 `qitos-zoo`。开发环境、方法模板贡献、文档贡献流程详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+欢迎贡献方法 recipe、benchmark adapters、memory/history 工作流、qita UX 与核心框架能力。产品级 agent 应优先进入 `qitos-zoo`。开发环境、recipe 贡献与文档贡献流程详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## License
 

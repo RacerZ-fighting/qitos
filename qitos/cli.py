@@ -40,8 +40,6 @@ def main(argv: list[str] | None = None) -> int:
         subparsers.add_parser("skill", help="Manage third-party skills")
         subparsers.add_parser("bench", help="Unified benchmark CLI")
         subparsers.add_parser("experiment", help="Run parameter-sweep experiments")
-        subparsers.add_parser("new", help="Scaffold a new agent from a template")
-        subparsers.add_parser("list-templates", help="List built-in agent templates")
         subparsers.add_parser("leaderboard", help="Local benchmark leaderboard")
         subparsers.add_parser("push", help="Push trace artifacts to HF Hub")
         subparsers.add_parser("pull", help="Pull trace artifacts from HF Hub")
@@ -58,10 +56,6 @@ def main(argv: list[str] | None = None) -> int:
             return _bench_main(remaining)
         if command == "experiment":
             return _experiment_main(remaining)
-        if command == "new":
-            return _new_main(remaining)
-        if command == "list-templates":
-            return _list_templates_main(remaining)
         if command == "leaderboard":
             return _leaderboard_main(remaining)
         if command == "push":
@@ -76,8 +70,6 @@ def main(argv: list[str] | None = None) -> int:
     subparsers.add_parser("skill", help="Manage third-party skills")
     subparsers.add_parser("bench", help="Unified benchmark CLI")
     subparsers.add_parser("experiment", help="Run parameter-sweep experiments")
-    subparsers.add_parser("new", help="Scaffold a new agent from a template")
-    subparsers.add_parser("list-templates", help="List built-in agent templates")
     subparsers.add_parser("leaderboard", help="Local benchmark leaderboard")
     subparsers.add_parser("push", help="Push trace artifacts to HF Hub")
     subparsers.add_parser("pull", help="Pull trace artifacts from HF Hub")
@@ -403,146 +395,6 @@ def _experiment_run(args: argparse.Namespace) -> int:
     result = runner.run()
     print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
     return 0
-
-
-# ---------------------------------------------------------------------------
-# qit new / qit list-templates
-# ---------------------------------------------------------------------------
-
-_TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
-
-# Known scaffold templates (cookiecutter-based)
-_SCAFFOLD_TEMPLATES = {
-    "qitos_new_agent": "Scaffold a complete agent project with tests and eval config",
-}
-
-# Known method templates (paper reproduction / reference)
-_METHOD_TEMPLATES = {
-    "react": "ReAct — Reason+Act agent with scratchpad",
-    "plan_act": "Plan-and-Act — separate planning and execution phases",
-    "swe_agent": "SWE-Agent — software engineering agent",
-    "voyager": "Voyager — open-ended exploration with skill library",
-    "debate": "Debate — multi-agent debate for reasoning",
-    "manager_worker": "Manager-Worker — orchestration with delegation",
-    "planner_executor": "Planner-Executor — plan decomposition with execution",
-    "self_refine": "Self-Refine — iterative generate, critique, and refine",
-    "reflexion": "Reflexion — act, reflect, and retry with memory",
-    "lats": "LATS — Monte Carlo tree search with language evaluation",
-    "moa": "MoA — parallel proposals and aggregation",
-    "magentic_one": "Magentic-One — orchestrator with specialist workers",
-}
-
-
-def _list_templates_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
-        prog="qit list-templates", description="List built-in agent templates"
-    )
-    parser.add_argument(
-        "--type",
-        choices=["scaffold", "method", "all"],
-        default="all",
-        help="Filter by template type (default: all)",
-    )
-    args = parser.parse_args(argv)
-
-    if args.type in ("scaffold", "all"):
-        print("Scaffold templates (cookiecutter-based, used with 'qit new'):")
-        for name, desc in _SCAFFOLD_TEMPLATES.items():
-            print(f"  {name:20s}  {desc}")
-        if args.type == "all":
-            print()
-
-    if args.type in ("method", "all"):
-        print("Method templates (paper reproduction / reference):")
-        for name, desc in _METHOD_TEMPLATES.items():
-            template_dir = _TEMPLATES_DIR / name
-            marker = "" if template_dir.is_dir() else "  [not installed]"
-            print(f"  {name:20s}  {desc}{marker}")
-
-    return 0
-
-
-def _new_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
-        prog="qit new", description="Scaffold a new agent from a template"
-    )
-    parser.add_argument(
-        "--template",
-        default="qitos_new_agent",
-        help="Template to use (default: qitos_new_agent)",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=".",
-        help="Directory to create the project in (default: current directory)",
-    )
-    parser.add_argument(
-        "--no-input",
-        action="store_true",
-        help="Use default values from cookiecutter.json without prompting",
-    )
-    # Pass-through cookiecutter parameters
-    parser.add_argument("--agent-name", help="Agent name (cookiecutter param)")
-    parser.add_argument("--agent-description", help="Agent description (cookiecutter param)")
-    parser.add_argument("--author", help="Author name (cookiecutter param)")
-    parser.add_argument("--default-model", help="Default model ID (cookiecutter param)")
-    parser.add_argument("--max-steps", type=int, help="Max steps (cookiecutter param)")
-
-    args = parser.parse_args(argv)
-
-    template_dir = _TEMPLATES_DIR / args.template
-    if not template_dir.is_dir():
-        print(
-            f"Error: Template '{args.template}' not found. "
-            f"Run 'qit list-templates' to see available templates.",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Check for cookiecutter.json to confirm it's a scaffold template
-    if not (template_dir / "cookiecutter.json").exists():
-        print(
-            f"Error: Template '{args.template}' is not a scaffold template "
-            f"(no cookiecutter.json). Method templates are reference-only.",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        from cookiecutter.main import cookiecutter
-    except ImportError:
-        print(
-            "Error: cookiecutter is required for 'qit new'. "
-            "Install it with: pip install cookiecutter",
-            file=sys.stderr,
-        )
-        return 1
-
-    # Build extra_context from CLI args
-    extra_context: dict[str, str] = {}
-    if args.agent_name:
-        extra_context["agent_name"] = args.agent_name
-    if args.agent_description:
-        extra_context["agent_description"] = args.agent_description
-    if args.author:
-        extra_context["author"] = args.author
-    if args.default_model:
-        extra_context["default_model"] = args.default_model
-    if args.max_steps is not None:
-        extra_context["max_steps"] = str(args.max_steps)
-
-    try:
-        result_dir = cookiecutter(
-            str(template_dir),
-            output_dir=args.output_dir,
-            no_input=args.no_input or bool(extra_context),
-            extra_context=extra_context or None,
-        )
-        print(f"Created agent project at: {result_dir}")
-        return 0
-    except Exception as exc:
-        print(f"Error generating project: {exc}", file=sys.stderr)
-        return 1
 
 
 # ---------------------------------------------------------------------------

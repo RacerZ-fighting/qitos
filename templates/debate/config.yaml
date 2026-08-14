@@ -1,9 +1,0 @@
-proposition: "AI systems should be required to explain their decisions"
-max_rounds: 3
-pro_agent_name: proponent
-con_agent_name: opponent
-judge_agent_name: judge
-context_strategy: summary
-shared_memory_fields:
-  - arguments
-  - round
