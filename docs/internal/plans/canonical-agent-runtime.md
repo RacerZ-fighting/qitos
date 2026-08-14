@@ -184,6 +184,6 @@ PentestAgent uses its own `make check`; it never substitutes for the commands ab
 
 ## Known baseline issues
 
-- Existing trace replay is an artifact viewer/fork helper, not deterministic Engine
-  replay. Conformance tests use scripted models and tools rather than claiming live
-  provider reproducibility.
+- Trace replay is a read-only artifact viewer, not deterministic Engine replay.
+  Executable forks use the Session Journal. Conformance tests use scripted models and
+  tools rather than claiming live provider reproducibility.

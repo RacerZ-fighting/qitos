@@ -81,6 +81,10 @@ qita export --run ./runs/<run_id> --html ./report.html
 
 `qita` 还支持运行比较，你可以直接回答两次运行为什么不同，不需要手工读 JSON。
 
+`qita` 只是这些产物的只读投影，不会通过复制或修改 trace 文件来创建可执行 fork。若要从此前的
+安全边界继续 Run，请在 handle 的 committed continuation position 上 fork canonical Session
+Journal；详见 [Session Journal](/zh/concepts/session-journal)。
+
 ## 继续阅读
 
 - [官方运行](/zh/concepts/official-runs)

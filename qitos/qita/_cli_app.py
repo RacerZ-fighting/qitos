@@ -398,77 +398,6 @@ def _build_handler(root: Path):
                 return
             self._send_json({"error": "not found", "route": route}, status=404)
 
-        def do_POST(self) -> None:  # noqa: N802
-            parsed = urlparse(self.path)
-            route = parsed.path
-
-            # POST /api/fork/{run_id}/{step_id}
-            import re as _re
-            fork_match = _re.match(r"^/api/fork/([^/]+)/(\d+)$", route)
-            if fork_match:
-                run_id = _slug_run_id(fork_match.group(1))
-                step_id = int(fork_match.group(2))
-                # Read body
-                content_length = int(self.headers.get("Content-Length", 0))
-                body_bytes = self.rfile.read(content_length) if content_length > 0 else b""
-                try:
-                    body = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    body = {}
-
-                override_decision = body.get("override_decision")
-                override_observation = body.get("override_observation")
-
-                # Resolve run directory
-                run_dir = None
-                for candidate in _discover_runs(root):
-                    if candidate.get("run_id") == run_id or Path(candidate.get("path", "")).name == run_id:
-                        run_dir = Path(candidate["path"])
-                        break
-
-                if run_dir is None or not run_dir.is_dir():
-                    self._send_json({"error": f"Run not found: {run_id}"}, status=404)
-                    return
-
-                # Use ReplaySession to fork
-                from qitos.debug.replay import ReplaySession
-                try:
-                    session = ReplaySession(str(run_dir))
-                    override = {}
-                    if override_decision:
-                        override["decision"] = override_decision
-                    if override_observation:
-                        override["observation"] = override_observation
-                    forked = session.fork_with_step_override(step_id, override)
-                except Exception as exc:
-                    self._send_json({"error": str(exc)}, status=500)
-                    return
-
-                # Write forked run as a new run directory
-                fork_run_id = f"{run_id}_fork_s{step_id}"
-                fork_dir = run_dir.parent / fork_run_id
-                fork_dir.mkdir(parents=True, exist_ok=True)
-                if "manifest" in forked:
-                    (fork_dir / "manifest.json").write_text(
-                        json.dumps(forked["manifest"], ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                if "events" in forked:
-                    lines = [json.dumps(e, ensure_ascii=False) for e in forked["events"]]
-                    (fork_dir / "events.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-                if "steps" in forked:
-                    lines = [json.dumps(s, ensure_ascii=False) for s in forked["steps"]]
-                    (fork_dir / "steps.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-                self._send_json({
-                    "fork_run_id": fork_run_id,
-                    "fork_dir": str(fork_dir),
-                    "step_id": step_id,
-                })
-                return
-
-            self._send_json({"error": "not found", "route": route}, status=404)
-
         def log_message(self, fmt: str, *args: Any) -> None:
             # Keep console clean; qita already prints startup summary.
             _ = fmt
@@ -5156,9 +5085,8 @@ function fmt(r){{
   const err = r.error ? '<span class="tag kind-error">error</span>' : '';
   const raw = esc(JSON.stringify(r.body, null, 2));
   const agentTag = r.agent_id ? '<span class="tag" style="border-color:var(--line-strong);color:var(--accent)">'+esc(r.agent_id)+'</span>' : '';
-  const forkBtn = r.step_id !== undefined ? '<button class="btn fork-btn" data-step="'+esc(String(r.step_id))+'" style="font-size:10px;padding:2px 6px" title="Fork from this step">fork</button>' : '';
   return '<article class="card kind-'+esc(r.kind)+'">' +
-    '<div class="ctitle"><span>'+esc(r.title)+'</span><span><span class="tag">'+esc(r.phase||'')+'</span> <span class="tag kind-'+esc(r.kind)+'">'+esc(r.kind)+'</span> '+agentTag+' '+err+' '+forkBtn+'</span></div>' +
+    '<div class="ctitle"><span>'+esc(r.title)+'</span><span><span class="tag">'+esc(r.phase||'')+'</span> <span class="tag kind-'+esc(r.kind)+'">'+esc(r.kind)+'</span> '+agentTag+' '+err+'</span></div>' +
     '<div class="cbody">'+renderRecordBody(r)+'</div>' +
     '<details style="margin-top:8px"><summary style="cursor:pointer;color:var(--muted)">Raw</summary><pre style="white-space:pre-wrap;background:var(--surface-1);border:1px solid var(--line);border-radius:var(--radius-md);padding:8px">'+raw+'</pre></details>' +
     '</article>';
@@ -5221,21 +5149,5 @@ resetBtn.onclick = ()=>{{ i = 0; render(); if(playing) tick(); }};
 progress.oninput = ()=>{{ i = Number(progress.value || 0); render(); }};
 speedEl.onchange = ()=>{{ if(playing){{ clearTimeout(timer); tick(); }} }};
 onlyErr.onchange = render;
-// Fork button handler — delegate clicks via event delegation on the screen
-screen.addEventListener('click', function(e){{
-  const btn = e.target.closest('.fork-btn');
-  if(!btn) return;
-  const stepId = btn.getAttribute('data-step');
-  if(stepId === null) return;
-  fetch('/api/fork/{run_id}/' + stepId, {{method: 'POST', headers: {{'Content-Type': 'application/json'}}, body: JSON.dumps({{}})}})
-  .then(function(r){{ return r.json(); }})
-  .then(function(data){{
-    if(data.error){{ alert('Fork failed: ' + data.error); return; }}
-    const msg = 'Forked run created: ' + data.fork_run_id + '\\nView at /run/' + data.fork_run_id;
-    alert(msg);
-    window.open('/run/' + data.fork_run_id, '_blank');
-  }})
-  .catch(function(err){{ alert('Fork request failed: ' + err); }});
-}});
 tick();
 </script></body></html>"""

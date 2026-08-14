@@ -19,9 +19,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 ## 最新进展
 
 - **只保留一条 canonical 可观测路径**：重复的进程级 tracing provider 及其 W&B/MLflow
-  processors 已删除。运行时事件、`TraceWriter`、Session Journal 和 `qita` 现在组成一条
-  明确的 trace/replay 路径；Handoff 仍通过 canonical `HANDOFF_START`/`HANDOFF_END`
-  事件完整可见。
+  processors 已删除。运行时事件、`TraceWriter`、Session Journal 和只读 `qita` 现在组成
+  一条明确的 trace/replay 路径；Handoff 仍通过 canonical
+  `HANDOFF_START`/`HANDOFF_END` 事件完整可见。已废弃的 debug 包和 trace 文件“fork”也已
+  删除，可继续执行的 fork 统一使用 Journal lineage。
 - **完整 Run 与交互式 Run 共用官方 MCP 生命周期**：独立 server 会在固定并发与 timeout
   下连接并发现目录，再按 factory 顺序确定性发布成功目录。交互式 session 由
   `Engine.astep()` 懒启动并持续持有同一生命周期；同步 `step()` 会明确拒绝 MCP

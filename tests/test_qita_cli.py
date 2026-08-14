@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+from http.client import HTTPConnection
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 
 from qitos.qita._cli_app import _result_error, _result_success_summary
 from qitos.qita.cli import (
@@ -811,6 +814,27 @@ def test_handler_routes(tmp_path: Path):
     _make_run(tmp_path, "r3")
     handler_cls = _build_handler(tmp_path)
     assert handler_cls is not None
+
+
+def test_handler_rejects_trace_mutation_requests(tmp_path: Path):
+    run = _make_run(tmp_path, "read-only")
+    before = set(tmp_path.iterdir())
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _build_handler(tmp_path))
+    thread = Thread(target=server.serve_forever)
+    thread.start()
+    connection = HTTPConnection(*server.server_address, timeout=2)
+    try:
+        connection.request("POST", f"/api/fork/{run.name}/0", body=b"{}")
+        response = connection.getresponse()
+        response.read()
+        assert response.status == 501
+        assert set(tmp_path.iterdir()) == before
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
 
 
 def test_build_run_diff_and_render(tmp_path: Path):

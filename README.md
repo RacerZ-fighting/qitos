@@ -20,8 +20,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 - **One canonical observability path**: the duplicate process-global tracing provider
   and its W&B/MLflow processors are gone. Runtime events, `TraceWriter`, the Session
-  Journal, and `qita` now form one explicit trace and replay path; handoffs remain
-  visible through canonical `HANDOFF_START`/`HANDOFF_END` events.
+  Journal, and read-only `qita` now form one explicit trace and replay path; handoffs
+  remain visible through canonical `HANDOFF_START`/`HANDOFF_END` events. The deprecated
+  debug package and trace-file “fork” are gone; resumable forks use Journal lineage.
 - **Truthful Runtime capability snapshots**: initialized environments now expose one
   immutable backend, working-directory, operation-group, facility, verified-command,
   and limitation snapshot. Engine freezes it with each turn, removes Tools whose ops

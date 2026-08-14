@@ -90,6 +90,11 @@ qita export --run ./runs/<run_id> --html ./report.html
 
 `qita` also supports run comparison so you can ask why two runs diverged instead of reading raw JSON by hand.
 
+`qita` is a read-only projection of these artifacts. It does not create executable
+forks by copying or editing trace files. To continue a Run from a prior safe boundary,
+fork its canonical Session Journal at the handle's committed continuation position;
+see [Session Journal](/concepts/session-journal).
+
 ## Related reading
 
 - [Official runs](/concepts/official-runs)

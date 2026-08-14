@@ -39,7 +39,7 @@ remain read-only and are not dependencies.
 | MCP | Run-scoped async connect/discover/execute/close exists | Add safe refresh and unified exposure/permission handling only where current callers require it |
 | Runtime capabilities | Environment ops exist but capability identity/preflight is incomplete | Define one immutable runtime capability snapshot and implement a container consumer |
 | Permission and scope | Tool admission and frozen exposure exist | Close command/path/network scope gaps at the existing admission boundary |
-| Observability | One canonical RuntimeEvent/TraceWriter/Journal/qita path; duplicate process-global tracing removed | Connect Session, Tool, Child, process, usage, and stop lineage without making trace recovery authority |
+| Observability | One canonical RuntimeEvent/TraceWriter/Journal path with read-only qita; duplicate tracing and trace-mutation replay removed | Connect Session, Tool, Child, process, usage, and stop lineage without making trace recovery authority |
 | Package modularity | Focused runtimes exist, but Engine/model/tool files remain oversized | Extract proven responsibility clusters after their behavior contracts are closed |
 
 ## Validation ledger
@@ -62,6 +62,7 @@ Each module plan records:
 - [x] Skill/resource alignment.
 - [x] Remove the duplicate tracing provider/processor architecture while preserving
   canonical trace and handoff events.
+- [x] Remove the deprecated debug replay model and non-canonical trace-file fork.
 - [ ] MCP refresh and admission alignment.
 - [ ] Runtime capability and managed container alignment.
 - [ ] Permission/scope alignment.

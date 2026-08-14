@@ -24,6 +24,10 @@ How to update:
   extras. Canonical runtime events, `TraceWriter`, the Session Journal, and `qita`
   now form the single observability and replay path. `EngineConfig` reports this
   path through `has_trace_writer`.
+- **Breaking:** Removed the deprecated `qitos.debug` replay/inspector package and
+  qita's trace-file mutation endpoint. `qita` is now a read-only artifact viewer;
+  executable forks use the canonical Session Journal and a committed continuation
+  boundary.
 
 ### Changed
 
