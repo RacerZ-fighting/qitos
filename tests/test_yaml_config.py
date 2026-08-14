@@ -4,6 +4,7 @@ import os
 import tempfile
 
 import pytest
+from pydantic import ValidationError
 
 from qitos.config import (
     AgentConfig,
@@ -15,7 +16,6 @@ from qitos.config import (
     build_run_spec,
     build_tool_registry,
 )
-
 
 # --- resolve_env_vars tests ---
 
@@ -65,9 +65,7 @@ model:
   model: gpt-4o
   temperature: 0.2
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(yaml_content)
             f.flush()
             config = load_agent_config(f.name)
@@ -92,9 +90,7 @@ dataset:
   - task: "10 - 4"
     expected: "6"
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(yaml_content)
             f.flush()
             config = load_agent_config(f.name)
@@ -112,9 +108,7 @@ model:
   provider: openai
   api_key: ${TEST_QITOS_API}
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(yaml_content)
             f.flush()
             config = load_agent_config(f.name)
@@ -131,9 +125,7 @@ model:
         yaml_content = """
 name: minimal
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(yaml_content)
             f.flush()
             config = load_agent_config(f.name)
@@ -152,9 +144,7 @@ model:
   model: gpt-5
   api_mode: responses
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(yaml_content)
             f.flush()
             config = load_agent_config(f.name)
@@ -181,9 +171,7 @@ dataset:
   - "task one"
   - "task two"
 """
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".yaml", delete=False
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write(yaml_content)
             f.flush()
             config = load_agent_config(f.name)
@@ -192,15 +180,50 @@ dataset:
         assert config.dataset[0].task == "task one"
         os.unlink(f.name)
 
+    def test_rejects_unknown_fields(self, tmp_path):
+        path = tmp_path / "agent.yaml"
+        path.write_text("name: agent\nunknown: value\n", encoding="utf-8")
+
+        with pytest.raises(ValidationError) as caught:
+            load_agent_config(path)
+
+        assert caught.value.errors()[0]["type"] == "extra_forbidden"
+
+    def test_rejects_invalid_nested_types(self, tmp_path):
+        path = tmp_path / "agent.yaml"
+        path.write_text(
+            "model:\n  max_tokens: many\ndataset:\n  - task: 3\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValidationError) as caught:
+            load_agent_config(path)
+
+        locations = {tuple(error["loc"]) for error in caught.value.errors()}
+        assert ("model", "max_tokens") in locations
+        assert ("dataset", 0, "_DatasetItemInput", "task") in locations
+
+    def test_rejects_non_positive_runtime_limits(self, tmp_path):
+        path = tmp_path / "agent.yaml"
+        path.write_text(
+            "max_steps: 0\nmodel:\n  context_window: -1\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ValidationError) as caught:
+            load_agent_config(path)
+
+        locations = {tuple(error["loc"]) for error in caught.value.errors()}
+        assert ("max_steps",) in locations
+        assert ("model", "context_window") in locations
+
 
 # --- build_run_spec tests ---
 
 
 class TestBuildRunSpec:
     def test_basic(self):
-        config = AgentConfig(
-            name="test", model=ModelConfig(model="gpt-4o"), seed=42
-        )
+        config = AgentConfig(name="test", model=ModelConfig(model="gpt-4o"), seed=42)
         spec = build_run_spec(config)
         assert spec.seed == 42
 

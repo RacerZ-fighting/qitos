@@ -4,6 +4,7 @@ import asyncio
 import os
 import shlex
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -363,4 +364,53 @@ async def test_managed_pty_accepts_interactive_input(tmp_path: Path) -> None:
 
     assert terminal.status is ProcessStatus.EXITED
     assert "echo:hello" in terminal.output.content
+    await runtime.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="PTY processes are POSIX-only")
+@pytest.mark.asyncio
+async def test_cancelled_pty_spawn_reaps_process_before_propagating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import qitos.kit.env.managed_process as process_module
+
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+
+    class _SpawnedPty:
+        pid = 12345
+
+    def spawn(*args: object, **kwargs: object) -> _SpawnedPty:
+        _ = args, kwargs
+        spawn_started.set()
+        release_spawn.wait()
+        return _SpawnedPty()
+
+    runtime = ManagedHostProcessRuntime(str(tmp_path))
+    reaped = asyncio.Event()
+
+    async def terminate_raw(process: object) -> None:
+        assert process.pid == _SpawnedPty.pid
+        reaped.set()
+
+    monkeypatch.setattr(process_module.PtyProcess, "spawn", spawn)
+    monkeypatch.setattr(runtime, "_terminate_raw", terminate_raw)
+    starting = asyncio.create_task(
+        runtime.start(
+            "ignored",
+            owner_run_id="run-1",
+            cwd=str(tmp_path),
+            tty=True,
+        )
+    )
+    await asyncio.to_thread(spawn_started.wait)
+
+    starting.cancel()
+    release_spawn.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+    assert reaped.is_set()
+    assert await runtime.list() == ()
     await runtime.close()

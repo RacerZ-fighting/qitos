@@ -11,6 +11,22 @@ QitOS is configured through three overlapping layers:
 
 ---
 
+## YAML validation
+
+`load_agent_config(path)` parses YAML with `yaml.safe_load()`, resolves explicit
+`${ENV_VAR}` placeholders, and validates the complete document through private
+Pydantic input models. Unknown fields, wrong nested types, empty Tool paths, and
+non-positive step, token, or context-window limits raise a standard
+`pydantic.ValidationError` with structured field locations. QitOS then converts the
+validated input into the public `AgentConfig`, `ModelConfig`, and `DatasetItem`
+dataclasses; Pydantic models do not become runtime state.
+
+Configuration is strict about YAML scalar types. Write `max_steps: 10`, not
+`max_steps: "10"`. Arbitrary application values remain allowed inside the explicit
+`environment` and `metadata` mappings.
+
+---
+
 ## OpenAI transport mode
 
 `OpenAIModel`, `OpenAICompatibleModel`, and their async variants support two

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+from mcp.types import CallToolResult, TextContent, Tool
 
 from qitos.core.action import Action
 from qitos.core.agent_module import AgentModule
@@ -17,15 +18,36 @@ from qitos.core.state import StateSchema
 from qitos.core.tool import BaseTool, ToolSpec
 from qitos.core.tool_registry import ToolExposure, ToolRegistry
 from qitos.engine.engine import Engine
-from qitos.mcp import MCPCallToolResult, MCPRequestError, MCPServer, MCPToolInfo
+from qitos.mcp import MCPRequestError, MCPServer
 from qitos.mcp.runtime import MCPRuntime
+
+
+def _tool(
+    name: str,
+    description: str = "",
+    input_schema: dict[str, Any] | None = None,
+) -> Tool:
+    return Tool(
+        name=name,
+        description=description,
+        inputSchema=input_schema or {"type": "object"},
+    )
+
+
+def _call_result(*, content: tuple[dict[str, Any], ...]) -> CallToolResult:
+    return CallToolResult(
+        content=[
+            TextContent(type="text", text=str(block.get("text", "")))
+            for block in content
+        ]
+    )
 
 
 class _MutableServer(MCPServer):
     def __init__(
         self,
         name: str,
-        tools: list[MCPToolInfo],
+        tools: list[Tool],
     ) -> None:
         self._name = name
         self.tools = tools
@@ -47,7 +69,7 @@ class _MutableServer(MCPServer):
     async def cleanup(self) -> None:
         self.cleanup_calls += 1
 
-    async def list_tools(self) -> list[MCPToolInfo]:
+    async def list_tools(self) -> list[Tool]:
         self.list_calls += 1
         self.list_started.set()
         if self.list_blocker is not None:
@@ -60,9 +82,9 @@ class _MutableServer(MCPServer):
         self,
         tool_name: str,
         arguments: dict[str, Any],
-    ) -> MCPCallToolResult:
+    ) -> CallToolResult:
         self.calls.append((tool_name, dict(arguments)))
-        return MCPCallToolResult(
+        return _call_result(
             content=(
                 {
                     "type": "text",
@@ -98,7 +120,7 @@ class _ChangeCatalogTool(BaseTool):
         runtime_context: dict[str, Any] | None = None,
     ) -> str:
         _ = args, runtime_context
-        self._server.tools = [MCPToolInfo(name="new")]
+        self._server.tools = [_tool(name="new")]
         self._server.notify_tools_changed()
         return "changed"
 
@@ -148,7 +170,7 @@ async def test_notification_refresh_is_visible_only_to_the_next_turn() -> None:
     server = _MutableServer(
         "catalog",
         [
-            MCPToolInfo(
+            _tool(
                 name="old",
                 input_schema={
                     "type": "object",
@@ -178,7 +200,7 @@ async def test_notification_refresh_is_visible_only_to_the_next_turn() -> None:
 
 @pytest.mark.asyncio
 async def test_failed_refresh_retains_the_last_complete_catalog() -> None:
-    server = _MutableServer("catalog", [MCPToolInfo(name="stable")])
+    server = _MutableServer("catalog", [_tool(name="stable")])
     registry = ToolRegistry()
     runtime = MCPRuntime(tool_registry=registry, servers=[server])
     await runtime.start()
@@ -199,10 +221,10 @@ async def test_session_expiry_reconnects_before_replaying_only_catalog_discovery
 ):
     class _ExpiringServer(_MutableServer):
         def __init__(self) -> None:
-            super().__init__("catalog", [MCPToolInfo(name="stable")])
+            super().__init__("catalog", [_tool(name="stable")])
             self.expire_next_list = False
 
-        async def list_tools(self) -> list[MCPToolInfo]:
+        async def list_tools(self) -> list[Tool]:
             self.list_calls += 1
             if self.expire_next_list:
                 self.expire_next_list = False
@@ -217,7 +239,7 @@ async def test_session_expiry_reconnects_before_replaying_only_catalog_discovery
     registry = ToolRegistry()
     runtime = MCPRuntime(tool_registry=registry, servers=[server])
     await runtime.start()
-    server.tools = [MCPToolInfo(name="replacement")]
+    server.tools = [_tool(name="replacement")]
     server.expire_next_list = True
 
     assert runtime.request_refresh("catalog") is True
@@ -233,13 +255,13 @@ async def test_session_expiry_reconnects_before_replaying_only_catalog_discovery
 
 @pytest.mark.asyncio
 async def test_cancelled_refresh_stays_pending_without_partial_publication() -> None:
-    server = _MutableServer("catalog", [MCPToolInfo(name="stable")])
+    server = _MutableServer("catalog", [_tool(name="stable")])
     registry = ToolRegistry()
     runtime = MCPRuntime(tool_registry=registry, servers=[server])
     await runtime.start()
     server.list_started = asyncio.Event()
     server.list_blocker = asyncio.Event()
-    server.tools = [MCPToolInfo(name="replacement")]
+    server.tools = [_tool(name="replacement")]
     assert runtime.request_refresh("catalog") is True
     refresh = asyncio.create_task(runtime.refresh_pending())
     await asyncio.wait_for(server.list_started.wait(), timeout=1)
@@ -256,7 +278,7 @@ async def test_cancelled_refresh_stays_pending_without_partial_publication() -> 
 
 @pytest.mark.asyncio
 async def test_expired_startup_deadline_cleans_partial_server_state() -> None:
-    server = _MutableServer("catalog", [MCPToolInfo(name="unused")])
+    server = _MutableServer("catalog", [_tool(name="unused")])
     registry = ToolRegistry()
     runtime = MCPRuntime(tool_registry=registry, servers=[server])
 
@@ -271,8 +293,8 @@ async def test_expired_startup_deadline_cleans_partial_server_state() -> None:
 
 @pytest.mark.asyncio
 async def test_startup_discovers_independent_servers_concurrently() -> None:
-    slow = _MutableServer("slow", [MCPToolInfo(name="first")])
-    healthy = _MutableServer("healthy", [MCPToolInfo(name="second")])
+    slow = _MutableServer("slow", [_tool(name="first")])
+    healthy = _MutableServer("healthy", [_tool(name="second")])
     slow.list_blocker = asyncio.Event()
     runtime = MCPRuntime(
         tool_registry=ToolRegistry(),
@@ -314,7 +336,7 @@ async def test_startup_concurrency_is_bounded() -> None:
                 active -= 1
 
     servers = [
-        _BlockingConnectServer(name, [MCPToolInfo(name="probe")])
+        _BlockingConnectServer(name, [_tool(name="probe")])
         for name in ("one", "two", "three")
     ]
     runtime = MCPRuntime(
@@ -339,11 +361,11 @@ async def test_startup_concurrency_is_bounded() -> None:
 
 @pytest.mark.asyncio
 async def test_invalid_replacement_catalog_is_not_partially_published() -> None:
-    server = _MutableServer("catalog", [MCPToolInfo(name="stable")])
+    server = _MutableServer("catalog", [_tool(name="stable")])
     registry = ToolRegistry()
     runtime = MCPRuntime(tool_registry=registry, servers=[server])
     await runtime.start()
-    server.tools = [MCPToolInfo(name="duplicate"), MCPToolInfo(name="duplicate")]
+    server.tools = [_tool(name="duplicate"), _tool(name="duplicate")]
 
     assert runtime.request_refresh("catalog") is True
     assert await runtime.refresh_pending() == ()
@@ -355,13 +377,13 @@ async def test_invalid_replacement_catalog_is_not_partially_published() -> None:
 
 @pytest.mark.asyncio
 async def test_refresh_requested_during_discovery_remains_pending() -> None:
-    server = _MutableServer("catalog", [MCPToolInfo(name="stable")])
+    server = _MutableServer("catalog", [_tool(name="stable")])
     registry = ToolRegistry()
     runtime = MCPRuntime(tool_registry=registry, servers=[server])
     await runtime.start()
     server.list_started = asyncio.Event()
     server.list_blocker = asyncio.Event()
-    server.tools = [MCPToolInfo(name="first")]
+    server.tools = [_tool(name="first")]
     assert runtime.request_refresh("catalog") is True
     first_refresh = asyncio.create_task(runtime.refresh_pending())
     await asyncio.wait_for(server.list_started.wait(), timeout=1)
@@ -373,7 +395,7 @@ async def test_refresh_requested_during_discovery_remains_pending() -> None:
     assert registry.list_tools() == ["mcp__catalog__first"]
 
     server.list_blocker = None
-    server.tools = [MCPToolInfo(name="second")]
+    server.tools = [_tool(name="second")]
     assert await runtime.refresh_pending() == ("catalog",)
     assert runtime.has_pending_refresh is False
     assert registry.list_tools() == ["mcp__catalog__second"]
@@ -388,7 +410,7 @@ async def test_cleanup_failure_can_be_retried_without_republishing_tools() -> No
             if self.cleanup_calls == 1:
                 raise RuntimeError("transient cleanup failure")
 
-    server = _RetryCleanupServer("catalog", [MCPToolInfo(name="stable")])
+    server = _RetryCleanupServer("catalog", [_tool(name="stable")])
     registry = ToolRegistry()
     runtime = MCPRuntime(tool_registry=registry, servers=[server])
     await runtime.start()
@@ -407,12 +429,12 @@ async def test_cleanup_failure_can_be_retried_without_republishing_tools() -> No
 async def test_partial_start_keeps_healthy_catalog_and_retries_failed_cleanup() -> None:
     class _FailedStartServer(_MutableServer):
         def __init__(self) -> None:
-            super().__init__("failed", [MCPToolInfo(name="never_published")])
+            super().__init__("failed", [_tool(name="never_published")])
             self.cleanup_error: Exception | None = RuntimeError(
                 "transient failed-start cleanup"
             )
 
-        async def list_tools(self) -> list[MCPToolInfo]:
+        async def list_tools(self) -> list[Tool]:
             self.list_calls += 1
             raise RuntimeError("discovery failed")
 
@@ -423,7 +445,7 @@ async def test_partial_start_keeps_healthy_catalog_and_retries_failed_cleanup() 
                 self.cleanup_error = None
                 raise error
 
-    healthy = _MutableServer("healthy", [MCPToolInfo(name="stable")])
+    healthy = _MutableServer("healthy", [_tool(name="stable")])
     failed = _FailedStartServer()
     registry = ToolRegistry()
     runtime = MCPRuntime(
@@ -436,7 +458,7 @@ async def test_partial_start_keeps_healthy_catalog_and_retries_failed_cleanup() 
     assert registry.list_tools() == ["mcp__healthy__stable"]
     assert healthy.cleanup_calls == 0
     assert failed.cleanup_calls == 1
-    healthy.tools = [MCPToolInfo(name="refreshed")]
+    healthy.tools = [_tool(name="refreshed")]
     assert runtime.request_refresh("healthy") is True
     assert await runtime.refresh_pending() == ("healthy",)
     assert registry.list_tools() == ["mcp__healthy__refreshed"]

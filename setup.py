@@ -59,7 +59,10 @@ setup(
     ),
     python_requires=">=3.10",
     install_requires=[
-        "httpx>=0.27,<1",
+        "httpx[socks]>=0.27,<1",
+        "mcp>=1.28.1,<2",
+        "pydantic>=2.13,<3",
+        "ptyprocess>=0.7,<1; sys_platform != 'win32'",
         "requests>=2.31.0",
         "beautifulsoup4>=4.12.3",
         "jsonschema>=4.23,<5",

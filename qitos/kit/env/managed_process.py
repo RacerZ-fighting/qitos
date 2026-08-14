@@ -12,8 +12,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from uuid import uuid4
+
+if os.name != "nt":
+    from ptyprocess import PtyProcess
 
 from qitos.core.journal import JournalRecordType, SessionJournal
 from qitos.core.process import (
@@ -34,6 +37,70 @@ def _utc_now() -> str:
 def _append_bytes(path: Path, content: bytes) -> None:
     with path.open("ab") as handle:
         handle.write(content)
+
+
+async def _settle_pty_spawn(task: asyncio.Task[PtyProcess]) -> PtyProcess:
+    """Retrieve a thread-backed PTY spawn even through repeated cancellation."""
+
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.done():
+                return task.result()
+
+
+class _ManagedProcess(Protocol):
+    """Async process operations used by the run-owned supervisor."""
+
+    pid: int
+    stdin: asyncio.StreamWriter | None
+
+    @property
+    def returncode(self) -> int | None:
+        raise NotImplementedError
+
+    async def wait(self) -> int:
+        raise NotImplementedError
+
+
+class _AsyncPtyProcess:
+    """Adapt ptyprocess's blocking wait primitive to one shared async Task."""
+
+    stdin: asyncio.StreamWriter | None = None
+
+    def __init__(self, process: PtyProcess) -> None:
+        self._process = process
+        self.pid = process.pid
+        self._returncode: int | None = None
+        self._wait_task: asyncio.Task[int] | None = None
+
+    @property
+    def returncode(self) -> int | None:
+        return self._returncode
+
+    async def wait(self) -> int:
+        task = self._wait_task
+        if task is None:
+            task = asyncio.create_task(
+                asyncio.to_thread(self._wait_blocking),
+                name=f"qitos-pty-wait-{self.pid}",
+            )
+            self._wait_task = task
+        return await asyncio.shield(task)
+
+    def _wait_blocking(self) -> int:
+        try:
+            self._process.wait()
+            if self._process.signalstatus is not None:
+                returncode = -int(self._process.signalstatus)
+            else:
+                returncode = int(self._process.exitstatus or 0)
+            self._returncode = returncode
+            return returncode
+        finally:
+            if not self._process.fileobj.closed:
+                self._process.fileobj.close()
 
 
 class _RollingOutput:
@@ -91,7 +158,7 @@ class _ProcessEntry:
     command: str
     cwd: str
     tty: bool
-    process: asyncio.subprocess.Process
+    process: _ManagedProcess
     output: _RollingOutput
     log_path: Path
     relative_log_path: str
@@ -205,7 +272,7 @@ class ManagedHostProcessRuntime:
         await asyncio.to_thread(log_dir.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread(log_path.write_bytes, b"")
 
-        process: asyncio.subprocess.Process | None = None
+        process: _ManagedProcess | None = None
         writer_fd: int | None = None
         read_transport: asyncio.BaseTransport | None = None
         try:
@@ -501,7 +568,7 @@ class ManagedHostProcessRuntime:
         cwd: str,
         tty: bool,
     ) -> tuple[
-        asyncio.subprocess.Process,
+        _ManagedProcess,
         asyncio.StreamReader,
         int | None,
         asyncio.BaseTransport | None,
@@ -529,35 +596,45 @@ class ManagedHostProcessRuntime:
         if os.name == "nt":
             raise NotImplementedError("PTY processes are not supported on Windows")
 
-        import pty
-
-        master_fd, slave_fd = pty.openpty()
-        writer_fd = os.dup(master_fd)
+        shell = os.environ.get("SHELL") or "/bin/sh"
+        spawn_task = asyncio.create_task(
+            asyncio.to_thread(
+                PtyProcess.spawn,
+                [shell, "-lc", command],
+                cwd=cwd,
+                env=None if self._env is None else dict(self._env),
+            ),
+            name="qitos-pty-spawn",
+        )
+        try:
+            pty_process = await asyncio.shield(spawn_task)
+        except asyncio.CancelledError as cancellation:
+            try:
+                pty_process = await _settle_pty_spawn(spawn_task)
+                await self._terminate_raw(_AsyncPtyProcess(pty_process))
+            except BaseException as cleanup_error:
+                raise cancellation from cleanup_error
+            raise
+        process = _AsyncPtyProcess(pty_process)
+        reader_fd = os.dup(pty_process.fd)
+        writer_fd = os.dup(pty_process.fd)
         os.set_blocking(writer_fd, False)
         try:
-            shell = os.environ.get("SHELL") or "/bin/sh"
-            process = await asyncio.create_subprocess_exec(
-                shell,
-                "-lc",
-                command,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                **process_kwargs,
+            reader = asyncio.StreamReader()
+            protocol = asyncio.StreamReaderProtocol(reader)
+            pipe = os.fdopen(reader_fd, "rb", buffering=0)
+            transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+                lambda: protocol,
+                pipe,
             )
         except BaseException:
-            os.close(master_fd)
             os.close(writer_fd)
+            try:
+                os.close(reader_fd)
+            except OSError:
+                pass
+            await self._terminate_raw(process)
             raise
-        finally:
-            os.close(slave_fd)
-        reader = asyncio.StreamReader()
-        protocol = asyncio.StreamReaderProtocol(reader)
-        pipe = os.fdopen(master_fd, "rb", buffering=0)
-        transport, _ = await asyncio.get_running_loop().connect_read_pipe(
-            lambda: protocol,
-            pipe,
-        )
         return process, reader, writer_fd, transport
 
     @staticmethod
@@ -695,7 +772,7 @@ class ManagedHostProcessRuntime:
         if watcher is not None:
             await asyncio.shield(watcher)
 
-    async def _terminate_raw(self, process: asyncio.subprocess.Process) -> None:
+    async def _terminate_raw(self, process: _ManagedProcess) -> None:
         if process.returncode is not None:
             return
         self._signal_process_group(process, signal.SIGTERM)
@@ -710,7 +787,7 @@ class ManagedHostProcessRuntime:
 
     @staticmethod
     def _signal_process_group(
-        process: asyncio.subprocess.Process,
+        process: _ManagedProcess,
         sig: signal.Signals,
     ) -> None:
         if process.returncode is not None:

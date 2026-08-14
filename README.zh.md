@@ -18,12 +18,13 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
-- **完整 Run 与交互式 Run 共用有界 MCP 生命周期**：独立 server 会在固定并发与 timeout
+- **完整 Run 与交互式 Run 共用官方 MCP 生命周期**：独立 server 会在固定并发与 timeout
   下连接并发现目录，再按 factory 顺序确定性发布成功目录。交互式 session 由
   `Engine.astep()` 懒启动并持续持有同一生命周期；同步 `step()` 会明确拒绝 MCP
-  session。Stdio 限制单帧不超过 8 MiB，reader 失败后自动清理并终止完整子进程树；
-  cancellation notification 是有界 best effort。来自 incomplete 或 failed 模型终态的
-  ToolCall 只保留诊断，不会执行。
+  session。Stdio 与 Streamable HTTP 现在直接使用官方 Python SDK 和协议类型；每个
+  SDK context 由一个专用 task 持有到关闭，QitOS 继续负责有界目录发布和稳定
+  ToolResult 错误。PTY 改由 `ptyprocess` 建立，YAML 配置入口使用严格的 Pydantic
+  边界校验。来自 incomplete 或 failed 模型终态的 ToolCall 只保留诊断，不会执行。
 - **从 terminal fact 恢复完成通知**：后台 Child 与受管进程的完成输入现在都是 canonical Journal
   terminal 的确定性投影。Resume 无需第二份存储即可补上 terminal 到 Mailbox 之间的崩溃窗口，也不会重复投递前台 Child ToolResult；
   已消费 event id 保持幂等，Fork 继承的事实也不会变成新输入。canonical `ToolResult` 同时保存

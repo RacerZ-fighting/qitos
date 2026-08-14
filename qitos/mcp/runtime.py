@@ -9,10 +9,12 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TypeVar
 
+from mcp.types import Tool
+
 from ..core.tool import BaseTool
 from ..core.tool_registry import ToolRegistry
 from .bridge import mcp_server_to_function_tools
-from .server import MCPRequestError, MCPServer, MCPToolInfo
+from .server import MCPRequestError, MCPServer
 
 _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -35,7 +37,7 @@ class _ServerState:
 @dataclass(frozen=True, slots=True)
 class _StartupDiscovery:
     state: _ServerState
-    tool_infos: tuple[MCPToolInfo, ...] = ()
+    tool_infos: tuple[Tool, ...] = ()
     error: Exception | None = None
 
 
@@ -173,7 +175,7 @@ class MCPRuntime:
         if run_deadline_monotonic is not None:
             deadline = min(deadline, run_deadline_monotonic)
 
-        async def discover() -> tuple[MCPToolInfo, ...]:
+        async def discover() -> tuple[Tool, ...]:
             async with self._start_limit:
                 state.server.set_tools_changed_handler(
                     self._refresh_handler(state.name)
@@ -313,12 +315,12 @@ class MCPRuntime:
     async def _build_tools(
         self,
         state: _ServerState,
-        tool_infos: Sequence[MCPToolInfo],
+        tool_infos: Sequence[Tool],
     ) -> tuple[BaseTool, ...]:
         if not isinstance(tool_infos, Sequence) or any(
-            not isinstance(tool, MCPToolInfo) for tool in tool_infos
+            not isinstance(tool, Tool) for tool in tool_infos
         ):
-            raise TypeError("MCP list_tools() must return MCPToolInfo values")
+            raise TypeError("MCP list_tools() must return mcp.types.Tool values")
         raw_names = [tool.name for tool in tool_infos]
         if len(raw_names) != len(set(raw_names)):
             raise ValueError(f"MCP server {state.name} returned duplicate Tool names")
@@ -337,7 +339,7 @@ class MCPRuntime:
         state: _ServerState,
         *,
         deadline_monotonic: float | None,
-    ) -> Sequence[MCPToolInfo]:
+    ) -> Sequence[Tool]:
         if not state.connected:
             await _await_with_deadline(
                 state.server.connect,
@@ -356,7 +358,7 @@ class MCPRuntime:
         state: _ServerState,
         *,
         deadline_monotonic: float | None,
-    ) -> Sequence[MCPToolInfo]:
+    ) -> Sequence[Tool]:
         """Recreate one expired transport before replaying only safe discovery."""
 
         await _await_with_deadline(

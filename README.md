@@ -25,14 +25,16 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   container runs use the same managed file, foreground, background, PTY, stdin, and
   cleanup primitives; Docker exec advertises foreground-only process support instead
   of silently detaching untracked work.
-- **Bounded MCP lifecycle for full and interactive Runs**: independent servers now
+- **Official MCP lifecycle for full and interactive Runs**: independent servers now
   connect and discover concurrently under fixed limits, then publish successful
   catalogs in deterministic factory order. `Engine.astep()` lazily owns the same MCP
   lifecycle for interactive sessions, while synchronous `step()` rejects MCP-backed
-  sessions. Stdio enforces an 8 MiB frame limit, cleans up on reader failure, and
-  terminates its complete subprocess tree; cancellation notifications are bounded
-  best effort. ToolCalls from incomplete or failed model terminals are retained only
-  as diagnostics and never execute.
+  sessions. Stdio and Streamable HTTP now use the official Python SDK and protocol
+  models; one dedicated task owns each SDK context through shutdown while QitOS keeps
+  bounded catalog publication and stable ToolResult errors. PTYs use `ptyprocess`, and
+  YAML configuration uses strict Pydantic boundary validation. ToolCalls from
+  incomplete or failed model terminals are retained only as diagnostics and never
+  execute.
 - **Terminal facts recover completion delivery**: Background Child and managed-process completion
   inputs are now deterministic projections of canonical Journal terminals. Resume
   closes the terminal-to-mailbox crash window without a second store, does not redeliver

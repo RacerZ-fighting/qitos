@@ -99,15 +99,17 @@ for tool in tools:
 ```
 
 Both transports follow bounded `nextCursor` pagination rather than silently returning
-only the first page. Each `MCPToolInfo` carries `name`, `description`, `input_schema`,
-and typed MCP `annotations`. Annotation values are treated as untrusted hints:
+only the first page. Each item is the official `mcp.types.Tool` model and exposes
+`name`, `description`, `inputSchema`, and typed MCP `annotations`. Annotation values
+are treated as untrusted hints:
 missing `readOnlyHint` is not interpreted as read-only, and QitOS never infers
 concurrency safety or retry permission from them.
 
-Stdio uses newline-delimited JSON-RPC and accepts at most 8 MiB per frame by default.
-An oversized frame is a typed MCP protocol error. Unexpected EOF and other fatal
-reader failures become typed transport errors and trigger transport cleanup
-automatically.
+Both transports use the official `mcp` Python SDK for framing, validation,
+initialization, notification dispatch, and shutdown. Stdio inherits only the SDK's
+safe environment allowlist plus variables explicitly supplied through `env=`. QitOS
+adds one run-owned task per connection because the SDK context must exit in the same
+task that entered it.
 
 ## Lower-level bridging
 
@@ -126,16 +128,15 @@ tools = await mcp_server_to_function_tools(server)
 ```
 
 Each returned `FunctionTool` wraps a remote MCP call. When the tool is executed, QitOS
-sends a `tools/call` JSON-RPC request and projects the typed `MCPCallToolResult` into a
-normal QitOS `ToolResult`. `structuredContent`, `_meta`, and content blocks remain
+sends a `tools/call` JSON-RPC request and projects the official
+`mcp.types.CallToolResult` into a normal QitOS `ToolResult`. `structuredContent`,
+`_meta`, and content blocks remain
 available; `isError=true` becomes `ToolResult(status="error")` rather than a successful
 JSON value. JSON-RPC protocol failures, remote request errors, remote Tool errors,
 timeouts, and cancellation remain distinguishable terminal outcomes.
 
-The Streamable HTTP transport accepts JSON or SSE responses to POST, keeps the
-negotiated session and protocol headers, and reconnects an idle GET stream with
-`Last-Event-ID`. Only events from that GET notification stream advance the reconnect
-cursor; IDs in POST responses do not. A session 404 has the stable
+The Streamable HTTP SDK transport accepts JSON or SSE responses and keeps the
+negotiated session headers. A terminated session has the stable
 `MCP_SESSION_EXPIRED` classification. QitOS may reconnect and repeat safe catalog
 discovery at the next turn boundary, but it never automatically replays a potentially
 side-effecting `tools/call`.
@@ -230,16 +231,12 @@ finally:
     await server.cleanup()
 ```
 
-`MCPServerStdio.cleanup()` terminates and reaps its complete subprocess tree (first a
-graceful group signal, then a forced tree kill after a 5-second timeout).
-`MCPServerStreamableHttp.cleanup()` waits for an active POST, terminates the negotiated
-session, and closes the HTTP client. Caller cancellation is propagated only after
-those owned resources settle.
-
-When a request is cancelled, both transports attempt the MCP cancellation notification
-for a bounded period (250 ms by default). This notification is best effort: a blocked
-or failed notification never delays local cancellation indefinitely, and cleanup does
-not start a new notification while the transport is already closing.
+`MCPServerStdio.cleanup()` follows the SDK shutdown sequence: close server input, wait
+for graceful exit, then terminate the owned process tree if necessary.
+`MCPServerStreamableHttp.cleanup()` terminates the negotiated session and closes its
+HTTP client. QitOS stops admitting new calls and waits for already active calls before
+the dedicated owner task exits both SDK contexts. Caller cancellation still propagates
+without creating a second event loop or replaying a Tool call.
 
 The bridge, transport, and Engine all run on the caller's event loop. They do not
 create a temporary or dedicated MCP event loop, so application code must not block

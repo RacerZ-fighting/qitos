@@ -8,6 +8,7 @@ import threading
 from typing import Any
 
 import pytest
+from mcp.types import CallToolResult, TextContent, Tool
 
 from qitos.core.action import Action
 from qitos.core.agent_module import AgentModule
@@ -17,9 +18,29 @@ from qitos.core.tool import ToolPermissionContext
 from qitos.core.tool_registry import ToolRegistry
 from qitos.engine.engine import Engine
 from qitos.kit.permission import PermissionPipeline
-from qitos.mcp import MCPCallToolResult
 from qitos.mcp.runtime import MCPRuntime
-from qitos.mcp.server import MCPServer, MCPToolInfo
+from qitos.mcp.server import MCPServer
+
+
+def _tool(
+    name: str,
+    description: str = "",
+    input_schema: dict[str, Any] | None = None,
+) -> Tool:
+    return Tool(
+        name=name,
+        description=description,
+        inputSchema=input_schema or {"type": "object"},
+    )
+
+
+def _call_result(*, content: tuple[dict[str, Any], ...]) -> CallToolResult:
+    return CallToolResult(
+        content=[
+            TextContent(type="text", text=str(block.get("text", "")))
+            for block in content
+        ]
+    )
 
 
 class FakeMCPServer(MCPServer):
@@ -31,7 +52,7 @@ class FakeMCPServer(MCPServer):
             tools
             if tools is not None
             else [
-                MCPToolInfo(
+                _tool(
                     name="read",
                     description="Read a file",
                     input_schema={"type": "object"},
@@ -56,17 +77,17 @@ class FakeMCPServer(MCPServer):
         self.cleaned_up = True
         self.lifecycle_threads.append(threading.get_ident())
 
-    async def list_tools(self) -> list[MCPToolInfo]:
+    async def list_tools(self) -> list[Tool]:
         return self._tools
 
     async def call_tool(
         self,
         name: str,
         arguments: dict,
-    ) -> MCPCallToolResult:
+    ) -> CallToolResult:
         self.calls.append((name, dict(arguments)))
         self.lifecycle_threads.append(threading.get_ident())
-        return MCPCallToolResult(
+        return _call_result(
             content=(
                 {
                     "type": "text",
@@ -127,7 +148,7 @@ class TestEngineMCPServerFactory:
             server = FakeMCPServer(
                 name="server.one",
                 tools=[
-                    MCPToolInfo(
+                    _tool(
                         name="tool.two-three",
                         input_schema={
                             "type": "object",
@@ -167,7 +188,7 @@ class TestEngineMCPServerFactory:
         server = FakeMCPServer(
             name="server.one",
             tools=[
-                MCPToolInfo(
+                _tool(
                     name="tool.two-three",
                     input_schema={
                         "type": "object",
@@ -190,7 +211,7 @@ class TestEngineMCPServerFactory:
         assert server.calls == [("tool.two-three", {"value": "evidence"})]
         assert registry.list_tools() == ["mcp__server_one__tool_two_three"]
 
-        server._tools = [MCPToolInfo(name="replacement")]
+        server._tools = [_tool(name="replacement")]
         server.notify_tools_changed()
         engine.advance_step(state)
         await engine.astep(state, first.observation)
@@ -220,7 +241,7 @@ class TestEngineMCPServerFactory:
         server = FakeMCPServer(
             name="server.one",
             tools=[
-                MCPToolInfo(
+                _tool(
                     name="tool.two-three",
                     input_schema={
                         "type": "object",

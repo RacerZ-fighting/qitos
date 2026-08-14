@@ -6,12 +6,13 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 import yaml
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
-@dataclass
+@dataclass(slots=True)
 class ModelConfig:
     """Model configuration from YAML."""
 
@@ -94,7 +95,7 @@ class ModelConfig:
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class DatasetItem:
     """A single task in the dataset."""
 
@@ -103,7 +104,7 @@ class DatasetItem:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(slots=True)
 class AgentConfig:
     """Agent configuration loaded from YAML."""
 
@@ -137,6 +138,47 @@ class AgentConfig:
 
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([^}]+)\}")
+_NonEmptyString = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1),
+]
+
+
+class _ModelConfigInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    provider: _NonEmptyString = "openai"
+    model: str = ""
+    model_name: str = ""
+    api_key: str = ""
+    base_url: str = ""
+    temperature: float = 0.7
+    max_tokens: int = Field(default=2048, gt=0)
+    context_window: int | None = Field(default=None, gt=0)
+    api_mode: str = ""
+
+
+class _DatasetItemInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    task: str = ""
+    expected: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class _AgentConfigInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: _NonEmptyString = "agent"
+    max_steps: int = Field(default=10, gt=0)
+    model: _ModelConfigInput = Field(default_factory=_ModelConfigInput)
+    dataset: list[_DatasetItemInput | str] = Field(default_factory=list)
+    tools: list[_NonEmptyString] = Field(default_factory=list)
+    protocol: str | None = None
+    parser: str | None = None
+    environment: dict[str, Any] = Field(default_factory=dict)
+    seed: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 def resolve_env_vars(value: Any) -> Any:
@@ -176,52 +218,45 @@ def load_agent_config(path: str | Path) -> AgentConfig:
         )
 
     raw = resolve_env_vars(raw)
-    return _parse_agent_config(raw)
+    validated = _AgentConfigInput.model_validate(raw)
+    return _to_agent_config(validated)
 
 
-def _parse_agent_config(raw: Dict[str, Any]) -> AgentConfig:
-    model_raw = raw.get("model", {})
-    if isinstance(model_raw, dict):
-        model_config = ModelConfig(
-            provider=str(model_raw.get("provider", "openai")),
-            model=str(model_raw.get("model", "")),
-            model_name=str(model_raw.get("model_name", "")),
-            api_key=str(model_raw.get("api_key", "")),
-            base_url=str(model_raw.get("base_url", "")),
-            temperature=float(model_raw.get("temperature", 0.7)),
-            max_tokens=int(model_raw.get("max_tokens", 2048)),
-            context_window=model_raw.get("context_window"),
-            api_mode=str(model_raw.get("api_mode", "")),
+def _to_agent_config(config: _AgentConfigInput) -> AgentConfig:
+    model = config.model
+    dataset = [
+        (
+            DatasetItem(task=item)
+            if isinstance(item, str)
+            else DatasetItem(
+                task=item.task,
+                expected=item.expected,
+                metadata=dict(item.metadata),
+            )
         )
-    else:
-        model_config = ModelConfig()
-
-    dataset_raw = raw.get("dataset", [])
-    dataset = []
-    if isinstance(dataset_raw, list):
-        for item in dataset_raw:
-            if isinstance(item, dict):
-                dataset.append(
-                    DatasetItem(
-                        task=str(item.get("task", "")),
-                        expected=item.get("expected"),
-                        metadata=item.get("metadata", {}),
-                    )
-                )
-            elif isinstance(item, str):
-                dataset.append(DatasetItem(task=item))
-
+        for item in config.dataset
+    ]
     return AgentConfig(
-        name=str(raw.get("name", "agent")),
-        max_steps=int(raw.get("max_steps", 10)),
-        model=model_config,
+        name=config.name,
+        max_steps=config.max_steps,
+        model=ModelConfig(
+            provider=model.provider,
+            model=model.model,
+            model_name=model.model_name,
+            api_key=model.api_key,
+            base_url=model.base_url,
+            temperature=model.temperature,
+            max_tokens=model.max_tokens,
+            context_window=model.context_window,
+            api_mode=model.api_mode,
+        ),
         dataset=dataset,
-        tools=list(raw.get("tools", [])),
-        protocol=raw.get("protocol"),
-        parser=raw.get("parser"),
-        environment=dict(raw.get("environment", {})),
-        seed=raw.get("seed"),
-        metadata=dict(raw.get("metadata", {})),
+        tools=list(config.tools),
+        protocol=config.protocol,
+        parser=config.parser,
+        environment=dict(config.environment),
+        seed=config.seed,
+        metadata=dict(config.metadata),
     )
 
 

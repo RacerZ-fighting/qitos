@@ -94,13 +94,13 @@ for tool in tools:
 ```
 
 两种 transport 都会按有界的 `nextCursor` 分页读取目录，不会静默只返回第一页。
-`list_tools()` 返回的每个 `MCPToolInfo` 都包含 `name`、`description`、
-`input_schema` 和类型化 MCP `annotations`。Annotation 只是不可信提示：缺失
+`list_tools()` 返回的每一项都是官方 `mcp.types.Tool`，包含 `name`、
+`description`、`inputSchema` 和类型化 MCP `annotations`。Annotation 只是不可信提示：缺失
 `readOnlyHint` 不会被解释为只读，QitOS 也不会据此推断并发安全或允许重试。
 
-Stdio 使用 newline-delimited JSON-RPC，默认单帧最多 8 MiB。超限帧会成为类型化 MCP
-协议错误；意外 EOF 或其他 reader 致命错误会成为类型化 transport 错误，并自动触发
-transport cleanup。
+两种 transport 都直接使用官方 `mcp` Python SDK 完成 framing、校验、初始化、通知分发
+和关闭。Stdio 只继承 SDK 的安全环境变量白名单以及通过 `env=` 显式传入的变量。由于 SDK
+context 必须由进入它的同一个 task 退出，QitOS 会为每个连接持有一个 run-owned task。
 
 ## 底层桥接
 
@@ -119,15 +119,13 @@ tools = await mcp_server_to_function_tools(server)
 ```
 
 每个返回的 `FunctionTool` 封装了一次远程 MCP 调用。工具执行时，QitOS 会发送
-`tools/call` JSON-RPC 请求，并把类型化 `MCPCallToolResult` 投影为普通 QitOS
+`tools/call` JSON-RPC 请求，并把官方 `mcp.types.CallToolResult` 投影为普通 QitOS
 `ToolResult`。`structuredContent`、`_meta` 和 content block 会被保留；
 `isError=true` 会成为 `ToolResult(status="error")`，不会伪装成成功 JSON 值。
 JSON-RPC 协议错误、远端请求错误、远端 Tool 错误、timeout 和 cancellation 仍是可区分的终态。
 
-Streamable HTTP transport 支持 POST 返回 JSON 或 SSE，保留协商得到的 session 和
-protocol header，并在空闲 GET stream 断开后携带 `Last-Event-ID` 重连。只有 GET
-notification stream 中的 event id 会推进重连游标，POST response 中的 id 不会污染它。
-Session 404 会稳定分类为 `MCP_SESSION_EXPIRED`。QitOS 可以在下一轮安全点重新连接并重复
+官方 Streamable HTTP transport 支持 JSON 或 SSE，并保留协商得到的 session header。
+Session 终止会稳定分类为 `MCP_SESSION_EXPIRED`。QitOS 可以在下一轮安全点重新连接并重复
 无副作用的 catalog discovery，但不会自动重放可能产生副作用的 `tools/call`。
 
 当需要将多个服务器桥接到同一注册表时，可以添加名称前缀来消除歧义：
@@ -220,14 +218,11 @@ finally:
     await server.cleanup()
 ```
 
-`MCPServerStdio.cleanup()` 会终止并回收完整子进程树（先向进程组发送 graceful signal，
-5 秒超时后强制终止整棵进程树）。`MCPServerStreamableHttp.cleanup()` 会先等待正在执行的
-POST，终止协商得到的 session，再关闭 HTTP client。调用方的取消只会在这些资源完成
-收敛后继续传播。
-
-请求被取消时，两种 transport 都只在有界时间内尝试发送 MCP cancellation notification
-（默认 250 ms）。该通知是 best effort：阻塞或失败不会无限拖延本地取消；transport 已在
-closing 时，cleanup 也不会再启动新通知。
+`MCPServerStdio.cleanup()` 遵循 SDK 的关闭流程：关闭 server 输入、等待优雅退出，必要时
+终止所持有的进程树。`MCPServerStreamableHttp.cleanup()` 会终止协商得到的 session 并关闭
+HTTP client。QitOS 会先停止接纳新调用，等待已经开始的调用收敛，再由专用 owner task
+退出两个 SDK context。调用方取消仍会继续向上传播，不会创建第二个 event loop，也不会
+重放 Tool 调用。
 
 Bridge、transport 与 Engine 都运行在调用方 event loop 上，不会创建临时或独立的
 MCP event loop。因此 bridged Tool 运行期间，应用代码不能阻塞该 loop。

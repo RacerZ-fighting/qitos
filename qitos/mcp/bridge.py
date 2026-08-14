@@ -24,14 +24,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Sequence
 from typing import Any, List, Optional, Set
+
+from mcp.types import CallToolResult, TextContent, Tool
 
 from ..core.tool import FunctionTool, ToolMeta, ToolSpec
 from ..core.tool_result import ToolResult
 from .filter import ToolFilter
 from .schema_convert import convert_mcp_schema_to_tool_spec
-from .server import MCPCallToolResult, MCPRequestError, MCPServer, MCPToolInfo
+from .server import MCPRequestError, MCPServer
 
 
 async def mcp_server_to_function_tools(
@@ -39,7 +42,7 @@ async def mcp_server_to_function_tools(
     tool_filter: Optional[ToolFilter] = None,
     name_prefix: Optional[str] = None,
     used_names: Optional[Set[str]] = None,
-    tool_infos: Sequence[MCPToolInfo] | None = None,
+    tool_infos: Sequence[Tool] | None = None,
 ) -> List[FunctionTool]:
     """Convert all tools exposed by an MCP server into QitOS FunctionTools.
 
@@ -115,7 +118,7 @@ def _make_function_tool(
                     "mcp_tool": original_name,
                 },
             )
-        if not isinstance(result, MCPCallToolResult):
+        if not isinstance(result, CallToolResult):
             return ToolResult(
                 status="error",
                 error="MCP transport returned an invalid tools/call result",
@@ -126,7 +129,8 @@ def _make_function_tool(
                     "mcp_tool": original_name,
                 },
             )
-        return result.to_tool_result(
+        return _to_tool_result(
+            result,
             server_name=server.name,
             tool_name=original_name,
         )
@@ -146,6 +150,45 @@ def _make_function_tool(
     # Override the spec with our MCP-derived spec (preserving all fields)
     tool.spec = spec
     return tool
+
+
+def _to_tool_result(
+    result: CallToolResult,
+    *,
+    server_name: str,
+    tool_name: str,
+) -> ToolResult:
+    payload = result.model_dump(by_alias=True, mode="json", exclude_none=True)
+    output: Any = payload
+    if result.structuredContent is None and result.meta is None:
+        if len(result.content) == 1 and isinstance(result.content[0], TextContent):
+            text = result.content[0].text
+            try:
+                output = json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                output = text
+
+    metadata: dict[str, Any] = {
+        "mcp_server": server_name,
+        "mcp_tool": tool_name,
+    }
+    if result.isError:
+        metadata.update(
+            {
+                "error_category": "mcp_tool_error",
+                "error_code": "MCP_TOOL_ERROR",
+            }
+        )
+        text_blocks = [
+            block.text for block in result.content if isinstance(block, TextContent)
+        ]
+        return ToolResult(
+            status="error",
+            output=output,
+            error="\n".join(text_blocks) or "MCP tool reported an error",
+            metadata=metadata,
+        )
+    return ToolResult(status="success", output=output, metadata=metadata)
 
 
 def _sanitize_model_tool_name(value: str) -> str:

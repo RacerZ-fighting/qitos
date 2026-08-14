@@ -19,9 +19,10 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
+from mcp.types import Tool
+
 from ..core.tool import ToolPermission, ToolSpec
 from ..core.tool_schema import normalize_tool_input_schema
-from .server import MCPToolInfo
 
 # --------------------------------------------------------------------------- #
 # Public API
@@ -29,10 +30,10 @@ from .server import MCPToolInfo
 
 
 def convert_mcp_schema_to_tool_spec(
-    mcp_tool: MCPToolInfo,
+    mcp_tool: Tool,
     name_prefix: Optional[str] = None,
 ) -> ToolSpec:
-    """Convert an ``MCPToolInfo`` into a QitOS ``ToolSpec``.
+    """Convert an official MCP ``Tool`` into a QitOS ``ToolSpec``.
 
     :param mcp_tool: The MCP tool descriptor.
     :param name_prefix: Optional prefix to avoid name collisions across
@@ -44,7 +45,7 @@ def convert_mcp_schema_to_tool_spec(
     if name_prefix:
         tool_name = f"{name_prefix}__{tool_name}"
 
-    schema = deepcopy(mcp_tool.input_schema) if mcp_tool.input_schema else {}
+    schema = deepcopy(mcp_tool.inputSchema) if mcp_tool.inputSchema else {}
 
     # Resolve $defs / definitions so we can inline simple ref patterns.
     defs = _extract_defs(schema)
@@ -82,7 +83,10 @@ def convert_mcp_schema_to_tool_spec(
         required=required_list,
         input_schema=input_schema,
         permissions=ToolPermission(network=True),
-        read_only=mcp_tool.annotations.read_only_hint is True,
+        read_only=(
+            mcp_tool.annotations is not None
+            and mcp_tool.annotations.readOnlyHint is True
+        ),
         concurrency_safe=None,
         group="mcp",
     )
