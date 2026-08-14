@@ -19,6 +19,11 @@ How to update:
 
 ### Removed
 
+- **Breaking:** Removed the fixed `qitos.kit.patterns` Manager/Worker,
+  Planner/Executor, Proposer/Verifier, Debate, MoA, and DAG workflow templates.
+  They formed a synchronous parallel orchestration layer with no production caller
+  inside QitOS. Applications should express coordination policy through the typed
+  `AgentTool` and `ChildControlToolSet` lifecycle or in application-owned recipes.
 - **Breaking:** Removed the deprecated product-level `SecurityAuditAgent` template and
   redundant security-audit Tool/ToolSet forwarding packages. Security research remains
   available from the explicit `qitos.kit.tool.experimental.security_research` owner,

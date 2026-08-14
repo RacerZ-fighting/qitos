@@ -18,6 +18,11 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One general Child-Agent lifecycle**: the fixed `qitos.kit.patterns`
+  Manager/Worker, Planner/Executor, Proposer/Verifier, Debate, MoA, and DAG workflow
+  templates are gone. Applications now compose coordination policy from the typed,
+  async `AgentTool` and `ChildControlToolSet` lifecycle or keep it in explicit
+  application-owned recipes instead of entering a second orchestration runtime.
 - **One Skill path and one HTTP client**: QitOS now keeps only progressive, read-only
   bundled `SKILL.md` disclosure in the Agent runtime. The old SkillHub installer,
   mutable registry, self-install Tools, and orphaned search adapters are gone; all

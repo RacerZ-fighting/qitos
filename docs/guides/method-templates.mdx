@@ -230,7 +230,9 @@ print(result.state.synthesis)  # the aggregated answer
 2. **Aggregate**: When all proposals are collected, the critic prompts for synthesis.
 3. **Output**: When synthesis is complete and meets the quality threshold, the critic returns `stop`.
 
-For parallel proposer execution with actual multi-agent delegation, use `qitos.kit.patterns.moa.build_moa_system()`.
+This recipe owns the MoA method state, not a second Child runtime. Applications that
+need parallel proposers should expose QitOS `AgentTool` instances through an
+application-owned invocation factory and retain their own role policy.
 
 ### MoACritic parameters
 

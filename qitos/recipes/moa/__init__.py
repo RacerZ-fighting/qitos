@@ -11,9 +11,9 @@ directing the agent to delegate to proposers. When a synthesis
 exists, it returns continue/stop.
 
 This recipe provides a single-agent orchestration interface that
-tracks proposal state. For the multi-agent delegation pattern
-with actual parallel proposer execution, see
-``qitos.kit.patterns.moa.build_moa_system()``.
+tracks proposal state. Applications that need actual parallel
+proposer execution compose the general QitOS Child-Agent lifecycle
+and own the proposer role policy.
 
 Usage::
 

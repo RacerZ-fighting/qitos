@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **Child Agent 只保留一套通用生命周期**：固定的 `qitos.kit.patterns`
+  Manager/Worker、Planner/Executor、Proposer/Verifier、Debate、MoA 与 DAG workflow
+  模板已删除。应用直接组合类型化、异步的 `AgentTool` 和 `ChildControlToolSet`，或把具体
+  协作策略留在显式的应用 recipe 中，不再进入第二套编排 runtime。
 - **Skill 单主线，HTTP 单 client**：Agent runtime 只保留渐进披露、只读的 bundled
   `SKILL.md`。旧 SkillHub installer、可变 registry、自安装 Tool 和孤立 search adapter
   已删除；仍维护的同步/异步 HTTP 路径统一直接使用支持 SOCKS 的 `httpx`。

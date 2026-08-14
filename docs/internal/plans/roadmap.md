@@ -432,16 +432,12 @@ Support:
 - shared vs private memory,
 - stop / timeout / arbitration.
 
-#### 5.3.2 Canonical Multi-Agent Templates
+#### 5.3.2 Composable Multi-Agent Experiments
 
-Ship template patterns such as:
-
-- manager-worker,
-- planner-executor,
-- proposer-verifier,
-- actor-critic,
-- debate,
-- self-play / red-team.
+Keep role and topology policy in explicit recipes or applications. Reuse the same
+typed Child launch, control, result, budget, cancellation, and Journal contracts for
+manager-worker, planner-executor, proposer-verifier, actor-critic, debate, and
+self-play experiments instead of shipping fixed constructors as another runtime.
 
 #### 5.3.3 Multi-Agent Trace and Evaluation
 
@@ -603,4 +599,3 @@ Qitos does **not** win when it has the longest feature page.
 Qitos wins when this becomes true:
 
 > When an AI agent researcher wants to build a new method, run a benchmark, analyze a failure, or reproduce a paper, their first instinct is to use Qitos.
-

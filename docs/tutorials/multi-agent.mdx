@@ -129,21 +129,14 @@ print(result.state.final_result)
 The LLM will call `fanout(tasks=[{"agent":"explorer","task":"Explore /auth"}, ...])`,
 spawning three parallel explorers.
 
-## Quick Start with Patterns
+## Keep coordination policy in the application
 
-For common patterns, use the built-in templates:
-
-```python
-from qitos.kit.patterns import build_manager_worker_system, ManagerWorkerConfig
-
-config = ManagerWorkerConfig(
-    worker_name="explorer",
-    workspace_root="./my-project",
-    llm=llm,
-)
-coordinator, registry = build_manager_worker_system(config)
-result = coordinator.run(task="Explore the codebase structure")
-```
+Manager/Worker, Planner/Executor, and review topologies are application policies, not
+separate QitOS runtimes. Compose them from the general delegation primitives above, or
+use the typed async `AgentTool` and `ChildControlToolSet` lifecycle when the application
+needs durable handles, background Children, follow-up messages, waits, or interrupts.
+This keeps nested Children on the same kernel while allowing every application to
+narrow its own tools, context, budgets, and permissions.
 
 ## What's Next
 
