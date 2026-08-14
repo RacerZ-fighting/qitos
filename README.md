@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Provider-owned model caching**: the deprecated local response-cache package and
+  implicit `Engine(cache_backend=...)` model mutation are gone. QitOS no longer replays
+  a previous provider transaction as a new model call; provider-native prompt caching,
+  cache usage, deadlines, continuation, and trace facts remain authoritative.
 - **One runtime configuration path**: the disconnected `qitos.config` YAML builder,
   parallel `qitos.experiment` runner, and `qit experiment` command are gone. They
   bypassed canonical Agent runs, Journals, and traces while silently ignoring most

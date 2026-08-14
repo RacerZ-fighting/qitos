@@ -4,7 +4,6 @@ from collections.abc import AsyncIterator
 from dataclasses import FrozenInstanceError
 import pytest
 
-from qitos.cache import CachedModel, InMemoryCache
 from qitos.models import (
     AnthropicModel,
     Model,
@@ -93,9 +92,3 @@ def test_model_capabilities_are_immutable_and_reject_duplicate_facts() -> None:
         )
     with pytest.raises(ValueError, match="hosted_tools must be unique"):
         ModelCapabilities(hosted_tools=("web_search", "web_search"))
-
-
-def test_cached_model_preserves_wrapped_transport_capabilities() -> None:
-    wrapped = OpenAIModel(api_key="test-key", model="gpt-test")
-
-    assert CachedModel(wrapped, InMemoryCache()).capabilities == wrapped.capabilities

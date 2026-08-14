@@ -293,7 +293,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         hooks: Optional[List[EngineHook]] = None,
         render_hooks: Optional[List[Any]] = None,
         context_config: Optional[ContextConfig | Dict[str, Any]] = None,
-        cache_backend: Optional[Any] = None,
         checkpoint_store: Optional[CheckpointStore] = None,
         artifact_store: Optional[ArtifactStore] = None,
         permission_pipeline: Optional[Any] = None,
@@ -470,17 +469,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         )
         self._context_runtime = _ContextRuntime(self)
         self._context_runtime.apply_config(self.context_config)
-
-        # LLM Cache: auto-wrap agent.llm with CachedModel if backend provided
-        self.cache_backend = cache_backend
-        if (
-            self.cache_backend is not None
-            and getattr(self.agent, "llm", None) is not None
-        ):
-            from ..cache import CachedModel
-
-            if not isinstance(self.agent.llm, CachedModel):
-                self.agent.llm = CachedModel(self.agent.llm, self.cache_backend)
 
         self._checkpoint_store = checkpoint_store
         self._last_checkpoint_id: Optional[CheckpointId] = None

@@ -19,6 +19,11 @@ How to update:
 
 ### Removed
 
+- **Breaking:** Removed the deprecated `qitos.cache` package and
+  `Engine(cache_backend=...)`. The implicit wrapper mutated an Agent's model during
+  Engine construction and replayed complete prior transactions with stale usage,
+  continuation, deadline, and trace semantics. Provider-native prompt caching remains
+  available through each model adapter and its recorded usage fields.
 - **Breaking:** Removed `qitos.config`, `qitos.experiment`, and the `qit experiment`
   command. The YAML builder and parameter-sweep runner formed a parallel runtime that
   bypassed canonical Agent runs, Journals, and traces while ignoring most declared

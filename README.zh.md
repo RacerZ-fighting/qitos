@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **模型缓存由 Provider 持有**：已废弃的本地 response-cache 包和隐式
+  `Engine(cache_backend=...)` 模型改写已删除。QitOS 不再把历史 provider transaction
+  重放成一次新模型调用；Provider 原生 prompt cache、cache usage、deadline、续接与
+  trace 事实继续作为权威来源。
 - **运行配置只保留一条主线**：未接入主运行时的 `qitos.config` YAML builder、平行的
   `qitos.experiment` runner 和 `qit experiment` 命令已删除。它们会绕过 canonical Agent
   run、Journal 与 trace，同时静默忽略大部分声明配置。应用现在显式构造 Provider 与 Agent；

@@ -61,7 +61,8 @@ Suspected boundary problems:
 | `qitos.func` | REMOVED | Unused decorators executed host functions outside Engine transactions and exposed a nonfunctional `AgentModule` adapter. |
 | `qitos.checkpoint.fork` | REMOVED | Snapshot copying did not create canonical Run transactions or resumable Journal lineage. |
 | `qitos.engine.run_state` | REMOVED | Whole-result JSON snapshots duplicated recovery state but were not consumable by any Engine resume path. |
-| `qitos.cache`, `qitos.checkpoint` | FRAMEWORK_EXTENSION | Runtime support outside the top-level public API. |
+| `qitos.checkpoint` | FRAMEWORK_EXTENSION | Snapshot persistence outside the top-level public API; Journal remains the canonical lineage owner. |
+| `qitos.cache` | REMOVED | Deprecated implicit response replay mutated Agent models and conflicted with provider transaction facts. |
 | `qitos.config`, `qitos.experiment` | REMOVED | Disconnected YAML builder and parallel runner bypassed canonical Agent, Journal, and trace ownership. |
 | `qitos.examples.pentagi` | SHOULD_MOVE_TO_ZOO | Full PentAGI-inspired cybersecurity product app. Exclude from packaging and stage under `qitos-cyber-agent`. |
 
@@ -78,6 +79,8 @@ Suspected boundary problems:
   effects.
 - Removed the disconnected YAML Agent builder, parallel experiment runner, and
   `qit experiment`; canonical benchmark specs and `qit bench` remain.
+- Removed the deprecated model response cache and Engine's implicit model wrapper;
+  provider-native prompt caching remains the only model-cache behavior.
 - Added migration banners to product-like `examples/real` files that remain temporarily.
 - Repaired engine final/wait handling so finalization, parser feedback, hooks, checkpoints, and memory records follow the normal loop.
 
@@ -100,8 +103,8 @@ that obsolete path is absent.
 ## Public API Changes
 
 - `qitos.__init__` now focuses on kernel/public contracts.
-- Cache and checkpoint imports remain available from their package paths. The
-  disconnected config and experiment packages are removed.
+- Checkpoint imports remain available from their package path. The disconnected cache,
+  config, and experiment packages are removed.
 - `qitos.kit` and `qitos.kit.tool` no longer export security-audit surfaces from the broad default import list.
 
 ## Dependency Changes
