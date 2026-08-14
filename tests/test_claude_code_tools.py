@@ -1,4 +1,4 @@
-"""Tests for sub-agents, cron, and worktree management."""
+"""Tests for sub-agents, cron, and coding-tool helpers."""
 
 import asyncio
 import os
@@ -217,43 +217,6 @@ class TestCronTools:
             result = await list_tool.execute({})
             assert result["status"] == "success"
             assert result["count"] == 2
-
-
-# ── WorktreeManager ───────────────────────────────────────────────────────────
-
-
-class TestWorktreeManager:
-    def test_list_empty(self):
-        from qitos.kit.agent.worktree_manager import WorktreeManager
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            wm = WorktreeManager(workspace_root=tmpdir)
-            assert wm.list_worktrees() == []
-
-    def test_fallback_copy_creates_directory(self):
-        from qitos.kit.agent.worktree_manager import WorktreeManager
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            wm = WorktreeManager(workspace_root=tmpdir)
-            path = wm._fallback_copy("test-wt")
-            assert os.path.isdir(path)
-            assert "test-wt" in path
-
-    def test_remove_worktree(self):
-        from qitos.kit.agent.worktree_manager import WorktreeManager
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            wm = WorktreeManager(workspace_root=tmpdir)
-            wm._fallback_copy("test-wt")
-            assert wm.remove_worktree("test-wt") is True
-            assert wm.list_worktrees() == []
-
-    def test_remove_nonexistent(self):
-        from qitos.kit.agent.worktree_manager import WorktreeManager
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            wm = WorktreeManager(workspace_root=tmpdir)
-            assert wm.remove_worktree("nonexistent") is False
 
 
 # ── AgentTool ─────────────────────────────────────────────────────────────────

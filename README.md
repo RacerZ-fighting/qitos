@@ -27,9 +27,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   maintained `qitos.kit.tool` or `qitos.kit.toolset` owners; experimental security
   research tools remain explicit opt-ins.
 - **Removed dead compatibility surfaces**: the superseded in-repo zoo staging,
-  Snowl-specific adapters, unused `RunState` snapshot, and source-only scaffold CLI are
-  gone. Product applications live in the independent `qitos-zoo` repository; QitOS
-  recovery uses only canonical Session Journals or checkpoint stores.
+  Snowl-specific adapters, unused `RunState` snapshot, source-only scaffold CLI, and
+  unwired pseudo-worktree helper are gone. Product applications live in the independent
+  `qitos-zoo` repository; QitOS recovery uses only canonical Session Journals or
+  checkpoint stores.
 - **One executable Agent path**: the unused `qitos.func` decorator/compose package is
   gone. Its direct calls bypassed Engine transactions, and its apparent `AgentModule`
   adapter never ran the wrapped function. Agents now use `AgentModule + Engine`;

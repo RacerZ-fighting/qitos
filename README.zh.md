@@ -25,8 +25,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   应用统一从仍在维护的 `qitos.kit.tool` 或 `qitos.kit.toolset` owner 导入；实验性
   security research 工具仍需显式选择。
 - **删除失效兼容面**：仓库内已被取代的 zoo staging、Snowl 专属 adapter、未使用的
-  `RunState` snapshot 和仅源码可见的 scaffold CLI 已删除。产品应用由独立 `qitos-zoo`
-  仓库维护；QitOS 恢复只使用 canonical Session Journal 或 checkpoint store。
+  `RunState` snapshot、仅源码可见的 scaffold CLI 和未接入运行时的伪 worktree helper 已删除。
+  产品应用由独立 `qitos-zoo` 仓库维护；QitOS 恢复只使用 canonical Session Journal 或
+  checkpoint store。
 - **Agent 只保留一条可执行主线**：未被使用的 `qitos.func` decorator/compose 包已删除。
   它的直接调用会绕过 Engine 事务，表面上的 `AgentModule` adapter 也不会执行被包装函数。
   Agent 统一使用 `AgentModule + Engine`；普通 Python callable Tool 继续使用已维护的

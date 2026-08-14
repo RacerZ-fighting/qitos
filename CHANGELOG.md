@@ -19,6 +19,9 @@ How to update:
 
 ### Removed
 
+- Removed the unexported `WorktreeManager` helper and its self-only tests. No runtime
+  called it, and its fallback created an invalid pseudo-worktree instead of an isolated
+  repository. Applications that need isolation should own a real workspace runtime.
 - **Breaking:** Removed the unused network-backed SkillHub installer, mutable Skill
   registry, `SkilledAgent` mixin, `qit skill` command, runtime install/search tools,
   and their compatibility loader. `SkillToolSet` now exposes only application-owned
