@@ -34,7 +34,12 @@ from ..core.history import (
 )
 from ..core.model_request import ModelContinuation, ModelRequest
 from ..core.model_stream import ModelStreamEventType
-from ..core.model_response import ModelResponse, ModelTiming
+from ..core.model_response import (
+    ModelResponse,
+    ModelTiming,
+    ModelUsageSource,
+    normalize_model_usage,
+)
 from ..core.multimodal import (
     content_to_text,
     image_base64_block,
@@ -950,6 +955,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             llm=llm,
         )
         engine._model_continuation = response.continuation
+        tokens_before = int(engine._token_usage)
         post_context = context_runtime.finalize_output(
             llm=llm,
             telemetry=pre_context,
@@ -961,6 +967,33 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             pricing=turn.budget.model_pricing,
             input_tokens=post_context.input_tokens_total,
             output_tokens=post_context.output_tokens,
+        )
+        normalized_usage = normalize_model_usage(response.usage)
+        if (
+            normalized_usage is None
+            or normalized_usage.source is not ModelUsageSource.PROVIDER
+        ):
+            usage_complete = False
+            cost_complete = False
+        else:
+            usage_complete = bool(
+                normalized_usage.total_tokens is not None
+                or (
+                    normalized_usage.input_tokens is not None
+                    and normalized_usage.output_tokens is not None
+                )
+            )
+            cost_complete = bool(
+                turn.budget.model_pricing is not None
+                and normalized_usage.input_tokens is not None
+                and normalized_usage.output_tokens is not None
+            )
+        await engine._settle_model_usage(
+            transaction_id=record.transaction_id,
+            tokens=max(0, int(engine._token_usage) - tokens_before),
+            cost_usd=transaction_cost_usd,
+            usage_complete=usage_complete,
+            cost_complete=cost_complete,
         )
         if pending_system_history is not None:
             engine._history_append(
@@ -1007,6 +1040,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         )
         record.model_response = response.to_summary_dict()
         record.model_response["cost_usd"] = transaction_cost_usd
+        record.model_response["usage_complete"] = usage_complete
+        record.model_response["cost_complete"] = cost_complete
         engine._last_context_telemetry = dict(record.context)
         engine._emit(
             record.step_id,

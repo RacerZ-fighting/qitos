@@ -2,6 +2,7 @@
 
 from .agent_module import ActionResultContext, AgentModule, CanonicalActionResult
 from .completion import CompletionAssessment, CompletionDisposition
+from .budget import BudgetLedger, BudgetSnapshot
 from .decision import Decision
 from .action import (
     Action,
@@ -139,6 +140,8 @@ from .agent_spec import AgentSpec, AgentRegistry, ContextStrategy, HandoffContex
 from .shared_memory import SharedMemory, InMemorySharedMemory, FileSharedMemory, SharedMemoryNamespace, SharedMemoryManager
 
 __all__ = [
+    "BudgetLedger",
+    "BudgetSnapshot",
     "ActionResultContext",
     "AgentModule",
     "CanonicalActionResult",

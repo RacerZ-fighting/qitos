@@ -267,6 +267,9 @@ return ToolResult(
 `output_limit_exceeded`、`cancelling` 和 `canceled` 等旧写法会被拒绝，不会再做
 兼容归一化；任何未知的显式状态都会被视为错误，而不是猜成成功。
 
+Handler 不需要自行生成关联身份。Engine 会在 Finalizer 前把 canonical Action 的身份写入
+`ToolResult.call_id`，因此 Journal replay、History、Reducer 和 trace 始终指向同一个模型 ToolCall。
+
 执行生命周期和业务结果必须分开。例如搜索正常完成但没有匹配项：
 
 ```python

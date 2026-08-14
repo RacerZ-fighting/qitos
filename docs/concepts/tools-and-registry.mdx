@@ -288,6 +288,9 @@ The canonical statuses are `success`, `partial`, `running`, `error`, `skipped`,
 `success` counts as success. The boundary is strict: spellings such as `failed`,
 `needs_user_input`, `output_limit_exceeded`, `cancelling`, and `canceled` are rejected
 rather than normalized. Any unknown explicit status is an error, not inferred success.
+Handlers do not need to manufacture correlation identity. Before finalization, the
+Engine copies the canonical Action identity into `ToolResult.call_id`; Journal replay,
+History, reducers, and traces therefore refer to the same model ToolCall.
 
 Execution lifecycle and domain outcome are separate. For example, an empty search ran
 successfully even though it found nothing:

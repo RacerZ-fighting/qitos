@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from qitos import AgentModule, Decision, Engine, StateSchema, ToolRegistry, tool
-from qitos.core import CompletionAssessment, ModelPricing
+from qitos.core import BudgetLedger, CompletionAssessment, ModelPricing
 from qitos.core.history import HistoryMessage
 from qitos.core.model_response import ModelUsage
 from qitos.engine import RuntimeBudget
@@ -223,3 +223,44 @@ def test_cost_budget_requires_explicit_pricing() -> None:
             _UsageAgent(llm=_UsageModel()),
             budget=RuntimeBudget(max_steps=3, max_cost_usd=1.0),
         )
+
+
+@pytest.mark.asyncio
+async def test_engines_share_run_budget_but_keep_local_usage() -> None:
+    ledger = BudgetLedger(max_tokens=20)
+    root = Engine(
+        _UsageAgent(llm=_UsageModel()),
+        budget=RuntimeBudget(max_steps=3, max_tokens=5),
+        budget_ledger=ledger,
+    )
+    child = Engine(
+        _UsageAgent(llm=_UsageModel()),
+        budget=RuntimeBudget(max_steps=3, max_tokens=5),
+        budget_ledger=ledger,
+    )
+
+    root_result = await root.arun("root")
+    child_result = await child.arun("child")
+
+    assert root_result.local_total_tokens == 12
+    assert root_result.total_tokens == 12
+    assert child_result.local_total_tokens == 12
+    assert child_result.total_tokens == 24
+    assert child_result.state.stop_reason == "budget_tokens"
+
+
+@pytest.mark.asyncio
+async def test_local_engine_budget_can_be_tighter_than_shared_run_budget() -> None:
+    ledger = BudgetLedger(max_tokens=100)
+    child = Engine(
+        _UsageAgent(llm=_UsageModel()),
+        budget=RuntimeBudget(max_steps=3, max_tokens=5),
+        budget_ledger=ledger,
+    )
+
+    result = await child.arun("child")
+
+    assert result.state.stop_reason == "budget_tokens"
+    assert result.local_total_tokens == 12
+    assert result.total_tokens == 12
+    assert ledger.snapshot().total_tokens == 12

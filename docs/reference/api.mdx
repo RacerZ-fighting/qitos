@@ -198,6 +198,7 @@ def __init__(
     recovery_policy: RecoveryPolicy | None = None,
     trace_writer: TraceWriter | None = None,
     artifact_store: ArtifactStore | None = None,
+    budget_ledger: BudgetLedger | None = None,
     parser: Parser[ActionT] | None = None,
     stop_criteria: List[StopCriteria] | None = None,
     branch_selector: BranchSelector | None = None,
@@ -213,7 +214,8 @@ def __init__(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `agent` | `AgentModule` | required | Agent whose hooks the Engine will call |
-| `budget` | `RuntimeBudget \| None` | `RuntimeBudget(max_steps=10)` | Step, time, and token budgets |
+| `budget` | `RuntimeBudget \| None` | `RuntimeBudget(max_steps=10)` | Local step, time, token, cost, Tool, and Child limits |
+| `budget_ledger` | `BudgetLedger \| None` | new Root ledger | Shared token/cost owner; pass the Root instance to descendants |
 | `validation_gate` | `StateValidationGate \| None` | default gate | Pre/post phase state validation |
 | `recovery_handler` | `RecoveryHandler \| None` | `None` | Callable invoked on recoverable errors |
 | `recovery_policy` | `RecoveryPolicy \| None` | default policy | Controls retry behaviour on failures |

@@ -8,6 +8,7 @@ QitOS public API surface.
 __version__ = "0.6.0"
 
 from .core.agent_module import AgentModule
+from .core.budget import BudgetLedger, BudgetSnapshot
 from .core.action import Action
 from .core.decision import Decision
 from .core.env import Env, EnvSpec
@@ -82,6 +83,8 @@ from .engine.states import ContextConfig
 
 __all__ = [
     "AgentModule",
+    "BudgetLedger",
+    "BudgetSnapshot",
     "Engine",
     "EngineEvent",
     "EngineEventType",

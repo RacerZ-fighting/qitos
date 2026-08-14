@@ -441,14 +441,17 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
         elapsed_seconds: float,
     ) -> tuple[bool, Optional[StopReason], Optional[str]]:
         engine = self.engine
+        run_budget = engine._run_budget_snapshot()
         for criteria in engine.stop_criteria:
             hit, reason, detail = criteria.should_stop(
                 state,
                 step_id,
                 runtime_info={
                     "elapsed_seconds": elapsed_seconds,
-                    "total_tokens": int(engine._token_usage),
-                    "total_cost_usd": float(engine._cost_usage_usd),
+                    "total_tokens": int(run_budget.total_tokens),
+                    "total_cost_usd": float(run_budget.total_cost_usd),
+                    "local_total_tokens": int(engine._token_usage),
+                    "local_total_cost_usd": float(engine._cost_usage_usd),
                     "budget_max_steps": engine.budget.max_steps,
                     "budget_max_runtime_seconds": engine.budget.max_runtime_seconds,
                     "budget_max_tokens": engine.budget.max_tokens,
@@ -461,6 +464,7 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
 
     def budget_exhausted(self, step_id: int, state: StateT) -> bool:
         engine = self.engine
+        run_budget = engine._run_budget_snapshot()
         if step_id >= engine.budget.max_steps:
             state.set_stop(StopReason.BUDGET_STEPS)
             return True
@@ -473,10 +477,16 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
         ):
             state.set_stop(StopReason.BUDGET_TOKENS)
             return True
+        if run_budget.tokens_exhausted:
+            state.set_stop(StopReason.BUDGET_TOKENS)
+            return True
         if (
             engine.budget.max_cost_usd is not None
             and engine._cost_usage_usd >= float(engine.budget.max_cost_usd)
         ):
+            state.set_stop(StopReason.BUDGET_COST)
+            return True
+        if run_budget.cost_exhausted:
             state.set_stop(StopReason.BUDGET_COST)
             return True
         return False

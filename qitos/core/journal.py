@@ -46,6 +46,7 @@ class JournalRecordType(str, Enum):
     RUN_STARTED = "run.started"
     INPUT_ACCEPTED = "input.accepted"
     MODEL_COMPLETED = "model.completed"
+    BUDGET_COMMITTED = "budget.committed"
     TOOL_STARTED = "tool.started"
     TOOL_TERMINAL = "tool.terminal"
     PROCESS_STARTED = "process.started"

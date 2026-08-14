@@ -242,7 +242,8 @@ When you construct an `Engine` directly (or via `engine_kwargs`), these paramete
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `agent` | `AgentModule` | required | The agent whose hooks the Engine calls |
-| `budget` | `RuntimeBudget \| None` | `RuntimeBudget(max_steps=10)` | Step, time, and token budgets for the run |
+| `budget` | `RuntimeBudget \| None` | `RuntimeBudget(max_steps=10)` | Local step, time, token, cost, Tool, and Child limits |
+| `budget_ledger` | `BudgetLedger \| None` | new Root ledger | Shared token/cost owner passed unchanged to Child Engines |
 | `validation_gate` | `StateValidationGate \| None` | default gate | Validates state before and after each phase |
 | `recovery_handler` | `RecoveryHandler \| None` | `None` | Callable `(state, phase, exc) -> None` invoked on recoverable errors |
 | `recovery_policy` | `RecoveryPolicy \| None` | `RecoveryPolicy()` | Controls retry behaviour and backoff |
@@ -265,6 +266,9 @@ class RuntimeBudget:
     max_steps: int = 10
     max_runtime_seconds: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_cost_usd: Optional[float] = None
+    max_tool_concurrency: int = 4
+    max_children: int = 4
     deadline_monotonic: Optional[float] = None
 ```
 

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import inspect
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import Any
@@ -22,11 +22,15 @@ from ...core.child import (
     ChildStatus,
 )
 from ...core.journal import JournalRecordType, SessionJournal
-from ...core.runtime_input import RuntimeInput
+from ...core.runtime_input import (
+    RuntimeInput,
+    child_result_payload,
+    child_terminal_runtime_input,
+)
 from ...core.tool_result import ToolResult
 
 ChildInvocationFactory = Callable[
-    [ChildLaunchRequest, dict[str, Any]], ChildInvocation
+    [ChildLaunchRequest, dict[str, Any]], ChildInvocation | Awaitable[ChildInvocation]
 ]
 ChildExecutionScope = Callable[
     [dict[str, Any]],
@@ -41,6 +45,7 @@ _PARTIAL_RESULT_MAX_CHARS = 16_000
 class _OwnedChild:
     handle: ChildHandle
     request: ChildLaunchRequest
+    background: bool
     runtime_context: dict[str, Any]
     cancel_event: asyncio.Event
     terminal_event: asyncio.Event
@@ -109,6 +114,7 @@ class ChildSupervisor:
             owned = _OwnedChild(
                 handle=handle,
                 request=request,
+                background=background,
                 runtime_context=dict(runtime_context),
                 cancel_event=asyncio.Event(),
                 terminal_event=asyncio.Event(),
@@ -207,7 +213,7 @@ class ChildSupervisor:
         if normalized_parent in self._recovered_runs:
             return self._results_for_parent(normalized_parent)
         records = await journal.replay()
-        started: dict[ChildHandle, ChildLaunchRequest] = {}
+        started: dict[ChildHandle, tuple[ChildLaunchRequest, bool]] = {}
         terminal: dict[ChildHandle, ChildResult] = {}
         try:
             for record in records:
@@ -224,7 +230,10 @@ class ChildSupervisor:
                     request = ChildLaunchRequest.from_dict(raw_request)
                     if handle.parent_run_id != normalized_parent:
                         raise ValueError("child.started parent is inconsistent")
-                    started[handle] = request
+                    raw_background = record.payload.get("background", False)
+                    if not isinstance(raw_background, bool):
+                        raise ValueError("child.started background flag is invalid")
+                    started[handle] = (request, raw_background)
                 elif record.type is JournalRecordType.CHILD_TERMINAL:
                     result = ChildResult.from_dict(record.payload)
                     if result.handle.parent_run_id != normalized_parent:
@@ -238,7 +247,7 @@ class ChildSupervisor:
             ) from exc
 
         recovered = dict(terminal)
-        for handle, request in started.items():
+        for handle, (request, _background) in started.items():
             if handle in recovered:
                 continue
             result = ChildResult(
@@ -270,9 +279,13 @@ class ChildSupervisor:
             for handle, result in recovered.items():
                 owned = self._children.get(handle)
                 if owned is None:
+                    started_entry = started.get(handle)
                     owned = _OwnedChild(
                         handle=handle,
                         request=result.request,
+                        background=(
+                            started_entry[1] if started_entry is not None else False
+                        ),
                         runtime_context={},
                         cancel_event=asyncio.Event(),
                         terminal_event=asyncio.Event(),
@@ -412,6 +425,15 @@ class ChildSupervisor:
                         "total_tokens": int(
                             getattr(owned.engine, "_token_usage", 0) or 0
                         ),
+                        "total_cost_usd": float(
+                            getattr(owned.engine, "_cost_usage_usd", 0.0) or 0.0
+                        ),
+                        "usage_complete": bool(
+                            getattr(owned.engine, "_usage_complete", False)
+                        ),
+                        "cost_complete": bool(
+                            getattr(owned.engine, "_cost_complete", False)
+                        ),
                         "run_id": self._child_run_id(owned),
                     },
                 )
@@ -544,7 +566,12 @@ class ChildSupervisor:
         owned: _OwnedChild,
         runtime_context: dict[str, Any],
     ) -> ChildResult:
-        invocation = self._invocation_factory(owned.request, runtime_context)
+        pending_invocation = self._invocation_factory(owned.request, runtime_context)
+        invocation = (
+            await pending_invocation
+            if inspect.isawaitable(pending_invocation)
+            else pending_invocation
+        )
         if not isinstance(invocation, ChildInvocation):
             raise TypeError("invocation_factory must return ChildInvocation")
         if self._closed:
@@ -585,7 +612,28 @@ class ChildSupervisor:
                 or ""
             ),
             steps=int(engine_result.step_count or 0),
-            total_tokens=int(engine_result.total_tokens or 0),
+            total_tokens=int(
+                getattr(
+                    engine_result,
+                    "local_total_tokens",
+                    getattr(engine_result, "total_tokens", 0),
+                )
+                or 0
+            ),
+            total_cost_usd=float(
+                getattr(
+                    engine_result,
+                    "local_total_cost_usd",
+                    getattr(engine_result, "total_cost_usd", 0.0),
+                )
+                or 0.0
+            ),
+            usage_complete=bool(
+                getattr(engine_result, "local_usage_complete", False)
+            ),
+            cost_complete=bool(
+                getattr(engine_result, "local_cost_complete", False)
+            ),
         )
 
     def _set_terminal(self, owned: _OwnedChild, result: ChildResult) -> None:
@@ -625,6 +673,7 @@ class ChildSupervisor:
                 {
                     "handle": owned.handle.to_dict(),
                     "request": owned.request.to_dict(),
+                    "background": owned.background,
                 },
                 record_id=(
                     f"{owned.handle.parent_run_id}:child:"
@@ -682,24 +731,7 @@ class ChildSupervisor:
     def result_payload(result: ChildResult) -> dict[str, Any]:
         """Project typed child state without overloading Tool execution status."""
 
-        return {
-            "status": ChildSupervisor._execution_status(result),
-            "child_status": result.status.value,
-            "ready": result.ready,
-            "handle": result.handle.to_dict(),
-            "child_id": result.handle.child_id,
-            "agent_type": result.request.agent_type,
-            "name": result.request.name,
-            "description": result.request.description,
-            "output": ChildSupervisor._json_safe(result.conclusion.summary),
-            "conclusion": result.conclusion.to_dict(),
-            "error": result.error,
-            "steps": result.steps,
-            "total_tokens": result.total_tokens,
-            "elapsed_seconds": result.elapsed_seconds,
-            "stop_reason": result.status.value,
-            "run_id": result.child_run_id,
-        }
+        return child_result_payload(result)
 
     async def _post_completion_event(
         self,
@@ -710,15 +742,7 @@ class ChildSupervisor:
         if not callable(post_runtime_event):
             return
         try:
-            await post_runtime_event(
-                RuntimeInput(
-                    event_id=f"{owned.handle.child_id}:terminal",
-                    kind="agent.child.completed",
-                    correlation_id=owned.handle.child_id,
-                    source="qitos.agent",
-                    payload=self.result_payload(result),
-                )
-            )
+            await post_runtime_event(child_terminal_runtime_input(result))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -786,6 +810,7 @@ class ChildSupervisor:
         error: str = "Child agent was cancelled.",
     ) -> ChildResult:
         error = error or "Child agent was cancelled."
+        tokens, cost, usage_complete, cost_complete = self._engine_usage(owned)
         return ChildResult(
             handle=owned.handle,
             request=owned.request,
@@ -793,10 +818,15 @@ class ChildSupervisor:
             conclusion=AgentConclusion(failure_paths=(error,)),
             child_run_id=self._child_run_id(owned),
             error=error,
+            total_tokens=tokens,
+            total_cost_usd=cost,
+            usage_complete=usage_complete,
+            cost_complete=cost_complete,
         )
 
     def _failed_result(self, owned: _OwnedChild, exc: Exception) -> ChildResult:
         error = str(exc) or type(exc).__name__
+        tokens, cost, usage_complete, cost_complete = self._engine_usage(owned)
         return ChildResult(
             handle=owned.handle,
             request=owned.request,
@@ -804,6 +834,22 @@ class ChildSupervisor:
             conclusion=AgentConclusion(failure_paths=(error,)),
             child_run_id=self._child_run_id(owned),
             error=error,
+            total_tokens=tokens,
+            total_cost_usd=cost,
+            usage_complete=usage_complete,
+            cost_complete=cost_complete,
+        )
+
+    @staticmethod
+    def _engine_usage(owned: _OwnedChild) -> tuple[int, float, bool, bool]:
+        engine = owned.engine
+        if engine is None:
+            return (0, 0.0, False, False)
+        return (
+            int(getattr(engine, "_token_usage", 0) or 0),
+            float(getattr(engine, "_cost_usage_usd", 0.0) or 0.0),
+            bool(getattr(engine, "_usage_complete", False)),
+            bool(getattr(engine, "_cost_complete", False)),
         )
 
     @staticmethod
@@ -842,13 +888,6 @@ class ChildSupervisor:
         return marker + rendered[-tail_size:]
 
     @staticmethod
-    def _json_safe(value: Any) -> Any:
-        try:
-            return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
-        except (TypeError, ValueError):
-            return str(value)
-
-    @staticmethod
     def _child_status(stop_reason: str) -> ChildStatus:
         if stop_reason in {"completed", "final", "success"}:
             return ChildStatus.COMPLETED
@@ -863,15 +902,3 @@ class ChildSupervisor:
         if stop_reason.startswith("interrupt"):
             return ChildStatus.INTERRUPTED
         return ChildStatus.FAILED
-
-    @staticmethod
-    def _execution_status(result: ChildResult) -> str:
-        if result.status is ChildStatus.COMPLETED:
-            return "success"
-        if result.status in {ChildStatus.PENDING, ChildStatus.RUNNING}:
-            return "running"
-        if result.status in {ChildStatus.CANCELLED, ChildStatus.INTERRUPTED}:
-            return "cancelled"
-        if result.conclusion.summary:
-            return "partial"
-        return "error"

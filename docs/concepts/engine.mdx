@@ -257,6 +257,12 @@ engine = Engine(
 Cost limits never guess from model names. Pass `model_pricing=ModelPricing(...)` to
 Engine, or expose a typed `pricing` value on the configured Model.
 
+One Engine owns the Root `BudgetLedger`. Product runtimes that create Child Engines
+pass `parent_engine.budget_ledger` unchanged. The effective token/cost remainder is the
+smaller of that shared Run balance and the Engine's local `RuntimeBudget`. Result
+`total_*` fields report the shared total; `local_total_*` fields preserve per-Engine
+audit values. See [Session journal](/concepts/session-journal) for settlement and replay.
+
 The effective run deadline is shared by Engine step admission, runtime waits, tool
 admission and timeout, and tool retry backoff. Expiry requests graceful termination; it
 does not claim that Python forcibly killed a synchronous call already in progress.

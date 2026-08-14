@@ -183,6 +183,13 @@ class ChildStateView(Protocol):
 class ChildRunResult(Protocol):
     step_count: int
     total_tokens: int
+    total_cost_usd: float
+    local_total_tokens: int
+    local_total_cost_usd: float
+    usage_complete: bool
+    cost_complete: bool
+    local_usage_complete: bool
+    local_cost_complete: bool
     run_id: str
 
     @property
@@ -307,6 +314,9 @@ class ChildResult:
     error: str | None = None
     steps: int = 0
     total_tokens: int = 0
+    total_cost_usd: float = 0.0
+    usage_complete: bool = False
+    cost_complete: bool = False
     elapsed_seconds: float = 0.0
 
     def __post_init__(self) -> None:
@@ -326,6 +336,18 @@ class ChildResult:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"ChildResult.{name} must be non-negative")
+        if (
+            isinstance(self.total_cost_usd, bool)
+            or not isinstance(self.total_cost_usd, (int, float))
+            or not math.isfinite(float(self.total_cost_usd))
+            or self.total_cost_usd < 0
+        ):
+            raise ValueError(
+                "ChildResult.total_cost_usd must be finite and non-negative"
+            )
+        for name in ("usage_complete", "cost_complete"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"ChildResult.{name} must be a boolean")
         if (
             isinstance(self.elapsed_seconds, bool)
             or not isinstance(self.elapsed_seconds, (int, float))
@@ -353,12 +375,15 @@ class ChildResult:
             "error": self.error,
             "steps": self.steps,
             "total_tokens": self.total_tokens,
+            "total_cost_usd": float(self.total_cost_usd),
+            "usage_complete": self.usage_complete,
+            "cost_complete": self.cost_complete,
             "elapsed_seconds": float(self.elapsed_seconds),
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ChildResult":
-        expected = {
+        legacy = {
             "handle",
             "request",
             "status",
@@ -370,7 +395,12 @@ class ChildResult:
             "total_tokens",
             "elapsed_seconds",
         }
-        if set(value) != expected:
+        expected = legacy | {
+            "total_cost_usd",
+            "usage_complete",
+            "cost_complete",
+        }
+        if set(value) not in (legacy, expected):
             raise ValueError("ChildResult fields are invalid")
         raw_handle = value["handle"]
         raw_request = value["request"]
@@ -390,6 +420,9 @@ class ChildResult:
             error=value["error"],
             steps=value["steps"],
             total_tokens=value["total_tokens"],
+            total_cost_usd=value.get("total_cost_usd", 0.0),
+            usage_complete=value.get("usage_complete", False),
+            cost_complete=value.get("cost_complete", False),
             elapsed_seconds=value["elapsed_seconds"],
         )
         if value["ready"] is not result.ready:

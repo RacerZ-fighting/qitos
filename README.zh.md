@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **从 terminal fact 恢复完成通知**：后台 Child 与受管进程的完成输入现在都是 canonical Journal
+  terminal 的确定性投影。Resume 无需第二份存储即可补上 terminal 到 Mailbox 之间的崩溃窗口，也不会重复投递前台 Child ToolResult；
+  已消费 event id 保持幂等，Fork 继承的事实也不会变成新输入。canonical `ToolResult` 同时保存
+  模型 `call_id`，Child factory 可以安全完成异步资源构造。
 - **无 writer lease 的 Run 查询与 lineage**：`JsonlRunCatalog` 现在可以在 Engine
   仍持有 writer lease 时返回不可变、类型化的 Run 摘要、确定性列表、已校验祖先和直接
   Child。读取不会修复 canonical JSONL，也不会重建可丢弃的 SQLite 投影。继承到本地的
@@ -46,6 +50,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   事务。Parser、Critic 与 handoff 作为组合策略接入，不再各自占据或复制 Agent loop；
   Tool、Mailbox、MCP 与 Child 始终运行在调用方 event loop，取消会先等待已启动 handler
   清理并按输入顺序写完 terminal 结果。模型变化只会让下一 turn 重新解析推断协议。
+- **Root/Child 共用一份 usage 总账**：产品运行时可把同一个 `BudgetLedger` 传给所有
+  后代 Engine。每个完成的模型事务只向 Root JSONL 结算一次 token 与 cost；Child 预算
+  只会进一步收紧共享余额，不会复制一份全局额度。结果同时保留共享总量、本地用量和
+  完整性。首版在结算后阻止下一 turn，不为已经并发发出的请求预留 token。
 - **Session Journal 只有一个 owner**：每个 Run 现在使用进程安全的 JSONL writer lease
   和明确的终止生命周期。replay 始终先验证 canonical JSONL；可丢弃的 SQLite 读取投影只有
   在与 JSONL 一致时才会保留，并会在过期或损坏后重建。payload 在 append 前先通过唯一的
