@@ -1,16 +1,19 @@
 ---
-title: "Checkpoint and Fork"
-description: "Save, resume, and branch agent runs with QitOS checkpointing."
+title: "Checkpoint Resume and Journal Fork"
+description: "Resume snapshots with checkpoints and branch canonical runs with the Session Journal."
 ---
 
-# Checkpoint and Fork
+# Checkpoint Resume and Journal Fork
 
-QitOS checkpoints let you save an agent's state at any step, resume a run after interruption, and fork a run to explore alternative paths — all without rerunning from scratch.
+QitOS checkpoints save an Agent state snapshot for resume after interruption. Session
+journals persist complete model and Tool transactions and own executable Run branching.
+Choose one persistence mode for an Engine; do not configure a checkpoint store and a
+journal together.
 
 This is essential for:
 - **Long-running tasks** that may be interrupted (network errors, budget limits)
-- **Branching experiments** where you want to explore "what if?" from a particular step
-- **Time-travel debugging** where you restore state from an earlier checkpoint
+- **Branching experiments** that continue from a committed Journal boundary
+- **Lineage inspection** across parent and Child Runs
 
 ## Step 1: Basic Checkpointing
 
@@ -72,50 +75,64 @@ without another model request, tool call, or checkpoint. When the resumed Engine
 new `TraceWriter`, QitOS finalizes that empty trace with the persisted stop reason and
 result.
 
-## Step 3: Forking a Checkpoint
+## Step 3: Forking a Journal Run
 
-Forking creates a new branch from an existing checkpoint, allowing you to explore alternative paths without affecting the original run:
-
-```python
-from qitos.checkpoint import fork_checkpoint, CheckpointConfig
-
-# Point to a specific checkpoint (e.g., step 3)
-source_config = CheckpointConfig(
-    thread_id="my-run-001",
-    checkpoint_id="abc123",  # The checkpoint to fork from
-)
-
-# Fork into a new thread (true branch)
-fork_config = await fork_checkpoint(
-    store,
-    source_config,
-    new_thread_id="my-run-001-branch-a",
-)
-
-# Run the agent from the forked state with a different prompt
-result = await engine.aresume_from_checkpoint(fork_config)
-```
-
-The original run is untouched. The forked run starts from the same state but can follow a different path.
-
-## Step 4: Time-Travel (Same-Thread Fork)
-
-If you omit `new_thread_id`, the fork creates a new checkpoint in the same thread and
-keeps the original lineage — useful for "undo and retry" scenarios:
+Use a Journal-backed Run when the work must support executable branching. Fork only a
+committed continuation position:
 
 ```python
-from qitos.checkpoint import fork_checkpoint, CheckpointConfig
+from qitos import Engine
+from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 
-# Fork within the same thread (time-travel)
-config = CheckpointConfig(
-    thread_id="my-run-001",
-    checkpoint_id="step2-checkpoint-id",
+journal_root = ".qitos/sessions"
+run = await Engine(
+    MyAgent(),
+    journal=JsonlSessionJournal(journal_root),
+    auto_approve=True,
+).arun("Analyze the dataset")
+
+catalog = JsonlRunCatalog(journal_root)
+handle = await catalog.inspect_run(run.run_id)
+boundary = handle.continuation_position
+if boundary is None:
+    raise RuntimeError("Run has no committed continuation boundary")
+
+child_run_id = "my-run-001-branch-a"
+child_journal = await Engine(
+    MyAgent(),
+    journal=JsonlSessionJournal(journal_root),
+    auto_approve=True,
+).afork_journal(
+    handle.run_id,
+    boundary,
+    new_run_id=child_run_id,
 )
-time_travel_config = await fork_checkpoint(store, config)
 
-# Re-run from the earlier state
-result = await engine.aresume_from_checkpoint(time_travel_config)
+# Resume the independent child without replaying committed Tools.
+branch_result = await Engine(
+    MyAgent(),
+    journal=child_journal,
+    auto_approve=True,
+).aresume_from_journal(child_run_id)
 ```
+
+The source Run is untouched. The Child owns an independent inherited prefix and can
+resume even if the ancestor files later become unavailable.
+
+## Step 4: Inspecting Run Lineage
+
+Use the read-only catalog to resolve parents and direct children without opening a
+writer lease or constructing an Engine:
+
+```python
+lineage = await catalog.lineage(child_run_id)
+children = await catalog.children(handle.run_id)
+print([item.run_id for item in lineage])
+print([item.run_id for item in children])
+```
+
+Terminal Runs remain read-only under resume. Continue them by explicitly forking their
+non-terminal `continuation_position` into a new Run id.
 
 ## Step 5: Durability Boundary
 
@@ -132,8 +149,8 @@ the same JSON-serializable payloads.
 
 ## Step 6: Inspecting the Snapshot
 
-Each checkpoint contains the state, original task, complete model-history
-prefix, and parent lineage needed by resume and fork:
+Each checkpoint contains the state, original task, complete model-history prefix, and
+snapshot parent needed by checkpoint resume:
 
 ```python
 config = CheckpointConfig(thread_id="my-run-001")

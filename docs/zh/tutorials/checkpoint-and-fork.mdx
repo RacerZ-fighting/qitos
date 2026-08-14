@@ -1,16 +1,18 @@
 ---
-title: "检查点与分支"
-description: "使用 QitOS 检查点机制保存、恢复和分支 Agent 运行。"
+title: "Checkpoint 恢复与 Journal 分支"
+description: "使用 checkpoint 恢复 snapshot，并通过 Session Journal 分支 canonical Run。"
 ---
 
-# 检查点与分支
+# Checkpoint 恢复与 Journal 分支
 
-QitOS 检查点让你可以在任意步骤保存 Agent 状态，在中断后恢复运行，以及从某个步骤分叉运行来探索替代路径——所有这些都不需要从头重新运行。
+QitOS checkpoint 保存 Agent 状态 snapshot，用于中断后的恢复。Session Journal 保存完整的
+模型与 Tool 事务，并拥有可执行 Run 的分支语义。一个 Engine 只能选择一种持久化模式；不要同时
+配置 checkpoint store 和 Journal。
 
 这对以下场景至关重要：
 - **长时间运行的任务**，可能被中断（网络错误、预算限制）
-- **分支实验**，你想从特定步骤探索"如果…会怎样？"
-- **时间旅行调试**，你从更早的检查点恢复状态
+- **分支实验**，从已提交的 Journal boundary 继续执行
+- **lineage 检查**，查询 Parent 与 Child Run
 
 ## Step 1: 基本检查点
 
@@ -70,50 +72,62 @@ Engine 从最新检查点恢复状态，从中断处继续执行。
 工具调用或新 checkpoint。若恢复用的 Engine 配置了新的 `TraceWriter`，QitOS 会用已保存的
 停止原因和结果正确结束这份空 trace。
 
-## Step 3: 分叉检查点
+## Step 3: 分叉 Journal Run
 
-分叉从现有检查点创建新分支，允许你探索替代路径而不影响原始运行：
-
-```python
-from qitos.checkpoint import fork_checkpoint, CheckpointConfig
-
-# 指向特定检查点（例如第 3 步）
-source_config = CheckpointConfig(
-    thread_id="my-run-001",
-    checkpoint_id="abc123",  # 要分叉的检查点
-)
-
-# 分叉到新线程（真正分支）
-fork_config = await fork_checkpoint(
-    store,
-    source_config,
-    new_thread_id="my-run-001-branch-a",
-)
-
-# 从分叉状态以不同提示运行 Agent
-result = await engine.aresume_from_checkpoint(fork_config)
-```
-
-原始运行不受影响。分叉运行从相同状态开始，但可以走不同路径。
-
-## Step 4: 时间旅行（同线程分叉）
-
-如果省略 `new_thread_id`，分叉会在同一线程创建新的检查点并保留原有链路——适用于
-"撤销并重试"场景：
+需要可执行分支时，应创建 Journal-backed Run，并且只从已提交的 continuation position
+进行 fork：
 
 ```python
-from qitos.checkpoint import fork_checkpoint, CheckpointConfig
+from qitos import Engine
+from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 
-# 在同一线程内分叉（时间旅行）
-config = CheckpointConfig(
-    thread_id="my-run-001",
-    checkpoint_id="step2-checkpoint-id",
+journal_root = ".qitos/sessions"
+run = await Engine(
+    MyAgent(),
+    journal=JsonlSessionJournal(journal_root),
+    auto_approve=True,
+).arun("分析数据集")
+
+catalog = JsonlRunCatalog(journal_root)
+handle = await catalog.inspect_run(run.run_id)
+boundary = handle.continuation_position
+if boundary is None:
+    raise RuntimeError("Run 没有已提交的 continuation boundary")
+
+child_run_id = "my-run-001-branch-a"
+child_journal = await Engine(
+    MyAgent(),
+    journal=JsonlSessionJournal(journal_root),
+    auto_approve=True,
+).afork_journal(
+    handle.run_id,
+    boundary,
+    new_run_id=child_run_id,
 )
-time_travel_config = await fork_checkpoint(store, config)
 
-# 从更早状态重新运行
-result = await engine.aresume_from_checkpoint(time_travel_config)
+# 恢复独立 Child，不重放已提交的 Tool。
+branch_result = await Engine(
+    MyAgent(),
+    journal=child_journal,
+    auto_approve=True,
+).aresume_from_journal(child_run_id)
 ```
+
+原始 Run 不受影响。Child 拥有独立的 inherited prefix；即使祖先文件之后不可用，仍可恢复。
+
+## Step 4: 检查 Run Lineage
+
+只读 catalog 无需取得 writer lease 或创建 Engine，就能查询祖先与直接 Child：
+
+```python
+lineage = await catalog.lineage(child_run_id)
+children = await catalog.children(handle.run_id)
+print([item.run_id for item in lineage])
+print([item.run_id for item in children])
+```
+
+Terminal Run 的 resume 始终只读；需要继续工作时，应把它的非终态
+`continuation_position` 显式 fork 到新的 Run id。
 
 ## Step 5: 持久化边界
 
@@ -128,7 +142,8 @@ Engine 也会在每个完整 step 结束后等待 `CheckpointStore.put()`。写�
 
 ## Step 6: 检查快照
 
-每个 checkpoint 保存恢复和 fork 真正需要的状态、原始任务、完整模型历史前缀与父级链路：
+每个 checkpoint 保存 checkpoint resume 所需的状态、原始任务、完整模型历史前缀与
+snapshot 父级：
 
 ```python
 config = CheckpointConfig(thread_id="my-run-001")

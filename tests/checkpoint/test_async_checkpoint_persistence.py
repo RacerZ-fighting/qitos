@@ -18,8 +18,6 @@ from qitos.checkpoint import (
     CheckpointStore,
     InMemoryCheckpointStore,
     SqliteCheckpointStore,
-    fork_checkpoint,
-    list_fork_history,
 )
 from qitos.core.history import HistoryMessage, HistorySnapshot
 from qitos.trace.events import TraceEvent, TraceStep
@@ -103,7 +101,9 @@ async def test_store_round_trips_recoverable_model_history(store_factory) -> Non
 
 
 @pytest.mark.asyncio
-async def test_store_lists_and_forks_lineage(store_factory) -> None:
+async def test_store_lists_snapshots_in_reverse_chronological_order(
+    store_factory,
+) -> None:
     store = store_factory()
     first = _checkpoint("cp-1", step=1)
     second = _checkpoint("cp-2", step=2)
@@ -115,19 +115,6 @@ async def test_store_lists_and_forks_lineage(store_factory) -> None:
         listed = await store.list(CheckpointConfig(thread_id="run-1"))
         assert [item.checkpoint.id for item in listed] == ["cp-2", "cp-1"]
 
-        forked = await fork_checkpoint(
-            store,
-            CheckpointConfig(thread_id="run-1", checkpoint_id=second.id),
-            new_thread_id="run-1-child",
-        )
-        branch = await store.get(forked)
-        assert branch is not None
-        assert branch.parent_id == second.id
-        assert branch.parent_thread_id == "run-1"
-        assert branch.history == second.history
-
-        lineage = await list_fork_history(store, forked)
-        assert [item.checkpoint.id for item in lineage][1:] == ["cp-2", "cp-1"]
     finally:
         await store.close()
 

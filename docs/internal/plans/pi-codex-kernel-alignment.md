@@ -64,6 +64,7 @@ Each module plan records:
   canonical trace and handoff events.
 - [x] Remove the deprecated debug replay model and non-canonical trace-file fork.
 - [x] Remove the unused decorator-driven functional Agent/task execution path.
+- [x] Remove snapshot-copy checkpoint branching in favor of committed Journal fork.
 - [ ] MCP refresh and admission alignment.
 - [ ] Runtime capability and managed container alignment.
 - [ ] Permission/scope alignment.

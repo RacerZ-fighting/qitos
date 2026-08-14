@@ -24,6 +24,10 @@ How to update:
   `AgentModule` conversion never executed the wrapped function. Applications now use
   `AgentModule + Engine` for Agents and the maintained function-tool decorator for
   ordinary callable Tools.
+- **Breaking:** Removed `qitos.checkpoint.fork`, including `fork_checkpoint()` and
+  `list_fork_history()`. Copying a checkpoint snapshot did not create a canonical Run
+  transaction or resumable lineage. Checkpoint persistence and snapshot resume remain;
+  executable branching uses `SessionJournal.fork()` at a committed position.
 - **Breaking:** Removed the process-global `qitos.tracing` provider/processor
   hierarchy, the `Engine(..., tracing_provider=...)` argument, and the W&B/MLflow
   extras. Canonical runtime events, `TraceWriter`, the Session Journal, and `qita`
