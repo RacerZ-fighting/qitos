@@ -424,10 +424,8 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 record=record,
             ),
         )
-        current_task = asyncio.current_task()
         if (
-            current_task is not None
-            and current_task.cancelling()
+            exec_stats.get("cancel_source") == "caller_cancelled"
             and not engine._cancel_token.is_cancel_requested
         ):
             # The executor returned one terminal result per action and the

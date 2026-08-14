@@ -6,7 +6,6 @@ reducer, completion, and persistence ordering cannot drift.
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 from uuid import uuid4
@@ -167,15 +166,6 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
                 action_results = []
             else:
                 action_results = await engine._run_act(state, decision, record, turn)
-                current_task = asyncio.current_task()
-                if (
-                    current_task is not None
-                    and current_task.cancelling()
-                    and not engine._cancel_token.is_cancel_requested
-                ):
-                    # Tool cleanup and terminal persistence have completed.
-                    # Re-surface caller cancellation before the pure reducer.
-                    raise asyncio.CancelledError
 
             next_observation = engine._build_observation_after_action(
                 state=state,
@@ -236,9 +226,7 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
                     state=state,
                     terminal=True,
                 )
-            self._after_step_hook(
-                state, record, task=task, phase=RuntimePhase.CRITIC
-            )
+            self._after_step_hook(state, record, task=task, phase=RuntimePhase.CRITIC)
             engine._emit(
                 current_step,
                 RuntimePhase.END,
@@ -276,9 +264,7 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
                 current_step,
                 started_at,
             )
-            engine.validation_gate.after_phase(
-                state, RuntimePhase.CHECK_STOP.value
-            )
+            engine.validation_gate.after_phase(state, RuntimePhase.CHECK_STOP.value)
             engine._finalize_step(record, state)
             if not stop and managed_run:
                 state.advance_step()
@@ -294,9 +280,7 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
                     await engine._save_checkpoint(current_step, state, task)
             if stop:
                 engine._runtime_inbox.close(engine.active_run_id)
-        self._after_step_hook(
-            state, record, task=task, phase=RuntimePhase.CHECK_STOP
-        )
+        self._after_step_hook(state, record, task=task, phase=RuntimePhase.CHECK_STOP)
 
         if stop:
             engine._emit(

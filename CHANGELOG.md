@@ -173,6 +173,9 @@ How to update:
 
 ### Fixed
 
+- Caller cancellation after Tool execution now reuses the executor's typed terminal
+  `cancel_source` instead of inspecting Python-version-specific Task internals. The
+  Engine still commits one terminal result per ToolCall before propagating cancellation.
 - Resume now derives idempotent background Child and process completion inputs from local
   terminal facts. A crash between `child.terminal` / `process.terminal` and mailbox
   acceptance no longer loses the notification; foreground Child results are not
