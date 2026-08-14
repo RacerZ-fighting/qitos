@@ -44,7 +44,9 @@ read-only and are not dependencies.
 - [x] A checked runtime-requirement snapshot marks catalog availability and prevents
   full loading when requirements are missing; an omitted snapshot remains explicitly
   unchecked for compatibility.
-- [x] Existing provider-backed search/install tools remain behaviorally separate.
+- [x] Provider-backed search/install tools remained separate for this delivery and
+  were subsequently removed by `httpx-skill-convergence.md`; the bundled disclosure
+  contract did not change.
 - [x] Focused tests, full QitOS checks, consuming PentestAgent checks, configured live
   Provider contracts, and relevant isolated runtime acceptance pass before merge.
 

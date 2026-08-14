@@ -20,7 +20,6 @@ from qitos.benchmark import (
 )
 from qitos.demo.minimal import main as minimal_demo_main
 from qitos.core.spec import RunSpec
-from qitos.kit.skill.cli import main as skill_main
 from qitos.qita._cli_app import _cmd_export as qita_export
 from qitos.qita._cli_app import _cmd_replay as qita_replay
 
@@ -29,15 +28,16 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args and args[0] == "--version":
         from qitos import __version__
+
         print(f"qit {__version__}")
         return 0
     if args and args[0] in {"-h", "--help"}:
         parser = argparse.ArgumentParser(
-            prog="qit", description="QitOS CLI for demos, benchmarks, and developer workflows"
+            prog="qit",
+            description="QitOS CLI for demos, benchmarks, and developer workflows",
         )
         subparsers = parser.add_subparsers(dest="command")
         subparsers.add_parser("demo", help="Run packaged demos and quickstarts")
-        subparsers.add_parser("skill", help="Manage third-party skills")
         subparsers.add_parser("bench", help="Unified benchmark CLI")
         subparsers.add_parser("experiment", help="Run parameter-sweep experiments")
         subparsers.add_parser("leaderboard", help="Local benchmark leaderboard")
@@ -50,8 +50,6 @@ def main(argv: list[str] | None = None) -> int:
         remaining = args[1:]
         if command == "demo":
             return _demo_main(remaining)
-        if command == "skill":
-            return skill_main(remaining)
         if command == "bench":
             return _bench_main(remaining)
         if command == "experiment":
@@ -63,11 +61,11 @@ def main(argv: list[str] | None = None) -> int:
         if command == "pull":
             return _pull_main(remaining)
     parser = argparse.ArgumentParser(
-        prog="qit", description="QitOS CLI for demos, benchmarks, and developer workflows"
+        prog="qit",
+        description="QitOS CLI for demos, benchmarks, and developer workflows",
     )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("demo", help="Run packaged demos and quickstarts")
-    subparsers.add_parser("skill", help="Manage third-party skills")
     subparsers.add_parser("bench", help="Unified benchmark CLI")
     subparsers.add_parser("experiment", help="Run parameter-sweep experiments")
     subparsers.add_parser("leaderboard", help="Local benchmark leaderboard")
@@ -78,7 +76,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _demo_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="qit demo", description="QitOS packaged demos")
+    parser = argparse.ArgumentParser(
+        prog="qit demo", description="QitOS packaged demos"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_minimal = sub.add_parser(
@@ -127,7 +127,9 @@ def _demo_main(argv: list[str]) -> int:
 
 
 def _bench_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="qit bench", description="QitOS benchmark CLI")
+    parser = argparse.ArgumentParser(
+        prog="qit bench", description="QitOS benchmark CLI"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_run = sub.add_parser("run", help="Prepare or run benchmark tasks")
@@ -164,9 +166,11 @@ def _bench_main(argv: list[str]) -> int:
     p_export.add_argument("--html", required=True)
 
     p_list = sub.add_parser("list", help="List available benchmarks and splits")
-    p_list.add_argument("--benchmark", default=None, help="Show splits for a specific benchmark")
+    p_list.add_argument(
+        "--benchmark", default=None, help="Show splits for a specific benchmark"
+    )
 
-    p_presets = sub.add_parser("presets", help="List available model-family presets")
+    sub.add_parser("presets", help="List available model-family presets")
 
     args = parser.parse_args(argv)
     if args.command == "run":
@@ -303,7 +307,11 @@ def _bench_presets(args: argparse.Namespace) -> int:
         marker = " *" if preset.id in gold_ids else ""
         ctx = preset.context_policy.context_window_hint
         ctx_str = f"{ctx // 1000}k" if ctx else "-"
-        models = ", ".join(preset.recommended_models[:2]) if preset.recommended_models else "-"
+        models = (
+            ", ".join(preset.recommended_models[:2])
+            if preset.recommended_models
+            else "-"
+        )
         print(
             f"  {preset.id:12s}{marker}  {preset.display_name:16s}  "
             f"{preset.default_protocol:26s}  {preset.tool_policy.primary_delivery:18s}  "
@@ -322,12 +330,20 @@ def _experiment_main(argv: list[str]) -> int:
 
     p_run = sub.add_parser("run", help="Run an experiment from a YAML config")
     p_run.add_argument("--config", required=True, help="Path to experiment YAML config")
-    p_run.add_argument("--output", default="./runs/experiments", help="Output directory")
-    p_run.add_argument("--cache", choices=["memory", "disk"], default=None, help="Cache backend")
-    p_run.add_argument("--cache-dir", default="./runs/cache", help="Cache directory (disk backend)")
+    p_run.add_argument(
+        "--output", default="./runs/experiments", help="Output directory"
+    )
+    p_run.add_argument(
+        "--cache", choices=["memory", "disk"], default=None, help="Cache backend"
+    )
+    p_run.add_argument(
+        "--cache-dir", default="./runs/cache", help="Cache directory (disk backend)"
+    )
     p_run.add_argument("--concurrency", type=int, default=1, help="Parallel tasks")
     p_run.add_argument("--resume", action="store_true", help="Skip completed tasks")
-    p_run.add_argument("--agent-module", default=None, help="Dotted path to AgentModule subclass")
+    p_run.add_argument(
+        "--agent-module", default=None, help="Dotted path to AgentModule subclass"
+    )
 
     args = parser.parse_args(argv)
     if args.command == "run":
@@ -338,7 +354,6 @@ def _experiment_main(argv: list[str]) -> int:
 def _experiment_run(args: argparse.Namespace) -> int:
     from qitos.config.loader import load_agent_config
     from qitos.experiment import ExperimentRunner, SweepSpec
-    from qitos.experiment.sweep import sweep_product
     from qitos.core.spec import ExperimentSpec
 
     config = load_agent_config(args.config)
@@ -403,28 +418,40 @@ def _experiment_run(args: argparse.Namespace) -> int:
 
 
 def _leaderboard_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="qit leaderboard", description="Local benchmark leaderboard")
+    parser = argparse.ArgumentParser(
+        prog="qit leaderboard", description="Local benchmark leaderboard"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_submit = sub.add_parser("submit", help="Submit benchmark results to the leaderboard")
+    p_submit = sub.add_parser(
+        "submit", help="Submit benchmark results to the leaderboard"
+    )
     p_submit.add_argument("--results", help="Path to JSONL results file")
     p_submit.add_argument("--run-dir", help="Path to a single run directory")
-    p_submit.add_argument("--db", default="./runs/leaderboard.db", help="Leaderboard database path")
+    p_submit.add_argument(
+        "--db", default="./runs/leaderboard.db", help="Leaderboard database path"
+    )
 
     p_show = sub.add_parser("show", help="Show leaderboard entries")
     p_show.add_argument("--benchmark", help="Filter by benchmark name")
     p_show.add_argument("--split", help="Filter by split")
     p_show.add_argument("--model", help="Filter by model name")
-    p_show.add_argument("--official", action="store_true", help="Show only official runs")
+    p_show.add_argument(
+        "--official", action="store_true", help="Show only official runs"
+    )
     p_show.add_argument("--sort-by", default="submitted_at", help="Sort field")
     p_show.add_argument("--limit", type=int, default=50, help="Max rows to show")
-    p_show.add_argument("--db", default="./runs/leaderboard.db", help="Leaderboard database path")
+    p_show.add_argument(
+        "--db", default="./runs/leaderboard.db", help="Leaderboard database path"
+    )
 
     p_summary = sub.add_parser("summary", help="Show aggregated statistics")
     p_summary.add_argument("--benchmark", required=True, help="Benchmark name")
     p_summary.add_argument("--split", required=True, help="Split name")
     p_summary.add_argument("--official", action="store_true", help="Official runs only")
-    p_summary.add_argument("--db", default="./runs/leaderboard.db", help="Leaderboard database path")
+    p_summary.add_argument(
+        "--db", default="./runs/leaderboard.db", help="Leaderboard database path"
+    )
 
     args = parser.parse_args(argv)
 
@@ -460,7 +487,9 @@ def _leaderboard_main(argv: list[str]) -> int:
             if not rows:
                 print("No entries found.")
                 return 0
-            print(f"{'model':30s} {'bench':15s} {'split':10s} {'ok':3s} {'steps':6s} {'lat':8s} {'official':3s} {'submitted':20s}")
+            print(
+                f"{'model':30s} {'bench':15s} {'split':10s} {'ok':3s} {'steps':6s} {'lat':8s} {'official':3s} {'submitted':20s}"
+            )
             for r in rows:
                 print(
                     f"{r.model_name:30s} {r.benchmark:15s} {r.split:10s} "
@@ -489,14 +518,23 @@ def _leaderboard_main(argv: list[str]) -> int:
 
 
 def _push_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="qit push", description="Push trace artifacts to HF Hub")
+    parser = argparse.ArgumentParser(
+        prog="qit push", description="Push trace artifacts to HF Hub"
+    )
     parser.add_argument("--run", help="Path to a single run directory")
     parser.add_argument("--logdir", help="Push all runs in a logdir")
     parser.add_argument("--repo", required=True, help="HF Hub dataset repo ID")
     parser.add_argument("--token", help="HF Hub API token")
     parser.add_argument("--revision", help="Git revision/branch")
-    parser.add_argument("--private", action="store_true", default=True, help="Make repo private (default)")
-    parser.add_argument("--public", action="store_false", dest="private", help="Make repo public")
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        default=True,
+        help="Make repo private (default)",
+    )
+    parser.add_argument(
+        "--public", action="store_false", dest="private", help="Make repo public"
+    )
 
     args = parser.parse_args(argv)
 
@@ -509,8 +547,11 @@ def _push_main(argv: list[str]) -> int:
     if args.run:
         try:
             url = push_run(
-                args.run, args.repo, token=args.token,
-                revision=args.revision, private=args.private,
+                args.run,
+                args.repo,
+                token=args.token,
+                revision=args.revision,
+                private=args.private,
             )
             print(f"Pushed to {url}")
         except Exception as exc:
@@ -528,8 +569,11 @@ def _push_main(argv: list[str]) -> int:
             if run_dir.is_dir() and (run_dir / "manifest.json").exists():
                 try:
                     url = push_run(
-                        run_dir, args.repo, token=args.token,
-                        revision=args.revision, private=args.private,
+                        run_dir,
+                        args.repo,
+                        token=args.token,
+                        revision=args.revision,
+                        private=args.private,
                     )
                     print(f"Pushed {run_dir.name} -> {url}")
                     count += 1
@@ -543,7 +587,9 @@ def _push_main(argv: list[str]) -> int:
 
 
 def _pull_main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(prog="qit pull", description="Pull trace artifacts from HF Hub")
+    parser = argparse.ArgumentParser(
+        prog="qit pull", description="Pull trace artifacts from HF Hub"
+    )
     parser.add_argument("--run-id", required=True, help="Run ID to download")
     parser.add_argument("--repo", required=True, help="HF Hub dataset repo ID")
     parser.add_argument("--output", default="./runs", help="Local output directory")
@@ -560,8 +606,11 @@ def _pull_main(argv: list[str]) -> int:
 
     try:
         local_path = pull_run(
-            args.run_id, args.repo, args.output,
-            token=args.token, revision=args.revision,
+            args.run_id,
+            args.repo,
+            args.output,
+            token=args.token,
+            revision=args.revision,
         )
         print(f"Pulled to {local_path}")
     except Exception as exc:

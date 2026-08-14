@@ -7,17 +7,14 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
+import httpx
+
 from qitos.core.env import EnvObservation
 from qitos.kit.env.host_env import HostEnv
 
 try:
-    import requests
-except Exception:  # pragma: no cover
-    requests = None  # type: ignore[assignment]
-
-try:
     from bs4 import BeautifulSoup
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     BeautifulSoup = None  # type: ignore[assignment]
 
 
@@ -49,18 +46,19 @@ class TextWebBrowserOps:
         self.state = _PageState()
 
     def search(self, query: str, max_results: int = 8) -> Dict[str, Any]:
-        if requests is None:
-            return {"status": "error", "message": "requests is not available"}
         if not query or not query.strip():
             return {"status": "error", "message": "query cannot be empty"}
         max_results = max(1, min(int(max_results), 20))
         url = f"https://duckduckgo.com/html/?q={quote_plus(query.strip())}"
         try:
-            r = requests.get(
-                url, headers={"User-Agent": self.user_agent}, timeout=self.timeout
+            r = httpx.get(
+                url,
+                headers={"User-Agent": self.user_agent},
+                timeout=self.timeout,
+                follow_redirects=True,
             )
             html = r.text
-        except Exception as exc:
+        except httpx.HTTPError as exc:
             return {"status": "error", "message": str(exc)}
         pattern = re.compile(
             r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
@@ -84,14 +82,15 @@ class TextWebBrowserOps:
     def visit(
         self, url: str, max_chars: int = 30000, keep_links: bool = True
     ) -> Dict[str, Any]:
-        if requests is None:
-            return {"status": "error", "message": "requests is not available"}
         try:
-            r = requests.get(
-                url, headers={"User-Agent": self.user_agent}, timeout=self.timeout
+            r = httpx.get(
+                url,
+                headers={"User-Agent": self.user_agent},
+                timeout=self.timeout,
+                follow_redirects=True,
             )
             text, title = self._html_to_text(r.text, keep_links=keep_links)
-        except Exception as exc:
+        except httpx.HTTPError as exc:
             return {"status": "error", "message": str(exc)}
 
         if max_chars > 0 and len(text) > max_chars:
@@ -196,7 +195,7 @@ class TextWebBrowserOps:
         self, html: str, keep_links: bool = True
     ) -> tuple[str, Optional[str]]:
         if BeautifulSoup is not None:
-            soup = BeautifulSoup(html, "lxml")
+            soup = BeautifulSoup(html, "html.parser")
             for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
                 tag.decompose()
             if keep_links:

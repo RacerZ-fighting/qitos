@@ -9,6 +9,7 @@ import threading
 from qitos.benchmark import read_benchmark_results
 from qitos.benchmark.osworld import (
     OSWorldBenchmarkAdapter,
+    OSWorldContainerLauncher,
     OSWorldRuntimeHook,
     evaluate_task,
     run_setup_config,
@@ -92,7 +93,9 @@ def test_osworld_runtime_hook_prepares_mock_env(tmp_path: Path) -> None:
     prepared = OSWorldRuntimeHook(settings={"mock_mode": True}).prepare(
         task=task,
         run_spec=RunSpec(benchmark_name="osworld", benchmark_split="test"),
-        experiment_spec=ExperimentSpec(name="osworld:test", benchmark_name="osworld", benchmark_split="test"),
+        experiment_spec=ExperimentSpec(
+            name="osworld:test", benchmark_name="osworld", benchmark_split="test"
+        ),
     )
     assert prepared.task.env_spec is not None
     assert prepared.task.env_spec.config["provider"] == "mock"
@@ -135,12 +138,14 @@ def test_osworld_setup_and_eval_bridges(tmp_path: Path) -> None:
         thread.join(timeout=2)
 
 
-def test_osworld_runtime_and_desktop_env_use_external_controller(tmp_path: Path) -> None:
+def test_osworld_runtime_and_desktop_env_use_external_controller(
+    tmp_path: Path,
+) -> None:
     screenshot = tmp_path / "desktop.png"
     _write_tiny_png(screenshot)
     dataset = _write_osworld_dataset(tmp_path, screenshot)
     recorded_actions: list[dict[str, object]] = []
-    screenshot_bytes = (b"\x89PNG" + b"x" * 12032)
+    screenshot_bytes = b"\x89PNG" + b"x" * 12032
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -154,13 +159,19 @@ def test_osworld_runtime_and_desktop_env_use_external_controller(tmp_path: Path)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"AT": {"role": "window", "name": "OSWorld"}}).encode("utf-8"))
+                self.wfile.write(
+                    json.dumps({"AT": {"role": "window", "name": "OSWorld"}}).encode(
+                        "utf-8"
+                    )
+                )
                 return
             if self.path == "/terminal":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"output": "$ echo osworld\nosworld\n"}).encode("utf-8"))
+                self.wfile.write(
+                    json.dumps({"output": "$ echo osworld\nosworld\n"}).encode("utf-8")
+                )
                 return
             self.send_response(404)
             self.end_headers()
@@ -190,11 +201,15 @@ def test_osworld_runtime_and_desktop_env_use_external_controller(tmp_path: Path)
             "screenshot_path": str(screenshot),
             "visual_ready_timeout_sec": 1,
         }
-        task.metadata["runtime_container"]["startup"] = dict(task.metadata["osworld_settings"])
+        task.metadata["runtime_container"]["startup"] = dict(
+            task.metadata["osworld_settings"]
+        )
         prepared = OSWorldRuntimeHook().prepare(
             task=task,
             run_spec=RunSpec(benchmark_name="osworld", benchmark_split="test"),
-            experiment_spec=ExperimentSpec(name="osworld:test", benchmark_name="osworld", benchmark_split="test"),
+            experiment_spec=ExperimentSpec(
+                name="osworld:test", benchmark_name="osworld", benchmark_split="test"
+            ),
         )
         assert prepared.task.env_spec is not None
         cfg = prepared.task.env_spec.config
@@ -219,6 +234,51 @@ def test_osworld_runtime_and_desktop_env_use_external_controller(tmp_path: Path)
         assert recorded_actions
         assert recorded_actions[0]["action_type"] == "CLICK"
         env.teardown()
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+def test_osworld_launcher_streams_redirected_vm_download(tmp_path: Path) -> None:
+    payload = b"vm-image" * 700_000
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/image.bin")
+                self.end_headers()
+                return
+            if self.path == "/image.bin":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+            _ = (format, args)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        launcher = OSWorldContainerLauncher(
+            repo_root=tmp_path,
+            settings={
+                "vm_cache_dir": str(tmp_path / "cache"),
+                "vm_url": f"{endpoint}/redirect",
+            },
+        )
+        vm_path, downloaded = launcher._ensure_default_vm()
+
+        assert downloaded is True
+        assert vm_path.read_bytes() == payload
+        assert not vm_path.with_suffix(vm_path.suffix + ".part").exists()
     finally:
         server.shutdown()
         thread.join(timeout=2)

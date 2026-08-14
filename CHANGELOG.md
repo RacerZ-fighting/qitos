@@ -19,6 +19,14 @@ How to update:
 
 ### Removed
 
+- **Breaking:** Removed the unused network-backed SkillHub installer, mutable Skill
+  registry, `SkilledAgent` mixin, `qit skill` command, runtime install/search tools,
+  and their compatibility loader. `SkillToolSet` now exposes only application-owned
+  bundled `SKILL.md` discovery, full loading, and bounded relative-resource reads.
+- **Breaking:** Removed the orphaned `SearchBackend` hierarchy and its DuckDuckGo,
+  Google CSE, Perplexity, SearXNG, Sploitus, Tavily, and Traversaal adapters. Managed
+  public search remains available through `WebSearchCapability` and
+  `ManagedWebSearchTool`.
 - **Breaking:** Removed deprecated compatibility import paths under `qitos.kit.tool`
   (`taskboard`, `report_toolset`, `text_web_browser`, `skill_tools`,
   `network_toolset`, `web_test_toolset`, and `tools`). Use the canonical tool and
@@ -52,6 +60,10 @@ How to update:
 
 ### Changed
 
+- QitOS now uses `httpx` as its only direct HTTP client dependency. Text Web, desktop
+  controllers, OSWorld setup/probes, and streamed VM downloads preserve redirects and
+  timeout behavior while sharing the same SOCKS-capable transport dependency as MCP
+  and managed Web capabilities.
 - Run handles now expose a stable lineage id, immediate parent, latest committed
   position, and latest non-terminal continuation position. `Engine.arun()` can bind a
   product lineage id, forks inherit it, legacy Journals derive a stable root id, and a

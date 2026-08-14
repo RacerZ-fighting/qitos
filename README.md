@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One Skill path and one HTTP client**: QitOS now keeps only progressive, read-only
+  bundled `SKILL.md` disclosure in the Agent runtime. The old SkillHub installer,
+  mutable registry, self-install Tools, and orphaned search adapters are gone; all
+  maintained sync/async HTTP paths use SOCKS-capable `httpx` directly.
 - **Canonical tool imports only**: seven deprecated `qitos.kit.tool.*` forwarding
   modules are gone. Applications now import tools and toolset builders from their
   maintained `qitos.kit.tool` or `qitos.kit.toolset` owners; experimental security

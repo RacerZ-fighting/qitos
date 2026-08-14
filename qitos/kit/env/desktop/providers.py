@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
-import requests
+import httpx
 
 from qitos.core.multimodal import guess_mime_type
 
@@ -38,7 +38,9 @@ class DesktopProvider(ABC):
         """Return screenshot/a11y/terminal/instruction-like state."""
 
     @abstractmethod
-    def execute_action(self, action: Mapping[str, Any], state: Any = None) -> Dict[str, Any]:
+    def execute_action(
+        self, action: Mapping[str, Any], state: Any = None
+    ) -> Dict[str, Any]:
         """Execute one normalized GUI action."""
 
     def health_check(self) -> Dict[str, Any]:
@@ -101,12 +103,17 @@ class MockDesktopProvider(DesktopProvider):
             "ocr": list(self.ocr),
             "ui_candidates": list(self.ui_candidates),
             "instruction": self.instruction,
-            "screen_size": {"width": int(self.screen_size[0]), "height": int(self.screen_size[1])},
+            "screen_size": {
+                "width": int(self.screen_size[0]),
+                "height": int(self.screen_size[1]),
+            },
             "metadata": dict(self.metadata),
             "action_history": list(self.actions),
         }
 
-    def execute_action(self, action: Mapping[str, Any], state: Any = None) -> Dict[str, Any]:
+    def execute_action(
+        self, action: Mapping[str, Any], state: Any = None
+    ) -> Dict[str, Any]:
         _ = state
         normalized = normalize_gui_action(action)
         self.actions.append(normalized)
@@ -187,13 +194,20 @@ class ContainerDesktopProvider(DesktopProvider):
                 "mime_type": guess_mime_type(self.screenshot_path),
                 "detail": "original",
             },
-            "accessibility_tree": remote_state.get("accessibility_tree", self.accessibility_tree),
+            "accessibility_tree": remote_state.get(
+                "accessibility_tree", self.accessibility_tree
+            ),
             "terminal": str(remote_state.get("terminal") or self.terminal),
             "dom": remote_state.get("dom", self.dom),
             "ocr": list(remote_state.get("ocr") or self.ocr),
-            "ui_candidates": list(remote_state.get("ui_candidates") or self.ui_candidates),
+            "ui_candidates": list(
+                remote_state.get("ui_candidates") or self.ui_candidates
+            ),
             "instruction": self.instruction,
-            "screen_size": {"width": int(self.screen_size[0]), "height": int(self.screen_size[1])},
+            "screen_size": {
+                "width": int(self.screen_size[0]),
+                "height": int(self.screen_size[1]),
+            },
             "metadata": {
                 "container": self.container,
                 "controller_endpoint": self._effective_controller_endpoint(),
@@ -203,17 +217,20 @@ class ContainerDesktopProvider(DesktopProvider):
             "action_history": list(self.actions),
         }
 
-    def execute_action(self, action: Mapping[str, Any], state: Any = None) -> Dict[str, Any]:
+    def execute_action(
+        self, action: Mapping[str, Any], state: Any = None
+    ) -> Dict[str, Any]:
         _ = state
         normalized = normalize_gui_action(action)
         self.actions.append(normalized)
         endpoint = self._effective_controller_endpoint()
         if endpoint:
             try:
-                resp = requests.post(
+                resp = httpx.post(
                     f"{endpoint.rstrip('/')}/execute",
                     json=to_osworld_action(normalized),
                     timeout=60,
+                    follow_redirects=True,
                 )
                 success = int(resp.status_code) == 200
                 return action_result_payload(
@@ -229,7 +246,7 @@ class ContainerDesktopProvider(DesktopProvider):
                         "status_code": int(resp.status_code),
                     },
                 )
-            except Exception as exc:
+            except httpx.HTTPError as exc:
                 return action_result_payload(
                     action=normalized,
                     status="error",
@@ -258,7 +275,11 @@ class ContainerDesktopProvider(DesktopProvider):
     def health_check(self) -> Dict[str, Any]:
         endpoint = self._effective_controller_endpoint()
         if not self.container and not endpoint:
-            return {"ok": False, "message": "container and controller endpoint are both empty", "provider": self.name}
+            return {
+                "ok": False,
+                "message": "container and controller endpoint are both empty",
+                "provider": self.name,
+            }
         if self.container:
             try:
                 proc = subprocess.run(
@@ -267,7 +288,7 @@ class ContainerDesktopProvider(DesktopProvider):
                     text=True,
                     timeout=20,
                 )
-            except Exception as exc:
+            except (OSError, subprocess.SubprocessError) as exc:
                 return {"ok": False, "message": str(exc), "provider": self.name}
             if proc.returncode != 0:
                 return {
@@ -279,9 +300,13 @@ class ContainerDesktopProvider(DesktopProvider):
                 }
         if endpoint:
             try:
-                screenshot = requests.get(f"{endpoint.rstrip('/')}/screenshot", timeout=15)
+                screenshot = httpx.get(
+                    f"{endpoint.rstrip('/')}/screenshot",
+                    timeout=15,
+                    follow_redirects=True,
+                )
                 endpoint_ok = bool(screenshot.status_code == 200)
-            except Exception as exc:
+            except httpx.HTTPError as exc:
                 return {
                     "ok": False,
                     "message": str(exc),
@@ -309,7 +334,9 @@ class ContainerDesktopProvider(DesktopProvider):
     def _ensure_runtime_available(self) -> None:
         health = self.health_check()
         if not bool(health.get("ok", False)):
-            raise RuntimeError(str(health.get("message", "container desktop provider unavailable")))
+            raise RuntimeError(
+                str(health.get("message", "container desktop provider unavailable"))
+            )
 
     def _effective_controller_endpoint(self) -> str:
         endpoint = self.controller_endpoint
@@ -325,13 +352,13 @@ class ContainerDesktopProvider(DesktopProvider):
         state: Dict[str, Any] = {}
         screenshot_url = f"{endpoint.rstrip('/')}/screenshot"
         try:
-            resp = requests.get(screenshot_url, timeout=20)
+            resp = httpx.get(screenshot_url, timeout=20, follow_redirects=True)
             if resp.status_code == 200 and resp.content:
                 target = Path(self.screenshot_path)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(resp.content)
                 state["screenshot_bytes"] = len(resp.content)
-        except Exception as exc:
+        except (httpx.HTTPError, OSError) as exc:
             state["screenshot_error"] = str(exc)
 
         for key, route in (
@@ -339,27 +366,51 @@ class ContainerDesktopProvider(DesktopProvider):
             ("terminal", "/terminal"),
         ):
             try:
-                resp = requests.get(f"{endpoint.rstrip('/')}{route}", timeout=20)
+                resp = httpx.get(
+                    f"{endpoint.rstrip('/')}{route}",
+                    timeout=20,
+                    follow_redirects=True,
+                )
                 if resp.status_code != 200:
                     continue
-                payload = resp.json() if "application/json" in str(resp.headers.get("content-type") or "") else {}
-                if key == "accessibility_tree":
-                    state[key] = payload.get("AT") or payload.get("accessibility_tree") or payload
+                payload = (
+                    resp.json()
+                    if "application/json" in str(resp.headers.get("content-type") or "")
+                    else {}
+                )
+                if not isinstance(payload, Mapping):
+                    state[key] = payload
+                elif key == "accessibility_tree":
+                    state[key] = (
+                        payload.get("AT")
+                        or payload.get("accessibility_tree")
+                        or payload
+                    )
                 else:
-                    state[key] = payload.get("output") or payload.get("terminal") or payload
-            except Exception as exc:
+                    state[key] = (
+                        payload.get("output") or payload.get("terminal") or payload
+                    )
+            except (httpx.HTTPError, ValueError) as exc:
                 state[f"{key}_error"] = str(exc)
 
         try:
-            resp = requests.get(f"{endpoint.rstrip('/')}/observation", timeout=20)
+            resp = httpx.get(
+                f"{endpoint.rstrip('/')}/observation",
+                timeout=20,
+                follow_redirects=True,
+            )
             if resp.status_code == 200:
-                payload = resp.json() if "application/json" in str(resp.headers.get("content-type") or "") else {}
+                payload = (
+                    resp.json()
+                    if "application/json" in str(resp.headers.get("content-type") or "")
+                    else {}
+                )
                 if isinstance(payload, Mapping):
                     for key in ("dom", "ocr", "ui_candidates", "screen_size"):
                         if key in payload:
                             state[key] = payload.get(key)
-        except Exception:
-            pass
+        except (httpx.HTTPError, ValueError) as exc:
+            state["observation_error"] = str(exc)
 
         state["captured_at"] = time.time()
         return state

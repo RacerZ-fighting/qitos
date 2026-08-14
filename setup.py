@@ -62,7 +62,6 @@ setup(
         "mcp>=1.28.1,<2",
         "pydantic>=2.13,<3",
         "ptyprocess>=0.7,<1; sys_platform != 'win32'",
-        "requests>=2.31.0",
         "beautifulsoup4>=4.12.3",
         "jsonschema>=4.23,<5",
         "rich>=13.7.0",

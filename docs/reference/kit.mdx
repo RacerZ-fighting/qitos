@@ -50,8 +50,7 @@ Use this page as a capability map for QitOS authoring.
 - `advanced_coding_tools(...)` for a Claude-style coding preset
 - `web_tools()` for web research and extraction
 - `task_tools(...)` for persistent task-board workflows
-- `SkillToolSet(...)` for read-only bundled Skill disclosure and optional
-  provider-backed Skill management
+- `SkillToolSet(...)` for read-only bundled Skill disclosure
 - explicit `qitos.kit.tool.experimental.security_research` imports for security research workflows
 - `thinking_tools()` for explicit thought-recording flows
 - `notebook_tools(...)`, `report_tools(...)`, and `epub_tools(...)` for narrower scenarios
@@ -519,8 +518,8 @@ registry.register_toolset(
 
 Expose a bounded catalog from application-owned, read-only Skill roots, load one
 selected `SKILL.md` without truncating its content, and page its linked UTF-8
-resources. The same toolset retains QitOS's separate provider-backed search, install,
-and activation tools.
+resources. Installation and package discovery are deployment concerns and are not
+available to the Agent through this toolset.
 
 ```python
 from qitos import ToolRegistry

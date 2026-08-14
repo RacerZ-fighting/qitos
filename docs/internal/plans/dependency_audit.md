@@ -2,10 +2,14 @@
 
 ## Current Packaging
 
-`setup.py` keeps the core runtime small:
+`setup.py` currently uses maintained protocol and validation libraries directly:
 
-- `requests`
+- `httpx[socks]`
+- `mcp`
+- `pydantic`
+- `ptyprocess` on non-Windows platforms
 - `beautifulsoup4`
+- `jsonschema`
 - `rich`
 - `pyyaml`
 
@@ -21,7 +25,10 @@ Extras:
 | --- | --- | --- |
 | `pyyaml` | core runtime dependency | Used by config/skill manifests; currently small enough to keep. |
 | `rich` | core/runtime UX dependency | Used by render and REPL helpers. Keep unless render becomes optional. |
-| `requests` | optional provider/browser/benchmark dependency | Used by provider adapters, web/search tools, OSWorld/CyberGym paths. Candidate for future optional split. |
+| `httpx[socks]` | core runtime dependency | Canonical sync/async HTTP client for MCP, managed Web, controller, and benchmark traffic. |
+| `mcp` | core runtime dependency | Official MCP SDK and protocol model owner. |
+| `pydantic` | core runtime dependency | Strict external configuration boundary validation. |
+| `ptyprocess` | platform runtime dependency | Official PTY process primitive on supported POSIX platforms. |
 | `beautifulsoup4` | optional browser/tool dependency | Used for web extraction. Candidate for future optional split. |
 | `openai` | optional model/provider dependency | Already in `[models]`. |
 | `litellm` | optional model/provider dependency | Already in `[models]`. |
@@ -37,9 +44,12 @@ Extras:
 - `qitos.examples*` is excluded from installable packages.
 - The completed temporary zoo migration staging is no longer part of this repository.
 
-## Recommended Next Split
+## Current convergence
 
-Avoid overcomplicating this PR. A later dependency PR should consider:
+The convergence recorded in
+[`httpx-skill-convergence.md`](httpx-skill-convergence.md) removed the duplicate HTTP
+dependency and old network-backed Skill/Search paths. A later packaging change may
+still consider:
 
 - `qitos[models]`: provider SDKs.
 - `qitos[benchmarks]`: benchmark runners and dataset SDKs.

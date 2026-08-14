@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **Skill 单主线，HTTP 单 client**：Agent runtime 只保留渐进披露、只读的 bundled
+  `SKILL.md`。旧 SkillHub installer、可变 registry、自安装 Tool 和孤立 search adapter
+  已删除；仍维护的同步/异步 HTTP 路径统一直接使用支持 SOCKS 的 `httpx`。
 - **Tool 只保留 canonical import**：7 个已废弃的 `qitos.kit.tool.*` 转发模块已删除。
   应用统一从仍在维护的 `qitos.kit.tool` 或 `qitos.kit.toolset` owner 导入；实验性
   security research 工具仍需显式选择。

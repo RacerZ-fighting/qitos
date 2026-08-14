@@ -15,15 +15,21 @@ class TestEpubToolMigration:
 
     def test_list_chapters_is_function_tool(self):
         tool = self.ts.list_chapters
-        assert isinstance(tool, FunctionTool), f"Expected FunctionTool, got {type(tool)}"
+        assert isinstance(
+            tool, FunctionTool
+        ), f"Expected FunctionTool, got {type(tool)}"
 
     def test_read_chapter_is_function_tool(self):
         tool = self.ts.read_chapter
-        assert isinstance(tool, FunctionTool), f"Expected FunctionTool, got {type(tool)}"
+        assert isinstance(
+            tool, FunctionTool
+        ), f"Expected FunctionTool, got {type(tool)}"
 
     def test_search_is_function_tool(self):
         tool = self.ts.search
-        assert isinstance(tool, FunctionTool), f"Expected FunctionTool, got {type(tool)}"
+        assert isinstance(
+            tool, FunctionTool
+        ), f"Expected FunctionTool, got {type(tool)}"
 
     def test_list_chapters_read_only(self):
         tool = self.ts.list_chapters
@@ -101,41 +107,17 @@ class TestThinkingToolMigration:
 
 
 class TestSkillToolMigration:
-    """Skill tools should be FunctionTool instances with correct read_only/needs_approval."""
+    """Bundled Skill tools are read-only FunctionTool instances."""
 
     def setup_method(self):
-        self.ts = SkillToolSet(workspace_root=".")
+        self.ts = SkillToolSet()
 
-    def test_check_skill_hub_is_function_tool(self):
-        assert isinstance(self.ts.check_skill_hub, FunctionTool)
-
-    def test_install_skill_hub_is_function_tool(self):
-        assert isinstance(self.ts.install_skill_hub, FunctionTool)
-
-    def test_search_skills_is_function_tool(self):
-        assert isinstance(self.ts.search_skills, FunctionTool)
-
-    def test_install_skill_is_function_tool(self):
-        assert isinstance(self.ts.install_skill, FunctionTool)
-
-    def test_activate_skill_is_function_tool(self):
-        assert isinstance(self.ts.activate_skill, FunctionTool)
-
-    def test_list_installed_skills_is_function_tool(self):
-        assert isinstance(self.ts.list_installed_skills, FunctionTool)
-
-    def test_get_skill_info_is_function_tool(self):
-        assert isinstance(self.ts.get_skill_info, FunctionTool)
+    def test_disclosure_tools_are_function_tools(self):
+        assert isinstance(self.ts.list_skills, FunctionTool)
+        assert isinstance(self.ts.load_skill, FunctionTool)
+        assert isinstance(self.ts.read_skill_resource, FunctionTool)
 
     def test_read_only_tools(self):
-        """check_skill_hub, search_skills, list_installed_skills, get_skill_info should be read_only."""
-        assert self.ts.check_skill_hub.meta.read_only is True
-        assert self.ts.search_skills.meta.read_only is True
-        assert self.ts.list_installed_skills.meta.read_only is True
-        assert self.ts.get_skill_info.meta.read_only is True
-
-    def test_approval_needed_tools(self):
-        """install_skill_hub, install_skill, activate_skill should need approval."""
-        assert self.ts.install_skill_hub.meta.needs_approval is True
-        assert self.ts.install_skill.meta.needs_approval is True
-        assert self.ts.activate_skill.meta.needs_approval is True
+        assert self.ts.list_skills.meta.read_only is True
+        assert self.ts.load_skill.meta.read_only is True
+        assert self.ts.read_skill_resource.meta.read_only is True

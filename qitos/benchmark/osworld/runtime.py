@@ -13,17 +13,14 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Sequence
 from urllib.parse import urlparse
 
-import requests
+import httpx
 
 from qitos.core import ExperimentSpec, RunSpec, Task
 from qitos.core.task import TaskBudget
 
 from ..contracts import BenchmarkRuntimeHook, PreparedBenchmarkTask
 
-
-OSWORLD_DEFAULT_BOOT_URL = (
-    "https://huggingface.co/datasets/xlangai/ubuntu_osworld/resolve/main/Ubuntu.qcow2.zip"
-)
+OSWORLD_DEFAULT_BOOT_URL = "https://huggingface.co/datasets/xlangai/ubuntu_osworld/resolve/main/Ubuntu.qcow2.zip"
 OSWORLD_DEFAULT_IMAGE = "happysixd/osworld-docker"
 OSWORLD_DEFAULT_READY_TIMEOUT_SEC = 240.0
 OSWORLD_FIRST_BOOT_READY_TIMEOUT_SEC = 1800.0
@@ -65,13 +62,20 @@ def _first_existing(paths: Sequence[str | Path]) -> str | None:
     return None
 
 
-def _run_setup_step(*, step_type: str, parameters: Mapping[str, Any], endpoint: str) -> dict[str, Any]:
+def _run_setup_step(
+    *, step_type: str, parameters: Mapping[str, Any], endpoint: str
+) -> dict[str, Any]:
     step = str(step_type or "").strip().lower()
     params = dict(parameters or {})
     if step == "sleep":
         seconds = float(params.get("seconds", 1.0))
         time.sleep(max(0.0, seconds))
-        return {"status_code": 200, "step_type": step, "slept_seconds": seconds, "ok": True}
+        return {
+            "status_code": 200,
+            "step_type": step,
+            "slept_seconds": seconds,
+            "ok": True,
+        }
 
     path_overrides = {
         "open": "/setup/open_file",
@@ -86,7 +90,7 @@ def _run_setup_step(*, step_type: str, parameters: Mapping[str, Any], endpoint: 
     }
     route = path_overrides.get(step, f"/setup/{step}")
     url = f"{endpoint.rstrip('/')}{route}"
-    resp = requests.post(url, json=params, timeout=120)
+    resp = httpx.post(url, json=params, timeout=120, follow_redirects=True)
     return {
         "status_code": int(resp.status_code),
         "step_type": step,
@@ -96,18 +100,30 @@ def _run_setup_step(*, step_type: str, parameters: Mapping[str, Any], endpoint: 
     }
 
 
-def run_setup_config(*, endpoint: str, setup_config: Sequence[Any]) -> list[dict[str, Any]]:
+def run_setup_config(
+    *, endpoint: str, setup_config: Sequence[Any]
+) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for index, item in enumerate(setup_config, start=1):
         if not isinstance(item, Mapping):
-            events.append({"index": index, "ok": False, "error": f"invalid setup item: {item!r}"})
+            events.append(
+                {"index": index, "ok": False, "error": f"invalid setup item: {item!r}"}
+            )
             continue
         step_type = str(item.get("type") or "").strip()
         params = item.get("parameters")
         if not step_type or not isinstance(params, Mapping):
-            events.append({"index": index, "ok": False, "error": f"invalid setup schema: {item!r}"})
+            events.append(
+                {
+                    "index": index,
+                    "ok": False,
+                    "error": f"invalid setup schema: {item!r}",
+                }
+            )
             continue
-        out = _run_setup_step(step_type=step_type, parameters=dict(params), endpoint=endpoint)
+        out = _run_setup_step(
+            step_type=step_type, parameters=dict(params), endpoint=endpoint
+        )
         out["index"] = index
         events.append(out)
         if not out.get("ok", False):
@@ -167,10 +183,10 @@ class OSWorldContainerLauncher:
         part = dst.with_suffix(dst.suffix + ".part")
         if part.exists():
             part.unlink()
-        with requests.get(url, stream=True, timeout=60) as resp:
+        with httpx.stream("GET", url, timeout=60, follow_redirects=True) as resp:
             resp.raise_for_status()
             with part.open("wb") as fh:
-                for chunk in resp.iter_content(chunk_size=4 * 1024 * 1024):
+                for chunk in resp.iter_bytes(chunk_size=4 * 1024 * 1024):
                     if chunk:
                         fh.write(chunk)
         part.replace(dst)
@@ -189,9 +205,13 @@ class OSWorldContainerLauncher:
         if artifact_path.suffix.lower() == ".zip":
             part = vm_path.with_suffix(vm_path.suffix + ".part")
             with zipfile.ZipFile(artifact_path, "r") as zf:
-                members = [x for x in zf.infolist() if x.filename.lower().endswith(".qcow2")]
+                members = [
+                    x for x in zf.infolist() if x.filename.lower().endswith(".qcow2")
+                ]
                 if not members:
-                    raise RuntimeError(f"No qcow2 image found in archive: {artifact_path}")
+                    raise RuntimeError(
+                        f"No qcow2 image found in archive: {artifact_path}"
+                    )
                 member = members[0]
                 with zf.open(member, "r") as src, part.open("wb") as dst:
                     shutil.copyfileobj(src, dst, length=16 * 1024 * 1024)
@@ -222,12 +242,16 @@ class OSWorldContainerLauncher:
         started = time.monotonic()
         while (time.monotonic() - started) <= float(timeout_sec):
             try:
-                resp = requests.get(f"{endpoint.rstrip('/')}/screenshot", timeout=20)
+                resp = httpx.get(
+                    f"{endpoint.rstrip('/')}/screenshot",
+                    timeout=20,
+                    follow_redirects=True,
+                )
                 if int(resp.status_code) == 200 and len(resp.content or b"") >= int(
                     OSWORLD_VISUAL_READY_MIN_SCREENSHOT_BYTES
                 ):
                     return True
-            except Exception:
+            except httpx.HTTPError:
                 pass
             time.sleep(OSWORLD_VISUAL_READY_POLL_SEC)
         return False
@@ -252,7 +276,9 @@ class OSWorldContainerLauncher:
             if not vm_file.exists():
                 raise RuntimeError(f"osworld.vm_path not found: {vm_file}")
             volumes[str(vm_file)] = "/System.qcow2:ro"
-            boot_config.update({"vm_path_set": True, "source": "env_vm_path", "vm_path": str(vm_file)})
+            boot_config.update(
+                {"vm_path_set": True, "source": "env_vm_path", "vm_path": str(vm_file)}
+            )
         elif explicit_boot_url:
             container_env["BOOT"] = explicit_boot_url
             first_boot = True
@@ -299,7 +325,14 @@ class OSWorldContainerLauncher:
             8006: self._setting("vnc_port"),
             8080: self._setting("vlc_port"),
         }
-        attempts = max(1, int(self._setting("port_retry_attempts", OSWORLD_DEFAULT_PORT_RETRY_ATTEMPTS)))
+        attempts = max(
+            1,
+            int(
+                self._setting(
+                    "port_retry_attempts", OSWORLD_DEFAULT_PORT_RETRY_ATTEMPTS
+                )
+            ),
+        )
         for port in OSWORLD_DEFAULT_PORTS:
             raw = explicit.get(port)
             if raw:
@@ -319,15 +352,25 @@ class OSWorldContainerLauncher:
         task: Task,
         task_metadata: Mapping[str, Any],
     ) -> dict[str, Any]:
-        image = str(self._setting("image", OSWORLD_DEFAULT_IMAGE)).strip() or OSWORLD_DEFAULT_IMAGE
+        image = (
+            str(self._setting("image", OSWORLD_DEFAULT_IMAGE)).strip()
+            or OSWORLD_DEFAULT_IMAGE
+        )
         container_env, volumes, first_boot, boot_config = self._resolve_boot_inputs()
         ports = self._resolve_ports()
         task_token = _safe_name(str(task.id))
-        container_name = str(self._setting("container", "")).strip() or f"qitos-osworld-{task_token}"
+        container_name = (
+            str(self._setting("container", "")).strip() or f"qitos-osworld-{task_token}"
+        )
         command = ["docker", "run", "-d", "--rm", "--name", container_name]
-        for host_port, container_port in sorted((value, key) for key, value in ports.items()):
+        for host_port, container_port in sorted(
+            (value, key) for key, value in ports.items()
+        ):
             command.extend(["-p", f"{host_port}:{container_port}"])
-        if not (os.path.exists("/dev/kvm") and str(container_env.get("KVM", "")).upper() != "N"):
+        if not (
+            os.path.exists("/dev/kvm")
+            and str(container_env.get("KVM", "")).upper() != "N"
+        ):
             container_env["KVM"] = "N"
         for key, value in sorted(container_env.items()):
             command.extend(["-e", f"{key}={value}"])
@@ -338,7 +381,10 @@ class OSWorldContainerLauncher:
             token = str(cap or "").strip()
             if token:
                 command.extend(["--cap-add", token])
-        if os.path.exists("/dev/kvm") and str(container_env.get("KVM", "")).upper() != "N":
+        if (
+            os.path.exists("/dev/kvm")
+            and str(container_env.get("KVM", "")).upper() != "N"
+        ):
             command.extend(["--device", "/dev/kvm"])
         command.append(image)
 
@@ -347,14 +393,20 @@ class OSWorldContainerLauncher:
             raise RuntimeError(
                 f"OSWorld container launch failed: {(proc.stderr or proc.stdout or '').strip()}"
             )
-        container_id = str((proc.stdout or "").strip().splitlines()[0] or container_name)
+        container_id = str(
+            (proc.stdout or "").strip().splitlines()[0] or container_name
+        )
         controller_endpoint = f"http://127.0.0.1:{int(ports[5000])}"
         ready_timeout = (
             OSWORLD_FIRST_BOOT_READY_TIMEOUT_SEC
             if first_boot
-            else float(self._setting("ready_timeout_sec", OSWORLD_DEFAULT_READY_TIMEOUT_SEC))
+            else float(
+                self._setting("ready_timeout_sec", OSWORLD_DEFAULT_READY_TIMEOUT_SEC)
+            )
         )
-        controller_ready = self._wait_for_endpoint(controller_endpoint, timeout_sec=ready_timeout)
+        controller_ready = self._wait_for_endpoint(
+            controller_endpoint, timeout_sec=ready_timeout
+        )
         visual_timeout = (
             OSWORLD_VISUAL_READY_TIMEOUT_FIRST_BOOT_SEC
             if first_boot
@@ -366,7 +418,9 @@ class OSWorldContainerLauncher:
         )
         visual_ready = controller_ready and self._wait_for_visual_ready(
             controller_endpoint,
-            timeout_sec=float(self._setting("visual_ready_timeout_sec", visual_timeout)),
+            timeout_sec=float(
+                self._setting("visual_ready_timeout_sec", visual_timeout)
+            ),
         )
         return {
             "container": container_name,
@@ -383,7 +437,9 @@ class OSWorldContainerLauncher:
             "docker_command": command,
         }
 
-    def prepare(self, *, task: Task, task_metadata: Mapping[str, Any]) -> OSWorldPrepareResult:
+    def prepare(
+        self, *, task: Task, task_metadata: Mapping[str, Any]
+    ) -> OSWorldPrepareResult:
         runtime_container = dict(task_metadata.get("runtime_container") or {})
         startup = dict(runtime_container.get("startup") or {})
         global_mock_mode = _truthy(self._setting("mock_mode"), default=False)
@@ -395,12 +451,20 @@ class OSWorldContainerLauncher:
         screenshot_path = _first_existing(screenshot_candidates)
         if screenshot_path is None:
             screenshot_path = str(
-                (self._repo_root / ".qitos" / "osworld_screenshots" / f"{_safe_name(task.id)}.png").resolve()
+                (
+                    self._repo_root
+                    / ".qitos"
+                    / "osworld_screenshots"
+                    / f"{_safe_name(task.id)}.png"
+                ).resolve()
             )
         controller_endpoint = str(
-            startup.get("controller_endpoint") or self._setting("controller_endpoint", "")
+            startup.get("controller_endpoint")
+            or self._setting("controller_endpoint", "")
         ).strip()
-        container_name = str(startup.get("container") or self._setting("container", "")).strip()
+        container_name = str(
+            startup.get("container") or self._setting("container", "")
+        ).strip()
         mock_mode = _truthy(startup.get("mock_mode"), default=global_mock_mode)
         mode = "mock" if mock_mode else "container"
         launch_metadata: dict[str, Any] = {
@@ -427,35 +491,53 @@ class OSWorldContainerLauncher:
                 settings=launch_settings,
             )
             if controller_endpoint:
-                ready_timeout = float(startup.get("ready_timeout_sec") or OSWORLD_DEFAULT_READY_TIMEOUT_SEC)
+                ready_timeout = float(
+                    startup.get("ready_timeout_sec")
+                    or OSWORLD_DEFAULT_READY_TIMEOUT_SEC
+                )
                 launch_metadata["controller_ready"] = launcher._wait_for_endpoint(
                     controller_endpoint,
                     timeout_sec=ready_timeout,
                 )
                 launch_metadata["visual_ready"] = launcher._wait_for_visual_ready(
                     controller_endpoint,
-                    timeout_sec=float(startup.get("visual_ready_timeout_sec") or OSWORLD_VISUAL_READY_TIMEOUT_SEC),
+                    timeout_sec=float(
+                        startup.get("visual_ready_timeout_sec")
+                        or OSWORLD_VISUAL_READY_TIMEOUT_SEC
+                    ),
                 )
             else:
-                launch_metadata = launcher._launch_container(task=task, task_metadata=task_metadata)
-                controller_endpoint = str(launch_metadata.get("controller_endpoint") or "")
+                launch_metadata = launcher._launch_container(
+                    task=task, task_metadata=task_metadata
+                )
+                controller_endpoint = str(
+                    launch_metadata.get("controller_endpoint") or ""
+                )
                 container_name = str(launch_metadata.get("container") or "")
                 boot_config = dict(launch_metadata.get("boot") or boot_config)
 
         env_config = dict((task.env_spec.config if task.env_spec else {}) or {})
         env_config.update(
             {
-                "provider": "container" if mode == "container" and container_name else "mock",
+                "provider": (
+                    "container" if mode == "container" and container_name else "mock"
+                ),
                 "screenshot_path": screenshot_path,
                 "instruction": task.objective,
                 "container": container_name,
                 "controller_endpoint": controller_endpoint,
-                "workspace_root": str(startup.get("workspace_root") or env_config.get("workspace_root") or "/workspace"),
+                "workspace_root": str(
+                    startup.get("workspace_root")
+                    or env_config.get("workspace_root")
+                    or "/workspace"
+                ),
                 "metadata": {
                     **dict(env_config.get("metadata") or {}),
                     "benchmark": "osworld",
                     "controller_endpoint": controller_endpoint,
-                    "controller_ready": bool(launch_metadata.get("controller_ready", False)),
+                    "controller_ready": bool(
+                        launch_metadata.get("controller_ready", False)
+                    ),
                     "visual_ready": bool(launch_metadata.get("visual_ready", False)),
                     "ports": dict(launch_metadata.get("ports") or {}),
                 },
@@ -468,9 +550,13 @@ class OSWorldContainerLauncher:
             metadata={
                 "container": container_name,
                 "controller_endpoint": controller_endpoint,
-                "controller_ready": bool(launch_metadata.get("controller_ready", False)),
+                "controller_ready": bool(
+                    launch_metadata.get("controller_ready", False)
+                ),
                 "visual_ready": bool(launch_metadata.get("visual_ready", False)),
-                "launched_container": bool(launch_metadata.get("launched_container", False)),
+                "launched_container": bool(
+                    launch_metadata.get("launched_container", False)
+                ),
                 "container_id": str(launch_metadata.get("container_id") or ""),
                 "boot": boot_config,
                 "mode": mode,
@@ -489,13 +575,17 @@ class OSWorldRuntimeHook(BenchmarkRuntimeHook):
         repo_root: str | None = None,
         settings: Mapping[str, Any] | None = None,
     ) -> None:
-        self.repo_root = Path(repo_root).expanduser().resolve() if repo_root else _repo_root()
+        self.repo_root = (
+            Path(repo_root).expanduser().resolve() if repo_root else _repo_root()
+        )
         self.settings = dict(settings or {})
 
     def prepare(
         self, *, task: Task, run_spec: RunSpec, experiment_spec: ExperimentSpec
     ) -> PreparedBenchmarkTask:
-        launcher = OSWorldContainerLauncher(repo_root=self.repo_root, settings=self.settings)
+        launcher = OSWorldContainerLauncher(
+            repo_root=self.repo_root, settings=self.settings
+        )
         launch = launcher.prepare(task=task, task_metadata=task.metadata)
         prepared_task = Task.from_dict(task.to_dict())
         if prepared_task.env_spec is None:
@@ -527,7 +617,9 @@ class OSWorldRuntimeHook(BenchmarkRuntimeHook):
                 endpoint=controller_endpoint,
                 setup_config=setup_config,
             )
-        return PreparedBenchmarkTask(task=prepared_task, runtime_metadata=runtime_metadata)
+        return PreparedBenchmarkTask(
+            task=prepared_task, runtime_metadata=runtime_metadata
+        )
 
     def finalize(
         self,
@@ -549,8 +641,12 @@ class OSWorldRuntimeHook(BenchmarkRuntimeHook):
             "error": str(error) if error is not None else None,
             "finalized": True,
         }
-        runtime_prepare = dict((prepared.runtime_metadata or {}).get("runtime_prepare") or {})
-        if cleanup_policy == "destroy_on_release" and runtime_prepare.get("launched_container"):
+        runtime_prepare = dict(
+            (prepared.runtime_metadata or {}).get("runtime_prepare") or {}
+        )
+        if cleanup_policy == "destroy_on_release" and runtime_prepare.get(
+            "launched_container"
+        ):
             container_name = str(runtime_prepare.get("container") or "").strip()
             if container_name:
                 proc = subprocess.run(

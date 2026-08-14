@@ -1,9 +1,52 @@
 from __future__ import annotations
 
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 import pytest
 
 from qitos.kit.env import TextWebEnv
 from qitos.kit.tool import FindInPage, FindNext, PageDown, PageUp
+
+
+def test_text_web_env_follows_redirects_and_keeps_final_url() -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/page")
+                self.end_headers()
+                return
+            if self.path == "/page":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(
+                    b"<html><title>Final page</title><body>redirected content</body></html>"
+                )
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A003
+            _ = (format, args)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        env = TextWebEnv(workspace_root=".")
+        ops = env.get_ops("web_browser")
+        result = ops.visit(f"{endpoint}/redirect")
+
+        assert result["status"] == "success"
+        assert ops.state.url == f"{endpoint}/page"
+        assert ops.state.title == "Final page"
+        assert any("redirected content" in line for line in ops.state.lines)
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
 
 
 def test_text_web_env_exposes_web_browser_ops():
