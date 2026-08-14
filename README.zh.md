@@ -49,7 +49,8 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 - **从 terminal fact 恢复完成通知**：后台 Child 与受管进程的完成输入现在都是 canonical Journal
   terminal 的确定性投影。Resume 无需第二份存储即可补上 terminal 到 Mailbox 之间的崩溃窗口，也不会重复投递前台 Child ToolResult；
   已消费 event id 保持幂等，Fork 继承的事实也不会变成新输入。canonical `ToolResult` 同时保存
-  模型 `call_id`，Child factory 可以安全完成异步资源构造。
+  模型 `call_id`，Child factory 可以安全完成异步资源构造。前台 Child 自身取消会返回 terminal
+  Child 结果，不再被误判为 Parent Task 取消。
 - **无 writer lease 的 Run 查询与 lineage**：`JsonlRunCatalog` 现在可以在 Engine
   仍持有 writer lease 时返回不可变、类型化的 Run 摘要、确定性列表、已校验祖先和直接
   Child。读取不会修复 canonical JSONL，也不会重建可丢弃的 SQLite 投影。继承到本地的

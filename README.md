@@ -64,7 +64,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   closes the terminal-to-mailbox crash window without a second store, does not redeliver
   foreground Child results, keeps consumed event ids idempotent, and never turns inherited fork facts into new input. Canonical
   `ToolResult` values also carry their model `call_id`, and Child factories may finish
-  async resource construction safely.
+  async resource construction safely. Foreground Child-local cancellation returns a
+  terminal Child result without being misclassified as parent Task cancellation.
 - **Lease-free Run discovery and lineage**: `JsonlRunCatalog` now returns immutable
   typed summaries, deterministic listings, validated ancestors, and direct children
   while an Engine still owns the writer lease. Reads never repair canonical JSONL or

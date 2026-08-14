@@ -24,6 +24,10 @@ class ChildPersistenceError(RuntimeError):
     """Raised when a Child lifecycle fact cannot be durably recorded."""
 
 
+class ChildInvocationCancelled(RuntimeError):
+    """Signal that one Child invocation ended without cancelling its caller."""
+
+
 class ChildRunLimitError(RuntimeError):
     """Raised when a root Run's shared Child limit rejects a launch."""
 
@@ -583,6 +587,7 @@ __all__ = [
     "ChildCancellationCheck",
     "ChildHandle",
     "ChildInvocation",
+    "ChildInvocationCancelled",
     "ChildInvocationCleanup",
     "ChildLaunchContext",
     "ChildLaunchRequest",

@@ -16,6 +16,7 @@ from ...core.child import (
     ChildEngine,
     ChildHandle,
     ChildInvocation,
+    ChildInvocationCancelled,
     ChildLaunchContext,
     ChildLaunchRequest,
     ChildPersistenceError,
@@ -713,6 +714,8 @@ class ChildSupervisor:
             else:
                 with scope:
                     result = await _run_in_scope()
+        except ChildInvocationCancelled as exc:
+            result = self._cancelled_result(owned, error=str(exc))
         except asyncio.CancelledError:
             raise
         except Exception as exc:

@@ -180,6 +180,9 @@ How to update:
 
 ### Fixed
 
+- Foreground Child supervision now distinguishes `ChildInvocationCancelled` from an
+  actual caller Task cancellation. Both outcomes persist one cancelled Child terminal,
+  but only `asyncio.CancelledError` from the caller aborts the parent.
 - Caller cancellation after Tool execution now reuses the executor's typed terminal
   `cancel_source` instead of inspecting Python-version-specific Task internals. The
   Engine still commits one terminal result per ToolCall before propagating cancellation.

@@ -13,6 +13,7 @@ from qitos.core.child import (
     AgentConclusion,
     ChildHandle,
     ChildInvocation,
+    ChildInvocationCancelled,
     ChildLaunchContext,
     ChildLaunchRequest,
     ChildPostRuntimeEvent,
@@ -223,6 +224,55 @@ async def test_foreground_children_share_supervisor_concurrency_limit() -> None:
     assert second_result.status is ChildStatus.COMPLETED
     assert await asyncio.wait_for(started.get(), timeout=1) == "two"
     assert peak == 1
+
+
+@pytest.mark.asyncio
+async def test_foreground_child_local_cancellation_does_not_cancel_parent() -> None:
+    async def cancelled_factory(
+        request: ChildLaunchRequest,
+        _context: ChildRuntimeContext,
+    ) -> ChildInvocation:
+        _ = request
+        raise ChildInvocationCancelled("Child construction cleanup was cancelled")
+
+    supervisor = ChildSupervisor(invocation_factory=cancelled_factory)
+
+    result = await supervisor.launch(
+        _request(),
+        _context(),
+        background=False,
+    )
+
+    assert result.status is ChildStatus.CANCELLED
+    assert result.error == "Child construction cleanup was cancelled"
+    assert result.child_run_id
+    assert await supervisor.aclose() == 0
+
+
+@pytest.mark.asyncio
+async def test_foreground_child_preserves_real_caller_cancellation() -> None:
+    factory_started = asyncio.Event()
+
+    async def waiting_factory(
+        request: ChildLaunchRequest,
+        _context: ChildRuntimeContext,
+    ) -> ChildInvocation:
+        _ = request
+        factory_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    supervisor = ChildSupervisor(invocation_factory=waiting_factory)
+    launch_task = asyncio.create_task(
+        supervisor.launch(_request(), _context(), background=False)
+    )
+    await factory_started.wait()
+    launch_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await launch_task
+
+    assert await supervisor.aclose() == 0
 
 
 @pytest.mark.asyncio
