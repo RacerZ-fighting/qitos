@@ -236,6 +236,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 "after_digest": state_digest(after),
                 "state_delta": build_state_delta(before, after),
                 "history_append": history_append,
+                "terminal": terminal,
             },
             record_id=f"{record.transaction_id}:committed",
         )
@@ -785,6 +786,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                             history_message_to_dict(item) for item in history_append
                         ],
                         "recovered": True,
+                        "terminal": bool(state_data.get("stop_reason")),
                     },
                 }
             )

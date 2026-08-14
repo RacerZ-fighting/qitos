@@ -103,15 +103,17 @@ catalog never takes a writer lease, repairs a torn tail, or rebuilds either arti
 claim that an Engine process is currently active.
 
 Each `RunHandle` also exposes a stable `lineage_id`, the immediate `parent_run_id`, the
-latest durable `committed_position`, and a `continuation_position`. Applications may
-pass `lineage_id=` to `Engine.arun()` to bind their own stable Session identity; the
-Root Run id is used when it is omitted, and forks inherit the same value. Legacy
-journals derive the root Run id from their inherited prefix.
+latest durable `committed_position`, a `continuation_position`, and
+`has_terminal_state`. Applications may pass `lineage_id=` to `Engine.arun()` to bind
+their own stable Session identity; the Root Run id is used when it is omitted, and
+forks inherit the same value. Legacy journals derive the root Run id from their
+inherited prefix.
 
 The continuation position is the latest committed boundary that does not encode a
 terminal turn. This normally equals the latest committed position for an active or
-interrupted Run. Once a terminal snapshot is durable—even if the process stopped before
-`run.completed` was appended—it points to the boundary before that terminal turn.
+interrupted Run. Terminal step commits carry an explicit marker, so once either the
+commit or terminal snapshot is durable—even if the process stopped before
+`run.completed` was appended—the handle points to the boundary before that terminal turn.
 Resuming a completed Run remains read-only and executes no Provider or Tool; continued
 work must fork the continuation position into a new resumable Run. The terminal
 `committed_position` remains available for audit and is never relabeled as a

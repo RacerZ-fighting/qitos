@@ -78,8 +78,8 @@ docs, English/Chinese concepts, README news, and CHANGELOG must remain aligned.
 - [x] Persist explicit and default lineage ids without adding a second Session store.
 - [x] Preserve lineage and immediate parent identity across nested forks.
 - [x] Keep audit and non-terminal continuation positions distinct.
-- [x] Cover completed and pre-completion terminal snapshots, legacy Journals, and
-  corrupt lineage metadata with behavior tests.
+- [x] Cover completed Runs, pre-snapshot terminal commits, legacy Journals, and corrupt
+  lineage metadata with behavior tests.
 - [x] Pass the complete QitOS test suite plus Black, Flake8, mypy, and Python 3.10
   import checks.
 - [x] Update public concepts, README news, and CHANGELOG.

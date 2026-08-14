@@ -301,6 +301,7 @@ async def test_catalog_exposes_declared_lineage_and_ready_terminal_fork(
     assert parent.continuation_position != terminal_commit
     assert parent.can_resume is False
     assert parent.can_continue is True
+    assert parent.has_terminal_state is True
 
     child = await journal.fork(parent.continuation_position, "child")
     await child.close()
@@ -314,7 +315,7 @@ async def test_catalog_exposes_declared_lineage_and_ready_terminal_fork(
 
 
 @pytest.mark.asyncio
-async def test_catalog_excludes_terminal_boundary_before_completion_is_durable(
+async def test_catalog_excludes_terminal_commit_before_snapshot_is_durable(
     tmp_path: Path,
 ) -> None:
     journal = JsonlSessionJournal(tmp_path)
@@ -324,22 +325,21 @@ async def test_catalog_excludes_terminal_boundary_before_completion_is_durable(
         {"state": {}, "state_digest": "initial", "reason": "initial"},
         record_id="initial",
     )
-    await journal.append(
+    terminal_payload = _commit_payload(step_id=1)
+    terminal_payload["terminal"] = True
+    terminal_commit = await journal.append(
         JournalRecordType.STEP_COMMITTED,
-        _commit_payload(step_id=1),
+        terminal_payload,
         record_id="terminal-commit",
-    )
-    await journal.append(
-        JournalRecordType.STATE_SNAPSHOT,
-        {"state": {}, "state_digest": "terminal", "reason": "terminal"},
-        record_id="terminal-snapshot",
     )
 
     handle = await JsonlRunCatalog(tmp_path).inspect_run("interrupted-terminal")
 
     assert handle.status is RunStatus.RESUMABLE
     assert handle.can_resume is True
+    assert handle.committed_position == terminal_commit
     assert handle.continuation_position == initial
+    assert handle.has_terminal_state is True
 
     await journal.close()
 
@@ -447,3 +447,4 @@ def test_run_handle_is_immutable_and_json_safe() -> None:
         "record_id": "start",
     }
     assert handle.to_dict()["lineage_id"] == "session"
+    assert handle.to_dict()["has_terminal_state"] is False

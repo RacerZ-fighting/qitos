@@ -79,6 +79,15 @@ class RunHandle:
         return self.status is RunStatus.COMPLETED
 
     @property
+    def has_terminal_state(self) -> bool:
+        """Whether the latest committed state is terminal, completed or not."""
+
+        return self.is_terminal or (
+            self.committed_position is not None
+            and self.continuation_position != self.committed_position
+        )
+
+    @property
     def can_resume(self) -> bool:
         """Whether Engine recovery may continue this Run in place."""
 
@@ -125,6 +134,7 @@ class RunHandle:
             "interrupted_at": _optional_position_to_dict(self.interrupted_at),
             "interruption_reason": self.interruption_reason,
             "is_terminal": self.is_terminal,
+            "has_terminal_state": self.has_terminal_state,
             "can_resume": self.can_resume,
             "can_fork": self.can_fork,
             "can_continue": self.can_continue,

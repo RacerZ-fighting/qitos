@@ -77,13 +77,14 @@ torn tail 或重建任何 artifact。`RunStatus.RESUMABLE` 只表示没有 durab
 声称当前一定有 Engine 进程在运行。
 
 每个 `RunHandle` 还会暴露稳定的 `lineage_id`、直接 `parent_run_id`、最新 durable
-`committed_position` 和 `continuation_position`。应用可以在 `Engine.arun()` 传入
-`lineage_id=` 绑定自己的稳定 Session 身份；未传入时使用 Root Run id，Fork 会继承同一个值。
-旧 Journal 则从继承前缀推导 Root Run id。
+`committed_position`、`continuation_position` 和 `has_terminal_state`。应用可以在
+`Engine.arun()` 传入 `lineage_id=` 绑定自己的稳定 Session 身份；未传入时使用 Root Run id，
+Fork 会继承同一个值。旧 Journal 则从继承前缀推导 Root Run id。
 
 continuation position 指向不包含 terminal turn 的最新 committed boundary。对普通 active 或
-interrupted Run，它通常就是最新 committed position；一旦 terminal snapshot 已经持久化，即使进程
-在写入 `run.completed` 前中断，它也会回退到 terminal turn 之前。Resume 已完成的 Run 仍然只读，
+interrupted Run，它通常就是最新 committed position。Terminal step commit 带有显式标记，因此
+commit 或 terminal snapshot 任意一个完成持久化后，即使进程在写入 `run.completed` 前中断，它也会
+回退到 terminal turn 之前。Resume 已完成的 Run 仍然只读，
 不会执行 Provider 或 Tool；要继续工作，必须从 continuation position 显式 fork 出新的 resumable
 Run。用于审计的 terminal `committed_position` 会原样保留，不会被伪装成可继续状态。
 

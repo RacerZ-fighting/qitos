@@ -228,6 +228,12 @@ def _continuation_position(
     excluded: set[int] = set()
     for index, record in committed_records:
         effective = resolve_inherited_record(record)
+        if effective.type is JournalRecordType.STEP_COMMITTED:
+            terminal = effective.payload.get("terminal")
+            if terminal is not None and not isinstance(terminal, bool):
+                raise JournalCorruptionError("step.committed terminal flag is invalid")
+            if terminal is True:
+                excluded.add(index)
         if (
             effective.type is JournalRecordType.STATE_SNAPSHOT
             and effective.payload.get("reason") == "terminal"
