@@ -3,32 +3,66 @@ title: "MCP Integration"
 description: "Bridge external MCP servers into QitOS as FunctionTool instances, with filtering and async lifecycle management."
 ---
 
-The Model Context Protocol (MCP) is an open standard for connecting AI systems to external tools and data sources. QitOS can own an MCP server for one `Engine.arun()` lifecycle: it connects after preflight, discovers tools before the first model turn, executes calls on the transport's event loop, and removes the tools and closes the server when the run ends.
+The Model Context Protocol (MCP) is an open standard for connecting AI systems to external tools and data sources. QitOS can own MCP servers for a complete `Engine.arun()` or an interactive `Engine.astep()` session: it discovers tools before the first model turn, executes calls asynchronously on the caller's event loop, and removes tools and closes transports when the owner ends.
 
-## Preferred: let Engine own the lifecycle
+## Preferred: let Engine own each Run lifecycle
 
-Pass explicit server instances to `AgentModule` and give the agent a `ToolRegistry`:
+Give the agent a `ToolRegistry`, then pass `Engine` a construction-only factory that
+returns fresh, unconnected transports for every Run:
 
 ```python
 from qitos import Engine, ToolRegistry
 from qitos.mcp import MCPServerStdio
 
-server = MCPServerStdio(
-    command="npx",
-    args=["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
-    name="filesystem",
-)
-agent = MyAgent(
-    tool_registry=ToolRegistry(),
-    mcp_servers=[server],
-)
+def create_mcp_servers():
+    return (
+        MCPServerStdio(
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+            name="filesystem",
+        ),
+    )
 
-result = await Engine(agent).arun("Inspect the workspace")
+agent = MyAgent(tool_registry=ToolRegistry())
+engine = Engine(agent, mcp_server_factory=create_mcp_servers)
+result = await engine.arun("Inspect the workspace")
 ```
 
 The model sees provider-safe names such as `mcp__filesystem__read_file`; QitOS preserves the raw server and tool names for protocol calls. Names are sanitized, deduplicated, and bounded to 64 characters. Registrations are run-scoped, so the same registry can be reused by a later Engine run.
 
-`mcp_servers=[]` is the normal default. It starts no MCP event loop, subprocess, or HTTP client. Configuration discovery, catalogs, and approval policy remain application concerns.
+`mcp_server_factory=None` is the normal default. It starts no MCP subprocess or HTTP
+client. The factory must only construct objects; `connect()` performs I/O under the
+Run deadline. Do not return a shared client or process: Root, Child, resumed, and later
+Runs each own independent transports. Configuration discovery, catalogs, and approval
+policy remain application concerns.
+
+At Run startup, QitOS connects and discovers independent servers concurrently, with
+at most eight startup operations active by default. Each server gets at most 10 seconds
+or the remaining Run deadline, whichever is shorter. A failed server is cleaned up
+without cancelling healthy servers. Successful catalogs are still converted and
+published in factory order, so the model-visible Tool list is deterministic.
+
+Each model turn freezes one Tool exposure. A protocol
+`notifications/tools/list_changed` event or an explicit
+`engine.request_mcp_refresh(server_name)` marks a connected catalog for refresh at the
+next pre-turn safe point. A complete new catalog is published for the next turn only;
+the current turn keeps its original handlers and schema. A failed refresh retains the
+last complete catalog, while cancellation propagates and leaves the refresh pending.
+
+Interactive sessions use the same owner. `init_session()` only creates session state;
+the first `await engine.astep(...)` starts MCP before capturing the turn, and later
+`astep()` calls apply pending refreshes before their own turn snapshots. Keep every
+step and `aclose()` on the event loop that started the transports. Synchronous
+`engine.step(...)` rejects MCP-backed sessions because a temporary event loop cannot
+own a persistent transport.
+
+The stepwise API does not manage durable Run Journal or checkpoint commits. Use
+`arun()`, `resume()`, and `fork()` when model and Tool transactions must survive a
+process restart.
+
+Engine dispatches MCP ToolCalls only from a complete model transaction. Known
+incomplete, length-limited, failed, filtered, or cancelled terminals keep native or
+text-salvaged calls as `invalid_tool_calls` diagnostics, but never execute them.
 
 ## Transport options
 
@@ -64,7 +98,16 @@ for tool in tools:
     print(f"  {tool.name}: {tool.description}")
 ```
 
-Each `MCPToolInfo` returned by `list_tools()` carries `name`, `description`, and `input_schema`.
+Both transports follow bounded `nextCursor` pagination rather than silently returning
+only the first page. Each `MCPToolInfo` carries `name`, `description`, `input_schema`,
+and typed MCP `annotations`. Annotation values are treated as untrusted hints:
+missing `readOnlyHint` is not interpreted as read-only, and QitOS never infers
+concurrency safety or retry permission from them.
+
+Stdio uses newline-delimited JSON-RPC and accepts at most 8 MiB per frame by default.
+An oversized frame is a typed MCP protocol error. Unexpected EOF and other fatal
+reader failures become typed transport errors and trigger transport cleanup
+automatically.
 
 ## Lower-level bridging
 
@@ -82,7 +125,20 @@ await server.connect()
 tools = await mcp_server_to_function_tools(server)
 ```
 
-Each returned `FunctionTool` wraps a remote MCP call. When the tool is executed, QitOS sends a `tools/call` JSON-RPC request to the MCP server and returns the result.
+Each returned `FunctionTool` wraps a remote MCP call. When the tool is executed, QitOS
+sends a `tools/call` JSON-RPC request and projects the typed `MCPCallToolResult` into a
+normal QitOS `ToolResult`. `structuredContent`, `_meta`, and content blocks remain
+available; `isError=true` becomes `ToolResult(status="error")` rather than a successful
+JSON value. JSON-RPC protocol failures, remote request errors, remote Tool errors,
+timeouts, and cancellation remain distinguishable terminal outcomes.
+
+The Streamable HTTP transport accepts JSON or SSE responses to POST, keeps the
+negotiated session and protocol headers, and reconnects an idle GET stream with
+`Last-Event-ID`. Only events from that GET notification stream advance the reconnect
+cursor; IDs in POST responses do not. A session 404 has the stable
+`MCP_SESSION_EXPIRED` classification. QitOS may reconnect and repeat safe catalog
+discovery at the next turn boundary, but it never automatically replays a potentially
+side-effecting `tools/call`.
 
 You can add a name prefix to disambiguate tools when bridging multiple servers into the same registry:
 
@@ -174,9 +230,20 @@ finally:
     await server.cleanup()
 ```
 
-`MCPServerStdio.cleanup()` terminates the subprocess (first `SIGTERM`, then `SIGKILL` after a 5-second timeout). `MCPServerStreamableHttp.cleanup()` closes the HTTP client session.
+`MCPServerStdio.cleanup()` terminates and reaps its complete subprocess tree (first a
+graceful group signal, then a forced tree kill after a 5-second timeout).
+`MCPServerStreamableHttp.cleanup()` waits for an active POST, terminates the negotiated
+session, and closes the HTTP client. Caller cancellation is propagated only after
+those owned resources settle.
 
-The bridged functions submit calls back to the event loop where discovery occurred. Do not block that loop while executing a bridged tool. Engine-owned integration avoids this constraint by using one run-scoped MCP transport loop.
+When a request is cancelled, both transports attempt the MCP cancellation notification
+for a bounded period (250 ms by default). This notification is best effort: a blocked
+or failed notification never delays local cancellation indefinitely, and cleanup does
+not start a new notification while the transport is already closing.
+
+The bridge, transport, and Engine all run on the caller's event loop. They do not
+create a temporary or dedicated MCP event loop, so application code must not block
+that loop while a bridged Tool is running.
 
 ## What's next
 

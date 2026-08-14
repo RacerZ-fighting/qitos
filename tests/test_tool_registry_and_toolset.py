@@ -160,6 +160,156 @@ async def test_tool_registry_awaits_native_async_lifecycle_hooks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_registry_rejects_non_awaitable_async_lifecycle_hook() -> None:
+    class InvalidAsyncCloseTool(BaseTool):
+        def __init__(self) -> None:
+            super().__init__(ToolSpec(name="invalid_close", description="test"))
+
+        async def execute(
+            self,
+            args: dict[str, Any],
+            runtime_context: dict[str, Any] | None = None,
+        ) -> str:
+            _ = args, runtime_context
+            return "ok"
+
+        def aclose(self) -> None:
+            return None
+
+    registry = ToolRegistry().register(InvalidAsyncCloseTool())
+
+    with pytest.raises(TypeError, match="aclose.*must return an awaitable"):
+        await registry.ateardown()
+
+
+@pytest.mark.asyncio
+async def test_tool_registry_setup_failure_cleans_every_owned_resource() -> None:
+    events: list[str] = []
+
+    class LifecycleTool(BaseTool):
+        def __init__(self, name: str, *, fail_setup_once: bool = False) -> None:
+            super().__init__(ToolSpec(name=name, description="lifecycle fixture"))
+            self._fail_setup_once = fail_setup_once
+
+        async def asetup(self, context: dict[str, Any]) -> None:
+            _ = context
+            events.append(f"{self.name}.setup")
+            if self._fail_setup_once:
+                self._fail_setup_once = False
+                raise RuntimeError("setup failed")
+
+        async def execute(
+            self,
+            args: dict[str, Any],
+            runtime_context: dict[str, Any] | None = None,
+        ) -> str:
+            _ = args, runtime_context
+            return "ok"
+
+        async def aclose(self) -> None:
+            events.append(f"{self.name}.close")
+
+    registry = ToolRegistry()
+    registry.register(LifecycleTool("first"))
+    registry.register(LifecycleTool("failing", fail_setup_once=True))
+    registry.register(LifecycleTool("not_started"))
+
+    with pytest.raises(RuntimeError, match="setup failed"):
+        await registry.asetup({"run_id": "failed-run"})
+
+    assert events == [
+        "first.setup",
+        "failing.setup",
+        "not_started.close",
+        "failing.close",
+        "first.close",
+    ]
+
+    events.clear()
+    await registry.asetup({"run_id": "retry-run"})
+    await registry.ateardown({"run_id": "retry-run"})
+    assert events == [
+        "first.setup",
+        "failing.setup",
+        "not_started.setup",
+        "not_started.close",
+        "failing.close",
+        "first.close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_registry_teardown_attempts_every_cleanup_before_failing() -> None:
+    events: list[str] = []
+
+    class FailingCloseTool(BaseTool):
+        def __init__(self, name: str) -> None:
+            super().__init__(ToolSpec(name=name, description="cleanup fixture"))
+
+        async def execute(
+            self,
+            args: dict[str, Any],
+            runtime_context: dict[str, Any] | None = None,
+        ) -> str:
+            _ = args, runtime_context
+            return "ok"
+
+        async def aclose(self) -> None:
+            events.append(f"{self.name}.close")
+            raise RuntimeError(f"{self.name} close failed")
+
+    class FailingTeardownToolSet:
+        name = "failing_toolset"
+        version = "1"
+
+        def tools(self) -> list[BaseTool]:
+            return []
+
+        async def ateardown(self, context: dict[str, Any]) -> None:
+            _ = context
+            events.append("toolset.teardown")
+            raise RuntimeError("toolset teardown failed")
+
+    registry = ToolRegistry()
+    registry.register(FailingCloseTool("first"))
+    registry.register(FailingCloseTool("second"))
+    registry.register_toolset(FailingTeardownToolSet())
+
+    with pytest.raises(RuntimeError, match="second close failed"):
+        await registry.ateardown({"run_id": "run"})
+
+    assert events == ["second.close", "first.close", "toolset.teardown"]
+
+
+@pytest.mark.asyncio
+async def test_tool_registry_teardown_preserves_cancellation_over_cleanup_error() -> (
+    None
+):
+    class FailingCloseTool(BaseTool):
+        def __init__(self, name: str, error: BaseException) -> None:
+            super().__init__(ToolSpec(name=name, description="cleanup fixture"))
+            self._error = error
+
+        async def execute(
+            self,
+            args: dict[str, Any],
+            runtime_context: dict[str, Any] | None = None,
+        ) -> str:
+            _ = args, runtime_context
+            return "ok"
+
+        async def aclose(self) -> None:
+            raise self._error
+
+    registry = ToolRegistry()
+    registry.register(FailingCloseTool("cancelled", asyncio.CancelledError()))
+    registry.register(FailingCloseTool("failed", RuntimeError("close failed")))
+
+    with pytest.raises(asyncio.CancelledError):
+        await registry.ateardown()
+
+
+@pytest.mark.asyncio
 async def test_tool_exposure_freezes_spec_but_keeps_one_handler_owner() -> None:
     class StatefulTool(BaseTool):
         def __init__(self) -> None:
@@ -284,13 +434,10 @@ def test_tool_schemas_resolve_future_annotations_to_valid_json_types(tmp_path):
 
     specs = {spec["function"]["name"]: spec for spec in registry.get_all_specs()}
 
-    assert (
-        synthetic_spec.input_schema["properties"]["path"]["type"]
-        == "string"
-    )
-    findings_schema = specs["audit_hotspots"]["function"]["parameters"][
-        "properties"
-    ]["findings"]
+    assert synthetic_spec.input_schema["properties"]["path"]["type"] == "string"
+    findings_schema = specs["audit_hotspots"]["function"]["parameters"]["properties"][
+        "findings"
+    ]
     Draft202012Validator.check_schema(findings_schema)
     validator = Draft202012Validator(findings_schema)
     validator.validate(None)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 import threading
 import time
@@ -16,6 +17,7 @@ from qitos import (
     AgentSpec,
     Decision,
     Engine,
+    Env,
     StateSchema,
     ToolRegistry,
     tool,
@@ -32,6 +34,8 @@ from qitos.core import (
     ToolResult,
 )
 from qitos.core.journal import JournalError, JournalRecordRef
+from qitos.core.env import EnvObservation, EnvStepResult
+from qitos.core.tool import BaseTool, ToolSpec
 from qitos.checkpoint import InMemoryCheckpointStore
 from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 from qitos.kit.parser import ReActTextParser
@@ -114,6 +118,34 @@ class JournalAgent(AgentModule[JournalState, dict[str, Any], Action]):
         return state
 
 
+def _tamper_journal_payload(
+    path: Path,
+    record_type: JournalRecordType,
+    keys: tuple[str | int, ...],
+    value: Any,
+) -> None:
+    records = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    for record in records:
+        if record["type"] != record_type.value:
+            continue
+        target = record["payload"]
+        for key in keys[:-1]:
+            target = target[key]
+        target[keys[-1]] = value
+        break
+    else:
+        raise AssertionError(f"journal has no {record_type.value} record")
+    path.write_text(
+        "".join(
+            f"{json.dumps(record, ensure_ascii=False, sort_keys=True)}\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.asyncio
 async def test_each_terminal_is_reduced_before_the_next_finalizer(
     tmp_path: Path,
@@ -122,9 +154,7 @@ async def test_each_terminal_is_reduced_before_the_next_finalizer(
         def __init__(self) -> None:
             super().__init__()
             self.finalizer_seen: list[tuple[str, ...]] = []
-            self.finalizer_terminals: list[
-                tuple[JournalRecordRef | None, ...]
-            ] = []
+            self.finalizer_terminals: list[tuple[JournalRecordRef | None, ...]] = []
 
         def decide(
             self,
@@ -241,10 +271,14 @@ async def test_invalid_tool_arguments_commit_unexecuted_terminal(
 
 
 @pytest.mark.asyncio
-async def test_terminal_run_resumes_without_model_or_tool_replay(tmp_path: Path) -> None:
+async def test_terminal_run_resumes_without_model_or_tool_replay(
+    tmp_path: Path,
+) -> None:
     original_agent = JournalAgent()
     original_journal = JsonlSessionJournal(tmp_path)
-    original = await Engine(agent=original_agent, journal=original_journal).arun("inspect")
+    original = await Engine(agent=original_agent, journal=original_journal).arun(
+        "inspect"
+    )
 
     resumed_agent = JournalAgent()
     resumed = await Engine(
@@ -255,6 +289,111 @@ async def test_terminal_run_resumes_without_model_or_tool_replay(tmp_path: Path)
     assert resumed.state.final_result == "done"
     assert resumed.state.seen == ["canonical"]
     assert resumed_agent.executions == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("record_type", "keys", "value", "error"),
+    [
+        (
+            JournalRecordType.TOOL_TERMINAL,
+            ("action", "name"),
+            "tampered",
+            "tool.terminal action does not match model decision",
+        ),
+        (
+            JournalRecordType.TOOL_TERMINAL,
+            ("action_index",),
+            99,
+            "tool.terminal action_index is out of range",
+        ),
+        (
+            JournalRecordType.STEP_COMMITTED,
+            ("terminal_record_ids",),
+            ["wrong-terminal"],
+            "step.committed terminal_record_ids do not match its actions",
+        ),
+        (
+            JournalRecordType.MODEL_COMPLETED,
+            ("decision", "actions", 0),
+            "not-an-action",
+            "decision actions are invalid",
+        ),
+        (
+            JournalRecordType.STEP_COMMITTED,
+            ("history_append",),
+            ["not-a-message"],
+            "history_append entries must be objects",
+        ),
+    ],
+)
+async def test_resume_rejects_cross_record_transaction_corruption(
+    tmp_path: Path,
+    record_type: JournalRecordType,
+    keys: tuple[str | int, ...],
+    value: Any,
+    error: str,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    original = await Engine(agent=JournalAgent(), journal=journal).arun("inspect")
+    _tamper_journal_payload(journal.path, record_type, keys, value)
+
+    with pytest.raises(JournalError, match=error):
+        await Engine(
+            agent=JournalAgent(),
+            journal=JsonlSessionJournal(tmp_path),
+        ).aresume_from_journal(original.run_id)
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_tool_terminals_persisted_out_of_order(
+    tmp_path: Path,
+) -> None:
+    class TwoActionAgent(JournalAgent):
+        def decide(
+            self,
+            state: JournalState,
+            observation: dict[str, Any],
+        ) -> Decision[Action]:
+            _ = observation
+            if state.current_step == 0:
+                return Decision.act(
+                    [
+                        Action("inspect", action_id="first"),
+                        Action("inspect", action_id="second"),
+                    ]
+                )
+            return Decision.final("done")
+
+    journal = JsonlSessionJournal(tmp_path)
+    original = await Engine(agent=TwoActionAgent(), journal=journal).arun("inspect")
+    records = [
+        json.loads(line)
+        for line in journal.path.read_text(encoding="utf-8").splitlines()
+    ]
+    terminal_indexes = [
+        index
+        for index, record in enumerate(records)
+        if record["type"] == JournalRecordType.TOOL_TERMINAL.value
+    ]
+    assert len(terminal_indexes) == 2
+    first = records[terminal_indexes[0]]
+    second = records[terminal_indexes[1]]
+    first["record_id"], second["record_id"] = second["record_id"], first["record_id"]
+    first["payload"], second["payload"] = second["payload"], first["payload"]
+    journal.path.write_text(
+        "".join(
+            f"{json.dumps(record, ensure_ascii=False, sort_keys=True)}\n"
+            for record in records
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(JournalError, match="tool.terminal actions are out of order"):
+        await Engine(
+            agent=TwoActionAgent(),
+            journal=JsonlSessionJournal(tmp_path),
+        ).aresume_from_journal(original.run_id)
 
 
 @pytest.mark.asyncio
@@ -336,9 +475,7 @@ async def test_terminal_resume_restores_model_usage_and_cost(tmp_path: Path) -> 
         if record.type is JournalRecordType.BUDGET_COMMITTED
     )
     assert budget_commit.payload["tokens"] == original.total_tokens
-    assert budget_commit.payload["cost_usd"] == pytest.approx(
-        original.total_cost_usd
-    )
+    assert budget_commit.payload["cost_usd"] == pytest.approx(original.total_cost_usd)
     assert resumed.total_tokens == original.total_tokens
     assert resumed.total_cost_usd == pytest.approx(original.total_cost_usd)
     assert resumed_engine._token_usage == original.total_tokens
@@ -438,9 +575,10 @@ async def test_resume_reuses_only_the_last_committed_model_continuation(
         if record.type is JournalRecordType.MODEL_COMPLETED
     ]
     assert model_records[0].payload["model_request"]["provider"] == "model"
-    assert model_records[0].payload["model_response"]["continuation"][
-        "response_id"
-    ] == "resp-1"
+    assert (
+        model_records[0].payload["model_response"]["continuation"]["response_id"]
+        == "resp-1"
+    )
 
     resumed_model = ContinuationModel(block_continuation=False)
     resumed = await Engine(
@@ -515,6 +653,166 @@ class ForkSourceCloseFailingJournal(JsonlSessionJournal):
 
 
 @pytest.mark.asyncio
+async def test_fresh_run_accepts_an_explicit_stable_run_id(tmp_path: Path) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    result = await Engine(
+        agent=JournalAgent(),
+        journal=journal,
+    ).arun("inspect", run_id="stable-child-run")
+
+    assert result.run_id == "stable-child-run"
+    assert journal.run_id == "stable-child-run"
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_continuation_when_complete_tool_batch_was_uncommitted(
+    tmp_path: Path,
+) -> None:
+    class ContinuationModel(Model):
+        def __init__(self) -> None:
+            super().__init__(model="recovered-continuation", temperature=None)
+            self.requests: list[ModelRequest] = []
+            self.qitos_harness_metadata = {
+                "tool_policy": {"native_tool_call_preferred": True},
+                "parser": "ReActTextParser",
+                "protocol": "react_text_v1",
+            }
+
+        @property
+        def capabilities(self) -> ModelCapabilities:
+            return ModelCapabilities(
+                api=ModelAPI.RESPONSES,
+                native_tool_calls=True,
+                continuation=True,
+            )
+
+        async def stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            self.requests.append(request)
+            if request.continuation is not None:
+                yield ModelStreamEvent(
+                    text="Final Answer: resumed",
+                    type=ModelStreamEventType.COMPLETED,
+                    finish_reason="stop",
+                )
+                return
+            yield ModelStreamEvent(
+                type=ModelStreamEventType.COMPLETED,
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "inspect", "arguments": "{}"},
+                    }
+                ],
+                finish_reason="tool_calls",
+                continuation=ModelContinuation(
+                    run_id=request.run_id,
+                    provider=request.provider,
+                    model=request.model,
+                    protocol=request.protocol,
+                    response_id="resp-uncommitted",
+                    prefix_items=1,
+                    prefix_digest="prefix",
+                    settings_digest="settings",
+                ),
+            )
+
+    class ContinuationAgent(JournalAgent):
+        def __init__(self, model: ContinuationModel) -> None:
+            super().__init__()
+            self.llm = model
+            self.model_parser = ReActTextParser()
+
+        def decide(
+            self,
+            state: JournalState,
+            observation: dict[str, Any],
+        ) -> Decision[Action] | None:
+            _ = state, observation
+            return None
+
+    failed = FailingJournal(tmp_path, fail_type=JournalRecordType.STEP_COMMITTED)
+    with pytest.raises(JournalError, match="step.committed"):
+        await Engine(
+            ContinuationAgent(ContinuationModel()),
+            journal=failed,
+        ).arun("inspect")
+
+    resumed_model = ContinuationModel()
+    resumed = await Engine(
+        ContinuationAgent(resumed_model),
+        journal=JsonlSessionJournal(tmp_path),
+    ).aresume_from_journal(failed.run_id)
+
+    assert resumed.state.final_result == "resumed"
+    assert len(resumed_model.requests) == 1
+    continuation = resumed_model.requests[0].continuation
+    assert continuation is not None
+    assert continuation.response_id == "resp-uncommitted"
+
+
+@pytest.mark.asyncio
+async def test_journal_initialization_failure_closes_tools_and_environment(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class TrackingTool(BaseTool):
+        def __init__(self) -> None:
+            super().__init__(ToolSpec(name="tracking", description="lifecycle fixture"))
+
+        async def asetup(self, context: dict[str, Any]) -> None:
+            _ = context
+            events.append("tool.setup")
+
+        async def execute(
+            self,
+            args: dict[str, Any],
+            runtime_context: dict[str, Any] | None = None,
+        ) -> str:
+            _ = args, runtime_context
+            return "ok"
+
+        async def aclose(self) -> None:
+            events.append("tool.close")
+
+    class TrackingEnv(Env):
+        def reset(
+            self,
+            task: Any = None,
+            workspace: str | None = None,
+            **kwargs: Any,
+        ) -> EnvObservation:
+            _ = task, workspace, kwargs
+            events.append("env.reset")
+            return EnvObservation(data={})
+
+        def observe(self, state: Any = None) -> EnvObservation:
+            _ = state
+            return EnvObservation(data={})
+
+        def step(self, action: Any, state: Any = None) -> EnvStepResult:
+            _ = action, state
+            return EnvStepResult(observation=EnvObservation(data={}))
+
+        async def ateardown(self) -> None:
+            events.append("env.teardown")
+
+    agent = JournalAgent()
+    agent.tool_registry.register(TrackingTool())
+    journal = FailingJournal(tmp_path, fail_type=JournalRecordType.INPUT_ACCEPTED)
+
+    with pytest.raises(JournalError, match="input.accepted"):
+        await Engine(agent=agent, env=TrackingEnv(), journal=journal).arun("inspect")
+
+    assert journal.closed is True
+    assert events == ["tool.setup", "env.reset", "env.teardown", "tool.close"]
+
+
+@pytest.mark.asyncio
 async def test_tool_does_not_execute_when_started_record_fails(tmp_path: Path) -> None:
     agent = JournalAgent()
     journal = FailingJournal(tmp_path, fail_type=JournalRecordType.TOOL_STARTED)
@@ -536,6 +834,88 @@ async def test_close_failure_does_not_mask_run_failure(tmp_path: Path) -> None:
     with pytest.raises(JournalError, match="tool.started"):
         await Engine(agent=JournalAgent(), journal=journal).arun("inspect")
 
+    assert journal.closed is True
+
+
+@pytest.mark.asyncio
+async def test_engine_aclose_retries_only_incomplete_run_cleanup(
+    tmp_path: Path,
+) -> None:
+    class RetryCloseTool(BaseTool):
+        def __init__(self) -> None:
+            self.close_calls = 0
+            super().__init__(ToolSpec(name="retry_close", description="cleanup probe"))
+
+        async def execute(
+            self,
+            args: dict[str, Any],
+            runtime_context: dict[str, Any] | None = None,
+        ) -> str:
+            _ = args, runtime_context
+            return "unused"
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("tool close failed once")
+
+    class RetryCloseEnv(Env):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def reset(
+            self,
+            task: Any = None,
+            workspace: str | None = None,
+            **kwargs: Any,
+        ) -> EnvObservation:
+            _ = task, workspace, kwargs
+            return EnvObservation(data={})
+
+        def observe(self, state: Any = None) -> EnvObservation:
+            _ = state
+            return EnvObservation(data={})
+
+        def step(self, action: Any, state: Any = None) -> EnvStepResult:
+            _ = action, state
+            return EnvStepResult(observation=EnvObservation(data={}))
+
+        async def ateardown(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("env close failed once")
+
+    class RetryCloseJournal(JsonlSessionJournal):
+        def __init__(self, root: Path) -> None:
+            super().__init__(root)
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("journal close failed once")
+            await super().close()
+
+    agent = JournalAgent()
+    tool = RetryCloseTool()
+    agent.tool_registry.register(tool)
+    env = RetryCloseEnv()
+    journal = RetryCloseJournal(tmp_path)
+    engine = Engine(agent=agent, env=env, journal=journal)
+
+    with pytest.raises(RuntimeError, match="env close failed once"):
+        await engine.arun("inspect")
+
+    assert env.close_calls == 1
+    assert tool.close_calls == 1
+    assert journal.close_calls == 1
+
+    await engine.aclose()
+    await engine.aclose()
+
+    assert env.close_calls == 2
+    assert tool.close_calls == 2
+    assert journal.close_calls == 2
     assert journal.closed is True
 
 
@@ -965,7 +1345,7 @@ async def test_nested_terminal_fork_recovers_without_replaying_tools(
     source = JsonlSessionJournal(tmp_path)
     await source.open(original.run_id)
     child = await source.fork(terminal_boundary.position, "child-run")
-    child_boundary = (await JsonlRunCatalog(tmp_path).inspect_run("child-run"))
+    child_boundary = await JsonlRunCatalog(tmp_path).inspect_run("child-run")
     assert child_boundary.committed_position is not None
     grandchild = await child.fork(
         child_boundary.committed_position,
@@ -1075,7 +1455,9 @@ async def test_action_finalizers_see_only_prior_durable_results(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_journal_commits_critic_retry_before_the_next_step(tmp_path: Path) -> None:
+async def test_journal_commits_critic_retry_before_the_next_step(
+    tmp_path: Path,
+) -> None:
     class RetryOnce(Critic):
         def __init__(self) -> None:
             self.calls = 0

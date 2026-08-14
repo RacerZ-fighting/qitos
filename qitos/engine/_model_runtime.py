@@ -444,9 +444,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         )
         if isinstance(query, dict):
             query.setdefault("pending_content", str(prepared))
-            query.setdefault(
-                "model_name", getattr(llm, "model", None)
-            )
+            query.setdefault("model_name", getattr(llm, "model", None))
             query.setdefault("step_id", record.step_id)
             query.setdefault(
                 "warning_ratio", float(engine.context_config.warning_ratio)
@@ -465,7 +463,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         try:
             history_impl = engine._history()
             if history_impl.snapshot() != turn.history:
-                raise RuntimeError("history changed after the turn snapshot was captured")
+                raise RuntimeError(
+                    "history changed after the turn snapshot was captured"
+                )
             retrieved = history_impl.retrieve(
                 state=state, observation=observation, query=query
             )
@@ -1481,6 +1481,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     ) from exc
                 if not isinstance(chunk, ModelStreamEvent):
                     raise TypeError("Model.stream() must yield ModelStreamEvent values")
+                if terminal_seen:
+                    raise ModelTransportError(
+                        "model stream emitted an event after its terminal event",
+                        attempts=1,
+                        retryable=False,
+                    )
                 chunk_received_at = time.monotonic()
                 if first_event_at is None:
                     first_event_at = chunk_received_at
@@ -2057,7 +2063,25 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             if isinstance(response.tool_calls, list)
             else None
         )
-        if not tool_calls:
+        tool_calls_allowed = self._model_transaction_allows_tool_calls(response)
+        if tool_calls and not tool_calls_allowed:
+            invalid = metadata.get("invalid_tool_calls")
+            invalid_tool_calls = list(invalid) if isinstance(invalid, list) else []
+            invalid_tool_calls.extend(
+                {
+                    "call_id": item.get("id"),
+                    "name": (
+                        item.get("function", {}).get("name")
+                        if isinstance(item.get("function"), dict)
+                        else None
+                    ),
+                    "code": "tool_call_incomplete_transaction",
+                }
+                for item in tool_calls
+            )
+            metadata["invalid_tool_calls"] = invalid_tool_calls
+            tool_calls = None
+        if not tool_calls and tool_calls_allowed:
             markup_tool_calls = self._extract_text_tool_call_markup(text)
             if markup_tool_calls:
                 tool_calls = markup_tool_calls
@@ -2065,6 +2089,17 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 metadata["tool_call_markup_format"] = "glm_text_tool_call"
                 if self._contains_only_text_tool_call_markup(text):
                     text = ""
+        elif not tool_calls and "<tool_call>" in text:
+            invalid = metadata.get("invalid_tool_calls")
+            invalid_tool_calls = list(invalid) if isinstance(invalid, list) else []
+            invalid_tool_calls.append(
+                {
+                    "call_id": None,
+                    "name": None,
+                    "code": "tool_call_markup_incomplete_transaction",
+                }
+            )
+            metadata["invalid_tool_calls"] = invalid_tool_calls
         return ModelResponse(
             text=text,
             usage=response.usage,
@@ -2078,6 +2113,25 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             timing=response.timing,
             continuation=response.continuation,
         )
+
+    @staticmethod
+    def _model_transaction_allows_tool_calls(response: ModelResponse) -> bool:
+        """Reject action payloads from known partial or failed terminals."""
+
+        finish_reason = str(response.finish_reason or "").strip().casefold()
+        status = str(response.metadata.get("status") or "").strip().casefold()
+        unsafe_terminals = {
+            "canceled",
+            "cancelled",
+            "content_filter",
+            "error",
+            "failed",
+            "incomplete",
+            "length",
+            "max_output_tokens",
+            "max_tokens",
+        }
+        return finish_reason not in unsafe_terminals and status not in unsafe_terminals
 
     def _extract_text_tool_call_markup(self, text: str) -> List[Dict[str, Any]] | None:
         """Salvage GLM-style textual tool-call markup into native tool calls."""

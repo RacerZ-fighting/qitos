@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from ....core.budget import BudgetLedger
 from ....core.child import (
     DEFAULT_CHILD_MAX_STEPS,
     ChildHandle,
+    ChildLaunchContext,
     ChildLaunchRequest,
     ChildResult,
 )
@@ -16,6 +18,8 @@ from ....core.tool import BaseTool, ToolPermission, ToolSpec
 from ...child import (
     ChildExecutionScope,
     ChildInvocationFactory,
+    ChildJournalFactory,
+    ChildRunLimiter,
     ChildSupervisor,
 )
 
@@ -32,6 +36,8 @@ class AgentTool(BaseTool):
         execution_scope: ChildExecutionScope | None = None,
         execution_mode: AgentExecutionMode = "foreground",
         max_background_workers: int = 4,
+        run_limiter: ChildRunLimiter | None = None,
+        child_journal_factory: ChildJournalFactory | None = None,
         max_delegate_depth: int = 1,
         child_budget: TaskBudget | None = None,
         child_profile: str = "default",
@@ -41,9 +47,7 @@ class AgentTool(BaseTool):
     ) -> None:
         if max_delegate_depth <= 0:
             raise ValueError("max_delegate_depth must be positive")
-        resolved_budget = child_budget or TaskBudget(
-            max_steps=DEFAULT_CHILD_MAX_STEPS
-        )
+        resolved_budget = child_budget or TaskBudget(max_steps=DEFAULT_CHILD_MAX_STEPS)
         if not isinstance(resolved_budget, TaskBudget):
             raise TypeError("child_budget must be a TaskBudget")
         if not isinstance(child_profile, str) or not child_profile.strip():
@@ -52,9 +56,7 @@ class AgentTool(BaseTool):
             not isinstance(group, str) or not group.strip()
             for group in child_allowed_tool_groups
         ):
-            raise TypeError(
-                "child_allowed_tool_groups must contain non-empty strings"
-            )
+            raise TypeError("child_allowed_tool_groups must contain non-empty strings")
         if child_working_directory is not None and (
             not isinstance(child_working_directory, str)
             or not child_working_directory.strip()
@@ -71,10 +73,13 @@ class AgentTool(BaseTool):
         if supervisor is not None and (
             invocation_factory is not None
             or execution_scope is not None
+            or run_limiter is not None
+            or child_journal_factory is not None
             or max_background_workers != 4
         ):
             raise ValueError(
-                "invocation_factory, execution_scope, and max_background_workers "
+                "invocation_factory, execution_scope, run_limiter, "
+                "child_journal_factory, and max_background_workers "
                 "belong to the supplied supervisor"
             )
         if supervisor is None:
@@ -84,6 +89,8 @@ class AgentTool(BaseTool):
                 invocation_factory=invocation_factory,
                 execution_scope=execution_scope,
                 max_concurrency=max_background_workers,
+                run_limiter=run_limiter,
+                child_journal_factory=child_journal_factory,
             )
         self._supervisor = supervisor
         self._execution_mode = execution_mode
@@ -176,14 +183,14 @@ class AgentTool(BaseTool):
             str(args.get("subagent_type", "general-purpose")).strip()
             or "general-purpose"
         )
-        context = self._snapshot_parent_context(runtime_context, agent_type=agent_type)
-        parent_run_id = str(context.get("parent_run_id") or "").strip()
-        if not parent_run_id:
-            return {
-                "status": "error",
-                "error": "parent_run_id is required for child ownership",
-            }
-        current_depth = int(context.get("delegate_depth", 0))
+        try:
+            context = self._snapshot_parent_context(
+                runtime_context,
+                agent_type=agent_type,
+            )
+        except (TypeError, ValueError) as exc:
+            return {"status": "error", "error": str(exc)}
+        current_depth = context.delegate_depth
         if current_depth >= self._max_delegate_depth:
             return {
                 "status": "error",
@@ -216,9 +223,7 @@ class AgentTool(BaseTool):
             result = await self._supervisor.launch(
                 request,
                 context,
-                parent_run_id=parent_run_id,
                 background=background,
-                max_children=int(context.get("max_children", 0) or 0),
             )
         except (RuntimeError, ValueError, TypeError) as exc:
             return {"status": "error", "error": str(exc)}
@@ -293,15 +298,30 @@ class AgentTool(BaseTool):
         runtime_context: dict[str, Any] | None,
         *,
         agent_type: str,
-    ) -> dict[str, Any]:
-        context = dict(runtime_context or {})
+    ) -> ChildLaunchContext:
+        context = runtime_context or {}
         parent_agent = context.get("agent")
         parent_history = getattr(parent_agent, "history", None)
         parent_messages = getattr(parent_history, "messages", None)
-        if parent_messages is not None and "parent_history" not in context:
-            context["parent_history"] = tuple(parent_messages)
-        if agent_type == "fork" and "parent_history_snapshot" not in context:
+        history = context.get("parent_history")
+        if history is None and parent_messages is not None:
+            history = tuple(parent_messages)
+        history_snapshot = context.get("parent_history_snapshot")
+        if agent_type == "fork" and history_snapshot is None:
             snapshot = getattr(parent_history, "snapshot", None)
             if callable(snapshot):
-                context["parent_history_snapshot"] = snapshot()
-        return context
+                history_snapshot = snapshot()
+        budget_ledger = context.get("budget_ledger")
+        if budget_ledger is not None and not isinstance(budget_ledger, BudgetLedger):
+            raise TypeError("budget_ledger must be a BudgetLedger or None")
+        return ChildLaunchContext(
+            parent_run_id=str(context.get("parent_run_id") or "").strip(),
+            delegate_depth=context.get("delegate_depth", 0),
+            max_children=context.get("max_children", 0) or 0,
+            deadline_monotonic=context.get("deadline_monotonic"),
+            budget_ledger=budget_ledger,
+            journal=context.get("journal"),
+            post_runtime_event=context.get("post_runtime_event"),
+            parent_history=tuple(history or ()),
+            parent_history_snapshot=history_snapshot,
+        )

@@ -9,15 +9,23 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Protocol
 
-from .journal import JournalRecordRef
+from .budget import BudgetLedger
+from .journal import JournalRecordRef, SessionJournal
+from .runtime_input import RuntimeInput
 from .task import TaskBudget
 
 DEFAULT_CHILD_MAX_STEPS = 200
 ChildInvocationCleanup = Callable[[], Awaitable[None]]
+ChildPostRuntimeEvent = Callable[[RuntimeInput], Awaitable[bool]]
+ChildCancellationCheck = Callable[[], bool]
 
 
 class ChildPersistenceError(RuntimeError):
     """Raised when a Child lifecycle fact cannot be durably recorded."""
+
+
+class ChildRunLimitError(RuntimeError):
+    """Raised when a root Run's shared Child limit rejects a launch."""
 
 
 class ChildStatus(str, Enum):
@@ -170,14 +178,115 @@ class ChildLaunchRequest:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class ChildLaunchContext:
+    """Validated parent-Run values retained while one Child is supervised."""
+
+    parent_run_id: str
+    delegate_depth: int = 0
+    max_children: int = 0
+    deadline_monotonic: float | None = None
+    budget_ledger: BudgetLedger | None = None
+    journal: SessionJournal | None = None
+    post_runtime_event: ChildPostRuntimeEvent | None = None
+    parent_history: tuple[object, ...] = ()
+    parent_history_snapshot: object | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.parent_run_id, str) or not self.parent_run_id.strip():
+            raise ValueError("ChildLaunchContext.parent_run_id must be non-empty")
+        for name, value in (
+            ("delegate_depth", self.delegate_depth),
+            ("max_children", self.max_children),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"ChildLaunchContext.{name} must be non-negative")
+        deadline = self.deadline_monotonic
+        if deadline is not None and (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(float(deadline))
+            or deadline < 0
+        ):
+            raise ValueError(
+                "ChildLaunchContext.deadline_monotonic must be finite and non-negative"
+            )
+        if deadline is not None:
+            object.__setattr__(self, "deadline_monotonic", float(deadline))
+        if self.budget_ledger is not None and not isinstance(
+            self.budget_ledger, BudgetLedger
+        ):
+            raise TypeError(
+                "ChildLaunchContext.budget_ledger must be a BudgetLedger or None"
+            )
+        if self.journal is not None and not isinstance(self.journal, SessionJournal):
+            raise TypeError(
+                "ChildLaunchContext.journal must implement SessionJournal or be None"
+            )
+        if self.post_runtime_event is not None and not callable(
+            self.post_runtime_event
+        ):
+            raise TypeError(
+                "ChildLaunchContext.post_runtime_event must be callable or None"
+            )
+        if not isinstance(self.parent_history, tuple):
+            raise TypeError("ChildLaunchContext.parent_history must be a tuple")
+
+
+@dataclass(frozen=True, slots=True)
+class ChildRuntimeContext:
+    """Immutable invocation context created after durable Child admission."""
+
+    launch: ChildLaunchContext
+    handle: ChildHandle
+    child_run_id: str
+    cancellation_requested: ChildCancellationCheck
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.launch, ChildLaunchContext):
+            raise TypeError("ChildRuntimeContext.launch must be a ChildLaunchContext")
+        if not isinstance(self.handle, ChildHandle):
+            raise TypeError("ChildRuntimeContext.handle must be a ChildHandle")
+        if not isinstance(self.child_run_id, str) or not self.child_run_id.strip():
+            raise ValueError("ChildRuntimeContext.child_run_id must be non-empty")
+        if not callable(self.cancellation_requested):
+            raise TypeError(
+                "ChildRuntimeContext.cancellation_requested must be callable"
+            )
+
+    @property
+    def parent_run_id(self) -> str:
+        return self.launch.parent_run_id
+
+    @property
+    def delegate_depth(self) -> int:
+        return self.launch.delegate_depth
+
+    @property
+    def deadline_monotonic(self) -> float | None:
+        return self.launch.deadline_monotonic
+
+    @property
+    def budget_ledger(self) -> BudgetLedger | None:
+        return self.launch.budget_ledger
+
+    @property
+    def parent_history(self) -> tuple[object, ...]:
+        return self.launch.parent_history
+
+    @property
+    def parent_history_snapshot(self) -> object | None:
+        return self.launch.parent_history_snapshot
+
+
 class ChildStateView(Protocol):
     @property
     def final_result(self) -> Any:
-        ...
+        raise NotImplementedError
 
     @property
     def stop_reason(self) -> Any:
-        ...
+        raise NotImplementedError
 
 
 class ChildRunResult(Protocol):
@@ -208,13 +317,17 @@ class ChildEngine(Protocol):
 
     @property
     def active_run_id(self) -> str:
-        ...
+        raise NotImplementedError
 
     async def arun(self, task: str, **kwargs: Any) -> ChildRunResult:
+        raise NotImplementedError
+
+    async def aclose(self) -> None:
+        """Release an idle Engine, including one that never entered ``arun``."""
         ...
 
     def cancel(self, mode: str) -> None:
-        ...
+        raise NotImplementedError
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,7 +467,9 @@ class ChildResult:
             or not math.isfinite(float(self.elapsed_seconds))
             or self.elapsed_seconds < 0
         ):
-            raise ValueError("ChildResult.elapsed_seconds must be finite and non-negative")
+            raise ValueError(
+                "ChildResult.elapsed_seconds must be finite and non-negative"
+            )
 
     @property
     def ready(self) -> bool:
@@ -465,13 +580,18 @@ __all__ = [
     "DEFAULT_CHILD_MAX_STEPS",
     "AgentConclusion",
     "ChildEngine",
+    "ChildCancellationCheck",
     "ChildHandle",
     "ChildInvocation",
     "ChildInvocationCleanup",
+    "ChildLaunchContext",
     "ChildLaunchRequest",
+    "ChildPostRuntimeEvent",
     "ChildPersistenceError",
+    "ChildRunLimitError",
     "ChildResult",
     "ChildRunResult",
+    "ChildRuntimeContext",
     "ChildStateView",
     "ChildStatus",
 ]

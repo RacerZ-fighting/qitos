@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import errno
 import os
 import signal
 import subprocess
@@ -391,8 +392,7 @@ class ManagedHostProcessRuntime:
             detached = [
                 snapshot
                 for snapshot in self._detached.values()
-                if owner_run_id is None
-                or snapshot.handle.owner_run_id == owner_run_id
+                if owner_run_id is None or snapshot.handle.owner_run_id == owner_run_id
             ]
         snapshots = [
             await self._snapshot(entry, cursor=entry.output.total_bytes)
@@ -451,9 +451,7 @@ class ManagedHostProcessRuntime:
                     await journal.append(
                         JournalRecordType.PROCESS_TERMINAL,
                         snapshot.to_dict(),
-                        record_id=(
-                            f"{owner_run_id}:process:{process_id}:terminal"
-                        ),
+                        record_id=(f"{owner_run_id}:process:{process_id}:terminal"),
                     )
                 except asyncio.CancelledError:
                     raise
@@ -600,6 +598,17 @@ class ManagedHostProcessRuntime:
             await self._record_output(entry, final)
         except asyncio.CancelledError:
             raise
+        except OSError as exc:
+            # Linux PTY masters report EIO when the final slave descriptor is
+            # closed. That is the PTY equivalent of EOF, not a process or
+            # output-reader failure.
+            if entry.tty and exc.errno == errno.EIO:
+                final = decoder.decode(b"", final=True).encode("utf-8")
+                await self._record_output(entry, final)
+                return
+            entry.error = f"process output reader failed: {exc}"
+            if entry.process.returncode is None:
+                self._signal_process_group(entry.process, signal.SIGKILL)
         except Exception as exc:
             entry.error = f"process output reader failed: {exc}"
             if entry.process.returncode is None:
@@ -900,8 +909,7 @@ class ManagedHostProcessRuntime:
             key=lambda entry: entry.started_monotonic,
         )
         while (
-            len(self._entries) + len(self._detached) >= self._max_tracked
-            and finished
+            len(self._entries) + len(self._detached) >= self._max_tracked and finished
         ):
             entry = finished.pop(0)
             self._entries.pop(entry.handle.process_id, None)

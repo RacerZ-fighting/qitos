@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import CancelledError as ConcurrentFutureCancelledError
 import json
 import logging
 import os
@@ -63,6 +64,8 @@ from ..core.turn import TurnBudgetSnapshot, TurnRuntimeCapabilities, TurnSnapsho
 from ..trace import TraceWriter
 from ..protocols import get_protocol, infer_protocol_from_parser
 from ..models.profile_registry import infer_default_protocol, infer_model_profile
+from ..mcp.runtime import MCPRuntime
+from ..mcp.server import MCPServerFactory
 from ._action_runtime import _ActionRuntime
 from ._context_runtime import _ContextRuntime
 from ._control_runtime import _ControlRuntime
@@ -100,7 +103,6 @@ from .states import (
 )
 from .stop_criteria import FinalResultCriteria, StopCriteria
 from .validation import StateValidationGate
-
 
 StateT = TypeVar("StateT", bound=StateSchema)
 ObservationT = TypeVar("ObservationT")
@@ -305,6 +307,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         journal: SessionJournal | None = None,
         budget_ledger: BudgetLedger | None = None,
         state_snapshot_interval: int = 16,
+        mcp_server_factory: MCPServerFactory | None = None,
     ):
         if journal is not None and checkpoint_store is not None:
             raise ValueError(
@@ -341,9 +344,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             max_children=self.budget.max_children,
             deadline_monotonic=self.budget.deadline_monotonic,
         )
-        if budget_ledger is not None and not isinstance(
-            budget_ledger, BudgetLedger
-        ):
+        if budget_ledger is not None and not isinstance(budget_ledger, BudgetLedger):
             raise TypeError("budget_ledger must be a BudgetLedger")
         self._owns_budget_ledger = budget_ledger is None
         self._budget_ledger = budget_ledger or BudgetLedger(
@@ -364,6 +365,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self.search = search
         self.critics = critics or []
         self.env = env
+        if mcp_server_factory is not None and not callable(mcp_server_factory):
+            raise TypeError("mcp_server_factory must be callable or None")
+        self._mcp_server_factory = mcp_server_factory
         self.history_policy = history_policy or HistoryPolicy()
         self.context_config = (
             context_config
@@ -396,6 +400,9 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._permission_pipeline = resolved_pipeline
         self._rbw_enforcer = resolved_rbw
         self._permission_interaction_callback = permission_interaction_callback
+        # Cancellation is an executor dependency, so it must exist before the
+        # first executor is constructed and then remain stable for this Engine.
+        self._cancel_token = CancelToken()
         self.executor = self._build_action_executor(self.tool_registry)
         self.events: List[RuntimeEvent] = []
         self.records: List[StepRecord] = []
@@ -446,8 +453,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._control_runtime: _ControlRuntime[StateT, ObservationT, ActionT] = (
             _ControlRuntime(self)
         )
-        self._turn_runtime: _TurnRuntime[StateT, ObservationT, ActionT] = (
-            _TurnRuntime(self)
+        self._turn_runtime: _TurnRuntime[StateT, ObservationT, ActionT] = _TurnRuntime(
+            self
         )
         self._trace_runtime: _TraceRuntime[StateT] = _TraceRuntime(self)
         self._handoff_runtime: _HandoffRuntime[StateT, ObservationT, ActionT] = (
@@ -496,14 +503,22 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         if getattr(agent, "handoff_targets", None) and self.tool_registry is not None:
             self._register_handoff_tools()
 
-        # Cancellation token — shared with EngineResult for external cancel
-        self._cancel_token = CancelToken()
+        # Runtime inbox and active task are initialized after the executor;
+        # unlike cancellation, they are not construction-time dependencies.
         self._runtime_inbox = _RuntimeInbox()
         self._runtime_input_post_lock = asyncio.Lock()
         self._active_async_task: Optional[asyncio.Task[Any]] = None
         self._active_async_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._connected_mcp_servers: List[Any] = []
-        self._mcp_tool_names: List[str] = []
+        self._mcp_runtime: MCPRuntime | None = None
+        self._stepwise_mcp_loop: asyncio.AbstractEventLoop | None = None
+        # Construction may allocate resources before the first Run.  Each flag
+        # remains set until that owner's teardown succeeds, allowing ``aclose``
+        # to retry only incomplete cleanup after a Run failure.
+        self._tool_cleanup_required = self.tool_registry is not None
+        self._tool_cleanup_context: Dict[str, Any] = {}
+        self._env_cleanup_required = self.env is not None
+        self._journal_cleanup_required = self.journal is not None
+        self._closed = False
 
     def _build_action_executor(
         self,
@@ -545,6 +560,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             read_before_write_enforcer=self._rbw_enforcer,
             permission_interaction_callback=self._permission_interaction_callback,
             auto_approve=self.auto_approve,
+            cancel_token=self._cancel_token,
             turn_budget=turn.budget if turn is not None else None,
         )
 
@@ -701,6 +717,33 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 records=records,
             )
 
+    def request_mcp_refresh(self, server_name: str | None = None) -> bool:
+        """Request MCP discovery at the next turn safe point."""
+
+        runtime = self._mcp_runtime
+        if runtime is None:
+            return False
+        return runtime.request_refresh(server_name)
+
+    async def _start_mcp_runtime(self) -> None:
+        """Create and start this session's MCP owner before turn capture."""
+
+        if self._mcp_server_factory is None:
+            return
+        if self._mcp_runtime is not None:
+            raise RuntimeError("MCP runtime is already active")
+        servers = tuple(self._mcp_server_factory())
+        runtime = MCPRuntime(
+            tool_registry=self.tool_registry,
+            servers=servers,
+        )
+        # Publish the owner before startup so ``aclose()`` can retry any
+        # transport cleanup left incomplete by factory or handshake failure.
+        self._mcp_runtime = runtime
+        await runtime.start(
+            deadline_monotonic=self._runtime_deadline_monotonic,
+        )
+
     def _record_model_cost(
         self,
         usage: ModelUsage | Mapping[str, Any] | None,
@@ -761,9 +804,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
         return self._active_run_id
 
-    async def apost_runtime_event(
-        self, event: RuntimeInput, *, run_id: str
-    ) -> bool:
+    async def apost_runtime_event(self, event: RuntimeInput, *, run_id: str) -> bool:
         """Durably post one idempotent event to the exact active run.
 
         Journal-backed runs append the event before making it visible to the
@@ -815,7 +856,14 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         except RuntimeError:
             post.close()
             return False
-        return bool(future.result())
+        try:
+            return bool(future.result())
+        except ConcurrentFutureCancelledError:
+            # The active Run may finish and close its event loop after the
+            # preflight check but before this scheduled post begins. Late
+            # synchronous producers observe the same stable rejection as any
+            # other post outside the Run lifecycle.
+            return False
 
     def defer_runtime_event(self, event: RuntimeInput, *, run_id: str) -> bool:
         """Queue an event from a synchronous Engine hook for the next safe point.
@@ -929,6 +977,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         Sets up Engine run state, creates initial state and observation.
         Returns (state, observation) ready for the first ``step()`` call.
         """
+        if self._closed:
+            raise RuntimeError("Engine is closed")
+        if self._mcp_runtime is not None:
+            raise RuntimeError(
+                "an MCP stepwise session is already active; close the Engine "
+                "before initializing another session"
+            )
         self._reset_run_state()
         memory = self._memory()
         if memory is not None:
@@ -989,17 +1044,46 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         Interactive callers own step advancement; full runs use the same turn
         runtime with transactional advancement and persistence enabled.
         """
-
-        await self._drain_runtime_events(state.current_step)
-        execution = await self._turn_runtime.execute(
-            state,
-            observation,
-            task=self._active_task or state.task,
-            started_at=time.monotonic(),
-            step_id=state.current_step,
-            managed_run=False,
-        )
-        return execution.step
+        if self._closed:
+            raise RuntimeError("Engine is closed")
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError("Engine.astep() requires a running event loop")
+        if self._active_async_task is not None and not self._active_async_task.done():
+            raise RuntimeError("Engine already has an active run or step")
+        current_loop = asyncio.get_running_loop()
+        if (
+            self._stepwise_mcp_loop is not None
+            and self._stepwise_mcp_loop is not current_loop
+        ):
+            raise RuntimeError(
+                "MCP stepwise sessions must remain on the event loop that "
+                "started their transports"
+            )
+        self._active_async_task = current_task
+        self._active_async_loop = current_loop
+        try:
+            if self._mcp_server_factory is not None and self._mcp_runtime is None:
+                self._stepwise_mcp_loop = current_loop
+                await self._start_mcp_runtime()
+            if self._mcp_runtime is not None:
+                await self._mcp_runtime.refresh_pending(
+                    deadline_monotonic=self._runtime_deadline_monotonic,
+                )
+            await self._drain_runtime_events(state.current_step)
+            execution = await self._turn_runtime.execute(
+                state,
+                observation,
+                task=self._active_task or state.task,
+                started_at=time.monotonic(),
+                step_id=state.current_step,
+                managed_run=False,
+            )
+            return execution.step
+        finally:
+            if self._active_async_task is current_task:
+                self._active_async_task = None
+                self._active_async_loop = None
 
     def step(
         self,
@@ -1007,6 +1091,12 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         observation: ObservationT,
     ) -> StepResult:
         """Run one step from a synchronous application boundary."""
+
+        if self._mcp_server_factory is not None:
+            raise RuntimeError(
+                "Engine.step() cannot drive MCP transports across temporary "
+                "event loops; await Engine.astep() instead"
+            )
 
         return self._run_sync(self.astep(state, observation), operation="step")
 
@@ -1100,10 +1190,20 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         task: str | Task,
         *,
         history_snapshot: HistorySnapshot | None = None,
+        run_id: str | None = None,
         **kwargs: Any,
     ) -> EngineResult[StateT]:
         """Run the canonical Engine loop on the caller's event loop."""
 
+        if self._closed:
+            raise RuntimeError("Engine is closed")
+        if self._stepwise_mcp_loop is not None:
+            raise RuntimeError(
+                "cannot start a full Run while an MCP stepwise session is active; "
+                "close the Engine first"
+            )
+        if run_id is not None and (not isinstance(run_id, str) or not run_id.strip()):
+            raise ValueError("run_id must be a non-empty string or None")
         current_task = asyncio.current_task()
         if current_task is None:
             raise RuntimeError("Engine.arun() requires a running event loop")
@@ -1111,10 +1211,13 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             raise RuntimeError("Engine already has an active run")
         self._active_async_task = current_task
         self._active_async_loop = asyncio.get_running_loop()
+        if self.journal is not None:
+            self._journal_cleanup_required = True
         try:
             result = await self._arun_impl(
                 task,
                 history_snapshot=history_snapshot,
+                run_id=run_id.strip() if run_id is not None else None,
                 **kwargs,
             )
         except BaseException:
@@ -1128,27 +1231,97 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 self._active_async_task = None
                 self._active_async_loop = None
 
+    async def aclose(self) -> None:
+        """Close an idle Engine, including one cancelled before its first run.
+
+        ``arun()`` owns normal per-run teardown. This method supplies the missing
+        construction-to-start boundary needed by Child factories and retries any
+        teardown that failed while a Run was unwinding. Closing an active Engine
+        is rejected; callers must cancel and await its run first.
+        """
+
+        if self._closed:
+            return
+        if (
+            self._stepwise_mcp_loop is not None
+            and self._stepwise_mcp_loop is not asyncio.get_running_loop()
+        ):
+            raise RuntimeError(
+                "an MCP stepwise session must be closed on the event loop that "
+                "started its transports"
+            )
+        active = self._active_async_task
+        if active is not None and not active.done():
+            raise RuntimeError("cannot close an active Engine; cancel and await it")
+
+        errors: list[BaseException] = []
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            await self._teardown_env()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            await self._ateardown_toolsets({})
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            if self._mcp_runtime is not None:
+                await self._mcp_runtime.aclose()
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except BaseException as exc:
+            errors.append(exc)
+        else:
+            self._mcp_runtime = None
+            self._stepwise_mcp_loop = None
+        try:
+            await self._close_journal()
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except BaseException as exc:
+            errors.append(exc)
+
+        if cancellation is not None:
+            if errors:
+                raise cancellation from errors[-1]
+            raise cancellation
+        if errors:
+            if len(errors) > 1:
+                raise errors[-1] from errors[0]
+            raise errors[0]
+        self._closed = True
+
     async def _arun_impl(
         self,
         task: str | Task,
         *,
         history_snapshot: HistorySnapshot | None = None,
+        run_id: str | None = None,
         **kwargs: Any,
     ) -> EngineResult[StateT]:
         # Check for resume-from-checkpoint internal kwargs
         _resume_state = kwargs.pop("_resume_state", None)
         _resume_step = kwargs.pop("_resume_step", None)
         _resume_run_id = kwargs.pop("_resume_run_id", None)
+        if (
+            run_id is not None
+            and _resume_run_id is not None
+            and run_id != str(_resume_run_id).strip()
+        ):
+            raise ValueError("run_id conflicts with the resumed Run id")
         _resume_checkpoint_id = kwargs.pop("_resume_checkpoint_id", None)
         _resume_journal = bool(kwargs.pop("_resume_journal", False))
-        _resume_canonical_results = tuple(
-            kwargs.pop("_resume_canonical_results", ())
-        )
+        _resume_canonical_results = tuple(kwargs.pop("_resume_canonical_results", ()))
         _resume_usage = dict(kwargs.pop("_resume_usage", {}) or {})
         _resume_budget_records = tuple(kwargs.pop("_resume_budget_records", ()))
-        if not all(
-            isinstance(item, JournalRecord) for item in _resume_budget_records
-        ):
+        if not all(isinstance(item, JournalRecord) for item in _resume_budget_records):
             raise TypeError("_resume_budget_records must contain JournalRecord values")
         _resume_continuation = kwargs.pop("_resume_continuation", None)
         _resume_runtime_inputs = tuple(kwargs.pop("_resume_runtime_inputs", ()))
@@ -1169,11 +1342,15 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 self.recovery_policy.reset()
             except Exception as exc:
                 _logger.debug("Failed to reset recovery_policy: %s", exc)
-        self._active_run_id = str(_resume_run_id or "").strip() or (
-            str(getattr(self.trace_writer, "run_id", "")).strip()
-            if self.trace_writer is not None
-            else ""
-        ) or f"run_{uuid4().hex[:12]}"
+        self._active_run_id = (
+            str(_resume_run_id or run_id or "").strip()
+            or (
+                str(getattr(self.trace_writer, "run_id", "")).strip()
+                if self.trace_writer is not None
+                else ""
+            )
+            or f"run_{uuid4().hex[:12]}"
+        )
         self._last_checkpoint_id = _resume_checkpoint_id
         self._last_system_prompt = ""
         self._last_prompt_metadata = {}
@@ -1229,64 +1406,101 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._active_state = state
         self._hydrate_trace_metadata(task_obj=task_obj, task_text=task_text)
 
+        toolsets_ready = False
+        environment_started = False
+        inbox_open = False
         try:
-            await self._asetup_toolsets(
-                {
-                    "state": state,
-                    "trace_writer": self.trace_writer,
-                    "task": task_obj or task_text,
-                    "run_id": self._active_run_id,
-                    "journal": self.journal,
-                    "resume_journal": _resume_journal,
-                }
+            # Setup may allocate before raising, so ownership starts before the
+            # call rather than only after a successful return.
+            toolsets_ready = True
+            try:
+                await self._asetup_toolsets(
+                    {
+                        "state": state,
+                        "trace_writer": self.trace_writer,
+                        "task": task_obj or task_text,
+                        "run_id": self._active_run_id,
+                        "journal": self.journal,
+                        "resume_journal": _resume_journal,
+                    }
+                )
+            except Exception as exc:
+                self._report_runtime_exception("SETUP_TOOLSETS", 0, exc, emit=False)
+                raise
+            if _resume_journal and self.journal is not None:
+                _resume_runtime_inputs = recover_pending_runtime_inputs(
+                    await self.journal.replay()
+                )
+            environment_started = True
+            try:
+                self._setup_env(task_obj=task_obj, state=state, kwargs=kwargs)
+            except Exception as exc:
+                self._report_runtime_exception("SETUP_ENV", 0, exc, emit=False)
+                raise
+            if self.journal is not None and not _resume_journal:
+                await self._journal_initialize(task_obj, task_text, state)
+                self._active_state = type(state).from_dict(state.to_dict())
+            elif self.journal is not None:
+                self._active_state = type(state).from_dict(state.to_dict())
+            self._runtime_inbox.open(
+                self._active_run_id,
+                recovered=_resume_runtime_inputs,
             )
-        except Exception as exc:
-            self._report_runtime_exception("SETUP_TOOLSETS", 0, exc, emit=False)
-            raise
-        if _resume_journal and self.journal is not None:
-            _resume_runtime_inputs = recover_pending_runtime_inputs(
-                await self.journal.replay()
-            )
-        try:
-            self._setup_env(task_obj=task_obj, state=state, kwargs=kwargs)
-        except Exception as exc:
-            self._report_runtime_exception("SETUP_ENV", 0, exc, emit=False)
-            raise
-        if self.journal is not None and not _resume_journal:
-            await self._journal_initialize(task_obj, task_text, state)
-            self._active_state = type(state).from_dict(state.to_dict())
-        elif self.journal is not None:
-            self._active_state = type(state).from_dict(state.to_dict())
-        self._runtime_inbox.open(
-            self._active_run_id,
-            recovered=_resume_runtime_inputs,
-        )
-        harness_diagnostics = self._harness_mismatch_diagnostics()
-        self._emit(
-            0,
-            RuntimePhase.INIT,
-            payload={
-                "task": task_text,
-                "task_id": task_obj.id if task_obj is not None else None,
-                "task_meta": self._task_meta(task_obj),
-                "run_meta": self._run_meta(),
-                "env": self._env_identity(),
-                "harness_diagnostics": harness_diagnostics,
-            },
-        )
-        if harness_diagnostics.get("mismatch"):
+            inbox_open = True
+            harness_diagnostics = self._harness_mismatch_diagnostics()
             self._emit(
                 0,
                 RuntimePhase.INIT,
-                payload={"stage": "harness_mismatch", **harness_diagnostics},
+                payload={
+                    "task": task_text,
+                    "task_id": task_obj.id if task_obj is not None else None,
+                    "task_meta": self._task_meta(task_obj),
+                    "run_meta": self._run_meta(),
+                    "env": self._env_identity(),
+                    "harness_diagnostics": harness_diagnostics,
+                },
             )
-        self._notify_run_start(task_text, state)
-        try:
+            if harness_diagnostics.get("mismatch"):
+                self._emit(
+                    0,
+                    RuntimePhase.INIT,
+                    payload={"stage": "harness_mismatch", **harness_diagnostics},
+                )
+            self._notify_run_start(task_text, state)
             preflight_issues = self._preflight_validate(
                 task_obj=task_obj, workspace=kwargs.get("workspace")
             )
         except BaseException:
-            await self._close_runtime_inbox(self._active_run_id)
+            if inbox_open:
+                try:
+                    await self._close_runtime_inbox(self._active_run_id)
+                except BaseException:
+                    _logger.warning(
+                        "Runtime inbox cleanup failed during Run initialization",
+                        exc_info=True,
+                    )
+            if environment_started:
+                try:
+                    await self._teardown_env()
+                except BaseException:
+                    _logger.warning(
+                        "Environment cleanup failed during Run initialization",
+                        exc_info=True,
+                    )
+            if toolsets_ready:
+                try:
+                    await self._ateardown_toolsets(
+                        {
+                            "state": state,
+                            "trace_writer": self.trace_writer,
+                            "task": task_obj or task_text,
+                        }
+                    )
+                except BaseException:
+                    _logger.warning(
+                        "Tool cleanup failed during Run initialization",
+                        exc_info=True,
+                    )
             raise
         if preflight_issues:
             has_task_issue = any(
@@ -1365,9 +1579,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         journal_interrupted = False
         try:
             # MCP discovery happens after preflight but before the first model
-            # turn. Empty configuration creates no thread or connection.
-            if getattr(self.agent, "mcp_servers", None):
-                await self._connect_mcp_servers()
+            # turn. Empty configuration creates no task or connection.
+            await self._start_mcp_runtime()
             current_observation = self._build_initial_observation(
                 state, step_id, started_at
             )
@@ -1406,6 +1619,14 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                         payload={"stop_reason": state.stop_reason},
                     )
                     break
+
+                # Notifications and explicit requests only invalidate the live
+                # catalog. Publication here precedes immutable turn capture, so
+                # an in-flight turn retains its exact Tool handlers and schema.
+                if self._mcp_runtime is not None:
+                    await self._mcp_runtime.refresh_pending(
+                        deadline_monotonic=self._runtime_deadline_monotonic,
+                    )
 
                 # External input is accepted only here. The turn runtime then
                 # captures one immutable provider/tool/config view and commits
@@ -1496,12 +1717,15 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     _logger.warning(
                         "Checkpoint save failed during cancellation: %s", exc
                     )
-            # Cleanup MCP servers
+            # Cleanup the run-owned MCP catalog and transports.
             try:
-                await self._cleanup_mcp_servers()
+                if self._mcp_runtime is not None:
+                    await self._mcp_runtime.aclose()
             except BaseException as exc:
                 if cleanup_error is None:
                     cleanup_error = exc
+            else:
+                self._mcp_runtime = None
             if cleanup_error is not None:
                 raise cleanup_error
 
@@ -1573,6 +1797,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         task: str | Task,
         *,
         history_snapshot: HistorySnapshot | None = None,
+        run_id: str | None = None,
         **kwargs: Any,
     ) -> EngineResult[StateT]:
         """Run from a synchronous application boundary.
@@ -1582,7 +1807,12 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         """
 
         return self._run_sync(
-            self.arun(task, history_snapshot=history_snapshot, **kwargs),
+            self.arun(
+                task,
+                history_snapshot=history_snapshot,
+                run_id=run_id,
+                **kwargs,
+            ),
             operation="run",
         )
 
@@ -1829,9 +2059,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         observation: ObservationT,
         branch_decision: Decision[ActionT],
     ) -> Decision[ActionT]:
-        return self._decision_runtime.select_branch(
-            state, observation, branch_decision
-        )
+        return self._decision_runtime.select_branch(state, observation, branch_decision)
 
     async def _run_act(
         self,
@@ -2166,6 +2394,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     async def aresume_from_journal(self, run_id: str) -> EngineResult[StateT]:
         """Resume one Run from its canonical journal."""
 
+        if self.journal is not None:
+            self._journal_cleanup_required = True
         try:
             result = await self._aresume_from_journal_impl(run_id)
         except BaseException:
@@ -2313,6 +2543,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         journal = self.journal
         if journal is None:
             raise RuntimeError("No journal configured; cannot fork.")
+        self._journal_cleanup_required = True
         try:
             if journal.run_id:
                 if journal.run_id != run_id:
@@ -2342,8 +2573,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
     async def _close_journal(self) -> None:
         journal = self.journal
-        if journal is not None:
-            await journal.close()
+        if journal is None or not self._journal_cleanup_required:
+            return
+        await journal.close()
+        self._journal_cleanup_required = False
 
     async def _close_journal_after_error(self) -> None:
         try:
@@ -2592,9 +2825,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             step_id=step_id,
             reasoning_content=reasoning_content,
             metadata=metadata or {},
-            tool_calls=[
-                dict(x) for x in list(tool_calls or []) if isinstance(x, dict)
-            ],
+            tool_calls=[dict(x) for x in list(tool_calls or []) if isinstance(x, dict)],
             tool_call_id=tool_call_id,
             name=name,
             native_items=[
@@ -2769,6 +3000,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     def _setup_env(
         self, task_obj: Optional[Task], state: StateT, kwargs: Dict[str, Any]
     ) -> None:
+        self._env_cleanup_required = True
         self._env_runtime.setup_env(task_obj, state, kwargs)
 
     def _build_env_from_spec(
@@ -2777,7 +3009,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         return self._env_runtime.build_env_from_spec(env_spec, fallback_workspace)
 
     async def _teardown_env(self) -> None:
+        if not self._env_cleanup_required:
+            return
         await self._env_runtime.teardown_env()
+        self._env_cleanup_required = False
 
     def _run_env_step(
         self,
@@ -2805,8 +3040,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         return self._env_runtime.env_step_result_to_dict(result)
 
     def _setup_toolsets(self, context: Dict[str, Any]) -> None:
-        if not hasattr(self.tool_registry, "setup"):
-            return
+        self._tool_cleanup_required = True
+        self._tool_cleanup_context = dict(context)
         self._write_lifecycle_event("toolset_setup_start", context)
         try:
             self.tool_registry.setup(context)
@@ -2817,9 +3052,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             )
 
     async def _asetup_toolsets(self, context: Dict[str, Any]) -> None:
-        if not hasattr(self.tool_registry, "asetup"):
-            self._setup_toolsets(context)
-            return
+        self._tool_cleanup_required = True
+        self._tool_cleanup_context = dict(context)
         self._write_lifecycle_event("toolset_setup_start", context)
         try:
             await self.tool_registry.asetup(context)
@@ -2831,31 +3065,36 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             raise
 
     def _teardown_toolsets(self, context: Dict[str, Any]) -> None:
-        if not hasattr(self.tool_registry, "teardown"):
+        if not self._tool_cleanup_required:
             return
-        self._write_lifecycle_event("toolset_teardown_start", context)
+        payload = dict(context) if context else dict(self._tool_cleanup_context)
+        self._write_lifecycle_event("toolset_teardown_start", payload)
         try:
-            self.tool_registry.teardown(context)
-            self._write_lifecycle_event("toolset_teardown_end", context)
+            self.tool_registry.teardown(payload)
+            self._write_lifecycle_event("toolset_teardown_end", payload)
         except Exception as exc:
             self._write_lifecycle_event(
-                "toolset_teardown_error", context, ok=False, error=str(exc)
+                "toolset_teardown_error", payload, ok=False, error=str(exc)
             )
             raise
+        self._tool_cleanup_required = False
+        self._tool_cleanup_context = {}
 
     async def _ateardown_toolsets(self, context: Dict[str, Any]) -> None:
-        if not hasattr(self.tool_registry, "ateardown"):
-            self._teardown_toolsets(context)
+        if not self._tool_cleanup_required:
             return
-        self._write_lifecycle_event("toolset_teardown_start", context)
+        payload = dict(context) if context else dict(self._tool_cleanup_context)
+        self._write_lifecycle_event("toolset_teardown_start", payload)
         try:
-            await self.tool_registry.ateardown(context)
-            self._write_lifecycle_event("toolset_teardown_end", context)
+            await self.tool_registry.ateardown(payload)
+            self._write_lifecycle_event("toolset_teardown_end", payload)
         except Exception as exc:
             self._write_lifecycle_event(
-                "toolset_teardown_error", context, ok=False, error=str(exc)
+                "toolset_teardown_error", payload, ok=False, error=str(exc)
             )
             raise
+        self._tool_cleanup_required = False
+        self._tool_cleanup_context = {}
 
     def _write_lifecycle_event(
         self,
@@ -2941,88 +3180,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._critic_modified_prompt = None
         self._critic_instruction_patch = None
         self._cancel_token.clear()
-
-    # -- MCP server lifecycle helpers --
-
-    async def _connect_mcp_servers(self) -> None:
-        """Connect all configured MCP servers and bridge their tools."""
-        from ..mcp.bridge import mcp_server_to_function_tools
-
-        servers = list(getattr(self.agent, "mcp_servers", None) or [])
-        if not servers:
-            return
-
-        used_names = set(
-            self.tool_registry.list_tools() if self.tool_registry is not None else []
-        )
-
-        for server in servers:
-            registered_names: List[str] = []
-
-            async def _rollback_setup() -> None:
-                for name in reversed(registered_names):
-                    try:
-                        self.tool_registry.unregister(name)
-                    except Exception as unregister_exc:
-                        _logger.warning(
-                            "MCP tool rollback failed for %s: %s",
-                            name,
-                            unregister_exc,
-                        )
-                if hasattr(server, "cleanup"):
-                    try:
-                        await server.cleanup()
-                    except Exception as cleanup_exc:
-                        _logger.warning(
-                            "MCP server cleanup after setup failure failed: %s",
-                            cleanup_exc,
-                        )
-
-            try:
-                if hasattr(server, "connect"):
-                    await server.connect()
-                # Bridge MCP tools into the engine's tool registry
-                if self.tool_registry is not None:
-                    tools = await mcp_server_to_function_tools(
-                        server,
-                        name_prefix=f"mcp__{server.name}",
-                        used_names=used_names,
-                    )
-                    for tool in tools:
-                        if hasattr(self.tool_registry, "register"):
-                            self.tool_registry.register(tool)
-                            registered_names.append(tool.name)
-                self._connected_mcp_servers.append(server)
-                self._mcp_tool_names.extend(registered_names)
-            except asyncio.CancelledError:
-                await _rollback_setup()
-                raise
-            except Exception as exc:
-                await _rollback_setup()
-                # One optional server must not prevent the remaining run.
-                _logger.warning(
-                    "MCP server %s could not be exposed: %s",
-                    getattr(server, "name", "<unknown>"),
-                    exc,
-                )
-
-    async def _cleanup_mcp_servers(self) -> None:
-        """Remove run-scoped MCP tools and close transports on this loop."""
-        for name in reversed(self._mcp_tool_names):
-            try:
-                if self.tool_registry is not None:
-                    self.tool_registry.unregister(name)
-            except Exception as exc:
-                _logger.warning("MCP tool cleanup failed for %s: %s", name, exc)
-        self._mcp_tool_names = []
-
-        for server in self._connected_mcp_servers:
-            try:
-                if hasattr(server, "cleanup"):
-                    await server.cleanup()
-            except Exception as exc:
-                _logger.warning("MCP server cleanup failed: %s", exc)
-        self._connected_mcp_servers = []
 
     # -- Handoff tool helpers --
 

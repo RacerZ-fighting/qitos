@@ -24,7 +24,6 @@ from .tool_registry import ToolExposure, ToolRegistry
 from .turn import TurnSnapshot
 from ..prompting import PromptBuildResult, PromptBuilder, PromptSpec
 
-
 StateT = TypeVar("StateT")
 ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
@@ -62,9 +61,13 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         model_protocol: Any = None,
         memory: Memory | None = None,
         history: History | None = None,
-        mcp_servers: List[Any] | None = None,
         **config: Any,
     ):
+        if "mcp_servers" in config:
+            raise TypeError(
+                "AgentModule no longer owns live mcp_servers; pass "
+                "mcp_server_factory to Engine"
+            )
         self.tool_registry = self._resolve_tool_registry(
             tool_registry=tool_registry, toolset=toolset
         )
@@ -73,7 +76,6 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         self.model_protocol = model_protocol
         self.memory = memory
         self.history = history
-        self.mcp_servers: List[Any] = mcp_servers or []
         self.config = config
 
     @abstractmethod
@@ -300,7 +302,9 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
             scaffold_spec = PromptSpec(
                 persona_prompt=str(manual_prompt or "").strip(),
                 parser_feedback=self._state_prompt_attr(state, "parser_feedback"),
-                continuation_feedback=self._state_prompt_attr(state, "timeout_feedback"),
+                continuation_feedback=self._state_prompt_attr(
+                    state, "timeout_feedback"
+                ),
                 include_tool_schema=True,
                 include_contract=True,
                 metadata={
@@ -324,13 +328,17 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
                     "prompt_builder": "manual_build_system_prompt",
                     "prompt_builder_version": "manual",
                     "sections_used": scaffold.metadata.get("sections_used", []),
-                    "tool_schema_style": getattr(
-                        protocol, "id", None
+                    "tool_schema_style": getattr(protocol, "id", None),
+                    "prompt_hash_static": scaffold.metadata.get(
+                        "prompt_hash_static", ""
                     ),
-                    "prompt_hash_static": scaffold.metadata.get("prompt_hash_static", ""),
                     "prompt_hash_full": scaffold.metadata.get("prompt_hash_full", ""),
-                    "estimated_tokens_static": scaffold.metadata.get("estimated_tokens_static", 0),
-                    "estimated_tokens_full": scaffold.metadata.get("estimated_tokens_full", 0),
+                    "estimated_tokens_static": scaffold.metadata.get(
+                        "estimated_tokens_static", 0
+                    ),
+                    "estimated_tokens_full": scaffold.metadata.get(
+                        "estimated_tokens_full", 0
+                    ),
                 }
             )
             return PromptBuildResult(
@@ -567,7 +575,10 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
             kwargs["stop_criteria"] = stop_criteria
         if history_policy is not None:
             kwargs["history_policy"] = history_policy
-        elif "history_policy" not in kwargs and self.config.get("history_policy") is not None:
+        elif (
+            "history_policy" not in kwargs
+            and self.config.get("history_policy") is not None
+        ):
             kwargs["history_policy"] = self.config.get("history_policy")
         if context_config is not None:
             kwargs["context_config"] = context_config
@@ -686,7 +697,11 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
         return ClaudeStyleHook(output_jsonl=output_jsonl, theme=theme)
 
     def _resolve_run_spec(
-        self, *, run_spec: RunSpec | Dict[str, Any] | None, engine: Any, task: Task | None
+        self,
+        *,
+        run_spec: RunSpec | Dict[str, Any] | None,
+        engine: Any,
+        task: Task | None,
     ) -> RunSpec:
         spec = RunSpec.from_value(run_spec)
         llm = getattr(self, "llm", None)
@@ -718,7 +733,9 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
             except Exception:
                 spec.prompt_protocol = None
         if not spec.parser_name:
-            parser = getattr(engine, "parser", None) or getattr(self, "model_parser", None)
+            parser = getattr(engine, "parser", None) or getattr(
+                self, "model_parser", None
+            )
             spec.parser_name = parser.__class__.__name__ if parser is not None else None
         if not spec.toolset_name and getattr(engine, "tool_registry", None) is not None:
             spec.toolset_name = engine.tool_registry.__class__.__name__
@@ -742,23 +759,20 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
                 value = harness_metadata.get(key)
                 if value and key not in merged_metadata:
                     merged_metadata[key] = value
-            if (
-                "tool_policy" not in merged_metadata
-                and isinstance(harness_metadata.get("tool_policy"), dict)
+            if "tool_policy" not in merged_metadata and isinstance(
+                harness_metadata.get("tool_policy"), dict
             ):
                 merged_metadata["tool_policy"] = dict(
                     harness_metadata.get("tool_policy") or {}
                 )
-            if (
-                "context_policy" not in merged_metadata
-                and isinstance(harness_metadata.get("context_policy"), dict)
+            if "context_policy" not in merged_metadata and isinstance(
+                harness_metadata.get("context_policy"), dict
             ):
                 merged_metadata["context_policy"] = dict(
                     harness_metadata.get("context_policy") or {}
                 )
-            if (
-                "harness_policy" not in merged_metadata
-                and isinstance(harness_metadata, dict)
+            if "harness_policy" not in merged_metadata and isinstance(
+                harness_metadata, dict
             ):
                 merged_metadata["harness_policy"] = dict(harness_metadata)
             spec.metadata = merged_metadata
@@ -874,12 +888,16 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
                 payload["type"] = env_type
             return {k: v for k, v in payload.items() if v is not None}
         if task is not None and task.env_spec is not None:
-            return task.env_spec.to_dict() if hasattr(task.env_spec, "to_dict") else {
-                "type": task.env_spec.type,
-                "config": dict(task.env_spec.config or {}),
-                "capabilities": list(task.env_spec.capabilities or []),
-                "metadata": dict(task.env_spec.metadata or {}),
-            }
+            return (
+                task.env_spec.to_dict()
+                if hasattr(task.env_spec, "to_dict")
+                else {
+                    "type": task.env_spec.type,
+                    "config": dict(task.env_spec.config or {}),
+                    "capabilities": list(task.env_spec.capabilities or []),
+                    "metadata": dict(task.env_spec.metadata or {}),
+                }
+            )
         return {}
 
 

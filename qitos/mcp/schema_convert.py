@@ -17,12 +17,11 @@ Key conversion rules:
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
-from ..core.tool import ToolSpec
+from ..core.tool import ToolPermission, ToolSpec
 from ..core.tool_schema import normalize_tool_input_schema
 from .server import MCPToolInfo
-
 
 # --------------------------------------------------------------------------- #
 # Public API
@@ -50,28 +49,26 @@ def convert_mcp_schema_to_tool_spec(
     # Resolve $defs / definitions so we can inline simple ref patterns.
     defs = _extract_defs(schema)
 
-    properties: Dict[str, Any] = schema.get("properties", {})
-    required_list: List[str] = list(schema.get("required", []))
+    raw_properties = schema.get("properties", {})
+    if not isinstance(raw_properties, dict):
+        raise ValueError("MCP Tool inputSchema properties must be an object")
+    properties: Dict[str, Any] = raw_properties
+    raw_required = schema.get("required", [])
+    if not isinstance(raw_required, list) or not all(
+        isinstance(item, str) for item in raw_required
+    ):
+        raise ValueError("MCP Tool inputSchema required must be an array of strings")
+    required_list: List[str] = list(raw_required)
 
     parameters: Dict[str, Dict[str, Any]] = {}
     for param_name, param_schema in properties.items():
         resolved = _resolve_refs(param_schema, defs)
         parameters[param_name] = _convert_property(resolved)
 
-    # Build the full input_schema for ToolSpec (preserving the original MCP schema
-    # shape but with resolved refs for the parameters sub-dict).
-    resolved_properties: Dict[str, Any] = {}
-    for param_name, param_schema in properties.items():
-        resolved_properties[param_name] = _resolve_refs(param_schema, defs)
-
-    input_schema = {
-        "type": "object",
-        "properties": resolved_properties,
-        "required": required_list,
-    }
-    # Preserve additionalProperties if present.
-    if "additionalProperties" in schema:
-        input_schema["additionalProperties"] = schema["additionalProperties"]
+    # The full MCP schema remains the validation authority. Resolving local refs
+    # must not discard root constraints such as oneOf, dependentRequired, or
+    # patternProperties merely because ToolSpec also exposes flat parameters.
+    input_schema = _resolve_refs(schema, defs)
     input_schema = normalize_tool_input_schema(
         input_schema,
         parameters=parameters,
@@ -84,7 +81,10 @@ def convert_mcp_schema_to_tool_spec(
         parameters=parameters,
         required=required_list,
         input_schema=input_schema,
-        read_only=True,  # MCP tools are treated as read-only by default
+        permissions=ToolPermission(network=True),
+        read_only=mcp_tool.annotations.read_only_hint is True,
+        concurrency_safe=None,
+        group="mcp",
     )
 
 

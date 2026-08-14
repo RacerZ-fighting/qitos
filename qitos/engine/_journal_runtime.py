@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Dict, Generic, Mapping, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Dict, Generic, Mapping, TypeVar
 from uuid import uuid4
 
 from ..core.action import Action
 from ..core.agent_module import ActionResultContext, CanonicalActionResult
 from ..core.child import ChildHandle, ChildResult
-from ..core.decision import Decision
+from ..core.decision import Decision, DecisionMode
 from ..core.completion import CompletionDisposition
 from ..core.errors import StopReason
 from ..core.history import HistoryMessage
@@ -298,9 +298,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
             return
         state_payload = state.to_dict()
         committed_payload = (
-            engine._active_state.to_dict()
-            if engine._active_state is not None
-            else None
+            engine._active_state.to_dict() if engine._active_state is not None else None
         )
         if committed_payload != state_payload:
             await self.snapshot_state(
@@ -361,7 +359,9 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 continue
             if journal_record.type is JournalRecordType.MODEL_COMPLETED:
                 transaction_id = str(payload.get("transaction_id") or "")
-                step_id = int(payload.get("step_id") or 0)
+                step_id = _non_negative_int(
+                    payload.get("step_id"), "model.completed step_id"
+                )
                 if not transaction_id:
                     raise JournalError("model.completed is missing transaction_id")
                 record = step_records.setdefault(
@@ -421,7 +421,9 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                     usage_completion_tokens += max(0, completion_value)
                     usage_total_tokens += max(0, total_value)
                 raw_cost = record.model_response.get("cost_usd", 0.0)
-                if isinstance(raw_cost, (int, float)) and not isinstance(raw_cost, bool):
+                if isinstance(raw_cost, (int, float)) and not isinstance(
+                    raw_cost, bool
+                ):
                     usage_cost_usd += max(0.0, float(raw_cost))
                 raw_prompt_metadata = payload.get("prompt_metadata")
                 record.prompt_metadata = (
@@ -434,35 +436,68 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                     raise JournalError("model.completed is missing decision")
                 record.decision = decision_from_dict(raw_decision)
                 record.actions = list(record.decision.actions)
-                transactions.setdefault(
-                    transaction_id,
-                    {
-                        "step_id": step_id,
-                        "decision": record.decision,
-                        "started": set(),
-                        "terminals": {},
-                        "committed": False,
-                    },
-                )
+                if transaction_id in transactions:
+                    raise JournalError("model.completed transaction is duplicated")
+                raw_continuation = record.model_response.get("continuation")
+                try:
+                    continuation = (
+                        ModelContinuation.from_dict(raw_continuation)
+                        if isinstance(raw_continuation, Mapping)
+                        else None
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise JournalError(
+                        "model.completed has an invalid model continuation"
+                    ) from exc
+                transactions[transaction_id] = {
+                    "step_id": step_id,
+                    "decision": record.decision,
+                    "continuation": continuation,
+                    "started": set(),
+                    "terminals": {},
+                    "terminal_record_ids": {},
+                    "committed": False,
+                }
                 history.extend(history_append_from_payload(payload))
                 continue
             if journal_record.type is JournalRecordType.TOOL_STARTED:
                 transaction_id = str(payload.get("transaction_id") or "")
-                action_index = payload.get("action_index")
-                if (
-                    not transaction_id
-                    or isinstance(action_index, bool)
-                    or not isinstance(action_index, int)
-                ):
+                if not transaction_id:
                     raise JournalError("tool.started payload is invalid")
+                action_index = _non_negative_int(
+                    payload.get("action_index"), "tool.started action_index"
+                )
                 transaction = transactions.get(transaction_id)
                 if transaction is None:
                     raise JournalError("tool.started has no model transaction")
+                if _non_negative_int(
+                    payload.get("step_id"), "tool.started step_id"
+                ) != int(transaction["step_id"]):
+                    raise JournalError(
+                        "tool.started step does not match its transaction"
+                    )
+                actions = list(transaction["decision"].actions)
+                if action_index >= len(actions):
+                    raise JournalError("tool.started action_index is out of range")
+                action_payload = payload.get("action")
+                if not isinstance(action_payload, Mapping):
+                    raise JournalError("tool.started is missing action")
+                started_action = action_from_dict(action_payload)
+                if action_to_dict(started_action) != action_to_dict(
+                    actions[action_index]
+                ):
+                    raise JournalError(
+                        "tool.started action does not match model decision"
+                    )
+                if action_index in transaction["started"]:
+                    raise JournalError("tool.started action is duplicated")
                 transaction["started"].add(action_index)
                 continue
             if journal_record.type is JournalRecordType.TOOL_TERMINAL:
                 transaction_id = str(payload.get("transaction_id") or "")
-                step_id = int(payload.get("step_id") or 0)
+                step_id = _non_negative_int(
+                    payload.get("step_id"), "tool.terminal step_id"
+                )
                 result = payload.get("result")
                 if not transaction_id or not isinstance(result, Mapping):
                     raise JournalError("tool.terminal payload is invalid")
@@ -475,29 +510,53 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                     ),
                 )
                 terminal_result = ToolResult.from_value(dict(result))
+                if terminal_result.to_dict() != dict(result):
+                    raise JournalError("tool.terminal result is not canonical")
                 record.action_results.append(terminal_result)
                 transaction = transactions.get(transaction_id)
-                action_index = payload.get("action_index")
-                if (
-                    transaction is None
-                    or isinstance(action_index, bool)
-                    or not isinstance(action_index, int)
-                ):
+                if transaction is None:
                     raise JournalError("tool.terminal has no model transaction")
+                action_index = _non_negative_int(
+                    payload.get("action_index"), "tool.terminal action_index"
+                )
+                if step_id != int(transaction["step_id"]):
+                    raise JournalError(
+                        "tool.terminal step does not match its transaction"
+                    )
+                actions = list(transaction["decision"].actions)
+                if action_index >= len(actions):
+                    raise JournalError("tool.terminal action_index is out of range")
+                if action_index != len(transaction["terminals"]):
+                    raise JournalError("tool.terminal actions are out of order")
+                if action_index in transaction["terminals"]:
+                    raise JournalError("tool.terminal action is duplicated")
                 transaction["terminals"][action_index] = terminal_result
                 action_payload = payload.get("action")
                 if not isinstance(action_payload, Mapping):
                     raise JournalError("tool.terminal is missing action")
-                action = Action.from_dict(dict(action_payload))
-                expected_call_id = _action_call_id(action, step_id, action_index)
+                terminal_action = action_from_dict(action_payload)
+                if action_to_dict(terminal_action) != action_to_dict(
+                    actions[action_index]
+                ):
+                    raise JournalError(
+                        "tool.terminal action does not match model decision"
+                    )
+                expected_call_id = _action_call_id(
+                    terminal_action,
+                    step_id,
+                    action_index,
+                )
                 if terminal_result.call_id is None:
                     terminal_result.call_id = expected_call_id
                 elif terminal_result.call_id != expected_call_id:
                     raise JournalError("tool.terminal call_id does not match action")
+                transaction["terminal_record_ids"][
+                    action_index
+                ] = journal_record.record_id
                 canonical_results.append(
                     CanonicalActionResult(
                         step_id,
-                        action,
+                        terminal_action,
                         terminal_result,
                         JournalRecordRef(
                             journal_record.run_id,
@@ -525,23 +584,36 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                 transaction = transactions.get(transaction_id)
                 if transaction is None:
                     raise JournalError("step.committed has no model transaction")
-                transaction["committed"] = True
-                model_record = step_records.get(transaction_id)
-                raw_continuation = (
-                    model_record.model_response.get("continuation")
-                    if model_record is not None
-                    else None
-                )
-                try:
-                    latest_continuation = (
-                        ModelContinuation.from_dict(raw_continuation)
-                        if isinstance(raw_continuation, Mapping)
-                        else None
-                    )
-                except (TypeError, ValueError) as exc:
+                if transaction["committed"]:
+                    raise JournalError("step.committed transaction is duplicated")
+                if _non_negative_int(
+                    payload.get("step_id"), "step.committed step_id"
+                ) != int(transaction["step_id"]):
                     raise JournalError(
-                        "step.committed has an invalid model continuation"
-                    ) from exc
+                        "step.committed step does not match its transaction"
+                    )
+                actions = list(transaction["decision"].actions)
+                committed_terminals = transaction["terminals"]
+                if set(committed_terminals) != set(range(len(actions))):
+                    raise JournalError(
+                        "step.committed does not contain one terminal per action"
+                    )
+                raw_terminal_ids = payload.get("terminal_record_ids")
+                if not isinstance(raw_terminal_ids, list) or any(
+                    not isinstance(record_id, str) or not record_id
+                    for record_id in raw_terminal_ids
+                ):
+                    raise JournalError("step.committed terminal_record_ids are invalid")
+                expected_terminal_ids = [
+                    transaction["terminal_record_ids"][index]
+                    for index in range(len(actions))
+                ]
+                if raw_terminal_ids != expected_terminal_ids:
+                    raise JournalError(
+                        "step.committed terminal_record_ids do not match its actions"
+                    )
+                transaction["committed"] = True
+                latest_continuation = transaction["continuation"]
                 history.extend(history_append_from_payload(payload))
                 continue
             if journal_record.type is JournalRecordType.RUN_INTERRUPTED:
@@ -630,9 +702,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                     "journal contains an incomplete terminal action batch"
                 )
             before = dict(state_data)
-            ordered_results = [
-                terminal_results[index] for index in range(len(actions))
-            ]
+            ordered_results = [terminal_results[index] for index in range(len(actions))]
             working = type(engine.agent.init_state(task)).from_dict(before)
             self.reduce_action_results(
                 working,
@@ -715,6 +785,7 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                     },
                 }
             )
+            latest_continuation = transaction["continuation"]
         return {
             "task": task,
             "task_data": task_data,
@@ -769,14 +840,59 @@ def action_to_dict(action: Action) -> Dict[str, Any]:
     }
 
 
+def _non_negative_int(value: object, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise JournalError(f"{field} is invalid")
+    return value
+
+
+def _has_exact_keys(
+    payload: Mapping[str, Any],
+    expected: set[str],
+    field: str,
+) -> None:
+    if set(payload) != expected:
+        raise JournalError(f"{field} fields are invalid")
+
+
+def action_from_dict(payload: Mapping[str, Any]) -> Action:
+    _has_exact_keys(
+        payload,
+        {"name", "args", "action_id", "metadata"},
+        "action",
+    )
+    name = payload["name"]
+    args = payload["args"]
+    action_id = payload["action_id"]
+    metadata = payload["metadata"]
+    if not isinstance(name, str) or not name.strip():
+        raise JournalError("action name is invalid")
+    if not isinstance(args, Mapping):
+        raise JournalError("action args are invalid")
+    if action_id is not None and not isinstance(action_id, str):
+        raise JournalError("action action_id is invalid")
+    if not isinstance(metadata, Mapping):
+        raise JournalError("action metadata is invalid")
+    try:
+        action = Action(
+            name=name,
+            args=dict(args),
+            action_id=action_id,
+            metadata=dict(metadata),
+        )
+    except (TypeError, ValueError) as exc:
+        raise JournalError("action is invalid") from exc
+    if action_to_dict(action) != dict(payload):
+        raise JournalError("action is not canonical")
+    return action
+
+
 def decision_to_dict(decision: Decision[Any]) -> Dict[str, Any]:
     return {
         "mode": decision.mode,
         "actions": [
             action_to_dict(
-                action
-                if isinstance(action, Action)
-                else Action.from_dict(dict(action))
+                action if isinstance(action, Action) else Action.from_dict(dict(action))
             )
             for action in decision.actions
         ],
@@ -788,35 +904,57 @@ def decision_to_dict(decision: Decision[Any]) -> Dict[str, Any]:
 
 
 def decision_from_dict(payload: Mapping[str, Any]) -> Decision[Action]:
-    decision = Decision(
-        mode=cast(Any, str(payload.get("mode") or "")),
-        actions=[
-            Action.from_dict(dict(item))
-            for item in list(payload.get("actions") or [])
-            if isinstance(item, Mapping)
-        ],
-        final_answer=(
-            str(payload["final_answer"])
-            if payload.get("final_answer") is not None
-            else None
-        ),
-        rationale=(
-            str(payload["rationale"])
-            if payload.get("rationale") is not None
-            else None
-        ),
-        meta=(
-            dict(payload.get("meta") or {})
-            if isinstance(payload.get("meta"), Mapping)
-            else {}
-        ),
-        candidates=[
-            decision_from_dict(item)
-            for item in list(payload.get("candidates") or [])
-            if isinstance(item, Mapping)
-        ],
+    _has_exact_keys(
+        payload,
+        {"mode", "actions", "final_answer", "rationale", "meta", "candidates"},
+        "decision",
     )
-    decision.validate()
+    mode = payload["mode"]
+    raw_actions = payload["actions"]
+    final_answer = payload["final_answer"]
+    rationale = payload["rationale"]
+    meta = payload["meta"]
+    raw_candidates = payload["candidates"]
+    if mode == "act":
+        decision_mode: DecisionMode = "act"
+    elif mode == "final":
+        decision_mode = "final"
+    elif mode == "wait":
+        decision_mode = "wait"
+    elif mode == "branch":
+        decision_mode = "branch"
+    elif mode == "handoff":
+        decision_mode = "handoff"
+    else:
+        raise JournalError("decision mode is invalid")
+    if not isinstance(raw_actions, list) or not all(
+        isinstance(item, Mapping) for item in raw_actions
+    ):
+        raise JournalError("decision actions are invalid")
+    if final_answer is not None and not isinstance(final_answer, str):
+        raise JournalError("decision final_answer is invalid")
+    if rationale is not None and not isinstance(rationale, str):
+        raise JournalError("decision rationale is invalid")
+    if not isinstance(meta, Mapping):
+        raise JournalError("decision meta is invalid")
+    if not isinstance(raw_candidates, list) or not all(
+        isinstance(item, Mapping) for item in raw_candidates
+    ):
+        raise JournalError("decision candidates are invalid")
+    try:
+        decision = Decision(
+            mode=decision_mode,
+            actions=[action_from_dict(item) for item in raw_actions],
+            final_answer=final_answer,
+            rationale=rationale,
+            meta=dict(meta),
+            candidates=[decision_from_dict(item) for item in raw_candidates],
+        )
+        decision.validate()
+    except (TypeError, ValueError) as exc:
+        raise JournalError("decision is invalid") from exc
+    if decision_to_dict(decision) != dict(payload):
+        raise JournalError("decision is not canonical")
     return decision
 
 
@@ -835,48 +973,71 @@ def history_message_to_dict(message: HistoryMessage) -> Dict[str, Any]:
 
 
 def history_message_from_dict(payload: Mapping[str, Any]) -> HistoryMessage:
-    return HistoryMessage(
-        role=str(payload.get("role") or ""),
-        step_id=int(payload.get("step_id") or 0),
-        content=payload.get("content"),
-        reasoning_content=(
-            str(payload["reasoning_content"])
-            if payload.get("reasoning_content") is not None
-            else None
-        ),
-        tool_calls=[
-            dict(item)
-            for item in list(payload.get("tool_calls") or [])
-            if isinstance(item, Mapping)
-        ],
-        tool_call_id=(
-            str(payload["tool_call_id"])
-            if payload.get("tool_call_id") is not None
-            else None
-        ),
-        name=str(payload["name"]) if payload.get("name") is not None else None,
-        metadata=(
-            dict(payload.get("metadata") or {})
-            if isinstance(payload.get("metadata"), Mapping)
-            else {}
-        ),
-        native_items=[
-            dict(item)
-            for item in list(payload.get("native_items") or [])
-            if isinstance(item, Mapping)
-        ],
+    _has_exact_keys(
+        payload,
+        {
+            "role",
+            "step_id",
+            "content",
+            "reasoning_content",
+            "tool_calls",
+            "tool_call_id",
+            "name",
+            "metadata",
+            "native_items",
+        },
+        "history message",
     )
+    role = payload["role"]
+    reasoning_content = payload["reasoning_content"]
+    raw_tool_calls = payload["tool_calls"]
+    tool_call_id = payload["tool_call_id"]
+    name = payload["name"]
+    metadata = payload["metadata"]
+    raw_native_items = payload["native_items"]
+    if not isinstance(role, str) or not role:
+        raise JournalError("history message role is invalid")
+    step_id = _non_negative_int(payload["step_id"], "history message step_id")
+    for value, field in (
+        (reasoning_content, "reasoning_content"),
+        (tool_call_id, "tool_call_id"),
+        (name, "name"),
+    ):
+        if value is not None and not isinstance(value, str):
+            raise JournalError(f"history message {field} is invalid")
+    if not isinstance(raw_tool_calls, list) or not all(
+        isinstance(item, Mapping) for item in raw_tool_calls
+    ):
+        raise JournalError("history message tool_calls are invalid")
+    if not isinstance(metadata, Mapping):
+        raise JournalError("history message metadata is invalid")
+    if not isinstance(raw_native_items, list) or not all(
+        isinstance(item, Mapping) for item in raw_native_items
+    ):
+        raise JournalError("history message native_items are invalid")
+    message = HistoryMessage(
+        role=role,
+        step_id=step_id,
+        content=payload["content"],
+        reasoning_content=reasoning_content,
+        tool_calls=[dict(item) for item in raw_tool_calls],
+        tool_call_id=tool_call_id,
+        name=name,
+        metadata=dict(metadata),
+        native_items=[dict(item) for item in raw_native_items],
+    )
+    if history_message_to_dict(message) != dict(payload):
+        raise JournalError("history message is not canonical")
+    return message
 
 
 def history_append_from_payload(payload: Mapping[str, Any]) -> list[HistoryMessage]:
-    raw_messages = payload.get("history_append") or []
+    raw_messages = payload.get("history_append", [])
     if not isinstance(raw_messages, list):
         raise JournalError("history_append must be an array")
-    return [
-        history_message_from_dict(item)
-        for item in raw_messages
-        if isinstance(item, Mapping)
-    ]
+    if not all(isinstance(item, Mapping) for item in raw_messages):
+        raise JournalError("history_append entries must be objects")
+    return [history_message_from_dict(item) for item in raw_messages]
 
 
 def tool_result_history_message(
@@ -979,9 +1140,7 @@ def _background_child_handles(
         if raw_background is None:
             continue
         raw_handle = record.payload.get("handle")
-        if not isinstance(raw_background, bool) or not isinstance(
-            raw_handle, Mapping
-        ):
+        if not isinstance(raw_background, bool) or not isinstance(raw_handle, Mapping):
             raise JournalError("child.started delivery policy is invalid")
         try:
             handle = ChildHandle.from_dict(raw_handle)

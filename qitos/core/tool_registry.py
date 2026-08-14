@@ -5,16 +5,74 @@ from __future__ import annotations
 import asyncio
 import difflib
 import hashlib
+import inspect
 import json
+import logging
 import re
 from copy import copy, deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Mapping, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    cast,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    runtime_checkable,
+)
 
 from .tool import BaseTool, FunctionTool, ToolMeta, get_tool_meta
 
 if TYPE_CHECKING:
     from .tool import ToolPermissionSpec
+
+
+_logger = logging.getLogger(__name__)
+
+
+async def _await_lifecycle_result(
+    result: object,
+    *,
+    owner: object,
+    method: str,
+) -> None:
+    if not inspect.isawaitable(result):
+        raise TypeError(f"{type(owner).__name__}.{method}() must return an awaitable")
+    await cast(Awaitable[object], result)
+
+
+@runtime_checkable
+class _SyncSetup(Protocol):
+    def setup(self, context: Dict[str, Any]) -> None:
+        raise NotImplementedError
+
+
+@runtime_checkable
+class _AsyncSetup(Protocol):
+    async def asetup(self, context: Dict[str, Any]) -> None:
+        raise NotImplementedError
+
+
+@runtime_checkable
+class _SyncTeardown(Protocol):
+    def teardown(self, context: Dict[str, Any]) -> None:
+        raise NotImplementedError
+
+
+@runtime_checkable
+class _AsyncTeardown(Protocol):
+    async def ateardown(self, context: Dict[str, Any]) -> None:
+        raise NotImplementedError
+
+
+@runtime_checkable
+class _AsyncClose(Protocol):
+    async def aclose(self) -> object:
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)
@@ -196,7 +254,9 @@ class ToolRegistry:
         ordered: List[str] = []
         if normalized_needle in normalized_candidates:
             ordered.append(normalized_candidates[normalized_needle])
-        close = difflib.get_close_matches(needle, candidates, n=max(1, int(limit)), cutoff=0.5)
+        close = difflib.get_close_matches(
+            needle, candidates, n=max(1, int(limit)), cutoff=0.5
+        )
         for item in close:
             if item not in ordered:
                 ordered.append(item)
@@ -260,11 +320,10 @@ class ToolRegistry:
             if identity in seen:
                 continue
             seen.add(identity)
-            setup = getattr(tool, "setup", None)
-            if callable(setup):
-                setup(payload)
+            if isinstance(tool, _SyncSetup):
+                tool.setup(payload)
         for toolset in self._toolsets:
-            if hasattr(toolset, "setup"):
+            if isinstance(toolset, _SyncSetup):
                 toolset.setup(payload)
         self._setup_done = True
 
@@ -275,28 +334,43 @@ class ToolRegistry:
             return
         payload = context or {}
         seen: set[int] = set()
-        for tool in self._tools.values():
-            identity = id(tool)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            setup = getattr(tool, "asetup", None)
-            if callable(setup):
-                await setup(payload)
-        for toolset in self._toolsets:
-            setup = getattr(toolset, "asetup", None)
-            if callable(setup):
-                await setup(payload)
-                continue
-            setup = getattr(toolset, "setup", None)
-            if callable(setup):
-                await asyncio.to_thread(setup, payload)
+        try:
+            for tool in self._tools.values():
+                identity = id(tool)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if isinstance(tool, _AsyncSetup):
+                    await _await_lifecycle_result(
+                        tool.asetup(payload),
+                        owner=tool,
+                        method="asetup",
+                    )
+            for toolset in self._toolsets:
+                if isinstance(toolset, _AsyncSetup):
+                    await _await_lifecycle_result(
+                        toolset.asetup(payload),
+                        owner=toolset,
+                        method="asetup",
+                    )
+                    continue
+                if isinstance(toolset, _SyncSetup):
+                    await asyncio.to_thread(toolset.setup, payload)
+        except BaseException:
+            try:
+                await self.ateardown(payload)
+            except BaseException as cleanup_error:
+                _logger.warning(
+                    "ToolRegistry cleanup after setup failure also failed",
+                    exc_info=cleanup_error,
+                )
+            raise
         self._setup_done = True
 
     def teardown(self, context: Optional[Dict[str, Any]] = None) -> None:
         payload = context or {}
         for toolset in reversed(self._toolsets):
-            if hasattr(toolset, "teardown"):
+            if isinstance(toolset, _SyncTeardown):
                 toolset.teardown(payload)
         self._setup_done = False
 
@@ -305,23 +379,58 @@ class ToolRegistry:
 
         payload = context or {}
         seen: set[int] = set()
+        cleanup_error: BaseException | None = None
+        cancellation: asyncio.CancelledError | None = None
         for tool in reversed(list(self._tools.values())):
             identity = id(tool)
             if identity in seen:
                 continue
             seen.add(identity)
-            close = getattr(tool, "aclose", None)
-            if callable(close):
-                await close()
+            if isinstance(tool, _AsyncClose):
+                try:
+                    await _await_lifecycle_result(
+                        tool.aclose(),
+                        owner=tool,
+                        method="aclose",
+                    )
+                except asyncio.CancelledError as exc:
+                    if cancellation is None:
+                        cancellation = exc
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                    else:
+                        _logger.warning(
+                            "Additional Tool cleanup failure",
+                            exc_info=exc,
+                        )
         for toolset in reversed(self._toolsets):
-            teardown = getattr(toolset, "ateardown", None)
-            if callable(teardown):
-                await teardown(payload)
-                continue
-            teardown = getattr(toolset, "teardown", None)
-            if callable(teardown):
-                await asyncio.to_thread(teardown, payload)
+            try:
+                if isinstance(toolset, _AsyncTeardown):
+                    await _await_lifecycle_result(
+                        toolset.ateardown(payload),
+                        owner=toolset,
+                        method="ateardown",
+                    )
+                    continue
+                if isinstance(toolset, _SyncTeardown):
+                    await asyncio.to_thread(toolset.teardown, payload)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                else:
+                    _logger.warning(
+                        "Additional ToolSet cleanup failure",
+                        exc_info=exc,
+                    )
         self._setup_done = False
+        if cancellation is not None:
+            raise cancellation
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def get_tool_descriptions(self, protocol: Any = None, renderer: Any = None) -> str:
         if renderer is not None:
@@ -343,9 +452,7 @@ class ToolRegistry:
             if tool.spec.required_ops:
                 lines.append(f"Required Ops: {', '.join(tool.spec.required_ops)}")
             if tool.spec.environment_ops:
-                lines.append(
-                    f"Environment Ops: {', '.join(tool.spec.environment_ops)}"
-                )
+                lines.append(f"Environment Ops: {', '.join(tool.spec.environment_ops)}")
             if tool.spec.group != "default":
                 lines.append(f"Group: {tool.spec.group}")
             if origin.toolset_name:

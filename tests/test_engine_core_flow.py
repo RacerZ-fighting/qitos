@@ -133,7 +133,9 @@ def test_engine_records_local_model_stream_timing(monkeypatch):
                     text="Final Answer: done",
                     event_type="text.delta",
                 ),
-                ModelStreamEvent(type=ModelStreamEventType.COMPLETED, finish_reason="stop"),
+                ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED, finish_reason="stop"
+                ),
             ]
         ]
     )
@@ -869,7 +871,13 @@ def test_memory_and_history_streams_are_strictly_separated():
 
 def test_engine_records_context_telemetry_and_defaults_to_compact_runtime_history():
     model = _ChunkSequenceModel(
-        [[ModelStreamEvent(text="Final Answer: ok", type=ModelStreamEventType.COMPLETED)]],
+        [
+            [
+                ModelStreamEvent(
+                    text="Final Answer: ok", type=ModelStreamEventType.COMPLETED
+                )
+            ]
+        ],
         model="dummy-context",
         max_tokens=128,
         context_window=4096,
@@ -1011,7 +1019,15 @@ def test_engine_keeps_estimated_usage_distinct_from_provider_usage() -> None:
         source=ModelUsageSource.ESTIMATE,
     )
     model = _ChunkSequenceModel(
-        [[ModelStreamEvent(text="Final Answer: estimate", type=ModelStreamEventType.COMPLETED, usage=usage)]],
+        [
+            [
+                ModelStreamEvent(
+                    text="Final Answer: estimate",
+                    type=ModelStreamEventType.COMPLETED,
+                    usage=usage,
+                )
+            ]
+        ],
         model="dummy-estimated-usage",
         max_tokens=128,
         context_window=8192,
@@ -1254,7 +1270,11 @@ def test_engine_preserves_streamed_reasoning_for_trace_and_tool_follow_up():
                     finish_reason="tool_calls",
                 ),
             ],
-            [ModelStreamEvent(text="Final Answer: done", type=ModelStreamEventType.COMPLETED)],
+            [
+                ModelStreamEvent(
+                    text="Final Answer: done", type=ModelStreamEventType.COMPLETED
+                )
+            ],
         ],
         model="kimi-k3",
         provider="openai-compatible",
@@ -1525,6 +1545,111 @@ def test_engine_salvages_glm_text_tool_call_markup_before_parser():
     assert record.model_response["tool_calls"][0]["function"]["name"] == "add"
 
 
+def test_engine_never_salvages_tool_markup_from_truncated_transaction():
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamEvent(
+                    text=(
+                        "<tool_call>add"
+                        "<arg_key>a</arg_key><arg_value>20</arg_value>"
+                        "<arg_key>b</arg_key><arg_value>22</arg_value>"
+                        "</tool_call>"
+                    ),
+                    type=ModelStreamEventType.COMPLETED,
+                    finish_reason="length",
+                )
+            ]
+        ],
+        model="GLM-5.1",
+        provider="openai-compatible",
+    )
+    model.qitos_harness_metadata = {
+        "family_preset": "glm",
+        "tool_policy": {
+            "primary_delivery": "api_parameter",
+            "fallback_delivery": "prompt_injection",
+            "native_tool_call_preferred": True,
+        },
+    }
+
+    class _Agent(DemoAgent):
+        def __init__(self):
+            super().__init__()
+            self.llm = model
+            self.model_parser = ReActTextParser()
+
+        def decide(self, state: DemoState, observation: dict[str, Any]):
+            _ = state, observation
+            return None
+
+    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=1)).run("compute")
+
+    record = result.records[0]
+    assert record.actions == []
+    assert record.model_response["tool_calls"] is None
+    assert record.model_response["metadata"]["invalid_tool_calls"] == [
+        {
+            "call_id": None,
+            "name": None,
+            "code": "tool_call_markup_incomplete_transaction",
+        }
+    ]
+
+
+def test_engine_rejects_native_tool_call_from_truncated_transaction():
+    model = _ChunkSequenceModel(
+        [
+            [
+                ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
+                    finish_reason="max_tokens",
+                    tool_calls=[
+                        {
+                            "id": "partial-call",
+                            "type": "function",
+                            "function": {
+                                "name": "add",
+                                "arguments": '{"a":20,"b":22}',
+                            },
+                        }
+                    ],
+                )
+            ]
+        ],
+        provider="compatible",
+    )
+    model.qitos_harness_metadata = {
+        "tool_policy": {
+            "primary_delivery": "api_parameter",
+            "native_tool_call_preferred": True,
+        },
+    }
+
+    class _Agent(DemoAgent):
+        def __init__(self):
+            super().__init__()
+            self.llm = model
+            self.model_parser = ReActTextParser()
+
+        def decide(self, state: DemoState, observation: dict[str, Any]):
+            _ = state, observation
+            return None
+
+    result = Engine(agent=_Agent(), budget=RuntimeBudget(max_steps=1)).run("compute")
+
+    record = result.records[0]
+    assert record.actions == []
+    assert record.model_response["tool_calls"] is None
+    assert record.model_response["metadata"]["invalid_tool_calls"] == [
+        {
+            "call_id": "partial-call",
+            "name": "add",
+            "code": "tool_call_incomplete_transaction",
+        }
+    ]
+
+
 def test_engine_native_tool_call_lane_returns_paired_error_on_bad_arguments():
     model = _ChunkSequenceModel(
         [
@@ -1545,7 +1670,11 @@ def test_engine_native_tool_call_lane_returns_paired_error_on_bad_arguments():
                     finish_reason="tool_calls",
                 )
             ],
-            [ModelStreamEvent(text="Final Answer: recovered", type=ModelStreamEventType.COMPLETED)],
+            [
+                ModelStreamEvent(
+                    text="Final Answer: recovered", type=ModelStreamEventType.COMPLETED
+                )
+            ],
         ],
         model="qwen-plus",
     )

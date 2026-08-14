@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import threading
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -13,8 +13,12 @@ from qitos.core.action import Action
 from qitos.core.agent_module import AgentModule
 from qitos.core.decision import Decision
 from qitos.core.state import StateSchema
+from qitos.core.tool import ToolPermissionContext
 from qitos.core.tool_registry import ToolRegistry
 from qitos.engine.engine import Engine
+from qitos.kit.permission import PermissionPipeline
+from qitos.mcp import MCPCallToolResult
+from qitos.mcp.runtime import MCPRuntime
 from qitos.mcp.server import MCPServer, MCPToolInfo
 
 
@@ -23,11 +27,17 @@ class FakeMCPServer(MCPServer):
 
     def __init__(self, name: str = "fake", tools: list | None = None):
         self._name = name
-        self._tools = tools or [
-            MCPToolInfo(
-                name="read", description="Read a file", input_schema={"type": "object"}
-            ),
-        ]
+        self._tools = (
+            tools
+            if tools is not None
+            else [
+                MCPToolInfo(
+                    name="read",
+                    description="Read a file",
+                    input_schema={"type": "object"},
+                ),
+            ]
+        )
         self.connected = False
         self.cleaned_up = False
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -49,10 +59,21 @@ class FakeMCPServer(MCPServer):
     async def list_tools(self) -> list[MCPToolInfo]:
         return self._tools
 
-    async def call_tool(self, name: str, arguments: dict) -> Any:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict,
+    ) -> MCPCallToolResult:
         self.calls.append((name, dict(arguments)))
         self.lifecycle_threads.append(threading.get_ident())
-        return {"result": name, "arguments": arguments}
+        return MCPCallToolResult(
+            content=(
+                {
+                    "type": "text",
+                    "text": json.dumps({"result": name, "arguments": arguments}),
+                },
+            )
+        )
 
 
 @dataclass
@@ -87,53 +108,62 @@ class CallingAgent(DummyAgent):
         return Decision.final("done")
 
 
-class TestAgentModuleMCPServers:
-    def test_mcp_servers_default_empty(self):
-        agent = DummyAgent()
-        assert agent.mcp_servers == []
+class FinalAgent(DummyAgent):
+    def decide(self, state: DummyState, observation: Any) -> Decision[Action]:
+        _ = state, observation
+        return Decision.final("done")
 
-    def test_mcp_servers_passed_to_init(self):
-        server = FakeMCPServer()
-        agent = DummyAgent(mcp_servers=[server])
-        assert len(agent.mcp_servers) == 1
-        assert agent.mcp_servers[0] is server
 
-    @pytest.mark.asyncio
-    async def test_empty_mcp_configuration_starts_no_runtime(self):
-        engine = Engine(DummyAgent(tool_registry=ToolRegistry()))
-
-        await engine._connect_mcp_servers()
-
-        assert engine._connected_mcp_servers == []
-        assert engine._connected_mcp_servers == []
-        assert engine.tool_registry.list_tools() == []
+class TestEngineMCPServerFactory:
+    def test_agent_module_rejects_live_transport_ownership(self) -> None:
+        with pytest.raises(TypeError):
+            DummyAgent(mcp_servers=[FakeMCPServer()])
 
     @pytest.mark.asyncio
-    async def test_engine_connects_mcp_servers_on_run(self):
-        server = FakeMCPServer()
-        agent = DummyAgent(tool_registry=ToolRegistry(), mcp_servers=[server])
-        # Patch the engine's run loop to avoid actual execution
-        engine = Engine(agent)
+    async def test_engine_factory_creates_fresh_transport_for_each_run(self):
+        servers: list[FakeMCPServer] = []
 
-        # Mock the main run loop to just test MCP lifecycle
-        with patch.object(engine, "_normalize_task", return_value=(None, "test task")):
-            with patch.object(
-                engine.agent, "init_state", return_value=DummyState(task="test")
-            ):
-                # Directly test connect/cleanup
-                engine._connected_mcp_servers = []
-                await engine._connect_mcp_servers()
-                assert server.connected
-                assert len(engine._connected_mcp_servers) == 1
-                assert "mcp__fake__read" in engine.tool_registry
+        def create_servers() -> tuple[MCPServer, ...]:
+            server = FakeMCPServer(
+                name="server.one",
+                tools=[
+                    MCPToolInfo(
+                        name="tool.two-three",
+                        input_schema={
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                            "required": ["value"],
+                        },
+                    )
+                ],
+            )
+            servers.append(server)
+            return (server,)
 
-                await engine._cleanup_mcp_servers()
-                assert server.cleaned_up
-                assert engine._connected_mcp_servers == []
-                assert "mcp__fake__read" not in engine.tool_registry
+        registry = ToolRegistry()
+        agent = CallingAgent(tool_registry=registry)
+        engine = Engine(agent, mcp_server_factory=create_servers)
+
+        first = await engine.arun("first")
+        second = await engine.arun("second")
+
+        assert first.state.stop_reason == "completed"
+        assert second.state.stop_reason == "completed"
+        assert len(servers) == 2
+        assert [server.calls for server in servers] == [
+            [("tool.two-three", {"value": "evidence"})],
+            [("tool.two-three", {"value": "evidence"})],
+        ]
+        assert all(len(server.lifecycle_threads) == 3 for server in servers)
+        assert all(
+            set(server.lifecycle_threads) == {threading.get_ident()}
+            for server in servers
+        )
+        assert registry.list_tools() == []
+        assert all(server.cleaned_up for server in servers)
 
     @pytest.mark.asyncio
-    async def test_engine_calls_raw_mcp_tool_and_registry_is_reusable(self):
+    async def test_stepwise_session_starts_refreshes_and_closes_mcp_runtime(self):
         server = FakeMCPServer(
             name="server.one",
             tools=[
@@ -148,54 +178,138 @@ class TestAgentModuleMCPServers:
             ],
         )
         registry = ToolRegistry()
-        agent = CallingAgent(tool_registry=registry, mcp_servers=[server])
+        engine = Engine(
+            CallingAgent(tool_registry=registry),
+            mcp_server_factory=lambda: (server,),
+        )
+        state, observation = engine.init_session("stepwise")
 
-        first = await Engine(agent).arun("first")
-        second = await Engine(agent).arun("second")
+        first = await engine.astep(state, observation)
 
-        assert first.state.stop_reason == "completed"
-        assert second.state.stop_reason == "completed"
-        assert server.calls == [
-            ("tool.two-three", {"value": "evidence"}),
-            ("tool.two-three", {"value": "evidence"}),
-        ]
-        assert len(server.lifecycle_threads) == 6
-        assert set(server.lifecycle_threads) == {threading.get_ident()}
+        assert first.stop is False
+        assert server.calls == [("tool.two-three", {"value": "evidence"})]
+        assert registry.list_tools() == ["mcp__server_one__tool_two_three"]
+
+        server._tools = [MCPToolInfo(name="replacement")]
+        server.notify_tools_changed()
+        engine.advance_step(state)
+        await engine.astep(state, first.observation)
+
+        assert registry.list_tools() == ["mcp__server_one__replacement"]
+        await engine.aclose()
         assert registry.list_tools() == []
-        assert server.cleaned_up
+        assert server.cleaned_up is True
+
+    @pytest.mark.asyncio
+    async def test_sync_step_rejects_mcp_transport_loop_churn(self):
+        server = FakeMCPServer()
+        engine = Engine(
+            FinalAgent(tool_registry=ToolRegistry()),
+            mcp_server_factory=lambda: (server,),
+        )
+        state, observation = engine.init_session("stepwise")
+
+        with pytest.raises(RuntimeError, match="await Engine.astep"):
+            engine.step(state, observation)
+
+        assert server.connected is False
+        await engine.aclose()
+
+    @pytest.mark.asyncio
+    async def test_engine_permission_pipeline_can_deny_published_mcp_tool(self):
+        server = FakeMCPServer(
+            name="server.one",
+            tools=[
+                MCPToolInfo(
+                    name="tool.two-three",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                )
+            ],
+        )
+        agent = CallingAgent(tool_registry=ToolRegistry())
+
+        result = await Engine(
+            agent,
+            mcp_server_factory=lambda: (server,),
+            permission_pipeline=PermissionPipeline(
+                context=ToolPermissionContext(default_decision="deny")
+            ),
+        ).arun("deny the remote call")
+
+        denied = result.records[0].action_results[0]
+        assert denied.status == "denied"
+        assert denied.metadata["executed"] is False
+        assert server.calls == []
+        assert server.cleaned_up is True
 
     @pytest.mark.asyncio
     async def test_engine_mcp_connect_failure_doesnt_crash(self):
         """If an MCP server fails to connect, the engine should continue."""
-        bad_server = MagicMock()
-        bad_server.connect = AsyncMock()
-        bad_server.connect.side_effect = RuntimeError("Connection failed")
-        bad_server.cleanup = AsyncMock()
 
-        agent = DummyAgent(mcp_servers=[bad_server])
-        engine = Engine(agent)
-        engine._connected_mcp_servers = []
-        await engine._connect_mcp_servers()
+        class FailingConnectServer(FakeMCPServer):
+            async def connect(self) -> None:
+                raise RuntimeError("Connection failed")
 
-        # Should not have crashed, and the bad server should not be in connected list
-        assert len(engine._connected_mcp_servers) == 0
-        bad_server.cleanup.assert_awaited_once()
+        bad_server = FailingConnectServer()
+        result = await Engine(
+            FinalAgent(tool_registry=ToolRegistry()),
+            mcp_server_factory=lambda: (bad_server,),
+        ).arun("complete without optional MCP")
+
+        assert result.state.stop_reason == "completed"
+        assert bad_server.cleaned_up is True
 
     @pytest.mark.asyncio
-    async def test_engine_mcp_cleanup_failure_doesnt_crash(self):
-        """If cleanup fails, other servers should still be cleaned up."""
-        server1 = MagicMock()
-        server1.cleanup = AsyncMock()
-        server1.cleanup.side_effect = RuntimeError("Cleanup failed")
-        server2 = MagicMock()
-        server2.cleanup = AsyncMock()
+    async def test_mcp_cleanup_failure_is_visible_after_other_servers_close(self):
+        """Cleanup attempts every server and preserves the first failure."""
 
-        agent = DummyAgent(mcp_servers=[server1, server2])
-        engine = Engine(agent)
-        engine._connected_mcp_servers = [server1, server2]
-        await engine._cleanup_mcp_servers()
+        class FailingCleanupServer(FakeMCPServer):
+            async def cleanup(self) -> None:
+                self.cleaned_up = True
+                raise RuntimeError("Cleanup failed")
 
-        # Both should have been attempted
-        server1.cleanup.assert_called_once()
-        server2.cleanup.assert_called_once()
-        assert engine._connected_mcp_servers == []
+        failing = FailingCleanupServer(name="failing")
+        healthy = FakeMCPServer(name="healthy")
+        runtime = MCPRuntime(
+            tool_registry=ToolRegistry(),
+            servers=[failing, healthy],
+        )
+        await runtime.start()
+
+        with pytest.raises(RuntimeError, match="Cleanup failed"):
+            await runtime.aclose()
+
+        assert failing.cleaned_up is True
+        assert healthy.cleaned_up is True
+
+    @pytest.mark.asyncio
+    async def test_engine_aclose_retries_failed_mcp_run_cleanup(self):
+        class RetryCleanupServer(FakeMCPServer):
+            def __init__(self) -> None:
+                super().__init__()
+                self.cleanup_calls = 0
+
+            async def cleanup(self) -> None:
+                self.cleanup_calls += 1
+                if self.cleanup_calls == 1:
+                    raise RuntimeError("transient MCP cleanup failure")
+                await super().cleanup()
+
+        server = RetryCleanupServer()
+        engine = Engine(
+            FinalAgent(tool_registry=ToolRegistry()),
+            mcp_server_factory=lambda: (server,),
+        )
+
+        with pytest.raises(RuntimeError, match="transient MCP cleanup failure"):
+            await engine.arun("complete")
+
+        assert server.cleanup_calls == 1
+        await engine.aclose()
+        await engine.aclose()
+        assert server.cleanup_calls == 2
+        assert server.cleaned_up is True

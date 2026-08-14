@@ -3,19 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from qitos.core.child import (
+    AgentConclusion,
     ChildHandle,
     ChildInvocation,
+    ChildLaunchContext,
     ChildLaunchRequest,
+    ChildPostRuntimeEvent,
     ChildPersistenceError,
+    ChildResult,
+    ChildRuntimeContext,
     ChildStatus,
 )
-from qitos.core.journal import JournalError, JournalRecordType
-from qitos.kit.child import ChildSupervisor
+from qitos.core.journal import (
+    JournalAppendCancelled,
+    JournalCommitError,
+    JournalCommitState,
+    JournalError,
+    JournalPosition,
+    JournalRecordType,
+    SessionJournal,
+)
+from qitos.kit.child import ChildRunLimiter, ChildSupervisor
 from qitos.kit.journal import JsonlSessionJournal
 
 
@@ -23,21 +38,44 @@ def _request(task: str = "inspect") -> ChildLaunchRequest:
     return ChildLaunchRequest(task=task, description=f"{task} task")
 
 
+def _context(
+    *,
+    journal: SessionJournal | None = None,
+    post_runtime_event: ChildPostRuntimeEvent | None = None,
+) -> ChildLaunchContext:
+    return ChildLaunchContext(
+        parent_run_id="parent-run",
+        journal=journal,
+        post_runtime_event=post_runtime_event,
+    )
+
+
 async def _set_event(event: asyncio.Event) -> None:
     event.set()
 
 
-class _CompletingEngine:
+async def _ready_invocation(**kwargs: Any) -> ChildInvocation:
+    return ChildInvocation(**kwargs)
+
+
+class _ClosableEngine:
+    async def aclose(self) -> None:
+        return None
+
+
+class _CompletingEngine(_ClosableEngine):
     active_run_id = "child-run"
 
     async def arun(self, task: str, **kwargs: object) -> object:
+        run_id = kwargs.pop("run_id")
+        assert isinstance(run_id, str)
         assert kwargs == {}
         return SimpleNamespace(
             state=SimpleNamespace(final_result=f"done:{task}", stop_reason="completed"),
             records=[],
             step_count=1,
             total_tokens=2,
-            run_id=self.active_run_id,
+            run_id=run_id,
         )
 
     def cancel(self, mode: str) -> None:
@@ -61,16 +99,144 @@ class _FailingChildJournal(JsonlSessionJournal):
         return await super().append(record_type, payload, record_id=record_id)
 
 
+class _CommittedCancellationJournal(JsonlSessionJournal):
+    async def append(
+        self,
+        record_type: JournalRecordType,
+        payload,
+        *,
+        record_id: str,
+    ):
+        position = await super().append(
+            record_type,
+            payload,
+            record_id=record_id,
+        )
+        if record_type is JournalRecordType.CHILD_STARTED:
+            raise JournalAppendCancelled(position)
+        return position
+
+
+class _UnknownCancellationJournal(JsonlSessionJournal):
+    async def append(
+        self,
+        record_type: JournalRecordType,
+        payload,
+        *,
+        record_id: str,
+    ):
+        if record_type is JournalRecordType.CHILD_STARTED:
+            raise JournalAppendCancelled(
+                None,
+                commit_state=JournalCommitState.UNKNOWN,
+                pending_position=JournalPosition(
+                    run_id=self.run_id,
+                    seq=2,
+                    record_id=record_id,
+                ),
+                commit_error=OSError("injected uncertain commit"),
+            )
+        return await super().append(record_type, payload, record_id=record_id)
+
+
+class _CommitErrorJournal(JsonlSessionJournal):
+    def __init__(
+        self,
+        *args: object,
+        fail_type: JournalRecordType,
+        commit_state: JournalCommitState,
+    ) -> None:
+        super().__init__(*args)
+        self._fail_type = fail_type
+        self._commit_state = commit_state
+
+    async def append(
+        self,
+        record_type: JournalRecordType,
+        payload,
+        *,
+        record_id: str,
+    ):
+        if record_type is self._fail_type:
+            raise JournalCommitError(
+                JournalPosition(self.run_id, 2, record_id),
+                self._commit_state,
+                cause=OSError("injected commit failure"),
+            )
+        return await super().append(record_type, payload, record_id=record_id)
+
+
+@pytest.mark.asyncio
+async def test_foreground_children_share_supervisor_concurrency_limit() -> None:
+    started: asyncio.Queue[str] = asyncio.Queue()
+    release_first = asyncio.Event()
+    active = 0
+    peak = 0
+
+    class Engine(_ClosableEngine):
+        active_run_id = "child-run"
+
+        async def arun(self, task: str, **kwargs: object) -> object:
+            nonlocal active, peak
+            run_id = kwargs.pop("run_id")
+            assert isinstance(run_id, str)
+            assert kwargs == {}
+            active += 1
+            peak = max(peak, active)
+            await started.put(task)
+            try:
+                if task == "one":
+                    await release_first.wait()
+            finally:
+                active -= 1
+            return SimpleNamespace(
+                state=SimpleNamespace(final_result=task, stop_reason="completed"),
+                records=[],
+                step_count=1,
+                total_tokens=1,
+                run_id=run_id,
+            )
+
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=Engine(),
+            task=request.task,
+        ),
+        max_concurrency=1,
+    )
+    first = asyncio.create_task(
+        supervisor.launch(_request("one"), _context(), background=False)
+    )
+    assert await asyncio.wait_for(started.get(), timeout=1) == "one"
+    second = asyncio.create_task(
+        supervisor.launch(_request("two"), _context(), background=False)
+    )
+    await asyncio.sleep(0)
+
+    assert started.empty()
+    assert peak == 1
+
+    release_first.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result.status is ChildStatus.COMPLETED
+    assert second_result.status is ChildStatus.COMPLETED
+    assert await asyncio.wait_for(started.get(), timeout=1) == "two"
+    assert peak == 1
+
+
 @pytest.mark.asyncio
 async def test_wait_timeout_does_not_cancel_child() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
 
-    class Engine:
+    class Engine(_ClosableEngine):
         active_run_id = "child-run"
 
         async def arun(self, task: str, **kwargs: object) -> object:
             assert task == "inspect"
+            run_id = kwargs.pop("run_id")
+            assert isinstance(run_id, str)
             assert kwargs == {}
             started.set()
             await release.wait()
@@ -79,7 +245,7 @@ async def test_wait_timeout_does_not_cancel_child() -> None:
                 records=[],
                 step_count=1,
                 total_tokens=2,
-                run_id=self.active_run_id,
+                run_id=run_id,
             )
 
         def cancel(self, mode: str) -> None:
@@ -87,15 +253,14 @@ async def test_wait_timeout_does_not_cancel_child() -> None:
             release.set()
 
     supervisor = ChildSupervisor(
-        invocation_factory=lambda request, _context: ChildInvocation(
+        invocation_factory=lambda request, _context: _ready_invocation(
             engine=Engine(),
             task=request.task,
         )
     )
     launched = await supervisor.launch(
         _request(),
-        {},
-        parent_run_id="parent-run",
+        _context(),
         background=True,
     )
     await asyncio.wait_for(started.wait(), timeout=1)
@@ -118,7 +283,7 @@ async def test_terminal_delivery_remains_owned_until_close() -> None:
     delivery_started = asyncio.Event()
     delivery_cancelled = asyncio.Event()
 
-    class Engine:
+    class Engine(_ClosableEngine):
         active_run_id = "child-run"
 
         async def arun(self, task: str, **kwargs: object) -> object:
@@ -144,15 +309,14 @@ async def test_terminal_delivery_remains_owned_until_close() -> None:
         return True  # pragma: no cover
 
     supervisor = ChildSupervisor(
-        invocation_factory=lambda request, _context: ChildInvocation(
+        invocation_factory=lambda request, _context: _ready_invocation(
             engine=Engine(),
             task=request.task,
         )
     )
     launched = await supervisor.launch(
         _request(),
-        {"post_runtime_event": post_runtime_event},
-        parent_run_id="parent-run",
+        _context(post_runtime_event=post_runtime_event),
         background=True,
     )
     await asyncio.wait_for(delivery_started.wait(), timeout=1)
@@ -172,7 +336,7 @@ async def test_interrupt_waits_for_started_child_cleanup() -> None:
     cleaned = asyncio.Event()
     resource_closed = asyncio.Event()
 
-    class Engine:
+    class Engine(_ClosableEngine):
         active_run_id = "child-run"
 
         async def arun(self, task: str, **kwargs: object) -> object:
@@ -187,7 +351,7 @@ async def test_interrupt_waits_for_started_child_cleanup() -> None:
             assert mode == "immediate"
 
     supervisor = ChildSupervisor(
-        invocation_factory=lambda request, _context: ChildInvocation(
+        invocation_factory=lambda request, _context: _ready_invocation(
             engine=Engine(),
             task=request.task,
             cleanup=lambda: _set_event(resource_closed),
@@ -195,8 +359,7 @@ async def test_interrupt_waits_for_started_child_cleanup() -> None:
     )
     launched = await supervisor.launch(
         _request(),
-        {},
-        parent_run_id="parent-run",
+        _context(),
         background=True,
     )
     await asyncio.wait_for(started.wait(), timeout=1)
@@ -217,7 +380,7 @@ async def test_invocation_cleanup_failure_is_a_terminal_child_failure() -> None:
         raise RuntimeError("cleanup failed")
 
     supervisor = ChildSupervisor(
-        invocation_factory=lambda request, _context: ChildInvocation(
+        invocation_factory=lambda request, _context: _ready_invocation(
             engine=_CompletingEngine(),
             task=request.task,
             cleanup=fail_cleanup,
@@ -226,8 +389,7 @@ async def test_invocation_cleanup_failure_is_a_terminal_child_failure() -> None:
 
     result = await supervisor.launch(
         _request(),
-        {},
-        parent_run_id="parent-run",
+        _context(),
         background=False,
     )
 
@@ -240,7 +402,10 @@ async def test_invocation_cleanup_failure_is_a_terminal_child_failure() -> None:
 async def test_invocation_factory_can_finish_async_resource_construction() -> None:
     factory_finished = asyncio.Event()
 
-    async def invocation_factory(request, _context):
+    async def invocation_factory(
+        request: ChildLaunchRequest,
+        _context: ChildRuntimeContext,
+    ) -> ChildInvocation:
         await asyncio.sleep(0)
         factory_finished.set()
         return ChildInvocation(engine=_CompletingEngine(), task=request.task)
@@ -249,8 +414,7 @@ async def test_invocation_factory_can_finish_async_resource_construction() -> No
 
     result = await supervisor.launch(
         _request(),
-        {},
-        parent_run_id="parent-run",
+        _context(),
         background=False,
     )
 
@@ -260,19 +424,166 @@ async def test_invocation_factory_can_finish_async_resource_construction() -> No
 
 
 @pytest.mark.asyncio
+async def test_engine_cleanup_retries_one_incomplete_close() -> None:
+    class Engine(_CompletingEngine):
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise RuntimeError("cleanup remains incomplete")
+
+    engine = Engine()
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=engine,
+            task=request.task,
+        )
+    )
+
+    result = await supervisor.launch(
+        _request(),
+        _context(),
+        background=False,
+    )
+
+    assert result.status is ChildStatus.COMPLETED
+    assert engine.close_calls == 2
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_invocation_cannot_override_durable_child_run_id() -> None:
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task=request.task,
+            run_kwargs={"run_id": "conflicting-run"},
+        )
+    )
+
+    result = await supervisor.launch(
+        _request(),
+        _context(),
+        background=False,
+    )
+
+    assert result.status is ChildStatus.FAILED
+    assert "conflicts with its durable launch" in str(result.error)
+    assert result.child_run_id
+    assert result.child_run_id != "conflicting-run"
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_cancels_async_invocation_construction() -> None:
+    factory_started = asyncio.Event()
+    factory_cancelled = asyncio.Event()
+
+    async def invocation_factory(
+        request: ChildLaunchRequest,
+        _context: ChildRuntimeContext,
+    ) -> ChildInvocation:
+        _ = request
+        factory_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            factory_cancelled.set()
+            raise
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    supervisor = ChildSupervisor(invocation_factory=invocation_factory)
+    launched = await supervisor.launch(
+        _request(),
+        _context(),
+        background=True,
+    )
+    await asyncio.wait_for(factory_started.wait(), timeout=1)
+
+    terminal = await supervisor.interrupt(launched.handle, wait_seconds=1)
+
+    assert terminal is not None
+    assert terminal.status is ChildStatus.CANCELLED
+    assert factory_cancelled.is_set()
+    assert supervisor.active_count == 0
+    assert await supervisor.aclose(wait_seconds=0) == 0
+
+
+@pytest.mark.asyncio
+async def test_invocation_returned_after_interrupt_is_cleaned_without_starting() -> (
+    None
+):
+    factory_started = asyncio.Event()
+    release_factory = asyncio.Event()
+    cleanup_called = asyncio.Event()
+    engine_cancelled = asyncio.Event()
+    engine_closed = asyncio.Event()
+
+    class Engine(_ClosableEngine):
+        active_run_id = ""
+
+        async def arun(self, task: str, **kwargs: object) -> object:
+            _ = task, kwargs
+            raise AssertionError("cancelled invocation must not start")
+
+        def cancel(self, mode: str) -> None:
+            assert mode == "immediate"
+            engine_cancelled.set()
+
+        async def aclose(self) -> None:
+            engine_closed.set()
+
+    async def invocation_factory(
+        request: ChildLaunchRequest,
+        _context: ChildRuntimeContext,
+    ) -> ChildInvocation:
+        factory_started.set()
+        try:
+            await release_factory.wait()
+        except asyncio.CancelledError:
+            # A factory that finishes an atomic acquisition despite cancellation
+            # still transfers the returned invocation to the supervisor.
+            pass
+        return ChildInvocation(
+            engine=Engine(),
+            task=request.task,
+            cleanup=lambda: _set_event(cleanup_called),
+        )
+
+    supervisor = ChildSupervisor(invocation_factory=invocation_factory)
+    launched = await supervisor.launch(
+        _request(),
+        _context(),
+        background=True,
+    )
+    await asyncio.wait_for(factory_started.wait(), timeout=1)
+
+    terminal = await supervisor.interrupt(launched.handle, wait_seconds=1)
+
+    assert terminal is not None
+    assert terminal.status is ChildStatus.CANCELLED
+    assert engine_cancelled.is_set()
+    assert engine_closed.is_set()
+    assert cleanup_called.is_set()
+    assert supervisor.active_count == 0
+    assert await supervisor.aclose(wait_seconds=0) == 0
+
+
+@pytest.mark.asyncio
 async def test_close_terminalizes_child_cancelled_before_task_start() -> None:
     factory_called = False
 
     def invocation_factory(request, _context):
         nonlocal factory_called
         factory_called = True
-        return ChildInvocation(engine=object(), task=request.task)
+        return _ready_invocation(engine=object(), task=request.task)
 
     supervisor = ChildSupervisor(invocation_factory=invocation_factory)
     launched = await supervisor.launch(
         _request(),
-        {},
-        parent_run_id="parent-run",
+        _context(),
         background=True,
     )
 
@@ -284,11 +595,102 @@ async def test_close_terminalizes_child_cancelled_before_task_start() -> None:
 
 
 @pytest.mark.asyncio
+async def test_immediate_interrupt_persists_child_cancelled_before_task_start(
+    tmp_path,
+) -> None:
+    factory_called = False
+    journal = JsonlSessionJournal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+
+    def invocation_factory(request, _context):
+        nonlocal factory_called
+        factory_called = True
+        return _ready_invocation(engine=object(), task=request.task)
+
+    supervisor = ChildSupervisor(invocation_factory=invocation_factory)
+    launched = await supervisor.launch(
+        _request(),
+        _context(journal=journal),
+        background=True,
+    )
+
+    terminal = await supervisor.interrupt(launched.handle, wait_seconds=0)
+
+    assert terminal is not None
+    assert terminal.status is ChildStatus.CANCELLED
+    assert supervisor.active_count == 0
+    assert factory_called is False
+    records = await journal.replay()
+    assert [
+        record.type
+        for record in records
+        if record.type
+        in {JournalRecordType.CHILD_STARTED, JournalRecordType.CHILD_TERMINAL}
+    ] == [JournalRecordType.CHILD_STARTED, JournalRecordType.CHILD_TERMINAL]
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_interrupt_does_not_cancel_invocation_cleanup() -> None:
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_cancelled = asyncio.Event()
+
+    class Engine(_ClosableEngine):
+        active_run_id = "child-run"
+
+        async def arun(self, task: str, **kwargs: object) -> object:
+            _ = task, kwargs
+            started.set()
+            await asyncio.Event().wait()
+
+        def cancel(self, mode: str) -> None:
+            assert mode == "immediate"
+
+    async def cleanup() -> None:
+        cleanup_started.set()
+        try:
+            await release_cleanup.wait()
+        except asyncio.CancelledError:
+            cleanup_cancelled.set()
+            raise
+
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=Engine(),
+            task=request.task,
+            cleanup=cleanup,
+        )
+    )
+    launched = await supervisor.launch(
+        _request(),
+        _context(),
+        background=True,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    assert supervisor.request_interrupt(launched.handle) is True
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    assert supervisor.request_interrupt(launched.handle) is True
+    assert await supervisor.aclose(wait_seconds=0) == 1
+    assert cleanup_cancelled.is_set() is False
+
+    release_cleanup.set()
+    terminal = await supervisor.wait(launched.handle, timeout_seconds=1)
+    assert terminal is not None
+    assert terminal.status is ChildStatus.CANCELLED
+    assert cleanup_cancelled.is_set() is False
+    assert await supervisor.aclose(wait_seconds=1) == 0
+
+
+@pytest.mark.asyncio
 async def test_child_lifecycle_journals_started_before_terminal(tmp_path) -> None:
     journal = JsonlSessionJournal(tmp_path / "journal")
     await journal.create("parent-run", {})
     supervisor = ChildSupervisor(
-        invocation_factory=lambda request, _context: ChildInvocation(
+        invocation_factory=lambda request, _context: _ready_invocation(
             engine=_CompletingEngine(),
             task=request.task,
         )
@@ -296,8 +698,7 @@ async def test_child_lifecycle_journals_started_before_terminal(tmp_path) -> Non
 
     result = await supervisor.launch(
         _request(),
-        {"journal": journal},
-        parent_run_id="parent-run",
+        _context(journal=journal),
         background=False,
     )
 
@@ -324,16 +725,18 @@ async def test_invocation_factory_receives_persisted_child_handle(tmp_path) -> N
     await journal.create("parent-run", {})
     observed_handle = None
 
-    def invocation_factory(request, runtime_context):
+    def invocation_factory(
+        request: ChildLaunchRequest,
+        runtime_context: ChildRuntimeContext,
+    ) -> Awaitable[ChildInvocation]:
         nonlocal observed_handle
-        observed_handle = runtime_context["child_handle"]
-        return ChildInvocation(engine=_CompletingEngine(), task=request.task)
+        observed_handle = runtime_context.handle
+        return _ready_invocation(engine=_CompletingEngine(), task=request.task)
 
     supervisor = ChildSupervisor(invocation_factory=invocation_factory)
     result = await supervisor.launch(
         _request(),
-        {"journal": journal},
-        parent_run_id="parent-run",
+        _context(journal=journal),
         background=False,
     )
 
@@ -359,20 +762,188 @@ async def test_started_record_failure_never_constructs_child(tmp_path) -> None:
     def invocation_factory(request, _context):
         nonlocal factory_called
         factory_called = True
-        return ChildInvocation(engine=_CompletingEngine(), task=request.task)
+        return _ready_invocation(engine=_CompletingEngine(), task=request.task)
 
     supervisor = ChildSupervisor(invocation_factory=invocation_factory)
 
     with pytest.raises(ChildPersistenceError, match="was not executed"):
         await supervisor.launch(
             _request(),
-            {"journal": journal},
-            parent_run_id="parent-run",
+            _context(journal=journal),
             background=False,
         )
 
     assert factory_called is False
     assert supervisor.active_count == 0
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_committed_start_keeps_budget_and_persists_terminal(
+    tmp_path,
+) -> None:
+    factory_called = False
+    journal = _CommittedCancellationJournal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
+
+    def invocation_factory(request, _context):
+        nonlocal factory_called
+        factory_called = True
+        return _ready_invocation(engine=_CompletingEngine(), task=request.task)
+
+    supervisor = ChildSupervisor(
+        invocation_factory=invocation_factory,
+        run_limiter=limiter,
+    )
+
+    with pytest.raises(JournalAppendCancelled) as cancelled:
+        await supervisor.launch(
+            _request(),
+            _context(journal=journal),
+            background=False,
+        )
+
+    assert cancelled.value.committed_position is not None
+    assert factory_called is False
+    assert limiter.children_started == 1
+    assert limiter.active_children == 0
+    lifecycle = [
+        record
+        for record in await journal.replay()
+        if record.type
+        in {JournalRecordType.CHILD_STARTED, JournalRecordType.CHILD_TERMINAL}
+    ]
+    assert [record.type for record in lifecycle] == [
+        JournalRecordType.CHILD_STARTED,
+        JournalRecordType.CHILD_TERMINAL,
+    ]
+    assert lifecycle[-1].payload["status"] == ChildStatus.CANCELLED.value
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_unknown_start_never_rolls_back_durable_budget(
+    tmp_path,
+) -> None:
+    factory_called = False
+    journal = _UnknownCancellationJournal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
+
+    def invocation_factory(request, _context):
+        nonlocal factory_called
+        factory_called = True
+        return _ready_invocation(engine=_CompletingEngine(), task=request.task)
+
+    supervisor = ChildSupervisor(
+        invocation_factory=invocation_factory,
+        run_limiter=limiter,
+    )
+
+    with pytest.raises(JournalAppendCancelled) as cancelled:
+        await supervisor.launch(
+            _request(),
+            _context(journal=journal),
+            background=False,
+        )
+
+    assert cancelled.value.commit_state is JournalCommitState.UNKNOWN
+    assert factory_called is False
+    assert limiter.children_started == 1
+    assert limiter.active_children == 0
+    assert supervisor.active_count == 0
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_start_commit_error_never_rolls_back_durable_budget(
+    tmp_path,
+) -> None:
+    journal = _CommitErrorJournal(
+        tmp_path / "journal",
+        fail_type=JournalRecordType.CHILD_STARTED,
+        commit_state=JournalCommitState.UNKNOWN,
+    )
+    await journal.create("parent-run", {})
+    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task=request.task,
+        ),
+        run_limiter=limiter,
+    )
+
+    with pytest.raises(ChildPersistenceError, match="was not executed"):
+        await supervisor.launch(
+            _request(),
+            _context(journal=journal),
+            background=False,
+        )
+
+    assert limiter.children_started == 1
+    assert limiter.active_children == 0
+    assert supervisor.active_count == 0
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_committed_terminal_error_preserves_terminal_result(tmp_path) -> None:
+    journal = _CommitErrorJournal(
+        tmp_path / "journal",
+        fail_type=JournalRecordType.CHILD_TERMINAL,
+        commit_state=JournalCommitState.COMMITTED,
+    )
+    await journal.create("parent-run", {})
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task=request.task,
+        )
+    )
+
+    result = await supervisor.launch(
+        _request(),
+        _context(journal=journal),
+        background=False,
+    )
+
+    assert result.status is ChildStatus.COMPLETED
+    assert result.conclusion.summary == "done:inspect"
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_terminal_commit_error_reports_unknown_result(tmp_path) -> None:
+    journal = _CommitErrorJournal(
+        tmp_path / "journal",
+        fail_type=JournalRecordType.CHILD_TERMINAL,
+        commit_state=JournalCommitState.UNKNOWN,
+    )
+    await journal.create("parent-run", {})
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task=request.task,
+        )
+    )
+
+    result = await supervisor.launch(
+        _request(),
+        _context(journal=journal),
+        background=False,
+    )
+
+    assert result.status is ChildStatus.UNKNOWN
+    assert "durable terminal outcome is unknown" in str(result.error)
+    assert result.conclusion.summary == "done:inspect"
+    assert result.conclusion.unknowns
     await supervisor.aclose()
     await journal.close()
 
@@ -392,15 +963,17 @@ async def test_terminal_record_failure_is_visible_and_not_delivered(tmp_path) ->
         return True
 
     supervisor = ChildSupervisor(
-        invocation_factory=lambda request, _context: ChildInvocation(
+        invocation_factory=lambda request, _context: _ready_invocation(
             engine=_CompletingEngine(),
             task=request.task,
         )
     )
     launched = await supervisor.launch(
         _request(),
-        {"journal": journal, "post_runtime_event": post_runtime_event},
-        parent_run_id="parent-run",
+        _context(
+            journal=journal,
+            post_runtime_event=post_runtime_event,
+        ),
         background=True,
     )
     terminal = await supervisor.wait(launched.handle, timeout_seconds=1)
@@ -452,6 +1025,223 @@ async def test_recovery_terminalizes_started_child_without_replay(tmp_path) -> N
     assert ChildStatus(terminal_records[0].payload["status"]) is ChildStatus.INTERRUPTED
     await supervisor.aclose()
     await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_conflicting_child_started_records(tmp_path) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+    handle = ChildHandle(child_id="child-conflict", parent_run_id="parent-run")
+    for index, request in enumerate((_request("first"), _request("second"))):
+        await journal.append(
+            JournalRecordType.CHILD_STARTED,
+            {"handle": handle.to_dict(), "request": request.to_dict()},
+            record_id=f"parent-run:child:conflicting-start:{index}",
+        )
+
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda _request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task="unused",
+        )
+    )
+
+    with pytest.raises(ChildPersistenceError, match="lifecycle journal"):
+        await supervisor.recover(parent_run_id="parent-run", journal=journal)
+
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_terminal_run_id_that_conflicts_with_start(
+    tmp_path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+    request = _request()
+    handle = ChildHandle(child_id="child-lineage", parent_run_id="parent-run")
+    await journal.append(
+        JournalRecordType.CHILD_STARTED,
+        {
+            "handle": handle.to_dict(),
+            "request": request.to_dict(),
+            "child_run_id": "child-run-started",
+        },
+        record_id="parent-run:child:child-lineage:started",
+    )
+    await journal.append(
+        JournalRecordType.CHILD_TERMINAL,
+        ChildResult(
+            handle=handle,
+            request=request,
+            status=ChildStatus.COMPLETED,
+            child_run_id="child-run-terminal",
+        ).to_dict(),
+        record_id="parent-run:child:child-lineage:terminal",
+    )
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda _request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task="unused",
+        )
+    )
+
+    with pytest.raises(ChildPersistenceError, match="lifecycle journal"):
+        await supervisor.recover(parent_run_id="parent-run", journal=journal)
+
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_recovery_is_single_flight(tmp_path) -> None:
+    replay_entered = asyncio.Event()
+    release_replay = asyncio.Event()
+
+    class Journal(JsonlSessionJournal):
+        def __init__(self, *args: object) -> None:
+            super().__init__(*args)
+            self.replay_calls = 0
+
+        async def replay(self):
+            self.replay_calls += 1
+            replay_entered.set()
+            await release_replay.wait()
+            return await super().replay()
+
+    journal = Journal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda _request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task="unused",
+        )
+    )
+
+    first = asyncio.create_task(
+        supervisor.recover(parent_run_id="parent-run", journal=journal)
+    )
+    await asyncio.wait_for(replay_entered.wait(), timeout=1)
+    second = asyncio.create_task(
+        supervisor.recover(parent_run_id="parent-run", journal=journal)
+    )
+    release_replay.set()
+    first_result, second_result = await asyncio.gather(first, second)
+
+    assert first_result == second_result == ()
+    assert journal.replay_calls == 1
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_interrupted_terminal_does_not_commit_restored_budget(
+    tmp_path,
+) -> None:
+    journal = _FailingChildJournal(
+        tmp_path / "journal",
+        fail_type=JournalRecordType.CHILD_TERMINAL,
+    )
+    await journal.create("parent-run", {})
+    request = _request()
+    handle = ChildHandle(child_id="child-interrupted", parent_run_id="parent-run")
+    await journal.append(
+        JournalRecordType.CHILD_STARTED,
+        {"handle": handle.to_dict(), "request": request.to_dict()},
+        record_id="parent-run:child:child-interrupted:started",
+    )
+    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda _request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task="unused",
+        ),
+        run_limiter=limiter,
+    )
+
+    with pytest.raises(ChildPersistenceError, match="interrupted child terminal"):
+        await supervisor.recover(parent_run_id="parent-run", journal=journal)
+
+    assert limiter.children_started == 0
+    assert supervisor.result(handle) is None
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_orphan_and_conflicting_terminal_records(
+    tmp_path,
+) -> None:
+    request = _request()
+    handle = ChildHandle(child_id="child-terminal", parent_run_id="parent-run")
+    terminal = ChildResult(
+        handle=handle,
+        request=request,
+        status=ChildStatus.COMPLETED,
+        conclusion=AgentConclusion(summary="done"),
+    )
+
+    orphan_journal = JsonlSessionJournal(tmp_path / "orphan")
+    await orphan_journal.create("parent-run", {})
+    await orphan_journal.append(
+        JournalRecordType.CHILD_TERMINAL,
+        terminal.to_dict(),
+        record_id="parent-run:child:orphan-terminal",
+    )
+    orphan_supervisor = ChildSupervisor(
+        invocation_factory=lambda _request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task="unused",
+        )
+    )
+
+    with pytest.raises(ChildPersistenceError, match="lifecycle journal"):
+        await orphan_supervisor.recover(
+            parent_run_id="parent-run",
+            journal=orphan_journal,
+        )
+
+    await orphan_supervisor.aclose()
+    await orphan_journal.close()
+
+    conflict_journal = JsonlSessionJournal(tmp_path / "conflict")
+    await conflict_journal.create("parent-run", {})
+    await conflict_journal.append(
+        JournalRecordType.CHILD_STARTED,
+        {"handle": handle.to_dict(), "request": request.to_dict()},
+        record_id="parent-run:child:started",
+    )
+    await conflict_journal.append(
+        JournalRecordType.CHILD_TERMINAL,
+        terminal.to_dict(),
+        record_id="parent-run:child:terminal:first",
+    )
+    await conflict_journal.append(
+        JournalRecordType.CHILD_TERMINAL,
+        ChildResult(
+            handle=handle,
+            request=request,
+            status=ChildStatus.FAILED,
+            error="different",
+        ).to_dict(),
+        record_id="parent-run:child:terminal:second",
+    )
+    conflict_supervisor = ChildSupervisor(
+        invocation_factory=lambda _request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task="unused",
+        )
+    )
+
+    with pytest.raises(ChildPersistenceError, match="lifecycle journal"):
+        await conflict_supervisor.recover(
+            parent_run_id="parent-run",
+            journal=conflict_journal,
+        )
+
+    await conflict_supervisor.aclose()
+    await conflict_journal.close()
 
 
 @pytest.mark.asyncio

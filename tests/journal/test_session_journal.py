@@ -7,12 +7,16 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 from pathlib import Path
 
 import pytest
 
 from qitos.core.journal import (
+    JournalAppendCancelled,
     JournalClosedError,
+    JournalCommitError,
+    JournalCommitState,
     JournalCorruptionError,
     JournalError,
     JournalOwnershipError,
@@ -23,6 +27,7 @@ from qitos.core.journal import (
 from qitos.kit.journal import JsonlSessionJournal
 from qitos.kit.journal import jsonl as jsonl_module
 from qitos.kit.journal._sqlite_index import JournalIndexError, SqliteJournalIndex
+from qitos.kit.journal._writer_lease import JournalWriterLease
 
 
 @pytest.mark.asyncio
@@ -55,6 +60,279 @@ async def test_journal_round_trips_durable_records(tmp_path: Path) -> None:
     ]
     assert any(mode in {"full", "data", "file"} for _, mode in synced)
     assert any(descriptor == -1 for descriptor, _ in synced)
+
+
+@pytest.mark.asyncio
+async def test_append_settles_canonical_write_before_propagating_cancellation(
+    tmp_path: Path,
+) -> None:
+    commit_started = asyncio.Event()
+    release_commit = threading.Event()
+    loop = asyncio.get_running_loop()
+    block_next_sync = False
+
+    def sync_file(_descriptor: int, _mode: str) -> None:
+        if not block_next_sync:
+            return
+        loop.call_soon_threadsafe(commit_started.set)
+        if not release_commit.wait(timeout=5):
+            raise RuntimeError("test did not release Journal commit")
+
+    journal = JsonlSessionJournal(tmp_path, sync_file=sync_file)
+    await journal.create("run-1", {})
+    block_next_sync = True
+    append = asyncio.create_task(
+        journal.append(
+            JournalRecordType.INPUT_ACCEPTED,
+            {"content": "durable"},
+            record_id="input-1",
+        )
+    )
+    await asyncio.wait_for(commit_started.wait(), timeout=1)
+
+    append.cancel()
+    release_commit.set()
+    with pytest.raises(JournalAppendCancelled) as cancelled:
+        await append
+
+    assert cancelled.value.committed_position is not None
+    assert cancelled.value.committed_position.record_id == "input-1"
+    assert [record.record_id for record in await journal.replay()] == [
+        "run-1:start",
+        "input-1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_append_with_failed_rollback_poisoned_until_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commit_started = asyncio.Event()
+    release_commit = threading.Event()
+    loop = asyncio.get_running_loop()
+    fail_next_sync = False
+
+    def sync_file(_descriptor: int, _mode: str) -> None:
+        nonlocal fail_next_sync
+        if not fail_next_sync:
+            return
+        fail_next_sync = False
+        loop.call_soon_threadsafe(commit_started.set)
+        if not release_commit.wait(timeout=5):
+            raise RuntimeError("test did not release Journal commit")
+        raise OSError("injected sync failure")
+
+    journal = JsonlSessionJournal(tmp_path, sync_file=sync_file)
+    await journal.create("run-1", {})
+
+    def fail_rollback(_descriptor: int, _length: int) -> None:
+        raise OSError("injected rollback failure")
+
+    fail_next_sync = True
+    with monkeypatch.context() as patch:
+        patch.setattr(jsonl_module.os, "ftruncate", fail_rollback)
+        append = asyncio.create_task(
+            journal.append(
+                JournalRecordType.INPUT_ACCEPTED,
+                {"content": "possibly durable"},
+                record_id="input-1",
+            )
+        )
+        await asyncio.wait_for(commit_started.wait(), timeout=1)
+        append.cancel()
+        release_commit.set()
+        with pytest.raises(JournalAppendCancelled) as cancelled:
+            await append
+
+    assert cancelled.value.commit_state is JournalCommitState.UNKNOWN
+    assert cancelled.value.committed_position is None
+    assert cancelled.value.pending_position is not None
+    assert cancelled.value.pending_position.record_id == "input-1"
+    assert isinstance(cancelled.value.commit_error, JournalCommitError)
+
+    with pytest.raises(JournalError, match="close and reopen"):
+        await journal.replay()
+    with pytest.raises(JournalError, match="close and reopen"):
+        await journal.append(
+            JournalRecordType.INPUT_ACCEPTED,
+            {"content": "must not reuse seq"},
+            record_id="input-2",
+        )
+
+    await journal.close()
+    reopened = JsonlSessionJournal(tmp_path)
+    await reopened.open("run-1")
+    assert [record.record_id for record in await reopened.replay()] == [
+        "run-1:start",
+        "input-1",
+    ]
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_append_rolls_back_before_allowing_next_record(
+    tmp_path: Path,
+) -> None:
+    fail_next_sync = False
+
+    def sync_file(_descriptor: int, _mode: str) -> None:
+        nonlocal fail_next_sync
+        if fail_next_sync:
+            fail_next_sync = False
+            raise OSError("injected sync failure")
+
+    journal = JsonlSessionJournal(tmp_path, sync_file=sync_file)
+    await journal.create("run-1", {})
+    fail_next_sync = True
+
+    with pytest.raises(JournalCommitError) as failed:
+        await journal.append(
+            JournalRecordType.INPUT_ACCEPTED,
+            {"content": "rolled back"},
+            record_id="input-1",
+        )
+
+    assert failed.value.commit_state is JournalCommitState.NOT_COMMITTED
+    position = await journal.append(
+        JournalRecordType.INPUT_ACCEPTED,
+        {"content": "committed"},
+        record_id="input-2",
+    )
+    assert position.seq == 2
+    assert [record.record_id for record in await journal.replay()] == [
+        "run-1:start",
+        "input-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_create_settles_and_removes_unstarted_run(
+    tmp_path: Path,
+) -> None:
+    directory_sync_started = asyncio.Event()
+    release_directory_sync = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def sync_directory(path: Path) -> None:
+        if path != tmp_path:
+            return
+        loop.call_soon_threadsafe(directory_sync_started.set)
+        if not release_directory_sync.wait(timeout=5):
+            raise RuntimeError("test did not release directory sync")
+
+    journal = JsonlSessionJournal(tmp_path, sync_directory=sync_directory)
+    creating = asyncio.create_task(journal.create("run-1", {}))
+    await asyncio.wait_for(directory_sync_started.wait(), timeout=1)
+
+    creating.cancel()
+    release_directory_sync.set()
+    with pytest.raises(asyncio.CancelledError):
+        await creating
+
+    replacement = JsonlSessionJournal(tmp_path)
+    await replacement.create("run-1", {})
+    await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_create_removes_files_created_before_directory_sync_error(
+    tmp_path: Path,
+) -> None:
+    def fail_parent_sync(path: Path) -> None:
+        if path == tmp_path:
+            raise OSError("injected directory sync failure")
+
+    journal = JsonlSessionJournal(tmp_path, sync_directory=fail_parent_sync)
+
+    with pytest.raises(OSError, match="directory sync"):
+        await journal.create("run-1", {})
+
+    replacement = JsonlSessionJournal(tmp_path)
+    await replacement.create("run-1", {})
+    await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_open_releases_acquired_writer_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed = JsonlSessionJournal(tmp_path)
+    await seed.create("run-1", {})
+    await seed.close()
+    lease_acquired = asyncio.Event()
+    release_acquire = threading.Event()
+    loop = asyncio.get_running_loop()
+    acquire = JournalWriterLease.acquire
+
+    def acquire_then_block(run_directory: Path, run_id: str) -> JournalWriterLease:
+        lease = acquire(run_directory, run_id)
+        loop.call_soon_threadsafe(lease_acquired.set)
+        if not release_acquire.wait(timeout=5):
+            lease.release()
+            raise RuntimeError("test did not release writer acquisition")
+        return lease
+
+    monkeypatch.setattr(
+        JournalWriterLease,
+        "acquire",
+        staticmethod(acquire_then_block),
+    )
+    opening = asyncio.create_task(JsonlSessionJournal(tmp_path).open("run-1"))
+    await asyncio.wait_for(lease_acquired.wait(), timeout=1)
+
+    opening.cancel()
+    release_acquire.set()
+    with pytest.raises(asyncio.CancelledError):
+        await opening
+
+    monkeypatch.setattr(JournalWriterLease, "acquire", acquire)
+    successor = JsonlSessionJournal(tmp_path)
+    await successor.open("run-1")
+    await successor.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_open_closes_loaded_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed = JsonlSessionJournal(tmp_path)
+    await seed.create("run-1", {})
+    await seed.close()
+    load_completed = asyncio.Event()
+    release_load = threading.Event()
+    projection_closed = threading.Event()
+    loop = asyncio.get_running_loop()
+    opener = JsonlSessionJournal(tmp_path)
+    load_records = opener._load_records
+    close_projection = SqliteJournalIndex.close
+
+    def load_then_block(path: Path, run_id: str):
+        result = load_records(path, run_id)
+        assert result[1] is not None
+        loop.call_soon_threadsafe(load_completed.set)
+        if not release_load.wait(timeout=5):
+            result[1].close()
+            raise RuntimeError("test did not release Journal load")
+        return result
+
+    def close_and_record(index: SqliteJournalIndex) -> None:
+        projection_closed.set()
+        close_projection(index)
+
+    monkeypatch.setattr(opener, "_load_records", load_then_block)
+    monkeypatch.setattr(SqliteJournalIndex, "close", close_and_record)
+    opening = asyncio.create_task(opener.open("run-1"))
+    await asyncio.wait_for(load_completed.wait(), timeout=1)
+
+    opening.cancel()
+    release_load.set()
+    with pytest.raises(asyncio.CancelledError):
+        await opening
+
+    assert projection_closed.is_set()
 
 
 @pytest.mark.asyncio
@@ -180,8 +458,7 @@ async def test_process_exit_releases_writer_ownership(tmp_path: Path) -> None:
     seed = JsonlSessionJournal(tmp_path)
     await seed.create("run-1", {})
     await seed.close()
-    script = textwrap.dedent(
-        """
+    script = textwrap.dedent("""
         import asyncio
         import sys
 
@@ -194,8 +471,7 @@ async def test_process_exit_releases_writer_ownership(tmp_path: Path) -> None:
             await asyncio.Event().wait()
 
         asyncio.run(main())
-        """
-    )
+        """)
     process = subprocess.Popen(
         [sys.executable, "-c", script, str(tmp_path)],
         stdout=subprocess.PIPE,
@@ -507,9 +783,10 @@ async def test_fork_creates_an_independently_replayable_journal(tmp_path: Path) 
     ]
     assert inherited[-1].payload["origin_record_id"] == "parent-step"
     assert inherited[-1].payload["record"]["type"] == "step.committed"
-    assert json.loads(child.path.read_text(encoding="utf-8").splitlines()[0])[
-        "run_id"
-    ] == "child"
+    assert (
+        json.loads(child.path.read_text(encoding="utf-8").splitlines()[0])["run_id"]
+        == "child"
+    )
 
 
 @pytest.mark.asyncio
@@ -625,9 +902,7 @@ async def test_fork_resolves_inherited_committed_tool_origin(
     assert inherited is not None
     assert inherited.terminal.run_id == "parent"
     assert inherited.result.model_visible_output == "canonical"
-    assert (
-        child.find_tool_transaction(JournalRecordRef("child", terminal_id)) is None
-    )
+    assert child.find_tool_transaction(JournalRecordRef("child", terminal_id)) is None
 
     await child.close()
     reopened = JsonlSessionJournal(tmp_path)

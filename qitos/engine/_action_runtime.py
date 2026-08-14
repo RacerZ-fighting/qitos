@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import TYPE_CHECKING, Any, Dict, Generic, List, TypeVar, cast
 
@@ -140,9 +141,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                         "stage": "action_blocked",
                         "tool_name": normalized_action.name,
                         "reason": block_reason,
-                        "action_results": [
-                            blocked_result.to_model_dict()
-                        ],
+                        "action_results": [blocked_result.to_model_dict()],
                     },
                 )
                 continue
@@ -308,11 +307,13 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         results: List[ToolResult] = []
         for item in execution:
             result_metadata = dict(item.metadata)
-            result_metadata.update({
-                "tool_name": item.name,
-                "latency_ms": item.latency_ms,
-                "attempts": item.attempts,
-            })
+            result_metadata.update(
+                {
+                    "tool_name": item.name,
+                    "latency_ms": item.latency_ms,
+                    "attempts": item.attempts,
+                }
+            )
             results.append(
                 ToolResult(
                     status=item.status.value,
@@ -409,9 +410,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
             payload={
                 "stage": "action_results",
                 "tool_invocations": record.tool_invocations,
-                "action_results": [
-                    item.to_model_dict() for item in results
-                ],
+                "action_results": [item.to_model_dict() for item in results],
             },
         )
         engine._dispatch_hook(
@@ -425,6 +424,16 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 record=record,
             ),
         )
+        current_task = asyncio.current_task()
+        if (
+            current_task is not None
+            and current_task.cancelling()
+            and not engine._cancel_token.is_cancel_requested
+        ):
+            # The executor returned one terminal result per action and the
+            # Journal/history boundary above is complete. Preserve caller
+            # cancellation instead of turning it into an ordinary Tool result.
+            raise asyncio.CancelledError
         return [item.to_dict() for item in results]
 
     def _commit_tool_result_history(

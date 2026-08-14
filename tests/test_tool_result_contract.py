@@ -147,6 +147,32 @@ async def test_action_executor_preserves_typed_artifact_projection() -> None:
     assert result.model_output == artifact.path
 
 
+@pytest.mark.asyncio
+async def test_action_executor_preserves_typed_result_metadata() -> None:
+    @tool(name="classified_failure")
+    def classified_failure() -> ToolResult:
+        return ToolResult(
+            status="error",
+            error="classified",
+            metadata={
+                "error_category": "backend_rejected",
+                "error_code": "BACKEND_REJECTED",
+                "correlation_id": "request-1",
+            },
+        )
+
+    result = (
+        await ActionExecutor(ToolRegistry().register(classified_failure)).execute(
+            [Action(name="classified_failure")]
+        )
+    )[0]
+
+    assert result.status is ActionStatus.ERROR
+    assert result.metadata["error_category"] == "backend_rejected"
+    assert result.metadata["error_code"] == "BACKEND_REJECTED"
+    assert result.metadata["correlation_id"] == "request-1"
+
+
 def test_tool_result_rejects_a_contradictory_success_error() -> None:
     result = ToolResult.from_value(
         {"status": "success", "output": "opaque", "error": "backend failed"}

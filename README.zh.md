@@ -18,6 +18,12 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **完整 Run 与交互式 Run 共用有界 MCP 生命周期**：独立 server 会在固定并发与 timeout
+  下连接并发现目录，再按 factory 顺序确定性发布成功目录。交互式 session 由
+  `Engine.astep()` 懒启动并持续持有同一生命周期；同步 `step()` 会明确拒绝 MCP
+  session。Stdio 限制单帧不超过 8 MiB，reader 失败后自动清理并终止完整子进程树；
+  cancellation notification 是有界 best effort。来自 incomplete 或 failed 模型终态的
+  ToolCall 只保留诊断，不会执行。
 - **从 terminal fact 恢复完成通知**：后台 Child 与受管进程的完成输入现在都是 canonical Journal
   terminal 的确定性投影。Resume 无需第二份存储即可补上 terminal 到 Mailbox 之间的崩溃窗口，也不会重复投递前台 Child ToolResult；
   已消费 event id 保持幂等，Fork 继承的事实也不会变成新输入。canonical `ToolResult` 同时保存
@@ -45,7 +51,8 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   `previous_response_id`；resume 可以保留这项优化，fork、Provider 切换、压缩漂移或
   句柄过期都会回退到完整本地 transcript。恢复回归现在会让多轮 Run 依次经历压缩、
   取消、从 committed boundary fork 和 resume，并验证 canonical ToolCall/ToolResult
-  transcript 始终完整。
+  transcript 始终完整。若所有 Tool terminal 已落盘、但进程在 step commit 前退出，
+  恢复出的 step 也会保留与之匹配的 continuation。
 - **同一个异步 turn 事务**：完整 Run 与交互式 step 现在共用一份不可变 turn
   事务。Parser、Critic 与 handoff 作为组合策略接入，不再各自占据或复制 Agent loop；
   Tool、Mailbox、MCP 与 Child 始终运行在调用方 event loop，取消会先等待已启动 handler
@@ -92,9 +99,12 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   Messages adapter。Claude 4.5 的 reasoning 强度会映射为受输出上限约束的手动
   thinking budget，请求默认值会真实进入 wire payload，thinking 请求也不会再发送
   不兼容的 temperature 覆盖；预设默认使用原生 API tool schema。
-- **Run-scoped MCP 工具**：通过 `AgentModule.mcp_servers` 传入显式 MCP server 后，
-  Engine 会完成连接、发现、暴露 `mcp__server__tool` 名称、在 transport 所属 event
-  loop 上执行调用，并在 run 结束时注销工具和关闭连接；默认空配置没有启动成本。
+- **Run-scoped MCP 工具**：向 Engine 传入为每个 Run 创建全新 transport 的
+  `mcp_server_factory` 后，Engine 会完成连接、发现、暴露 `mcp__server__tool` 名称、在调用方 event
+  loop 上执行调用，并在 run 结束时注销工具和关闭连接。目录变化只会在下一轮安全点
+  原子发布；annotations、分页、类型化远端错误、取消和上一版有效目录都会保留；
+  HTTP JSON/SSE、隔离的 GET 重连游标、取消安全的 cleanup 和 session 过期恢复都不会重放
+  可能有副作用的 Tool 调用；默认空配置没有启动成本。
 - **渐进式 bundled Skill**：应用可以给 `SkillToolSet` 配置只读资源根目录，先暴露
   有界目录，再按精确名称加载完整 `SKILL.md`。递归发现遵循显式根目录优先级，并返回
   强类型诊断；同一个 bundle revision 同时覆盖说明与资源。应用还可以传入冻结的运行时

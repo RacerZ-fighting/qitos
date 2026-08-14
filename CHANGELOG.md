@@ -28,6 +28,17 @@ How to update:
   Engine before application finalization and reconstructed for older Journal records.
   Child invocation factories may complete async resource construction while existing
   synchronous factories remain supported.
+- Engine-owned MCP catalogs now refresh atomically at pre-turn safe points after an
+  explicit request or `notifications/tools/list_changed`. Discovery follows bounded
+  cursor pagination, preserves typed annotations, retains the last complete catalog
+  on failure, and uses the same Tool exposure, permission, deadline, cancellation,
+  terminal-result, Journal, and cleanup path as native Tools. Streamable HTTP accepts
+  JSON or SSE POST responses, resumes GET notifications with `Last-Event-ID`, recovers
+  expired sessions only at safe discovery boundaries, and never replays a failed
+  side-effecting Tool call. Run startup discovers independent servers concurrently
+  under a fixed limit and timeout, then publishes successful catalogs in factory
+  order. Interactive sessions lazily start and refresh MCP through `astep()` on one
+  owning event loop; synchronous `step()` rejects MCP-backed sessions explicitly.
 - Bundled Skill roots now use recursive nearest-root discovery, deterministic
   first-root-wins precedence, and typed non-fatal diagnostics. Explicit refresh
   replaces the catalog atomically; bundle revisions cover both `SKILL.md` and resource
@@ -46,6 +57,19 @@ How to update:
 
 ### Breaking
 
+- Live MCP transports no longer belong to `AgentModule.mcp_servers`. Applications pass
+  `Engine(mcp_server_factory=...)` a construction-only factory that returns fresh,
+  unconnected transports for each Run, preventing Root, Child, resumed, or repeated
+  Runs from sharing a process, HTTP client, or session.
+
+- `MCPServer.call_tool()` now returns `MCPCallToolResult` instead of an implicitly
+  decoded arbitrary value. The typed result preserves content blocks,
+  `structuredContent`, `_meta`, and `isError`; MCP bridges project it into a regular
+  QitOS `ToolResult` with stable protocol, remote-request, and remote-Tool error
+  classifications.
+- Child invocation factories are now async-only and must resolve to a
+  `ChildInvocation`. This makes cancellation and partial-construction cleanup part of
+  the same awaited ownership chain instead of a synchronous pre-run side effect.
 - Custom `FileSystemCapability` implementations must provide `write_text_atomic()`.
   The method owns same-path mutation ordering, optional SHA-256 preconditions, and the
   final replace boundary; `write_text()` remains the unconditional convenience path.
@@ -81,6 +105,22 @@ How to update:
   terminal facts. A crash between `child.terminal` / `process.terminal` and mailbox
   acceptance no longer loses the notification; foreground Child results are not
   redelivered, consumed ids stay consumed, and forks do not receive inherited completions.
+- Cancelling MCP shutdown now waits for owned stdio processes and active HTTP requests
+  to settle before cancellation propagates. HTTP notification status failures use the
+  same typed MCP request error boundary as ordinary requests, and only the GET
+  notification stream contributes its `Last-Event-ID` reconnect cursor.
+- MCP cancellation notifications are bounded best-effort operations and cannot delay
+  local cancellation indefinitely. Stdio rejects frames over 8 MiB, maps fatal reader
+  errors to stable protocol or transport failures, cleans up automatically, and
+  terminates the complete owned subprocess tree rather than only its group leader.
+- Engine now rejects native and text-salvaged ToolCalls from known incomplete, length-
+  limited, failed, filtered, or cancelled model terminals. The calls remain visible as
+  typed `invalid_tool_calls` diagnostics but can never reach a Tool handler.
+
+- Journal recovery now retains the latest Provider continuation when a complete Tool
+  batch reached durable terminal records but crashed before `step.committed`; the
+  recovered step still resumes from the canonical local transcript if the Provider
+  later rejects that optimization.
 - Session Journal payloads now cross one strict JSON boundary before append, keeping
   in-memory replay, reopened replay, stable record IDs, JSONL, and projection digests
   consistent. Unsupported schema versions now have a dedicated upgrade error, and a

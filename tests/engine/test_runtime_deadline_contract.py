@@ -13,6 +13,7 @@ import pytest
 
 from qitos import AgentModule, Decision, Engine, StateSchema, ToolRegistry
 from qitos.core.action import Action, ActionResult, ActionStatus
+from qitos.core.budget import BudgetLedger
 from qitos.core.errors import ModelRequestDeadlineExceeded, ModelTransportError
 from qitos.core.tool import (
     BaseTool,
@@ -35,6 +36,10 @@ class _RuntimeEngine:
         self._cancel_token = CancelToken()
         self.active_run_id = "run-deadline-test"
         self.agent = SimpleNamespace()
+        self.budget = RuntimeBudget()
+        self.budget_ledger = BudgetLedger()
+        self.events: list[Any] = []
+        self.journal = None
 
     @property
     def runtime_deadline_monotonic(self) -> float | None:
@@ -51,10 +56,13 @@ class _RuntimeEngine:
 
 
 async def _execute(tool: BaseTool, engine: _RuntimeEngine) -> ActionResult:
-    return (await ActionExecutor(
-        tool_registry=ToolRegistry().register(tool),
-        engine=engine,
-    ).execute([Action(name=tool.spec.name)]))[0]
+    return (
+        await ActionExecutor(
+            tool_registry=ToolRegistry().register(tool),
+            engine=engine,
+            cancel_token=engine._cancel_token,
+        ).execute([Action(name=tool.spec.name)])
+    )[0]
 
 
 class _RecordingTool(BaseTool):
@@ -135,9 +143,7 @@ class _RetryingTool(BaseTool):
         )
         self.calls = 0
 
-    async def execute(
-        self, args: dict[str, Any], runtime_context: Any = None
-    ) -> None:
+    async def execute(self, args: dict[str, Any], runtime_context: Any = None) -> None:
         _ = args, runtime_context
         self.calls += 1
         raise RuntimeError("retry me")
@@ -193,9 +199,7 @@ class _AdmissionCountingTool(BaseTool):
         self.permission_calls += 1
         return ToolPermissionDecision.allow()
 
-    async def execute(
-        self, args: dict[str, Any], runtime_context: Any = None
-    ) -> str:
+    async def execute(self, args: dict[str, Any], runtime_context: Any = None) -> str:
         _ = args, runtime_context
         self.execution_calls += 1
         if self.execution_calls < 3:
@@ -236,9 +240,7 @@ class _SlowAdmissionTool(BaseTool):
         time.sleep(0.03)
         return ToolPermissionDecision.allow()
 
-    async def execute(
-        self, args: dict[str, Any], runtime_context: Any = None
-    ) -> str:
+    async def execute(self, args: dict[str, Any], runtime_context: Any = None) -> str:
         _ = args, runtime_context
         self.executed = True
         return "unexpected"
@@ -280,9 +282,7 @@ class _SharedRetryBudgetTool(BaseTool):
         )
         self.calls = 0
 
-    async def execute(
-        self, args: dict[str, Any], runtime_context: Any = None
-    ) -> str:
+    async def execute(self, args: dict[str, Any], runtime_context: Any = None) -> str:
         _ = args, runtime_context
         self.calls += 1
         await asyncio.sleep(0.015)
@@ -492,6 +492,50 @@ async def test_model_request_deadline_cancels_provider_and_closes_stream() -> No
         )
 
     assert model.entered.is_set()
+    assert model.closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_model_stream_rejects_events_after_terminal_and_closes_stream() -> None:
+    class _LateEventModel(Model):
+        def __init__(self) -> None:
+            super().__init__(model="late-event-model", temperature=None)
+            self.closed = asyncio.Event()
+
+        async def stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            _ = request
+            try:
+                yield ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
+                    text="complete",
+                    finish_reason="stop",
+                )
+                yield ModelStreamEvent(
+                    type=ModelStreamEventType.TEXT_DELTA,
+                    text="late",
+                )
+            finally:
+                self.closed.set()
+
+    model = _LateEventModel()
+    engine = Engine(_ModelDeadlineAgent(model), budget=RuntimeBudget(max_steps=1))
+
+    with pytest.raises(ModelTransportError, match="after its terminal event"):
+        await engine._model_runtime._call_llm(
+            model,
+            ModelRequest(
+                run_id="late-event-run",
+                transaction_id="late-event-run:0",
+                provider=model.provider_name,
+                model=model.model,
+                protocol=model.capabilities.api.value,
+                messages=(),
+            ),
+        )
+
     assert model.closed.is_set()
 
 

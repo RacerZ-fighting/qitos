@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+from concurrent.futures import Future
 import threading
 import time
 from dataclasses import dataclass
@@ -26,8 +27,45 @@ from qitos.kit.history import WindowHistory
 from qitos.kit.parser import JsonDecisionParser
 from qitos.core.child import ChildInvocation
 from qitos.core.journal import JournalRecordType
+from qitos.core.tool import BaseTool, ToolSpec
 from qitos.kit.tool.agent import AgentTool
 from qitos.kit.journal import JsonlSessionJournal
+
+
+async def _ready_invocation(**kwargs: Any) -> ChildInvocation:
+    return ChildInvocation(**kwargs)
+
+
+class _ClosableEngine:
+    async def aclose(self) -> None:
+        return None
+
+
+class _CloseProbe(BaseTool):
+    def __init__(self) -> None:
+        self.close_count = 0
+        super().__init__(
+            ToolSpec(
+                name="close_probe",
+                description="Observe Engine ownership cleanup.",
+                input_schema={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            )
+        )
+
+    async def execute(
+        self,
+        args: dict[str, Any],
+        runtime_context: dict[str, Any] | None = None,
+    ) -> str:
+        _ = args, runtime_context
+        return "unused"
+
+    async def aclose(self) -> None:
+        self.close_count += 1
 
 
 @dataclass
@@ -82,6 +120,21 @@ def _event(event_id: str = "event-1") -> RuntimeInput:
         source="test",
         payload={"status": "completed"},
     )
+
+
+@pytest.mark.asyncio
+async def test_engine_close_releases_resources_before_first_run() -> None:
+    agent = _WaitAgent()
+    probe = _CloseProbe()
+    agent.tool_registry.register(probe)
+    engine = Engine(agent)
+
+    await engine.aclose()
+    await engine.aclose()
+
+    assert probe.close_count == 1
+    with pytest.raises(RuntimeError, match="Engine is closed"):
+        await engine.arun("must not start")
 
 
 @pytest.mark.parametrize("payload", [{"bad": object()}, {"bad": float("nan")}])
@@ -224,11 +277,28 @@ def test_runtime_wait_sleeps_until_event_and_delivers_it_at_safe_point() -> None
     assert stages.count("runtime_input") == 1
 
 
+def test_sync_runtime_post_rejects_run_loop_close_race(monkeypatch) -> None:
+    engine = Engine(_WaitAgent())
+    active_loop = SimpleNamespace(is_running=lambda: True)
+    engine._active_async_loop = active_loop
+
+    def schedule(post, loop):
+        assert loop is active_loop
+        post.close()
+        future: Future[bool] = Future()
+        future.cancel()
+        return future
+
+    monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", schedule)
+
+    assert engine.post_runtime_event(_event(), run_id="closing-run") is False
+
+
 def test_background_agent_completion_wakes_parent_runtime_wait() -> None:
     child_started = threading.Event()
     release_child = threading.Event()
 
-    class ChildEngine:
+    class ChildEngine(_ClosableEngine):
         active_run_id = "child-run"
 
         async def arun(self, task: str, **kwargs: Any) -> Any:
@@ -251,7 +321,7 @@ def test_background_agent_completion_wakes_parent_runtime_wait() -> None:
             release_child.set()
 
     agent_tool = AgentTool(
-        invocation_factory=lambda request, _context: ChildInvocation(
+        invocation_factory=lambda request, _context: _ready_invocation(
             engine=ChildEngine(),
             task=request.task,
         ),

@@ -18,6 +18,14 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Bounded MCP lifecycle for full and interactive Runs**: independent servers now
+  connect and discover concurrently under fixed limits, then publish successful
+  catalogs in deterministic factory order. `Engine.astep()` lazily owns the same MCP
+  lifecycle for interactive sessions, while synchronous `step()` rejects MCP-backed
+  sessions. Stdio enforces an 8 MiB frame limit, cleans up on reader failure, and
+  terminates its complete subprocess tree; cancellation notifications are bounded
+  best effort. ToolCalls from incomplete or failed model terminals are retained only
+  as diagnostics and never execute.
 - **Terminal facts recover completion delivery**: Background Child and managed-process completion
   inputs are now deterministic projections of canonical Journal terminals. Resume
   closes the terminal-to-mailbox crash window without a second store, does not redeliver
@@ -56,6 +64,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   automatically use the complete local transcript. Recovery coverage now follows a
   multi-turn Run through compaction, cancellation, committed-boundary fork, and resume
   while proving that the canonical ToolCall/ToolResult transcript remains complete.
+  A crash after every Tool terminal but before the step commit now also retains the
+  matching continuation when the step is reconstructed.
 - **One async turn transaction**: every model turn now captures an immutable model,
   protocol, complete History, Tool exposure, capability, deadline, pricing, and budget
   view. Full runs and interactive steps share this one transaction; parser and optional
@@ -133,10 +143,14 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   terminal resume, and committed-boundary fork. Tools execute only after a durable
   permit; ordered terminal results are reduced one by one, and unknown in-flight side
   effects are closed explicitly without replay.
-- **Run-scoped MCP tools**: pass explicit MCP server instances through
-  `AgentModule.mcp_servers` and Engine will connect, discover, expose
-  `mcp__server__tool` names, execute calls on the transport's owning event loop, and
-  unregister and close everything at run end. The empty default has no startup cost.
+- **Run-scoped MCP tools**: pass `Engine` an `mcp_server_factory` that creates fresh
+  transports for each Run, and Engine will connect, discover, expose
+  `mcp__server__tool` names, execute calls on the caller's event loop, and unregister
+  and close everything at run end. Catalog changes publish atomically at the next
+  turn safe point; annotations, pagination, typed remote errors, cancellation, and
+  the last good catalog are preserved. HTTP JSON/SSE, resumable GET notifications,
+  isolated reconnect cursors, and cancellation-safe cleanup do not replay
+  side-effecting Tool calls. The empty default has no startup cost.
 - **Public checkpoint lifecycle state**: hooks can read
   `Engine.last_checkpoint_id` after a successful durable commit instead of reaching
   into private Engine fields.

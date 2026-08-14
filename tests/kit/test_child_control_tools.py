@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from qitos.core.child import ChildInvocation, ChildLaunchRequest
+from qitos.core.child import ChildInvocation, ChildLaunchContext, ChildLaunchRequest
 from qitos.core.runtime_input import RuntimeInput
 from qitos.kit.child import ChildSupervisor
 from qitos.kit.tool.agent import (
@@ -18,7 +19,16 @@ from qitos.kit.tool.agent import (
 )
 
 
-class _MailboxEngine:
+async def _ready_invocation(**kwargs: Any) -> ChildInvocation:
+    return ChildInvocation(**kwargs)
+
+
+class _ClosableEngine:
+    async def aclose(self) -> None:
+        return None
+
+
+class _MailboxEngine(_ClosableEngine):
     active_run_id = "child-run"
 
     def __init__(self) -> None:
@@ -59,7 +69,7 @@ class _MailboxEngine:
 
 def _supervisor(engine: _MailboxEngine) -> ChildSupervisor:
     return ChildSupervisor(
-        invocation_factory=lambda request, _context: ChildInvocation(
+        invocation_factory=lambda request, _context: _ready_invocation(
             engine=engine,
             task=request.task,
         )
@@ -69,8 +79,7 @@ def _supervisor(engine: _MailboxEngine) -> ChildSupervisor:
 async def _launch(supervisor: ChildSupervisor):
     return await supervisor.launch(
         ChildLaunchRequest(task="inspect", description="inspect service"),
-        {},
-        parent_run_id="parent-run",
+        ChildLaunchContext(parent_run_id="parent-run"),
         background=True,
     )
 

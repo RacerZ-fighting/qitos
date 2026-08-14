@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Mapping, Protocol
+from typing import Any, Mapping, Protocol, runtime_checkable
 
 from .action import Action
 from .tool_result import ToolResult
@@ -42,6 +43,14 @@ class JournalClosedError(JournalError):
     """Raised when an operation requires a journal whose lifecycle has ended."""
 
 
+class JournalCommitState(str, Enum):
+    """Durable outcome of one canonical append attempt."""
+
+    NOT_COMMITTED = "not_committed"
+    COMMITTED = "committed"
+    UNKNOWN = "unknown"
+
+
 class JournalRecordType(str, Enum):
     RUN_STARTED = "run.started"
     INPUT_ACCEPTED = "input.accepted"
@@ -67,6 +76,85 @@ class JournalPosition:
     run_id: str
     seq: int
     record_id: str
+
+
+class JournalCommitError(JournalError):
+    """Canonical append failure with an explicit durable outcome."""
+
+    def __init__(
+        self,
+        position: JournalPosition,
+        commit_state: JournalCommitState,
+        *,
+        cause: BaseException,
+        rollback_error: BaseException | None = None,
+    ) -> None:
+        if not isinstance(position, JournalPosition):
+            raise TypeError("position must be a JournalPosition")
+        if not isinstance(commit_state, JournalCommitState):
+            raise TypeError("commit_state must be a JournalCommitState")
+        self.position = position
+        self.commit_state = commit_state
+        self.cause = cause
+        self.rollback_error = rollback_error
+        if commit_state is JournalCommitState.UNKNOWN:
+            message = (
+                "journal append outcome is unknown; close and reopen before "
+                "continuing"
+            )
+        elif commit_state is JournalCommitState.COMMITTED:
+            message = "journal append committed but local finalization failed"
+        else:
+            message = "journal append failed and was rolled back"
+        super().__init__(message)
+
+
+class JournalAppendCancelled(asyncio.CancelledError):
+    """Cancellation observed after a Journal append had started settling.
+
+    ``committed_position`` is present only when the canonical record was durably
+    appended before cancellation propagated. Callers that reserve external state
+    for the record can then commit instead of guessing from the filesystem.
+    """
+
+    def __init__(
+        self,
+        committed_position: JournalPosition | None,
+        *,
+        commit_state: JournalCommitState | None = None,
+        pending_position: JournalPosition | None = None,
+        commit_error: BaseException | None = None,
+    ) -> None:
+        resolved_state = commit_state or (
+            JournalCommitState.COMMITTED
+            if committed_position is not None
+            else JournalCommitState.NOT_COMMITTED
+        )
+        if (
+            committed_position is not None
+            and resolved_state is not JournalCommitState.COMMITTED
+        ):
+            raise ValueError("committed_position requires committed commit_state")
+        if (
+            committed_position is None
+            and resolved_state is JournalCommitState.COMMITTED
+        ):
+            raise ValueError("committed commit_state requires committed_position")
+        self.committed_position = committed_position
+        self.commit_state = resolved_state
+        self.pending_position = pending_position or committed_position
+        self.commit_error = commit_error
+        if resolved_state is JournalCommitState.COMMITTED:
+            message = (
+                "journal append was cancelled after its canonical record committed"
+            )
+        elif resolved_state is JournalCommitState.UNKNOWN:
+            message = "journal append was cancelled with an unknown durable outcome"
+        else:
+            message = (
+                "journal append was cancelled before its canonical record committed"
+            )
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,20 +368,26 @@ def resolve_inherited_record(record: JournalRecord) -> JournalRecord:
     raise JournalCorruptionError("journal.inherited nesting is too deep")
 
 
+@runtime_checkable
 class SessionJournal(Protocol):
-    """Durable single-Run journal used by the Engine."""
+    """Durable single-Run journal used by the Engine.
+
+    An append cancelled before admission raises ordinary ``CancelledError`` and
+    commits nothing. Once canonical I/O starts, implementations settle it before
+    propagating :class:`JournalAppendCancelled`; its ``commit_state`` distinguishes
+    a committed, rolled-back, or unknown durable outcome. An unknown outcome makes
+    that journal instance unusable until it is closed and replayed.
+    """
 
     @property
     def run_id(self) -> str:
-        ...
+        raise NotImplementedError
 
-    async def create(
-        self, run_id: str, metadata: Mapping[str, Any]
-    ) -> JournalPosition:
-        ...
+    async def create(self, run_id: str, metadata: Mapping[str, Any]) -> JournalPosition:
+        raise NotImplementedError
 
     async def open(self, run_id: str) -> None:
-        ...
+        raise NotImplementedError
 
     async def append(
         self,
@@ -302,10 +396,10 @@ class SessionJournal(Protocol):
         *,
         record_id: str,
     ) -> JournalPosition:
-        ...
+        raise NotImplementedError
 
     async def replay(self) -> tuple[JournalRecord, ...]:
-        ...
+        raise NotImplementedError
 
     def find_tool_transaction(
         self, reference: JournalRecordRef
@@ -315,7 +409,7 @@ class SessionJournal(Protocol):
         ...
 
     async def flush(self) -> None:
-        ...
+        raise NotImplementedError
 
     async def close(self) -> None:
         """Flush pending writes and permanently release this journal instance."""
@@ -325,12 +419,15 @@ class SessionJournal(Protocol):
     async def fork(
         self, parent_position: JournalPosition, new_run_id: str
     ) -> "SessionJournal":
-        ...
+        raise NotImplementedError
 
 
 __all__ = [
     "JournalCorruptionError",
     "JournalClosedError",
+    "JournalAppendCancelled",
+    "JournalCommitError",
+    "JournalCommitState",
     "JournalError",
     "JournalOwnershipError",
     "JournalPosition",

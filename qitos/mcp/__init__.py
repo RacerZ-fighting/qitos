@@ -8,6 +8,7 @@ Public API::
 
     from qitos.mcp import (
         MCPServer,
+        MCPServerFactory,
         MCPToolInfo,
         MCPServerStdio,
         MCPServerStreamableHttp,
@@ -16,14 +17,25 @@ Public API::
     )
 """
 
-from .server import MCPServer, MCPToolInfo
+from .server import (
+    MCPCallToolResult,
+    MCPRequestError,
+    MCPServer,
+    MCPServerFactory,
+    MCPToolAnnotations,
+    MCPToolInfo,
+)
 from .stdio import MCPServerStdio
 from .http import MCPServerStreamableHttp
 from .bridge import mcp_server_to_function_tools
 from .filter import ToolFilter
 
 __all__ = [
+    "MCPCallToolResult",
+    "MCPRequestError",
     "MCPServer",
+    "MCPServerFactory",
+    "MCPToolAnnotations",
     "MCPToolInfo",
     "MCPServerStdio",
     "MCPServerStreamableHttp",

@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from ..core.action import Action, ActionExecutionPolicy, ActionResult, ActionStatus
+from ..core.budget import BudgetLedger
 from ..core.env import Env
+from ..core.journal import SessionJournal
+from ..core.runtime_input import RuntimeInput
 from ..core.tool_result import ToolResult
 from ..core.turn import TurnBudgetSnapshot
 from ..core.tool_registry import ToolRegistry
@@ -20,11 +23,40 @@ from ..core.tool import (
 )
 from ..core.tool_schema import tool_input_schema_errors
 from .interrupt import EngineInterrupt
-from .states import RuntimeEvent, RuntimePhase
+from .cancellation import CancelToken
+from .states import RuntimeBudget, RuntimeEvent, RuntimePhase
 
-if TYPE_CHECKING:
-    from .cancellation import CancelToken
-    from .engine import Engine
+
+class _ActionRuntimeOwner(Protocol):
+    """Engine surface required while projecting one Tool runtime context."""
+
+    agent: Any
+    budget: RuntimeBudget
+    events: List[RuntimeEvent]
+    journal: SessionJournal | None
+
+    @property
+    def active_run_id(self) -> str:
+        raise NotImplementedError
+
+    @property
+    def budget_ledger(self) -> BudgetLedger:
+        raise NotImplementedError
+
+    @property
+    def runtime_deadline_monotonic(self) -> float | None:
+        raise NotImplementedError
+
+    def remaining_runtime_seconds(self) -> float | None:
+        raise NotImplementedError
+
+    async def apost_runtime_event(
+        self,
+        event: RuntimeInput,
+        *,
+        run_id: str,
+    ) -> bool:
+        raise NotImplementedError
 
 
 # Terminal states that count as a failure for fail_fast purposes.
@@ -77,7 +109,7 @@ class ActionExecutor:
         trace_writer: Any = None,
         delegate_depth: int = 0,
         shared_memory: Any = None,
-        engine: Optional[Engine[Any, Any, Any]] = None,
+        engine: _ActionRuntimeOwner | None = None,
         permission_pipeline: Any = None,
         read_before_write_enforcer: Any = None,
         permission_interaction_callback: Optional[Any] = None,
@@ -103,18 +135,14 @@ class ActionExecutor:
     # ── Cancellation ───────────────────────────────────────────────────────────
 
     def _resolve_cancel_token(self) -> Optional[CancelToken]:
-        """Prefer an explicit token, else fall back to the owning Engine's."""
-        if self._cancel_token is not None:
-            return self._cancel_token
-        if self._engine is not None:
-            return getattr(self._engine, "_cancel_token", None)
-        return None
+        """Return the explicitly owned cancellation dependency, if configured."""
+        return self._cancel_token
 
     def _is_cancelled(self) -> bool:
         token = self._resolve_cancel_token()
         if token is None:
             return False
-        return bool(getattr(token, "is_cancel_requested", False))
+        return token.is_cancel_requested
 
     def _remaining_runtime_seconds(self) -> Optional[float]:
         if self._turn_budget is not None:
@@ -126,14 +154,8 @@ class ActionExecutor:
             )
         if self._engine is None:
             return None
-        remaining = getattr(self._engine, "remaining_runtime_seconds", None)
-        if callable(remaining):
-            value = remaining()
-            return None if value is None else max(0.0, float(value))
-        deadline = getattr(self._engine, "runtime_deadline_monotonic", None)
-        if deadline is None:
-            return None
-        return max(0.0, float(deadline) - time.monotonic())
+        remaining = self._engine.remaining_runtime_seconds()
+        return None if remaining is None else max(0.0, float(remaining))
 
     async def execute(
         self, actions: Sequence[Action], env: Optional[Env] = None, state: Any = None
@@ -171,6 +193,9 @@ class ActionExecutor:
             )
             self.last_execution_stats["concurrency_peak"] = tracker.peak
             self.last_execution_stats["segments"] = 1
+            cancel_source = result.metadata.get("cancel_source")
+            if isinstance(cancel_source, str) and cancel_source:
+                self.last_execution_stats["cancel_source"] = cancel_source
             return [result]
 
         # Respect ActionExecutionPolicy.mode
@@ -214,7 +239,11 @@ class ActionExecutor:
                 action, env=env, state=state, tracker=tracker, segment_index=idx
             )
             results.append(result)
-            if self.policy.fail_fast and result.status in _FAILED_STATUSES:
+            cancel_source = result.metadata.get("cancel_source")
+            if isinstance(cancel_source, str) and cancel_source:
+                aborted = cancel_source
+                self.last_execution_stats["cancel_source"] = aborted
+            elif self.policy.fail_fast and result.status in _FAILED_STATUSES:
                 aborted = "fail_fast"
                 self.last_execution_stats["cancel_source"] = aborted
         self.last_execution_stats["concurrency_peak"] = tracker.peak
@@ -287,13 +316,18 @@ class ActionExecutor:
 
             if len(segment) == 1:
                 idx = segment[0]
-                results[idx] = await self._execute_one(
+                segment_result = await self._execute_one(
                     actions[idx],
                     env=env,
                     state=state,
                     tracker=tracker,
                     segment_index=segment_index,
                 )
+                results[idx] = segment_result
+                cancel_source = segment_result.metadata.get("cancel_source")
+                if isinstance(cancel_source, str) and cancel_source:
+                    aborted = cancel_source
+                    self.last_execution_stats["cancel_source"] = aborted
             else:
                 aborted = await self._execute_segment_concurrently(
                     actions,
@@ -341,10 +375,9 @@ class ActionExecutor:
     ) -> Optional[str]:
         """Run one contiguous safe segment in parallel.
 
-        Returns the abort reason (``"fail_fast"`` / ``"cancel_token"``) if the
-        segment was cut short, else ``None``. Actions that already started are
-        always drained to their real terminal state — never relabelled as
-        errors — while actions that never started are recorded as cancelled.
+        Returns the abort reason if the segment was cut short, else ``None``.
+        Actions that already started are always drained to their real terminal
+        state, while actions that never started are recorded as cancelled.
         """
         max_concurrency = min(max(1, self.policy.max_concurrency), len(segment))
         abort_reason: Optional[str] = None
@@ -423,16 +456,16 @@ class ActionExecutor:
                         )
                     pending.clear()
         except asyncio.CancelledError:
-            abort_reason = "cancel_token"
+            abort_reason = (
+                "cancel_token" if self._is_cancelled() else "caller_cancelled"
+            )
             self.last_execution_stats["cancel_source"] = abort_reason
             pending = {task for task in tasks if not task.done()}
             pending_tasks = list(pending)
             for task in pending_tasks:
                 task.cancel()
             if pending_tasks:
-                drained = await asyncio.gather(
-                    *pending_tasks, return_exceptions=True
-                )
+                drained = await asyncio.gather(*pending_tasks, return_exceptions=True)
                 for pending_task, drained_outcome in zip(pending_tasks, drained):
                     idx = tasks[pending_task]
                     results[idx] = (
@@ -1037,13 +1070,18 @@ class ActionExecutor:
                         action.name, effective_args, reported_result.output
                     )
                 latency = (time.monotonic() - start) * 1000
+                reported_error_category = reported_result.metadata.get("error_category")
+                if not isinstance(reported_error_category, str):
+                    reported_error_category = None
                 result_metadata = {
+                    **reported_result.metadata,
                     **tool_meta,
                     **ordering_meta,
                     "error_category": (
                         None
                         if reported_result.is_success
-                        else f"tool_reported_{reported_result.status}"
+                        else reported_error_category
+                        or f"tool_reported_{reported_result.status}"
                     ),
                     "permission": self._permission_payload(permission),
                     "progress_count": len(runtime_context["progress_events"]),
@@ -1069,6 +1107,9 @@ class ActionExecutor:
             except EngineInterrupt:
                 raise
             except asyncio.CancelledError:
+                cancel_source = (
+                    "cancel_token" if self._is_cancelled() else "caller_cancelled"
+                )
                 return self._finish_result(
                     action=action,
                     status=ActionStatus.CANCELLED,
@@ -1079,7 +1120,7 @@ class ActionExecutor:
                     extra_metadata={
                         **ordering_meta,
                         "error_category": "cancelled",
-                        "cancel_source": "cancel_token",
+                        "cancel_source": cancel_source,
                         "worker_still_running": False,
                         "ended_at": time.time(),
                     },
@@ -1129,10 +1170,11 @@ class ActionExecutor:
                             timeout_source=timeout_source,
                             timeout_s=timeout_s,
                         )
-                    if await self._wait_for_retry(
+                    retry_cancel_source = await self._wait_for_retry(
                         delay,
                         deadline_monotonic=action_deadline_monotonic,
-                    ):
+                    )
+                    if retry_cancel_source is not None:
                         return self._finish_result(
                             action=action,
                             status=ActionStatus.CANCELLED,
@@ -1143,7 +1185,7 @@ class ActionExecutor:
                             extra_metadata={
                                 **ordering_meta,
                                 "error_category": "cancelled",
-                                "cancel_source": "cancel_token",
+                                "cancel_source": retry_cancel_source,
                                 "ended_at": time.time(),
                             },
                         )
@@ -1185,18 +1227,18 @@ class ActionExecutor:
         delay: float,
         *,
         deadline_monotonic: Optional[float],
-    ) -> bool:
-        """Wait for retry backoff, returning true when cancellation wins."""
+    ) -> str | None:
+        """Wait for retry backoff and identify the cancellation source."""
 
         wake_at = time.monotonic() + max(0.0, delay)
         while True:
             if self._is_cancelled():
-                return True
+                return "cancel_token"
             now = time.monotonic()
             if now >= wake_at:
-                return False
+                return None
             if deadline_monotonic is not None and now >= deadline_monotonic:
-                return False
+                return None
             remaining_delay = wake_at - now
             remaining_deadline = (
                 None
@@ -1207,11 +1249,11 @@ class ActionExecutor:
             if remaining_deadline is not None:
                 sleep_for = min(sleep_for, remaining_deadline)
             if sleep_for <= 0:
-                return False
+                return None
             try:
                 await asyncio.sleep(sleep_for)
             except asyncio.CancelledError:
-                return True
+                return "caller_cancelled"
 
     def _action_stop_result(
         self,
@@ -1353,11 +1395,7 @@ class ActionExecutor:
         def _record_artifact(payload: Dict[str, Any]) -> None:
             artifacts.append(dict(payload))
 
-        active_run_id = (
-            str(getattr(self._engine, "active_run_id", "") or "")
-            if self._engine is not None
-            else ""
-        )
+        active_run_id = self._engine.active_run_id if self._engine is not None else ""
 
         async def _post_runtime_event(event: Any) -> bool:
             if self._engine is None or not active_run_id:
@@ -1376,10 +1414,7 @@ class ActionExecutor:
                 runtime_phase = RuntimePhase(phase)
             except ValueError:
                 return
-            events = getattr(self._engine, "events", None)
-            if not isinstance(events, list):
-                return
-            events.append(
+            self._engine.events.append(
                 RuntimeEvent(
                     step_id=int(getattr(state, "current_step", 0) or 0),
                     phase=runtime_phase,
@@ -1391,7 +1426,9 @@ class ActionExecutor:
         max_children = (
             self._turn_budget.max_children
             if self._turn_budget is not None
-            else int(getattr(getattr(self._engine, "budget", None), "max_children", 0))
+            else int(
+                self._engine.budget.max_children if self._engine is not None else 0
+            )
         )
 
         def _remaining_seconds() -> Optional[float]:
@@ -1414,15 +1451,9 @@ class ActionExecutor:
             "delegate_depth": self.delegate_depth,
             "run_id": active_run_id,
             "parent_run_id": active_run_id,
-            "journal": (
-                getattr(self._engine, "journal", None)
-                if self._engine is not None
-                else None
-            ),
+            "journal": self._engine.journal if self._engine is not None else None,
             "budget_ledger": (
-                getattr(self._engine, "budget_ledger", None)
-                if self._engine is not None
-                else None
+                self._engine.budget_ledger if self._engine is not None else None
             ),
             "max_children": max_children,
             "post_runtime_event": _post_runtime_event,
@@ -1432,11 +1463,7 @@ class ActionExecutor:
             "agent_cancelled": self._is_cancelled,
             "trace_writer": self.trace_writer,
             "shared_memory": self.shared_memory,
-            "agent": (
-                getattr(self._engine, "agent", None)
-                if self._engine is not None
-                else None
-            ),
+            "agent": self._engine.agent if self._engine is not None else None,
         }
 
     def _resolve_tool(self, name: str) -> Optional[BaseTool]:

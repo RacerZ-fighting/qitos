@@ -3,32 +3,61 @@ title: "MCP 集成"
 description: "将外部 MCP 服务器桥接到 QitOS，转化为 FunctionTool 实例，支持工具过滤与异步生命周期管理。"
 ---
 
-Model Context Protocol（MCP）是一个开放标准，用于将 AI 系统连接到外部工具和数据源。QitOS 可以在一次 `Engine.arun()` 中完整持有 MCP 生命周期：preflight 后连接、第一轮模型请求前发现工具、在 transport 所属 event loop 上执行调用，并在运行结束时移除工具和关闭服务器。
+Model Context Protocol（MCP）是一个开放标准，用于将 AI 系统连接到外部工具和数据源。QitOS 可以为完整的 `Engine.arun()` 或交互式 `Engine.astep()` session 持有 MCP 生命周期：第一轮模型请求前发现工具，在调用方 event loop 上异步执行调用，并在 owner 结束时移除工具和关闭 transport。
 
-## 推荐：由 Engine 持有生命周期
+## 推荐：由 Engine 持有每个 Run 的生命周期
 
-把显式构造的 server 传给 `AgentModule`，同时给 Agent 配置 `ToolRegistry`：
+给 Agent 配置 `ToolRegistry`，再向 `Engine` 传入一个只负责构造的 factory；每次
+Run 都必须返回全新且尚未连接的 transport：
 
 ```python
 from qitos import Engine, ToolRegistry
 from qitos.mcp import MCPServerStdio
 
-server = MCPServerStdio(
-    command="npx",
-    args=["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
-    name="filesystem",
-)
-agent = MyAgent(
-    tool_registry=ToolRegistry(),
-    mcp_servers=[server],
-)
+def create_mcp_servers():
+    return (
+        MCPServerStdio(
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+            name="filesystem",
+        ),
+    )
 
-result = await Engine(agent).arun("检查 workspace")
+agent = MyAgent(tool_registry=ToolRegistry())
+engine = Engine(agent, mcp_server_factory=create_mcp_servers)
+result = await engine.arun("检查 workspace")
 ```
 
 模型看到的是 `mcp__filesystem__read_file` 这类 provider-safe 名称；QitOS 仍保留服务器与工具的原始名称来发起协议调用。模型可见名称会经过字符清理、冲突消解，并限制为 64 个字符。注册只在当前 run 生效，因此后续 Engine 可以复用同一个 registry。
 
-`mcp_servers=[]` 是正常默认值，不会创建 MCP event loop、子进程或 HTTP client。配置发现、catalog 和审批策略仍由应用层决定。
+`mcp_server_factory=None` 是正常默认值，不会创建 MCP 子进程或 HTTP client。
+Factory 只能构造对象；真正的 I/O 由 `connect()` 在 Run deadline 内完成。不能返回共享的
+client 或进程：Root、Child、resume 以及后续 Run 都应持有独立 transport。配置发现、
+catalog 和审批策略仍由应用层决定。
+
+Run 启动时，QitOS 会并发连接独立 server 并发现目录，默认最多同时执行八个 startup
+操作。每个 server 最多使用 10 秒或 Run 剩余 deadline，以较短者为准。单个 server
+失败后会独立清理，不会取消健康 server；成功目录仍按 factory 顺序转换和发布，因此
+模型看到的 Tool 列表保持确定性。
+
+每轮模型请求都会冻结一份 Tool exposure。协议
+`notifications/tools/list_changed` 通知或显式调用
+`engine.request_mcp_refresh(server_name)`，只会把已连接目录标记为在下一次 turn
+前安全点刷新。完整的新目录只从下一轮开始发布；当前轮仍使用原来的 handler 和
+schema。刷新失败会保留上一版完整目录；刷新被取消时取消会继续向上传播，同时保留待刷新状态。
+
+交互式 session 使用同一个 owner。`init_session()` 只创建 session state；第一次
+`await engine.astep(...)` 会在捕获 turn 前启动 MCP，后续 `astep()` 会在各自 turn
+快照前应用待处理 refresh。所有 step 与 `aclose()` 都应留在启动 transport 的同一个
+event loop。同步 `engine.step(...)` 会拒绝 MCP session，因为临时 event loop 无法持有
+持久 transport。
+
+Stepwise API 不管理 durable Run Journal 或 checkpoint commit。需要让模型与 Tool
+事务在进程重启后继续恢复时，请使用 `arun()`、`resume()` 和 `fork()`。
+
+Engine 只执行来自完整模型事务的 MCP ToolCall。已知 incomplete、达到长度上限、failed、
+filtered 或 cancelled 的终态会把原生或文本恢复出的调用保留为
+`invalid_tool_calls` 诊断，但绝不会执行。
 
 ## Transport 选项
 
@@ -64,7 +93,14 @@ for tool in tools:
     print(f"  {tool.name}: {tool.description}")
 ```
 
-`list_tools()` 返回的每个 `MCPToolInfo` 包含 `name`、`description` 和 `input_schema`。
+两种 transport 都会按有界的 `nextCursor` 分页读取目录，不会静默只返回第一页。
+`list_tools()` 返回的每个 `MCPToolInfo` 都包含 `name`、`description`、
+`input_schema` 和类型化 MCP `annotations`。Annotation 只是不可信提示：缺失
+`readOnlyHint` 不会被解释为只读，QitOS 也不会据此推断并发安全或允许重试。
+
+Stdio 使用 newline-delimited JSON-RPC，默认单帧最多 8 MiB。超限帧会成为类型化 MCP
+协议错误；意外 EOF 或其他 reader 致命错误会成为类型化 transport 错误，并自动触发
+transport cleanup。
 
 ## 底层桥接
 
@@ -82,7 +118,17 @@ await server.connect()
 tools = await mcp_server_to_function_tools(server)
 ```
 
-每个返回的 `FunctionTool` 封装了一次远程 MCP 调用。当工具被执行时，QitOS 向 MCP 服务器发送 `tools/call` JSON-RPC 请求并返回结果。
+每个返回的 `FunctionTool` 封装了一次远程 MCP 调用。工具执行时，QitOS 会发送
+`tools/call` JSON-RPC 请求，并把类型化 `MCPCallToolResult` 投影为普通 QitOS
+`ToolResult`。`structuredContent`、`_meta` 和 content block 会被保留；
+`isError=true` 会成为 `ToolResult(status="error")`，不会伪装成成功 JSON 值。
+JSON-RPC 协议错误、远端请求错误、远端 Tool 错误、timeout 和 cancellation 仍是可区分的终态。
+
+Streamable HTTP transport 支持 POST 返回 JSON 或 SSE，保留协商得到的 session 和
+protocol header，并在空闲 GET stream 断开后携带 `Last-Event-ID` 重连。只有 GET
+notification stream 中的 event id 会推进重连游标，POST response 中的 id 不会污染它。
+Session 404 会稳定分类为 `MCP_SESSION_EXPIRED`。QitOS 可以在下一轮安全点重新连接并重复
+无副作用的 catalog discovery，但不会自动重放可能产生副作用的 `tools/call`。
 
 当需要将多个服务器桥接到同一注册表时，可以添加名称前缀来消除歧义：
 
@@ -174,9 +220,17 @@ finally:
     await server.cleanup()
 ```
 
-`MCPServerStdio.cleanup()` 终止子进程（先 `SIGTERM`，5 秒超时后 `SIGKILL`）。`MCPServerStreamableHttp.cleanup()` 关闭 HTTP 客户端会话。
+`MCPServerStdio.cleanup()` 会终止并回收完整子进程树（先向进程组发送 graceful signal，
+5 秒超时后强制终止整棵进程树）。`MCPServerStreamableHttp.cleanup()` 会先等待正在执行的
+POST，终止协商得到的 session，再关闭 HTTP client。调用方的取消只会在这些资源完成
+收敛后继续传播。
 
-桥接后的函数会把调用提交回执行 discovery 的 event loop；执行工具时不能阻塞该 loop。由 Engine 持有时使用独立的 run-scoped MCP transport loop，因此没有这个限制。
+请求被取消时，两种 transport 都只在有界时间内尝试发送 MCP cancellation notification
+（默认 250 ms）。该通知是 best effort：阻塞或失败不会无限拖延本地取消；transport 已在
+closing 时，cleanup 也不会再启动新通知。
+
+Bridge、transport 与 Engine 都运行在调用方 event loop 上，不会创建临时或独立的
+MCP event loop。因此 bridged Tool 运行期间，应用代码不能阻塞该 loop。
 
 ## 下一步
 

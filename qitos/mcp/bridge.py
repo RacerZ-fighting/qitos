@@ -22,13 +22,16 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+from collections.abc import Sequence
 from typing import Any, List, Optional, Set
 
 from ..core.tool import FunctionTool, ToolMeta, ToolSpec
+from ..core.tool_result import ToolResult
 from .filter import ToolFilter
 from .schema_convert import convert_mcp_schema_to_tool_spec
-from .server import MCPServer
+from .server import MCPCallToolResult, MCPRequestError, MCPServer, MCPToolInfo
 
 
 async def mcp_server_to_function_tools(
@@ -36,6 +39,7 @@ async def mcp_server_to_function_tools(
     tool_filter: Optional[ToolFilter] = None,
     name_prefix: Optional[str] = None,
     used_names: Optional[Set[str]] = None,
+    tool_infos: Sequence[MCPToolInfo] | None = None,
 ) -> List[FunctionTool]:
     """Convert all tools exposed by an MCP server into QitOS FunctionTools.
 
@@ -48,7 +52,9 @@ async def mcp_server_to_function_tools(
     :returns: A list of ``FunctionTool`` instances, one per MCP tool that
         passes the filter.
     """
-    mcp_tools = await server.list_tools()
+    mcp_tools = (
+        list(tool_infos) if tool_infos is not None else await server.list_tools()
+    )
     tools: List[FunctionTool] = []
     occupied = used_names if used_names is not None else set()
 
@@ -92,20 +98,48 @@ def _make_function_tool(
 
     async def _async_wrapper(**kwargs: Any) -> Any:
         """Call the MCP transport on its owning event loop."""
-        call_kwargs = {
-            k: v
-            for k, v in kwargs.items()
-            if k not in ("runtime_context", "env", "ops", "file_ops", "process_ops")
-        }
-        return await server.call_tool(original_name, call_kwargs)
+        try:
+            result = await server.call_tool(original_name, dict(kwargs))
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            raise
+        except MCPRequestError as exc:
+            return ToolResult(
+                status="error",
+                error=str(exc),
+                metadata={
+                    "error_category": exc.error_category,
+                    "error_code": exc.error_code,
+                    "mcp_server": server.name,
+                    "mcp_tool": original_name,
+                },
+            )
+        if not isinstance(result, MCPCallToolResult):
+            return ToolResult(
+                status="error",
+                error="MCP transport returned an invalid tools/call result",
+                metadata={
+                    "error_category": "mcp_protocol_error",
+                    "error_code": "MCP_PROTOCOL_ERROR",
+                    "mcp_server": server.name,
+                    "mcp_tool": original_name,
+                },
+            )
+        return result.to_tool_result(
+            server_name=server.name,
+            tool_name=original_name,
+        )
 
     # Attach metadata so FunctionTool uses our spec fields.
     meta = ToolMeta(
         name=spec.name,
         description=spec.description,
         input_schema=spec.input_schema,
+        permissions=spec.permissions,
         read_only=spec.read_only,
         concurrency_safe=spec.concurrency_safe,
+        group=spec.group,
     )
 
     tool = FunctionTool(_async_wrapper, meta=meta)
