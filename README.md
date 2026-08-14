@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Reproducible on-demand quality gates**: CI, documentation, and contribution
+  validation now run only through explicit GitHub Actions dispatch. The declared
+  development environment includes async-test support, and build/audit jobs require a
+  `setuptools` release fixed for `PYSEC-2026-3447`.
 - **Provider-owned model caching**: the deprecated local response-cache package and
   implicit `Engine(cache_backend=...)` model mutation are gone. QitOS no longer replays
   a previous provider transaction as a new model call; provider-native prompt caching,

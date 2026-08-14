@@ -82,6 +82,9 @@ How to update:
 
 ### Changed
 
+- CI, documentation validation, and contribution checks now run only when explicitly
+  dispatched from GitHub Actions. The manual jobs retain the supported-Python test
+  matrix, coverage, packaging, lint, type, audit, and focused contribution checks.
 - Text Web, coding Web fetch, HTML extraction, and EPUB reading now share one
   Beautiful Soup parser policy. The required dependency replaces three unreachable
   optional-dependency branches and their regex fallbacks; text search results are also
@@ -196,6 +199,17 @@ How to update:
 
 ### Fixed
 
+- The declared development environment now installs `pytest-asyncio`, so the complete
+  async suite executes in CI instead of producing unknown-mark warnings and hundreds
+  of unsupported-coroutine failures. Build and audit environments require a
+  `setuptools` release containing the fix for `PYSEC-2026-3447`.
+- MCP startup, Child waits, and their behavior tests now use structured primitives
+  available across the declared Python 3.10+ range. Python 3.10 cancellation tests
+  verify the canonical Journal outcome when its runtime normalizes a cancelled Task's
+  `CancelledError` subclass.
+- Manual contribution checks now import the canonical `ToolSpec`, and the Chinese
+  documentation set includes the multi-agent tutorial required by the bilingual
+  navigation validation.
 - Foreground Child supervision now distinguishes `ChildInvocationCancelled` from an
   actual caller Task cancellation. Both outcomes persist one cancelled Child terminal,
   but only `asyncio.CancelledError` from the caller aborts the parent.

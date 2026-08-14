@@ -302,9 +302,11 @@ class ChildSupervisor:
             if timeout_seconds is None:
                 await owned.terminal_event.wait()
             else:
-                async with asyncio.timeout(timeout_seconds):
-                    await owned.terminal_event.wait()
-        except TimeoutError:
+                await asyncio.wait_for(
+                    owned.terminal_event.wait(),
+                    timeout=timeout_seconds,
+                )
+        except asyncio.TimeoutError:
             return self._current_result(owned)
         return self._current_result(owned)
 
@@ -830,8 +832,13 @@ class ChildSupervisor:
         )
         waits = (engine_wait, terminal_wait)
         try:
-            async with asyncio.timeout(timeout_seconds):
-                await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
+            completed, _ = await asyncio.wait(
+                waits,
+                timeout=timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not completed:
+                raise TimeoutError("Child did not become ready before its deadline")
         finally:
             for task in waits:
                 if not task.done():

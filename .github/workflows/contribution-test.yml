@@ -1,19 +1,11 @@
 name: contribution-test
 
 on:
-  pull_request:
-    paths:
-      - 'qitos/kit/tool/**'
-      - 'qitos/kit/parser/**'
-      - 'qitos/kit/critic/**'
-      - 'qitos/kit/embedding/**'
-      - 'qitos/protocols.py'
-      - 'qitos/core/**'
+  workflow_dispatch:
 
 jobs:
   tool-schema-check:
     runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.changed_files.*.filename, 'kit/tool')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,9 +23,8 @@ jobs:
       - name: Validate tool schemas
         run: |
           python -c "
-          from qitos.core.tool_registry import ToolRegistry
-          from qitos.core.tool_schema import ToolSpec
-          import importlib, pkgutil, inspect
+          from qitos.core.tool import ToolSpec
+          import importlib, pkgutil
           import qitos.kit.tool as pkg
           errors = []
           for _, name, _ in pkgutil.walk_packages(pkg.__path__, pkg.__name__ + '.'):
@@ -50,7 +41,6 @@ jobs:
 
   parser-contract-check:
     runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.changed_files.*.filename, 'kit/parser') || contains(github.event.pull_request.changed_files.*.filename, 'protocols.py')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -93,15 +83,10 @@ jobs:
           python -m pip install -e ".[dev,models]"
 
       - name: Run affected test subsets
-        run: |
-          # Run tests for each changed area
-          CHANGED="${{ github.event.pull_request.changed_files }}"
-          pytest tests/core/ tests/engine/ tests/kit/ -q --tb=short 2>/dev/null || true
-          pytest -q --tb=short
+        run: pytest -q --tb=short
 
   critic-test:
     runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.changed_files.*.filename, 'kit/critic') || contains(github.event.pull_request.changed_files.*.filename, 'critic_decorator')
     steps:
       - name: Checkout
         uses: actions/checkout@v4

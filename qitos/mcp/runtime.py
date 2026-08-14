@@ -121,19 +121,24 @@ class MCPRuntime:
             raise RuntimeError("MCP runtime is already started")
         self._started = True
         try:
-            tasks: list[asyncio.Task[_StartupDiscovery]] = []
-            async with asyncio.TaskGroup() as group:
-                for state in self._states:
-                    tasks.append(
-                        group.create_task(
-                            self._discover_startup_catalog(
-                                state,
-                                run_deadline_monotonic=deadline_monotonic,
-                            ),
-                            name=f"qitos-mcp-start-{state.name}",
-                        )
-                    )
-            discoveries = tuple(task.result() for task in tasks)
+            tasks = [
+                asyncio.create_task(
+                    self._discover_startup_catalog(
+                        state,
+                        run_deadline_monotonic=deadline_monotonic,
+                    ),
+                    name=f"qitos-mcp-start-{state.name}",
+                )
+                for state in self._states
+            ]
+            try:
+                discoveries = tuple(await asyncio.gather(*tasks))
+            except BaseException:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
             for discovery in discoveries:
                 state = discovery.state
                 error = discovery.error

@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **可复现的手动质量门**：CI、文档和贡献校验现在只通过 GitHub Actions 手动触发。
+  声明的开发环境已包含异步测试支持，build/audit job 也要求包含
+  `PYSEC-2026-3447` 修复的 `setuptools` 版本。
 - **模型缓存由 Provider 持有**：已废弃的本地 response-cache 包和隐式
   `Engine(cache_backend=...)` 模型改写已删除。QitOS 不再把历史 provider transaction
   重放成一次新模型调用；Provider 原生 prompt cache、cache usage、deadline、续接与

@@ -1,0 +1,142 @@
+# 使用 QitOS 构建你的第一个多智能体系统
+
+本教程将构建一个多智能体代码探索系统。它会并行派发多个子智能体，分别检查代码库的不同部分。
+
+## 最终效果
+
+你将得到一个协调智能体。它通过 `fanout` 工具并行启动多个探索智能体，让每个智能体检查一个目录，
+最后汇总并综合各自的结果。
+
+## 准备工作
+
+- 已安装 QitOS（`pip install qitos`）
+- 已配置兼容 OpenAI 的 API key
+
+## 第一步：定义子智能体
+
+先创建一个能够检查目录的探索智能体：
+
+```python
+from dataclasses import dataclass, field
+from typing import Any
+from qitos import Action, AgentModule, Decision, StateSchema, ToolRegistry
+from qitos.kit import CodingToolSet, REACT_SYSTEM_PROMPT, ReActTextParser, format_action, render_prompt
+
+@dataclass
+class ExplorerState(StateSchema):
+    scratchpad: list[str] = field(default_factory=list)
+
+EXPLORER_PROMPT = """\
+You are a code explorer agent. Investigate directories and report findings.
+
+Output contract (strict):
+Thought: <reasoning>
+Action: <tool_name>(arg=value, ...)
+or
+Final Answer: <summary>
+"""
+
+class ExplorerAgent(AgentModule[ExplorerState, dict[str, Any], Action]):
+    def __init__(self, llm, workspace_root):
+        registry = ToolRegistry()
+        registry.include(CodingToolSet(
+            workspace_root=workspace_root,
+            include_notebook=False,
+            enable_lsp=False,
+            enable_tasks=False,
+            enable_web=False,
+        ))
+        super().__init__(tool_registry=registry, llm=llm, model_parser=ReActTextParser())
+
+    def init_state(self, task, **kwargs):
+        return ExplorerState(task=task, max_steps=5)
+
+    def build_system_prompt(self, state):
+        return render_prompt(EXPLORER_PROMPT, {"tool_schema": self.tool_registry.get_tool_descriptions()})
+
+    def prepare(self, state):
+        lines = [f"Task: {state.task}", f"Step: {state.current_step}/{state.max_steps}"]
+        if state.scratchpad:
+            lines.extend(state.scratchpad[-8:])
+        return "\n".join(lines)
+
+    def reduce(self, state, observation, decision):
+        action_results = observation.get("action_results", []) if isinstance(observation, dict) else []
+        if decision.rationale:
+            state.scratchpad.append(f"Thought: {decision.rationale}")
+        if decision.actions:
+            state.scratchpad.append(f"Action: {format_action(decision.actions[0])}")
+        if action_results:
+            state.scratchpad.append(f"Observation: {action_results[0]}")
+        state.scratchpad = state.scratchpad[-20:]
+        return state
+```
+
+## 第二步：注册智能体
+
+通过 `AgentSpec` 和 `AgentRegistry` 注册子智能体：
+
+```python
+from qitos import AgentRegistry, AgentSpec, ContextStrategy
+
+llm = ...  # 模型实例
+
+explorer_spec = AgentSpec(
+    name="explorer",
+    description="Explores a directory and reports its structure",
+    agent=ExplorerAgent(llm=llm, workspace_root="./my-project"),
+    context_strategy=ContextStrategy.ISOLATED,  # 子智能体不需要父级上下文
+    max_steps_override=5,
+)
+
+registry = AgentRegistry()
+registry.register(explorer_spec)
+```
+
+## 第三步：创建协调智能体
+
+协调智能体同时拥有编码工具和 `fanout` 工具：
+
+```python
+from qitos.kit import CodingToolSet
+
+class CoordinatorAgent(AgentModule[ExplorerState, dict[str, Any], Action]):
+    def __init__(self, llm, workspace_root, agent_registry):
+        registry = ToolRegistry()
+        registry.include(CodingToolSet(workspace_root=workspace_root, ...))
+        # 注册委派和并行派发工具
+        for delegate_tool in agent_registry.get_delegate_tools():
+            registry.register(delegate_tool)
+        registry.register(agent_registry.get_fanout_tool())
+
+        super().__init__(tool_registry=registry, llm=llm, model_parser=ReActTextParser())
+    # init_state、build_system_prompt、prepare 和 reduce 与 ExplorerAgent 相同
+```
+
+## 第四步：运行
+
+```python
+coordinator = CoordinatorAgent(llm=llm, workspace_root="./my-project", agent_registry=registry)
+result = coordinator.run(
+    task="Analyze this codebase. Investigate the auth, api, and db modules in parallel.",
+    max_steps=12,
+)
+print(result.state.final_result)
+```
+
+模型将调用
+`fanout(tasks=[{"agent":"explorer","task":"Explore /auth"}, ...])`，
+并行启动三个探索智能体。
+
+## 将协作策略留在应用层
+
+Manager/Worker、Planner/Executor 和评审拓扑都是应用策略，不是独立的 QitOS runtime。
+你可以用上述通用委派原语组合这些策略；如果应用需要持久 handle、后台 Child、后续消息、等待或中断，
+则使用类型化异步 `AgentTool` 和 `ChildControlToolSet` 生命周期。这样，嵌套 Child 仍运行在同一个内核上，
+同时每个应用都可以收窄自己的工具、上下文、预算和权限。
+
+## 后续尝试
+
+- 使用 `ContextStrategy.FULL` 向子智能体传递父级上下文
+- 使用 `DelegateTool` 完成一对一委派并返回结果
+- 使用 `Decision.handoff()` 构建工作流式智能体链

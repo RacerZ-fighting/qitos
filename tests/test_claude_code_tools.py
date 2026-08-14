@@ -4,13 +4,14 @@ import asyncio
 import os
 import tempfile
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Protocol
 
 import pytest
 from qitos.core.child import (
     ChildHandle,
     ChildInvocation,
     ChildLaunchRequest,
+    ChildResult,
     ChildRuntimeContext,
     ChildStatus,
 )
@@ -25,6 +26,21 @@ from qitos.kit.tool.internal.coding_utils import (
 
 async def _ready_invocation(**kwargs: Any) -> ChildInvocation:
     return ChildInvocation(**kwargs)
+
+
+class _ChildResultReader(Protocol):
+    def child_result(self, handle: ChildHandle) -> ChildResult | None: ...
+
+
+async def _wait_for_child_result(
+    tool: _ChildResultReader,
+    handle: ChildHandle,
+) -> ChildResult:
+    while True:
+        result = tool.child_result(handle)
+        if result is not None and result.ready:
+            return result
+        await asyncio.sleep(0)
 
 
 class _ClosableEngine:
@@ -559,11 +575,10 @@ class TestAgentTool:
         parent_messages.append(object())
         open_slot.set()
         handle = ChildHandle.from_dict(launched["handle"])
-        result = tool.child_result(handle)
-        async with asyncio.timeout(1):
-            while result is not None and not result.ready:
-                await asyncio.sleep(0)
-                result = tool.child_result(handle)
+        result = await asyncio.wait_for(
+            _wait_for_child_result(tool, handle),
+            timeout=1,
+        )
 
         assert factory_called.is_set()
         assert received_parent_history == (before_launch,)
@@ -805,9 +820,10 @@ class TestAgentTool:
         )
 
         handle = ChildHandle.from_dict(launched["handle"])
-        async with asyncio.timeout(1):
-            while not tool.child_result(handle).ready:
-                await asyncio.sleep(0)
+        await asyncio.wait_for(
+            _wait_for_child_result(tool, handle),
+            timeout=1,
+        )
 
         assert tool.snapshot_background_events() == []
         assert await tool.aclose(wait_seconds=0) == 0
@@ -983,11 +999,10 @@ class TestAgentTool:
         )
 
         handle = ChildHandle.from_dict(launched["handle"])
-        terminal = tool.child_result(handle)
-        async with asyncio.timeout(1):
-            while terminal is not None and not terminal.ready:
-                await asyncio.sleep(0)
-                terminal = tool.child_result(handle)
+        terminal = await asyncio.wait_for(
+            _wait_for_child_result(tool, handle),
+            timeout=1,
+        )
 
         assert terminal is not None
         assert terminal.status is ChildStatus.BUDGET_EXHAUSTED

@@ -80,9 +80,11 @@ setup(
         "hf": ["huggingface_hub>=0.24.0"],
         "web": ["playwright>=1.40.0"],
         "dev": [
+            "setuptools>=83",
             "build>=1.2.1",
             "twine>=5.1.1",
             "pytest>=7.0.0",
+            "pytest-asyncio>=0.23,<2",
             "pytest-cov>=4.0.0",
             "black>=23.0.0",
             "flake8>=6.0.0",
