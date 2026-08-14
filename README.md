@@ -46,7 +46,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   while an Engine still owns the writer lease. Reads never repair canonical JSONL or
   rebuild its disposable SQLite projection. Inherited committed boundaries support
   nested forks, whose Engine recovery no longer depends on ancestor files or replays
-  completed tools.
+  completed tools. Stable lineage ids survive every fork, and terminal handles expose
+  the latest non-terminal continuation boundary so explicit follow-up forks become
+  resumable instead of inheriting a completed state.
 - **Revision-safe atomic file tools**: bounded reads now return a SHA-256 revision for
   the complete UTF-8 file. Host and Docker filesystem capabilities replace files
   atomically, serialize same-path mutations per environment, and support compare-and-

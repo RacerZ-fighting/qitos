@@ -33,7 +33,8 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   仍持有 writer lease 时返回不可变、类型化的 Run 摘要、确定性列表、已校验祖先和直接
   Child。读取不会修复 canonical JSONL，也不会重建可丢弃的 SQLite 投影。继承到本地的
   committed boundary 可继续 fork；嵌套 fork 的 Engine 恢复不依赖祖先文件，也不会重放
-  已完成工具。
+  已完成工具。稳定 lineage id 会跨 fork 保留；terminal handle 还会给出最后一个非终态
+  continuation boundary，让显式 follow-up fork 成为 resumable Run，而不是继承完成态。
 - **带 revision 的原子文件工具**：有界读取现在会返回完整 UTF-8 文件的 SHA-256
   revision。Host 与 Docker 文件能力通过原子替换提交内容，并在每个 environment 内按
   相同路径串行化 mutation；`write_file` 支持 compare-and-swap，`edit_file` 默认校验

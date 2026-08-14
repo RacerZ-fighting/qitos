@@ -59,7 +59,10 @@ class _JournalRuntime(Generic[StateT, ActionT]):
             return
         engine._last_journal_position = await journal.create(
             engine._active_run_id,
-            {"agent": engine.agent.name},
+            {
+                "agent": engine.agent.name,
+                "lineage_id": engine._active_lineage_id,
+            },
         )
         engine._prepare_owned_budget_ledger(await journal.replay())
         engine._last_journal_position = await journal.append(

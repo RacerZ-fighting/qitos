@@ -417,6 +417,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._cost_complete = True
         self._model_continuation: ModelContinuation | None = None
         self._active_run_id: str = ""
+        self._active_lineage_id: str = ""
         self._runtime_deadline_monotonic: Optional[float] = None
         from ..kit.history import WindowHistory
 
@@ -1214,6 +1215,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         *,
         history_snapshot: HistorySnapshot | None = None,
         run_id: str | None = None,
+        lineage_id: str | None = None,
         **kwargs: Any,
     ) -> EngineResult[StateT]:
         """Run the canonical Engine loop on the caller's event loop."""
@@ -1227,6 +1229,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             )
         if run_id is not None and (not isinstance(run_id, str) or not run_id.strip()):
             raise ValueError("run_id must be a non-empty string or None")
+        if lineage_id is not None and (
+            not isinstance(lineage_id, str) or not lineage_id.strip()
+        ):
+            raise ValueError("lineage_id must be a non-empty string or None")
         current_task = asyncio.current_task()
         if current_task is None:
             raise RuntimeError("Engine.arun() requires a running event loop")
@@ -1241,6 +1247,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 task,
                 history_snapshot=history_snapshot,
                 run_id=run_id.strip() if run_id is not None else None,
+                lineage_id=(lineage_id.strip() if lineage_id is not None else None),
                 **kwargs,
             )
         except BaseException:
@@ -1327,6 +1334,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         *,
         history_snapshot: HistorySnapshot | None = None,
         run_id: str | None = None,
+        lineage_id: str | None = None,
         **kwargs: Any,
     ) -> EngineResult[StateT]:
         # Check for resume-from-checkpoint internal kwargs
@@ -1374,6 +1382,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             )
             or f"run_{uuid4().hex[:12]}"
         )
+        self._active_lineage_id = lineage_id or self._active_run_id
         self._last_checkpoint_id = _resume_checkpoint_id
         self._last_system_prompt = ""
         self._last_prompt_metadata = {}
@@ -3197,6 +3206,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._deferred_runtime_inputs = []
         self._journal_terminal_record_ids = {}
         self._last_journal_position = None
+        self._active_lineage_id = ""
         if self._tool_loop_detector is not None:
             self._tool_loop_detector.reset()
         self._handoff_history = []

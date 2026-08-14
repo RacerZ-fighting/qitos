@@ -1369,6 +1369,20 @@ async def test_nested_terminal_fork_recovers_without_replaying_tools(
 
 
 @pytest.mark.asyncio
+async def test_engine_persists_explicit_lineage_id_in_run_handle(
+    tmp_path: Path,
+) -> None:
+    result = await Engine(
+        agent=JournalAgent(),
+        journal=JsonlSessionJournal(tmp_path),
+    ).arun("inspect", lineage_id="session-stable")
+
+    handle = await JsonlRunCatalog(tmp_path).inspect_run(result.run_id)
+
+    assert handle.lineage_id == "session-stable"
+
+
+@pytest.mark.asyncio
 async def test_journal_keeps_declared_safe_tools_parallel_and_results_ordered(
     tmp_path: Path,
 ) -> None:

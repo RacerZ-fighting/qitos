@@ -76,12 +76,26 @@ replay record；只有逐条摘要与 canonical record 一致时才会保留该�
 torn tail 或重建任何 artifact。`RunStatus.RESUMABLE` 只表示没有 durable `run.completed`，并不
 声称当前一定有 Engine 进程在运行。
 
+每个 `RunHandle` 还会暴露稳定的 `lineage_id`、直接 `parent_run_id`、最新 durable
+`committed_position` 和 `continuation_position`。应用可以在 `Engine.arun()` 传入
+`lineage_id=` 绑定自己的稳定 Session 身份；未传入时使用 Root Run id，Fork 会继承同一个值。
+旧 Journal 则从继承前缀推导 Root Run id。
+
+continuation position 指向不包含 terminal turn 的最新 committed boundary。对普通 active 或
+interrupted Run，它通常就是最新 committed position；一旦 terminal snapshot 已经持久化，即使进程
+在写入 `run.completed` 前中断，它也会回退到 terminal turn 之前。Resume 已完成的 Run 仍然只读，
+不会执行 Provider 或 Tool；要继续工作，必须从 continuation position 显式 fork 出新的 resumable
+Run。用于审计的 terminal `committed_position` 会原样保留，不会被伪装成可继续状态。
+
 ```python
 from qitos import Engine
 from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 
 journal = JsonlSessionJournal(".qitos/sessions")
-result = await Engine(agent=agent, journal=journal).arun("inspect the project")
+result = await Engine(agent=agent, journal=journal).arun(
+    "inspect the project",
+    lineage_id="engagement-42",
+)
 
 resumed = await Engine(
     agent=agent,
@@ -92,6 +106,13 @@ catalog = JsonlRunCatalog(".qitos/sessions")
 handle = await catalog.inspect_run(result.run_id)
 all_runs = await catalog.list_runs()
 ancestors = await catalog.lineage(result.run_id)
+
+if handle.is_terminal and handle.continuation_position is not None:
+    source = JsonlSessionJournal(".qitos/sessions")
+    await source.open(handle.run_id)
+    child = await source.fork(handle.continuation_position, "follow-up-run")
+    await child.close()
+    await source.close()
 ```
 
 Fork 只接受 committed `JournalPosition`。Child Journal 拥有独立的继承前缀，不会修改 Parent。

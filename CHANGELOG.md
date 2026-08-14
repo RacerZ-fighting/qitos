@@ -19,6 +19,10 @@ How to update:
 
 ### Changed
 
+- Run handles now expose a stable lineage id, immediate parent, latest committed
+  position, and latest non-terminal continuation position. `Engine.arun()` can bind a
+  product lineage id, forks inherit it, legacy Journals derive a stable root id, and a
+  terminal Run can be continued only through an explicit resumable fork.
 - Environments now publish one typed, immutable `RuntimeCapabilitySnapshot` with
   backend identity, working directory, operation groups, optional facilities,
   verified commands, and stable limitations. Engine captures that exact snapshot in

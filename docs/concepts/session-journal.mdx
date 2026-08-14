@@ -102,12 +102,30 @@ catalog never takes a writer lease, repairs a torn tail, or rebuilds either arti
 `RunStatus.RESUMABLE` means only that no durable `run.completed` exists; it does not
 claim that an Engine process is currently active.
 
+Each `RunHandle` also exposes a stable `lineage_id`, the immediate `parent_run_id`, the
+latest durable `committed_position`, and a `continuation_position`. Applications may
+pass `lineage_id=` to `Engine.arun()` to bind their own stable Session identity; the
+Root Run id is used when it is omitted, and forks inherit the same value. Legacy
+journals derive the root Run id from their inherited prefix.
+
+The continuation position is the latest committed boundary that does not encode a
+terminal turn. This normally equals the latest committed position for an active or
+interrupted Run. Once a terminal snapshot is durable—even if the process stopped before
+`run.completed` was appended—it points to the boundary before that terminal turn.
+Resuming a completed Run remains read-only and executes no Provider or Tool; continued
+work must fork the continuation position into a new resumable Run. The terminal
+`committed_position` remains available for audit and is never relabeled as a
+continuable state.
+
 ```python
 from qitos import Engine
 from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 
 journal = JsonlSessionJournal(".qitos/sessions")
-result = await Engine(agent=agent, journal=journal).arun("inspect the project")
+result = await Engine(agent=agent, journal=journal).arun(
+    "inspect the project",
+    lineage_id="engagement-42",
+)
 
 resumed = await Engine(
     agent=agent,
@@ -118,6 +136,13 @@ catalog = JsonlRunCatalog(".qitos/sessions")
 handle = await catalog.inspect_run(result.run_id)
 all_runs = await catalog.list_runs()
 ancestors = await catalog.lineage(result.run_id)
+
+if handle.is_terminal and handle.continuation_position is not None:
+    source = JsonlSessionJournal(".qitos/sessions")
+    await source.open(handle.run_id)
+    child = await source.fork(handle.continuation_position, "follow-up-run")
+    await child.close()
+    await source.close()
 ```
 
 Forking accepts only a committed `JournalPosition`. The child journal owns an

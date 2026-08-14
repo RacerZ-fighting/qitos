@@ -19,6 +19,7 @@ from ...core.journal import (
 from ...core.run import RunHandle, RunNotFoundError, RunStatus
 from ._paths import JOURNAL_FILENAME, journal_path, validate_run_id
 from ._reader import read_journal_records
+
 _COMMITTED_BOUNDARIES = {
     JournalRecordType.STEP_COMMITTED,
     JournalRecordType.STATE_SNAPSHOT,
@@ -143,14 +144,16 @@ def _summarize_run(
     updated_at = _parse_timestamp(records[-1])
     forked_from = _fork_origin(records)
     committed_position: JournalPosition | None = None
+    committed_records: list[tuple[int, JournalRecord]] = []
     completed: JournalRecord | None = None
     interrupted: JournalRecord | None = None
     task = ""
     agent_name = _optional_text(start.payload, "agent")
-    for record in records:
+    for index, record in enumerate(records):
         effective = resolve_inherited_record(record)
         if effective.type in _COMMITTED_BOUNDARIES:
             committed_position = record.position
+            committed_records.append((index, record))
         if effective.type is JournalRecordType.INPUT_ACCEPTED:
             task = _optional_text(effective.payload, "task") or ""
         if agent_name is None and effective.type is JournalRecordType.RUN_STARTED:
@@ -165,13 +168,16 @@ def _summarize_run(
             completed = record
     return RunHandle(
         run_id=run_id,
-        status=(
-            RunStatus.COMPLETED if completed is not None else RunStatus.RESUMABLE
-        ),
+        lineage_id=_lineage_id(run_id, records),
+        status=(RunStatus.COMPLETED if completed is not None else RunStatus.RESUMABLE),
         created_at=created_at,
         updated_at=updated_at,
         latest_position=records[-1].position,
         committed_position=committed_position,
+        continuation_position=_continuation_position(
+            records,
+            committed_records,
+        ),
         forked_from=forked_from,
         record_count=len(records),
         agent_name=agent_name,
@@ -190,8 +196,58 @@ def _summarize_run(
     )
 
 
+def _lineage_id(run_id: str, records: tuple[JournalRecord, ...]) -> str:
+    declared: set[str] = set()
+    inherited_starts: list[JournalRecord] = []
+    for record in records:
+        effective = resolve_inherited_record(record)
+        if effective.type is not JournalRecordType.RUN_STARTED:
+            continue
+        if effective.run_id != run_id:
+            inherited_starts.append(effective)
+        value = effective.payload.get("lineage_id")
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise JournalCorruptionError("run.started lineage_id is invalid")
+        declared.add(value)
+    if len(declared) > 1:
+        raise JournalCorruptionError("Run lineage contains conflicting lineage ids")
+    if declared:
+        return next(iter(declared))
+    return inherited_starts[-1].run_id if inherited_starts else run_id
+
+
+def _continuation_position(
+    records: tuple[JournalRecord, ...],
+    committed_records: list[tuple[int, JournalRecord]],
+) -> JournalPosition | None:
+    if not committed_records:
+        return None
+
+    excluded: set[int] = set()
+    for index, record in committed_records:
+        effective = resolve_inherited_record(record)
+        if (
+            effective.type is JournalRecordType.STATE_SNAPSHOT
+            and effective.payload.get("reason") == "terminal"
+        ):
+            excluded.add(index)
+            prior_index = index - 1
+            if prior_index >= 0:
+                prior = resolve_inherited_record(records[prior_index])
+                if prior.type is JournalRecordType.STEP_COMMITTED:
+                    excluded.add(prior_index)
+    for index, record in reversed(committed_records):
+        if index not in excluded:
+            return record.position
+    return None
+
+
 def _fork_origin(records: tuple[JournalRecord, ...]) -> JournalPosition | None:
-    forks = [record for record in records if record.type is JournalRecordType.RUN_FORKED]
+    forks = [
+        record for record in records if record.type is JournalRecordType.RUN_FORKED
+    ]
     if len(forks) > 1:
         raise JournalCorruptionError("Run journal contains multiple fork records")
     inherited = any(record.type is JournalRecordType.INHERITED for record in records)
@@ -228,7 +284,9 @@ def _validate_fork(parent: _RunView, child: _RunView) -> None:
         raise JournalCorruptionError("Run fork cutoff is unavailable in its parent")
     boundary = parent.records[origin.seq - 1]
     if boundary.record_id != origin.record_id:
-        raise JournalCorruptionError("Run fork cutoff identity does not match its parent")
+        raise JournalCorruptionError(
+            "Run fork cutoff identity does not match its parent"
+        )
     if resolve_inherited_record(boundary).type not in _COMMITTED_BOUNDARIES:
         raise JournalCorruptionError("Run fork cutoff is not a committed boundary")
     inherited_end = 2 + origin.seq

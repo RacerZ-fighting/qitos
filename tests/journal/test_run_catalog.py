@@ -78,7 +78,10 @@ async def test_catalog_inspects_active_writer_without_taking_ownership(
     assert handle.status is RunStatus.RESUMABLE
     assert handle.can_resume is True
     assert handle.can_fork is True
+    assert handle.can_continue is True
+    assert handle.lineage_id == "active"
     assert handle.committed_position == committed
+    assert handle.continuation_position == committed
     assert handle.agent_name == "worker"
     assert handle.task == "inspect target"
     await journal.append(
@@ -158,6 +161,16 @@ async def test_catalog_rejects_non_final_corruption_and_missing_runs(
 
 
 @pytest.mark.asyncio
+async def test_catalog_rejects_invalid_declared_lineage_id(tmp_path: Path) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    await journal.create("broken-lineage", {"lineage_id": " "})
+    await journal.close()
+
+    with pytest.raises(JournalCorruptionError, match="lineage_id is invalid"):
+        await JsonlRunCatalog(tmp_path).inspect_run("broken-lineage")
+
+
+@pytest.mark.asyncio
 async def test_catalog_lists_and_projects_terminal_lifecycle(tmp_path: Path) -> None:
     first = JsonlSessionJournal(tmp_path)
     await first.create("first", {"agent": "agent-a"})
@@ -216,6 +229,8 @@ async def test_catalog_validates_lineage_children_and_nested_forks(
     child = await parent.fork(boundary, "child")
     child_handle = await JsonlRunCatalog(tmp_path).inspect_run("child")
     assert child_handle.committed_position is not None
+    assert child_handle.lineage_id == "parent"
+    assert child_handle.parent_run_id == "parent"
 
     grandchild = await child.fork(child_handle.committed_position, "grandchild")
     await grandchild.close()
@@ -231,6 +246,7 @@ async def test_catalog_validates_lineage_children_and_nested_forks(
         "child",
         "grandchild",
     ]
+    assert {handle.lineage_id for handle in lineage} == {"parent"}
     assert [handle.run_id for handle in children] == ["child"]
     assert lineage[-1].task == "trace lineage"
     assert lineage[-1].agent_name == "worker"
@@ -245,6 +261,87 @@ async def test_catalog_validates_lineage_children_and_nested_forks(
     ]
     assert effective
     await independent.close()
+
+
+@pytest.mark.asyncio
+async def test_catalog_exposes_declared_lineage_and_ready_terminal_fork(
+    tmp_path: Path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    await journal.create(
+        "parent",
+        {"agent": "worker", "lineage_id": "session-stable"},
+    )
+    initial = await journal.append(
+        JournalRecordType.STATE_SNAPSHOT,
+        {"state": {}, "state_digest": "initial", "reason": "initial"},
+        record_id="initial",
+    )
+    terminal_commit = await journal.append(
+        JournalRecordType.STEP_COMMITTED,
+        _commit_payload(step_id=1),
+        record_id="terminal-commit",
+    )
+    terminal_snapshot = await journal.append(
+        JournalRecordType.STATE_SNAPSHOT,
+        {"state": {}, "state_digest": "terminal", "reason": "terminal"},
+        record_id="terminal-snapshot",
+    )
+    await journal.append(
+        JournalRecordType.RUN_COMPLETED,
+        {"stop_reason": "completed"},
+        record_id="completed",
+    )
+
+    parent = await JsonlRunCatalog(tmp_path).inspect_run("parent")
+
+    assert parent.lineage_id == "session-stable"
+    assert parent.committed_position == terminal_snapshot
+    assert parent.continuation_position == initial
+    assert parent.continuation_position != terminal_commit
+    assert parent.can_resume is False
+    assert parent.can_continue is True
+
+    child = await journal.fork(parent.continuation_position, "child")
+    await child.close()
+    await journal.close()
+    child_handle = await JsonlRunCatalog(tmp_path).inspect_run("child")
+
+    assert child_handle.lineage_id == parent.lineage_id
+    assert child_handle.parent_run_id == parent.run_id
+    assert child_handle.status is RunStatus.RESUMABLE
+    assert child_handle.continuation_position is not None
+
+
+@pytest.mark.asyncio
+async def test_catalog_excludes_terminal_boundary_before_completion_is_durable(
+    tmp_path: Path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    await journal.create("interrupted-terminal", {"agent": "worker"})
+    initial = await journal.append(
+        JournalRecordType.STATE_SNAPSHOT,
+        {"state": {}, "state_digest": "initial", "reason": "initial"},
+        record_id="initial",
+    )
+    await journal.append(
+        JournalRecordType.STEP_COMMITTED,
+        _commit_payload(step_id=1),
+        record_id="terminal-commit",
+    )
+    await journal.append(
+        JournalRecordType.STATE_SNAPSHOT,
+        {"state": {}, "state_digest": "terminal", "reason": "terminal"},
+        record_id="terminal-snapshot",
+    )
+
+    handle = await JsonlRunCatalog(tmp_path).inspect_run("interrupted-terminal")
+
+    assert handle.status is RunStatus.RESUMABLE
+    assert handle.can_resume is True
+    assert handle.continuation_position == initial
+
+    await journal.close()
 
 
 @pytest.mark.asyncio
@@ -317,10 +414,7 @@ async def test_catalog_rejects_missing_parent_and_lineage_cycle(tmp_path: Path) 
     a_records = [
         a_stub[0],
         a_stub[1],
-        *[
-            _inherit("a", index, record)
-            for index, record in enumerate(b_records, 3)
-        ],
+        *[_inherit("a", index, record) for index, record in enumerate(b_records, 3)],
     ]
     _write_records(cycle_root, "a", a_records)
     _write_records(cycle_root, "b", b_records)
@@ -334,11 +428,13 @@ def test_run_handle_is_immutable_and_json_safe() -> None:
     position = JournalPosition("run", 1, "start")
     handle = RunHandle(
         run_id="run",
+        lineage_id="session",
         status=RunStatus.RESUMABLE,
         created_at=now,
         updated_at=now,
         latest_position=position,
         committed_position=None,
+        continuation_position=None,
         forked_from=None,
         record_count=1,
     )
@@ -350,3 +446,4 @@ def test_run_handle_is_immutable_and_json_safe() -> None:
         "seq": 1,
         "record_id": "start",
     }
+    assert handle.to_dict()["lineage_id"] == "session"

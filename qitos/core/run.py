@@ -30,11 +30,13 @@ class RunHandle:
     """
 
     run_id: str
+    lineage_id: str
     status: RunStatus
     created_at: datetime
     updated_at: datetime
     latest_position: JournalPosition
     committed_position: JournalPosition | None
+    continuation_position: JournalPosition | None
     forked_from: JournalPosition | None
     record_count: int
     agent_name: str | None = None
@@ -46,6 +48,8 @@ class RunHandle:
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not self.run_id:
             raise ValueError("Run handle run_id must be non-empty")
+        if not isinstance(self.lineage_id, str) or not self.lineage_id.strip():
+            raise ValueError("Run handle lineage_id must be non-empty")
         if not isinstance(self.status, RunStatus):
             raise TypeError("Run handle status must be a RunStatus")
         if self.latest_position.run_id != self.run_id:
@@ -55,6 +59,11 @@ class RunHandle:
             and self.committed_position.run_id != self.run_id
         ):
             raise ValueError("Run handle committed position belongs to another Run")
+        if (
+            self.continuation_position is not None
+            and self.continuation_position.run_id != self.run_id
+        ):
+            raise ValueError("Run handle continuation position belongs to another Run")
         if (
             self.interrupted_at is not None
             and self.interrupted_at.run_id != self.run_id
@@ -81,19 +90,34 @@ class RunHandle:
 
         return self.committed_position is not None
 
+    @property
+    def can_continue(self) -> bool:
+        """Whether an explicit fork can create a non-terminal continuation."""
+
+        return self.continuation_position is not None
+
+    @property
+    def parent_run_id(self) -> str | None:
+        """Return the immediate fork parent without hiding the exact cutoff."""
+
+        return self.forked_from.run_id if self.forked_from is not None else None
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-safe read projection without exposing a storage path."""
 
         return {
             "run_id": self.run_id,
+            "lineage_id": self.lineage_id,
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
             "latest_position": _position_to_dict(self.latest_position),
-            "committed_position": _optional_position_to_dict(
-                self.committed_position
+            "committed_position": _optional_position_to_dict(self.committed_position),
+            "continuation_position": _optional_position_to_dict(
+                self.continuation_position
             ),
             "forked_from": _optional_position_to_dict(self.forked_from),
+            "parent_run_id": self.parent_run_id,
             "record_count": self.record_count,
             "agent_name": self.agent_name,
             "task": self.task,
@@ -103,6 +127,7 @@ class RunHandle:
             "is_terminal": self.is_terminal,
             "can_resume": self.can_resume,
             "can_fork": self.can_fork,
+            "can_continue": self.can_continue,
         }
 
 

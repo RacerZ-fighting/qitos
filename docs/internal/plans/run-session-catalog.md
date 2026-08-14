@@ -55,3 +55,31 @@ and does not adopt either reference's product UI or storage layout.
 - [x] Support nested committed-boundary forks.
 - [x] Add behavior tests and public documentation.
 - [ ] Pass local and remote acceptance before merge.
+
+## Stable lineage handle extension (2026-08-15)
+
+PentestAgent now has a concrete product consumer that must identify one stable Session
+across committed-boundary forks. QitOS will extend the existing Run contract in place:
+
+1. `Engine.arun()` accepts an optional non-empty `lineage_id`; when omitted, the Root
+   Run id is the lineage id.
+2. `run.started` persists that value. A fork inherits it from the source metadata.
+3. `RunHandle` exposes the typed `lineage_id` and immediate `parent_run_id`; catalog
+   lineage and children remain the only authority for ancestry traversal.
+4. Terminal Runs remain non-resumable. Continued work is an explicit fork whose new
+   handle is resumable and shares the lineage id.
+
+Success requires behavior tests for explicit/default ids, fork inheritance, legacy
+journals, terminal resume, catalog projections, and corrupt lineage metadata. Public
+docs, English/Chinese concepts, README news, and CHANGELOG must remain aligned.
+
+### Extension progress
+
+- [x] Persist explicit and default lineage ids without adding a second Session store.
+- [x] Preserve lineage and immediate parent identity across nested forks.
+- [x] Keep audit and non-terminal continuation positions distinct.
+- [x] Cover completed and pre-completion terminal snapshots, legacy Journals, and
+  corrupt lineage metadata with behavior tests.
+- [x] Pass the complete QitOS test suite plus Black, Flake8, mypy, and Python 3.10
+  import checks.
+- [x] Update public concepts, README news, and CHANGELOG.
