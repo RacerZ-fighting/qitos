@@ -63,6 +63,7 @@ Each module plan records:
 - [x] Remove the duplicate tracing provider/processor architecture while preserving
   canonical trace and handoff events.
 - [x] Remove the deprecated debug replay model and non-canonical trace-file fork.
+- [x] Remove the unused decorator-driven functional Agent/task execution path.
 - [ ] MCP refresh and admission alignment.
 - [ ] Runtime capability and managed container alignment.
 - [ ] Permission/scope alignment.

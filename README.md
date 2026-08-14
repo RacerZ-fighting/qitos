@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One executable Agent path**: the unused `qitos.func` decorator/compose package is
+  gone. Its direct calls bypassed Engine transactions, and its apparent `AgentModule`
+  adapter never ran the wrapped function. Agents now use `AgentModule + Engine`;
+  ordinary Python callables continue to use the maintained function-tool decorator.
 - **One canonical observability path**: the duplicate process-global tracing provider
   and its W&B/MLflow processors are gone. Runtime events, `TraceWriter`, the Session
   Journal, and read-only `qita` now form one explicit trace and replay path; handoffs

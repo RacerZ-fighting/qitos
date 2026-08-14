@@ -18,6 +18,10 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **Agent 只保留一条可执行主线**：未被使用的 `qitos.func` decorator/compose 包已删除。
+  它的直接调用会绕过 Engine 事务，表面上的 `AgentModule` adapter 也不会执行被包装函数。
+  Agent 统一使用 `AgentModule + Engine`；普通 Python callable Tool 继续使用已维护的
+  function-tool decorator。
 - **只保留一条 canonical 可观测路径**：重复的进程级 tracing provider 及其 W&B/MLflow
   processors 已删除。运行时事件、`TraceWriter`、Session Journal 和只读 `qita` 现在组成
   一条明确的 trace/replay 路径；Handoff 仍通过 canonical

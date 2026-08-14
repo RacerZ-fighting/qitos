@@ -19,6 +19,11 @@ How to update:
 
 ### Removed
 
+- **Breaking:** Removed the unused `qitos.func` decorator and composition package.
+  Its `@agent`/`@task` callables bypassed Engine transactions, while its advertised
+  `AgentModule` conversion never executed the wrapped function. Applications now use
+  `AgentModule + Engine` for Agents and the maintained function-tool decorator for
+  ordinary callable Tools.
 - **Breaking:** Removed the process-global `qitos.tracing` provider/processor
   hierarchy, the `Engine(..., tracing_provider=...)` argument, and the W&B/MLflow
   extras. Canonical runtime events, `TraceWriter`, the Session Journal, and `qita`

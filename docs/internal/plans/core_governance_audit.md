@@ -58,6 +58,7 @@ Suspected boundary problems:
 | `qitos.benchmark` | BENCHMARK_ADAPTER | Keep thin adapters/runners. Review `pentagi_e2e` and cyber benchmark surfaces for opt-in safety. |
 | `qitos.evaluate`, `qitos.metric` | FRAMEWORK_EXTENSION | Generic evaluation contracts. Keep if dependency-light. |
 | `qitos.debug` | REMOVED | Deprecated replay helpers duplicated qita and exposed a non-canonical trace-file fork. |
+| `qitos.func` | REMOVED | Unused decorators executed host functions outside Engine transactions and exposed a nonfunctional `AgentModule` adapter. |
 | `qitos.cache`, `qitos.checkpoint`, `qitos.config`, `qitos.experiment` | FRAMEWORK_EXTENSION | Useful runtime support but not top-level public API for this boundary pass. |
 | `qitos.examples.pentagi` | SHOULD_MOVE_TO_ZOO | Full PentAGI-inspired cybersecurity product app. Exclude from packaging and stage under `qitos-cyber-agent`. |
 
