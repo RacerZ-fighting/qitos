@@ -8,14 +8,11 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote_plus
 
 import httpx
+from bs4 import BeautifulSoup
 
 from qitos.core.env import EnvObservation
+from qitos.kit._html import extract_html_text
 from qitos.kit.env.host_env import HostEnv
-
-try:
-    from bs4 import BeautifulSoup
-except ImportError:  # pragma: no cover
-    BeautifulSoup = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -60,15 +57,12 @@ class TextWebBrowserOps:
             html = r.text
         except httpx.HTTPError as exc:
             return {"status": "error", "message": str(exc)}
-        pattern = re.compile(
-            r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-            re.IGNORECASE | re.DOTALL,
-        )
         rows: list[dict[str, str]] = []
-        for href, title_html in pattern.findall(html):
-            title = re.sub(r"<[^>]+>", "", title_html)
-            title = re.sub(r"\s+", " ", title).strip()
-            if title:
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.select("a.result__a"):
+            href = anchor.get("href")
+            title = anchor.get_text(" ", strip=True)
+            if isinstance(href, str) and href and title:
                 rows.append({"title": title, "url": href})
             if len(rows) >= max_results:
                 break
@@ -194,33 +188,12 @@ class TextWebBrowserOps:
     def _html_to_text(
         self, html: str, keep_links: bool = True
     ) -> tuple[str, Optional[str]]:
-        if BeautifulSoup is not None:
-            soup = BeautifulSoup(html, "html.parser")
-            for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
-                tag.decompose()
-            if keep_links:
-                for a in soup.find_all("a"):
-                    href = a.get("href")
-                    if href:
-                        a.append(f" ({href})")
-            title = (
-                str(soup.title.string).strip()
-                if soup.title and soup.title.string
-                else None
-            )
-            text = soup.get_text(separator="\n", strip=True)
-            text = re.sub(r"\n{3,}", "\n\n", text)
-            return text.strip(), title
-        data = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
-        data = re.sub(r"(?is)<style.*?>.*?</style>", " ", data)
-        data = re.sub(r"(?is)<noscript.*?>.*?</noscript>", " ", data)
-        title = None
-        m = re.search(r"(?is)<title[^>]*>(.*?)</title>", data)
-        if m:
-            title = re.sub(r"\s+", " ", m.group(1)).strip()
-        data = re.sub(r"(?is)<[^>]+>", " ", data)
-        data = re.sub(r"\s+", " ", data)
-        return data.strip(), title
+        extracted = extract_html_text(
+            html,
+            keep_links=keep_links,
+            layout="lines",
+        )
+        return extracted.text, extracted.title
 
 
 class TextWebEnv(HostEnv):

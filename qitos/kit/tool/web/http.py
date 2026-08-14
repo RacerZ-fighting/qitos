@@ -3,18 +3,13 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
 import httpx
 
 from qitos.core.tool import BaseTool, RetryPolicy, ToolPermission, ToolSpec
-
-try:  # optional dependency, with graceful fallback
-    from bs4 import BeautifulSoup
-except Exception:  # pragma: no cover - optional dependency path
-    BeautifulSoup = None  # type: ignore[assignment]
+from qitos.kit._html import extract_html_text
 
 
 class HTTPRequest(BaseTool):
@@ -358,37 +353,8 @@ class HTMLExtractText(BaseTool):
     def _to_text(
         self, html: str, keep_links: bool = False
     ) -> tuple[str, Optional[str]]:
-        if BeautifulSoup is not None:
-            # Prefer the stdlib parser to avoid third-party parser deprecation noise
-            # in the supported extraction path while preserving extraction behavior.
-            soup = BeautifulSoup(html, "html.parser")
-            for tag in soup(["script", "style", "noscript", "svg", "canvas"]):
-                tag.decompose()
-            title = None
-            if soup.title and soup.title.string:
-                title = str(soup.title.string).strip()
-            if keep_links:
-                for a in soup.find_all("a"):
-                    href = a.get("href")
-                    if href:
-                        a.append(f" ({href})")
-            text = soup.get_text(separator=" ", strip=True)
-            text = re.sub(r"\s+", " ", text)
-            return text.strip(), title
-
-        # Fallback extraction without bs4.
-        data = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
-        data = re.sub(r"(?is)<style.*?>.*?</style>", " ", data)
-        data = re.sub(r"(?is)<noscript.*?>.*?</noscript>", " ", data)
-        title = None
-        m = re.search(r"(?is)<title[^>]*>(.*?)</title>", data)
-        if m:
-            title = re.sub(r"\s+", " ", m.group(1)).strip()
-        data = re.sub(r"(?is)<[^>]+>", " ", data)
-        data = re.sub(r"&nbsp;", " ", data)
-        data = re.sub(r"&amp;", "&", data)
-        data = re.sub(r"\s+", " ", data)
-        return data.strip(), title
+        extracted = extract_html_text(html, keep_links=keep_links)
+        return extracted.text, extracted.title
 
 
 __all__ = ["HTTPRequest", "HTTPGet", "HTTPPost", "HTMLExtractText"]

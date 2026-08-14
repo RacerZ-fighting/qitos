@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import re
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import xml.etree.ElementTree as ET
 
 from qitos.core.function_tool_decorator import function_tool
+from qitos.kit._html import extract_html_text
 
 
 class EpubToolSet:
@@ -81,14 +81,15 @@ class EpubToolSet:
                 }
             href = chapter_files[chapter_index]
             raw = self._read_zip_text(epub_path, href)
-            text = self._html_to_text(raw)
+            extracted = extract_html_text(raw)
+            text = extracted.text
             if len(text) > max_chars:
                 text = text[:max_chars] + "\n... [truncated]"
             return {
                 "status": "success",
                 "chapter_index": chapter_index,
                 "href": href,
-                "title": self._extract_title(epub_path, href),
+                "title": extracted.title,
                 "content": text,
             }
         except Exception as e:
@@ -114,7 +115,8 @@ class EpubToolSet:
             hits: List[Dict[str, Any]] = []
             q = query.lower()
             for idx, href in enumerate(chapter_files):
-                text = self._html_to_text(self._read_zip_text(epub_path, href))
+                extracted = extract_html_text(self._read_zip_text(epub_path, href))
+                text = extracted.text
                 pos = text.lower().find(q)
                 if pos < 0:
                     continue
@@ -125,8 +127,7 @@ class EpubToolSet:
                     {
                         "chapter_index": idx,
                         "href": href,
-                        "title": self._extract_title(epub_path, href)
-                        or f"Chapter {idx + 1}",
+                        "title": extracted.title or f"Chapter {idx + 1}",
                         "snippet": snippet,
                     }
                 )
@@ -190,21 +191,9 @@ class EpubToolSet:
     def _extract_title(self, epub_path: Path, chapter_path: str) -> Optional[str]:
         try:
             html = self._read_zip_text(epub_path, chapter_path)
-            m = re.search(
-                r"<title>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL
-            )
-            if m:
-                return re.sub(r"\s+", " ", m.group(1)).strip()
-        except Exception:
+            return extract_html_text(html).title
+        except (KeyError, OSError, zipfile.BadZipFile):
             return None
-        return None
-
-    def _html_to_text(self, html: str) -> str:
-        html = re.sub(r"(?is)<script.*?>.*?</script>", " ", html)
-        html = re.sub(r"(?is)<style.*?>.*?</style>", " ", html)
-        text = re.sub(r"(?is)<[^>]+>", " ", html)
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
 
 
 __all__ = ["EpubToolSet"]

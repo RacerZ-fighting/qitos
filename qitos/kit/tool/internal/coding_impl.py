@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 import os
-import re
 import subprocess
 from collections.abc import Mapping
 from copy import copy
@@ -32,6 +31,7 @@ from qitos.core.process import (
 )
 from qitos.core.runtime_input import process_terminal_runtime_input
 from qitos.kit.env.host_env import HostCommandCapability, HostFSCapability
+from qitos.kit._html import extract_html_text
 from qitos.kit.tool.internal.coding_utils import (
     build_diff,
     default_rule_scope,
@@ -43,12 +43,6 @@ from qitos.kit.tool.internal.coding_utils import (
 from qitos.kit.tool.internal.work_plan import UpdateWorkPlanTool
 from qitos.kit.tool.internal.runtime_ops import select_runtime_ops
 from qitos.kit.tool.notebook import NotebookToolSet
-
-try:  # optional dependency
-    from bs4 import BeautifulSoup
-except Exception:  # pragma: no cover
-    BeautifulSoup = None  # type: ignore[assignment]
-
 
 TASK_STATUSES = {"pending", "in_progress", "blocked", "completed", "cancelled"}
 _MAX_SEARCH_RESULTS = 2000
@@ -783,24 +777,12 @@ class CodingToolSet:
             return {"status": "error", "message": str(e), "url": url, "method": method}
 
     def _extract_html_text(self, html: str) -> Dict[str, Any]:
-        if BeautifulSoup is not None:
-            soup = BeautifulSoup(html or "", "html.parser")
-            title = (
-                soup.title.string.strip() if soup.title and soup.title.string else ""
-            )
-            text = "\n".join(
-                line.strip()
-                for line in soup.get_text("\n").splitlines()
-                if line.strip()
-            )
-            return {"status": "success", "title": title, "text": text}
-        title_match = re.search(
-            r"<title>(.*?)</title>", html or "", re.IGNORECASE | re.DOTALL
-        )
-        title = title_match.group(1).strip() if title_match else ""
-        text = re.sub(r"<[^>]+>", " ", html or "")
-        text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-        return {"status": "success", "title": title, "text": text}
+        extracted = extract_html_text(html or "", layout="lines")
+        return {
+            "status": "success",
+            "title": extracted.title or "",
+            "text": extracted.text,
+        }
 
     def _next_task_id(self) -> str:
         self._task_counter += 1

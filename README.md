@@ -18,6 +18,10 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **One maintained HTML parser**: Text Web, coding Web fetch, standalone extraction,
+  and EPUB reading now use the required Beautiful Soup parser through one shared
+  policy. Optional-dependency branches and regex HTML fallbacks are gone, and search
+  result links are selected from the parsed DOM.
 - **One general Child-Agent lifecycle**: the fixed `qitos.kit.patterns`
   Manager/Worker, Planner/Executor, Proposer/Verifier, Debate, MoA, and DAG workflow
   templates are gone. Applications now compose coordination policy from the typed,

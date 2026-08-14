@@ -18,6 +18,9 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **HTML 只保留一套成熟 parser**：Text Web、coding Web fetch、独立 HTML 提取和
+  EPUB 阅读现在通过同一策略直接使用必装的 Beautiful Soup。无效的可选依赖分支和正则
+  HTML fallback 已删除，搜索结果链接也改为从解析后的 DOM 中选择。
 - **Child Agent 只保留一套通用生命周期**：固定的 `qitos.kit.patterns`
   Manager/Worker、Planner/Executor、Proposer/Verifier、Debate、MoA 与 DAG workflow
   模板已删除。应用直接组合类型化、异步的 `AgentTool` 和 `ChildControlToolSet`，或把具体

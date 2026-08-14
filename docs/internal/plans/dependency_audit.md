@@ -29,7 +29,7 @@ Extras:
 | `mcp` | core runtime dependency | Official MCP SDK and protocol model owner. |
 | `pydantic` | core runtime dependency | Strict external configuration boundary validation. |
 | `ptyprocess` | platform runtime dependency | Official PTY process primitive on supported POSIX platforms. |
-| `beautifulsoup4` | optional browser/tool dependency | Used for web extraction. Candidate for future optional split. |
+| `beautifulsoup4` | default runtime dependency | Canonical HTML parser for Web, coding fetch, and EPUB text extraction. |
 | `openai` | optional model/provider dependency | Already in `[models]`. |
 | `litellm` | optional model/provider dependency | Already in `[models]`. |
 | `datasets` | optional benchmark dependency | Already in `[benchmarks]`. |
@@ -48,8 +48,9 @@ Extras:
 
 The convergence recorded in
 [`httpx-skill-convergence.md`](httpx-skill-convergence.md) removed the duplicate HTTP
-dependency and old network-backed Skill/Search paths. A later packaging change may
-still consider:
+dependency and old network-backed Skill/Search paths. Maintained HTML consumers now
+share the required Beautiful Soup parser instead of carrying regex fallbacks. A later
+packaging change may still consider:
 
 - `qitos[models]`: provider SDKs.
 - `qitos[benchmarks]`: benchmark runners and dataset SDKs.

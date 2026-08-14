@@ -72,6 +72,10 @@ How to update:
 
 ### Changed
 
+- Text Web, coding Web fetch, HTML extraction, and EPUB reading now share one
+  Beautiful Soup parser policy. The required dependency replaces three unreachable
+  optional-dependency branches and their regex fallbacks; text search results are also
+  selected from the parsed DOM instead of matching HTML with a regular expression.
 - QitOS now uses `httpx` as its only direct HTTP client dependency. Text Web, desktop
   controllers, OSWorld setup/probes, and streamed VM downloads preserve redirects and
   timeout behavior while sharing the same SOCKS-capable transport dependency as MCP

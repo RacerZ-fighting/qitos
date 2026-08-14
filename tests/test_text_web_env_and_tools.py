@@ -5,7 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from qitos.kit.env import TextWebEnv
+from qitos.kit.env import TextWebBrowserOps, TextWebEnv
 from qitos.kit.tool import FindInPage, FindNext, PageDown, PageUp
 
 
@@ -56,6 +56,35 @@ def test_text_web_env_exposes_web_browser_ops():
     assert ops is not None
     summary = ops.summary()
     assert "active_url" in summary
+
+
+def test_text_web_search_parses_nested_result_links(monkeypatch) -> None:
+    response_html = """
+    <html><body>
+      <a class="result__a featured" href="https://example.com/result">
+        Maintained <strong>parser &amp; result</strong>
+      </a>
+      <a class="other" href="https://example.com/ignored">Ignored</a>
+    </body></html>
+    """
+
+    class Response:
+        text = response_html
+
+    monkeypatch.setattr(
+        "qitos.kit.env.text_web_env.httpx.get",
+        lambda *args, **kwargs: Response(),
+    )
+
+    result = TextWebBrowserOps().search("parser")
+
+    assert result["status"] == "success"
+    assert result["results"] == [
+        {
+            "title": "Maintained parser & result",
+            "url": "https://example.com/result",
+        }
+    ]
 
 
 @pytest.mark.asyncio

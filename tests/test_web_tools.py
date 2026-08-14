@@ -89,19 +89,21 @@ async def test_http_get_and_post_delegate(monkeypatch):
 async def test_html_extract_text_title_and_content():
     tool = HTMLExtractText()
     html = """
-    <html><head><title>Demo Page</title></head>
+    <html><head><title>Demo &amp; Page</title></head>
     <body>
       <script>ignore()</script>
       <h1>Hello</h1>
-      <p>World</p>
+      <p>World &amp; friends&nbsp;today</p>
       <a href="https://x.com">Link</a>
     </body></html>
     """
     out = await tool.execute({"html": html, "max_chars": 1000, "keep_links": True})
     assert out["status"] == "success"
-    assert out["title"] == "Demo Page"
+    assert out["title"] == "Demo & Page"
     assert "Hello" in out["content"]
+    assert "World & friends today" in out["content"]
     assert "https://x.com" in out["content"]
+    assert "ignore()" not in out["content"]
 
 
 @pytest.mark.asyncio
