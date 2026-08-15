@@ -1,6 +1,7 @@
 import json
 
 from qitos.core.memory import MemoryRecord
+from qitos.engine.parser import parser_raw_preview
 from qitos.kit.critic import PassThroughCritic
 from qitos.kit.memory import SummaryMemory, VectorMemory, WindowMemory
 from qitos.kit.parser import (
@@ -30,6 +31,17 @@ def test_memory_adapters_basic():
     vec.append(MemoryRecord(role="user", content="flight booking", step_id=1))
     top = vec.retrieve({"text": "python", "top_k": 1})
     assert len(top) == 1
+
+
+def test_parser_diagnostic_preview_is_bounded_and_keeps_both_ends() -> None:
+    raw = "diagnostic-head\n" + ("x" * 5_000) + "\ndiagnostic-tail"
+
+    preview = parser_raw_preview(raw)
+
+    assert len(preview) <= 2_048
+    assert preview.startswith("diagnostic-head")
+    assert preview.endswith("diagnostic-tail")
+    assert "preview truncated" in preview
 
 
 def test_parser_and_critic_impls():

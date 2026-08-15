@@ -65,6 +65,7 @@ from .process import (
     ProcessTerminalNotifier,
 )
 from .history import History, HistoryMessage, HistoryPolicy, HistorySnapshot
+from .message_builder import ContextSnapshot, ContextSnapshotConflictError
 from .observation import Observation
 from .journal import (
     JournalAppendCancelled,
@@ -244,6 +245,8 @@ __all__ = [
     "HistoryMessage",
     "HistoryPolicy",
     "HistorySnapshot",
+    "ContextSnapshot",
+    "ContextSnapshotConflictError",
     "Observation",
     "JournalAppendCancelled",
     "JournalClosedError",

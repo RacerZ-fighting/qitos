@@ -632,6 +632,7 @@ async def test_openai_defaults_to_responses_and_streams_one_complete_transaction
     assert model.api_mode == "responses"
     assert captured["client"]["max_retries"] == 0
     assert captured["request"]["stream"] is True
+    assert captured["request"]["prompt_cache_key"] == "openai-test"
     assert captured["request"]["input"] == [{"role": "user", "content": "question"}]
     assert "reasoning.encrypted_content" in captured["request"]["include"]
     assert captured["request"]["tools"] == [
@@ -663,6 +664,56 @@ async def test_openai_defaults_to_responses_and_streams_one_complete_transaction
     }
     assert events.closed is True
     assert captured["client_closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_responses_retries_without_prompt_cache_key_when_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    events = _AsyncListStream(
+        [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "model": "gpt-test",
+                    "output": [],
+                },
+            }
+        ]
+    )
+
+    class UnsupportedCacheKeyError(RuntimeError):
+        status_code = 400
+        body = {"error": "unknown parameter prompt_cache_key"}
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(dict(kwargs))
+            if len(requests) == 1:
+                raise UnsupportedCacheKeyError(
+                    "prompt_cache_key is not supported"
+                )
+            return events
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="test-key", model="gpt-test", max_attempts=1)
+    chunks = await _collect(model, [{"role": "user", "content": "question"}])
+
+    assert chunks[-1].done is True
+    assert requests[0]["prompt_cache_key"] == "openai-test"
+    assert "prompt_cache_key" not in requests[1]
 
 
 @pytest.mark.asyncio
@@ -1230,8 +1281,8 @@ def test_responses_continuation_rejects_context_or_settings_drift(
     original_request = _request_for(model, original_messages)
     original_payload = _request_payload(
         model,
-        original_messages,
-        {},
+        original_request,
+        {"prompt_cache_key": original_request.cache_affinity},
         provider="openai",
     )
     continuation = ModelContinuation(
@@ -1254,8 +1305,11 @@ def test_responses_continuation_rejects_context_or_settings_drift(
     )
     current_payload = _request_payload(
         model,
-        request.message_dicts(),
-        request.option_dict(),
+        request,
+        {
+            **request.option_dict(),
+            "prompt_cache_key": request.cache_affinity,
+        },
         provider="openai",
     )
 
@@ -1328,7 +1382,12 @@ async def test_responses_invalid_continuation_falls_back_to_full_transcript(
     from qitos.models._openai_responses import _continuation_settings, _request_payload
 
     base = _request_for(model, prior_input)
-    payload = _request_payload(model, prior_input, {}, provider="openai")
+    payload = _request_payload(
+        model,
+        base,
+        {"prompt_cache_key": base.cache_affinity},
+        provider="openai",
+    )
     prefix = list(payload["input"]) + [prior_output]
     continuation = ModelContinuation(
         run_id=base.run_id,
@@ -1638,6 +1697,7 @@ async def test_chat_compatibility_streams_reasoning_parallel_tool_calls_and_usag
     assert model.api_mode == "chat_completions"
     assert captured["client"]["max_retries"] == 0
     assert captured["request"]["stream"] is True
+    assert captured["request"]["prompt_cache_key"] == "openai-test"
     assert "".join(chunk.text for chunk in chunks) == "answer"
     assert "".join(chunk.reasoning_content or "" for chunk in chunks) == "check"
     assert chunks[-1].tool_calls == [
@@ -1660,6 +1720,65 @@ async def test_chat_compatibility_streams_reasoning_parallel_tool_calls_and_usag
     }
     assert events.closed is True
     assert captured["client_closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_chat_retries_without_prompt_cache_key_when_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    events = _AsyncListStream(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="done",
+                            reasoning_content=None,
+                            tool_calls=None,
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+        ]
+    )
+
+    class UnsupportedCacheKeyError(RuntimeError):
+        status_code = 400
+        body = {"error": "unknown parameter prompt_cache_key"}
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(dict(kwargs))
+            if len(requests) == 1:
+                raise UnsupportedCacheKeyError(
+                    "prompt_cache_key is not supported"
+                )
+            return events
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAICompatibleModel(
+        model="compatible-test",
+        api_key="key",
+        base_url="https://example.test/v1",
+        max_attempts=1,
+    )
+    chunks = await _collect(model, [{"role": "user", "content": "question"}])
+
+    assert chunks[-1].done is True
+    assert requests[0]["prompt_cache_key"] == "openai-test"
+    assert "prompt_cache_key" not in requests[1]
 
 
 def test_chat_output_limit_does_not_publish_partial_tool_calls() -> None:

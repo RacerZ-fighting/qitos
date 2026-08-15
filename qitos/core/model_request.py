@@ -215,6 +215,12 @@ class ModelRequest:
             }
         )
 
+    @property
+    def cache_affinity(self) -> str:
+        """Return the stable Run identity used by Provider prompt caches."""
+
+        return self.run_id
+
     def message_dicts(self) -> List[Dict[str, Any]]:
         return [dict(_thaw_json(message)) for message in self.messages]
 
@@ -244,6 +250,7 @@ class ModelRequest:
             "provider": self.provider,
             "model": self.model,
             "protocol": self.protocol,
+            "cache_affinity": self.cache_affinity,
             "messages": _redact_json(self.messages),
             "options": _redact_json(self.options),
             "request_digest": self.request_digest,

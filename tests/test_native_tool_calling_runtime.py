@@ -247,7 +247,7 @@ def test_native_tool_timeout_remains_timed_out_in_result_trace_and_history() -> 
     assert "timed_out" in str(tool_messages[0].get("content", ""))
 
 
-def test_default_history_window_never_sends_orphan_parallel_tool_results() -> None:
+def test_normal_turns_append_complete_native_tool_transactions() -> None:
     class _VariableNativeToolModel(Model):
         qitos_harness_metadata = {
             "tool_policy": {"native_tool_call_preferred": True},
@@ -263,6 +263,7 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
                 temperature=None,
             )
             self.calls = 0
+            self.messages_by_call: list[list[dict[str, Any]]] = []
             self.orphan_ids_by_call: list[list[str]] = []
 
         async def stream(
@@ -270,6 +271,7 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
             request: ModelRequest,
         ) -> AsyncIterator[ModelStreamEvent]:
             messages = request.message_dicts()
+            self.messages_by_call.append(messages)
             assistant_ids = {
                 str(tool_call["id"])
                 for message in messages
@@ -286,7 +288,7 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
 
             call_index = self.calls
             self.calls += 1
-            if call_index >= 8:
+            if call_index >= 12:
                 yield ModelStreamEvent(
                     text="Final Answer: done",
                     type=ModelStreamEventType.COMPLETED,
@@ -330,7 +332,7 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
 
         def init_state(self, task: str, **kwargs: Any) -> _State:
             _ = kwargs
-            return _State(task=task, max_steps=12)
+            return _State(task=task, max_steps=16)
 
         def prepare(self, state: _State) -> str:
             return f"continue step {state.current_step}"
@@ -353,22 +355,47 @@ def test_default_history_window_never_sends_orphan_parallel_tool_results() -> No
     llm = _VariableNativeToolModel()
     result = Engine(
         agent=_VariableNativeToolAgent(llm),
-        budget=RuntimeBudget(max_steps=12),
+        budget=RuntimeBudget(max_steps=16),
     ).run("exercise variable native tool rounds")
 
     assert result.state.final_result == "done"
-    assert llm.calls == 9
-    assert llm.orphan_ids_by_call == [[] for _ in range(9)]
+    assert llm.calls == 13
+    assert llm.orphan_ids_by_call == [[] for _ in range(13)]
+    for previous, current in zip(
+        llm.messages_by_call,
+        llm.messages_by_call[1:],
+        strict=False,
+    ):
+        assert current[: len(previous)] == previous
     model_input_events = [
         event.payload
         for event in result.events
         if event.payload.get("stage") == "model_input"
     ]
-    assert len(model_input_events) == 9
-    for payload in model_input_events:
+    assert len(model_input_events) == 13
+    system_digests = set()
+    for index, payload in enumerate(model_input_events):
         parity = payload["tool_transaction_parity"]
         assert parity["valid"] is True
         assert parity["orphan_result_ids"] == []
+        cache = payload["request_cache"]
+        assert cache["affinity_enabled"] is True
+        assert "cache_affinity" not in cache
+        system_digests.add(cache["system_prompt_digest"])
+        if index == 0:
+            assert cache["previous_request_available"] is False
+            assert cache["previous_messages_are_prefix"] is None
+            continue
+        assert cache["previous_request_available"] is True
+        assert cache["previous_messages_are_prefix"] is True
+        assert cache["common_prefix_messages"] == len(
+            llm.messages_by_call[index - 1]
+        )
+        assert cache["common_prefix_tokens"] > 0
+        assert cache["system_prompt_stable"] is True
+        assert cache["tool_schema_stable"] is True
+        assert cache["prefix_cache_reusable"] is True
+    assert len(system_digests) == 1
 
 
 def test_responses_native_items_survive_engine_tool_round() -> None:

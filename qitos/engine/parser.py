@@ -73,11 +73,19 @@ def parser_contract(parser: Any) -> str:
     return str(getattr(parser, "contract_id", parser.__class__.__name__.lower()))
 
 
-def parser_raw_preview(raw_output: Any, limit: int = 50000) -> str:
+def parser_raw_preview(raw_output: Any, limit: int = 2_048) -> str:
     text = str(raw_output or "").strip()
     if len(text) <= limit:
         return text
-    return text[:limit] + "... (truncated)"
+    marker = "\n... (parser preview truncated) ...\n"
+    content_budget = max(0, limit - len(marker))
+    head_chars = content_budget // 2
+    tail_chars = content_budget - head_chars
+    return (
+        text[:head_chars]
+        + marker
+        + (text[-tail_chars:] if tail_chars else "")
+    )[:limit]
 
 
 def build_parser_diagnostics(

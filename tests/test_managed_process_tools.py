@@ -3,12 +3,20 @@ from __future__ import annotations
 import asyncio
 import shlex
 import sys
+from copy import copy
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from qitos.core.journal import JournalRecordType
+from qitos.core.action import Action, ActionStatus
+from qitos.core.budget import BudgetLedger
 from qitos.core.process import ProcessStatus
+from qitos.core.tool_registry import ToolRegistry
+from qitos.engine.action_executor import ActionExecutor
+from qitos.engine.states import RuntimeBudget
 from qitos.kit.env.host_env import HostCommandCapability
 from qitos.kit.env.managed_process import ManagedHostProcessRuntime
 from qitos.kit.journal import JsonlSessionJournal
@@ -82,7 +90,8 @@ async def test_shell_toolset_manages_background_process_through_one_async_owner(
 
     assert first["status"] == ProcessStatus.RUNNING.value
     assert "ready" in first["output"]["content"]
-    assert terminal["status"] == ProcessStatus.EXITED.value
+    assert terminal["status"] == "success"
+    assert terminal["process_status"] == ProcessStatus.EXITED.value
     assert "echo:hello" in incremental["output"]["content"]
     assert [item["process_id"] for item in listed["processes"]] == [process_id]
 
@@ -255,7 +264,201 @@ async def test_reused_shell_toolset_creates_a_fresh_supervisor_for_each_run(
         runtime_context=_runtime_context("run-2"),
     )
 
-    assert terminal["status"] == ProcessStatus.EXITED.value
+    assert terminal["status"] == "success"
+    assert terminal["process_status"] == ProcessStatus.EXITED.value
     assert stale["status"] == "error"
     assert "unknown process handle" in stale["message"]
+    await tools.ateardown({})
+
+
+@pytest.mark.asyncio
+async def test_run_command_yields_a_short_process_as_a_terminal_result(
+    tmp_path: Path,
+) -> None:
+    tools = CodingToolSet(workspace_root=str(tmp_path), profile="shell")
+
+    result = await tools.run_command.execute(
+        {
+            "command": _python_command("print('done', flush=True)"),
+            "yield_time_ms": 1000,
+        },
+        runtime_context=_runtime_context("run-short"),
+    )
+
+    assert result["status"] == "success"
+    assert result["process_status"] == ProcessStatus.EXITED.value
+    assert result["terminal"] is True
+    assert "done" in result["output"]["content"]
+    await tools.ateardown({})
+
+
+@pytest.mark.asyncio
+async def test_run_command_yields_a_long_process_with_a_durable_handle_and_log(
+    tmp_path: Path,
+) -> None:
+    tools = CodingToolSet(workspace_root=str(tmp_path), profile="shell")
+    context = _runtime_context("run-long")
+
+    result = await tools.run_command.execute(
+        {
+            "command": _python_command(
+                "import time; print('ready', flush=True); time.sleep(60)"
+            ),
+            "yield_time_ms": 20,
+        },
+        runtime_context=context,
+    )
+
+    assert result["status"] == "running"
+    assert result["process_status"] == ProcessStatus.RUNNING.value
+    assert result["terminal"] is False
+    assert result["process_id"]
+    assert result["output"]["log_path"].startswith(".qitos/processes/")
+    assert (tmp_path / result["output"]["log_path"]).is_file()
+
+    await tools.process_terminate.execute(
+        {"process_id": result["process_id"]},
+        runtime_context=context,
+    )
+    await tools.ateardown({})
+
+
+@pytest.mark.asyncio
+async def test_process_wait_timeout_returns_a_running_snapshot(
+    tmp_path: Path,
+) -> None:
+    tools = CodingToolSet(workspace_root=str(tmp_path), profile="shell")
+    context = _runtime_context("run-wait")
+    started = await tools.run_command.execute(
+        {
+            "command": _python_command("import time; time.sleep(60)"),
+            "run_in_background": True,
+        },
+        runtime_context=context,
+    )
+
+    result = await tools.process_wait.execute(
+        {"process_id": started["process_id"], "timeout_seconds": 0.01},
+        runtime_context=context,
+    )
+
+    assert result["status"] == "running"
+    assert result["process_status"] == ProcessStatus.RUNNING.value
+    assert result["process_id"] == started["process_id"]
+    await tools.process_terminate.execute(
+        {"process_id": started["process_id"]},
+        runtime_context=context,
+    )
+    await tools.ateardown({})
+
+
+@pytest.mark.asyncio
+async def test_invalid_yield_does_not_start_a_process(tmp_path: Path) -> None:
+    tools = CodingToolSet(workspace_root=str(tmp_path), profile="shell")
+    context = _runtime_context("run-invalid")
+
+    result = await tools.run_command.execute(
+        {
+            "command": _python_command("import time; time.sleep(60)"),
+            "yield_time_ms": -1,
+        },
+        runtime_context=context,
+    )
+    listed = await tools.process_list.execute({}, runtime_context=context)
+
+    assert result["status"] == "error"
+    assert result["message"].endswith("must be finite and non-negative")
+    assert listed["processes"] == []
+    await tools.ateardown({})
+
+
+@pytest.mark.asyncio
+async def test_process_output_is_fully_written_to_log_with_a_bounded_summary(
+    tmp_path: Path,
+) -> None:
+    tools = CodingToolSet(workspace_root=str(tmp_path), profile="shell")
+    content = "x" * 50_000
+
+    result = await tools.run_command.execute(
+        {
+            "command": _python_command(
+                "import sys; sys.stdout.write('x' * 50000); sys.stdout.flush()"
+            ),
+            "yield_time_ms": 2000,
+        },
+        runtime_context=_runtime_context("run-output", timeout=3.0),
+    )
+
+    log_path = tmp_path / result["output"]["log_path"]
+    assert result["status"] == "success"
+    assert result["process_status"] == ProcessStatus.EXITED.value
+    assert log_path.read_text(encoding="utf-8") == content
+    assert len(result["model_summary"]) <= 8_000
+    assert "omitted" in result["model_summary"]
+    await tools.ateardown({})
+
+
+class _ProcessExecutorEngine:
+    def __init__(self) -> None:
+        self.active_run_id = "run-timeout"
+        self.agent = SimpleNamespace()
+        self.budget = RuntimeBudget()
+        self.budget_ledger = BudgetLedger()
+        self.events: list[Any] = []
+        self.journal = None
+
+    @property
+    def runtime_deadline_monotonic(self) -> float | None:
+        return None
+
+    def remaining_runtime_seconds(self) -> float | None:
+        return None
+
+    async def apost_runtime_event(self, event: Any, *, run_id: str) -> bool:
+        _ = event, run_id
+        return True
+
+
+@pytest.mark.asyncio
+async def test_action_timeout_preserves_the_running_process_handle(
+    tmp_path: Path,
+) -> None:
+    tools = CodingToolSet(workspace_root=str(tmp_path), profile="shell")
+    run_command = copy(tools.run_command)
+    run_command.spec = copy(tools.run_command.spec)
+    run_command.spec.timeout_s = 0.03
+    engine = _ProcessExecutorEngine()
+    result = (
+        await ActionExecutor(
+            ToolRegistry().register(run_command),
+            engine=engine,
+            auto_approve=True,
+        ).execute(
+            [
+                Action(
+                    name="run_command",
+                    args={
+                        "command": _python_command("import time; time.sleep(60)"),
+                        "yield_time_ms": 1000,
+                    },
+                )
+            ]
+        )
+    )[0]
+
+    assert result.status is ActionStatus.TIMED_OUT
+    assert result.metadata["worker_still_running"] is True
+    assert result.output["process_status"] == ProcessStatus.RUNNING.value
+    process_id = result.output["process_id"]
+    context = _runtime_context(engine.active_run_id)
+    queried = await tools.process_read.execute(
+        {"process_id": process_id},
+        runtime_context=context,
+    )
+    assert queried["process_status"] == ProcessStatus.RUNNING.value
+
+    await tools.process_terminate.execute(
+        {"process_id": process_id},
+        runtime_context=context,
+    )
     await tools.ateardown({})

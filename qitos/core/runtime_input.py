@@ -15,6 +15,22 @@ if TYPE_CHECKING:
 _PROCESS_TERMINAL_EVENT_MAX_CHARS = 8_000
 
 
+def _bounded_head_tail(content: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(content) <= max_chars:
+        return content
+    marker = "\n... [middle omitted from runtime notification] ...\n"
+    content_budget = max(0, max_chars - len(marker))
+    head_chars = content_budget // 4
+    tail_chars = content_budget - head_chars
+    return (
+        content[:head_chars]
+        + marker
+        + (content[-tail_chars:] if tail_chars else "")
+    )[:max_chars]
+
+
 @dataclass(frozen=True)
 class RuntimeInput:
     """A small external event delivered before the next model request."""
@@ -138,8 +154,9 @@ def process_terminal_payload(snapshot: ProcessSnapshot) -> dict[str, Any]:
     content = snapshot.output.content
     notification_truncated = len(content) > _PROCESS_TERMINAL_EVENT_MAX_CHARS
     if notification_truncated:
-        content = (
-            content[:_PROCESS_TERMINAL_EVENT_MAX_CHARS] + "\n... [truncated]"
+        content = _bounded_head_tail(
+            content,
+            _PROCESS_TERMINAL_EVENT_MAX_CHARS,
         )
     return {
         "handle": snapshot.handle.to_dict(),

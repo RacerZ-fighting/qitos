@@ -22,10 +22,6 @@ class ContextCompactionRequired(ContextOverflowError):
     """Raised before dispatch when the complete input reaches the force threshold."""
 
 
-class DecisionContextConfigurationError(RuntimeError):
-    """The stable controller failed to render one authoritative context."""
-
-
 class _ContextRuntime:
     _REACTIVE_COMPACT_FACTORS = (0.70, 0.50, 0.35)
 

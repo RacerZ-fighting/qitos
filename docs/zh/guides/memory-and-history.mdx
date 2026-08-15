@@ -90,9 +90,9 @@ result = agent.run(
 
 它支持：
 
-- 溢出前警告阈值
+- 80% 可观察性告警与 85% 明确压缩水位
 - 基于轮次的消息分组
-- 对巨大旧消息的微压缩
+- 只在明确水位后处理巨大旧消息
 - 对更早历史的摘要压缩
 - 可进入追踪记录的压缩元数据
 
@@ -110,7 +110,7 @@ result = agent.run(
 
 - `CompactConfig`：阈值与上下文压缩策略
 - `MessageGrouper`：消息如何按轮分组
-- 微压缩：裁剪超长旧消息，但保留预览
+- 微压缩：到达明确压缩水位后，才裁剪超长旧消息并保留预览
 - 摘要压缩：把更早轮次替换成连续摘要
 
 典型配置：
@@ -122,14 +122,16 @@ history = CompactHistory(
     config=CompactConfig(
         max_tokens=16000,
         keep_last_rounds=2,
-        warning_ratio=0.8,
+        warning_ratio=1.0,
+        microcompact_ratio=1.0,
         auto_compact=True,
     ),
     llm=llm,
 )
 ```
 
-如果你想把上下文行为也纳入研究产物，这通常是最合适的选择。
+`1.0` 表示在 Engine 的 85% 明确水位之前不改写投影历史，从而在两次压缩之间保持
+append-only Provider 前缀，同时让每次压缩都能在 trace 中被观察。
 
 ## 记忆
 

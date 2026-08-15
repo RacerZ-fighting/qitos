@@ -131,6 +131,10 @@ async def test_process_terminal_wakes_agent_after_durable_mailbox_post(
     assert event["payload"]["terminal"] is True
     assert event["payload"]["status"] == "exited"
     assert event["payload"]["output"]["notification_truncated"] is True
+    notification = event["payload"]["output"]["content"]
+    assert len(notification) <= 8_000
+    assert notification.endswith("x\n")
+    assert "middle omitted" in notification
 
     records = await journal.replay()
     record_types = [record.type for record in records]

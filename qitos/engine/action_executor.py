@@ -8,6 +8,7 @@ import time
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
 from ..core.action import Action, ActionExecutionPolicy, ActionResult, ActionStatus
+from ..core.artifact import ArtifactRef
 from ..core.budget import BudgetLedger
 from ..core.env import Env, RuntimeCapabilitySnapshot
 from ..core.journal import SessionJournal
@@ -815,6 +816,7 @@ class ActionExecutor:
                     "executed": False,
                 },
             )
+        ordering_meta["permission"] = self._permission_payload(permission)
         if permission.decision == "deny":
             self._dispatch_tool_hook(
                 "on_permission_denied",
@@ -1017,18 +1019,30 @@ class ActionExecutor:
                     runtime_context=runtime_context,
                     timeout_s=self._remaining_action_seconds(action_deadline_monotonic),
                 )
-                stop_result = self._action_stop_result(
-                    action=action,
-                    start=start,
-                    attempts=attempts,
-                    tool_meta=tool_meta,
-                    segment_index=segment_index,
-                    action_deadline_monotonic=action_deadline_monotonic,
-                    timeout_source=timeout_source,
-                    timeout_s=timeout_s,
-                )
-                if stop_result is not None:
-                    return stop_result
+                if self._is_cancelled():
+                    interruption = self._interruption_result(runtime_context)
+                    return self._finish_result(
+                        action=action,
+                        status=ActionStatus.CANCELLED,
+                        start=start,
+                        attempts=attempts,
+                        tool_meta=tool_meta,
+                        output=(None if interruption is None else interruption.output),
+                        error="action cancelled",
+                        extra_metadata={
+                            **ordering_meta,
+                            "error_category": "cancelled",
+                            "cancel_source": "cancel_token",
+                            "worker_still_running": self._worker_still_running(
+                                interruption
+                            ),
+                            "ended_at": time.time(),
+                        },
+                        artifacts=(
+                            () if interruption is None else interruption.artifacts
+                        ),
+                        model_output=self._interruption_model_output(interruption),
+                    )
                 if output is None:
                     card = "\n".join(
                         [
@@ -1058,8 +1072,7 @@ class ActionExecutor:
                             "executed": True,
                         },
                     )
-                normalized_output = self._normalize_output(tool, output)
-                reported_result = ToolResult.from_value(normalized_output)
+                reported_result = ToolResult.from_value(output)
                 self._dispatch_tool_hook(
                     "on_after_tool_use",
                     action.name,
@@ -1112,35 +1125,51 @@ class ActionExecutor:
                 cancel_source = (
                     "cancel_token" if self._is_cancelled() else "caller_cancelled"
                 )
+                interruption = self._interruption_result(runtime_context)
                 return self._finish_result(
                     action=action,
                     status=ActionStatus.CANCELLED,
                     start=start,
                     attempts=attempts,
                     tool_meta=tool_meta,
+                    output=(None if interruption is None else interruption.output),
                     error="action cancelled",
                     extra_metadata={
                         **ordering_meta,
                         "error_category": "cancelled",
                         "cancel_source": cancel_source,
-                        "worker_still_running": False,
+                        "worker_still_running": self._worker_still_running(
+                            interruption
+                        ),
                         "ended_at": time.time(),
                     },
+                    artifacts=(
+                        () if interruption is None else interruption.artifacts
+                    ),
+                    model_output=self._interruption_model_output(interruption),
                 )
             except asyncio.TimeoutError as exc:
+                interruption = self._interruption_result(runtime_context)
                 timed_out_result = self._finish_result(
                     action=action,
                     status=ActionStatus.TIMED_OUT,
                     start=start,
                     attempts=attempts,
                     tool_meta=tool_meta,
+                    output=(None if interruption is None else interruption.output),
                     error=str(exc),
                     extra_metadata={
                         **ordering_meta,
                         "error_category": "timeout",
-                        "worker_still_running": False,
+                        "worker_still_running": self._worker_still_running(
+                            interruption
+                        ),
                         "ended_at": time.time(),
                     },
+                    artifacts=(
+                        () if interruption is None else interruption.artifacts
+                    ),
+                    model_output=self._interruption_model_output(interruption),
                 )
                 return timed_out_result
             except Exception as exc:  # pragma: no cover - defensive path
@@ -1347,6 +1376,8 @@ class ActionExecutor:
         output: Any = None,
         error: Optional[str] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
+        artifacts: tuple[ArtifactRef, ...] = (),
+        model_output: str | None = None,
     ) -> ActionResult:
         if output is None:
             code = str(
@@ -1375,7 +1406,29 @@ class ActionExecutor:
             attempts=attempts,
             latency_ms=latency,
             metadata=metadata,
+            artifacts=artifacts,
+            model_output=model_output,
         )
+
+    @staticmethod
+    def _interruption_result(
+        runtime_context: Dict[str, Any],
+    ) -> ToolResult | None:
+        result = runtime_context.get("interruption_result")
+        return result if isinstance(result, ToolResult) else None
+
+    @staticmethod
+    def _worker_still_running(result: ToolResult | None) -> bool:
+        if result is None or not isinstance(result.output, dict):
+            return False
+        return result.output.get("process_status") == "running"
+
+    @staticmethod
+    def _interruption_model_output(result: ToolResult | None) -> str | None:
+        if result is None:
+            return None
+        output = result.model_visible_output
+        return output if isinstance(output, str) else None
 
     def _build_runtime_context(
         self,
@@ -1515,31 +1568,9 @@ class ActionExecutor:
     ) -> Any:
         return await tool.execute(args, runtime_context=runtime_context)
 
-    def _normalize_output(self, tool: BaseTool, output: Any) -> Any:
-        if isinstance(output, ToolResult):
-            output = output.to_dict()
-        max_chars = tool.spec.result_max_chars
-        if not max_chars or max_chars <= 0:
-            return output
-        if isinstance(output, str):
-            return self._truncate_text(output, max_chars)
-        if isinstance(output, dict):
-            normalized = dict(output)
-            for key in ("content", "stdout", "stderr", "result", "summary", "message"):
-                value = normalized.get(key)
-                if isinstance(value, str):
-                    normalized[key] = self._truncate_text(value, max_chars)
-            return normalized
-        return output
-
-    def _truncate_text(self, text: str, max_chars: int) -> str:
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars] + "\n... [truncated]"
-
     def _resolve_permission_context(
         self, env: Optional[Env], state: Any
-    ) -> ToolPermissionContext:
+    ) -> ToolPermissionContext | None:
         candidate = None
         if state is not None:
             metadata = getattr(state, "metadata", None)
@@ -1551,10 +1582,13 @@ class ActionExecutor:
             return candidate
         if isinstance(candidate, dict):
             return ToolPermissionContext.from_dict(candidate)
-        return ToolPermissionContext()
+        return None
 
     def _permission_payload(self, decision: ToolPermissionDecision) -> Dict[str, Any]:
+        mode = getattr(self._pipeline, "mode", None)
+        mode_value = getattr(mode, "value", mode)
         return {
+            "mode": str(mode_value or "tool"),
             "decision": decision.decision,
             "message": decision.message,
             "scope": decision.scope,
@@ -1659,7 +1693,7 @@ class ActionExecutor:
 
         Returns an ActionResult if the action should be blocked, None otherwise.
         """
-        if self._rbw_enforcer is None:
+        if self._rbw_enforcer is None or self._uses_autonomous_permission():
             return None
         if action.name not in self._WRITE_TOOL_NAMES:
             return None
@@ -1693,7 +1727,7 @@ class ActionExecutor:
         self, tool_name: str, args: Dict[str, Any], output: Any
     ) -> None:
         """Track file reads and invalidate cache on writes for RBW enforcement."""
-        if self._rbw_enforcer is None:
+        if self._rbw_enforcer is None or self._uses_autonomous_permission():
             return
 
         # Record successful file reads
@@ -1711,3 +1745,7 @@ class ActionExecutor:
             path = args.get("path") or args.get("file_path", "")
             if path:
                 self._rbw_enforcer.invalidate(path)
+
+    def _uses_autonomous_permission(self) -> bool:
+        mode = getattr(self._pipeline, "mode", None)
+        return getattr(mode, "value", mode) == "autonomous"

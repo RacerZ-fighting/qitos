@@ -38,7 +38,6 @@ class _EchoTool(BaseTool):
                 parameters={"value": {"type": "string"}},
                 required=["value"],
                 permissions=ToolPermission(),
-                result_max_chars=8,
             )
         )
 
@@ -124,7 +123,7 @@ class _CandidateReadyState(StateSchema):
     workspace_root: str = ""
 
 
-async def test_action_executor_applies_validation_permission_and_truncation():
+async def test_action_executor_preserves_output_before_model_projection():
     registry = ToolRegistry().register(_EchoTool())
     executor = ActionExecutor(registry)
     state = _ExecutorState(task="demo")
@@ -133,7 +132,7 @@ async def test_action_executor_applies_validation_permission_and_truncation():
         [Action(name="echo_tool", args={"value": "1234567890"})], state=state
     ))[0]
     assert ok.status == ActionStatus.SUCCESS
-    assert ok.output["result"].endswith("[truncated]")
+    assert ok.output["result"] == "1234567890"
 
     invalid = (await executor.execute(
         [Action(name="echo_tool", args={"value": "bad"})], state=state

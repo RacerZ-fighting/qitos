@@ -235,9 +235,20 @@ def _responses_usage(response: Any) -> Optional[Dict[str, Any]]:
         "completion_tokens": output_tokens,
         "total_tokens": total_tokens,
     }
-    for key in ("input_tokens_details", "output_tokens_details"):
+    for key in (
+        "input_tokens_details",
+        "output_tokens_details",
+        "prompt_tokens_details",
+        "cached_tokens",
+        "prompt_cache_hit_tokens",
+        "cache_read_input_tokens",
+        "cache_write_input_tokens",
+        "cache_creation_input_tokens",
+    ):
         if isinstance(usage.get(key), dict):
             result[key] = dict(usage[key])
+        elif usage.get(key) is not None:
+            result[key] = usage[key]
     return result
 
 
@@ -356,7 +367,7 @@ def _responses_create(client: Any) -> Any:
 
 def _request_payload(
     adapter: Model,
-    messages: List[Dict[str, Any]],
+    request: ModelRequest,
     kwargs: Dict[str, Any],
     *,
     provider: str,
@@ -366,7 +377,7 @@ def _request_payload(
     payload.update(
         {
             "model": adapter.model,
-            "input": cast(Any, _to_responses_input(messages)),
+            "input": cast(Any, _to_responses_input(request.message_dicts())),
             "stream": True,
         }
     )
@@ -844,7 +855,7 @@ async def _open_responses_stream(
 
     full_payload = _request_payload(
         adapter,
-        request.message_dicts(),
+        request,
         request_kwargs,
         provider=provider,
     )

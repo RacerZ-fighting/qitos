@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
 import subprocess
 from collections.abc import Mapping
@@ -27,9 +28,11 @@ from qitos.core.function_tool_decorator import function_tool
 from qitos.core.process import (
     ProcessHandle,
     ProcessSnapshot,
+    ProcessStatus,
     ProcessTerminalNotifier,
 )
 from qitos.core.runtime_input import process_terminal_runtime_input
+from qitos.core.tool_result import ToolResult
 from qitos.kit.env.host_env import HostCommandCapability, HostFSCapability
 from qitos.kit._html import extract_html_text
 from qitos.kit.tool.internal.coding_utils import (
@@ -46,6 +49,7 @@ from qitos.kit.tool.notebook import NotebookToolSet
 
 TASK_STATUSES = {"pending", "in_progress", "blocked", "completed", "cancelled"}
 _MAX_SEARCH_RESULTS = 2000
+_PROCESS_MODEL_SUMMARY_MAX_CHARS = 8_000
 
 
 def _utc_now() -> str:
@@ -75,6 +79,96 @@ def _default_rule_scope(args: Dict[str, Any]) -> Optional[str]:
 def _process_rule_scope(args: Dict[str, Any]) -> Optional[str]:
     process_id = str(args.get("process_id") or "").strip()
     return f"process:{process_id}" if process_id else None
+
+
+def _non_negative_seconds(value: Any, *, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be numeric")
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return seconds
+
+
+def _bounded_head_tail(content: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(content) <= max_chars:
+        return content
+
+    marker = "\n\n--- output omitted ---\n\n"
+    for _ in range(3):
+        content_budget = max(0, max_chars - len(marker))
+        head_chars = content_budget // 4
+        tail_chars = content_budget - head_chars
+        omitted = max(0, len(content) - head_chars - tail_chars)
+        next_marker = f"\n\n--- omitted {omitted:,} chars ---\n\n"
+        if next_marker == marker:
+            break
+        marker = next_marker
+
+    content_budget = max(0, max_chars - len(marker))
+    head_chars = content_budget // 4
+    tail_chars = content_budget - head_chars
+    omitted = max(0, len(content) - head_chars - tail_chars)
+    marker = f"\n\n--- omitted {omitted:,} chars ---\n\n"
+    content_budget = max(0, max_chars - len(marker))
+    head_chars = content_budget // 4
+    tail_chars = content_budget - head_chars
+    return (
+        content[:head_chars]
+        + marker
+        + (content[-tail_chars:] if tail_chars else "")
+    )[:max_chars]
+
+
+def _tool_status_for_process(snapshot: ProcessSnapshot) -> str:
+    if snapshot.status is ProcessStatus.RUNNING:
+        return "running"
+    if snapshot.status is ProcessStatus.EXITED:
+        return "success" if snapshot.exit_code == 0 else "partial"
+    if snapshot.status is ProcessStatus.TERMINATED:
+        return "success"
+    return "error"
+
+
+def _process_snapshot_payload(snapshot: ProcessSnapshot) -> Dict[str, Any]:
+    output = snapshot.output
+    state = "running" if snapshot.status is ProcessStatus.RUNNING else "terminal"
+    lines = [
+        f"[process {state}]",
+        f"process_status: {snapshot.status.value}",
+        f"process_id: {snapshot.handle.process_id}",
+        f"cwd: {snapshot.cwd}",
+        f"exit_code: {snapshot.exit_code if snapshot.exit_code is not None else 'n/a'}",
+        f"output_bytes: {output.total_bytes}",
+        f"omitted_bytes: {output.omitted_bytes}",
+        f"full_log: {output.log_path}",
+    ]
+    if snapshot.error:
+        lines.append(f"error: {snapshot.error}")
+    if snapshot.status is ProcessStatus.RUNNING:
+        lines.append(
+            "next: continue other work or use process_read/process_wait with this process_id"
+        )
+    header = "\n".join(lines)
+    if output.content:
+        output_header = "\n\nOutput:\n"
+        content_budget = max(
+            0,
+            _PROCESS_MODEL_SUMMARY_MAX_CHARS - len(header) - len(output_header),
+        )
+        summary = header + output_header + _bounded_head_tail(
+            output.content,
+            content_budget,
+        )
+    else:
+        summary = header
+    payload = snapshot.to_dict()
+    payload["process_status"] = snapshot.status.value
+    payload["status"] = _tool_status_for_process(snapshot)
+    payload["model_summary"] = summary[:_PROCESS_MODEL_SUMMARY_MAX_CHARS]
+    return payload
 
 
 def _join_capability_path(base: str, child: str) -> str:
@@ -471,6 +565,29 @@ class CodingToolSet:
         return payload
 
     @staticmethod
+    def _remember_process_interruption(
+        runtime_context: Dict[str, Any],
+        snapshot: ProcessSnapshot,
+    ) -> None:
+        """Keep a bounded process receipt available if the tool task is cancelled."""
+
+        runtime_context["interruption_result"] = ToolResult.from_value(
+            _process_snapshot_payload(snapshot)
+        )
+
+    async def _refresh_process_interruption(
+        self,
+        runtime_context: Dict[str, Any],
+        process_ops: CommandCapability,
+        handle: ProcessHandle,
+    ) -> None:
+        try:
+            snapshot = await asyncio.shield(process_ops.apoll(handle))
+        except Exception:
+            return
+        self._remember_process_interruption(runtime_context, snapshot)
+
+    @staticmethod
     def _process_handle(process_id: str, owner_run_id: str) -> ProcessHandle:
         return ProcessHandle(
             process_id=str(process_id or "").strip(),
@@ -800,6 +917,7 @@ class CodingToolSet:
         command: str,
         run_in_background: bool = False,
         tty: bool = False,
+        yield_time_ms: int = 10000,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -808,50 +926,69 @@ class CodingToolSet:
         :param command: Shell command string to execute.
         :param run_in_background: Detach the command and return its task handle.
         :param tty: Allocate a pseudo-terminal for a managed background command.
+        :param yield_time_ms: Initial wait before a live command returns its handle.
         :param runtime_context: Optional runtime context injected by the executor.
         """
         text = str(command or "").strip()
         if not text:
             return {"status": "error", "message": "Command cannot be empty"}
         try:
-            process_ops = self._process_ops(runtime_context)
-            if run_in_background:
-                if tty:
-                    self._require_runtime_facility(
-                        runtime_context or {},
-                        "process.pty",
-                    )
-                process_ops, run_id = await self._managed_process_ops(runtime_context)
-                context = runtime_context or {}
-                snapshot = await process_ops.astart(
-                    text,
-                    owner_run_id=run_id,
-                    tty=bool(tty),
-                    journal=context.get("journal"),
-                    terminal_notifier=self._process_terminal_notifier(context),
-                )
-                return snapshot.to_dict()
-            self._require_runtime_facility(
-                runtime_context or {},
-                "process.foreground",
-            )
+            yield_seconds = _non_negative_seconds(
+                yield_time_ms,
+                name="yield_time_ms",
+            ) / 1000
+            context = runtime_context or {}
+            run_id = str(context.get("run_id") or "").strip()
+            if not run_id and not run_in_background and not tty:
+                self._require_runtime_facility(context, "process.foreground")
+                process_ops = self._process_ops(runtime_context)
+                timeout = float(self.shell_timeout)
+                remaining = self._remaining_seconds(runtime_context)
+                if remaining is not None:
+                    timeout = min(timeout, remaining)
+                if timeout <= 0:
+                    return {
+                        "status": "error",
+                        "message": "command deadline expired before execution",
+                        "command": text,
+                    }
+                return await process_ops.arun(text, timeout=timeout)
             if tty:
-                return {
-                    "status": "error",
-                    "message": "tty requires run_in_background=true",
-                    "command": text,
-                }
-            timeout = float(self.shell_timeout)
-            remaining = self._remaining_seconds(runtime_context)
-            if remaining is not None:
-                timeout = min(timeout, remaining)
-            if timeout <= 0:
-                return {
-                    "status": "error",
-                    "message": "command deadline expired before execution",
-                    "command": text,
-                }
-            return await process_ops.arun(text, timeout=timeout)
+                self._require_runtime_facility(
+                    context,
+                    "process.pty",
+                )
+            process_ops, run_id = await self._managed_process_ops(runtime_context)
+            snapshot = await process_ops.astart(
+                text,
+                owner_run_id=run_id,
+                tty=bool(tty),
+                journal=context.get("journal"),
+                terminal_notifier=self._process_terminal_notifier(context),
+            )
+            self._remember_process_interruption(context, snapshot)
+            if run_in_background:
+                return _process_snapshot_payload(snapshot)
+            deadline = asyncio.get_running_loop().time() + yield_seconds
+            raw_deadline = context.get("deadline_monotonic")
+            if raw_deadline is not None:
+                deadline = min(deadline, float(raw_deadline))
+            try:
+                snapshot = await process_ops.await_process(
+                    snapshot.handle,
+                    deadline_monotonic=deadline,
+                )
+            except asyncio.CancelledError:
+                await self._refresh_process_interruption(
+                    context,
+                    process_ops,
+                    snapshot.handle,
+                )
+                raise
+            self._remember_process_interruption(context, snapshot)
+            return _process_snapshot_payload(snapshot)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             return self._process_error_payload(exc, command=text)
 
@@ -894,16 +1031,30 @@ class CodingToolSet:
 
         try:
             process_ops, run_id = await self._managed_process_ops(runtime_context)
+            context = runtime_context or {}
             remaining = self._remaining_seconds(runtime_context)
-            bounded_wait = max(0.0, float(wait_seconds))
+            bounded_wait = _non_negative_seconds(
+                wait_seconds,
+                name="wait_seconds",
+            )
             if remaining is not None:
                 bounded_wait = min(bounded_wait, remaining)
-            snapshot = await process_ops.aread(
-                self._process_handle(process_id, run_id),
-                cursor=int(cursor),
-                wait_seconds=bounded_wait,
-            )
-            return snapshot.to_dict()
+            handle = self._process_handle(process_id, run_id)
+            initial = await process_ops.apoll(handle)
+            self._remember_process_interruption(context, initial)
+            try:
+                snapshot = await process_ops.aread(
+                    handle,
+                    cursor=int(cursor),
+                    wait_seconds=bounded_wait,
+                )
+            except asyncio.CancelledError:
+                await self._refresh_process_interruption(context, process_ops, handle)
+                raise
+            self._remember_process_interruption(context, snapshot)
+            return _process_snapshot_payload(snapshot)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             return self._process_error_payload(exc, process_id=process_id)
 
@@ -927,7 +1078,7 @@ class CodingToolSet:
                 self._process_handle(process_id, run_id),
                 data,
             )
-            return snapshot.to_dict()
+            return _process_snapshot_payload(snapshot)
         except Exception as exc:
             return self._process_error_payload(exc, process_id=process_id)
 
@@ -951,15 +1102,26 @@ class CodingToolSet:
             raw_deadline = context.get("deadline_monotonic")
             deadline = None if raw_deadline is None else float(raw_deadline)
             if timeout_seconds is not None:
-                relative = asyncio.get_running_loop().time() + max(
-                    0.0, float(timeout_seconds)
+                relative = asyncio.get_running_loop().time() + _non_negative_seconds(
+                    timeout_seconds,
+                    name="timeout_seconds",
                 )
                 deadline = relative if deadline is None else min(deadline, relative)
-            snapshot = await process_ops.await_process(
-                self._process_handle(process_id, run_id),
-                deadline_monotonic=deadline,
-            )
-            return snapshot.to_dict()
+            handle = self._process_handle(process_id, run_id)
+            initial = await process_ops.apoll(handle)
+            self._remember_process_interruption(context, initial)
+            try:
+                snapshot = await process_ops.await_process(
+                    handle,
+                    deadline_monotonic=deadline,
+                )
+            except asyncio.CancelledError:
+                await self._refresh_process_interruption(context, process_ops, handle)
+                raise
+            self._remember_process_interruption(context, snapshot)
+            return _process_snapshot_payload(snapshot)
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             return self._process_error_payload(exc, process_id=process_id)
 
@@ -980,7 +1142,7 @@ class CodingToolSet:
             snapshot = await process_ops.aterminate(
                 self._process_handle(process_id, run_id)
             )
-            return snapshot.to_dict()
+            return _process_snapshot_payload(snapshot)
         except Exception as exc:
             return self._process_error_payload(exc, process_id=process_id)
 

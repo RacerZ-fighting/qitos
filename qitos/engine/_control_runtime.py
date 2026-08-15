@@ -15,11 +15,11 @@ from ..core.errors import (
     RuntimeErrorInfo,
     StopReason,
 )
+from ..core.message_builder import ContextSnapshotConflictError
 from ..core.state import StateSchema
 from ._context_runtime import (
     ContextCompactionRequired,
     ContextOverflowError,
-    DecisionContextConfigurationError,
 )
 from .critic_result import CriticResult
 from .states import RuntimePhase, StepRecord
@@ -513,7 +513,7 @@ class _ControlRuntime(Generic[StateT, ObservationT, ActionT]):
         if engine.recovery_handler is not None:
             engine.recovery_handler(state, phase, exc)
 
-        if isinstance(exc, DecisionContextConfigurationError):
+        if isinstance(exc, ContextSnapshotConflictError):
             state.set_stop(StopReason.INFRASTRUCTURE_INVALID)
             return False
 

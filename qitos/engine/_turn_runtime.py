@@ -6,6 +6,7 @@ reducer, completion, and persistence ordering cannot drift.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, TypeVar, cast
 from uuid import uuid4
@@ -296,6 +297,196 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
             stop=stop,
             next_step_id=current_step if stop else current_step + 1,
             check_after_step_cancel=not stop,
+        )
+
+    async def execute_terminal(
+        self,
+        state: StateT,
+        observation: ObservationT,
+        *,
+        task: str,
+        stop_reason: StopReason,
+        step_id: int,
+        use_model: bool,
+    ) -> TurnExecution[StateT, ObservationT]:
+        """Commit the reserved tool-free terminal step exactly once."""
+
+        engine = self.engine
+        _reset_interrupt_context()
+        turn = engine._capture_turn(
+            state,
+            step_id,
+            terminal_reason=stop_reason.value,
+        )
+        engine.validation_gate.before_phase(state, RuntimePhase.DECIDE.value)
+        record = StepRecord(step_id=step_id, agent_id=engine.agent.name)
+        record.transaction_id = f"step-{step_id}-{uuid4().hex[:12]}"
+        engine.records.append(record)
+        step_before = state.to_dict()
+        if engine.journal is not None:
+            state = cast(StateT, type(state).from_dict(step_before))
+            step_before = state.to_dict()
+        engine._dispatch_hook(
+            "on_before_step",
+            HookContext(
+                task=task,
+                step_id=step_id,
+                phase=RuntimePhase.DECIDE,
+                state=state,
+                observation=observation,
+                record=record,
+                payload={"terminal_synthesis": True},
+            ),
+        )
+
+        decision: Decision[ActionT] | None = None
+        failure: Exception | None = None
+        attempted_model = bool(use_model and turn.model is not None)
+        if attempted_model:
+            engine._model_continuation = None
+            try:
+                decision = await engine._run_terminal_synthesis(
+                    state,
+                    observation,
+                    record,
+                    turn,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failure = exc
+                engine._model_continuation = None
+
+        if decision is None:
+            if not attempted_model:
+                engine._dispatch_hook(
+                    "on_before_decide",
+                    engine._hook_context(
+                        step_id=step_id,
+                        phase=RuntimePhase.DECIDE,
+                        state=state,
+                        observation=observation,
+                        record=record,
+                        payload={"terminal_synthesis": True, "model_skipped": True},
+                    ),
+                )
+            answer = str(
+                engine.agent.build_terminal_fallback(state, stop_reason.value) or ""
+            ).strip()
+            if not answer:
+                answer = (
+                    f"Run stopped because {stop_reason.value}; no final model "
+                    "conclusion was available."
+                )
+            decision = Decision.final(
+                answer,
+                meta={
+                    "terminal_synthesis": True,
+                    "terminal_reason": stop_reason.value,
+                    "fallback": True,
+                    "model_attempted": attempted_model,
+                    "error_type": type(failure).__name__ if failure else None,
+                },
+            )
+            record.decision = decision
+            record.actions = []
+            fallback_metadata = {
+                "reason": stop_reason.value,
+                "model_attempted": attempted_model,
+                "error_type": type(failure).__name__ if failure else None,
+                "error": str(failure) if failure else None,
+            }
+            record.prompt_metadata["terminal_synthesis"] = fallback_metadata
+            if not record.model_response:
+                record.model_response = {
+                    "text": answer,
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                    "usage_complete": not attempted_model,
+                    "cost_complete": not attempted_model,
+                }
+            record.model_response["terminal_fallback"] = fallback_metadata
+            engine._history_append(
+                "assistant",
+                answer,
+                step_id,
+                metadata={"source": "terminal_fallback"},
+            )
+            engine._memory_append("decision", decision, step_id)
+            engine._emit(
+                step_id,
+                RuntimePhase.DECIDE,
+                ok=failure is None,
+                payload={
+                    "stage": "decision_ready",
+                    "mode": "final",
+                    "final_answer": answer,
+                    "terminal_synthesis": True,
+                    "fallback": True,
+                    "error_type": type(failure).__name__ if failure else None,
+                },
+                error=str(failure) if failure else None,
+            )
+            engine._dispatch_hook(
+                "on_after_decide",
+                engine._hook_context(
+                    step_id=step_id,
+                    phase=RuntimePhase.DECIDE,
+                    state=state,
+                    observation=observation,
+                    decision=decision,
+                    model_response=dict(record.model_response),
+                    record=record,
+                    payload={
+                        "model_response": dict(record.model_response),
+                        "terminal_synthesis": True,
+                        "fallback": True,
+                    },
+                ),
+            )
+
+        if engine.journal is not None:
+            await engine._journal_model_completed(record, decision)
+        state.set_stop(stop_reason, decision.final_answer)
+        engine.validation_gate.after_phase(state, RuntimePhase.CHECK_STOP.value)
+        engine._finalize_step(record, state)
+        async with engine._runtime_input_post_lock:
+            if engine.journal is not None:
+                await engine._journal_commit_step(
+                    record,
+                    before=step_before,
+                    state=state,
+                    terminal=True,
+                )
+            else:
+                await engine._save_checkpoint(step_id, state, task)
+            engine._runtime_inbox.close(engine.active_run_id)
+        self._after_step_hook(
+            state,
+            record,
+            task=task,
+            phase=RuntimePhase.CHECK_STOP,
+            include_stop_reason=True,
+        )
+        engine._emit(
+            step_id,
+            RuntimePhase.END,
+            payload={
+                "stop_reason": state.stop_reason,
+                "terminal_synthesis": True,
+                "fallback": bool(decision.meta.get("fallback")),
+            },
+        )
+        return self._execution(
+            state,
+            observation,
+            record,
+            decision,
+            stop=True,
+            next_step_id=step_id,
         )
 
     async def _recover_decide_error(

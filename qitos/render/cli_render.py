@@ -16,11 +16,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
-from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.box import DOUBLE, ROUNDED
-from rich.color import Color
 from rich.theme import Theme
 
 console = Console()
@@ -35,6 +33,30 @@ DEFAULT_THEME = Theme(
         "step": "magenta",
     }
 )
+
+_DEBUG_MESSAGE_PREVIEW_CHARS = 8_000
+
+
+def _debug_message_preview(content: Any) -> str:
+    if isinstance(content, (dict, list)):
+        try:
+            text = json.dumps(content, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError, OverflowError):
+            text = str(content)
+    else:
+        text = str(content)
+    if len(text) <= _DEBUG_MESSAGE_PREVIEW_CHARS:
+        return text
+
+    marker = "\n... [debug preview truncated; inspect the run trace for the full request] ...\n"
+    content_budget = max(0, _DEBUG_MESSAGE_PREVIEW_CHARS - len(marker))
+    head_chars = content_budget // 2
+    tail_chars = content_budget - head_chars
+    return (
+        text[:head_chars]
+        + marker
+        + (text[-tail_chars:] if tail_chars else "")
+    )[:_DEBUG_MESSAGE_PREVIEW_CHARS]
 
 
 class RichRender:
@@ -109,20 +131,13 @@ class RichRender:
                 panel_style = "white"
                 icon = "📝"
 
-            # Truncate content if too long (high limit for full debug visibility)
-            content_str = str(content)
-            if len(content_str) > 200000:
-                content_str = content_str[:200000] + "\n... [truncated]"
+            content_str = _debug_message_preview(content)
 
             # Format content with syntax highlighting if it's JSON
-            if isinstance(content, dict):
-                try:
-                    content_json = json.dumps(content, ensure_ascii=False, indent=2)
-                    content_text = Syntax(
-                        content_json, "json", theme="monokai", word_wrap=True
-                    )
-                except:
-                    content_text = Text(content_str, style=role_style)
+            if isinstance(content, (dict, list)):
+                content_text = Syntax(
+                    content_str, "json", theme="monokai", word_wrap=True
+                )
             else:
                 content_text = Text(content_str, style=role_style)
 

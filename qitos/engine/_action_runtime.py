@@ -455,9 +455,8 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 tool_call_id = actions[idx].action_id
             if not tool_call_id:
                 tool_call_id = f"call_{record.step_id}_{idx}"
-            model_payload = result.model_visible_output
             serialized = self._serialize_for_tool_message(
-                model_payload,
+                result.model_visible_output,
                 result.error,
                 result.status,
             )
@@ -523,12 +522,10 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         step_id: int,
     ) -> None:
         config = self.engine.context_config
-        max_chars = int(getattr(config, "tool_result_max_chars", 0) or 0)
+        max_chars = int(config.tool_result_max_chars)
         if max_chars <= 0:
             return
-        per_message_max = int(
-            getattr(config, "tool_result_per_message_max_chars", 0) or 0
-        )
+        batch_max = int(config.tool_result_batch_max_chars)
         message_chars = 0
         for index, result in enumerate(results):
             if isinstance(result.output, dict) and set(result.output) == {"env"}:
@@ -539,13 +536,12 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                 result.status,
             )
             effective_max = max_chars
-            if (
-                per_message_max > 0
-                and message_chars + len(serialized) > per_message_max
-            ):
+            if batch_max > 0:
+                remaining_results = len(results) - index
+                remaining_chars = max(0, batch_max - message_chars)
                 effective_max = min(
                     max_chars,
-                    max(256, per_message_max - message_chars),
+                    remaining_chars // remaining_results,
                 )
             if len(serialized) > effective_max:
                 action = actions[index] if index < len(actions) else None
@@ -566,11 +562,7 @@ class _ActionRuntime(Generic[StateT, ActionT]):
                     effective_max,
                     artifact,
                 )
-                serialized = self._serialize_for_tool_message(
-                    result.model_output,
-                    result.error,
-                    result.status,
-                )
+                serialized = result.model_output
             message_chars += len(serialized)
 
     def _persist_tool_output(
@@ -620,23 +612,49 @@ class _ActionRuntime(Generic[StateT, ActionT]):
         max_chars: int,
         artifact: ArtifactRef | None,
     ) -> str:
+        if max_chars <= 0:
+            return ""
         if artifact is None:
-            header = (
-                f"Tool output exceeded the model budget ({len(content)} characters). "
-                "The full output could not be persisted."
+            header = "\n".join(
+                (
+                    "[tool output truncated]",
+                    "complete: false",
+                    f"original_chars: {len(content)}",
+                    "artifact: unavailable",
+                )
             )
         else:
-            header = (
-                f"Tool output exceeded the model budget ({len(content)} characters).\n"
-                f"Full output: {artifact.path}\n"
-                f"Artifact bytes: {artifact.size_bytes}"
+            header = "\n".join(
+                (
+                    "[tool output truncated]",
+                    "complete: false",
+                    f"original_chars: {len(content)}",
+                    f"artifact: {artifact.path}",
+                    f"artifact_bytes: {artifact.size_bytes}",
+                )
             )
-        prefix = f"{header}\n\nPreview:\n"
-        available = max(0, max_chars - len(prefix))
+        prefix = f"{header}\n\nPreview (head/tail):\n"
+        if len(prefix) >= max_chars:
+            return prefix[:max_chars]
+        available = max_chars - len(prefix)
         if available == 0:
-            return header
+            return prefix
         if len(content) <= available:
             return prefix + content
-        marker = "\n…"
-        preview = content[: max(0, available - len(marker))].rstrip()
-        return prefix + preview + marker
+        marker = f"\n\n--- omitted {len(content) - available:,} chars ---\n\n"
+        content_budget = max(0, available - len(marker))
+        head_chars = content_budget // 4
+        tail_chars = content_budget - head_chars
+        omitted = max(0, len(content) - head_chars - tail_chars)
+        marker = f"\n\n--- omitted {omitted:,} chars ---\n\n"
+        content_budget = max(0, available - len(marker))
+        head_chars = content_budget // 4
+        tail_chars = content_budget - head_chars
+        omitted = max(0, len(content) - head_chars - tail_chars)
+        marker = f"\n\n--- omitted {omitted:,} chars ---\n\n"
+        return (
+            prefix
+            + content[:head_chars]
+            + marker
+            + (content[-tail_chars:] if tail_chars else "")
+        )[:max_chars]

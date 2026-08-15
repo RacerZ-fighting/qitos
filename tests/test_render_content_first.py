@@ -62,6 +62,34 @@ def test_content_first_renderer_core_blocks() -> None:
     assert obs.get("title") == "Search Results"
 
 
+def test_default_tool_preview_is_bounded_and_keeps_both_ends() -> None:
+    renderer = ContentFirstRenderer()
+    content = "tool-head\n" + ("x" * 20_000) + "\ntool-tail"
+    event = RenderEvent(
+        channel="observation",
+        node="action_results",
+        step_id=0,
+        payload={
+            "action_results": [
+                ToolResult(
+                    status="success",
+                    output={"summary": content},
+                    metadata={"tool_name": "BASH"},
+                ).to_dict()
+            ]
+        },
+    )
+
+    summary = renderer.observation_summary(event)
+
+    assert isinstance(summary, dict)
+    body = str(summary["body"])
+    assert len(body) <= renderer.max_preview_chars
+    assert body.startswith("tool-head")
+    assert body.endswith("tool-tail")
+    assert "omitted" in body
+
+
 def test_action_object_is_rendered_without_raw_repr() -> None:
     renderer = ContentFirstRenderer(max_preview_chars=200)
     evt = RenderEvent(
@@ -342,36 +370,6 @@ def test_claude_style_hook_shows_context_state_without_dumping_messages() -> Non
     assert "⦿" in text
     assert "web_search first" in text
     assert "very long history" not in text
-
-
-def test_claude_style_hook_shows_runtime_context_only_when_explicitly_provided() -> None:
-    hook = ClaudeStyleHook(max_preview_chars=200)
-    hook.console = Console(record=True, width=120)
-
-    hook.on_render_event(
-        RenderEvent(channel="lifecycle", node="run_start", step_id=0, payload={})
-    )
-    hook.on_render_event(
-        RenderEvent(channel="lifecycle", node="step_start", step_id=0, payload={})
-    )
-    hook.on_render_event(
-        RenderEvent(
-            channel="thinking",
-            node="model_input",
-            step_id=0,
-            payload={
-                "runtime_context_delivery": {"effective": "merge_tool"},
-                "runtime_context_display": {
-                    "tool_call_id": "call_1",
-                    "content": "<RUNTIME_CONTEXT>fresh state</RUNTIME_CONTEXT>",
-                },
-            },
-        )
-    )
-
-    text = hook.console.export_text()
-    assert "folded into tool call_1" in text
-    assert "fresh state" in text
 
 
 def test_claude_style_hook_does_not_duplicate_successful_tool_invocations() -> None:

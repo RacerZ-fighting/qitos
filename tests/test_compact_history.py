@@ -374,7 +374,7 @@ def test_compact_history_emits_microcompact_and_summary_events() -> None:
     assert metadata[0].get("source") == "compact_history"
 
 
-def test_microcompaction_runs_before_force_summary_threshold() -> None:
+def test_projected_history_stays_unchanged_before_force_summary_threshold() -> None:
     from qitos.kit.history.compact_history import CompactConfig
 
     history = CompactHistory(
@@ -401,12 +401,13 @@ def test_microcompaction_runs_before_force_summary_threshold() -> None:
     retrieved = history.retrieve(query={"max_tokens": 100})
     stages = [event["context"]["stage"] for event in history.consume_runtime_events()]
 
-    assert "microcompact_applied" in stages
+    assert "microcompact_applied" not in stages
     assert "summary_compact_applied" not in stages
     assert not any(message.metadata.get("summary") for message in retrieved)
-    assert any(
-        message.metadata.get("compaction_mode") == "micro" for message in retrieved
+    assert not any(
+        message.metadata.get("compaction_mode") for message in retrieved
     )
+    assert any(message.content == "x" * 320 for message in retrieved)
 
 
 def test_hard_compaction_resummarizes_all_but_latest_complete_round() -> None:
@@ -773,7 +774,8 @@ def test_compact_ratio_moves_the_compaction_trigger() -> None:
         < default_trigger
         < default_ceiling
     )
-    assert ContextConfig().compact_ratio == 0.80
+    assert ContextConfig().warning_ratio == 0.80
+    assert ContextConfig().compact_ratio == 0.85
 
     runtime.config = ContextConfig(
         safety_reserve_tokens=0,
@@ -1180,28 +1182,3 @@ def test_engine_falls_back_to_bounded_canonical_history_when_compaction_fails() 
         == "compact_failed_fallback"
         for event in result.events
     )
-
-
-def test_native_tool_history_preserves_incomplete_tail_as_an_atomic_round() -> None:
-    from qitos.engine._model_runtime import _ModelRuntime
-
-    runtime = object.__new__(_ModelRuntime)
-    history = [
-        {"role": "assistant", "_step_id": 1, "tool_calls": [{"id": "a"}, {"id": "b"}]},
-        {"role": "tool", "_step_id": 1, "tool_call_id": "a", "content": "one"},
-        {"role": "tool", "_step_id": 1, "tool_call_id": "b", "content": "two"},
-        {"role": "assistant", "_step_id": 2, "tool_calls": [{"id": "dangling"}]},
-        {"role": "assistant", "_step_id": 3, "tool_calls": [{"id": "c"}]},
-        {"role": "tool", "_step_id": 3, "tool_call_id": "c", "content": "three"},
-    ]
-    result = runtime._trim_native_tool_history(history, max_rounds=2)
-    assert {m.get("_step_id") for m in result} == {2, 3}
-    consistent = runtime._ensure_chain_consistency(result)
-    dangling_index = next(
-        index
-        for index, message in enumerate(consistent)
-        if message.get("_step_id") == 2
-    )
-    placeholder = consistent[dangling_index + 1]
-    assert placeholder["tool_call_id"] == "dangling"
-    assert "tool_call_not_completed" in str(placeholder["content"])

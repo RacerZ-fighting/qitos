@@ -95,9 +95,9 @@ Choose it when:
 
 It combines:
 
-- a warning before the Engine's 80% force-compaction boundary
+- an observability warning at 80% and an explicit Engine compaction boundary at 85%
 - transaction-aware grouping of generic and provider-native tool rounds
-- level 1 micro-compaction for large messages in older complete rounds
+- boundary-triggered micro-compaction for large messages in older complete rounds
 - level 2 summary compaction while preserving the configured recent rounds
 - level 3 resummarization of everything except the latest complete round
 - runtime compaction metadata that can surface in traces
@@ -116,14 +116,15 @@ Its main pieces are:
 
 - `CompactConfig` — thresholds and compaction policy
 - `MessageGrouper` — how messages are grouped into rounds
-- micro-compaction — trims very large old messages while keeping a preview
+- micro-compaction — trims very large old messages only after the explicit boundary
 - summary compaction — projects older rounds as a compact continuation summary
 
 The Engine computes occupancy against the provider-safe input budget. It prefers an
 explicit model `max_input_tokens`; otherwise it derives the budget as context window
 minus output allocation and safety reserve. The complete request count includes system
 and user messages, history, native reasoning items, tool schemas, and response schemas.
-At 80%, model dispatch is blocked until the history projection is compacted. If the
+At 80%, Engine emits a warning without changing messages. At 85%, model dispatch is
+blocked until the history projection is compacted. If the
 provider still rejects the request, QitOS asks the same immutable history strategy for
 progressively smaller `.70`, `.50`, and `.35` projections. It never uses an arbitrary
 message slice as the normal recovery path.
@@ -154,14 +155,17 @@ history = CompactHistory(
     config=CompactConfig(
         max_tokens=16000,
         keep_last_rounds=2,
-        warning_ratio=0.7,
+        warning_ratio=1.0,
+        microcompact_ratio=1.0,
         auto_compact=True,
     ),
     llm=llm,
 )
 ```
 
-This is usually the right choice when you are intentionally studying long-running tool use and want the context behavior to remain visible in traces.
+The `1.0` ratios keep the projected transcript unchanged until the Engine's explicit
+85% watermark. This preserves an append-only Provider prefix between compactions while
+keeping every compaction event visible in traces.
 
 ## Memory
 

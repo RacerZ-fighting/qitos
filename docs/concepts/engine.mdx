@@ -248,11 +248,19 @@ engine = Engine(
         max_cost_usd=2.0,
         max_tool_concurrency=4,
         max_children=4,
+        # Reserve step 30 for a tool-free final conclusion.
+        terminal_synthesis=True,
         # Optional outer scheduler deadline; the earlier limit wins.
         deadline_monotonic=time.monotonic() + 120.0,
     ),
 )
 ```
+
+With `terminal_synthesis=True`, ordinary work can consume at most `max_steps - 1`
+steps. The reserved turn receives an empty frozen Tool exposure and cannot execute an
+action. A valid model final is committed normally; unavailable budget, Provider failure,
+an empty answer, or a ToolCall uses the Agent's deterministic terminal fallback and still
+publishes a terminal Journal boundary.
 
 Cost limits never guess from model names. Pass `model_pricing=ModelPricing(...)` to
 Engine, or expose a typed `pricing` value on the configured Model.

@@ -93,18 +93,23 @@ Agents that need an exact provider message shape can expose a `message_builder`
 implementing `qitos.core.message_builder.MessageBuilder`. Its
 `MessageBuildResult` owns outbound messages and optional history entries.
 
-For a tool-using agent, set `runtime_context` with
-`runtime_context_delivery="merge_tool"` to attach transient controller state
-to the final real tool result. QitOS keeps its original `tool_call_id` and adds
-a notice that this state is not tool output. If no text tool result is available
-or a multimodal user turn is required, QitOS safely falls back to a user
-message; it never writes the transient context back to history.
+Use `ContextSnapshot` for an application-state projection that must survive
+resume and remain cache-stable. QitOS appends a changed revision as its own
+canonical user message, persists exactly what the model saw, and leaves every
+earlier user, assistant, and ToolResult message unchanged. Returning the same
+revision and digest is a no-op; reusing one revision for different content is a
+configuration error. The snapshot is a model-input fact, not a replacement for
+the application's typed state.
 
 ```python
+from qitos import ContextSnapshot
+
 return MessageBuildResult(
     messages=messages,
-    runtime_context=current_state_summary,
-    runtime_context_delivery="merge_tool",
+    context_snapshot=ContextSnapshot(
+        revision=str(state.revision),
+        content=current_state_summary,
+    ),
 )
 ```
 

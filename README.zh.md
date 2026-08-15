@@ -18,6 +18,13 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **长程运行保持可缓存前缀**：两次明确压缩之间，canonical 模型历史严格 append-only。
+  Engine 在 80% 告警、85% 压缩并记录 Provider cache/prefix 事实；应用状态通过新的
+  `ContextSnapshot` 追加，不再改写旧 ToolResult。超大工具输出先完整持久化，模型侧统一使用
+  单条 8K、批次 16K 的 receipt 和可继续读取的 Artifact 引用。
+- **有终态结论的自主预算运行**：应用可以把最后一个 budget step 保留为无工具结论；Provider
+  不可用时仍提交确定性的可恢复 fallback。`PermissionMode.AUTONOMOUS` 为已授权产品移除
+  approval 与 shell 形态启发式，同时保留显式 deny、Runtime capability 与跨 Run owner 边界。
 - **可复现的手动质量门**：CI、文档和贡献校验现在只通过 GitHub Actions 手动触发。
   声明的开发环境已包含异步测试支持，build/audit job 也要求包含
   `PYSEC-2026-3447` 修复的 `setuptools` 版本。

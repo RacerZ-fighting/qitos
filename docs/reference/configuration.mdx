@@ -261,6 +261,7 @@ class RuntimeBudget:
     max_tool_concurrency: int = 4
     max_children: int = 4
     deadline_monotonic: Optional[float] = None
+    terminal_synthesis: bool = False
 ```
 
 `max_runtime_seconds` starts when the Engine run is admitted. `deadline_monotonic` is an
@@ -268,6 +269,12 @@ absolute `time.monotonic()` deadline supplied by an outer scheduler, so time spe
 Engine admission is not accidentally restored. When both are set, the earlier deadline
 wins. A `Task` object's relative budget values override the Engine defaults for that run;
 the outer absolute deadline is retained.
+
+`terminal_synthesis=True` reserves the final `max_steps` slot for a tool-free conclusion.
+That request does not expose Tool schemas or reuse Provider continuation. If the terminal
+request fails, returns a ToolCall, or cannot run because time/token/cost is exhausted,
+Engine commits `AgentModule.build_terminal_fallback()` instead. The default remains
+`False` so existing generic agents keep their current budget semantics.
 
 ---
 

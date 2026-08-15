@@ -18,13 +18,14 @@ from .journal import JournalRecordRef
 from .memory import Memory
 from .model_response import ModelResponse
 from .spec import ExperimentSpec, RunSpec
+from .state import StateSchema
 from .task import Task, TaskBudget
 from .tool_result import ToolResult
 from .tool_registry import ToolExposure, ToolRegistry
 from .turn import TurnSnapshot
 from ..prompting import PromptBuildResult, PromptBuilder, PromptSpec
 
-StateT = TypeVar("StateT")
+StateT = TypeVar("StateT", bound=StateSchema)
 ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
 
@@ -150,6 +151,15 @@ class AgentModule(ABC, Generic[StateT, ObservationT, ActionT]):
 
         _ = state, decision
         return CompletionAssessment.completed()
+
+    def build_terminal_fallback(self, state: StateT, stop_reason: str) -> str:
+        """Build a deterministic conclusion when terminal model synthesis is unavailable."""
+
+        step = state.current_step
+        return (
+            f"Run stopped because {stop_reason} after {step} committed work steps. "
+            "No additional tool execution was attempted."
+        )
 
     def decide(
         self, state: StateT, observation: ObservationT

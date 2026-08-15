@@ -26,6 +26,7 @@ class PermissionMode(str, Enum):
     DEFAULT = "default"
     PLAN = "plan"
     ACCEPT_EDITS = "accept_edits"
+    AUTONOMOUS = "autonomous"
     BYPASS = "bypass"
     AUTO = "auto"
 
@@ -78,18 +79,19 @@ class PermissionPipeline:
         Returns a ToolPermissionDecision (allow/deny/ask).
         """
         scope = self._build_scope(tool_name, args, tool_spec)
+        context = self._resolve_context(runtime_context)
 
         # Stage 0: BYPASS — allow everything if in bypass mode
         if self.mode == PermissionMode.BYPASS:
             return ToolPermissionDecision.allow(scope=scope)
 
         # Stage 1: DENY — hard deny rules + protected paths + mode-specific
-        deny = self._check_deny(tool_name, args, tool_spec, scope)
+        deny = self._check_deny(tool_name, args, tool_spec, scope, context)
         if deny is not None:
             return deny
 
         # Stage 2: ASK — ask rules from context
-        ask = self._check_ask(tool_name, args, tool_spec, scope)
+        ask = self._check_ask(tool_name, args, tool_spec, scope, context)
         if ask is not None:
             return ask
 
@@ -104,7 +106,19 @@ class PermissionPipeline:
             return safety
 
         # Stage 5: ALLOW — context allow rules + default
-        return self._check_allow(tool_name, args, tool_spec, scope)
+        return self._check_allow(tool_name, args, tool_spec, scope, context)
+
+    def _resolve_context(
+        self, runtime_context: Optional[Dict[str, Any]]
+    ) -> ToolPermissionContext:
+        if runtime_context is None:
+            return self._context
+        candidate = runtime_context.get("permission_context")
+        if isinstance(candidate, dict):
+            return ToolPermissionContext.from_dict(candidate)
+        if isinstance(candidate, ToolPermissionContext):
+            return candidate
+        return self._context
 
     def _build_scope(
         self,
@@ -131,15 +145,22 @@ class PermissionPipeline:
         args: Dict[str, Any],
         tool_spec: Optional[ToolSpec],
         scope: str,
+        context: ToolPermissionContext,
     ) -> Optional[ToolPermissionDecision]:
         # Check context deny rules
-        for rule in self._context.deny_rules:
+        for rule in context.deny_rules:
             if rule.matches(tool_name, scope):
                 return ToolPermissionDecision.deny(
                     rule.message or f"Tool '{tool_name}' is denied by rule.",
                     scope=scope,
                     matched_rule=rule,
                 )
+
+        # Autonomous callers explicitly opt out of QitOS safety heuristics.
+        # Tool exposure, runtime capabilities and caller-owned scope checks
+        # remain separate admission boundaries.
+        if self.mode == PermissionMode.AUTONOMOUS:
+            return None
 
         # Check protected paths for write tools
         if tool_name in WRITE_TOOL_NAMES:
@@ -173,9 +194,12 @@ class PermissionPipeline:
         args: Dict[str, Any],
         tool_spec: Optional[ToolSpec],
         scope: str,
+        context: ToolPermissionContext,
     ) -> Optional[ToolPermissionDecision]:
+        if self.mode == PermissionMode.AUTONOMOUS:
+            return None
         # Check context ask rules
-        for rule in self._context.ask_rules:
+        for rule in context.ask_rules:
             if rule.matches(tool_name, scope):
                 return ToolPermissionDecision.ask(
                     rule.message or f"Tool '{tool_name}' requires confirmation.",
@@ -191,6 +215,9 @@ class PermissionPipeline:
         tool_spec: Optional[ToolSpec],
         scope: str,
     ) -> Optional[ToolPermissionDecision]:
+        if self.mode == PermissionMode.AUTONOMOUS:
+            return None
+
         # ACCEPT_EDITS mode: auto-allow file edits, still ask for bash
         if self.mode == PermissionMode.ACCEPT_EDITS:
             if tool_name in WRITE_TOOL_NAMES:
@@ -241,6 +268,9 @@ class PermissionPipeline:
         tool_spec: Optional[ToolSpec],
         scope: str,
     ) -> Optional[ToolPermissionDecision]:
+        if self.mode == PermissionMode.AUTONOMOUS:
+            return None
+
         # Bash command safety analysis
         if tool_name in BASH_TOOL_NAMES:
             command = args.get("command", "")
@@ -264,19 +294,23 @@ class PermissionPipeline:
         args: Dict[str, Any],
         tool_spec: Optional[ToolSpec],
         scope: str,
+        context: ToolPermissionContext,
     ) -> ToolPermissionDecision:
         # Check context allow rules
-        for rule in self._context.allow_rules:
+        for rule in context.allow_rules:
             if rule.matches(tool_name, scope):
                 return ToolPermissionDecision.allow(scope=scope)
 
         # Default decision from context
-        if self._context.default_decision == "deny":
+        if context.default_decision == "deny":
             return ToolPermissionDecision.deny(
                 f"Tool '{tool_name}' is denied by default policy.",
                 scope=scope,
             )
-        if self._context.default_decision == "ask":
+        if (
+            context.default_decision == "ask"
+            and self.mode != PermissionMode.AUTONOMOUS
+        ):
             return ToolPermissionDecision.ask(
                 f"Tool '{tool_name}' requires confirmation by default policy.",
                 scope=scope,

@@ -17,9 +17,9 @@ to `main`.
 
 - Replay the 12 commits unique to `main` onto `core` without dropping either
   side's runtime behavior.
-- Preserve `MessageBuilder`, `runtime_context_delivery="merge_tool"`, and
-  parser-action projection as canonical `assistant(tool_calls) -> tool`
-  history.
+- Preserve `MessageBuilder` and parser-action projection as canonical
+  `assistant(tool_calls) -> tool` history. Dynamic application state now uses the
+  later append-only `ContextSnapshot` contract rather than rewriting a ToolResult.
 - Preserve the OpenAI-compatible provider and JSON repair fixes from `main`.
 - Run the QitOS test suite and stable-surface static checks, with any
   pre-existing optional-component or static-analysis blockers recorded.

@@ -7,7 +7,11 @@ import pytest
 
 from qitos import Action, AgentModule, Decision, Engine, ToolRegistry, tool
 from qitos.core.history import History, HistoryMessage
-from qitos.core.message_builder import MessageBuildRequest, MessageBuildResult
+from qitos.core.message_builder import (
+    ContextSnapshot,
+    MessageBuildRequest,
+    MessageBuildResult,
+)
 from qitos.core.model_response import ModelResponse
 from qitos.core.state import StateSchema
 from qitos.engine import RuntimeBudget
@@ -129,25 +133,48 @@ class _ToolCallAgent(AgentModule[_State, dict, Action]):
         return state
 
 
-class _RuntimeContextBuilder:
-    def __init__(self, delivery: str = "merge_tool"):
-        self.delivery = delivery
+class _ContextSnapshotBuilder:
+    def __init__(self, *, fixed: bool = False, conflicting: bool = False):
+        self.fixed = fixed
+        self.conflicting = conflicting
 
     def build_messages(self, request: MessageBuildRequest) -> MessageBuildResult:
         messages = [{"role": "system", "content": "System prompt"}]
-        if request.step_id == 0:
-            messages.append({"role": "user", "content": request.prepared})
-            return MessageBuildResult(messages=messages)
-        messages.append({"role": "user", "content": request.state.task})
         messages.extend(
-            message
+            message for message in request.history if message.get("role") != "system"
+        )
+        history_entries: list[dict[str, Any]] = []
+        if not any(
+            (message.get("_metadata") or {}).get("source") == "task"
             for message in request.history
-            if message.get("role") in {"assistant", "tool"}
+        ):
+            task = str(request.state.task)
+            messages.append({"role": "user", "content": task})
+            history_entries.append(
+                {
+                    "role": "user",
+                    "content": task,
+                    "step_id": request.step_id,
+                    "metadata": {"source": "task"},
+                }
+            )
+        revision = (
+            "fixed"
+            if self.fixed or self.conflicting
+            else f"step-{request.state.current_step}"
+        )
+        content_revision = (
+            f"step-{request.state.current_step}"
+            if self.conflicting
+            else revision
         )
         return MessageBuildResult(
             messages=messages,
-            runtime_context="authoritative state for the next action",
-            runtime_context_delivery=self.delivery,
+            history_entries=history_entries,
+            context_snapshot=ContextSnapshot(
+                revision=revision,
+                content=f"authoritative state {content_revision}",
+            ),
         )
 
 
@@ -439,7 +466,7 @@ def test_parser_tool_actions_use_the_same_assistant_tool_result_history_chain():
     assert assistant["tool_calls"][0]["function"]["name"] == "add"
 
 
-def test_message_builder_merges_runtime_context_into_last_real_tool_result():
+def test_message_builder_appends_changed_snapshot_without_rewriting_tool_result():
     model = _ResponseSequenceModel(
         [
             ModelResponse(
@@ -467,7 +494,7 @@ def test_message_builder_merges_runtime_context_into_last_real_tool_result():
     class _Agent(_ToolCallAgent):
         def __init__(self, llm):
             super().__init__(llm)
-            self.message_builder = _RuntimeContextBuilder()
+            self.message_builder = _ContextSnapshotBuilder()
 
         def decide(self, state, observation):
             _ = state, observation
@@ -481,24 +508,30 @@ def test_message_builder_merges_runtime_context_into_last_real_tool_result():
     assert [message["role"] for message in second] == [
         "system",
         "user",
+        "user",
         "assistant",
         "tool",
         "tool",
+        "user",
     ]
-    first_tool, last_tool = second[-2:]
+    first_tool, last_tool = second[-3:-1]
     assert first_tool["tool_call_id"] == "call_first"
-    assert "<RUNTIME_CONTEXT" not in first_tool["content"]
+    assert first_tool["content"] == "3"
     assert last_tool["tool_call_id"] == "call_last"
-    assert "42" in last_tool["content"]
-    assert "NOT part of the tool result" in last_tool["content"]
-    assert "authoritative state for the next action" in last_tool["content"]
-    assert all(
-        message.role != "user" or "RUNTIME_CONTEXT" not in str(message.content)
+    assert last_tool["content"] == "42"
+    assert second[-1] == {"role": "user", "content": "authoritative state step-1"}
+    snapshots = [
+        message
         for message in agent.history.messages
-    )
+        if message.metadata.get("source") == "context_snapshot"
+    ]
+    assert [message.metadata["revision"] for message in snapshots] == [
+        "step-0",
+        "step-1",
+    ]
 
 
-def test_message_builder_can_request_runtime_user_delivery():
+def test_message_builder_does_not_duplicate_an_unchanged_snapshot():
     model = _ResponseSequenceModel(
         [
             ModelResponse(
@@ -508,7 +541,10 @@ def test_message_builder_can_request_runtime_user_delivery():
                     {
                         "id": "call_1",
                         "type": "function",
-                        "function": {"name": "add", "arguments": '{"a": 20, "b": 22}'},
+                        "function": {
+                            "name": "add",
+                            "arguments": '{"a": 20, "b": 22}',
+                        },
                     }
                 ],
             ),
@@ -521,7 +557,7 @@ def test_message_builder_can_request_runtime_user_delivery():
     class _Agent(_ToolCallAgent):
         def __init__(self, llm):
             super().__init__(llm)
-            self.message_builder = _RuntimeContextBuilder(delivery="user")
+            self.message_builder = _ContextSnapshotBuilder(fixed=True)
 
         def decide(self, state, observation):
             _ = state, observation
@@ -533,13 +569,55 @@ def test_message_builder_can_request_runtime_user_delivery():
 
     assert result.state.final_result == "done"
     second = model.seen_messages[1]
-    assert second[-1]["role"] == "user"
-    assert "<RUNTIME_CONTEXT" in second[-1]["content"]
-    assert "<RUNTIME_CONTEXT" not in second[-2]["content"]
+    assert sum(
+        message.get("content") == "authoritative state fixed" for message in second
+    ) == 1
+    first = model.seen_messages[0]
+    assert first == second[: len(first)]
+
+
+def test_message_builder_rejects_reusing_a_revision_for_changed_content():
+    model = _ResponseSequenceModel(
+        [
+            ModelResponse(
+                text="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "add",
+                            "arguments": '{"a": 20, "b": 22}',
+                        },
+                    }
+                ],
+            ),
+            ModelResponse(text="Final Answer: must not be requested"),
+        ],
+        model="demo-model",
+        harness_metadata={"tool_policy": {"native_tool_call_preferred": True}},
+    )
+
+    class _Agent(_ToolCallAgent):
+        def __init__(self, llm):
+            super().__init__(llm)
+            self.message_builder = _ContextSnapshotBuilder(conflicting=True)
+
+        def decide(self, state, observation):
+            _ = state, observation
+            return None
+
+    result = Engine(agent=_Agent(model), budget=RuntimeBudget(max_steps=3)).run(
+        "compute"
+    )
+
+    assert len(model.seen_messages) == 1
+    assert result.state.stop_reason == "infrastructure_invalid"
 
 
 @pytest.mark.asyncio
-async def test_message_builder_falls_back_to_user_without_a_real_tool_result():
+async def test_message_builder_appends_first_snapshot_as_a_user_message():
     model = _ResponseSequenceModel(
         [ModelResponse(text="Final Answer: done")],
         model="demo-model",
@@ -548,7 +626,7 @@ async def test_message_builder_falls_back_to_user_without_a_real_tool_result():
     class _Agent(_ToolCallAgent):
         def __init__(self, llm):
             super().__init__(llm)
-            self.message_builder = _RuntimeContextBuilder()
+            self.message_builder = _ContextSnapshotBuilder()
 
     agent = _Agent(model)
     engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=2))
@@ -566,31 +644,7 @@ async def test_message_builder_falls_back_to_user_without_a_real_tool_result():
 
     request = model.seen_messages[0]
     assert [message["role"] for message in request] == ["system", "user", "user"]
-    assert "<RUNTIME_CONTEXT" in request[-1]["content"]
-
-
-def test_runtime_context_merge_rejects_nontext_tool_content_and_detects_multimodal_input():
-    runtime = Engine(
-        agent=_ToolCallAgent(llm=None), budget=RuntimeBudget(max_steps=1)
-    )._model_runtime
-    merged, target = runtime._merge_runtime_context_into_last_tool(
-        [
-            {
-                "role": "tool",
-                "tool_call_id": "call_1",
-                "content": [{"type": "text", "text": "ok"}],
-            }
-        ],
-        "state",
-    )
-
-    assert merged is False
-    assert target is None
-    assert runtime._current_user_has_multimodal_content(
-        [{"type": "image_url", "url": "https://example.com/input.png"}],
-        observation={},
-        record=StepRecord(step_id=1),
-    )
+    assert request[-1]["content"] == "authoritative state step-1"
 
 
 def test_native_tool_chain_removes_tool_results_without_retained_assistant_call():

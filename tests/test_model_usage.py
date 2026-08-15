@@ -48,6 +48,41 @@ def test_usage_accepts_anthropic_cache_fields_and_preserves_unknown_counts() -> 
     assert usage.cache_write_tokens == 3
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"cached_tokens": 0}, 0),
+        ({"prompt_cache_hit_tokens": 7}, 7),
+        ({"prompt_tokens_details": {"cached_tokens": 8}}, 8),
+        ({"input_tokens_details": {"cached_tokens": 9}}, 9),
+    ],
+)
+def test_usage_normalizes_provider_cache_read_variants(
+    raw: dict[str, object],
+    expected: int,
+) -> None:
+    usage = ModelUsage.from_mapping(raw)
+
+    assert usage.cache_read_tokens == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"cache_write_tokens": 0}, 0),
+        ({"cache_write_input_tokens": 5}, 5),
+        ({"cache_creation_input_tokens": 6}, 6),
+    ],
+)
+def test_usage_normalizes_provider_cache_write_variants(
+    raw: dict[str, object],
+    expected: int,
+) -> None:
+    usage = ModelUsage.from_mapping(raw)
+
+    assert usage.cache_write_tokens == expected
+
+
 def test_usage_details_are_immutable_and_return_defensive_copies() -> None:
     raw = {"prompt_tokens": 2, "details": {"cached": 1}}
     usage = ModelUsage.from_mapping(raw)

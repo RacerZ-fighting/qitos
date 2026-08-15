@@ -19,7 +19,7 @@ from qitos.trace.redaction import redact_mapping
 from ..core.action import Action
 from ..engine.hooks import EngineHook, HookContext
 from .cli_render import RichRender
-from .content_renderer import ContentFirstRenderer
+from .content_renderer import ContentFirstRenderer, DEFAULT_RENDER_PREVIEW_CHARS
 from .events import RenderEvent
 
 if TYPE_CHECKING:
@@ -289,12 +289,7 @@ class RenderStreamHook(RenderHook):
                         "model_input_digest": event.payload.get("model_input_digest"),
                         "context": event.payload.get("context"),
                         "state_stats": event.payload.get("state_stats"),
-                        "runtime_context_delivery": event.payload.get(
-                            "runtime_context_delivery"
-                        ),
-                        "runtime_context_display": event.payload.get(
-                            "runtime_context_display"
-                        ),
+                        "context_snapshot": event.payload.get("context_snapshot"),
                     },
                 )
                 if os.getenv("QITOS_TUI_SHOW_MEMORY", "1").strip().lower() not in {"0", "false", "no", "off"}:
@@ -624,7 +619,7 @@ class ClaudeStyleHook(RenderStreamHook):
     def __init__(
         self,
         output_jsonl: Optional[str] = None,
-        max_preview_chars: int = 50000,
+        max_preview_chars: int = DEFAULT_RENDER_PREVIEW_CHARS,
         theme: str = "research",
         log_file: Optional[str] = None,
     ):
@@ -655,7 +650,6 @@ class ClaudeStyleHook(RenderStreamHook):
         self._last_step: Optional[int] = None
         self._last_agent_id: Optional[str] = None
         self._status: Any = None
-        chosen = _CLAUDE_THEME_PRESETS.get(theme, _CLAUDE_THEME_PRESETS["research"])
         self.theme_name = theme if theme in _CLAUDE_THEME_PRESETS else "research"
         self._spinner: str = "arc"
         self._renderer = ContentFirstRenderer(max_preview_chars=max_preview_chars)
@@ -883,22 +877,6 @@ class ClaudeStyleHook(RenderStreamHook):
                             if not stripped:
                                 continue
                             self._rail("bright_blue", f"[bright_blue]{stripped}[/bright_blue]")
-                    runtime_display = (event.payload or {}).get(
-                        "runtime_context_display"
-                    )
-                    if isinstance(runtime_display, dict):
-                        runtime_text = str(runtime_display.get("content") or "").strip()
-                        if runtime_text:
-                            from rich.markup import escape
-
-                            tool_call_id = runtime_display.get("tool_call_id") or "unknown"
-                            self._rail(
-                                "bright_green",
-                                "[bold bright_green]── Runtime Context "
-                                f"(folded into tool {escape(str(tool_call_id))}) ──[/bold bright_green]",
-                            )
-                            for line in runtime_text.splitlines():
-                                self._rail("gray70", f"[dim]{escape(line)}[/dim]")
                     self._state_steps.add(event.step_id)
                 return
             if event.step_id in self._thought_steps:
@@ -1090,7 +1068,7 @@ class ClaudeStyleHook(RenderStreamHook):
             elif event.node == "handoff_end":
                 self._rail(
                     "yellow",
-                    f"[dim]⇄ Handoff complete[/dim]",
+                    "[dim]⇄ Handoff complete[/dim]",
                 )
             return
 

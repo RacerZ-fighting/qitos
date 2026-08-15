@@ -18,6 +18,15 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Cache-stable long runs**: canonical model history stays append-only between explicit
+  compactions. Engine warns at 80%, compacts at 85%, records Provider cache/prefix facts,
+  and appends changed application `ContextSnapshot` revisions without rewriting an old
+  ToolResult. Oversized Tool output is persisted first, with an 8K/result and 16K/batch
+  model receipt plus a readable Artifact reference.
+- **A real final step for bounded autonomous runs**: applications can reserve the last
+  budget step for a tool-free conclusion with a deterministic durable fallback.
+  `PermissionMode.AUTONOMOUS` removes approval and shell-shape prompts for authorized
+  products while explicit denies, Runtime capabilities, and owner boundaries remain.
 - **Provider-hosted Web with a managed fallback**: an admitted `web_search` Tool now
   uses the official OpenAI Responses endpoint, Qwen Responses/Chat, or the official
   Anthropic Messages server-side search contract when that transport declares support. Native search

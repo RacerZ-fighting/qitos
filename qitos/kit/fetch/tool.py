@@ -42,7 +42,6 @@ class ManagedWebFetchTool(BaseTool):
                 rule_scope_builder=_url_rule_scope,
                 read_only=True,
                 concurrency_safe=True,
-                result_max_chars=110_000,
             )
         )
 

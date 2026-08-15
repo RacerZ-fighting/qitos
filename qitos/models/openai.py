@@ -62,18 +62,55 @@ def _usage_payload(usage: Any) -> Optional[Dict[str, Any]]:
     if usage is None:
         return None
     prompt_tokens = _field(usage, "prompt_tokens")
+    if prompt_tokens is None:
+        prompt_tokens = _field(usage, "input_tokens")
     completion_tokens = _field(usage, "completion_tokens")
+    if completion_tokens is None:
+        completion_tokens = _field(usage, "output_tokens")
     total_tokens = _field(usage, "total_tokens")
-    details = _field(usage, "prompt_tokens_details")
-    cached = _field(details, "cached_tokens")
-    if prompt_tokens is None and completion_tokens is None and total_tokens is None:
+    cached = _field(usage, "cached_tokens")
+    if cached is None:
+        cached = _field(_field(usage, "prompt_tokens_details"), "cached_tokens")
+    if cached is None:
+        cached = _field(_field(usage, "input_tokens_details"), "cached_tokens")
+    if cached is None:
+        cached = _field(usage, "prompt_cache_hit_tokens")
+    if cached is None:
+        cached = _field(usage, "cache_read_input_tokens")
+    cache_write = _field(usage, "cache_write_tokens")
+    if cache_write is None:
+        cache_write = _field(usage, "cache_write_input_tokens")
+    if cache_write is None:
+        cache_write = _field(usage, "cache_creation_input_tokens")
+    reasoning = _field(usage, "reasoning_tokens")
+    if reasoning is None:
+        reasoning = _field(
+            _field(usage, "output_tokens_details"),
+            "reasoning_tokens",
+        )
+    if all(
+        value is None
+        for value in (
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached,
+            cache_write,
+            reasoning,
+        )
+    ):
         return None
-    return {
+    result = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
         "cached_tokens": cached,
     }
+    if cache_write is not None:
+        result["cache_write_tokens"] = cache_write
+    if reasoning is not None:
+        result["reasoning_tokens"] = reasoning
+    return result
 
 
 class ChatStreamAccumulator:
@@ -121,6 +158,8 @@ class ChatStreamAccumulator:
         if finish_reason is not None:
             self._finish_reason = str(finish_reason)
         usage = _usage_payload(_field(chunk, "usage"))
+        if usage is None:
+            usage = _usage_payload(_field(choice, "usage"))
         if usage:
             self._usage = usage
         return events
@@ -465,12 +504,12 @@ def _disable_thinking_for_forced_tool_choice(kwargs: Dict[str, Any]) -> Dict[str
 
 
 def _is_unsupported_stream_options_error(exc: Exception) -> bool:
-    status_code = getattr(exc, "status_code", None)
+    status_code = _field(exc, "status_code")
     if status_code is None:
-        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        status_code = _field(_field(exc, "response"), "status_code")
     if status_code not in {400, 422}:
         return False
-    detail = f"{exc} {getattr(exc, 'body', '')}".casefold()
+    detail = f"{exc} {_field(exc, 'body', '')}".casefold()
     return "stream_options" in detail and any(
         marker in detail
         for marker in (
@@ -482,6 +521,25 @@ def _is_unsupported_stream_options_error(exc: Exception) -> bool:
             "unrecognized",
             "unsupported",
             "unexpected",
+        )
+    )
+
+
+def _is_unsupported_prompt_cache_key_error(exc: Exception) -> bool:
+    status_code = _provider_status_code(exc)
+    if status_code not in {400, 404, 422, None}:
+        return False
+    detail = f"{exc} {_field(exc, 'body', '')}".casefold()
+    if "prompt_cache_key" not in detail and "prompt cache key" not in detail:
+        return False
+    return any(
+        marker in detail
+        for marker in (
+            "not supported",
+            "unexpected keyword",
+            "unknown parameter",
+            "unrecognized",
+            "unsupported",
         )
     )
 
@@ -747,7 +805,7 @@ class OpenAICompatibleModel(Model):
 
     def _chat_stream_request(
         self,
-        messages: List[Dict[str, Any]],
+        model_request: ModelRequest,
         kwargs: Dict[str, Any],
         *,
         deadline_monotonic: float | None,
@@ -756,10 +814,17 @@ class OpenAICompatibleModel(Model):
             _relocate_chat_template_kwargs(kwargs)
         )
         create_kwargs.setdefault("stream_options", {"include_usage": True})
+        create_kwargs.setdefault(
+            "prompt_cache_key",
+            model_request.cache_affinity,
+        )
         request: Dict[str, Any] = {
             **create_kwargs,
             "model": self.model,
-            "messages": cast(Any, _to_openai_messages(messages)),
+            "messages": cast(
+                Any,
+                _to_openai_messages(model_request.message_dicts()),
+            ),
             "stream": True,
         }
         request.setdefault("max_tokens", self.max_tokens)
@@ -778,6 +843,7 @@ class OpenAICompatibleModel(Model):
         client = self._new_client(timeout=float(request_kwargs["timeout"]))
         candidate = dict(request_kwargs)
         stream_options_fallback = False
+        cache_affinity_fallback = False
         managed_search_fallback = False
         try:
             while True:
@@ -792,6 +858,14 @@ class OpenAICompatibleModel(Model):
                     ):
                         candidate.pop("stream_options", None)
                         stream_options_fallback = True
+                        continue
+                    if (
+                        not cache_affinity_fallback
+                        and "prompt_cache_key" in candidate
+                        and _is_unsupported_prompt_cache_key_error(exc)
+                    ):
+                        candidate.pop("prompt_cache_key", None)
+                        cache_affinity_fallback = True
                         continue
                     if (
                         not managed_search_fallback
@@ -827,7 +901,7 @@ class OpenAICompatibleModel(Model):
         )
         if self.api_mode == "chat_completions":
             chat_request = self._chat_stream_request(
-                request.message_dicts(),
+                request,
                 request_kwargs,
                 deadline_monotonic=deadline_monotonic,
             )
@@ -843,36 +917,42 @@ class OpenAICompatibleModel(Model):
         client = self._new_client(
             timeout=effective_request_timeout(self.timeout, deadline_monotonic)
         )
+        response_kwargs = self._attempt_request_kwargs(
+            request_kwargs,
+            deadline_monotonic=deadline_monotonic,
+        )
+        response_kwargs.setdefault("prompt_cache_key", request.cache_affinity)
+        cache_affinity_fallback = False
+        managed_search_fallback = False
         try:
-            try:
-                stream = await _open_responses_stream(
-                    self,
-                    client,
-                    request,
-                    provider=self.provider_name,
-                    request_kwargs=self._attempt_request_kwargs(
-                        request_kwargs,
-                        deadline_monotonic=deadline_monotonic,
-                    ),
-                )
-            except Exception as exc:
-                if (
-                    not isinstance(managed_web_search_tools, list)
-                    or not _is_unsupported_hosted_web_search_error(exc)
-                ):
+            while True:
+                try:
+                    stream = await _open_responses_stream(
+                        self,
+                        client,
+                        request,
+                        provider=self.provider_name,
+                        request_kwargs=dict(response_kwargs),
+                    )
+                    break
+                except Exception as exc:
+                    if (
+                        not cache_affinity_fallback
+                        and "prompt_cache_key" in response_kwargs
+                        and _is_unsupported_prompt_cache_key_error(exc)
+                    ):
+                        response_kwargs.pop("prompt_cache_key", None)
+                        cache_affinity_fallback = True
+                        continue
+                    if (
+                        not managed_search_fallback
+                        and isinstance(managed_web_search_tools, list)
+                        and _is_unsupported_hosted_web_search_error(exc)
+                    ):
+                        response_kwargs["tools"] = managed_web_search_tools
+                        managed_search_fallback = True
+                        continue
                     raise
-                fallback_kwargs = dict(request_kwargs)
-                fallback_kwargs["tools"] = managed_web_search_tools
-                stream = await _open_responses_stream(
-                    self,
-                    client,
-                    request,
-                    provider=self.provider_name,
-                    request_kwargs=self._attempt_request_kwargs(
-                        fallback_kwargs,
-                        deadline_monotonic=deadline_monotonic,
-                    ),
-                )
         except (asyncio.CancelledError, Exception):
             await close_async_resource(client)
             raise

@@ -171,11 +171,17 @@ class RuntimeBudget:
     max_runtime_seconds: Optional[float] = None
     max_tokens: Optional[int] = None
     deadline_monotonic: Optional[float] = None
+    terminal_synthesis: bool = False
 ```
 
 `max_runtime_seconds` 从 Engine 接纳运行时开始计时；`deadline_monotonic` 是外层调度器
 按 `time.monotonic()` 传入的绝对截止时间，不会把排队消耗的时间重新补回来。两者同时
 存在时取更早者。`Task` 可以覆盖相对预算，但不会移除外层绝对截止时间。
+
+启用 `terminal_synthesis=True` 后，`max_steps` 的最后一步只用于生成无工具结论，不发送 Tool
+schema，也不复用 Provider continuation。终态请求失败、返回 ToolCall，或时间/Token/费用已经
+耗尽时，Engine 会提交 `AgentModule.build_terminal_fallback()` 的确定性结果。默认仍为 `False`，
+保持通用 Agent 的既有预算语义。
 
 ## 环境变量
 

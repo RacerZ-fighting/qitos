@@ -82,6 +82,20 @@ How to update:
 
 ### Changed
 
+- Long-running model input is now append-only between explicit compactions. The old
+  recent-round projection is gone; Engine warns at 80%, compacts at 85%, records stable
+  cache-affinity/prefix telemetry, and exposes an immutable `ContextSnapshot` contract
+  for application state without rewriting ToolResults or prior messages.
+- Model-visible Tool output now has one Engine-owned envelope: 8,000 characters per
+  result and 16,000 per batch. Complete oversized output is persisted first and replaced
+  by a deterministic head/tail receipt with Artifact path, size, and read reference.
+- `RuntimeBudget.terminal_synthesis` can reserve the final step for a tool-free
+  conclusion with a deterministic Agent fallback and durable resume boundary.
+  `PermissionMode.AUTONOMOUS` lets authorized applications suppress QitOS approval and
+  shell-shape heuristics while retaining explicit deny rules and runtime boundaries.
+- Foreground commands now yield a stable managed-process handle when they outlive their
+  initial wait. Process wait/read cancellation and deadline results preserve the latest
+  bounded handle snapshot so resume and mailbox completion remain actionable.
 - Managed `web_fetch` now projects its requested URL into the canonical Tool permission
   scope, including the direct `BaseTool` permission path, so application network rules
   are applied consistently before a fetch begins.

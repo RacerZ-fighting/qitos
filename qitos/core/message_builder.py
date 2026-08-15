@@ -9,7 +9,44 @@ default message construction logic (unchanged behavior).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+
+
+class ContextSnapshotConflictError(RuntimeError):
+    """Raised when one immutable context revision is reused for other content."""
+
+
+@dataclass(frozen=True, slots=True)
+class ContextSnapshot:
+    """One immutable, append-only model projection of current application state."""
+
+    revision: str
+    content: str
+    digest: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        revision = str(self.revision or "").strip()
+        content = str(self.content or "").strip()
+        if not revision:
+            raise ValueError("context snapshot revision must be non-empty")
+        if not content:
+            raise ValueError("context snapshot content must be non-empty")
+        object.__setattr__(self, "revision", revision)
+        object.__setattr__(self, "content", content)
+        object.__setattr__(
+            self,
+            "digest",
+            hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        )
+
+    @classmethod
+    def from_content(cls, content: str) -> "ContextSnapshot":
+        """Use the content digest as a stable revision when no domain revision exists."""
+
+        normalized = str(content or "").strip()
+        revision = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return cls(revision=revision, content=normalized)
 
 
 @dataclass
@@ -34,14 +71,9 @@ class MessageBuildResult:
     # Each dict must have at least: {"role": str, "content": str, "step_id": int}
     # Optional keys: "metadata", "tool_calls", "tool_call_id", "name"
     history_entries: List[Dict[str, Any]] = field(default_factory=list)
-    # Optional transient working-state payload for the current request.  The
-    # engine wraps generic state in <RUNTIME_CONTEXT>; an already delimited
-    # <DECISION_CONTEXT> is delivered verbatim.  Neither form is persisted as
-    # a synthetic history turn.
-    runtime_context: Optional[str] = None
-    # ``merge_tool`` appends the wrapped context to the final tool result;
-    # ``user`` appends a trailing user message; ``none`` leaves messages intact.
-    runtime_context_delivery: str = "none"
+    # When the revision or digest changes, the engine appends this projection
+    # as a standalone user message and persists exactly what the model saw.
+    context_snapshot: Optional[ContextSnapshot] = None
 
 
 @runtime_checkable
@@ -57,9 +89,17 @@ class MessageBuilder(Protocol):
         The returned ``history_entries`` are appended to the engine's
         history, replacing the engine's default history-append logic.
 
-        ``runtime_context`` is transient request state.  Builders can request
-        ``merge_tool`` delivery to keep native assistant/tool conversations
-        closed on a tool result, with a safe user-message fallback when no
-        merge target is available.
+        ``context_snapshot`` is an immutable application-state projection. The
+        engine appends changed snapshots instead of rewriting a prior user or
+        tool message, preserving Provider-cacheable request prefixes.
         """
         ...
+
+
+__all__ = [
+    "ContextSnapshot",
+    "ContextSnapshotConflictError",
+    "MessageBuildRequest",
+    "MessageBuildResult",
+    "MessageBuilder",
+]

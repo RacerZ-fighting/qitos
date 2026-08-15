@@ -278,9 +278,9 @@ Use it when:
 
 It supports:
 
-- warning thresholds before the Engine's 80% force boundary
+- an 80% observability warning and the Engine's explicit 85% compaction boundary
 - transaction-aware round grouping with `MessageGrouper`
-- level 1 micro-compaction of large messages in older complete rounds
+- boundary-triggered micro-compaction of large messages in older complete rounds
 - level 2 summaries that preserve configured recent rounds
 - level 3 resummaries that preserve the latest complete round
 - runtime metadata and compaction events that can surface in traces
@@ -309,8 +309,9 @@ and tool results by call id even when they cross step boundaries, so selection a
 compaction never split one tool transaction.
 
 The Engine counts the complete provider packet, including API-delivered tool and response
-schemas, against a provider-safe input budget. At 80% it requests compaction before model
-dispatch. Summary work runs against an immutable history snapshot and is committed only
+schemas, against a provider-safe input budget. At 80% it emits a warning without changing
+messages; at 85% it requests compaction before model dispatch. Summary work runs against
+an immutable history snapshot and is committed only
 as a projection when the version still matches; canonical history remains untouched.
 Exact-prefix checkpoints let later projections summarize only newly covered complete
 rounds. With auto-compaction enabled, token selection precedes generic message-count

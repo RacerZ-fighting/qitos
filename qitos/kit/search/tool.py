@@ -38,7 +38,6 @@ class ManagedWebSearchTool(BaseTool):
                 permissions=ToolPermission(network=True),
                 read_only=True,
                 concurrency_safe=True,
-                result_max_chars=20_000,
             )
         )
 

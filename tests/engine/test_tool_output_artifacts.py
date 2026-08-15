@@ -131,7 +131,7 @@ async def test_large_output_is_durable_readable_and_stable_on_resume(
     )
     context = ContextConfig(
         tool_result_max_chars=len(output) // 8,
-        tool_result_per_message_max_chars=len(output) // 4,
+        tool_result_batch_max_chars=len(output) // 4,
     )
 
     result = await Engine(
@@ -154,6 +154,11 @@ async def test_large_output_is_durable_readable_and_stable_on_resume(
     assert artifact.path in model_content
     assert len(model_content) < len(output)
     assert len(model_content) <= context.tool_result_max_chars
+    assert output[:40] in model_content
+    assert output[-40:] in model_content
+    assert "omitted" in model_content
+    assert artifact.sha256
+    assert artifact.sha256 not in model_content
     assert original_model_message["tool_call_id"] == call_id
 
     read_result = await ReadFile(str(workspace)).execute(
@@ -239,3 +244,104 @@ async def test_persistence_failure_keeps_canonical_terminal_result() -> None:
         event.payload.get("stage") == "artifact_persist_failed"
         for event in result.events
     )
+
+
+@pytest.mark.asyncio
+async def test_parallel_results_share_one_strict_model_budget(
+    tmp_path: Path,
+) -> None:
+    class BatchModel(Model):
+        qitos_harness_metadata = _ToolModel.qitos_harness_metadata
+
+        def __init__(self) -> None:
+            super().__init__(model="artifact-batch", temperature=None)
+            self.inputs: list[list[dict[str, Any]]] = []
+
+        async def stream(
+            self,
+            request: ModelRequest,
+        ) -> AsyncIterator[ModelStreamEvent]:
+            self.inputs.append(request.message_dicts())
+            if len(self.inputs) == 1:
+                yield ModelStreamEvent(
+                    type=ModelStreamEventType.COMPLETED,
+                    tool_calls=[
+                        {
+                            "id": f"batch-{label}",
+                            "type": "function",
+                            "function": {
+                                "name": "produce_named",
+                                "arguments": f'{{"label":"{label}"}}',
+                            },
+                        }
+                        for label in ("alpha", "bravo", "charlie")
+                    ],
+                    finish_reason="tool_calls",
+                )
+                return
+            yield ModelStreamEvent(
+                text="Final Answer: complete",
+                type=ModelStreamEventType.COMPLETED,
+            )
+
+    class BatchAgent(AgentModule[_State, Observation, Action]):
+        def __init__(self, model: Model) -> None:
+            registry = ToolRegistry()
+
+            @tool(name="produce_named")
+            def produce_named(label: str) -> str:
+                return f"{label}-start\n" + (label * 600) + f"\n{label}-end"
+
+            registry.register(produce_named)
+            super().__init__(
+                llm=model,
+                tool_registry=registry,
+                model_parser=ReActTextParser(),
+            )
+
+        def init_state(self, task: str, **kwargs: Any) -> _State:
+            _ = kwargs
+            return _State(task=task, max_steps=3)
+
+        def decide(
+            self,
+            state: _State,
+            observation: Observation,
+        ) -> Decision[Action] | None:
+            _ = state, observation
+            return None
+
+        def reduce(
+            self,
+            state: _State,
+            observation: Observation,
+            decision: Decision[Action],
+        ) -> _State:
+            _ = observation, decision
+            return state
+
+    model = BatchModel()
+    single_limit = 420
+    batch_limit = 900
+    result = await Engine(
+        BatchAgent(model),
+        artifact_store=FileArtifactStore(
+            tmp_path / "artifacts",
+            reference_root=tmp_path,
+        ),
+        context_config=ContextConfig(
+            tool_result_max_chars=single_limit,
+            tool_result_batch_max_chars=batch_limit,
+        ),
+    ).arun("collect parallel evidence")
+
+    tool_messages = [
+        message for message in model.inputs[1] if message.get("role") == "tool"
+    ]
+    contents = [str(message.get("content") or "") for message in tool_messages]
+    assert len(tool_messages) == 3
+    assert all(0 < len(content) <= single_limit for content in contents)
+    assert sum(map(len, contents)) <= batch_limit
+    assert all("Preview (head/tail)" in content for content in contents)
+    assert all("omitted" in content for content in contents)
+    assert all(len(item.artifacts) == 1 for item in result.records[0].action_results)

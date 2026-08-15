@@ -43,8 +43,11 @@ class RuntimeBudget:
     max_tool_concurrency: int = 4
     max_children: int = 4
     deadline_monotonic: Optional[float] = None
+    terminal_synthesis: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.terminal_synthesis, bool):
+            raise TypeError("terminal_synthesis must be a boolean")
         for name in ("max_steps", "max_tool_concurrency", "max_children"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):
@@ -76,9 +79,9 @@ class ContextConfig:
 
     Three thresholds act on one request, in this order:
 
-    * ``warning_ratio`` (0.75) — occupancy at which a ``warning`` context event
+    * ``warning_ratio`` (0.80) — occupancy at which a ``warning`` context event
       is emitted. Observability only; nothing is reduced.
-    * ``compact_ratio`` (0.80) — fraction of the provider-safe total input
+    * ``compact_ratio`` (0.85) — fraction of the provider-safe total input
       budget at which the history strategy must compact. System and current
       user tokens count toward this threshold.
     * overflow (1.0) — exceeding ``available_input_budget`` raises
@@ -90,15 +93,14 @@ class ContextConfig:
     """
 
     enabled: bool = True
-    warning_ratio: float = 0.75
-    compact_ratio: float = 0.80
+    warning_ratio: float = 0.80
+    compact_ratio: float = 0.85
     safety_reserve_tokens: Optional[int] = None
     safety_reserve_ratio: float = 0.05
     min_safety_reserve_tokens: int = 1024
     default_context_window: int = 128000
-    tool_result_max_chars: int = 50000
-    tool_result_per_message_max_chars: int = 200000
-    conversation_max_rounds: int = 10
+    tool_result_max_chars: int = 8_000
+    tool_result_batch_max_chars: int = 16_000
     reactive_compact: bool = True
     # Repeated-call protection is generic policy and may be disabled explicitly
     # by a product configuration when its investigation semantics require it.
@@ -137,7 +139,7 @@ class ContextTelemetry:
     meter_error: str = ""
     token_estimate_error: Optional[int] = None
     occupancy_ratio: float = 0.0
-    warning_threshold_ratio: float = 0.75
+    warning_threshold_ratio: float = 0.80
     counting_mode: str = "disabled"
     prompt_tokens_total: int = 0
     completion_tokens_total: int = 0

@@ -245,8 +245,6 @@ class AgentREPL:
             read_before_write_enforcer=rbw_enforcer,
             permission_interaction_callback=self._permission_interaction_handler,
             context_config=ContextConfig(
-                tool_result_max_chars=50000,
-                tool_result_per_message_max_chars=200000,
                 reactive_compact=True,
                 loop_max_repeats=3,
             ),

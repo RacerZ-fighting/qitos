@@ -186,6 +186,7 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
 
     assert captured["client"]["max_retries"] == 0
     assert captured["request"]["system"] == "Follow the contract."
+    assert captured["request"]["metadata"] == {"user_id": "provider-test"}
     assert captured["request"]["messages"] == [
         {"role": "user", "content": [{"type": "text", "text": "Look up x."}]}
     ]
@@ -214,7 +215,6 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
         "prompt_tokens": 10,
         "completion_tokens": 5,
         "total_tokens": 15,
-        "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 2,
     }
     assert events.closed is True
@@ -239,6 +239,55 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
     assert replay[1]["content"] == [
         {"type": "tool_result", "tool_use_id": "toolu_1", "content": "result"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_retries_without_affinity_when_endpoint_rejects_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    events = _AsyncListStream(
+        [
+            {
+                "type": "message_start",
+                "message": {"id": "msg_1", "usage": {"input_tokens": 1}},
+            },
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 1},
+            },
+            {"type": "message_stop"},
+        ]
+    )
+
+    class UnsupportedAffinityError(RuntimeError):
+        status_code = 400
+        body = {"error": "unknown parameter metadata.user_id"}
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.messages = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(dict(kwargs))
+            if len(requests) == 1:
+                raise UnsupportedAffinityError("metadata user_id is not supported")
+            return events
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("anthropic")
+    fake.AsyncAnthropic = Client
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    model = AnthropicModel(api_key="test-key", model="claude-test", max_attempts=1)
+    chunks = await _collect(model, [{"role": "user", "content": "question"}])
+
+    assert chunks[-1].done is True
+    assert requests[0]["metadata"] == {"user_id": "provider-test"}
+    assert "metadata" not in requests[1]
 
 
 @pytest.mark.asyncio

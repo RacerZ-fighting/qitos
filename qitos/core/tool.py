@@ -301,7 +301,6 @@ class ToolSpec:
     needs_approval: bool = False
     requires_user_interaction: bool = False
     supports_background: bool = False
-    result_max_chars: Optional[int] = None
     produces_artifact: bool = False
     rule_scope_builder: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None
     prompt: str = ""
@@ -339,7 +338,6 @@ class ToolMeta:
     needs_approval: bool = False
     requires_user_interaction: bool = False
     supports_background: bool = False
-    result_max_chars: Optional[int] = None
     produces_artifact: bool = False
     rule_scope_builder: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None
     group: str = "default"
@@ -504,7 +502,6 @@ def tool(
     needs_approval: bool = False,
     requires_user_interaction: bool = False,
     supports_background: bool = False,
-    result_max_chars: Optional[int] = None,
     produces_artifact: bool = False,
     rule_scope_builder: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
     group: str = "default",
@@ -530,7 +527,6 @@ def tool(
             needs_approval=needs_approval,
             requires_user_interaction=requires_user_interaction,
             supports_background=supports_background,
-            result_max_chars=result_max_chars,
             produces_artifact=produces_artifact,
             rule_scope_builder=rule_scope_builder,
         )
@@ -690,7 +686,6 @@ def build_tool_spec(func: Callable[..., Any], meta: ToolMeta) -> ToolSpec:
         needs_approval=meta.needs_approval,
         requires_user_interaction=meta.requires_user_interaction,
         supports_background=meta.supports_background,
-        result_max_chars=meta.result_max_chars,
         produces_artifact=meta.produces_artifact,
         rule_scope_builder=meta.rule_scope_builder,
         prompt=meta.prompt,

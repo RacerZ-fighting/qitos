@@ -15,6 +15,9 @@ from rich.table import Table
 from .events import RenderEvent
 
 
+DEFAULT_RENDER_PREVIEW_CHARS = 8_000
+
+
 def _is_env_result(result: Any) -> bool:
     """Return True if this result is an environment step result (not a tool result)."""
     if not isinstance(result, dict):
@@ -65,7 +68,7 @@ def _display_tool_status(status: Any, *, has_error: bool = False) -> str:
 class ContentFirstRenderer:
     """Extract concise thought/action/observation/memory blocks from events."""
 
-    def __init__(self, max_preview_chars: int = 50000):
+    def __init__(self, max_preview_chars: int = DEFAULT_RENDER_PREVIEW_CHARS):
         self.max_preview_chars = max(120, int(max_preview_chars))
 
     def task_text(self, task: str, max_steps: Optional[int] = None) -> str:
@@ -650,7 +653,7 @@ class ContentFirstRenderer:
         return {
             "status": "success",
             "title": title,
-            "body": self._truncate(body, 50000) if body else "",
+            "body": self._head_tail(body, self.max_preview_chars) if body else "",
             "primary_kind": "terminal_output" if output else "terminal_screen",
             "secondary_only": secondary,
         }
@@ -662,7 +665,7 @@ class ContentFirstRenderer:
             return {
                 "status": "neutral",
                 "title": "Observation",
-                "body": self._truncate(self._to_text(item), 50000),
+                "body": self._head_tail(self._to_text(item), self.max_preview_chars),
                 "primary_kind": "tool_result",
                 "secondary_only": secondary,
             }
@@ -719,7 +722,10 @@ class ContentFirstRenderer:
                 "status": "error",
                 "title": self._truncate(str(err), 120),
                 "url": self._short_url(url) if url else "",
-                "body": self._truncate(self._to_text(cleaned.get("content", "")), 50000),
+                "body": self._head_tail(
+                    self._to_text(cleaned.get("content", "")),
+                    self.max_preview_chars,
+                ),
                 "primary_kind": "error",
                 "secondary_only": secondary,
             }, cleaned)
@@ -729,7 +735,7 @@ class ContentFirstRenderer:
             "status": "neutral",
             "title": self._truncate(title, 120),
             "url": self._short_url(url) if url else "",
-            "body": self._truncate(body, 50000) if body else "",
+            "body": self._head_tail(body, self.max_preview_chars) if body else "",
             "primary_kind": "tool_result",
             "secondary_only": secondary,
         }, cleaned)
@@ -744,6 +750,9 @@ class ContentFirstRenderer:
         )
         if lifecycle_status:
             summary["tool_result_status"] = lifecycle_status
+        body = summary.get("body")
+        if isinstance(body, str):
+            summary["body"] = self._head_tail(body, self.max_preview_chars)
         return summary
 
     def _unwrap_tool_result(self, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -936,7 +945,9 @@ class ContentFirstRenderer:
             if "\n" not in value or len(value) < 40:
                 continue
             return Syntax(
-                self._truncate(value, 50000), self._guess_language(data), word_wrap=True
+                self._head_tail(value, self.max_preview_chars),
+                self._guess_language(data),
+                word_wrap=True,
             )
         return None
 
@@ -1001,21 +1012,29 @@ class ContentFirstRenderer:
             return self._truncate(url, 36)
 
     def _truncate(self, text: str, limit: int) -> str:
+        limit = max(0, int(limit))
         if len(text) <= limit:
             return text
-        return f"{text[:limit]}... (truncated, {len(text)} total chars)"
+        if limit == 0:
+            return ""
+        marker = f"... (truncated, {len(text)} total chars)"
+        if len(marker) >= limit:
+            return text[:limit]
+        return text[: limit - len(marker)] + marker
 
     def _head_tail(self, text: str, limit: int) -> str:
-        limit = max(120, int(limit))
+        limit = max(0, int(limit))
         if len(text) <= limit:
             return text
-        head = max(60, int(limit * 0.65))
-        tail = max(40, limit - head)
-        return (
-            text[:head]
-            + f"\n... [truncated, {len(text)} total chars] ...\n"
-            + text[-tail:]
-        )
+        if limit == 0:
+            return ""
+        marker = f"\n... [middle omitted, {len(text)} total chars] ...\n"
+        if len(marker) >= limit:
+            return text[:limit]
+        content_budget = limit - len(marker)
+        head = int(content_budget * 0.65)
+        tail = content_budget - head
+        return text[:head] + marker + (text[-tail:] if tail else "")
 
     def _truncate_middle(self, text: str, limit: int) -> str:
         if len(text) <= limit:
@@ -1052,4 +1071,4 @@ class ContentFirstRenderer:
         return self._truncate_middle(d, 70)
 
 
-__all__ = ["ContentFirstRenderer"]
+__all__ = ["ContentFirstRenderer", "DEFAULT_RENDER_PREVIEW_CHARS"]

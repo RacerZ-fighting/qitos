@@ -31,11 +31,11 @@ class CompactConfig:
     # Canonical history is token-controlled by default. Count-based eviction
     # remains an explicit opt-in for applications that accept permanent loss.
     hard_window: int = 0
-    # Ratios are relative to the force-compaction budget supplied by Engine.
-    # With Engine's 0.80 total-input trigger these defaults warn near 56% and
-    # microcompact near 60%, leaving full summarization for the 80% boundary.
-    warning_ratio: float = 0.70
-    microcompact_ratio: float = 0.75
+    # Engine supplies the explicit provider-safe compaction watermark. Do not
+    # rewrite projected history before that boundary: doing so breaks an
+    # otherwise cacheable append-only request prefix.
+    warning_ratio: float = 1.0
+    microcompact_ratio: float = 1.0
     auto_compact: bool = True
     compact_long_messages_over_chars: int = 4_000
     microcompact_preview_chars: int = 800

@@ -42,6 +42,7 @@ from .core.process import (
     ProcessTerminalNotifier,
 )
 from .core.history import History, HistoryPolicy, HistorySnapshot
+from .core.message_builder import ContextSnapshot, ContextSnapshotConflictError
 from .core.observation import Observation
 from .core.tool_result import ToolResult, ToolResultStatus
 from .core.artifact import ArtifactRef, ArtifactStore, ArtifactStoreError
@@ -143,6 +144,8 @@ __all__ = [
     "History",
     "HistoryPolicy",
     "HistorySnapshot",
+    "ContextSnapshot",
+    "ContextSnapshotConflictError",
     "Observation",
     "ToolResult",
     "ToolResultStatus",

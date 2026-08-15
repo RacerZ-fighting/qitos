@@ -301,7 +301,6 @@ class ToolRegistry:
             "concurrency_safe": bool(tool.spec.concurrency_safe),
             "requires_user_interaction": bool(tool.spec.requires_user_interaction),
             "supports_background": bool(tool.spec.supports_background),
-            "result_max_chars": tool.spec.result_max_chars,
             "produces_artifact": bool(tool.spec.produces_artifact),
             "origin": {
                 "source": origin.source,
@@ -507,7 +506,6 @@ class ToolRegistry:
                             tool.spec.requires_user_interaction
                         ),
                         "supports_background": bool(tool.spec.supports_background),
-                        "result_max_chars": tool.spec.result_max_chars,
                         "produces_artifact": bool(tool.spec.produces_artifact),
                     },
                 }

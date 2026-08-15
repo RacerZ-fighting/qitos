@@ -146,6 +146,24 @@ def _is_unsupported_hosted_web_search_error(exc: Exception) -> bool:
     return names_web_search and rejects_capability
 
 
+def _is_unsupported_cache_affinity_error(exc: Exception) -> bool:
+    if _provider_status_code(exc) not in {400, 404, 422, None}:
+        return False
+    detail = f"{exc} {_field(exc, 'body', '')}".casefold()
+    if "metadata" not in detail and "user_id" not in detail:
+        return False
+    return any(
+        marker in detail
+        for marker in (
+            "not supported",
+            "unexpected keyword",
+            "unknown parameter",
+            "unrecognized",
+            "unsupported",
+        )
+    )
+
+
 def _anthropic_tool_choice(value: Any) -> Any:
     if value is None:
         return None
@@ -410,13 +428,16 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamEvent]):
         cache_read = int(self._usage.get("cache_read_input_tokens", 0))
         output_tokens = int(self._usage.get("output_tokens", 0))
         prompt_tokens = input_tokens + cache_creation + cache_read
-        return {
+        result = {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": output_tokens,
             "total_tokens": prompt_tokens + output_tokens,
-            "cache_creation_input_tokens": cache_creation,
-            "cache_read_input_tokens": cache_read,
         }
+        if "cache_creation_input_tokens" in self._usage:
+            result["cache_creation_input_tokens"] = cache_creation
+        if "cache_read_input_tokens" in self._usage:
+            result["cache_read_input_tokens"] = cache_read
+        return result
 
     def _terminal_chunk(self) -> ModelStreamEvent:
         native_items: List[Dict[str, Any]] = []
@@ -677,6 +698,7 @@ class AnthropicModel(Model):
         messages: List[Dict[str, Any]],
         request_kwargs: Dict[str, Any],
         *,
+        cache_affinity: str,
         deadline_monotonic: float | None,
     ) -> AsyncIterator[ModelStreamEvent]:
         try:
@@ -719,18 +741,47 @@ class AnthropicModel(Model):
             payload.setdefault("system", system)
         if "tool_choice" in payload:
             payload["tool_choice"] = _anthropic_tool_choice(payload["tool_choice"])
+        raw_metadata = payload.get("metadata")
+        affinity_injected = raw_metadata is None or (
+            isinstance(raw_metadata, dict) and "user_id" not in raw_metadata
+        )
+        if affinity_injected:
+            metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            metadata["user_id"] = cache_affinity
+            payload["metadata"] = metadata
+        candidate = dict(payload)
+        cache_affinity_fallback = False
+        managed_search_fallback = False
         try:
-            try:
-                events = await client.messages.create(**payload)
-            except Exception as exc:
-                if (
-                    not isinstance(managed_web_search_tools, list)
-                    or not _is_unsupported_hosted_web_search_error(exc)
-                ):
+            while True:
+                try:
+                    events = await client.messages.create(**candidate)
+                    break
+                except Exception as exc:
+                    if (
+                        affinity_injected
+                        and not cache_affinity_fallback
+                        and _is_unsupported_cache_affinity_error(exc)
+                    ):
+                        candidate_metadata = candidate.get("metadata")
+                        if isinstance(candidate_metadata, dict):
+                            fallback_metadata = dict(candidate_metadata)
+                            fallback_metadata.pop("user_id", None)
+                            if fallback_metadata:
+                                candidate["metadata"] = fallback_metadata
+                            else:
+                                candidate.pop("metadata", None)
+                        cache_affinity_fallback = True
+                        continue
+                    if (
+                        not managed_search_fallback
+                        and isinstance(managed_web_search_tools, list)
+                        and _is_unsupported_hosted_web_search_error(exc)
+                    ):
+                        candidate["tools"] = managed_web_search_tools
+                        managed_search_fallback = True
+                        continue
                     raise
-                fallback_payload = dict(payload)
-                fallback_payload["tools"] = managed_web_search_tools
-                events = await client.messages.create(**fallback_payload)
         except (asyncio.CancelledError, Exception):
             await close_async_resource(client)
             raise
@@ -757,6 +808,7 @@ class AnthropicModel(Model):
             return await self._open_stream(
                 request.message_dicts(),
                 dict(request_kwargs),
+                cache_affinity=request.cache_affinity,
                 deadline_monotonic=request.deadline_monotonic,
             )
 

@@ -27,10 +27,15 @@ from ..core.errors import (
 )
 from ..core.history import (
     HistoryMessage,
-    group_history_rounds,
     message_tool_call_ids,
     message_tool_result_ids,
     select_recent_history,
+)
+from ..core.message_builder import (
+    ContextSnapshot,
+    ContextSnapshotConflictError,
+    MessageBuildRequest,
+    MessageBuilder,
 )
 from ..core.model_request import ModelContinuation, ModelRequest
 from ..core.model_stream import ModelStreamEventType
@@ -59,7 +64,6 @@ from ..core.turn import TurnSnapshot
 from ._context_runtime import (
     ContextCompactionRequired,
     ContextOverflowError,
-    DecisionContextConfigurationError,
 )
 from .streaming import to_stream_handler
 from .states import RuntimePhase, StepRecord
@@ -74,6 +78,17 @@ _logger = logging.getLogger("qitos.engine._model_runtime")
 StateT = TypeVar("StateT", bound=StateSchema)
 ObservationT = TypeVar("ObservationT")
 ActionT = TypeVar("ActionT")
+
+
+def _terminal_synthesis_instruction(reason: str) -> str:
+    return (
+        "<terminal_synthesis>\n"
+        f"The run must stop now because {reason}. Do not call tools or request "
+        "more work. Produce the final answer from committed state and evidence "
+        "only. State the outcome, important evidence, unresolved items, and the "
+        "most useful next step when applicable.\n"
+        "</terminal_synthesis>"
+    )
 
 
 def _chunk_has_model_content(chunk: ModelStreamEvent) -> bool:
@@ -132,45 +147,8 @@ def _escape_runtime_context_content(content: str) -> str:
     return content.replace("</RUNTIME_CONTEXT>", "&lt;/RUNTIME_CONTEXT&gt;")
 
 
-_DECISION_CONTEXT_PATTERN = re.compile(
-    r"<DECISION_CONTEXT\b[^>]*>.*?</DECISION_CONTEXT>", re.DOTALL
-)
-
-
-def _is_decision_context_packet(content: str) -> bool:
-    """Return whether content carries one authoritative Decision Context.
-
-    Decision Context already has its own semantic boundary and contract.  A
-    second RUNTIME_CONTEXT wrapper adds no authority and makes the provider
-    packet harder to read.  Other agents' generic runtime state keeps the
-    existing wrapper.
-    """
-    return len(_DECISION_CONTEXT_PATTERN.findall(str(content or ""))) == 1
-
-
-def _strip_decision_context_content(content: Any) -> Any:
-    """Remove transient Decision Context blocks without changing other content."""
-    if isinstance(content, str):
-        return _DECISION_CONTEXT_PATTERN.sub("", content).rstrip()
-    if isinstance(content, list):
-        cleaned: list[Any] = []
-        for block in content:
-            if isinstance(block, dict) and str(block.get("type") or "") == "text":
-                updated = dict(block)
-                updated["text"] = _DECISION_CONTEXT_PATTERN.sub(
-                    "", str(updated.get("text") or "")
-                ).rstrip()
-                cleaned.append(updated)
-            else:
-                cleaned.append(block)
-        return cleaned
-    return content
-
-
 def _wrap_runtime_context(content: str) -> str:
     """Wrap runtime-state user message in semantic XML tags."""
-    if _is_decision_context_packet(content):
-        return str(content or "")
     safe_content = _escape_runtime_context_content(content)
     return (
         "<RUNTIME_CONTEXT\n"
@@ -180,14 +158,6 @@ def _wrap_runtime_context(content: str) -> str:
         f"{safe_content}\n"
         "</RUNTIME_CONTEXT>"
     )
-
-
-_RUNTIME_CONTEXT_IN_TOOL_NOTICE = (
-    "NOTE: The RUNTIME_CONTEXT block below was appended by the Agent Runtime "
-    "Controller and is NOT part of the tool result above. It is an "
-    "authoritative machine-generated working-state update; treat it as "
-    "current working state, not as tool output."
-)
 
 
 class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
@@ -341,6 +311,110 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         )
         return cast(Decision[ActionT], decision)
 
+    async def run_terminal_synthesis(
+        self,
+        state: StateT,
+        observation: ObservationT,
+        record: StepRecord,
+        turn: TurnSnapshot,
+    ) -> Decision[ActionT]:
+        """Run one tool-free model transaction that may only return a final answer."""
+
+        if not turn.is_terminal_synthesis:
+            raise ValueError("terminal synthesis requires a terminal TurnSnapshot")
+        engine = self.engine
+        engine._dispatch_hook(
+            "on_before_decide",
+            engine._hook_context(
+                step_id=record.step_id,
+                phase=RuntimePhase.DECIDE,
+                state=state,
+                observation=observation,
+                record=record,
+                payload={"terminal_synthesis": True},
+            ),
+        )
+        engine._emit(
+            record.step_id,
+            RuntimePhase.DECIDE,
+            payload={"stage": "terminal_synthesis_start"},
+        )
+        engine._memory_append("state", state.to_dict(), record.step_id)
+        response = await self._run_llm_decide(
+            state=state,
+            observation=observation,
+            record=record,
+            turn=turn,
+        )
+        if response.tool_calls:
+            raise ValueError("terminal synthesis returned a tool call")
+        text = str(response.text or "").strip()
+        if not text:
+            raise ValueError("terminal synthesis returned no final text")
+
+        interpreted = engine._decision_runtime._interpret_model_response(
+            state=state,
+            observation=observation,
+            response=response,
+            record=record,
+        )
+        decision: Decision[Any] = engine._decision_runtime.normalize_decision(
+            response if interpreted is None else interpreted,
+            step=record.step_id,
+            record=record,
+            turn=turn,
+        )
+        if decision.mode != "final":
+            raise ValueError(
+                f"terminal synthesis produced {decision.mode!r}, not a final answer"
+            )
+        decision.meta.update(
+            {
+                "terminal_synthesis": True,
+                "terminal_reason": turn.terminal_reason,
+                "fallback": False,
+            }
+        )
+        decision.validate()
+        engine._history_append(
+            "assistant",
+            decision.final_answer,
+            record.step_id,
+            metadata={"source": "terminal_synthesis"},
+            reasoning_content=response.reasoning_content,
+            native_items=response.native_items,
+        )
+        record.decision = decision
+        record.actions = []
+        engine._memory_append("decision", decision, record.step_id)
+        engine._emit(
+            record.step_id,
+            RuntimePhase.DECIDE,
+            payload={
+                "stage": "decision_ready",
+                "mode": "final",
+                "final_answer": decision.final_answer,
+                "terminal_synthesis": True,
+            },
+        )
+        engine._dispatch_hook(
+            "on_after_decide",
+            engine._hook_context(
+                step_id=record.step_id,
+                phase=RuntimePhase.DECIDE,
+                state=state,
+                observation=observation,
+                decision=decision,
+                model_response=dict(record.model_response),
+                record=record,
+                payload={
+                    "model_response": dict(record.model_response),
+                    "terminal_synthesis": True,
+                },
+            ),
+        )
+        return cast(Decision[ActionT], decision)
+
     def _raise_for_empty_model_response(
         self, *, response: ModelResponse, step: int
     ) -> None:
@@ -383,6 +457,15 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         prompt_bundle = engine.agent.build_prompt_bundle(state, turn)
         system_prompt = prompt_bundle.system_prompt
         prepared = engine.agent.prepare_turn(state, observation, turn)
+        if turn.is_terminal_synthesis:
+            prepared = "\n\n".join(
+                part
+                for part in (
+                    str(prepared or "").strip(),
+                    _terminal_synthesis_instruction(str(turn.terminal_reason)),
+                )
+                if part
+            )
         prompt_metadata = dict(getattr(prompt_bundle, "metadata", {}) or {})
         engine._last_prompt_metadata = dict(prompt_metadata)
         if engine.trace_writer is not None:
@@ -420,6 +503,9 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             protocol=protocol,
             llm=llm,
         )
+        if turn.is_terminal_synthesis:
+            for option_name in ("tools", "tool_choice", "parallel_tool_calls"):
+                request_options.pop(option_name, None)
         pre_context = context_runtime.build_pre_request(
             llm=llm,
             system_prompt=effective_system_prompt,
@@ -542,36 +628,10 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             compact_events=compact_events,
         )
         # --- Custom MessageBuilder support ---
-        from ..core.message_builder import MessageBuilder as _MessageBuilderProto
-
         custom_builder = getattr(engine.agent, "message_builder", None)
-        runtime_context_delivery: Dict[str, Any] = {
-            "requested": "none",
-            "effective": "none",
-            "target_tool_call_id": None,
-            "fallback_reason": None,
-        }
-        runtime_context_display: Dict[str, Any] | None = None
-        # Message builders may opt into one controller-owned Decision Context.
-        decision_context_required = bool(
-            getattr(custom_builder, "requires_decision_context", False)
-        )
-        # The default builder has no separate transient context, but the
-        # final sidecar uses one common schema for both builder modes.
-        runtime_context = ""
-        if custom_builder is not None and isinstance(
-            custom_builder, _MessageBuilderProto
-        ):
-            configured_rounds = int(
-                getattr(engine.context_config, "conversation_max_rounds", 16)
-            )
-            if configured_rounds > 0:
-                history = self._trim_native_tool_history(
-                    history, max_rounds=configured_rounds
-                )
-            from ..core.message_builder import MessageBuildRequest as _MBReq
-
-            build_req = _MBReq(
+        context_snapshot_telemetry: Dict[str, Any] = {"status": "none"}
+        if custom_builder is not None and isinstance(custom_builder, MessageBuilder):
+            build_req = MessageBuildRequest(
                 step_id=record.step_id,
                 state=state,
                 observation=observation,
@@ -582,84 +642,30 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             )
             build_result = custom_builder.build_messages(build_req)
             messages = list(build_result.messages)
-            runtime_context = str(
-                getattr(build_result, "runtime_context", "") or ""
-            ).strip()
-            requested_delivery = (
-                str(getattr(build_result, "runtime_context_delivery", "none") or "none")
-                .strip()
-                .lower()
-            )
-            if requested_delivery not in {"none", "merge_tool", "user"}:
-                _logger.warning(
-                    "Unknown MessageBuildResult runtime-context delivery %r; ignoring it",
-                    requested_delivery,
-                )
-                requested_delivery = "none"
-            runtime_context_delivery["requested"] = requested_delivery
-            if runtime_context and requested_delivery != "none":
-                wrapped_runtime_context = _wrap_runtime_context(runtime_context)
-                should_merge = (
-                    requested_delivery == "merge_tool"
-                    and not self._current_user_has_multimodal_content(
-                        prompt_user_content_blocks, observation, record
-                    )
-                )
-                if should_merge:
-                    merged, tool_call_id = self._merge_runtime_context_into_last_tool(
-                        messages, wrapped_runtime_context
-                    )
-                    if merged:
-                        runtime_context_delivery.update(
-                            {
-                                "effective": "merge_tool",
-                                "target_tool_call_id": tool_call_id,
-                            }
-                        )
-                        # Runtime Context is transient provider state, but every
-                        # step must remain observable in the TUI/trace for
-                        # offline decision analysis.
-                        runtime_context_display = {
-                            "tool_call_id": tool_call_id,
-                            "content": wrapped_runtime_context,
-                        }
-                    else:
-                        runtime_context_delivery["fallback_reason"] = (
-                            "no_text_tool_result"
-                        )
-                elif requested_delivery == "merge_tool":
-                    runtime_context_delivery["fallback_reason"] = (
-                        "multimodal_user_content"
-                    )
-
-                if runtime_context_delivery["effective"] != "merge_tool":
-                    current_user = self._build_current_user_message(
-                        prepared_text=wrapped_runtime_context,
-                        prompt_user_content_blocks=prompt_user_content_blocks,
-                        observation=observation,
-                        record=record,
-                        llm=llm,
-                    )
-                    messages.append(current_user)
-                    runtime_context_delivery["effective"] = "user"
             pending_builder_history = [
                 dict(entry)
                 for entry in build_result.history_entries
                 if isinstance(entry, dict)
             ]
+            snapshot = build_result.context_snapshot
+            if snapshot is not None and not isinstance(snapshot, ContextSnapshot):
+                raise TypeError(
+                    "MessageBuildResult.context_snapshot must be a ContextSnapshot"
+                )
+            if snapshot is not None:
+                context_snapshot_telemetry = self._append_context_snapshot(
+                    messages=messages,
+                    canonical_history=engine._normalize_history_messages(
+                        list(turn.history.messages)
+                    ),
+                    pending_history=pending_builder_history,
+                    snapshot=snapshot,
+                    step_id=record.step_id,
+                )
             prepared_full = str(prepared)
         else:
             # --- Default message construction (original logic) ---
             injection_prefixes: List[str] = []
-            if self._native_tool_call_preferred(turn.model, turn.protocol):
-                configured_rounds = int(
-                    getattr(engine.context_config, "conversation_max_rounds", 10)
-                )
-                if configured_rounds > 0:
-                    history = self._trim_native_tool_history(
-                        history,
-                        max_rounds=configured_rounds,
-                    )
             messages.extend(history)
             for item in prompt_messages:
                 if not isinstance(item, dict):
@@ -691,46 +697,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         # and digest must describe the exact payload handed to the provider.
         messages = self._ensure_chain_consistency(messages)
         llm_messages = self._strip_internal_message_keys(messages)
-        decision_context_source = runtime_context or str(prepared or "")
-        source_context_blocks = _DECISION_CONTEXT_PATTERN.findall(
-            decision_context_source
-        )
-        # A malformed transient source is a fixed controller/configuration
-        # problem for Decision-Context-aware agents, but first give the state
-        # projector one fresh chance to render it.  Normal duplicate/stale
-        # packet recovery never reaches this branch.
-        if decision_context_required and len(source_context_blocks) != 1:
-            try:
-                decision_context_source = str(
-                    engine.agent.prepare_turn(state, observation, turn) or ""
-                )
-            except Exception as exc:
-                raise DecisionContextConfigurationError(
-                    "could not render the authoritative DECISION_CONTEXT"
-                ) from exc
-            source_context_blocks = _DECISION_CONTEXT_PATTERN.findall(
-                decision_context_source
-            )
-        if decision_context_required and len(source_context_blocks) != 1:
-            raise DecisionContextConfigurationError(
-                "authoritative runtime state must contain exactly one DECISION_CONTEXT"
-            )
-        pre_rebuild_messages = list(llm_messages)
-        decision_context_recovery: Dict[str, Any] = {
-            "rebuild_required": False,
-            "reason": "",
-            "before_count": 0,
-            "after_count": 0,
-            "authoritative_context": "",
-        }
-        if decision_context_required:
-            llm_messages, decision_context_recovery = (
-                self._normalize_decision_context_packet(
-                    messages=llm_messages,
-                    authoritative_source=decision_context_source,
-                    delivery=runtime_context_delivery,
-                )
-            )
         pre_context = context_runtime.finalize_assembled_input(
             llm=llm,
             telemetry=pre_context,
@@ -762,47 +728,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 and str(meter_result.get("status") or "") != "ready"
             ):
                 raise ContextOverflowError("required prompt meter is unavailable")
-        # Historical blocks are an audit signal only. They are stripped from
-        # the projected provider packet by the normalizer.
-        history_context_blocks = self._decision_context_blocks(
-            self._strip_internal_message_keys(history)
-        )
-        provider_context_blocks = self._decision_context_blocks(llm_messages)
-        expects_decision_context = decision_context_required
-        if expects_decision_context and len(provider_context_blocks) != 1:
-            raise DecisionContextConfigurationError(
-                "packet normalization did not produce one current DECISION_CONTEXT"
-            )
-        if expects_decision_context and (
-            len(source_context_blocks) != 1
-            or provider_context_blocks[0] != source_context_blocks[0]
-        ):
-            raise DecisionContextConfigurationError(
-                "packet normalization did not preserve the authoritative DECISION_CONTEXT"
-            )
-        if decision_context_recovery.get("rebuild_required"):
-            self._write_pre_rebuild_packet_sidecar(
-                state,
-                record.step_id,
-                messages=pre_rebuild_messages,
-                recovery=decision_context_recovery,
-            )
-            engine._emit(
-                record.step_id,
-                RuntimePhase.DECIDE,
-                payload={
-                    "stage": "decision_context_packet_rebuilt",
-                    "reason": decision_context_recovery.get("reason"),
-                    "before_count": decision_context_recovery.get("before_count"),
-                    "after_count": decision_context_recovery.get("after_count"),
-                    "delivery": runtime_context_delivery.get("effective"),
-                    "authoritative_context_hash": hashlib.sha256(
-                        str(
-                            decision_context_recovery.get("authoritative_context") or ""
-                        ).encode("utf-8")
-                    ).hexdigest(),
-                },
-            )
         parity = self._tool_transaction_parity(llm_messages)
         normalized_compact_events = context_runtime.normalize_history_events(
             compact_events, pre_context
@@ -847,10 +772,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             request_options=request_options,
             prompt_bundle=prompt_bundle,
             protocol=protocol,
-            runtime_context=runtime_context,
-            runtime_context_delivery=runtime_context_delivery,
+            context_snapshot=context_snapshot_telemetry,
             context=context_runtime.telemetry_dict(pre_context),
-            decision_context_recovery=decision_context_recovery,
         )
         record.prompt_metadata = dict(prompt_metadata)
         record.prompt_metadata.update(
@@ -880,18 +803,58 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                         "mailbox": turn.capabilities.mailbox,
                         "child_agents": turn.capabilities.child_agents,
                     },
+                    "terminal_synthesis": turn.is_terminal_synthesis,
+                    "terminal_reason": turn.terminal_reason,
                 },
                 "model_input_modalities": list(record.model_input_modalities),
                 "model_input_visual_count": int(record.model_input_visual_count),
                 "observation_modalities": list(record.observation_modalities),
-                "runtime_context_delivery": dict(runtime_context_delivery),
+                "context_snapshot": dict(context_snapshot_telemetry),
                 "tool_transaction_parity": parity,
-                "decision_context_block_count": len(provider_context_blocks),
-                "historical_decision_context_block_count": len(history_context_blocks),
             }
         )
         record.context = context_runtime.telemetry_dict(pre_context)
         engine._last_context_telemetry = dict(record.context)
+        provider = str(getattr(llm, "provider_name", None) or "model")
+        model_name = str(getattr(llm, "model", None) or "default")
+        protocol_id = str(getattr(protocol, "id", None) or "unknown")
+        continuation = engine._model_continuation
+        continuation_eligible = bool(
+            continuation is not None
+            and not turn.is_terminal_synthesis
+            and continuation.run_id == turn.run_id
+            and continuation.provider == provider
+            and continuation.model == model_name
+            and continuation.protocol == protocol_id
+            and turn.capabilities.model.continuation
+        )
+        model_request = ModelRequest(
+            run_id=turn.run_id,
+            transaction_id=record.transaction_id,
+            provider=provider,
+            model=model_name,
+            protocol=protocol_id,
+            messages=tuple(llm_messages),
+            options=request_options,
+            deadline_monotonic=turn.budget.deadline_monotonic,
+            continuation=continuation if continuation_eligible else None,
+        )
+        record.model_request = model_request
+        request_cache = self._request_cache_telemetry(
+            model_request,
+            llm=llm,
+            tool_schema_digest=tool_schema_digest,
+        )
+        record.prompt_metadata["request_cache"] = request_cache
+        record.prompt_metadata["provider_continuation"] = {
+            "available": continuation is not None,
+            "eligible": continuation_eligible,
+            "response_id": (
+                continuation.response_id
+                if continuation_eligible and continuation is not None
+                else None
+            ),
+        }
         engine._emit(
             record.step_id,
             RuntimePhase.DECIDE,
@@ -912,48 +875,15 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 ],
                 "model_input_digest": model_input_digest,
                 "tool_schema_digest": tool_schema_digest,
+                "request_cache": dict(request_cache),
                 "context": dict(record.context),
                 "state_stats": self._state_stats(
                     observation, record.context, state=state
                 ),
                 "prompt": dict(record.prompt_metadata),
-                "runtime_context_delivery": dict(runtime_context_delivery),
-                "runtime_context_display": runtime_context_display,
+                "context_snapshot": dict(context_snapshot_telemetry),
             },
         )
-        provider = str(getattr(llm, "provider_name", None) or "model")
-        model_name = str(getattr(llm, "model", None) or "default")
-        protocol_id = str(getattr(protocol, "id", None) or "unknown")
-        continuation = engine._model_continuation
-        continuation_eligible = bool(
-            continuation is not None
-            and continuation.run_id == turn.run_id
-            and continuation.provider == provider
-            and continuation.model == model_name
-            and continuation.protocol == protocol_id
-            and turn.capabilities.model.continuation
-        )
-        model_request = ModelRequest(
-            run_id=turn.run_id,
-            transaction_id=record.transaction_id,
-            provider=provider,
-            model=model_name,
-            protocol=protocol_id,
-            messages=tuple(llm_messages),
-            options=request_options,
-            deadline_monotonic=turn.budget.deadline_monotonic,
-            continuation=continuation if continuation_eligible else None,
-        )
-        record.model_request = model_request
-        record.prompt_metadata["provider_continuation"] = {
-            "available": continuation is not None,
-            "eligible": continuation_eligible,
-            "response_id": (
-                continuation.response_id
-                if continuation_eligible and continuation is not None
-                else None
-            ),
-        }
         response = self._normalize_model_response(
             await self._call_llm(llm, model_request),
             llm=llm,
@@ -1037,10 +967,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             request_options=request_options,
             prompt_bundle=prompt_bundle,
             protocol=protocol,
-            runtime_context=runtime_context,
-            runtime_context_delivery=runtime_context_delivery,
+            context_snapshot=context_snapshot_telemetry,
             context=record.context,
-            decision_context_recovery=decision_context_recovery,
         )
         record.model_response = response.to_summary_dict()
         record.model_response["cost_usd"] = transaction_cost_usd
@@ -1056,12 +984,16 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 "reasoning_content": response.reasoning_content,
                 "model_response": dict(record.model_response),
                 "context": dict(record.context),
-                "prompt": prompt_metadata,
+                "prompt": dict(record.prompt_metadata),
             },
         )
         assistant_tool_calls = []
-        if response.tool_calls and self._native_tool_call_preferred(
-            turn.model, turn.protocol
+        if (
+            response.tool_calls
+            and not turn.is_terminal_synthesis
+            and self._native_tool_call_preferred(
+                turn.model, turn.protocol
+            )
         ):
             assistant_tool_calls = [
                 {
@@ -1210,50 +1142,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             "sidecar_path": sidecar_path,
         }
 
-    def _write_pre_rebuild_packet_sidecar(
-        self,
-        state: StateT,
-        step_id: int,
-        *,
-        messages: List[Dict[str, Any]],
-        recovery: Dict[str, Any],
-    ) -> None:
-        """Persist a rejected packet only when Context normalization repairs it."""
-        try:
-            metadata = dict(getattr(state, "metadata", {}) or {})
-            trace_root = str(
-                metadata.get("trace_run_dir")
-                or getattr(state, "workspace_root", "")
-                or ""
-            ).strip()
-            if not trace_root:
-                return
-            step_dir = Path(trace_root) / "agent_steps" / f"step-{int(step_id):04d}"
-            step_dir.mkdir(parents=True, exist_ok=True)
-            (step_dir / "assembled_messages.pre_rebuild.json").write_text(
-                json.dumps(messages, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8",
-            )
-            (step_dir / "decision_context_recovery.json").write_text(
-                json.dumps(
-                    {
-                        "reason": recovery.get("reason"),
-                        "before_count": recovery.get("before_count"),
-                        "after_count": recovery.get("after_count"),
-                        "authoritative_context_hash": hashlib.sha256(
-                            str(recovery.get("authoritative_context") or "").encode(
-                                "utf-8"
-                            )
-                        ).hexdigest(),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-        except Exception:
-            _logger.debug("pre-rebuild packet sidecar write failed", exc_info=True)
-
     def _write_assembled_messages_sidecar(
         self,
         state: StateT,
@@ -1298,6 +1186,105 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             "schema_hash": hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16],
         }
 
+    def _request_cache_telemetry(
+        self,
+        request: ModelRequest,
+        *,
+        llm: Any,
+        tool_schema_digest: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        previous: ModelRequest | None = None
+        for prior_record in reversed(self.engine.records):
+            candidate = prior_record.model_request
+            if candidate is not None and candidate is not request:
+                previous = candidate
+                break
+
+        current_messages = request.message_dicts()
+        system_messages = [
+            message
+            for message in current_messages
+            if message.get("role") in {"system", "developer"}
+        ]
+        system_serialized = json.dumps(
+            system_messages,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        telemetry: Dict[str, Any] = {
+            "affinity_enabled": bool(request.cache_affinity),
+            "affinity_source": "run_id",
+            "previous_request_available": previous is not None,
+            "segment_compatible": None,
+            "previous_messages_are_prefix": None,
+            "common_prefix_messages": 0,
+            "common_prefix_tokens": 0,
+            "common_prefix_counting_mode": "absent",
+            "system_prompt_digest": hashlib.sha256(
+                system_serialized.encode("utf-8")
+            ).hexdigest()[:16],
+            "system_prompt_stable": None,
+            "tool_schema_stable": None,
+            "prefix_cache_reusable": None,
+        }
+        if previous is None:
+            return telemetry
+
+        previous_messages = previous.message_dicts()
+        common_count = 0
+        for old, new in zip(previous_messages, current_messages, strict=False):
+            if old != new:
+                break
+            common_count += 1
+        common_prefix = current_messages[:common_count]
+        prefix_tokens, counting_mode = self.engine._context_runtime.count_tokens(
+            common_prefix,
+            llm,
+        )
+        previous_system = [
+            message
+            for message in previous_messages
+            if message.get("role") in {"system", "developer"}
+        ]
+        previous_system_serialized = json.dumps(
+            previous_system,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        previous_tools = previous.option_dict().get("tools")
+        previous_tool_digest = self._tool_schema_digest(previous_tools)
+        segment_compatible = (
+            previous.provider == request.provider
+            and previous.model == request.model
+            and previous.protocol == request.protocol
+        )
+        messages_are_prefix = common_count == len(previous_messages)
+        system_stable = previous_system_serialized == system_serialized
+        tool_schema_stable = (
+            previous_tool_digest.get("schema_hash")
+            == tool_schema_digest.get("schema_hash")
+        )
+        telemetry.update(
+            {
+                "segment_compatible": segment_compatible,
+                "previous_messages_are_prefix": messages_are_prefix,
+                "common_prefix_messages": common_count,
+                "common_prefix_tokens": prefix_tokens,
+                "common_prefix_counting_mode": counting_mode,
+                "system_prompt_stable": system_stable,
+                "tool_schema_stable": tool_schema_stable,
+                "prefix_cache_reusable": (
+                    segment_compatible
+                    and messages_are_prefix
+                    and system_stable
+                    and tool_schema_stable
+                ),
+            }
+        )
+        return telemetry
+
     def _write_model_input_bundle_sidecar(
         self,
         state: StateT,
@@ -1307,10 +1294,8 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         request_options: Dict[str, Any],
         prompt_bundle: Any,
         protocol: Any,
-        runtime_context: str = "",
-        runtime_context_delivery: Dict[str, Any] | None = None,
+        context_snapshot: Dict[str, Any] | None = None,
         context: Dict[str, Any] | None = None,
-        decision_context_recovery: Dict[str, Any] | None = None,
     ) -> None:
         try:
             metadata = dict(getattr(state, "metadata", {}) or {})
@@ -1327,7 +1312,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 tools, ensure_ascii=False, sort_keys=True, default=str
             )
             combined = message_json + "\n" + tools_json
-            decision_context_blocks = self._decision_context_blocks(messages)
             bundle = {
                 "messages": messages,
                 "tools": tools,
@@ -1339,8 +1323,7 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                     )
                     or ""
                 ),
-                "pre_merge_runtime_context": str(runtime_context or ""),
-                "runtime_context_delivery": dict(runtime_context_delivery or {}),
+                "context_snapshot": dict(context_snapshot or {}),
                 "context": dict(context or {}),
                 "messages_hash": hashlib.sha256(
                     message_json.encode("utf-8")
@@ -1351,52 +1334,12 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
                 "combined_hash": hashlib.sha256(combined.encode("utf-8")).hexdigest()[
                     :16
                 ],
-                "decision_context_block_count": len(decision_context_blocks),
-                "decision_context_sha256": (
-                    hashlib.sha256(
-                        decision_context_blocks[0].encode("utf-8")
-                    ).hexdigest()
-                    if len(decision_context_blocks) == 1
-                    else ""
-                ),
-                "decision_context_recovery": {
-                    "rebuilt": bool(
-                        (decision_context_recovery or {}).get("rebuild_required")
-                    ),
-                    "reason": str(
-                        (decision_context_recovery or {}).get("reason") or ""
-                    ),
-                    "before_count": int(
-                        (decision_context_recovery or {}).get("before_count") or 0
-                    ),
-                    "after_count": int(
-                        (decision_context_recovery or {}).get("after_count") or 0
-                    ),
-                },
             }
             (step_dir / "model_input_bundle.json").write_text(
                 json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8"
             )
-            if len(decision_context_blocks) == 1:
-                (step_dir / "decision_context.md").write_text(
-                    decision_context_blocks[0] + "\n", encoding="utf-8"
-                )
         except Exception:
             _logger.debug("model input bundle sidecar write failed", exc_info=True)
-
-    @staticmethod
-    def _decision_context_blocks(messages: List[Dict[str, Any]]) -> List[str]:
-        """Return actual non-system Decision Context blocks in a packet."""
-        blocks: List[str] = []
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") == "system":
-                continue
-            blocks.extend(
-                _DECISION_CONTEXT_PATTERN.findall(
-                    content_to_text(message.get("content"))
-                )
-            )
-        return blocks
 
     def _build_model_request_options(
         self, *, prompt_bundle: Any, protocol: Any, llm: Any
@@ -1668,25 +1611,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
         if record.model_input_visual_count > 0:
             return {"role": "user", "content": content_blocks}
         return {"role": "user", "content": str(prepared_text or "")}
-
-    def _current_user_has_multimodal_content(
-        self,
-        prompt_user_content_blocks: List[Dict[str, Any]],
-        observation: ObservationT,
-        record: StepRecord,
-    ) -> bool:
-        """Return whether a runtime-context turn must stay a user message.
-
-        Tool results are serialized text in the OpenAI-compatible providers
-        supported by QitOS.  Do not discard image/file inputs merely to retain
-        a tool-terminal conversation shape.
-        """
-        blocks: List[Dict[str, Any]] = [
-            normalize_content_block(block) for block in prompt_user_content_blocks
-        ]
-        blocks.extend(self._task_visual_blocks())
-        blocks.extend(self._observation_visual_blocks(observation, record))
-        return any(str(block.get("type") or "text") != "text" for block in blocks)
 
     def _content_modalities(self, content_blocks: List[Dict[str, Any]]) -> List[str]:
         modalities: List[str] = []
@@ -2254,54 +2178,58 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             protocol=protocol,
         )
 
-    def _trim_native_tool_history(
-        self, history: List[Dict[str, Any]], *, max_rounds: int
-    ) -> List[Dict[str, Any]]:
-        if max_rounds <= 0 or not history:
-            return history
-        wrapped: List[HistoryMessage] = []
-        for index, message in enumerate(history):
-            step_marker = message.get("_step_id")
-            step_id = int(step_marker) if isinstance(step_marker, int) else 0
-            wrapped.append(
-                HistoryMessage(
-                    role=str(message.get("role") or "user"),
-                    content=message.get("content"),
-                    step_id=step_id,
-                    reasoning_content=message.get("reasoning_content"),
-                    tool_calls=[
-                        dict(call)
-                        for call in list(message.get("tool_calls") or [])
-                        if isinstance(call, dict)
-                    ],
-                    tool_call_id=(
-                        str(message["tool_call_id"])
-                        if message.get("tool_call_id") not in (None, "")
-                        else None
-                    ),
-                    name=(
-                        str(message["name"])
-                        if message.get("name") not in (None, "")
-                        else None
-                    ),
-                    metadata={"history_index": index},
-                    native_items=[
-                        dict(item)
-                        for item in list(message.get("native_items") or [])
-                        if isinstance(item, dict)
-                    ],
+    @staticmethod
+    def _append_context_snapshot(
+        *,
+        messages: List[Dict[str, Any]],
+        canonical_history: List[Dict[str, Any]],
+        pending_history: List[Dict[str, Any]],
+        snapshot: ContextSnapshot,
+        step_id: int,
+    ) -> Dict[str, Any]:
+        """Append a changed snapshot without rewriting any prior message."""
+
+        latest_revision = ""
+        latest_digest = ""
+        for message in canonical_history:
+            metadata = message.get("_metadata")
+            if not isinstance(metadata, Mapping):
+                continue
+            if metadata.get("source") != "context_snapshot":
+                continue
+            revision = str(metadata.get("revision") or "")
+            digest = str(metadata.get("digest") or "")
+            if revision == snapshot.revision and digest != snapshot.digest:
+                raise ContextSnapshotConflictError(
+                    "context snapshot revision was reused for different content"
                 )
-            )
-        groups = group_history_rounds(wrapped)
-        selected = groups[-int(max_rounds) :]
-        keep_indices = {
-            int(message.metadata["history_index"])
-            for group in selected
-            for message in group
+            latest_revision = revision
+            latest_digest = digest
+
+        telemetry = {
+            "revision": snapshot.revision,
+            "digest": snapshot.digest,
         }
-        return [
-            message for index, message in enumerate(history) if index in keep_indices
-        ]
+        if (
+            latest_revision == snapshot.revision
+            and latest_digest == snapshot.digest
+        ):
+            return {"status": "current", **telemetry}
+
+        messages.append({"role": "user", "content": snapshot.content})
+        pending_history.append(
+            {
+                "role": "user",
+                "content": snapshot.content,
+                "step_id": step_id,
+                "metadata": {
+                    "source": "context_snapshot",
+                    "revision": snapshot.revision,
+                    "digest": snapshot.digest,
+                },
+            }
+        )
+        return {"status": "appended", **telemetry}
 
     def _tool_transaction_parity(
         self,
@@ -2328,128 +2256,6 @@ class _ModelRuntime(Generic[StateT, ObservationT, ActionT]):
             "missing_result_ids": missing,
             "orphan_result_ids": orphaned,
             "valid": not missing and not orphaned,
-        }
-
-    def _merge_runtime_context_into_last_tool(
-        self, messages: List[Dict[str, Any]], runtime_context: str
-    ) -> tuple[bool, str | None]:
-        """Attach transient controller state to the final real tool result.
-
-        The provider-visible tool chain remains valid because the message keeps
-        the tool call id produced by the model.  A synthetic hidden tool would
-        instead require fabricating an assistant call/result pair and degrade
-        trace accuracy.
-        """
-        context = str(runtime_context or "").strip()
-        if not context:
-            return False, None
-        for index in range(len(messages) - 1, -1, -1):
-            message = messages[index]
-            if not isinstance(message, dict) or message.get("role") != "tool":
-                continue
-            content = message.get("content")
-            if not isinstance(content, str):
-                continue
-            updated = dict(message)
-            if _is_decision_context_packet(context):
-                updated["content"] = f"{content.rstrip()}\n\n{context}"
-            else:
-                updated["content"] = (
-                    f"{content.rstrip()}\n\n[{_RUNTIME_CONTEXT_IN_TOOL_NOTICE}]\n{context}"
-                )
-            messages[index] = updated
-            tool_call_id = updated.get("tool_call_id")
-            return True, str(tool_call_id) if tool_call_id is not None else None
-        return False, None
-
-    def _normalize_decision_context_packet(
-        self,
-        *,
-        messages: List[Dict[str, Any]],
-        authoritative_source: str,
-        delivery: Dict[str, Any],
-    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Ensure the actual provider packet has one current Decision Context.
-
-        Decision Context is reconstructed from controller state every turn and
-        is never durable conversation history.  Old traces, a partial merge,
-        or a retry must therefore not be allowed to turn a duplicate transient
-        block into a terminal agent failure.
-        """
-        source_blocks = _DECISION_CONTEXT_PATTERN.findall(
-            str(authoritative_source or "")
-        )
-        if len(source_blocks) != 1:
-            return messages, {
-                "rebuild_required": True,
-                "reason": "authoritative_invalid",
-                "before_count": len(self._decision_context_blocks(messages)),
-                "after_count": len(self._decision_context_blocks(messages)),
-                "authoritative_context": "",
-            }
-        authoritative = source_blocks[0]
-        before_blocks = self._decision_context_blocks(messages)
-        valid = len(before_blocks) == 1 and before_blocks[0] == authoritative
-        if valid:
-            return messages, {
-                "rebuild_required": False,
-                "reason": "",
-                "before_count": 1,
-                "after_count": 1,
-                "authoritative_context": authoritative,
-            }
-
-        if not before_blocks:
-            reason = "missing"
-        elif len(before_blocks) > 1:
-            reason = "duplicate"
-        else:
-            reason = "mismatch"
-        rebuilt: List[Dict[str, Any]] = []
-        for message in messages:
-            if not isinstance(message, dict):
-                continue
-            updated = dict(message)
-            # System prompt content is authored stable text.  Only transient
-            # non-system delivery is eligible for replacement.
-            if updated.get("role") != "system":
-                updated["content"] = _strip_decision_context_content(
-                    updated.get("content")
-                )
-            rebuilt.append(updated)
-
-        requested = str(delivery.get("requested") or "").strip().lower()
-        merged = False
-        if requested == "merge_tool":
-            merged, tool_call_id = self._merge_runtime_context_into_last_tool(
-                rebuilt, authoritative
-            )
-            if merged:
-                delivery.update(
-                    {
-                        "effective": "merge_tool",
-                        "target_tool_call_id": tool_call_id,
-                        "fallback_reason": None,
-                    }
-                )
-        if not merged:
-            rebuilt.append({"role": "user", "content": authoritative})
-            delivery.update(
-                {
-                    "effective": "user",
-                    "target_tool_call_id": None,
-                    "fallback_reason": (
-                        "no_text_tool_result" if requested == "merge_tool" else None
-                    ),
-                }
-            )
-        after_count = len(self._decision_context_blocks(rebuilt))
-        return rebuilt, {
-            "rebuild_required": True,
-            "reason": reason,
-            "before_count": len(before_blocks),
-            "after_count": after_count,
-            "authoritative_context": authoritative,
         }
 
     def _ensure_chain_consistency(

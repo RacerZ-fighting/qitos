@@ -67,12 +67,21 @@ class TurnSnapshot:
     tools: ToolExposure
     capabilities: TurnRuntimeCapabilities
     budget: TurnBudgetSnapshot
+    terminal_reason: str | None = None
 
     def __post_init__(self) -> None:
         if not self.run_id:
             raise ValueError("run_id must be non-empty")
         if self.step_id < 0:
             raise ValueError("step_id must be non-negative")
+        if self.terminal_reason is not None and not self.terminal_reason.strip():
+            raise ValueError("terminal_reason must be non-empty when provided")
+
+    @property
+    def is_terminal_synthesis(self) -> bool:
+        """Return whether this turn can only form a terminal conclusion."""
+
+        return self.terminal_reason is not None
 
 
 __all__ = ["TurnBudgetSnapshot", "TurnRuntimeCapabilities", "TurnSnapshot"]

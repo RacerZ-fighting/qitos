@@ -47,9 +47,19 @@ def test_model_request_durable_snapshot_redacts_credentials_and_round_trips() ->
     snapshot = request.to_dict()
 
     assert snapshot["options"]["headers"] == "[REDACTED]"
+    assert snapshot["cache_affinity"] == request.run_id
     restored = ModelRequest.from_dict(snapshot)
     assert restored.request_digest == request.request_digest
     assert restored.messages == request.messages
+
+
+def test_model_request_cache_affinity_is_stable_per_run() -> None:
+    first = _request(run_id="session-lineage")
+    resumed = _request(run_id="session-lineage")
+    forked = _request(run_id="forked-run")
+
+    assert first.cache_affinity == resumed.cache_affinity
+    assert first.cache_affinity != forked.cache_affinity
 
 
 @pytest.mark.parametrize(

@@ -341,6 +341,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             max_tool_concurrency=self.budget.max_tool_concurrency,
             max_children=self.budget.max_children,
             deadline_monotonic=self.budget.deadline_monotonic,
+            terminal_synthesis=self.budget.terminal_synthesis,
         )
         if budget_ledger is not None and not isinstance(budget_ledger, BudgetLedger):
             raise TypeError("budget_ledger must be a BudgetLedger")
@@ -557,12 +558,23 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self,
         state: StateT,
         step_id: int,
+        *,
+        terminal_reason: str | None = None,
     ) -> TurnSnapshot:
         """Capture the exact immutable inputs shared by model and tools."""
 
-        exposure = self.agent.build_tool_exposure(state, self.tool_registry)
-        if not isinstance(exposure, ToolExposure):
-            raise TypeError("Agent.build_tool_exposure() must return ToolExposure")
+        if terminal_reason is None:
+            exposure = self.agent.build_tool_exposure(state, self.tool_registry)
+            if not isinstance(exposure, ToolExposure):
+                raise TypeError("Agent.build_tool_exposure() must return ToolExposure")
+        else:
+            exposure = self.tool_registry.freeze(
+                (),
+                metadata={
+                    "terminal_synthesis": True,
+                    "terminal_reason": terminal_reason,
+                },
+            )
         runtime_snapshot = self._env_runtime.capability_snapshot()
         if runtime_snapshot is not None:
             available_groups = set(runtime_snapshot.operation_groups)
@@ -638,6 +650,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                 max_tool_concurrency=int(self.budget.max_tool_concurrency),
                 max_children=int(self.budget.max_children),
             ),
+            terminal_reason=terminal_reason,
         )
 
     def cancel(self, mode: str = "immediate") -> None:
@@ -1623,6 +1636,26 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     journal_interrupted = True
                     break
 
+                terminal_reason = (
+                    self._terminal_synthesis_reason(step_id)
+                    if self.budget.terminal_synthesis
+                    else None
+                )
+                if terminal_reason is not None:
+                    await self._drain_runtime_events(step_id)
+                    execution = await self._turn_runtime.execute_terminal(
+                        state,
+                        current_observation,
+                        task=task_text,
+                        stop_reason=terminal_reason,
+                        step_id=step_id,
+                        use_model=terminal_reason is StopReason.BUDGET_STEPS,
+                    )
+                    state = execution.state
+                    current_observation = execution.observation
+                    step_id = execution.next_step_id
+                    break
+
                 if self._budget_exhausted(step_id, state):
                     self._emit(
                         step_id,
@@ -1922,6 +1955,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self.budget.max_tool_concurrency = self._base_budget.max_tool_concurrency
         self.budget.max_children = self._base_budget.max_children
         self.budget.deadline_monotonic = self._base_budget.deadline_monotonic
+        self.budget.terminal_synthesis = self._base_budget.terminal_synthesis
         if task_obj is not None:
             budget = task_obj.budget
             if budget.max_steps is not None:
@@ -2065,6 +2099,26 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         finally:
             self._model_runtime.stream_callback = None
 
+    async def _run_terminal_synthesis(
+        self,
+        state: StateT,
+        observation: ObservationT,
+        record: StepRecord,
+        turn: TurnSnapshot,
+    ) -> Decision[ActionT]:
+        """Run the reserved tool-free conclusion transaction."""
+
+        self._model_runtime.stream_callback = self.stream_callback
+        try:
+            return await self._model_runtime.run_terminal_synthesis(
+                state,
+                observation,
+                record,
+                turn,
+            )
+        finally:
+            self._model_runtime.stream_callback = None
+
     def _select_branch(
         self,
         state: StateT,
@@ -2144,6 +2198,27 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
 
     def _budget_exhausted(self, step_id: int, state: StateT) -> bool:
         return self._control_runtime.budget_exhausted(step_id, state)
+
+    def _terminal_synthesis_reason(self, step_id: int) -> StopReason | None:
+        """Return the hard stop that must consume the reserved terminal step."""
+
+        run_budget = self._run_budget_snapshot()
+        remaining = self.remaining_runtime_seconds()
+        if remaining is not None and remaining <= 0:
+            return StopReason.BUDGET_TIME
+        if (
+            self.budget.max_tokens is not None
+            and self._token_usage >= int(self.budget.max_tokens)
+        ) or run_budget.tokens_exhausted:
+            return StopReason.BUDGET_TOKENS
+        if (
+            self.budget.max_cost_usd is not None
+            and self._cost_usage_usd >= float(self.budget.max_cost_usd)
+        ) or run_budget.cost_exhausted:
+            return StopReason.BUDGET_COST
+        if step_id >= self.budget.max_steps - 1:
+            return StopReason.BUDGET_STEPS
+        return None
 
     async def _drain_runtime_events(self, step_id: int) -> None:
         deferred = self._deferred_runtime_inputs

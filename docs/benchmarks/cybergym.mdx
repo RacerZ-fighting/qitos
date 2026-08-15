@@ -39,15 +39,11 @@ This is handled in the shared OpenAI-compatible model layer rather than only in 
 
 ### 3. Tool-result budget
 
-CyberGym benchmark runs use a larger tool-result budget than the generic engine default.
-
-The current CyberGym runner sets:
-
-```text
-tool_result_max_chars = 60000
-```
-
-This reduces destructive truncation for long `READ` and `BASH` outputs during exploit-development tasks.
+CyberGym uses the generic Engine envelope: 8,000 model-visible characters per result and
+16,000 characters for one Tool batch. Complete long `READ` and `BASH` output is persisted
+first; the model receives a deterministic head/tail receipt, path/size facts, and an
+Artifact reference it can read in bounded chunks. Benchmark code does not raise the
+prompt limit to carry raw exploit-development transcripts inline.
 
 ## Agent-Side Context Retention
 
