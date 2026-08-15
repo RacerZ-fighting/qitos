@@ -6,12 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
+from qitos.core.tool import ToolPermissionContext, ToolPermissionRule
 from qitos.kit.fetch import (
     KimiWebFetchCapability,
     ManagedWebFetchTool,
     WebFetchError,
     build_web_fetch_capability,
 )
+from qitos.kit.permission import PermissionPipeline
 
 _FETCH_URL = "https://fetch.example.test/v1/fetch"
 
@@ -158,3 +160,37 @@ async def test_factory_and_managed_tool_keep_provider_contract_separate() -> Non
         "content_type": "text/markdown",
         "truncated": False,
     }
+
+
+def test_managed_tool_uses_fetch_url_in_both_permission_paths() -> None:
+    url = "https://docs.example/reference"
+    capability = KimiWebFetchCapability(
+        api_key="secret",
+        fetch_url=_FETCH_URL,
+        client=_Client(_Response(200)),
+    )
+    tool = ManagedWebFetchTool(capability)
+    permission_context = ToolPermissionContext(
+        deny_rules=[
+            ToolPermissionRule(
+                effect="deny",
+                tool_name="web_fetch",
+                scope=url,
+            )
+        ]
+    )
+
+    direct_decision = tool.check_permissions(
+        {"url": url},
+        runtime_context={"permission_context": permission_context},
+    )
+    pipeline_decision = PermissionPipeline(context=permission_context).evaluate(
+        tool.name,
+        {"url": url},
+        tool.spec,
+    )
+
+    assert direct_decision.decision == "deny"
+    assert direct_decision.scope == url
+    assert pipeline_decision.decision == "deny"
+    assert pipeline_decision.scope == url

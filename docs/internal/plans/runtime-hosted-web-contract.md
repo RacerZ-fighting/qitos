@@ -32,8 +32,9 @@ usage ledger, provenance store, or recovery model for the same transaction.
    transaction. Anthropic-compatible endpoints do not inherit Anthropic server tools:
    Kimi keeps its managed `/search` and Chat `$web_search` capabilities, including when
    its model uses Messages transport. Keep managed `web_search` and `web_fetch` as
-   ordinary terminal ToolResult paths; do not force both routes into a new common
-   metadata shape.
+   ordinary terminal ToolResult paths; `web_fetch` projects its requested URL into the
+   canonical Tool permission scope before network access. Do not force both routes into
+   a new common metadata shape.
 
 ## Verification
 
@@ -52,6 +53,7 @@ usage ledger, provenance store, or recovery model for the same transaction.
       and safe managed fallback without changing Kimi's existing managed paths.
 - [x] Add Qwen Responses/Chat hosted routing and its managed `enable_search` fallback.
 - [x] Verify Qwen Responses hosted search against the configured DashScope endpoint.
+- [x] Preserve the managed fetch URL in both canonical permission evaluation paths.
 - [x] Update public docs, changelog, and README news.
 - [x] Pass Python 3.10/3.11/3.12 tests and the stable flake8/mypy gate.
 - [x] Merge the reviewed feature commit into fork `main`.

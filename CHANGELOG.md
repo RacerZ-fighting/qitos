@@ -82,6 +82,9 @@ How to update:
 
 ### Changed
 
+- Managed `web_fetch` now projects its requested URL into the canonical Tool permission
+  scope, including the direct `BaseTool` permission path, so application network rules
+  are applied consistently before a fetch begins.
 - An admitted managed `web_search` schema now prefers the tested provider-hosted
   contract on the official OpenAI Responses endpoint, Qwen Responses/Chat, and the
   official Anthropic Messages endpoint. Native output items and citations remain canonical. Only an

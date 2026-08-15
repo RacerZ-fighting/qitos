@@ -9,6 +9,11 @@ from qitos.core.tool import BaseTool, ToolPermission, ToolSpec
 from .capability import WebFetchCapability
 
 
+def _url_rule_scope(args: dict[str, Any]) -> str:
+    url = args.get("url")
+    return url if isinstance(url, str) else ""
+
+
 class ManagedWebFetchTool(BaseTool):
     """Expose one configured managed fetch capability as ``web_fetch``."""
 
@@ -34,6 +39,7 @@ class ManagedWebFetchTool(BaseTool):
                     "additionalProperties": False,
                 },
                 permissions=ToolPermission(network=True),
+                rule_scope_builder=_url_rule_scope,
                 read_only=True,
                 concurrency_safe=True,
                 result_max_chars=110_000,

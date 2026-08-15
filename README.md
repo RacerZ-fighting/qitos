@@ -25,7 +25,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   rejection can fall back to the same managed Tool, but observable provider output is
   never replayed. Kimi keeps its `/search` and `$web_search` managed paths, and Qwen
   has a matching `enable_search` managed capability for providers without hosted Tool
-  delivery.
+  delivery. Managed `web_fetch` projects the requested URL into the same permission
+  scope before network access.
 - **Reproducible on-demand quality gates**: CI, documentation, and contribution
   validation now run only through explicit GitHub Actions dispatch. The declared
   development environment includes async-test support, and build/audit jobs require a
