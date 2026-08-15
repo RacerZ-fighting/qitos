@@ -819,9 +819,9 @@ async def test_committed_tool_transaction_lookup_rebuilds_and_isolated(
                 "metadata": {},
             },
             "result": {
-                "status": "success",
-                "output": {"reachable": True},
-                "error": None,
+                "status": "timed_out",
+                "output": {"process_status": "running"},
+                "error": "",
                 "metadata": {"evidence_id": "evidence-1"},
                 "model_output": "service is reachable",
             },
@@ -848,6 +848,8 @@ async def test_committed_tool_transaction_lookup_rebuilds_and_isolated(
     assert transaction.step_id == 3
     assert transaction.action_index == 0
     assert transaction.action.name == "inspect"
+    assert transaction.result.status == "timed_out"
+    assert transaction.result.error == ""
     assert transaction.result.model_visible_output == "service is reachable"
 
     transaction.action.args["target"] = "mutated"
