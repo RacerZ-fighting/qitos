@@ -23,7 +23,8 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
   `ContextSnapshot` 追加，不再改写旧 ToolResult。超大工具输出先完整持久化，模型侧统一使用
   单条 8K、批次 16K 的 receipt 和可继续读取的 Artifact 引用。
 - **有终态结论的自主预算运行**：应用可以把最后一个 budget step 保留为无工具结论；Provider
-  不可用时仍提交确定性的可恢复 fallback。`PermissionMode.AUTONOMOUS` 为已授权产品移除
+  不可用时仍提交确定性的可恢复 fallback。立即取消与逐步取消也使用同一持久终态边界；terminal
+  resume 直接返回已保存结论，不会重放模型或工具。`PermissionMode.AUTONOMOUS` 为已授权产品移除
   approval 与 shell 形态启发式，同时保留显式 deny、Runtime capability 与跨 Run owner 边界。
 - **可复现的手动质量门**：CI、文档和贡献校验现在只通过 GitHub Actions 手动触发。
   声明的开发环境已包含异步测试支持，build/audit job 也要求包含

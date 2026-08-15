@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import time
 from typing import Any
@@ -15,6 +17,7 @@ from qitos.engine import RuntimeBudget
 from qitos.kit import ReActTextParser
 from qitos.kit.journal import JsonlSessionJournal
 from qitos.models import Model, ModelRequest, ModelStreamEvent, ModelStreamEventType
+from qitos.trace.writer import TraceWriter
 
 
 @dataclass
@@ -40,6 +43,25 @@ class _TerminalModel(Model):
         if isinstance(response, Exception):
             raise response
         yield response
+
+
+class _BlockingModel(Model):
+    def __init__(self) -> None:
+        super().__init__(model="cancel-terminal", temperature=None)
+        self.started = asyncio.Event()
+        self.cleaned = asyncio.Event()
+
+    async def stream(
+        self,
+        request: ModelRequest,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        _ = request
+        self.started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.cleaned.set()
+        yield _completed()
 
 
 class _WaitingAgent(AgentModule[_State, dict[str, Any], Action]):
@@ -261,3 +283,216 @@ async def test_terminal_step_is_durable_and_resume_does_not_replay_it(
     assert resume_model.requests == []
     assert resumed.state.stop_reason == "budget_steps"
     assert resumed.state.final_result == "terminal report"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_terminal_request_commits_fallback_before_propagating(
+    tmp_path: Path,
+) -> None:
+    model = _BlockingModel()
+    journal = JsonlSessionJournal(tmp_path)
+    engine = Engine(
+        _WaitingAgent(model),
+        budget=RuntimeBudget(max_steps=1, terminal_synthesis=True),
+        journal=journal,
+    )
+    run_task = asyncio.create_task(engine.arun("investigate"))
+    await asyncio.wait_for(model.started.wait(), timeout=1)
+    run_id = engine.active_run_id
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert model.cleaned.is_set()
+    records = await journal.replay()
+    types = [record.type for record in records]
+    assert JournalRecordType.RUN_INTERRUPTED not in types
+    assert types[-1] is JournalRecordType.RUN_COMPLETED
+
+    resume_model = _TerminalModel(
+        [AssertionError("cancelled terminal Run called the model on resume")]
+    )
+    resumed = await Engine(
+        _WaitingAgent(resume_model),
+        budget=RuntimeBudget(max_steps=1, terminal_synthesis=True),
+        journal=JsonlSessionJournal(tmp_path),
+    ).aresume_from_journal(run_id)
+
+    assert resume_model.requests == []
+    assert resumed.state.stop_reason == "cancelled_immediate"
+    assert "cancelled_immediate" in str(resumed.state.final_result)
+
+
+@pytest.mark.asyncio
+async def test_engine_cancel_returns_durable_terminal_result(
+    tmp_path: Path,
+) -> None:
+    model = _BlockingModel()
+    journal = JsonlSessionJournal(tmp_path)
+    engine = Engine(
+        _WaitingAgent(model, model_driven=True),
+        budget=RuntimeBudget(max_steps=2, terminal_synthesis=True),
+        journal=journal,
+    )
+    run_task = asyncio.create_task(engine.arun("investigate"))
+    await asyncio.wait_for(model.started.wait(), timeout=1)
+
+    engine.cancel("immediate")
+    result = await run_task
+
+    assert model.cleaned.is_set()
+    assert result.state.stop_reason == "cancelled_immediate"
+    assert "cancelled_immediate" in str(result.state.final_result)
+    records = await journal.replay()
+    types = [record.type for record in records]
+    assert JournalRecordType.RUN_INTERRUPTED not in types
+    assert types[-1] is JournalRecordType.RUN_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_engine_cancel_during_terminal_request_returns_result(
+    tmp_path: Path,
+) -> None:
+    model = _BlockingModel()
+    journal = JsonlSessionJournal(tmp_path)
+    engine = Engine(
+        _WaitingAgent(model),
+        budget=RuntimeBudget(max_steps=1, terminal_synthesis=True),
+        journal=journal,
+    )
+    run_task = asyncio.create_task(engine.arun("investigate"))
+    await asyncio.wait_for(model.started.wait(), timeout=1)
+
+    engine.cancel("immediate")
+    result = await run_task
+
+    assert model.cleaned.is_set()
+    assert result.state.stop_reason == "cancelled_immediate"
+    assert "cancelled_immediate" in str(result.state.final_result)
+    records = await journal.replay()
+    assert records[-1].type is JournalRecordType.RUN_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_after_step_cancel_commits_terminal_result(
+    tmp_path: Path,
+) -> None:
+    class CancelAfterFirstStep:
+        requested = False
+
+        def on_after_step(self, context: Any, engine: Engine[Any, Any, Any]) -> None:
+            _ = context
+            if not self.requested:
+                self.requested = True
+                engine.cancel("after_step")
+
+    model = _TerminalModel([AssertionError("cancel conclusion called the model")])
+    journal = JsonlSessionJournal(tmp_path)
+    trace_writer = TraceWriter(str(tmp_path / "trace"), "cancel-after-step")
+    result = await Engine(
+        _WaitingAgent(model),
+        budget=RuntimeBudget(max_steps=3, terminal_synthesis=True),
+        journal=journal,
+        hooks=[CancelAfterFirstStep()],
+        trace_writer=trace_writer,
+    ).arun("investigate")
+
+    assert model.requests == []
+    assert result.state.stop_reason == "cancelled_after_step"
+    assert "cancelled_after_step" in str(result.state.final_result)
+    assert result.task_result is not None
+    assert result.task_result.success is False
+    manifest = json.loads(
+        Path(trace_writer.manifest_path).read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "stopped"
+    records = await journal.replay()
+    types = [record.type for record in records]
+    assert JournalRecordType.RUN_INTERRUPTED not in types
+    assert types[-1] is JournalRecordType.RUN_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_cancelling_tool_commits_pair_then_terminal_fallback(
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+    calls = 0
+    registry = ToolRegistry()
+
+    @tool(name="wait_forever")
+    async def wait_forever() -> str:
+        nonlocal calls
+        calls += 1
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+        return "unreachable"
+
+    registry.register(wait_forever)
+
+    class ToolAgent(AgentModule[_State, dict[str, Any], Action]):
+        def __init__(self) -> None:
+            super().__init__(tool_registry=registry)
+
+        def init_state(self, task: str, **kwargs: Any) -> _State:
+            _ = kwargs
+            return _State(task=task, max_steps=2)
+
+        def decide(
+            self,
+            state: _State,
+            observation: dict[str, Any],
+        ) -> Decision[Action]:
+            _ = state, observation
+            return Decision.act(
+                [Action(name="wait_forever", action_id="wait-call")]
+            )
+
+        def reduce(
+            self,
+            state: _State,
+            observation: dict[str, Any],
+            decision: Decision[Action],
+        ) -> _State:
+            _ = observation, decision
+            return state
+
+    journal = JsonlSessionJournal(tmp_path)
+    engine = Engine(
+        ToolAgent(),
+        budget=RuntimeBudget(max_steps=2, terminal_synthesis=True),
+        journal=journal,
+    )
+    run_task = asyncio.create_task(engine.arun("investigate"))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    run_id = engine.active_run_id
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert cleaned.is_set()
+    assert calls == 1
+    records = await journal.replay()
+    types = [record.type for record in records]
+    assert types.count(JournalRecordType.STEP_COMMITTED) == 2
+    assert types[-1] is JournalRecordType.RUN_COMPLETED
+    terminal = next(
+        record for record in records if record.type is JournalRecordType.TOOL_TERMINAL
+    )
+    assert terminal.payload["result"]["status"] == "cancelled"
+
+    resumed = await Engine(
+        ToolAgent(),
+        budget=RuntimeBudget(max_steps=2, terminal_synthesis=True),
+        journal=JsonlSessionJournal(tmp_path),
+    ).aresume_from_journal(run_id)
+
+    assert calls == 1
+    assert resumed.state.stop_reason == "cancelled_immediate"
+    assert "cancelled_immediate" in str(resumed.state.final_result)

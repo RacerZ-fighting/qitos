@@ -39,6 +39,7 @@ class TurnExecution(Generic[StateT, ObservationT]):
     stop: bool = False
     journal_interrupted: bool = False
     check_after_step_cancel: bool = False
+    caller_cancelled: bool = False
 
 
 class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
@@ -90,6 +91,20 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
             decision = await engine._run_decide(state, observation, record, turn)
             if managed_run:
                 await engine._journal_model_completed(record, decision)
+        except asyncio.CancelledError:
+            if not engine.budget.terminal_synthesis:
+                raise
+            caller_cancelled = not engine._cancel_token.is_cancel_requested
+            if engine.records and engine.records[-1] is record:
+                engine.records.pop()
+            return self._execution(
+                state,
+                observation,
+                record,
+                decision=None,
+                next_step_id=current_step,
+                caller_cancelled=caller_cancelled,
+            )
         except EngineInterrupt as exc:
             if not managed_run:
                 return await self._interrupt(
@@ -178,6 +193,55 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
             record.observation = next_observation
             engine._memory_append("observation", next_observation, record.step_id)
             engine._run_reduce(state, next_observation, decision, record)
+        except asyncio.CancelledError:
+            if not engine.budget.terminal_synthesis:
+                raise
+            if len(record.action_results) < len(decision.actions):
+                raise
+            cancelled_results = [
+                item.to_dict() if hasattr(item, "to_dict") else item
+                for item in record.action_results
+            ]
+            next_observation = engine._build_observation_after_action(
+                state=state,
+                step_id=current_step,
+                started_at=started_at,
+                decision=decision,
+                action_results=cancelled_results,
+            )
+            record.observation = next_observation
+            engine._memory_append("observation", next_observation, record.step_id)
+            engine._run_reduce(state, next_observation, decision, record)
+            engine.validation_gate.after_phase(
+                state,
+                RuntimePhase.CHECK_STOP.value,
+            )
+            engine._finalize_step(record, state)
+            if managed_run:
+                state.advance_step()
+                if engine.journal is not None:
+                    await engine._journal_commit_step(
+                        record,
+                        before=step_before,
+                        state=state,
+                        terminal=False,
+                    )
+                else:
+                    await engine._save_checkpoint(current_step, state, task)
+            self._after_step_hook(
+                state,
+                record,
+                task=task,
+                phase=RuntimePhase.CHECK_STOP,
+            )
+            return self._execution(
+                state,
+                next_observation,
+                record,
+                decision,
+                next_step_id=current_step + 1,
+                caller_cancelled=True,
+            )
         except EngineInterrupt as exc:
             if not managed_run:
                 return await self._interrupt(
@@ -340,7 +404,8 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
         )
 
         decision: Decision[ActionT] | None = None
-        failure: Exception | None = None
+        failure: BaseException | None = None
+        caller_cancelled = False
         attempted_model = bool(use_model and turn.model is not None)
         if attempted_model:
             engine._model_continuation = None
@@ -351,8 +416,11 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
                     record,
                     turn,
                 )
-            except asyncio.CancelledError:
-                raise
+            except asyncio.CancelledError as exc:
+                failure = exc
+                caller_cancelled = not engine._cancel_token.is_cancel_requested
+                stop_reason = StopReason.CANCELLED_IMMEDIATE
+                engine._model_continuation = None
             except Exception as exc:
                 failure = exc
                 engine._model_continuation = None
@@ -487,6 +555,7 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
             decision,
             stop=True,
             next_step_id=step_id,
+            caller_cancelled=caller_cancelled,
         )
 
     async def _recover_decide_error(
@@ -774,6 +843,7 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
             record,
             decision,
             next_step_id=record.step_id + 1,
+            check_after_step_cancel=managed_run,
         )
 
     def _after_step_hook(
@@ -809,6 +879,7 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
         stop: bool = False,
         journal_interrupted: bool = False,
         check_after_step_cancel: bool = False,
+        caller_cancelled: bool = False,
     ) -> TurnExecution[StateT, ObservationT]:
         stop_reason: StopReason | None = None
         if stop:
@@ -832,6 +903,7 @@ class _TurnRuntime(Generic[StateT, ObservationT, ActionT]):
             stop=stop,
             journal_interrupted=journal_interrupted,
             check_after_step_cancel=check_after_step_cancel,
+            caller_cancelled=caller_cancelled,
         )
 
     @staticmethod

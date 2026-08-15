@@ -1622,18 +1622,31 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     self._cancel_token.is_cancel_requested
                     and self._cancel_token.mode == CancelMode.IMMEDIATE
                 ):
-                    state.set_stop(StopReason.CANCELLED_IMMEDIATE)
-                    self._emit(
-                        step_id,
-                        RuntimePhase.END,
-                        ok=False,
-                        payload={"stop_reason": state.stop_reason},
-                    )
-                    await self._journal_interrupt_run(
-                        step_id=step_id,
-                        reason=StopReason.CANCELLED_IMMEDIATE.value,
-                    )
-                    journal_interrupted = True
+                    if self.budget.terminal_synthesis:
+                        execution = await self._turn_runtime.execute_terminal(
+                            state,
+                            current_observation,
+                            task=task_text,
+                            stop_reason=StopReason.CANCELLED_IMMEDIATE,
+                            step_id=step_id,
+                            use_model=False,
+                        )
+                        state = execution.state
+                        current_observation = execution.observation
+                        step_id = execution.next_step_id
+                    else:
+                        state.set_stop(StopReason.CANCELLED_IMMEDIATE)
+                        self._emit(
+                            step_id,
+                            RuntimePhase.END,
+                            ok=False,
+                            payload={"stop_reason": state.stop_reason},
+                        )
+                        await self._journal_interrupt_run(
+                            step_id=step_id,
+                            reason=StopReason.CANCELLED_IMMEDIATE.value,
+                        )
+                        journal_interrupted = True
                     break
 
                 terminal_reason = (
@@ -1654,6 +1667,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     state = execution.state
                     current_observation = execution.observation
                     step_id = execution.next_step_id
+                    if execution.caller_cancelled:
+                        cancelled = True
+                        propagate_cancel = True
+                        self._cancel_token.request_cancel("immediate")
                     break
 
                 if self._budget_exhausted(step_id, state):
@@ -1691,6 +1708,23 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     journal_interrupted or execution.journal_interrupted
                 )
 
+                if execution.caller_cancelled:
+                    cancelled = True
+                    propagate_cancel = True
+                    self._cancel_token.request_cancel("immediate")
+                    terminal = await self._turn_runtime.execute_terminal(
+                        state,
+                        current_observation,
+                        task=task_text,
+                        stop_reason=StopReason.CANCELLED_IMMEDIATE,
+                        step_id=step_id,
+                        use_model=False,
+                    )
+                    state = terminal.state
+                    current_observation = terminal.observation
+                    step_id = terminal.next_step_id
+                    break
+
                 if execution.stop:
                     break
 
@@ -1699,17 +1733,33 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
                     and self._cancel_token.is_cancel_requested
                     and self._cancel_token.mode == CancelMode.AFTER_STEP
                 ):
-                    await self._journal_interrupt_run(
-                        step_id=execution.step.step_id,
-                        reason="cancelled_after_step",
-                    )
-                    journal_interrupted = True
-                    self._emit(
-                        execution.step.step_id,
-                        RuntimePhase.END,
-                        ok=False,
-                        payload={"stop_reason": "cancelled_after_step"},
-                    )
+                    if self.budget.terminal_synthesis:
+                        terminal = await self._turn_runtime.execute_terminal(
+                            state,
+                            current_observation,
+                            task=task_text,
+                            stop_reason=StopReason.CANCELLED_AFTER_STEP,
+                            step_id=step_id,
+                            use_model=False,
+                        )
+                        state = terminal.state
+                        current_observation = terminal.observation
+                        step_id = terminal.next_step_id
+                    else:
+                        state.set_stop(StopReason.CANCELLED_AFTER_STEP)
+                        await self._journal_interrupt_run(
+                            step_id=execution.step.step_id,
+                            reason=StopReason.CANCELLED_AFTER_STEP.value,
+                        )
+                        journal_interrupted = True
+                        self._emit(
+                            execution.step.step_id,
+                            RuntimePhase.END,
+                            ok=False,
+                            payload={
+                                "stop_reason": state.stop_reason
+                            },
+                        )
                     break
         except asyncio.CancelledError:
             cancelled = True
@@ -1774,7 +1824,7 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             if cleanup_error is not None:
                 raise cleanup_error
 
-        if cancelled and propagate_cancel:
+        if cancelled and propagate_cancel and journal_interrupted:
             self._clear_active_context()
             raise asyncio.CancelledError
 
@@ -1835,6 +1885,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         )
         self._notify_run_end(result)
         self._clear_active_context()
+        if cancelled and propagate_cancel:
+            raise asyncio.CancelledError
         return result
 
     def run(
@@ -3222,7 +3274,10 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
     def _trace_status(stop_reason: str | None) -> str:
         if stop_reason == StopReason.UNRECOVERABLE_ERROR.value:
             return "failed"
-        if stop_reason == StopReason.CANCELLED_IMMEDIATE.value:
+        if stop_reason in {
+            StopReason.CANCELLED_IMMEDIATE.value,
+            StopReason.CANCELLED_AFTER_STEP.value,
+        }:
             return "stopped"
         return "completed"
 

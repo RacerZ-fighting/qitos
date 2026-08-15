@@ -305,6 +305,35 @@ class TestCancelInEngine:
         )
         assert stopped_early or has_cancel_event
 
+    def test_after_step_cancel_propagates_to_state_result_and_trace(self, tmp_path):
+        class _WaitAgent(_CountingAgent):
+            def decide(self, state, observation):
+                return Decision.wait(rationale="continue until cancelled")
+
+        class _CancelAfterFirstStep:
+            requested = False
+
+            def on_after_step(self, ctx, engine):
+                if not self.requested:
+                    self.requested = True
+                    engine.cancel("after_step")
+
+        writer = TraceWriter(str(tmp_path), "after-step-cancel")
+        result = Engine(
+            _WaitAgent(),
+            budget=RuntimeBudget(max_steps=3),
+            trace_writer=writer,
+            hooks=[_CancelAfterFirstStep()],
+        ).run("count")
+        with open(writer.manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+
+        assert result.state.stop_reason == "cancelled_after_step"
+        assert result.task_result is not None
+        assert result.task_result.stop_reason == "cancelled_after_step"
+        assert result.task_result.success is False
+        assert manifest["status"] == "stopped"
+
     def test_cancel_emits_end_event(self):
         """Cancellation emits an END event with stop_reason."""
         engine = _make_engine(max_steps=50)

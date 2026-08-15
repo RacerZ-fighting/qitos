@@ -304,6 +304,10 @@ Decision.branch(...)
 `"cancelled_immediate"` 同步写入最终 State、任务/运行结果与 END event；对应的
 trace manifest 使用终态 `status="stopped"`，而不是正常完成状态。
 
+`StopReason.CANCELLED_AFTER_STEP` 表示当前步骤已经提交到安全边界后再停止，其 trace manifest
+同样使用 `status="stopped"`。启用 terminal synthesis 时，两种取消都会保存非空结论；恢复该终态
+Run 不会重放模型或 Tool。
+
 </Accordion>
 
 </AccordionGroup>

@@ -276,6 +276,13 @@ request fails, returns a ToolCall, or cannot run because time/token/cost is exha
 Engine commits `AgentModule.build_terminal_fallback()` instead. The default remains
 `False` so existing generic agents keep their current budget semantics.
 
+With terminal synthesis enabled, immediate and after-step cancellation also commit a
+tool-free deterministic conclusion and a completed Journal boundary. A controlled
+`Engine.cancel()` returns that terminal result. If the caller cancels the `arun()` Task
+directly, QitOS first makes Tool terminals and the cancellation conclusion durable, then
+re-raises `asyncio.CancelledError`. Resuming the completed Run returns the saved state
+without calling the model or executing a Tool.
+
 ---
 
 ## Environment variables

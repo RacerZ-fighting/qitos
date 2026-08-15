@@ -39,6 +39,7 @@ class StopReason(str, Enum):
     INFRASTRUCTURE_INVALID = "infrastructure_invalid"
     UNRECOVERABLE_ERROR = "unrecoverable_error"
     CANCELLED_IMMEDIATE = "cancelled_immediate"
+    CANCELLED_AFTER_STEP = "cancelled_after_step"
     INTERRUPT = "interrupt"
 
 

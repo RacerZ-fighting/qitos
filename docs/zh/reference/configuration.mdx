@@ -183,6 +183,11 @@ schema，也不复用 Provider continuation。终态请求失败、返回 ToolCa
 耗尽时，Engine 会提交 `AgentModule.build_terminal_fallback()` 的确定性结果。默认仍为 `False`，
 保持通用 Agent 的既有预算语义。
 
+启用 terminal synthesis 后，立即取消与逐步取消也会提交无工具的确定性结论和已完成的 Journal
+边界。受控的 `Engine.cancel()` 返回该终态结果；调用方直接取消 `arun()` Task 时，QitOS 会先持久化
+Tool 终态与取消结论，再重新抛出 `asyncio.CancelledError`。恢复已完成的 Run 会直接返回保存状态，
+不会再次调用模型或执行 Tool。
+
 ## 环境变量
 
 常见环境变量包括：

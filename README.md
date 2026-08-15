@@ -25,6 +25,8 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   model receipt plus a readable Artifact reference.
 - **A real final step for bounded autonomous runs**: applications can reserve the last
   budget step for a tool-free conclusion with a deterministic durable fallback.
+  Immediate and after-step cancellation use the same durable terminal boundary, so a
+  terminal resume returns the saved conclusion without replaying a model or Tool.
   `PermissionMode.AUTONOMOUS` removes approval and shell-shape prompts for authorized
   products while explicit denies, Runtime capabilities, and owner boundaries remain.
 - **Provider-hosted Web with a managed fallback**: an admitted `web_search` Tool now

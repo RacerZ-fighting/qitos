@@ -227,6 +227,12 @@ How to update:
 
 ### Fixed
 
+- Terminal-synthesis Runs now commit a non-empty cancellation conclusion and
+  `run.completed` boundary instead of leaving resumable work at `run.interrupted`.
+  Controlled `Engine.cancel()` returns that terminal result; direct caller Task
+  cancellation propagates only after Tool terminals, the terminal step, and Journal
+  completion are durable. Immediate and after-step cancellation remain distinct stop
+  reasons.
 - The declared development environment now installs `pytest-asyncio`, so the complete
   async suite executes in CI instead of producing unknown-mark warnings and hundreds
   of unsupported-coroutine failures. Build and audit environments require a
