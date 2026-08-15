@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, Sequence, TypeAlias, cast
+from typing import Any, Dict, Literal, Mapping, Sequence, TypeAlias, cast
 
 from .action import ActionStatus
 from .artifact import ArtifactRef
@@ -105,6 +105,66 @@ class ToolResult:
         if self.call_id is not None:
             payload["call_id"] = self.call_id
         return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "ToolResult":
+        """Decode one canonical result previously produced by :meth:`to_dict`.
+
+        Unlike :meth:`from_value`, this decoder does not reinterpret empty fields or
+        domain payloads. Journal replay relies on that exact wire round trip.
+        """
+        required = {"status", "output", "error", "metadata"}
+        optional = {"artifacts", "model_output", "call_id"}
+        fields = set(payload)
+        if not required.issubset(fields) or not fields.issubset(required | optional):
+            raise ValueError("tool result fields are invalid")
+
+        raw_status = payload["status"]
+        if not isinstance(raw_status, str):
+            raise ValueError("tool result status must be text")
+        raw_error = payload["error"]
+        if raw_error is not None and not isinstance(raw_error, str):
+            raise ValueError("tool result error must be text or null")
+        raw_metadata = payload["metadata"]
+        if not isinstance(raw_metadata, dict):
+            raise ValueError("tool result metadata must be an object")
+
+        raw_artifacts = payload.get("artifacts", ())
+        if not isinstance(raw_artifacts, Sequence) or isinstance(
+            raw_artifacts, (str, bytes)
+        ):
+            raise ValueError("tool result artifacts must be a sequence")
+        artifacts = tuple(
+            item
+            if isinstance(item, ArtifactRef)
+            else ArtifactRef.from_dict(dict(item))
+            for item in raw_artifacts
+            if isinstance(item, (ArtifactRef, Mapping))
+        )
+        if len(artifacts) != len(raw_artifacts):
+            raise ValueError("tool result artifacts must contain references")
+
+        raw_model_output = payload.get("model_output")
+        if raw_model_output is not None and not isinstance(raw_model_output, str):
+            raise ValueError("tool result model_output must be text or null")
+        raw_call_id = payload.get("call_id")
+        if raw_call_id is not None and (
+            not isinstance(raw_call_id, str) or not raw_call_id
+        ):
+            raise ValueError("tool result call_id must be non-empty text or null")
+
+        result = cls(
+            status=cast(ToolResultStatus, raw_status),
+            output=payload["output"],
+            error=raw_error,
+            metadata=dict(raw_metadata),
+            artifacts=artifacts,
+            model_output=raw_model_output,
+            call_id=raw_call_id,
+        )
+        if result.to_dict() != dict(payload):
+            raise ValueError("tool result payload is not canonical")
+        return result
 
     @classmethod
     def from_value(cls, payload: Any) -> "ToolResult":

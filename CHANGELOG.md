@@ -227,6 +227,8 @@ How to update:
 
 ### Fixed
 
+- Canonical Tool results now use an exact Journal decoder, so terminal Runs containing
+  an empty error string can be resumed without rewriting or rejecting durable records.
 - Terminal-synthesis Runs now commit a non-empty cancellation conclusion and
   `run.completed` boundary instead of leaving resumable work at `run.interrupted`.
   Controlled `Engine.cancel()` returns that terminal result; direct caller Task

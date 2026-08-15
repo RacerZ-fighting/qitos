@@ -513,9 +513,12 @@ class _JournalRuntime(Generic[StateT, ActionT]):
                         agent_id=engine.agent.name,
                     ),
                 )
-                terminal_result = ToolResult.from_value(dict(result))
-                if terminal_result.to_dict() != dict(result):
-                    raise JournalError("tool.terminal result is not canonical")
+                try:
+                    terminal_result = ToolResult.from_dict(result)
+                except (TypeError, ValueError) as exc:
+                    raise JournalError(
+                        "tool.terminal result is not canonical"
+                    ) from exc
                 record.action_results.append(terminal_result)
                 transaction = transactions.get(transaction_id)
                 if transaction is None:

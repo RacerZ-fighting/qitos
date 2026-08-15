@@ -109,6 +109,21 @@ def test_tool_result_round_trip_preserves_domain_output() -> None:
     assert restored.metadata == result.metadata
 
 
+def test_canonical_tool_result_round_trip_preserves_empty_error() -> None:
+    payload = ToolResult(
+        call_id="call-timeout",
+        status="timed_out",
+        output={"process_status": "running"},
+        error="",
+        metadata={"tool_name": "run_command"},
+        model_output="process remains available",
+    ).to_dict()
+
+    restored = ToolResult.from_dict(payload)
+
+    assert restored.to_dict() == payload
+
+
 def test_tool_result_restores_legacy_payload_without_call_id() -> None:
     restored = ToolResult.from_value(
         {"status": "success", "output": "done", "metadata": {}}

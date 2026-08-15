@@ -1045,6 +1045,50 @@ async def test_reducer_failure_preserves_terminal_for_resume(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_terminal_resume_preserves_empty_tool_error(tmp_path: Path) -> None:
+    class EmptyErrorAgent(JournalAgent):
+        def finalize_action_result(
+            self,
+            state: JournalState,
+            action: Action,
+            result: ToolResult,
+            *,
+            step_id: int,
+            context: ActionResultContext,
+        ) -> ToolResult:
+            _ = state, result, context
+            return ToolResult(
+                status="timed_out",
+                output={"process_status": "running"},
+                error="",
+                metadata={"tool_name": action.name},
+                model_output="process remains available",
+                call_id=action.action_id,
+            )
+
+    journal = JsonlSessionJournal(tmp_path)
+    completed = await Engine(agent=EmptyErrorAgent(), journal=journal).arun("inspect")
+    records_before_resume = await journal.replay()
+    terminal = next(
+        record
+        for record in records_before_resume
+        if record.type is JournalRecordType.TOOL_TERMINAL
+    )
+
+    resumed_agent = EmptyErrorAgent()
+    resumed = await Engine(
+        agent=resumed_agent,
+        journal=JsonlSessionJournal(tmp_path),
+    ).aresume_from_journal(journal.run_id)
+
+    assert completed.state.final_result == "done"
+    assert terminal.payload["result"]["error"] == ""
+    assert resumed.state.final_result == "done"
+    assert resumed_agent.executions == 0
+    assert len(await journal.replay()) == len(records_before_resume)
+
+
+@pytest.mark.asyncio
 async def test_resume_closes_started_tool_without_replaying_unknown_side_effect(
     tmp_path: Path,
 ) -> None:

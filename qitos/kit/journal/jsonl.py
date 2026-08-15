@@ -801,7 +801,7 @@ def _tool_transaction(
         raise JournalCorruptionError("tool.terminal payload is invalid")
     try:
         action = Action.from_dict(copy.deepcopy(dict(raw_action)))
-        result = ToolResult.from_value(copy.deepcopy(dict(raw_result)))
+        result = ToolResult.from_dict(copy.deepcopy(dict(raw_result)))
     except (TypeError, ValueError) as exc:
         raise JournalCorruptionError("tool.terminal payload is invalid") from exc
     return ToolTransaction(
