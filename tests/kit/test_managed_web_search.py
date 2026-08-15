@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 from qitos.kit.search import (
     KimiBuiltinWebSearchCapability,
     KimiWebSearchCapability,
     ManagedWebSearchTool,
+    QwenWebSearchCapability,
     WebSearchError,
     build_web_search_capability,
 )
@@ -137,6 +140,97 @@ def test_factory_is_extensible_without_faking_unsupported_search() -> None:
         ),
         KimiWebSearchCapability,
     )
+    assert isinstance(
+        build_web_search_capability(
+            provider="qwen",
+            api_key="secret",
+            base_url="https://dashscope.example/compatible-mode/v1",
+            model="qwen3.7-max",
+        ),
+        QwenWebSearchCapability,
+    )
+
+
+@pytest.mark.asyncio
+async def test_qwen_managed_search_uses_native_enable_search_contract() -> None:
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                "Current advisory: "
+                                "https://vendor.example/advisory"
+                            ),
+                            "search_info": {
+                                "search_results": [
+                                    {
+                                        "title": "Vendor advisory",
+                                        "url": "https://vendor.example/advisory",
+                                        "content": "Affected versions and fixes.",
+                                        "site_name": "Vendor",
+                                        "publish_time": "2026-08-04",
+                                    },
+                                    {
+                                        "title": "Research note",
+                                        "url": "https://research.example/note",
+                                    },
+                                ]
+                            },
+                        },
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        capability = QwenWebSearchCapability(
+            api_key="secret",
+            base_url="https://dashscope.example/compatible-mode/v1",
+            model="qwen3.7-max",
+            client=client,
+        )
+        result = await capability.search("current vendor advisory", max_results=1)
+
+    assert result.text.startswith("Current advisory")
+    assert [source.url for source in result.sources] == [
+        "https://vendor.example/advisory"
+    ]
+    assert result.sources[0].title == "Vendor advisory"
+    assert result.sources[0].snippet == "Affected versions and fixes."
+    assert result.sources[0].date == "2026-08-04"
+    assert requests[0].url == (
+        "https://dashscope.example/compatible-mode/v1/chat/completions"
+    )
+    payload = json.loads(requests[0].content)
+    assert payload["model"] == "qwen3.7-max"
+    assert payload["enable_search"] is True
+    assert payload["search_options"] == {"forced_search": True}
+
+
+@pytest.mark.parametrize(
+    ("status", "kind"),
+    ((401, "authentication"), (429, "rate_limited"), (503, "provider")),
+)
+@pytest.mark.asyncio
+async def test_qwen_managed_search_preserves_failure_kind(
+    status: int,
+    kind: str,
+) -> None:
+    def respond(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": "failure"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        capability = QwenWebSearchCapability(api_key="secret", client=client)
+        with pytest.raises(WebSearchError) as error:
+            await capability.search("current vendor advisory")
+
+    assert error.value.kind == kind
 
 
 @dataclass

@@ -182,13 +182,19 @@ def _to_responses_tools(
     return normalized or None
 
 
-def _to_responses_tool_choice(tool_choice: Any) -> Any:
+def _to_responses_tool_choice(
+    tool_choice: Any,
+    *,
+    hosted_web_search: bool = False,
+) -> Any:
     if not isinstance(tool_choice, dict):
         return tool_choice
     function = tool_choice.get("function")
     if tool_choice.get("type") == "function" and isinstance(function, dict):
         name = str(function.get("name") or "").strip()
         if name:
+            if hosted_web_search and name == "web_search":
+                return {"type": "web_search"}
             return {"type": "function", "name": name}
     return _native_value(tool_choice)
 
@@ -199,11 +205,18 @@ def _normalize_request_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     if response_format is not None:
         request_kwargs["text"] = {"format": _native_value(response_format)}
     tools = request_kwargs.pop("tools", None)
+    hosted_web_search = False
     if tools is not None:
-        request_kwargs["tools"] = _to_responses_tools(tools)
+        normalized_tools = _to_responses_tools(tools)
+        request_kwargs["tools"] = normalized_tools
+        hosted_web_search = any(
+            isinstance(tool, dict) and tool.get("type") == "web_search"
+            for tool in normalized_tools or []
+        )
     if "tool_choice" in request_kwargs:
         request_kwargs["tool_choice"] = _to_responses_tool_choice(
-            request_kwargs["tool_choice"]
+            request_kwargs["tool_choice"],
+            hosted_web_search=hosted_web_search,
         )
     return request_kwargs
 

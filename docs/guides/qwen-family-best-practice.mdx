@@ -41,6 +41,26 @@ path, so an intended tool action cannot be reported as successful completion.
 The trace retains the raw response, parser diagnostics, and
 `decision_source: parser` for that recovery step.
 
+## Use Qwen Web search
+
+When your application admits a managed Tool named `web_search`, a Qwen model can use
+the provider's native search contract without introducing another Tool name:
+
+- Responses sends `tools=[{"type": "web_search"}]`.
+- Chat Completions sends `enable_search: true` and removes the managed function schema
+  from that first request.
+- If the provider explicitly rejects native search before streaming any output, QitOS
+  retries that request with the original managed function schema.
+
+QitOS never performs this fallback after text, reasoning, ToolCall deltas, or native
+output items become observable. This prevents one model turn from being replayed after
+it may already have produced a billable or externally meaningful result.
+
+For a client-side fallback, construct `QwenWebSearchCapability`. It calls the Chat
+endpoint with `enable_search` and projects structured
+`search_info.search_results`—plus source URLs found in the answer—into bounded
+`WebSource` values.
+
 ## Why QitOS does not copy the Qwen-Agent sentinel prompt
 
 The official Qwen-Agent project includes a Qwen-specific function-calling prompt format for chat interfaces that do not provide a native tool channel.

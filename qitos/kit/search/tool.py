@@ -62,9 +62,7 @@ class ManagedWebSearchTool(BaseTool):
         ).to_dict()
 
     async def aclose(self) -> None:
-        close = getattr(self._capability, "aclose", None)
-        if callable(close):
-            await close()
+        await self._capability.aclose()
 
 
 __all__ = ["ManagedWebSearchTool"]

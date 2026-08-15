@@ -18,6 +18,14 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Provider-hosted Web with a managed fallback**: an admitted `web_search` Tool now
+  uses the official OpenAI Responses endpoint, Qwen Responses/Chat, or the official
+  Anthropic Messages server-side search contract when that transport declares support. Native search
+  items and citations remain in the model transaction. An explicit request-time
+  rejection can fall back to the same managed Tool, but observable provider output is
+  never replayed. Kimi keeps its `/search` and `$web_search` managed paths, and Qwen
+  has a matching `enable_search` managed capability for providers without hosted Tool
+  delivery.
 - **Reproducible on-demand quality gates**: CI, documentation, and contribution
   validation now run only through explicit GitHub Actions dispatch. The declared
   development environment includes async-test support, and build/audit jobs require a
@@ -70,7 +78,9 @@ QitOS core is the small framework. Product-grade applications and showcase agent
   are unavailable, and gives execution the same facts. Local host and ordinary-
   container runs use the same managed file, foreground, background, PTY, stdin, and
   cleanup primitives; Docker exec advertises foreground-only process support instead
-  of silently detaching untracked work.
+  of silently detaching untracked work. Runtime-profile probes for Docker now execute
+  inside the selected container, and the verified commands are frozen into that
+  backend's snapshot.
 - **Official MCP lifecycle for full and interactive Runs**: independent servers now
   connect and discover concurrently under fixed limits, then publish successful
   catalogs in deterministic factory order. `Engine.astep()` lazily owns the same MCP

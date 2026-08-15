@@ -82,6 +82,14 @@ How to update:
 
 ### Changed
 
+- An admitted managed `web_search` schema now prefers the tested provider-hosted
+  contract on the official OpenAI Responses endpoint, Qwen Responses/Chat, and the
+  official Anthropic Messages endpoint. Native output items and citations remain canonical. Only an
+  explicit request-time unsupported response can retry with the managed schema;
+  provider output already published to the Run is never replayed. Kimi-compatible
+  Messages endpoints continue to receive an ordinary managed Tool.
+- Docker runtime-profile command probes now execute in the selected container and the
+  resulting verified commands are retained in its immutable capability snapshot.
 - CI, documentation validation, and contribution checks now run only when explicitly
   dispatched from GitHub Actions. The manual jobs retain the supported-Python test
   matrix, coverage, packaging, lint, type, audit, and focused contribution checks.
@@ -149,6 +157,9 @@ How to update:
 
 ### Breaking
 
+- Custom `WebSearchCapability` implementations must provide async `aclose()`. The
+  managed Tool now uses that typed lifecycle directly instead of probing for an
+  optional close method at runtime.
 - `CapabilityEnv(attestation=...)` has been replaced by
   `CapabilityEnv(snapshot=RuntimeCapabilitySnapshot(...))`.
   `TurnRuntimeCapabilities` now stores the complete Runtime snapshot; its
@@ -292,6 +303,10 @@ How to update:
 
 ### Added
 
+- Added `QwenWebSearchCapability`, which uses DashScope's native Chat
+  `enable_search` option and preserves structured `search_info.search_results` as
+  bounded `WebSource` values. It remains available as the managed fallback when a
+  model transport cannot accept hosted Web Tools.
 - Added immutable `RunHandle`/`RunStatus` contracts and a lease-free
   `JsonlRunCatalog` for inspect, deterministic listing, validated lineage, and direct
   children. Catalog reads use only an exact read-only SQLite projection or canonical

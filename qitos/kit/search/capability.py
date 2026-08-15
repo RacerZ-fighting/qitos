@@ -60,6 +60,10 @@ class WebSearchCapability(Protocol):
     ) -> WebSearchResponse:
         ...
 
+    async def aclose(self) -> None:
+        """Release resources owned by this capability."""
+        ...
+
 
 __all__ = [
     "WebSearchCapability",

@@ -39,13 +39,16 @@ capabilities = model.capabilities
 print(capabilities.api.value)       # responses
 print(capabilities.native_tool_calls)
 print(capabilities.reasoning)
+print(capabilities.hosted_tools)
 ```
 
 OpenAI Responses, Anthropic Messages, and compatible Chat Completions report their
-native-tool, reasoning/replay, usage/cache, and multimodal behavior. A false value is
-intentional: for example, Responses continuation and provider-hosted tools are not
-claimed until QitOS has a complete request, persistence, and recovery contract for
-them. Unknown/custom adapters inherit conservative `legacy` capabilities.
+native-tool, reasoning/replay, usage/cache, multimodal, and tested hosted-Tool
+behavior. Official OpenAI Responses, Qwen Responses/Chat, and official Anthropic
+Messages declare `web_search`; custom compatible endpoints stay conservative unless
+their adapter has a tested contract. Kimi's `/search` and `$web_search` remain managed
+capabilities and do not make a custom Anthropic-compatible endpoint claim Claude's
+server Tool. Unknown/custom adapters inherit conservative `legacy` capabilities.
 
 Terminal chunks and completed responses expose token counts through `ModelUsage`:
 

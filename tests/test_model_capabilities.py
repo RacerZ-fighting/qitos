@@ -50,6 +50,16 @@ def test_responses_capabilities_claim_validated_continuation() -> None:
     assert model.capabilities.continuation is True
     assert model.capabilities.usage is True
     assert model.capabilities.prompt_cache_usage is True
+    assert model.capabilities.hosted_tools == ("web_search",)
+
+
+def test_openai_compatible_base_url_does_not_inherit_official_hosted_tools() -> None:
+    model = OpenAIModel(
+        api_key="test-key",
+        base_url="https://gateway.example/v1",
+        model="gpt-test",
+    )
+
     assert model.capabilities.hosted_tools == ()
 
 
@@ -64,6 +74,20 @@ def test_chat_compatibility_capabilities_stay_explicitly_narrower() -> None:
     assert model.capabilities.reasoning == (ReasoningCapability.SUMMARY,)
     assert model.capabilities.opaque_replay is False
     assert model.capabilities.continuation is False
+    assert model.capabilities.hosted_tools == ()
+
+
+@pytest.mark.parametrize("api_mode", ("responses", "chat_completions"))
+def test_qwen_compatible_transport_declares_native_web_search(api_mode: str) -> None:
+    model = OpenAICompatibleModel(
+        api_key="test-key",
+        base_url="https://dashscope.example/compatible-mode/v1",
+        model="qwen3.7-max",
+        api_mode=api_mode,
+        provider_name="qwen",
+    )
+
+    assert model.capabilities.hosted_tools == ("web_search",)
 
 
 def test_anthropic_capabilities_describe_native_messages_contract() -> None:
@@ -76,6 +100,19 @@ def test_anthropic_capabilities_describe_native_messages_contract() -> None:
     assert model.capabilities.usage is True
     assert model.capabilities.prompt_cache_usage is True
     assert model.capabilities.multimodal_input is True
+    assert model.capabilities.hosted_tools == ("web_search",)
+
+
+def test_anthropic_compatible_provider_does_not_inherit_anthropic_hosted_tools() -> None:
+    model = AnthropicModel(
+        api_key="test-key",
+        base_url="https://api.moonshot.example/anthropic",
+        model="kimi-test",
+        provider_name="kimi",
+    )
+
+    assert model.capabilities.api is ModelAPI.ANTHROPIC_MESSAGES
+    assert model.capabilities.hosted_tools == ()
 
 
 def test_model_capabilities_are_immutable_and_reject_duplicate_facts() -> None:

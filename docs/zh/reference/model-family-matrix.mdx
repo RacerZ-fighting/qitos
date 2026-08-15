@@ -23,6 +23,17 @@ description: "QitOS v0.4 内建家族预设的默认适配层策略矩阵。"
 其余家族是成熟度不同的**受支持预设**。Anthropic 使用原生 Messages adapter；
 OpenAI、Gemini、DeepSeek 与 GLM 仍保留兼容传输，后续可随专用 adapter 演进。
 
+## 查看 Web Tool 能力
+
+配置完成的模型会通过不可变的 `model.capabilities.hosted_tools` 声明已经验证的
+Provider-hosted Tool。官方 OpenAI Responses、Qwen Responses/Chat 和官方 Anthropic
+Messages 会声明 `web_search`。自定义兼容端点默认保持保守，不会因为使用 Anthropic
+协议就继承 Claude 的 server Tool。
+
+Kimi 的 `/search` 与 `$web_search` 继续作为 managed capability 使用。若 Provider 在
+输出任何可观察事件前明确拒绝 hosted Web，QitOS 才会回退到同一次准入的 managed
+`web_search`；已经输出文本、推理、ToolCall 或原生 item 后不会重放 turn。
+
 ## 正确理解这张表
 
 这张表不是模型排行榜。

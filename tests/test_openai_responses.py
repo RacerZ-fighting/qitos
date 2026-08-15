@@ -204,6 +204,29 @@ def test_responses_tools_and_forced_choice_use_native_shape() -> None:
     assert _to_responses_tool_choice(
         {"type": "function", "function": {"name": "lookup"}}
     ) == {"type": "function", "name": "lookup"}
+    assert _to_responses_tool_choice(
+        {"type": "function", "function": {"name": "web_search"}},
+        hosted_web_search=True,
+    ) == {"type": "web_search"}
+
+
+def _managed_web_search_schema() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search public sources",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+    ]
 
 
 def test_responses_normalization_preserves_order_ids_and_usage() -> None:
@@ -640,6 +663,367 @@ async def test_openai_defaults_to_responses_and_streams_one_complete_transaction
     }
     assert events.closed is True
     assert captured["client_closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_prefers_hosted_web_search_and_preserves_citations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    output = [
+        {
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "vendor advisory"},
+        },
+        {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "Vendor advisory",
+                    "annotations": [
+                        {
+                            "type": "url_citation",
+                            "url": "https://vendor.example/advisory",
+                            "title": "Vendor advisory",
+                            "start_index": 0,
+                            "end_index": 15,
+                        }
+                    ],
+                }
+            ],
+        },
+    ]
+    events = _AsyncListStream(
+        [
+            {"type": "response.output_item.done", "item": item}
+            for item in output
+        ]
+        + [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "model": "gpt-test",
+                    "output": output,
+                },
+            }
+        ]
+    )
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return events
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    options = model.build_tool_schema_request_options(
+        _managed_web_search_schema(),
+        delivery="api_parameter",
+    )
+    chunks = await _collect(
+        model,
+        [{"role": "user", "content": "Find the vendor advisory"}],
+        **options,
+    )
+
+    assert captured["tools"] == [{"type": "web_search"}]
+    assert chunks[-1].native_items == output
+    message = chunks[-1].native_items[1]
+    assert message["content"][0]["annotations"][0]["url"] == (
+        "https://vendor.example/advisory"
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_falls_back_to_managed_search_on_request_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    terminal = _AsyncListStream(
+        [
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "model": "gpt-test",
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "web_search",
+                            "arguments": '{"query":"vendor advisory"}',
+                            "status": "completed",
+                        }
+                    ],
+                },
+            }
+        ]
+    )
+
+    class UnsupportedWebSearchError(Exception):
+        status_code = 400
+        body = {"error": "web_search is not supported by this model"}
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            if any(tool.get("type") == "web_search" for tool in kwargs["tools"]):
+                raise UnsupportedWebSearchError("unsupported web_search tool")
+            return terminal
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    options = model.build_tool_schema_request_options(
+        _managed_web_search_schema(),
+        delivery="api_parameter",
+    )
+    chunks = await _collect(
+        model,
+        [{"role": "user", "content": "Find the vendor advisory"}],
+        **options,
+    )
+
+    assert requests[0]["tools"] == [{"type": "web_search"}]
+    assert requests[1]["tools"][0]["type"] == "function"
+    assert requests[1]["tools"][0]["name"] == "web_search"
+    assert chunks[-1].tool_calls is not None
+    assert chunks[-1].tool_calls[0]["function"]["name"] == "web_search"
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_does_not_fallback_after_published_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    class UnsupportedWebSearchError(Exception):
+        status_code = 400
+        body = {"error": "web_search is not supported by this model"}
+
+    events = _AsyncListStream(
+        [{"type": "response.output_text.delta", "delta": "partial"}],
+        failure=UnsupportedWebSearchError("unsupported web_search tool"),
+    )
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            return events
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=1)
+    options = model.build_tool_schema_request_options(
+        _managed_web_search_schema(),
+        delivery="api_parameter",
+    )
+
+    with pytest.raises(ModelTransportError, match="unsupported web_search"):
+        await _collect(
+            model,
+            [{"role": "user", "content": "Find the vendor advisory"}],
+            **options,
+        )
+
+    assert len(requests) == 1
+
+
+def test_qwen_responses_projects_its_native_web_search_tool() -> None:
+    model = OpenAICompatibleModel(
+        model="qwen3.7-max",
+        api_key="key",
+        base_url="https://dashscope.example/compatible-mode/v1",
+        api_mode="responses",
+        provider_name="qwen",
+    )
+
+    options = model.build_tool_schema_request_options(
+        _managed_web_search_schema(),
+        delivery="api_parameter",
+    )
+
+    assert options["tools"] == [{"type": "web_search"}]
+
+
+@pytest.mark.asyncio
+async def test_qwen_chat_uses_native_search_for_admitted_web_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    events = _AsyncListStream(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content="Current answer",
+                            reasoning_content=None,
+                            tool_calls=None,
+                        ),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            )
+        ]
+    )
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        async def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return events
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAICompatibleModel(
+        model="qwen3.7-max",
+        api_key="key",
+        base_url="https://dashscope.example/compatible-mode/v1",
+        provider_name="qwen",
+        max_attempts=1,
+    )
+    options = model.build_tool_schema_request_options(
+        _managed_web_search_schema(),
+        delivery="api_parameter",
+    )
+    chunks = await _collect(
+        model,
+        [{"role": "user", "content": "Find current information"}],
+        **options,
+    )
+
+    assert "tools" not in captured
+    assert captured["extra_body"] == {"enable_search": True}
+    assert chunks[-1].finish_reason == "stop"
+
+
+@pytest.mark.asyncio
+async def test_qwen_chat_falls_back_to_managed_search_on_request_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    events = _AsyncListStream(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=None,
+                            reasoning_content=None,
+                            tool_calls=[
+                                SimpleNamespace(
+                                    index=0,
+                                    id="call_1",
+                                    type="function",
+                                    function=SimpleNamespace(
+                                        name="web_search",
+                                        arguments='{"query":"current information"}',
+                                    ),
+                                )
+                            ],
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ],
+                usage=None,
+            )
+        ]
+    )
+
+    class UnsupportedWebSearchError(Exception):
+        status_code = 400
+        body = {"error": "enable_search is not supported by this model"}
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            if kwargs.get("extra_body", {}).get("enable_search") is True:
+                raise UnsupportedWebSearchError("unsupported enable_search")
+            return events
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAICompatibleModel(
+        model="qwen3.7-max",
+        api_key="key",
+        base_url="https://dashscope.example/compatible-mode/v1",
+        provider_name="qwen",
+        max_attempts=1,
+    )
+    options = model.build_tool_schema_request_options(
+        _managed_web_search_schema(),
+        delivery="api_parameter",
+    )
+    chunks = await _collect(
+        model,
+        [{"role": "user", "content": "Find current information"}],
+        **options,
+    )
+
+    assert requests[0]["extra_body"] == {"enable_search": True}
+    assert "extra_body" not in requests[1]
+    assert requests[1]["tools"][0]["function"]["name"] == "web_search"
+    assert chunks[-1].tool_calls == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "arguments": '{"query":"current information"}',
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio

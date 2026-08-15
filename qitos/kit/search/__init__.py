@@ -12,6 +12,7 @@ from .kimi import (
     KimiBuiltinWebSearchCapability,
     KimiWebSearchCapability,
 )
+from .qwen import QwenWebSearchCapability
 from .tool import ManagedWebSearchTool
 
 __all__ = [
@@ -23,5 +24,6 @@ __all__ = [
     "DEFAULT_KIMI_SEARCH_URL",
     "KimiWebSearchCapability",
     "KimiBuiltinWebSearchCapability",
+    "QwenWebSearchCapability",
     "ManagedWebSearchTool",
 ]

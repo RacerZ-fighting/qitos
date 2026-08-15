@@ -11,6 +11,7 @@ from .kimi import (
     KimiBuiltinWebSearchCapability,
     KimiWebSearchCapability,
 )
+from .qwen import DEFAULT_QWEN_BASE_URL, DEFAULT_QWEN_MODEL, QwenWebSearchCapability
 
 CapabilityBuilder = Callable[
     [str, str | None, str | None, str | None, float],
@@ -40,7 +41,27 @@ def _build_kimi(
     )
 
 
-_BUILDERS: dict[str, CapabilityBuilder] = {"kimi": _build_kimi}
+def _build_qwen(
+    api_key: str,
+    search_url: str | None,
+    base_url: str | None,
+    model: str | None,
+    timeout_seconds: float,
+) -> WebSearchCapability:
+    if search_url is not None:
+        raise ValueError("Qwen web search does not accept a separate search URL")
+    return QwenWebSearchCapability(
+        api_key=api_key,
+        base_url=(base_url or DEFAULT_QWEN_BASE_URL).rstrip("/"),
+        model=model or DEFAULT_QWEN_MODEL,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+_BUILDERS: dict[str, CapabilityBuilder] = {
+    "kimi": _build_kimi,
+    "qwen": _build_qwen,
+}
 
 
 def build_web_search_capability(

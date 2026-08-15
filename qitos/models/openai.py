@@ -45,6 +45,9 @@ from .base import (
 )
 
 GLM_TOKENIZER_ENV_VARS = ("QITOS_GLM_TOKENIZER_PATH", "GLM_TOKENIZER_PATH")
+_MANAGED_WEB_SEARCH_FALLBACK_OPTION = "_qitos_managed_web_search_tools"
+_QWEN_PROVIDER_NAME = "qwen"
+_OFFICIAL_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -303,6 +306,108 @@ def _wire_tool_schema(
     return wire
 
 
+def _prefer_hosted_web_search(
+    tools: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]] | None]:
+    """Replace an admitted managed search schema with the hosted tool."""
+
+    hosted: List[Dict[str, Any]] = []
+    replaced = False
+    for tool in tools:
+        function = tool.get("function")
+        if (
+            not replaced
+            and tool.get("type") == "function"
+            and isinstance(function, dict)
+            and function.get("name") == "web_search"
+        ):
+            hosted.append({"type": "web_search"})
+            replaced = True
+        else:
+            hosted.append(tool)
+    return hosted, list(tools) if replaced else None
+
+
+def _prefer_qwen_chat_web_search(
+    tools: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Enable Qwen's native Chat search for an admitted managed search Tool."""
+
+    remaining: List[Dict[str, Any]] = []
+    replaced = False
+    for tool in tools:
+        function = tool.get("function")
+        if (
+            not replaced
+            and tool.get("type") == "function"
+            and isinstance(function, dict)
+            and function.get("name") == "web_search"
+        ):
+            replaced = True
+            continue
+        remaining.append(tool)
+    if not replaced:
+        return {"tools": tools}
+    options: Dict[str, Any] = {
+        "extra_body": {"enable_search": True},
+        _MANAGED_WEB_SEARCH_FALLBACK_OPTION: list(tools),
+    }
+    if remaining:
+        options["tools"] = remaining
+    return options
+
+
+def _managed_chat_web_search_fallback(
+    request_kwargs: Dict[str, Any],
+    tools: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    fallback = dict(request_kwargs)
+    extra_body = fallback.get("extra_body")
+    if isinstance(extra_body, dict):
+        managed_extra_body = dict(extra_body)
+        managed_extra_body.pop("enable_search", None)
+        if managed_extra_body:
+            fallback["extra_body"] = managed_extra_body
+        else:
+            fallback.pop("extra_body", None)
+    fallback["tools"] = tools
+    return fallback
+
+
+def _provider_status_code(exc: Exception) -> int | None:
+    status_code = _field(exc, "status_code")
+    if status_code is None:
+        status_code = _field(_field(exc, "response"), "status_code")
+    return (
+        status_code
+        if isinstance(status_code, int) and not isinstance(status_code, bool)
+        else None
+    )
+
+
+def _is_unsupported_hosted_web_search_error(exc: Exception) -> bool:
+    """Recognize a provider's request-time rejection of hosted Web search."""
+
+    if _provider_status_code(exc) not in {400, 404, 422}:
+        return False
+    detail = f"{exc} {_field(exc, 'body', '')}".casefold()
+    names_web_search = any(
+        name in detail for name in ("enable_search", "web_search", "web search")
+    )
+    rejects_capability = any(
+        marker in detail
+        for marker in (
+            "invalid",
+            "not available",
+            "not supported",
+            "unknown",
+            "unrecognized",
+            "unsupported",
+        )
+    )
+    return names_web_search and rejects_capability
+
+
 def _relocate_chat_template_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(kwargs)
     chat_template_kwargs = result.pop("chat_template_kwargs", None)
@@ -528,6 +633,7 @@ class OpenAICompatibleModel(Model):
     """OpenAI-compatible provider with an explicit wire protocol."""
 
     provider_name = "openai-compatible"
+    responses_hosted_tools: tuple[str, ...] = ()
 
     def __init__(
         self,
@@ -555,9 +661,10 @@ class OpenAICompatibleModel(Model):
             provider_name=provider_name,
         )
         self.api_key = api_key or os.getenv("OPENAI_API_KEY") or "dummy-key"
-        self.base_url = base_url or os.getenv("OPENAI_BASE_URL", "")
-        if not self.base_url:
+        resolved_base_url = base_url or os.getenv("OPENAI_BASE_URL", "")
+        if not resolved_base_url:
             raise ValueError("OPENAI_BASE_URL must be configured")
+        self.base_url: str = resolved_base_url
         if isinstance(timeout, bool) or timeout <= 0:
             raise ValueError("timeout must be positive")
         if isinstance(stream_idle_timeout, bool) or stream_idle_timeout <= 0:
@@ -591,6 +698,7 @@ class OpenAICompatibleModel(Model):
                 usage=True,
                 prompt_cache_usage=True,
                 multimodal_input=True,
+                hosted_tools=self._hosted_tools(),
             )
         return ModelCapabilities(
             api=ModelAPI.CHAT_COMPLETIONS,
@@ -599,7 +707,15 @@ class OpenAICompatibleModel(Model):
             usage=True,
             prompt_cache_usage=True,
             multimodal_input=True,
+            hosted_tools=self._hosted_tools(),
         )
+
+    def _hosted_tools(self) -> tuple[str, ...]:
+        if self.provider_name == _QWEN_PROVIDER_NAME:
+            return ("web_search",)
+        if self.api_mode == "responses":
+            return self.responses_hosted_tools
+        return ()
 
     def _attempt_request_kwargs(
         self,
@@ -657,20 +773,38 @@ class OpenAICompatibleModel(Model):
     async def _open_chat_stream(
         self,
         request_kwargs: Dict[str, Any],
+        managed_web_search_tools: List[Dict[str, Any]] | None = None,
     ) -> AsyncIterator[ModelStreamEvent]:
         client = self._new_client(timeout=float(request_kwargs["timeout"]))
+        candidate = dict(request_kwargs)
+        stream_options_fallback = False
+        managed_search_fallback = False
         try:
-            try:
-                response = await client.chat.completions.create(**request_kwargs)
-            except Exception as exc:
-                if "stream_options" not in request_kwargs:
+            while True:
+                try:
+                    response = await client.chat.completions.create(**candidate)
+                    break
+                except Exception as exc:
+                    if (
+                        not stream_options_fallback
+                        and "stream_options" in candidate
+                        and _is_unsupported_stream_options_error(exc)
+                    ):
+                        candidate.pop("stream_options", None)
+                        stream_options_fallback = True
+                        continue
+                    if (
+                        not managed_search_fallback
+                        and isinstance(managed_web_search_tools, list)
+                        and _is_unsupported_hosted_web_search_error(exc)
+                    ):
+                        candidate = _managed_chat_web_search_fallback(
+                            candidate,
+                            managed_web_search_tools,
+                        )
+                        managed_search_fallback = True
+                        continue
                     raise
-                if not _is_unsupported_stream_options_error(exc):
-                    raise
-                fallback = dict(request_kwargs)
-                fallback.pop("stream_options", None)
-                request_kwargs.pop("stream_options", None)
-                response = await client.chat.completions.create(**fallback)
         except (asyncio.CancelledError, Exception):
             await close_async_resource(client)
             raise
@@ -687,6 +821,10 @@ class OpenAICompatibleModel(Model):
         request_kwargs: Dict[str, Any],
     ) -> AsyncIterator[ModelStreamEvent]:
         deadline_monotonic = request.deadline_monotonic
+        managed_web_search_tools = request_kwargs.pop(
+            _MANAGED_WEB_SEARCH_FALLBACK_OPTION,
+            None,
+        )
         if self.api_mode == "chat_completions":
             chat_request = self._chat_stream_request(
                 request.message_dicts(),
@@ -695,22 +833,46 @@ class OpenAICompatibleModel(Model):
             )
             return await self._open_chat_stream(
                 chat_request,
+                managed_web_search_tools=(
+                    managed_web_search_tools
+                    if isinstance(managed_web_search_tools, list)
+                    else None
+                ),
             )
 
         client = self._new_client(
             timeout=effective_request_timeout(self.timeout, deadline_monotonic)
         )
         try:
-            stream = await _open_responses_stream(
-                self,
-                client,
-                request,
-                provider=self.provider_name,
-                request_kwargs=self._attempt_request_kwargs(
-                    request_kwargs,
-                    deadline_monotonic=deadline_monotonic,
-                ),
-            )
+            try:
+                stream = await _open_responses_stream(
+                    self,
+                    client,
+                    request,
+                    provider=self.provider_name,
+                    request_kwargs=self._attempt_request_kwargs(
+                        request_kwargs,
+                        deadline_monotonic=deadline_monotonic,
+                    ),
+                )
+            except Exception as exc:
+                if (
+                    not isinstance(managed_web_search_tools, list)
+                    or not _is_unsupported_hosted_web_search_error(exc)
+                ):
+                    raise
+                fallback_kwargs = dict(request_kwargs)
+                fallback_kwargs["tools"] = managed_web_search_tools
+                stream = await _open_responses_stream(
+                    self,
+                    client,
+                    request,
+                    provider=self.provider_name,
+                    request_kwargs=self._attempt_request_kwargs(
+                        fallback_kwargs,
+                        deadline_monotonic=deadline_monotonic,
+                    ),
+                )
         except (asyncio.CancelledError, Exception):
             await close_async_resource(client)
             raise
@@ -790,7 +952,17 @@ class OpenAICompatibleModel(Model):
         if str(delivery or "prompt_injection") not in {"api_parameter", "hybrid"}:
             return {}
         wire = _wire_tool_schema(tool_schema_payload)
-        return {"tools": wire} if wire else {}
+        if not wire:
+            return {}
+        if "web_search" not in self.capabilities.hosted_tools:
+            return {"tools": wire}
+        if self.api_mode == "chat_completions":
+            return _prefer_qwen_chat_web_search(wire)
+        hosted, fallback = _prefer_hosted_web_search(wire)
+        options: Dict[str, Any] = {"tools": hosted}
+        if fallback is not None:
+            options[_MANAGED_WEB_SEARCH_FALLBACK_OPTION] = fallback
+        return options
 
     def count_request_tokens(
         self,
@@ -841,6 +1013,7 @@ class OpenAIModel(OpenAICompatibleModel):
     """Official OpenAI provider; Responses is the default protocol."""
 
     provider_name = "openai"
+    responses_hosted_tools = ("web_search",)
 
     def __init__(
         self,
@@ -877,6 +1050,11 @@ class OpenAIModel(OpenAICompatibleModel):
             stream_idle_timeout=stream_idle_timeout,
             retry_window_seconds=retry_window_seconds,
         )
+
+    def _hosted_tools(self) -> tuple[str, ...]:
+        if self.base_url.rstrip("/") != _OFFICIAL_OPENAI_BASE_URL:
+            return ()
+        return super()._hosted_tools()
 
 
 class AzureOpenAIModel(OpenAICompatibleModel):

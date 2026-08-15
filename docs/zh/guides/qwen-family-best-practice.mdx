@@ -36,6 +36,24 @@ QitOS 会在以下条件同时满足时优先走原生通道：
 
 当端点没有返回 `tool_calls`、而是返回文本时，QitOS 会区分两种情况：普通自然语言结论仍会成为最终答案；如果文本带有结构化动作字段但解析失败，则会保留 parser 恢复路径，避免把待执行工具动作误报为任务完成。对应 trace 会保留原始响应、parser diagnostics 和该恢复步骤的 `decision_source: parser`。
 
+## 使用 Qwen Web 搜索
+
+当应用准入了名为 `web_search` 的 managed Tool 后，Qwen 可以直接使用 Provider
+原生搜索契约，无需再增加一个 Tool 名称：
+
+- Responses 发送 `tools=[{"type": "web_search"}]`。
+- Chat Completions 发送 `enable_search: true`，首次请求不再携带 managed function
+  schema。
+- 如果 Provider 在输出任何流事件前明确拒绝原生搜索，QitOS 会用原来的 managed
+  function schema 重试这次请求。
+
+一旦已经出现文本、推理、ToolCall 增量或原生 output item，就不会再 fallback，避免在
+可能已经计费或产生有效结果后重放同一个模型 turn。
+
+需要 client-side fallback 时，可以构造 `QwenWebSearchCapability`。它通过 Chat
+端点的 `enable_search` 执行搜索，并把结构化的
+`search_info.search_results` 以及答案中的来源 URL 投影成有界的 `WebSource`。
+
 ## 为什么不直接照搬 Qwen-Agent 的哨兵提示词
 
 官方 Qwen-Agent 为不提供原生工具通道的 Qwen 聊天接口设计了一套专门的函数调用提示词。

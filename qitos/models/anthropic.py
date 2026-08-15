@@ -29,12 +29,20 @@ from .base import (
 )
 
 _ANTHROPIC_BLOCK_TYPES = {
+    "server_tool_use",
     "text",
     "thinking",
     "redacted_thinking",
     "tool_use",
     "tool_result",
+    "web_search_tool_result",
 }
+_ANTHROPIC_HOSTED_WEB_SEARCH_TOOL = {
+    "type": "web_search_20250305",
+    "name": "web_search",
+}
+_MANAGED_WEB_SEARCH_FALLBACK_OPTION = "_qitos_managed_web_search_tools"
+_OFFICIAL_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -86,6 +94,56 @@ def _anthropic_tools(
             tool["description"] = str(description)
         tools.append(tool)
     return tools
+
+
+def _prefer_hosted_web_search(
+    tools: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]] | None]:
+    """Replace one admitted managed search schema with Anthropic's server tool."""
+
+    hosted: List[Dict[str, Any]] = []
+    replaced = False
+    for tool in tools:
+        if not replaced and tool.get("name") == "web_search":
+            hosted.append(dict(_ANTHROPIC_HOSTED_WEB_SEARCH_TOOL))
+            replaced = True
+        else:
+            hosted.append(tool)
+    return hosted, list(tools) if replaced else None
+
+
+def _provider_status_code(exc: Exception) -> int | None:
+    status_code = _field(exc, "status_code")
+    if status_code is None:
+        status_code = _field(_field(exc, "response"), "status_code")
+    return (
+        status_code
+        if isinstance(status_code, int) and not isinstance(status_code, bool)
+        else None
+    )
+
+
+def _is_unsupported_hosted_web_search_error(exc: Exception) -> bool:
+    """Recognize a request-time rejection before any stream output exists."""
+
+    if _provider_status_code(exc) not in {400, 404, 422}:
+        return False
+    detail = f"{exc} {_field(exc, 'body', '')}".casefold()
+    names_web_search = "web_search" in detail or "web search" in detail
+    rejects_capability = any(
+        marker in detail
+        for marker in (
+            "disabled",
+            "invalid",
+            "not available",
+            "not enabled",
+            "not supported",
+            "unknown",
+            "unrecognized",
+            "unsupported",
+        )
+    )
+    return names_web_search and rejects_capability
 
 
 def _anthropic_tool_choice(value: Any) -> Any:
@@ -186,14 +244,28 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamEvent]):
                 block = _native_value(_field(event, "content_block", {}))
                 if isinstance(block, dict):
                     self._blocks[index] = dict(block)
-                    if block.get("type") == "tool_use":
+                    block_type = block.get("type")
+                    if block_type in {"server_tool_use", "tool_use"}:
                         self._input_json[index] = ""
+                    if block_type == "tool_use":
                         return ModelStreamEvent(
                             type=ModelStreamEventType.TOOL_CALL_DELTA,
                             event_type="tool_call.start",
                             event_metadata={
                                 "index": index,
                                 "call_id": block.get("id"),
+                                "name": block.get("name"),
+                            },
+                        )
+                    if block_type in {"server_tool_use", "web_search_tool_result"}:
+                        return ModelStreamEvent(
+                            type=ModelStreamEventType.LIFECYCLE,
+                            event_type="native_item.start",
+                            event_metadata={
+                                "index": index,
+                                "item_type": block_type,
+                                "call_id": block.get("id")
+                                or block.get("tool_use_id"),
                                 "name": block.get("name"),
                             },
                         )
@@ -229,11 +301,20 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamEvent]):
                     signature = str(_field(delta, "signature", "") or "")
                     block["signature"] = str(block.get("signature") or "") + signature
                     continue
+                if delta_type == "citations_delta":
+                    citation = _native_value(_field(delta, "citation", {}))
+                    if isinstance(citation, dict):
+                        citations = block.setdefault("citations", [])
+                        if isinstance(citations, list):
+                            citations.append(citation)
+                    continue
                 if delta_type == "input_json_delta":
                     arguments = str(_field(delta, "partial_json", "") or "")
                     self._input_json[index] = (
                         self._input_json.get(index, "") + arguments
                     )
+                    if block.get("type") != "tool_use":
+                        continue
                     return ModelStreamEvent(
                         type=ModelStreamEventType.TOOL_CALL_DELTA,
                         event_type="tool_call.delta",
@@ -278,26 +359,33 @@ class _AnthropicEventStream(AsyncIterator[ModelStreamEvent]):
 
     def _finish_block(self, index: int, *, completed: bool) -> None:
         block = self._blocks.get(index)
-        if not isinstance(block, dict) or block.get("type") != "tool_use":
+        if not isinstance(block, dict):
             return
+        block_type = block.get("type")
+        if block_type not in {"server_tool_use", "tool_use"}:
+            return
+        is_client_tool = block_type == "tool_use"
         if index in self._tool_errors:
             return
         raw_arguments = self._input_json.get(index, "")
         if not completed:
-            self._tool_errors[index] = "tool_call_not_completed"
+            if is_client_tool:
+                self._tool_errors[index] = "tool_call_not_completed"
             return
         if not raw_arguments:
             existing = block.setdefault("input", {})
-            if not isinstance(existing, dict):
+            if is_client_tool and not isinstance(existing, dict):
                 self._tool_errors[index] = "tool_call_arguments_invalid"
             return
         try:
             parsed = json.loads(raw_arguments)
         except json.JSONDecodeError:
-            self._tool_errors[index] = "tool_call_arguments_invalid"
+            if is_client_tool:
+                self._tool_errors[index] = "tool_call_arguments_invalid"
         else:
             if not isinstance(parsed, dict):
-                self._tool_errors[index] = "tool_call_arguments_invalid"
+                if is_client_tool:
+                    self._tool_errors[index] = "tool_call_arguments_invalid"
             else:
                 block["input"] = parsed
 
@@ -456,6 +544,13 @@ class AnthropicModel(Model):
             usage=True,
             prompt_cache_usage=True,
             multimodal_input=True,
+            hosted_tools=("web_search",) if self._uses_official_api() else (),
+        )
+
+    def _uses_official_api(self) -> bool:
+        return (
+            self.provider_name == "anthropic"
+            and self.base_url == _OFFICIAL_ANTHROPIC_BASE_URL
         )
 
     def _system_text(self, messages: List[Dict[str, Any]]) -> str:
@@ -591,6 +686,10 @@ class AnthropicModel(Model):
                 "Anthropic support requires the qitos models extra"
             ) from exc
 
+        managed_web_search_tools = request_kwargs.pop(
+            _MANAGED_WEB_SEARCH_FALLBACK_OPTION,
+            None,
+        )
         timeout = effective_request_timeout(self.timeout, deadline_monotonic)
         client = anthropic.AsyncAnthropic(
             api_key=self.api_key,
@@ -621,7 +720,17 @@ class AnthropicModel(Model):
         if "tool_choice" in payload:
             payload["tool_choice"] = _anthropic_tool_choice(payload["tool_choice"])
         try:
-            events = await client.messages.create(**payload)
+            try:
+                events = await client.messages.create(**payload)
+            except Exception as exc:
+                if (
+                    not isinstance(managed_web_search_tools, list)
+                    or not _is_unsupported_hosted_web_search_error(exc)
+                ):
+                    raise
+                fallback_payload = dict(payload)
+                fallback_payload["tools"] = managed_web_search_tools
+                events = await client.messages.create(**fallback_payload)
         except (asyncio.CancelledError, Exception):
             await close_async_resource(client)
             raise
@@ -682,7 +791,15 @@ class AnthropicModel(Model):
         if str(delivery or "prompt_injection") not in {"api_parameter", "hybrid"}:
             return {}
         tools = _anthropic_tools(tool_schema_payload)
-        return {"tools": tools} if tools else {}
+        if not tools:
+            return {}
+        if "web_search" not in self.capabilities.hosted_tools:
+            return {"tools": tools}
+        hosted, fallback = _prefer_hosted_web_search(tools)
+        options: Dict[str, Any] = {"tools": hosted}
+        if fallback is not None:
+            options[_MANAGED_WEB_SEARCH_FALLBACK_OPTION] = fallback
+        return options
 
     def supports_multimodal_input(self) -> bool:
         return True

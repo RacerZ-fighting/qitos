@@ -113,6 +113,13 @@ honor the current Tool deadline. A backend such as Docker that has not implement
 managed async contract can still run foreground commands, but reports background mode
 as unavailable instead of creating an untracked process.
 
+Runtime-profile probes must use the selected backend's `CommandCapability`. For an
+attached `DockerEnv`, QitOS runs every fixed-argv probe through `docker exec` in the
+container workspace and stores those results in the same immutable snapshot. A
+controller command found on the host cannot make a missing container command appear
+available. Container health or workspace failures remain explicit; QitOS does not
+replace the selected backend with a host environment.
+
 Host-backed command tools inherit the current process environment by default. An
 application that owns a stricter execution boundary can instead pass one complete,
 pre-filtered environment snapshot:

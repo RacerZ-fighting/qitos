@@ -19,6 +19,7 @@ from qitos.core.env import (
     FileStat,
     FileSystemCapability,
     RuntimeCapabilitySnapshot,
+    RuntimeCommand,
     RuntimeLimitation,
     TextFileChunk,
 )
@@ -556,6 +557,7 @@ class DockerEnv(HostEnv):
         network: Optional[str] = None,
         extra_run_args: Optional[list[str]] = None,
         create_timeout: int = 60,
+        commands: Sequence[RuntimeCommand] = (),
     ):
         self.container = str(container).strip() if container else ""
         self.container_workspace = workspace_root
@@ -580,6 +582,7 @@ class DockerEnv(HostEnv):
             fs=fs,
             cmd=cmd,
             backend="docker",
+            commands=commands,
             limitations=(
                 RuntimeLimitation(
                     code="managed-process-unavailable",
@@ -649,6 +652,7 @@ class DockerEnv(HostEnv):
             working_directory=self.container_workspace,
             operation_groups=("file", "process"),
             facilities=("file.atomic-write", "process.foreground"),
+            commands=self.commands,
             limitations=self.limitations,
         )
 

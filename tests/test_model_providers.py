@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from qitos.core import ModelTransportError
 from qitos.models import (
     AnthropicModel,
     GeminiModel,
@@ -66,6 +67,25 @@ async def _collect(
         deadline_monotonic=deadline,
     )
     return [chunk async for chunk in model.stream(request)]
+
+
+def _managed_web_search_schema() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search current public sources",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -219,6 +239,340 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
     assert replay[1]["content"] == [
         {"type": "tool_result", "tool_use_id": "toolu_1", "content": "result"}
     ]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_prefers_hosted_search_and_preserves_native_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    search_results = [
+        {
+            "type": "web_search_result",
+            "title": "Vendor advisory",
+            "url": "https://vendor.example/advisory",
+        }
+    ]
+    citation = {
+        "type": "web_search_result_location",
+        "url": "https://vendor.example/advisory",
+        "title": "Vendor advisory",
+        "cited_text": "Affected versions",
+    }
+    events = _AsyncListStream(
+        [
+            {
+                "type": "message_start",
+                "message": {"id": "msg_web", "usage": {"input_tokens": 3}},
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                },
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"query":"vendor advisory"}',
+                },
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_1",
+                    "content": search_results,
+                },
+            },
+            {"type": "content_block_stop", "index": 1},
+            {
+                "type": "content_block_start",
+                "index": 2,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {"type": "text_delta", "text": "Affected versions"},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 2,
+                "delta": {"type": "citations_delta", "citation": citation},
+            },
+            {"type": "content_block_stop", "index": 2},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 4},
+            },
+            {"type": "message_stop"},
+        ]
+    )
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.messages = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return events
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("anthropic")
+    fake.AsyncAnthropic = Client
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    model = AnthropicModel(api_key="test-key", model="claude-test", max_attempts=1)
+    options = model.build_tool_schema_request_options(
+        _managed_web_search_schema(),
+        delivery="api_parameter",
+    )
+    chunks = await _collect(
+        model,
+        [{"role": "user", "content": "Find the current advisory"}],
+        **options,
+    )
+
+    assert captured["tools"] == [
+        {"type": "web_search_20250305", "name": "web_search"}
+    ]
+    assert [chunk.type for chunk in chunks] == [
+        ModelStreamEventType.LIFECYCLE,
+        ModelStreamEventType.LIFECYCLE,
+        ModelStreamEventType.TEXT_DELTA,
+        ModelStreamEventType.COMPLETED,
+    ]
+    terminal = chunks[-1]
+    assert terminal.tool_calls is None
+    assert terminal.native_items == [
+        {
+            "type": "server_tool_use",
+            "id": "srvtoolu_1",
+            "name": "web_search",
+            "input": {"query": "vendor advisory"},
+        },
+        {
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": search_results,
+        },
+        {"type": "text", "text": "Affected versions", "citations": [citation]},
+    ]
+    replay = model._anthropic_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "Affected versions",
+                "native_items": terminal.native_items,
+            }
+        ]
+    )
+    assert replay[0]["content"] == terminal.native_items
+
+
+@pytest.mark.asyncio
+async def test_anthropic_falls_back_to_managed_search_on_request_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    terminal = _AsyncListStream(
+        [
+            {
+                "type": "message_start",
+                "message": {"id": "msg_1", "usage": {}},
+            },
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "web_search",
+                    "input": {},
+                },
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": '{"query":"vendor advisory"}',
+                },
+            },
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"output_tokens": 1},
+            },
+            {"type": "message_stop"},
+        ]
+    )
+
+    class UnsupportedWebSearchError(Exception):
+        status_code = 400
+        body = {"error": "web_search is not enabled for this organization"}
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.messages = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            if kwargs["tools"][0].get("type") == "web_search_20250305":
+                raise UnsupportedWebSearchError("web search is not enabled")
+            return terminal
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("anthropic")
+    fake.AsyncAnthropic = Client
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    model = AnthropicModel(api_key="test-key", model="claude-test", max_attempts=1)
+    options = model.build_tool_schema_request_options(
+        _managed_web_search_schema(),
+        delivery="api_parameter",
+    )
+    chunks = await _collect(
+        model,
+        [{"role": "user", "content": "Find the current advisory"}],
+        **options,
+    )
+
+    assert requests[0]["tools"] == [
+        {"type": "web_search_20250305", "name": "web_search"}
+    ]
+    assert requests[1]["tools"][0]["name"] == "web_search"
+    assert requests[1]["tools"][0]["input_schema"]["required"] == ["query"]
+    assert chunks[-1].tool_calls == [
+        {
+            "id": "toolu_1",
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "arguments": '{"query":"vendor advisory"}',
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_does_not_replay_after_server_tool_use_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+
+    class StreamFailure(ConnectionError):
+        pass
+
+    class FailingStream(AsyncIterator[Any]):
+        def __init__(self) -> None:
+            self._events = iter(
+                [
+                    {
+                        "type": "message_start",
+                        "message": {"id": "msg_1", "usage": {}},
+                    },
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "server_tool_use",
+                            "id": "srvtoolu_1",
+                            "name": "web_search",
+                            "input": {"query": "vendor advisory"},
+                        },
+                    },
+                ]
+            )
+
+        def __aiter__(self) -> FailingStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            try:
+                return next(self._events)
+            except StopIteration:
+                raise StreamFailure("provider disconnected after server tool use")
+
+        async def aclose(self) -> None:
+            return None
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.messages = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            return FailingStream()
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("anthropic")
+    fake.AsyncAnthropic = Client
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+
+    model = AnthropicModel(
+        api_key="test-key",
+        model="claude-test",
+        max_attempts=2,
+    )
+    options = model.build_tool_schema_request_options(
+        _managed_web_search_schema(),
+        delivery="api_parameter",
+    )
+
+    with pytest.raises(ModelTransportError, match="provider disconnected"):
+        await _collect(
+            model,
+            [{"role": "user", "content": "Find the current advisory"}],
+            **options,
+        )
+
+    assert len(requests) == 1
+
+
+def test_kimi_anthropic_transport_keeps_managed_search_schema() -> None:
+    model = AnthropicModel(
+        api_key="test-key",
+        base_url="https://api.moonshot.example/anthropic",
+        model="kimi-test",
+        provider_name="kimi",
+    )
+
+    options = model.build_tool_schema_request_options(
+        _managed_web_search_schema(),
+        delivery="api_parameter",
+    )
+
+    assert options == {
+        "tools": [
+            {
+                "name": "web_search",
+                "description": "Search current public sources",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+            }
+        ]
+    }
 
 
 @pytest.mark.asyncio
