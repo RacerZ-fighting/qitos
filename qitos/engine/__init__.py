@@ -1,7 +1,7 @@
 """Stable engine exports."""
 
 from .critic_decorator import critic
-from .cancellation import CancelMode, CancelToken
+from ..core.cancellation import CancelMode, CancelToken
 from .engine import Engine, EngineResult, StepSummary
 from .events import EngineEvent, EngineEventType, EventStream
 from .hooks import EngineHook, HookContext, ToolHookContext

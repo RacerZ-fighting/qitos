@@ -17,6 +17,31 @@ How to update:
 
 ## Unreleased
 
+### Added
+
+- **Minimal agent loop and Agent façade (Pi-aligned).** New
+  `qitos.core.agent_loop` (`agent_loop` / `run_agent_loop`), `qitos.core.agent`
+  (`Agent`), `qitos.core.message` (typed `UserMessage` / `AssistantMessage` /
+  `ToolResultMessage` / `ToolCall` with wire and durable codecs),
+  `qitos.core.agent_events`, and `qitos.core.tool_executor`
+  (`ToolBatchExecutor`) implement the target `Message -> Model -> ToolCall ->
+  ToolResult` path alongside the current Engine mainline. The loop freezes one
+  model/Tool exposure/deadline snapshot per turn, injects steering before each
+  model request, revives on follow-up messages, fails truncated Tool-call
+  batches without execution, and records model/Tool/turn/run barriers through
+  a `TurnTransactionBoundary`; `qitos.kit.journal.JournalTurnTransaction`
+  persists them into the canonical JSONL journal. Tool execution keeps the
+  proven invariants: serial by default with bounded parallel segments for
+  `concurrency_safe` tools, results in input order, exactly one terminal
+  `ToolResult` per admitted call, absolute downward-propagated deadlines and
+  cooperative `CancelToken` cancellation (now `qitos.core.cancellation`).
+
+### Changed
+
+- `CancelToken` / `CancelMode` moved from `qitos.engine.cancellation` to
+  `qitos.core.cancellation`; `qitos.engine` re-exports them until the Engine
+  mainline is replaced.
+
 ### Removed
 
 - **Breaking:** Removed the deprecated `qitos.cache` package and

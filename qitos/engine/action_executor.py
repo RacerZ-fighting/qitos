@@ -24,7 +24,7 @@ from ..core.tool import (
 )
 from ..core.tool_schema import tool_input_schema_errors
 from .interrupt import EngineInterrupt
-from .cancellation import CancelToken
+from ..core.cancellation import CancelToken
 from .states import RuntimeBudget, RuntimeEvent, RuntimePhase
 
 

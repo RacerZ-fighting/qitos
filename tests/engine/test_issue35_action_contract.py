@@ -278,7 +278,7 @@ async def test_fail_fast_disabled_runs_everything():
 
 
 async def test_cancel_token_prevents_unstarted_actions():
-    from qitos.engine.cancellation import CancelToken
+    from qitos.core.cancellation import CancelToken
 
     rec = _Recorder()
     token = CancelToken()

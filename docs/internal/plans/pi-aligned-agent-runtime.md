@@ -34,6 +34,14 @@ not compatibility requirements.
 Done when the suite can run against a replacement loop without importing AgentModule,
 Observation, Decision or Action.
 
+Progress on `feat/pi-aligned-agent-loop`: typed messages (`core/message.py`),
+loop events (`core/agent_events.py`), `AgentLoopResult`/rejection types, the
+minimal loop (`core/agent_loop.py`), the `Agent` façade (`core/agent.py`) and
+`ToolBatchExecutor` (`core/tool_executor.py`) landed with conformance tests in
+`tests/core/test_agent_{message,loop,facade}.py`, `test_tool_executor.py` and
+`tests/journal/test_turn_recorder.py`. Old-lifecycle callers remain until the
+rest of milestone 2.2.
+
 ### 2.2 Replace loop and façade
 
 - Introduce the minimal loop and small Agent façade as the only execution path.

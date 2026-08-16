@@ -23,7 +23,7 @@ from qitos.core.tool import (
     ToolValidationResult,
 )
 from qitos.engine.action_executor import ActionExecutor
-from qitos.engine.cancellation import CancelToken
+from qitos.core.cancellation import CancelToken
 from qitos.engine.states import RuntimeBudget
 from qitos.models import ModelRequest
 from qitos.models import ModelStreamEventType

@@ -85,6 +85,30 @@ from .core.agent_spec import (
 from .engine.engine import Engine, EngineResult, StepSummary
 from .engine.events import EngineEvent, EngineEventType, EventStream
 from .engine.states import ContextConfig
+from .core.agent import Agent, AgentBusyError, AgentRunRejected, QueueMode
+from .core.agent_events import AgentEvent
+from .core.agent_loop import (
+    AgentContext,
+    AgentLoopConfig,
+    AgentLoopResult,
+    AgentRunStatus,
+    TurnTransactionBoundary,
+    agent_loop,
+    agent_loop_continue,
+)
+from .core.cancellation import CancelMode, CancelToken
+from .core.message import (
+    AssistantMessage,
+    Message,
+    ToolCall,
+    ToolResultMessage,
+    UserMessage,
+)
+from .core.tool_executor import (
+    ToolBatchExecutor,
+    ToolExecutionConfig,
+    ToolTransactionBoundary,
+)
 
 __all__ = [
     "AgentModule",
@@ -172,4 +196,26 @@ __all__ = [
     "StateAdapter",
     "StopReason",
     "QitosRuntimeError",
+    "Agent",
+    "AgentBusyError",
+    "AgentRunRejected",
+    "QueueMode",
+    "AgentEvent",
+    "AgentContext",
+    "AgentLoopConfig",
+    "AgentLoopResult",
+    "AgentRunStatus",
+    "TurnTransactionBoundary",
+    "agent_loop",
+    "agent_loop_continue",
+    "CancelMode",
+    "CancelToken",
+    "AssistantMessage",
+    "Message",
+    "ToolCall",
+    "ToolResultMessage",
+    "UserMessage",
+    "ToolBatchExecutor",
+    "ToolExecutionConfig",
+    "ToolTransactionBoundary",
 ]

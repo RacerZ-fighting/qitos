@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 from qitos.core.agent_module import AgentModule
 from qitos.core.decision import Decision
 from qitos.core.state import StateSchema
-from qitos.engine.cancellation import CancelMode, CancelToken
+from qitos.core.cancellation import CancelMode, CancelToken
 from qitos.engine.engine import Engine, EngineResult
 from qitos.engine.states import RuntimeBudget, RuntimePhase
 from qitos.trace.writer import TraceWriter

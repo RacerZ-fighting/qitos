@@ -82,7 +82,7 @@ from ._journal_runtime import (
 from ._trace_runtime import _TraceRuntime
 from ._turn_runtime import _TurnRuntime
 from .action_executor import ActionExecutor
-from .cancellation import CancelMode, CancelToken
+from ..core.cancellation import CancelMode, CancelToken
 from .branching import BranchSelector, FirstCandidateSelector
 from ._runtime_inbox import RuntimeWaitOutcome, _RuntimeInbox
 from .critic import Critic
