@@ -1,7 +1,9 @@
-# Internal Documentation
+# Internal documentation
 
-This directory contains internal planning documents that are not part of the public documentation site.
+These files are maintainer-facing and are not published to the Mintlify site.
 
-- `plans/` — Historical and current development plans, release notes, and migration documents.
+- `architecture/` contains accepted target contracts that are not yet shipped.
+- `plans/` contains active migration plans only.
 
-These files are not published to the Mintlify docs site and are intended for project maintainers only.
+Completed and superseded plans are deleted; Git history is the archive. Shipped user
+behavior belongs in public docs and release history belongs in `CHANGELOG.md`.

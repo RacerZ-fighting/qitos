@@ -1,9 +1,9 @@
 ---
 title: "Introduction"
-description: "QitOS is a research-first agent framework for building reproducible LLM agents with a clean AgentModule + Engine kernel."
+description: "QitOS is a research-first framework for building reproducible, traceable LLM agents."
 ---
 
-QitOS gives you a stable `AgentModule + Engine` kernel for building reproducible LLM agents. Whether you are prototyping ReAct loops, running GAIA benchmarks, or shipping a production coding agent, QitOS keeps your runs traceable, your patterns composable, and your results reproducible.
+Current QitOS releases use one `AgentModule + Engine` runtime for building reproducible LLM agents. Whether you are prototyping ReAct loops, running GAIA benchmarks, or shipping a production coding agent, QitOS keeps your runs traceable, your patterns composable, and your results reproducible. The accepted runtime refactor will replace that API in place with a Model, minimal async Agent loop, and durable Session/Harness.
 
 A long-running QitOS coding run stays readable — it does not degrade into opaque glue code.
 
@@ -170,7 +170,7 @@ This makes specialization easier to reason about and easier to reproduce.
 ## Status
 
 <Warning>
-QitOS is currently **Alpha**. The stable foundation is the `AgentModule + Engine` kernel, the `qita` trace/observability flow, canonical examples, and benchmark adapters. Higher-level convenience APIs, some `kit` modules, and experimental toolsets are likely to evolve. If you are evaluating QitOS for adoption, start from the kernel and examples rather than assuming all higher-level APIs are frozen.
+QitOS is currently **Beta**. Trace/qita behavior, canonical durable records, examples, and benchmark adapters remain supported during the runtime migration. The public Agent/runtime API will change as `AgentModule + Engine` is replaced in place, so pin the installed version and follow the changelog rather than treating that API as frozen.
 </Warning>
 
 ## Where to go next

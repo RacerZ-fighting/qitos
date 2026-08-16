@@ -1,9 +1,9 @@
 ---
 title: "简介"
-description: "QitOS 是一个以研究为先的智能体框架，用清晰的 AgentModule + Engine 内核构建可复现的 LLM 智能体。"
+description: "QitOS 是一个以研究为先、用于构建可复现和可追踪 LLM 智能体的框架。"
 ---
 
-QitOS 提供了一套稳定的 `AgentModule + Engine` 内核（kernel），用于构建可复现的 LLM 智能体（agent）。无论你是在原型化 ReAct 循环、运行 GAIA 基准测试（benchmark），还是交付一个面向真实工作流的编程智能体，运行结果始终可追踪、可组合、可复现。
+当前 QitOS 版本通过同一套 `AgentModule + Engine` 运行时构建可复现的 LLM 智能体（agent）。无论你是在原型化 ReAct 循环、运行 GAIA 基准测试（benchmark），还是交付一个面向真实工作流的编程智能体，运行结果始终可追踪、可组合、可复现。已经确认的运行时重构会原地将这套 API 替换为 Model、最小异步 Agent loop 和可恢复 Session/Harness。
 
 一个长时间运行的 QitOS 编程任务不应该退化成难以理解的胶水代码。
 
@@ -151,7 +151,7 @@ Claude Code 风格智能体、基准测试运行器、代码安全审计智能�
 ## 当前状态
 
 <Warning>
-QitOS 当前处于 **Alpha** 阶段。稳定的基础主要是 `AgentModule + Engine` 内核、`qita` 追踪与可观测性流程、规范化示例以及基准测试适配器。更高层的便捷 API、部分 `kit` 模块和实验性工具集仍可能持续演进。若你正在评估采用路径，建议从内核与示例入手，不要假设所有 API 表面都已冻结。
+QitOS 当前处于 **Beta** 阶段。运行时迁移期间继续保持 trace/qita、canonical durable records、规范化示例和 benchmark adapter 的行为；`AgentModule + Engine` 被原地替换时，公开 Agent/runtime API 会变化。用于生产环境时请固定版本并关注 Changelog，不要把当前 API 视为冻结接口。
 </Warning>
 
 ## 接下来读什么

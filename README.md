@@ -10,7 +10,12 @@
 
 QitOS is the torch-flavor framework for agent researchers.
 
-Prototype methods, run benchmarks, and inspect long-horizon trajectories on one `AgentModule + Engine` kernel with built-in `qita` observability.
+Current releases prototype methods, run benchmarks, and inspect long-horizon
+trajectories on one `AgentModule + Engine` runtime with built-in `qita`
+observability. The accepted next runtime architecture will replace that path in
+place with a provider-neutral Model, a minimal async Agent loop, and a durable
+Session/Harness; the shipped API documentation remains authoritative until that
+migration lands.
 
 QitOS core is the small framework. Product-grade applications and showcase agents live in `qitos-zoo`, including planned apps such as `qitos-coder` and `qitos-cyber-agent`.
 
@@ -18,6 +23,14 @@ QitOS core is the small framework. Product-grade applications and showcase agent
 
 ## What's New
 
+- **Accepted Pi-aligned runtime architecture**: the next runtime refactor replaces
+  `AgentModule + Engine` in place with `Model -> minimal async Agent loop ->
+  Session/Harness -> application composition`; it will not add a parallel V2 path.
+  A durable, goal-bearing Task becomes the work root for Root and Child Agents,
+  while benchmark inputs, environment handles, metrics, and application plugin
+  policy stay outside that Task contract. See the
+  [target architecture](docs/internal/architecture/agent-runtime.md) and
+  [migration plan](docs/internal/plans/pi-aligned-agent-runtime.md).
 - **Cache-stable long runs**: canonical model history stays append-only between explicit
   compactions. Engine warns at 80%, compacts at 85%, records Provider cache/prefix facts,
   and appends changed application `ContextSnapshot` revisions without rewriting an old
@@ -429,7 +442,7 @@ Then go deeper:
 
 | If you want... | QitOS gives you... |
 |---|---|
-| reproducible agent research | a stable `AgentModule + Engine` kernel |
+| reproducible agent research | one canonical runtime with durable trajectories |
 | method = Agent + Critic | maintained method recipes with explicit state and critics |
 | observability | `qita` board, replay, export, and trace artifacts |
 | benchmark workflows | GAIA, Tau-Bench, and CyBench adapters |
@@ -532,8 +545,12 @@ Security-sensitive tools are explicit opt-in imports and are not part of `qitos`
 
 QitOS is currently **Beta**.
 
-- Stable direction: `AgentModule + Engine`, trace/qita flow, canonical examples, benchmark adapters, and official reproducible-run contracts.
-- Likely to evolve: higher-level convenience APIs, some `kit` modules, and experimental toolsets.
+- Stable behavior during migration: trace/qita flow, canonical durable records,
+  benchmark adapters, and official reproducible-run contracts.
+- Accepted runtime direction: replace `AgentModule + Engine` in place with the
+  Model / minimal Agent loop / Session-Harness architecture described above.
+- Likely to evolve: public Agent/runtime APIs, higher-level convenience APIs, some
+  `kit` modules, and experimental toolsets.
 - If you are evaluating adoption, start from the kernel and examples, not assumptions about frozen surface area.
 - For ongoing project evolution and upgrade notes, see [CHANGELOG.md](CHANGELOG.md).
 

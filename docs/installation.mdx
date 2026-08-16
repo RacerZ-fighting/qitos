@@ -4,7 +4,7 @@ description: "Install QitOS from PyPI or source, with optional extras for models
 ---
 
 <Warning>
-QitOS is currently **Alpha**. The core `AgentModule + Engine` kernel, tracing, and canonical examples are stable. Higher-level APIs may change between releases. Pin your version in production.
+QitOS is currently **Beta**. Current releases ship `AgentModule + Engine`; the accepted runtime migration will replace that API in place. Trace/qita behavior and canonical examples remain supported, but pin your version in production and review the changelog before upgrading.
 </Warning>
 
 ## Requirements
@@ -23,7 +23,7 @@ Install the core framework from PyPI:
 pip install qitos
 ```
 
-The core install includes the `AgentModule + Engine` kernel, the `qita` observability tools (QitOS's built-in trace viewer), and the `kit` toolkit modules (pre-built parsers, memory adapters, toolsets, critics, and planners). It does not include the OpenAI client or benchmark dataset loaders.
+The current core install includes the shipped `AgentModule + Engine` runtime, the `qita` observability tools (QitOS's built-in trace viewer), and the `kit` toolkit modules (pre-built parsers, memory adapters, toolsets, critics, and planners). It does not include the OpenAI client or benchmark dataset loaders.
 
 <Tip>
 If you want to run the minimal coding-agent quickstart immediately, skip straight to `pip install "qitos[models]"`.

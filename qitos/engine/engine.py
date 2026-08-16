@@ -461,10 +461,8 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             _HandoffRuntime(self)
         )
         self._handoff_history: list[str] = []  # tracks agent names for loop detection
-        # NOTE (v0.6): Handoff Decision-mode handling is stable for v0.6.
-        # Changes to the Engine loop for full handoff context strategies,
-        # shared memory, and canonical multi-agent templates are deferred to v0.7.
-        # See docs/internal/plans/v0.7_handoff_scope.md for details.
+        # Historical handoff paths are migration-only and must not grow new policy.
+        # See docs/internal/plans/pi-aligned-agent-runtime.md for their removal boundary.
         self.stream_callback: Optional[Any] = (
             None  # Callable[[str], None] for streaming
         )

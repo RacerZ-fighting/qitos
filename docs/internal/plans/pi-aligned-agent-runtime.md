@@ -1,0 +1,97 @@
+# Pi-aligned Agent runtime migration
+
+## Status
+
+Accepted migration plan on 2026-08-16. The target contracts are defined by the
+[QitOS Agent runtime architecture](../architecture/agent-runtime.md). Current releases
+still execute `AgentModule + Engine`; a milestone is complete only after callers and
+superseded paths are removed.
+
+## 1. Current gaps
+
+- Public execution still centers on `AgentModule`, Observation, Decision, Action and
+  Engine rather than Model, minimal loop and Session/Harness.
+- Engine still owns application parser/critic/search/handoff, environment setup,
+  checkpoint compatibility and benchmark concerns.
+- Task mixes objective identity with benchmark resources, environment probing, metrics
+  and free-form metadata.
+- WorkPlan is a flat single-active checklist rather than an owner/dependency graph.
+- Application composition subclasses the old Agent lifecycle, so deleting historical
+  runtime surfaces is not yet possible.
+
+Proven Tool transaction, cancellation, absolute deadline, result ordering, trace and
+recovery behavior is the conformance baseline. Legacy type names and package layout are
+not compatibility requirements.
+
+## 2. Milestones
+
+### 2.1 Freeze behavioral conformance
+
+- Express provider/message, Tool transaction, cancellation, deadline, ordering and
+  recovery tests without legacy class names.
+- Resolve the public Message, ToolCall, ToolResult, AgentEvent and failure types.
+
+Done when the suite can run against a replacement loop without importing AgentModule,
+Observation, Decision or Action.
+
+### 2.2 Replace loop and façade
+
+- Introduce the minimal loop and small Agent façade as the only execution path.
+- Move all application callers in the same slices that delete the corresponding old
+  lifecycle; do not publish two runtimes.
+
+Done when application composition no longer subclasses AgentModule and old Engine is
+absent from public exports, examples and runtime tests.
+
+### 2.3 Make Session/Harness authoritative
+
+- Separate transcript entries from operation records in one canonical storage contract.
+- Move queue, compact, recovery, resume, fork and expected rejection out of Engine.
+- Provide memory/JSONL conformance and pure recovery tests.
+
+Done when recovery never branches through a live Engine or guesses side effects.
+
+### 2.4 Replace Task and Plan
+
+- Commit Root Task before side effects and persist lifecycle/usage.
+- Remove benchmark/environment/evaluation/free-metadata fields from canonical Task.
+- Replace flat WorkPlan with the dependency-aware owner graph.
+- Bind Child Task and parent assignment durably before launch.
+
+Done when Task, Session, Run, Plan and Child identities stay distinct across recovery,
+and no TaskV2/Goal mirror or compatibility Plan remains.
+
+### 2.5 Migrate application composition
+
+- Let PentestAgent compose the new façade directly.
+- Preserve product-owned Engagement, Scope, domain state, plugin system and completion
+  policy outside QitOS.
+- Keep Root and Child on the same Agent implementation with narrowing-only authority.
+
+Done when QitOS contains no PentestAgent concepts and PentestAgent contains no QitOS
+runtime wrapper.
+
+### 2.6 Remove historical surface
+
+Delete final callers, packages, exports, dependencies, tests, examples and docs for:
+
+- AgentModule, Observation, Decision and Action public lifecycle;
+- checkpoint as a second persistence owner;
+- handoff, delegate, fanout and shared-memory multi-Agent paths;
+- Engine critic, search, branch selector, text parser and prompt-injected protocol;
+- planning/workflow runtimes that compete with Task + Plan + Child;
+- duplicate benchmark, evaluate, metric, leaderboard and recipe paths;
+- unconsumed environment, memory, parser, ToolSet, renderer and demo surfaces;
+- sync bridges below the outermost application/CLI boundary.
+
+Do not keep V2 modules, legacy aliases, wrappers or mirror DTOs.
+
+## 3. Verification
+
+Each slice needs focused behavior tests, followed by QitOS's independent pytest,
+flake8 and mypy checks. The final matrix covers terminal ToolResult pairing,
+cancellation, absolute deadline, ordered concurrency, queue safe points, Task/Plan
+transitions, compact/resume/fork, corruption, Child cleanup and no leaked tasks.
+
+README, public shipped-behavior docs and Changelog change in the same slice. A
+PentestAgent quality gate does not validate QitOS.

@@ -54,7 +54,9 @@ Prefer small, reviewable commits with imperative summaries:
 
 Before opening a PR:
 
-- Keep changes aligned with the `AgentModule + Engine` mental model
+- Keep changes aligned with the target Model / minimal Agent loop / Session-Harness
+  architecture in [ARCHITECTURE.md](ARCHITECTURE.md); do not extend the old
+  `AgentModule + Engine` lifecycle except for correctness, security or migration work
 - Preserve or improve examples and docs when behavior changes
 - Add or update tests for user-facing behavior
 - Update [CHANGELOG.md](CHANGELOG.md) for high-signal user-facing changes

@@ -1,151 +1,123 @@
-# QitOS AGENTS.md
+# QitOS development instructions
 
-This file is the durable working agreement for AI coding agents operating in this repository.
+This file contains repository-wide rules. Keep detailed module contracts in code/docs
+and add nested instructions only when a directory has a genuinely different workflow.
 
-Keep this file high-signal:
-- put repository-wide rules here
-- put directory-specific rules in nested `AGENTS.md` or `AGENTS.override.md`
-- prefer concrete commands, constraints, and acceptance criteria over slogans
+## 1. Architecture authority
 
----
+QitOS is a reusable Agent runtime with one target path:
 
-## Mission
+```text
+Model / Provider
+→ minimal async Message / ToolCall / ToolResult loop
+→ Agent façade / Session Harness
+→ application composition
+```
 
-You are the coding agent for QitOS, a research-first, builder-friendly agent framework centered on one canonical kernel:
-- `AgentModule + Engine`
-- explicit lifecycle: `observe -> decide -> act -> reduce -> check_stop`
+The target contracts are in `docs/internal/architecture/agent-runtime.md`. Migration
+order and deletion work are in `docs/internal/plans/pi-aligned-agent-runtime.md`.
+Public docs describe shipped behavior until the migration lands.
 
-Your job is not only to ship correct code, but also to make project progress visible, reviewable, and easy for users and contributors to follow.
+Hard rules:
 
-The quality bar is not MVP. Changes should move QitOS toward world-class open-source framework quality in:
-- architecture clarity
-- modularity and extensibility
-- reproducibility and observability
-- developer ergonomics
-- documentation quality
+- Maintain one implementation of each core concept. Do not add V2/legacy aliases,
+  wrappers, mirror DTOs, second codecs or parallel runtimes.
+- Replace old behavior in place. A replacement is complete only when callers, exports,
+  tests, examples and affected docs move, and the superseded path is removed.
+- Preserve verified Tool transaction, deadline, cancellation, ordering, trace and
+  recovery behavior while replacing `AgentModule / Observation / Decision / Action`.
+- New product capability must target the Model/loop/Session contracts, not extend the
+  old Engine lifecycle.
+- Benchmark, evaluation, recipe, renderer and product/plugin policy stay outside the
+  Agent loop, Task, Session and Tool executor.
 
----
+## 2. Ownership boundaries
 
-## Primary goals
+- `qitos.core`: stable provider-neutral contracts such as Message, Task, Tool and
+  Session records.
+- `qitos.models`: Provider adapters and model-runtime configuration.
+- Agent loop: model/Tool turn mechanics and transaction barriers only.
+- Session/Harness: queue, compact, resume, fork, abort, idle and pure recovery.
+- `qitos.kit`: concrete reusable Runtime, storage, Tool, Skill, MCP, Artifact, Plan and
+  Child implementations.
+- `examples`: runnable product-surface examples, not alternate framework layers.
+- `docs`: public shipped behavior or explicitly labelled internal target architecture.
 
-Optimize for the following, in order:
+QitOS does not own PentestAgent concepts or a general product plugin loader. Products
+compose QitOS primitives explicitly without arbitrary loop/Session hooks.
 
-1. Correctness
-2. Clarity
-3. Consistency with the existing codebase
-4. Reproducibility and maintainability
-5. Visible project momentum for users and contributors
+## 3. Standard workflow
 
-Do not optimize for speed at the expense of quality.
+For a non-trivial change:
 
----
+1. Inspect the current owner, public callers, behavior tests and directly relevant doc.
+2. State the observable change, failure semantics, migration impact and success test.
+3. If the change affects architecture, a public contract, persistence, Provider
+   semantics or the default runtime path, update the active plan and confirm the
+   tradeoff before implementation.
+4. Implement the smallest complete slice in place. Move real callers before extracting
+   a new abstraction; do not prebuild a registry/factory/hook without a second use.
+5. Add or update behavior tests, then run the checks appropriate to the changed layer.
+6. Update only the affected docs/history surfaces, inspect the final diff and remove
+   superseded code/documents from the same slice.
 
-## Default working style
+Small isolated fixes and docs-only edits do not require a new plan document.
 
-- Be proactive and execution-oriented.
-- Gather the necessary context from the repository before editing.
-- Follow existing patterns, naming, abstractions, and conventions unless there is a strong reason to improve them.
-- Prefer small, coherent, reviewable changes over scattered hacks.
-- Solve the root problem, not just the immediate symptom.
-- When changing behavior, make sure all related surfaces remain consistent: code, tests, docs, examples, changelog, and README-facing project updates.
+## 4. Runtime and contract rules
 
-Do not stop at "the code compiles".
-A task is only complete when implementation, verification, and repository-facing communication are all complete.
+- Async is native below the outermost application/CLI boundary. Do not call
+  `asyncio.run()` or create a temporary loop inside running async code.
+- Re-raise `asyncio.CancelledError` after durable terminalization and cleanup.
+- Propagate absolute deadlines; child calls receive only remaining time.
+- Use structured concurrency for bounded parallel work. No detached unowned tasks.
+- Every ToolCall receives exactly one terminal ToolResult, including invalid, denied,
+  timeout, cancelled and failed calls. Parallel results commit in input order.
+- A turn freezes model, history, Tool exposure, runtime capability, deadline and budget.
+- Do not wait for Model, Tool, user or cleanup while holding a Session lock or storage
+  transaction.
+- Imports must not start threads/tasks, connect MCP, probe environments or mutate a
+  process-global registry.
+- Public/cross-module objects use explicit types; validate external dict/SDK payloads at
+  the boundary and preserve exception causality.
 
----
+Task rules:
 
-## Architecture invariants
+- Commit one goal-bearing Root Task before the first model or Tool side effect.
+- A Session has at most one unfinished Root Task. Resume and non-terminal fork preserve
+  Task identity; terminal follow-up creates a new Task explicitly.
+- Blocked is resumable only after explicit caller input or observed external-state
+  change. Completed, failed and cancelled are terminal once.
+- Child launch creates a narrowed Task linked to parent Task and Plan assignment before
+  runtime construction.
+- Benchmark resources, environment probing, metrics and free-form metadata do not enter
+  canonical Task.
 
-These are non-negotiable:
+Tool rules:
 
-- Keep a single mainline architecture. Do not introduce parallel architecture tracks.
-- Do not create `V1`, `V2`, `Legacy`, `Next`, or alias-based duplicate concepts in core APIs.
-- Before adding a framework capability, inspect the existing QitOS owner, callers, and
-  behavior tests. Extend or correct that implementation in place instead of adding a
-  wrapper, gateway, mirror type, second codec, or parallel runtime path.
-- A replacement is complete only when callers, tests, exports, and documentation use the
-  canonical implementation and the superseded mechanism is removed in the same change.
-- Keep stable contracts in `qitos.core`; put replaceable concrete implementations in `qitos.kit`.
-- Preserve the `AgentModule + Engine` story as the primary public mental model.
-- Prefer explicit contracts and hook points over hidden magic.
-- Do not reduce trace clarity, stop-reason clarity, or `qita` replay/export usefulness.
+- Class Tools expose only `execute(args, runtime_context)`; function Tools use the
+  canonical decorator path.
+- Registry conflicts fail. Registration and exposure are instance-scoped and explicit.
+- Model schema and execution admission use the same frozen ToolSpec/input schema.
+- Tool retry, permission, timeout and concurrency behavior has one owner. Do not stack
+  transport/executor/handler retry loops or infer concurrency safety from a name.
+- Env-backed operations use Env capabilities and never silently fall back to the host.
 
----
+## 5. Verification by change type
 
-## Package boundaries
+Run commands through `uv`, not bare Python/pip or a parent repository environment.
+Use Python 3.11 for contributor checks.
 
-Use these boundaries strictly:
+Docs/comments only:
 
-- `qitos.core`: abstract contracts, canonical data types, stable framework primitives
-- `qitos.engine`: execution kernel, loop mechanics, hooks, validation, recovery, stop logic, action execution
-- `qitos.kit`: concrete reusable implementations such as tools, memory, parser, planning, critic, env helpers, prompts
-- `qitos.benchmark`: adapters that turn external benchmarks into canonical `Task` (deprecated, migrating to recipes/)
-- `examples`: runnable reference agents and benchmark runners
-- `docs`: educational and operational documentation
+- `git diff --check`
+- verify changed local links and current-vs-target wording
 
-Rule of thumb:
-- if it is concrete or swappable, prefer `qitos.kit`
-- if it is a stable contract, keep it in `qitos.core`
+Focused behavior change:
 
----
+- run the smallest relevant pytest selection first;
+- run flake8/mypy when touching their stable surfaces.
 
-## Planning rules
-
-For simple changes, proceed directly after gathering enough context.
-
-For larger tasks, create or update a written execution plan before major implementation work begins.
-
-Use a plan when any of the following is true:
-- the task spans multiple files or subsystems,
-- the task will likely take more than 30 minutes,
-- the task involves architecture, refactors, benchmarks, or public API changes,
-- the task has non-trivial product or documentation implications.
-
-When a plan is needed:
-- create or update a task-specific plan document,
-- make the plan concrete and executable,
-- keep the plan updated as the work evolves,
-- treat the plan as a living document, not a one-time sketch.
-
----
-
-## Code quality rules
-
-- Prefer existing helpers and patterns over introducing new abstractions.
-- Do not duplicate logic if a reusable internal abstraction already exists.
-- Keep functions and modules focused.
-- Avoid speculative generalization.
-- Avoid broad try/catch blocks and silent failures unless the repository already uses them intentionally.
-- Surface errors clearly and follow existing error-handling patterns.
-- Keep types strong; do not use unsafe casts unless absolutely necessary and justified.
-- Avoid adding production dependencies unless clearly necessary.
-
-When introducing a new abstraction, ensure it earns its complexity.
-
----
-
-## Verification rules
-
-For every meaningful code change, you must do the relevant verification work.
-
-Run Python tools through `uv`; do not invoke bare `python`, `python3`, `pip`, or a
-virtual-environment interpreter path. QitOS owns its environment and checks. A parent
-repository's interpreter or acceptance gate must not be used as a substitute for the
-QitOS commands below. QitOS supports Python 3.10 and newer according to `setup.py`;
-use Python 3.11 for contributor checks, matching the repository's mypy target. Because
-QitOS still uses `setup.py` metadata rather than a PEP 621 `[project]` table, run uv in
-`--no-project` mode with QitOS editable and install only the checker needed by each
-command. This avoids both an incorrect workspace requirement and repeatedly resolving
-unrelated release tooling from the full `dev` extra.
-
-This includes, as applicable:
-- updating or adding tests,
-- running the relevant test suites,
-- running lint / formatting / type checks,
-- checking that behavior matches the request,
-- reviewing your own diff for regressions, inconsistencies, or overreach.
-
-Default project validations:
+Core/public contract, Provider, persistence, concurrency or broad refactor:
 
 ```bash
 uv run --no-project --python 3.11 \
@@ -154,190 +126,41 @@ uv run --no-project --python 3.11 \
   --with 'pytest-asyncio>=0.23' \
   --with 'openai>=1.66.0' \
   pytest -q
+
+uv run --no-project --python 3.11 --with-editable . \
+  --with 'flake8>=6' flake8 qitos/core qitos/engine qitos/models qitos/trace
+
+uv run --no-project --python 3.11 --with-editable . \
+  --with 'mypy>=1' mypy qitos/core qitos/engine qitos/models qitos/trace
 ```
 
-Stable-surface static checks:
-
-```bash
-uv run --no-project --python 3.11 --with-editable . --with 'flake8>=6' flake8 qitos/core qitos/engine qitos/models qitos/trace
-uv run --no-project --python 3.11 --with-editable . --with 'mypy>=1' mypy qitos/core qitos/engine qitos/models qitos/trace
-```
-
-Packaging checks when changing packaging, distribution, or release-facing behavior:
+Packaging/release metadata:
 
 ```bash
 uv build
 uv run --no-project --python 3.11 --with 'twine>=5.1.1' twine check dist/*
 ```
 
-Do not claim success without verification.
-If you cannot run a check, explicitly say so and explain why.
+Do not claim a check passed unless it ran. Report skipped checks and why.
 
----
+## 6. Documentation and history
 
-## Tooling and contract rules
+- Update `CHANGELOG.md` for user/developer-visible behavior, API, dependency,
+  performance, deprecation or removal changes.
+- Update the relevant public doc when behavior/workflow changes; update internal
+  architecture/plan docs when the target or migration changes.
+- Update README news only for meaningful user-visible or roadmap-level progress, not
+  every internal edit.
+- Keep English/Chinese public docs aligned when both exist.
+- Remove completed/superseded internal plan documents; Git history is the archive.
+- Examples and commands must remain runnable and credentials come from environment
+  variables.
 
-- Class-based tools should implement `execute(args, runtime_context)`.
-- `execute(args, runtime_context)` is the only class-based execution entry; do not add
-  `run`, `call`, callable fallbacks, name aliases, or normalized-name dispatch.
-- Function-style tools should continue to use the canonical decorator path.
-- `ToolRegistry` owns registration and exact-name lookup; `ActionExecutor` owns
-  validation, permission checks, timeout handling, execution, and result normalization.
-- `ToolSpec.retry_policy` is the only tool retry control. Admission runs once; retry
-  attempts and backoff share one absolute action deadline. Do not add integer retry
-  fields, transport retry loops, retry interceptors, or action-level timeout overrides.
-- `ModelRetryPolicy` is the only OpenAI transport retry owner and every OpenAI SDK
-  client must use `max_retries=0`. Model attempts, streams, provider timeouts, and
-  backoff share the Engine's absolute request deadline; late results are discarded.
-- Parallel execution requires an explicit `ToolSpec.concurrency_safe=True`; read-only
-  metadata and historical tool names never imply concurrency safety.
-- Env-backed operations should consume env ops rather than assuming host filesystem/process access directly.
+## 7. Repository hygiene
 
----
-
-## Observability and reproducibility
-
-Do not ship changes that degrade:
-
-- trace schema consistency
-- hook payload usefulness
-- `run_id`, `step_id`, and `phase` clarity
-- replayability through `qita`
-- final result and stop reason auditability
-
-Every major feature should preserve or improve observability.
-
----
-
-## Documentation and project-history rules
-
-These rules are mandatory.
-
-### 1. CHANGELOG discipline
-
-For every meaningful change, update `CHANGELOG.md`.
-
-Default behavior:
-- add an entry under the appropriate `Unreleased` section,
-- describe the change in user-facing language,
-- mention the affected area clearly,
-- keep entries concise but informative,
-- prefer `Added`, `Changed`, `Fixed`, `Deprecated`, `Removed`, and `Breaking` categories.
-
-You must update `CHANGELOG.md` for:
-- new features, fixes, behavior changes, CLI changes,
-- benchmark support changes, docs-visible workflow changes,
-- developer-facing improvements, performance improvements, deprecations or removals.
-
-Do not leave meaningful repository progress undocumented.
-
-### 2. Docs discipline
-
-Whenever behavior, APIs, workflows, architecture, examples, setup, benchmarks, or contributor expectations change, update `docs/` in the same task.
-
-Default behavior:
-- update the most relevant existing doc if one already exists,
-- create a new doc only when the topic does not fit cleanly into existing docs,
-- keep examples and commands accurate,
-- keep terminology consistent with the codebase.
-
-You must treat documentation updates as part of implementation, not as optional follow-up work.
-
-### 3. README news discipline
-
-The README must visibly communicate that the project is actively progressing.
-
-For every meaningful user-visible, contributor-visible, or roadmap-relevant change:
-- update the `News`, `What's New`, or equivalent section in `README.md`,
-- add a short, high-signal entry describing the progress,
-- prefer concise updates that help users immediately notice momentum.
-
-### 4. Sync rule
-
-Never finish a meaningful task without checking whether all three of the following need updates:
-- `CHANGELOG.md`
-- `docs/`
-- `README.md` news / updates section
-
-Default to **yes** unless the change is clearly too minor.
-
----
-
-## Open-source maintenance rules
-
-QitOS is an open-source project.
-Work should leave behind signals that help external users and contributors understand project health and direction.
-
-Whenever relevant:
-- improve contributor clarity,
-- improve discoverability of new functionality,
-- improve tutorial quality,
-- improve consistency between docs and code,
-- improve release readability.
-
-Think like a maintainer, not just an implementer.
-
----
-
-## Safety and scope control
-
-- Do not make unrelated drive-by changes unless they are necessary to complete the task safely.
-- Do not rewrite large areas of the codebase without clear justification.
-- Do not introduce hidden breaking changes.
-- Call out migration or compatibility implications clearly.
-- If the task reveals a larger issue, fix what is necessary now and note the broader follow-up separately.
-- Never use destructive git commands such as `git reset --hard` or `git checkout --` unless explicitly requested.
-- Do not amend commits unless explicitly requested.
-
----
-
-## Codex / MCP best practices
-
-When using Codex in this repository:
-
-- Give the agent concrete context: target files, expected behavior, constraints, and validation commands.
-- Prefer durable guidance in `AGENTS.md` over repeating the same instructions in every prompt.
-- Keep repository instructions concise and operational; add nested overrides only near specialized subsystems.
-- Validate real outcomes after edits instead of stopping at analysis or code generation.
-- Turn repeated workflows into reusable skills, scripts, or automation only after the workflow is stable.
-
-For OpenAI-, ChatGPT-, or Codex-related questions:
-- Always use the OpenAI developer documentation MCP server first if available.
-- If MCP is unavailable, fall back only to official OpenAI docs domains.
-- Do not rely on memory alone for volatile OpenAI product guidance.
-
----
-
-## Benchmarks, examples, and docs rules
-
-Benchmark rules:
-- convert benchmark inputs into canonical `Task`
-- keep benchmark-specific hacks out of core
-- preserve useful raw fields in metadata
-- keep adapters in `qitos.benchmark` (deprecated, migrating to `qitos.recipes`)
-- provide runnable examples where practical
-
-Example rules:
-- examples are product surface, not toy snippets
-- each example should run end-to-end on a real path
-- examples should teach one clear pattern
-- credentials must come from environment variables
-
-Docs rules:
-- update docs when public behavior, contracts, or user workflows change
-- keep English and Chinese docs reasonably aligned when both exist
-- prefer constructive walkthroughs over command dumps
-
----
-
-## Preferred decision heuristic
-
-When uncertain, choose the option that:
-
-1. keeps `AgentModule + Engine` simpler
-2. improves researcher iteration speed
-3. improves traceability and debuggability
-4. preserves modular extension through `qitos.kit`
-5. avoids architecture forks and surface-area sprawl
-
-If a proposal violates this file, revise the design before coding.
+- Keep changes scoped; preserve unrelated user work.
+- Do not add production dependencies without a demonstrated default-path need.
+- Never hide flaky behavior with retries or broad exception handling.
+- Do not use destructive Git commands or amend commits unless explicitly requested.
+- Review the final diff for credentials, machine-local paths, generated artifacts,
+  compatibility leftovers and unrelated rewrites.

@@ -1,9 +1,9 @@
 ---
 title: "QitOS 文档"
-description: "面向智能体研究者的类 PyTorch 风格框架，用单一 AgentModule + Engine 内核构建可复现的 LLM 智能体。"
+description: "面向智能体研究者的类 PyTorch 风格框架，用可追踪的单一运行时构建可复现 LLM 智能体。"
 ---
 
-QitOS 是面向智能体（agent）研究者的类 PyTorch 风格框架。你可以在同一个 `AgentModule + Engine` 内核上原型化方法、运行基准测试（benchmark），并用内建 `qita` 观察长时运行轨迹（trajectory）。
+QitOS 是面向智能体（agent）研究者的类 PyTorch 风格框架。当前版本通过已发布的 `AgentModule + Engine` 运行时原型化方法、运行基准测试（benchmark），并用内建 `qita` 观察长时运行轨迹（trajectory）。已经确认的下一版架构会原地替换为 Model、最小异步 Agent loop 和可恢复 Session/Harness；迁移完成前，下列指南继续准确描述当前安装版本。
 
 ## 两种编写方式
 
@@ -93,7 +93,7 @@ QitOS 提供两种顶层的智能体编写方式：
 
 <CardGroup cols={2}>
   <Card title="单一执行内核" icon="cpu" href="/zh/concepts/engine">
-    示例、评测与生产型智能体全都运行在同一个 `AgentModule + Engine` 上
+    示例、评测与生产型智能体全都运行在同一条 canonical runtime 上
   </Card>
   <Card title="协议感知解析" icon="brackets-curly" href="/zh/reference/kit">
     提示词格式与解析器选择是显式设计，而不是隐藏的胶水层

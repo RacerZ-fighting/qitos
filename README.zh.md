@@ -10,7 +10,10 @@
 
 QitOS 是面向 agent 研究者的 torch-flavor 框架。
 
-你可以在同一个 `AgentModule + Engine` 内核上原型化方法、运行 benchmark，并用内建 `qita` 检查长时轨迹。
+当前版本在同一个 `AgentModule + Engine` 运行时上原型化方法、运行 benchmark，并用
+内建 `qita` 检查长时轨迹。已经确认的下一版运行时架构会原地替换这条路径，收敛为
+与 Provider 无关的 Model、最小异步 Agent loop 和可恢复的 Session/Harness；迁移完成前，
+现有 API 文档仍以当前已发布行为为准。
 
 QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会进入独立的 `qitos-zoo`，包括计划中的 `qitos-coder` 与 `qitos-cyber-agent`。
 
@@ -18,6 +21,12 @@ QitOS 主仓库是小而清晰的核心框架。产品级 / 展示级应用会�
 
 ## 最新进展
 
+- **确认与 Pi 对齐的运行时架构**：下一轮重构会原地把 `AgentModule + Engine` 替换为
+  `Model -> 最小异步 Agent loop -> Session/Harness -> 应用组合`，不新建平行 V2 路径。
+  可持久化、携带 goal 的 Task 会成为 Root 和 Child Agent 的工作根；benchmark 输入、
+  environment handle、metrics 与应用插件策略不进入 Task 契约。详见
+  [目标架构](docs/internal/architecture/agent-runtime.md)和
+  [迁移计划](docs/internal/plans/pi-aligned-agent-runtime.md)。
 - **长程运行保持可缓存前缀**：两次明确压缩之间，canonical 模型历史严格 append-only。
   Engine 在 80% 告警、85% 压缩并记录 Provider cache/prefix 事实；应用状态通过新的
   `ContextSnapshot` 追加，不再改写旧 ToolResult。超大工具输出先完整持久化，模型侧统一使用
@@ -273,7 +282,7 @@ export QITOS_MODEL="Qwen/Qwen3-8B"
 
 | 如果你想要... | QitOS 提供... |
 |---|---|
-| 可复现的 agent 研究 | 稳定的 `AgentModule + Engine` 内核 |
+| 可复现的 agent 研究 | 一条具有 durable trajectory 的 canonical runtime |
 | 方法 = Agent + Critic | 具有显式状态和 critic 的受维护 recipe |
 | 强可观测性 | `qita` board、replay、export 与 trace 工件 |
 | benchmark 工作流 | GAIA、Tau-Bench、CyBench 适配器 |
@@ -376,8 +385,11 @@ registry = ToolRegistry().include_toolset(
 
 QitOS 当前处于 **Beta**。
 
-- 相对稳定：`AgentModule + Engine`、trace/qita、canonical examples、benchmark adapters，以及官方可复现 run 契约。
-- 仍会演进：更高层 convenience API、部分 `kit` 模块、实验性 toolset。
+- 迁移期间保持稳定的行为：trace/qita、canonical durable records、benchmark adapters，
+  以及官方可复现 run 契约。
+- 已确认的运行时方向：原地把 `AgentModule + Engine` 替换为上文的 Model、最小 Agent loop
+  和 Session/Harness 架构。
+- 仍会演进：公开 Agent/runtime API、更高层 convenience API、部分 `kit` 模块和实验性 toolset。
 - 如果你正在评估接入，建议从 kernel 与 examples 开始，而不是假设所有高层表面都已冻结。
 - 持续演进和升级说明见 [CHANGELOG.md](CHANGELOG.md)。
 

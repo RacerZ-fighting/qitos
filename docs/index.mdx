@@ -1,9 +1,9 @@
 ---
 title: "QitOS Documentation"
-description: "The torch-flavor framework for agent researchers building reproducible LLM agents on one AgentModule + Engine kernel."
+description: "The torch-flavor framework for agent researchers building reproducible, traceable LLM agents."
 ---
 
-QitOS is a PyTorch-style framework for agent researchers. It lets you prototype methods, run benchmarks, and inspect long-horizon trajectories on a single `AgentModule + Engine` kernel, with built-in observability via `qita` (the trace viewer that ships with QitOS).
+QitOS is a PyTorch-style framework for agent researchers. Current releases let you prototype methods, run benchmarks, and inspect long-horizon trajectories through the shipped `AgentModule + Engine` runtime, with built-in observability via `qita` (the trace viewer that ships with QitOS). The accepted next architecture replaces that runtime in place with a Model, minimal async Agent loop, and durable Session/Harness; the guides below continue to document the installed release until migration completes.
 
 ## Two authoring paths
 
@@ -93,7 +93,7 @@ Both paths are first-class citizens in the framework.
 
 <CardGroup cols={2}>
   <Card title="Single kernel" icon="cpu" href="/concepts/engine">
-    One `AgentModule + Engine` runtime across examples, benchmarks, and production-style agents
+    One canonical runtime across examples, benchmarks, and production-style agents
   </Card>
   <Card title="Protocol-aware parsers" icon="brackets-curly" href="/reference/kit">
     Prompt format and parser choice are paired intentionally, not left as implicit glue code

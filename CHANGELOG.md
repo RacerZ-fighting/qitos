@@ -82,6 +82,17 @@ How to update:
 
 ### Changed
 
+- Accepted a Pi-aligned runtime architecture that will replace `AgentModule + Engine`
+  in place with a provider-neutral Model, a minimal async Agent loop, and a durable
+  Session/Harness. The same plan makes a typed, goal-bearing Task the Root/Child work
+  root and removes benchmark, environment, metrics, and free-form metadata concerns
+  from that contract. This entry records the architecture decision; current releases
+  keep their documented runtime behavior until the replacement lands.
+- Consolidated internal architecture history into one target architecture and one
+  active migration plan, removing superseded Engine, handoff, WorkPlan, release-roadmap
+  and completed task plans. Contributor instructions now use one short risk-based
+  workflow instead of requiring plans, full checks, README news and changelog edits for
+  every non-trivial change.
 - Long-running model input is now append-only between explicit compactions. The old
   recent-round projection is gone; Engine warns at 80%, compacts at 85%, records stable
   cache-affinity/prefix telemetry, and exposes an immutable `ContextSnapshot` contract
@@ -850,7 +861,8 @@ How to update:
 - Added a first-class `qitos.harness` layer with `FamilyPreset`, `HarnessPolicy`, `ModelAdapter`, `ToolPolicy`, `ContextPolicy`, `build_harness_policy(...)`, and `build_model_for_preset(...)`.
 - Added built-in gold presets for Qwen, Kimi, MiniMax, `gpt-oss`, and Gemma 4, plus bilingual docs for family presets, preset authoring, the model-family matrix, and same-example switching.
 - Added `qit demo minimal`, a packaged minimal coding-agent demo that configures a real model, fixes a tiny workspace bug, and leaves behind a qita-ready trace.
-- Added release notes for the first formal GitHub release package under `plans/releases/v0.3.0.md`.
+- Added release notes for the first formal GitHub release package. Those notes were
+  later consolidated into this changelog when completed internal plans were removed.
 
 ### Changed
 

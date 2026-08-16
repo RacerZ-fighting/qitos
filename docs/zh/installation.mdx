@@ -4,7 +4,7 @@ description: "从 PyPI 或源码安装 QitOS，并按需启用模型与基准测
 ---
 
 <Warning>
-QitOS 当前处于 **Alpha** 阶段。核心 `AgentModule + Engine` 执行内核（kernel）、追踪（tracing）与规范化示例相对稳定；更高层 API 仍可能在版本间演进。用于生产环境时请固定版本号。
+QitOS 当前处于 **Beta** 阶段。当前版本仍发布 `AgentModule + Engine`，已经确认的运行时迁移会原地替换这套 API。Trace/qita 行为和规范化示例会继续保留，但生产环境应固定版本，并在升级前检查 Changelog。
 </Warning>
 
 ## 环境要求
@@ -25,7 +25,7 @@ pip install qitos
 
 核心安装包含：
 
-- `AgentModule + Engine` 执行内核
+- 当前已发布的 `AgentModule + Engine` 运行时
 - `qita` 可观测性工具
 - `kit` 工具箱模块
 
