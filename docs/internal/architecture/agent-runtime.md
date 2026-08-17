@@ -2,9 +2,9 @@
 
 ## Status
 
-Accepted target architecture on 2026-08-16. The minimal loop and `Agent` façade are
-the only execution path; authoritative Session/Harness and Task/Plan work remains in
-the migration plan.
+Accepted target architecture on 2026-08-16. The minimal loop, the `Agent`
+façade and the authoritative Session/Harness are the shipped execution and
+recovery path; Task/Plan work remains in the migration plan.
 
 This document owns the final QitOS runtime boundaries. The
 [migration plan](../plans/pi-aligned-agent-runtime.md) owns the remaining sequencing.

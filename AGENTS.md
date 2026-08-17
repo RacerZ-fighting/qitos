@@ -15,11 +15,12 @@ Model / Provider
 ```
 
 The contracts are in `docs/internal/architecture/agent-runtime.md`. The minimal loop,
-the `Agent` façade, the journaled child path and the façade quickstart are the shipped
+the `Agent` façade, the journaled child path, the façade quickstart and the
+authoritative Session/Harness (`qitos.kit.session`) are the shipped
 mainline; the retired `AgentModule / Observation / Decision / Action` lifecycle, its
 Engine, checkpoint store, prompt-injected protocols/parsers/critics, recipes, and
-benchmark execution adapters are removed. Remaining migration work (authoritative
-Session/Harness, Task/Plan replacement) is tracked in
+benchmark execution adapters are removed. Remaining migration work (Task/Plan
+replacement) is tracked in
 `docs/internal/plans/pi-aligned-agent-runtime.md`.
 
 Hard rules:

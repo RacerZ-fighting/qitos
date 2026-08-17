@@ -346,6 +346,10 @@ class RecoveredRecorderState:
     journaled that dimension) so the recorder writes diffs only instead of
     rewriting history. ``recorded_message_count`` is the number of transcript
     entries replayed through the lineage, kept for continuation accounting.
+    ``input_accepted`` marks that this run already committed its initial
+    input: later prompt batches (steering converted by the façade) stay
+    durable through their turn commits and must not write a second
+    ``input.accepted`` record.
     """
 
     next_turn: int
@@ -353,6 +357,7 @@ class RecoveredRecorderState:
     thinking_level: ThinkingLevel | None
     active_tool_names: tuple[str, ...] | None
     recorded_message_count: int
+    input_accepted: bool = False
 
     def __post_init__(self) -> None:
         if isinstance(self.next_turn, bool) or not isinstance(
@@ -380,6 +385,8 @@ class RecoveredRecorderState:
             self.recorded_message_count, int
         ) or self.recorded_message_count < 0:
             raise ValueError("recorded_message_count must be a non-negative integer")
+        if not isinstance(self.input_accepted, bool):
+            raise TypeError("input_accepted must be a boolean")
 
 
 class JournalTurnTransaction(TurnTransactionBoundary):
@@ -425,6 +432,7 @@ class JournalTurnTransaction(TurnTransactionBoundary):
         self._tool_terminal_record_ids: dict[tuple[int, str], str] = {}
         self._budget_ledger = budget_ledger
         self._model_pricing = model_pricing
+        self._input_accepted = seed.input_accepted
 
     @property
     def journal(self) -> SessionJournal:
@@ -478,17 +486,28 @@ class JournalTurnTransaction(TurnTransactionBoundary):
             )
         return record_id
 
-    async def input_accepted(self, prompts: tuple[Message, ...]) -> JournalPosition:
-        """Commit the run's prompt transcript entries before model side effects."""
+    async def input_accepted(self, prompts: tuple[Message, ...]) -> JournalPosition | None:
+        """Commit the run's prompt transcript entries before model side effects.
+
+        One Run accepts its initial input exactly once. When a recovered or
+        steering-driven run already has its ``input.accepted`` record, the
+        batch is left to its turn commit (the durable path every steered
+        message takes) and no second input record is written; the return is
+        then ``None``.
+        """
 
         if not prompts:
             raise ValueError("input_accepted requires at least one prompt message")
+        if self._input_accepted:
+            return None
         record_ids = [await self._append_transcript(prompt) for prompt in prompts]
-        return await self._journal.append(
+        position = await self._journal.append(
             JournalRecordType.INPUT_ACCEPTED,
             {"transcript_record_ids": record_ids},
             record_id=f"{self._journal.run_id}:input",
         )
+        self._input_accepted = True
+        return position
 
     async def turn_frozen(
         self, turn: int, config: TurnConfigSnapshot

@@ -142,6 +142,46 @@ How to update:
   uses. `runtime_input.consumed` records consumption of a posted runtime
   input; recovery folds own-run records only and never redelivers inherited
   fork facts.
+- **Authoritative Session Harness (S2b).** `qitos.kit.session.SessionHarness`
+  owns start, resume, fork, compaction and trace reattachment over the
+  canonical Run journals. `start` creates the journal and an `Agent` whose
+  transaction boundary is the seeded `JournalTurnTransaction`; `resume`
+  replays the journal through pure recovery, closes any crash window with
+  explicit cancelled terminals, and restores the façade (context messages,
+  thinking level, configuration lineage) with typed `ResumeRejected`
+  values (`not_found` / `terminal` / `model_mismatch` / `tools_missing`
+  with the missing names / `busy`) — corruption raises
+  `JournalCorruptionError` instead. `fork` branches at a committed boundary
+  (default: the latest) into a new self-contained journal; forking a
+  terminal run is the explicit continuation, and one `SessionRun` advances
+  along the same mechanism when the caller prompts again after a leg
+  settles. The default root `post_runtime_event` endpoint persists
+  `runtime_input.posted`, steers the message and appends
+  `runtime_input.consumed` once the steered message is covered by a
+  `step.committed`; unconsumed inputs are re-projected exactly once on
+  resume, and the Child engine now marks consumption the same way. Manual
+  `compact()` runs at idle only (typed `CompactRejected` for `busy` /
+  `nothing_to_compact`); automatic compaction evaluates Pi's token
+  threshold at idle boundaries against the model's `context_window`, and a
+  one-shot overflow recovery compacts and continues once after a
+  context-overflow model failure (conservative provider error patterns plus
+  usage-based silent-overflow detection, ported from Pi). Compaction
+  follows Pi v3's algorithm (chars/4 estimation, keep-recent cut search
+  that never splits a Tool call from its result, split-turn prefix merge,
+  previous-summary iteration), persists the durable `compaction` record
+  with summarization usage when available, swaps the context through
+  `Agent.set_transcript` and seals Provider continuation so the next
+  request is full. `qitos.trace.AgentTraceProducer` reattaches the trace
+  writer to the façade event stream: each committed turn publishes its
+  events with one `TraceStep` (step id = turn), lifecycle events write
+  directly, and the manifest finalizes with the terminal status `qita`
+  reads; trace artifacts remain observational and are never recovery truth.
+  The `Agent` façade restores `initial_messages`, replaces its transcript
+  between runs via `set_transcript` (busy runs reject), and the loop counts
+  turns from a recovered `turn_base` so journaled turn numbering continues
+  across resume. Journal recovery now replays nested fork prefixes as a
+  sequence of closed per-run segments (turn barriers and Tool-call pairing
+  are scoped per segment, since call ids are unique only within one run).
 
 ### Changed
 

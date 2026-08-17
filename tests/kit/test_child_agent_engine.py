@@ -416,6 +416,59 @@ async def test_parent_message_reserved_before_turn_end_settles_before_terminal(
 
 
 @pytest.mark.asyncio
+async def test_accepted_parent_message_is_marked_consumed_after_its_turn_commits(
+    tmp_path,
+) -> None:
+    registry = ToolRegistry().register(_echo)
+
+    async def first_response(_request):
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.COMPLETED,
+            finish_reason="tool_calls",
+            tool_calls=[tool_call_wire("c1", "echo", {"text": "wait"})],
+        )
+
+    model = ScriptedModel(
+        [first_response, text_events("acknowledged")],
+    )
+    engine = AgentChildEngine(
+        model=model,
+        tool_registry=registry,
+        journal_factory=_child_journal_factory(tmp_path),
+    )
+    event = RuntimeInput(
+        event_id="parent-message-consume",
+        kind="agent.parent.message",
+        correlation_id="child",
+        source="qitos.parent",
+        payload={"content": "reserved note"},
+    )
+
+    async def _post_when_started() -> None:
+        while not engine._accepting_runtime_events:
+            await asyncio.sleep(0)
+        assert await engine.apost_runtime_event(event, run_id="run_childconsume")
+
+    posting = asyncio.create_task(_post_when_started())
+    result = await engine.arun("inspect", run_id="run_childconsume")
+    await posting
+    assert result.state.stop_reason == "completed"
+    await engine.aclose()
+
+    records = await _read_child_records(tmp_path, "run_childconsume")
+    record_types = [record.type for record in records]
+    posted = record_types.index(JournalRecordType.RUNTIME_INPUT_POSTED)
+    consumed = record_types.index(JournalRecordType.RUNTIME_INPUT_CONSUMED)
+    committed = record_types.index(JournalRecordType.RUN_COMPLETED)
+    # Consumption commits after the steered message's turn committed, before
+    # the run terminal, and exactly once.
+    assert posted < consumed < committed
+    assert record_types.count(JournalRecordType.RUNTIME_INPUT_CONSUMED) == 1
+    consumed_record = records[consumed]
+    assert consumed_record.payload == {"event_id": "parent-message-consume"}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("withdrawal", ["cancel", "timeout"])
 async def test_pending_parent_message_withdrawal_leaves_no_reservation_or_record(
     tmp_path,

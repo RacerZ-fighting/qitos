@@ -538,8 +538,9 @@ as `interrupted` without replaying the Agent. Fork recovery ignores inherited
 parent lifecycle records, so a fork cannot query or interrupt the parent's live Child.
 If mailbox acceptance fails after `child.terminal`, the terminal result remains
 queryable through the control tools. Re-projecting unconsumed background completion
-inputs during resume belongs to the authoritative Session/Harness migration; the
-current façade path does not claim recovery-time redelivery. Foreground results are
+inputs is owned by `qitos.kit.session.SessionHarness`: it re-projects them exactly
+once from the recovered journal's own records while inherited fork facts are never
+redelivered. Foreground results are
 returned only through the original Agent ToolResult.
 
 `active_background_count`, `child_result(handle)`, `wait_child(handle)`,

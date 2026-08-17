@@ -4,33 +4,22 @@
 
 Accepted migration plan on 2026-08-16. The target contracts are defined by the
 [QitOS Agent runtime architecture](../architecture/agent-runtime.md). The minimal loop,
-façade, and retired-runtime deletion slices are implemented on the migration branch.
-The remaining merge gates land as three slices on the same branch:
+façade, retired-runtime deletion slices, S1 parity items, and the authoritative
+Session/Harness (S2) are implemented on the migration branch. The remaining merge
+gates land on the same branch:
 
-- S1 — milestone 2.1 parity items (typed thinking level, typed Tool usage and
-  result-activated Tool names).
-- S2 — milestone 2.3, the authoritative Session/Harness per the storage and
-  recovery contract in the architecture document and the dispositions below.
 - S3 — milestone 2.4, goal-bearing Task (S3a) and dependency-aware Plan (S3b).
 
 ## 1. Current gaps
 
-- Session/Harness is not yet the authoritative owner of compact, resume, fork, and
-  pure recovery (S2).
-- Background Child terminal facts have deterministic completion-input projections, but
-  recovery-time redelivery and consumed-event idempotence still depend on that
-  authoritative Session/Harness owner (S2).
-- The façade cannot yet restore initial messages/Tool activation (S2), and the loop
-  has no typed per-turn thinking-level update (S1). Raw `extra_request_options` are
-  provider wire data, not an equivalent reasoning contract.
-- Tool execution usage and the names of Tools activated by a result are not yet typed,
-  durable ToolResult facts (S1). A live registry is re-frozen for the next turn, but
-  that alone cannot reproduce activation order after resume (S2 verifies the lineage).
 - Task mixes objective identity with benchmark resources, environment probing, metrics
   and free-form metadata (S3a).
 - WorkPlan is a flat single-active checklist rather than an owner/dependency graph
   (S3b).
-- The loop/façade event stream is not yet reattached to the trace writer (S2).
+- Background Child terminal facts have deterministic completion-input projections,
+  and the Session/Harness now re-projects a run's own unconsumed inputs exactly
+  once; Task/Plan-owned durable lifecycle (blocked/terminal Task transitions and
+  Plan update replay) is what remains for recovery beyond that (S3).
 
 Proven Tool transaction, cancellation, absolute deadline, result ordering, trace and
 recovery behavior is the conformance baseline. Legacy type names and package layout are
@@ -97,7 +86,8 @@ AgentModule, and the old Engine is absent from exports, examples and tests.
 
 ### 2.3 Make Session/Harness authoritative (S2)
 
-Scope per the architecture document §4; concretely:
+Done on `feat/pi-aligned-agent-loop`. Scope per the architecture document §4;
+concretely:
 
 - (done in S2a) Transcript entries (`transcript.message`, `compaction`) own
   message content; operation records reference them by record id.
@@ -115,27 +105,39 @@ Scope per the architecture document §4; concretely:
 - (done in S2a) Memory and JSONL journal implementations share one
   conformance suite (`InMemorySessionJournal`,
   `tests/journal/test_session_journal_conformance.py`).
-- Resume/fork restore the façade (transcript, thinking level, configuration
-  lineage) and verify the provided Model identity and Tool registry coverage
-  with typed rejections; the run's turn counter continues from recovery
-  (S2b; the recorder already accepts the recovered seed).
-- Compaction: manual at idle, automatic token-threshold at idle boundaries,
-  and one-shot overflow recovery; Pi's cut-point rule (never between a Tool
-  call and its result) and summary-as-user-message projection (S2b; the
-  `compaction` record codec and recovery projection are done in S2a).
-- Unconsumed background Child completion inputs re-project from terminal facts
-  without redelivering foreground results or inherited fork facts
-  (`runtime_input.consumed` records consumption — record and recovery folding
-  done in S2a; harness re-projection wiring is S2b).
-- Reattach the trace writer to the loop/façade event stream so new runs emit
-  trace artifacts again; `qita` keeps reading the same three-file layout.
+- (done in S2b) Resume/fork restore the façade (transcript, thinking level,
+  configuration lineage) and verify the provided Model identity and Tool
+  registry coverage with typed rejections; the run's turn counter continues
+  from recovery via the loop's `turn_base` and the recovered recorder seed.
+  `qitos.kit.session.SessionHarness` owns start/resume/fork and the
+  `SessionRun` leg machinery (one journal per Agent run; terminal
+  continuations advance along explicit forks).
+- (done in S2b) Compaction: manual at idle, automatic token-threshold at
+  idle boundaries, and one-shot overflow recovery; Pi's cut-point rule
+  (never between a Tool call and its result), split-turn prefix merge and
+  summary-as-user-message projection land in
+  `qitos.kit.session.compaction`, and the context swap seals Provider
+  continuation through `Agent.set_transcript` plus the loop's
+  `continuation_floor`.
+- (done in S2b) Unconsumed background Child completion inputs re-project
+  from own-run posted facts exactly once (the default root
+  `post_runtime_event` and `AgentChildEngine` both append
+  `runtime_input.consumed` once the steered message is covered by a
+  `step.committed`); inherited fork facts and foreground results are never
+  redelivered.
+- (done in S2b) The trace writer is reattached to the loop/façade event
+  stream via `qitos.trace.AgentTraceProducer`; new runs emit the three-file
+  layout again and `qita` reads them unchanged.
 - (done in S2a) The run catalog reads the new payload shapes; Engine-era
   payload readers (`stop_reason`, `reason`, `task`, terminal flags, legacy
   usage fallback) are removed in favor of fail-closed decoders.
+- (done in S2b) Recovery replays nested fork prefixes as a sequence of
+  closed per-run segments: turn barriers and Tool-call pairing are scoped
+  by owning run, since call ids are unique only within one run.
 
-Done when recovery never branches through a live Engine or guesses side
-effects, and crash recovery is demonstrated at the model terminal, tool
-started, tool terminal and state commit boundaries.
+Crash recovery is demonstrated at the model terminal, tool started, tool
+terminal and state commit boundaries, and recovery never branches through a
+live Engine or guesses side effects.
 
 ### 2.4 Replace Task and Plan (S3)
 

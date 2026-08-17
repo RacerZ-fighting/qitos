@@ -149,13 +149,33 @@ AgentEventListener = Union[
 ]
 
 
+def normalize_prompt_messages(
+    message: Union[str, Message, Sequence[Message]]
+) -> List[Message]:
+    """Normalize prompt input into a non-empty list of typed Messages."""
+
+    if isinstance(message, str):
+        return [UserMessage(content=message)]
+    if isinstance(message, (UserMessage, AssistantMessage, ToolResultMessage)):
+        return [message]
+    if isinstance(message, Sequence) and not isinstance(message, (str, bytes)):
+        messages: List[Message] = list(message)
+        if not messages:
+            raise ValueError("prompt requires at least one message")
+        return messages
+    raise TypeError("prompt expects text, a Message, or a sequence of Messages")
+
+
 class Agent:
     """One model, one Tool registry, one transcript, one active run.
 
     The façade hands the live Tool registry to the loop, which re-freezes it
     into an immutable exposure at every turn boundary; mutating the registry,
     system prompt or model between runs affects the next run only, while a
-    Tool loaded mid-run becomes visible to the next turn.
+    Tool loaded mid-run becomes visible to the next turn. ``initial_messages``
+    and ``turn_base`` restore a recovered transcript and its journaled turn
+    numbering (Session resume/fork); ``set_transcript`` replaces the
+    transcript between runs and seals the seeded Provider continuations.
     """
 
     def __init__(
@@ -183,6 +203,8 @@ class Agent:
         after_tool_call: Optional[AfterToolCallHook] = None,
         should_stop_after_turn: Optional[ShouldStopAfterTurnHook] = None,
         prepare_next_turn: Optional[PrepareNextTurnHook] = None,
+        initial_messages: Sequence[Message] = (),
+        turn_base: int = 0,
     ) -> None:
         self._model = model
         self._tool_registry = (
@@ -204,8 +226,17 @@ class Agent:
         self._after_tool_call = after_tool_call
         self._should_stop_after_turn = should_stop_after_turn
         self._prepare_next_turn = prepare_next_turn
+        if (
+            isinstance(turn_base, bool)
+            or not isinstance(turn_base, int)
+            or turn_base < 0
+        ):
+            raise ValueError("turn_base must be a non-negative integer")
+        self._turn_base = turn_base
 
         self._messages: List[Message] = []
+        self._continuation_floor = 0
+        self._seed_transcript(initial_messages)
         self._listeners: List[Tuple[AgentEventListener, bool]] = []
         self._steering = _PendingMessageQueue(steering_mode)
         self._follow_up = _PendingMessageQueue(follow_up_mode)
@@ -391,11 +422,47 @@ class Agent:
                 "Agent is already processing. Wait for completion before resetting."
             )
         self._messages = []
+        self._continuation_floor = 0
+        self._clear_run_projection()
+        self.clear_all_queues()
+
+    def set_transcript(self, messages: Sequence[Message]) -> None:
+        """Replace the transcript between runs (restore or compaction swap).
+
+        Busy runs reject because a run holds its own context snapshot. The
+        replacement seals every Provider continuation carried by the seeded
+        messages: the next model request is a full request, and only
+        assistant messages produced by this façade's own later runs may
+        chain a continuation again. Steering/follow-up queues are
+        memory-only input, not transcript truth, so they are preserved.
+        """
+
+        if self._active is not None:
+            raise AgentBusyError(
+                "Agent is already processing. Wait for completion before "
+                "replacing the transcript."
+            )
+        self._seed_transcript(messages)
+        self._continuation_floor = len(self._messages)
+        self._clear_run_projection()
+
+    def _seed_transcript(self, messages: Sequence[Message]) -> None:
+        seeded = list(messages)
+        for message in seeded:
+            if not isinstance(
+                message, (UserMessage, AssistantMessage, ToolResultMessage)
+            ):
+                raise TypeError(
+                    "transcript messages must be typed UserMessage, "
+                    "AssistantMessage or ToolResultMessage values"
+                )
+        self._messages = seeded
+
+    def _clear_run_projection(self) -> None:
         self._is_streaming = False
         self._streaming_message = None
         self._pending_tool_calls = frozenset()
         self._error_message = None
-        self.clear_all_queues()
 
     async def prompt(
         self, message: Union[str, Message, Sequence[Message]]
@@ -404,7 +471,7 @@ class Agent:
 
         if self._active is not None:
             return AgentRunRejected(reason="busy")
-        messages = self._normalize_prompt(message)
+        messages = normalize_prompt_messages(message)
         return await self._run(messages)
 
     async def continue_run(self) -> AgentRunResult:
@@ -426,21 +493,6 @@ class Agent:
         return await self._run(None)
 
     # ── internals ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def _normalize_prompt(
-        message: Union[str, Message, Sequence[Message]]
-    ) -> List[Message]:
-        if isinstance(message, str):
-            return [UserMessage(content=message)]
-        if isinstance(message, (UserMessage, AssistantMessage, ToolResultMessage)):
-            return [message]
-        if isinstance(message, Sequence) and not isinstance(message, (str, bytes)):
-            messages: List[Message] = list(message)
-            if not messages:
-                raise ValueError("prompt requires at least one message")
-            return messages
-        raise TypeError("prompt expects text, a Message, or a sequence of Messages")
 
     async def _run(
         self,
@@ -494,6 +546,7 @@ class Agent:
             thinking_level=self._thinking_level,
             runtime_context=self._runtime_context,
             transaction=transaction,
+            turn_base=self._turn_base,
             transform_context=self._transform_context,
             before_tool_call=self._before_tool_call,
             after_tool_call=self._after_tool_call,
@@ -501,6 +554,7 @@ class Agent:
             prepare_next_turn=self._prepare_next_turn,
             get_steering_messages=_drain_steering,
             get_follow_up_messages=_drain_follow_up,
+            continuation_floor=self._continuation_floor,
         )
         context = AgentContext(
             system_prompt=self._system_prompt,
@@ -698,4 +752,5 @@ __all__ = [
     "AgentRunResult",
     "AgentRunStatus",
     "QueueMode",
+    "normalize_prompt_messages",
 ]

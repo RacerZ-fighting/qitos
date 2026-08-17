@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple, Union
 
 from ...core.agent import Agent, AgentRunRejected
-from ...core.agent_events import AgentEnd, TurnEnd, TurnStart
+from ...core.agent_events import AgentEnd, MessageEnd, TurnEnd, TurnStart
 from ...core.agent_loop import (
     AgentLoopResult,
     AgentRunStatus,
@@ -56,6 +56,7 @@ from ...core.tool_executor import BeforeToolCallContext, BeforeToolCallDecision
 from ...core.tool_registry import ToolExposure, ToolRegistry
 from ...core.tool_result import ToolResult
 from ..journal import JournalTurnTransaction, JsonlSessionJournal
+from ..journal.turn_recorder import encode_runtime_input_consumed
 
 if TYPE_CHECKING:
     from ...models.base import Model
@@ -428,6 +429,9 @@ class AgentChildEngine:
         self._runtime_started = asyncio.Event()
         self._accepting_runtime_events = False
         self._runtime_event_reservations: list[_RuntimeEventReservation] = []
+        self._runtime_input_messages: dict[int, str] = {}
+        self._runtime_input_injected: list[str] = []
+        self._runtime_input_consumed: set[str] = set()
         self._closed = False
         self._result: Optional[AgentLoopResult] = None
 
@@ -565,6 +569,15 @@ class AgentChildEngine:
             if isinstance(event, TurnStart):
                 self._accepting_runtime_events = True
                 self._runtime_started.set()
+            elif isinstance(event, MessageEnd):
+                event_id = self._runtime_input_messages.pop(
+                    id(event.message), None
+                )
+                if (
+                    event_id is not None
+                    and event_id not in self._runtime_input_consumed
+                ):
+                    self._runtime_input_injected.append(event_id)
             elif isinstance(event, TurnEnd):
                 # Close admission before observing the reservations. No await
                 # separates a post's open-state check from its reservation, so
@@ -572,6 +585,10 @@ class AgentChildEngine:
                 # decides and settles reservations immediately before the
                 # loop's stop checks and steering drain.
                 self._close_runtime_event_admission()
+                # TurnEnd follows the turn's durable commit: every steered
+                # input the turn injected is now covered by a step.committed,
+                # so its consumption becomes durable exactly once.
+                await self._consume_injected_runtime_inputs()
             elif isinstance(event, AgentEnd):
                 await self._reject_runtime_event_admissions()
             if self._cancel_requested:
@@ -618,7 +635,11 @@ class AgentChildEngine:
         first reserves ordered admission; the existing prepare-next-turn hook
         accepts it only when the one-shot Child can continue, and settles the
         journal plus steering queue before the loop drains that queue. Terminal
-        turns reject without writing a runtime-input record.
+        turns reject without writing a runtime-input record. Once the steered
+        message enters the committed transcript (its ``MessageEnd`` followed by
+        the turn's commit), the engine appends the idempotent
+        ``runtime_input.consumed`` record; a run that ends without injecting
+        the message consumes nothing.
         """
 
         if not isinstance(event, RuntimeInput):
@@ -707,15 +728,35 @@ class AgentChildEngine:
         if not reservation.result.done():
             reservation.result.set_result(False)
 
-    @staticmethod
     def _commit_runtime_event(
+        self,
         reservation: _RuntimeEventReservation,
         agent: Agent,
     ) -> None:
         reservation.phase = "committed"
+        self._runtime_input_messages[id(reservation.message)] = (
+            reservation.event.event_id
+        )
         agent.steer(reservation.message)
         if not reservation.result.done():
             reservation.result.set_result(True)
+
+    async def _consume_injected_runtime_inputs(self) -> None:
+        """Mark each committed steered input consumed once (idempotent)."""
+
+        if self._journal is None:
+            self._runtime_input_injected.clear()
+            return
+        while self._runtime_input_injected:
+            event_id = self._runtime_input_injected.pop(0)
+            if event_id in self._runtime_input_consumed:
+                continue
+            await self._journal.append(
+                JournalRecordType.RUNTIME_INPUT_CONSUMED,
+                encode_runtime_input_consumed(event_id),
+                record_id=f"{self._run_id}:runtime:{event_id}:consumed",
+            )
+            self._runtime_input_consumed.add(event_id)
 
     async def _accept_runtime_event(
         self,
@@ -812,21 +853,21 @@ class AgentChildEngine:
             await asyncio.gather(withdrawal, return_exceptions=True)
         self._commit_runtime_event(reservation, agent)
 
-    @staticmethod
     def _settle_runtime_event_append_error(
+        self,
         reservation: _RuntimeEventReservation,
         agent: Agent,
         error: JournalAppendCancelled | JournalCommitError,
     ) -> None:
         if isinstance(error, JournalAppendCancelled):
             if error.commit_state is JournalCommitState.COMMITTED:
-                AgentChildEngine._commit_runtime_event(reservation, agent)
+                self._commit_runtime_event(reservation, agent)
             elif error.commit_state is JournalCommitState.NOT_COMMITTED:
                 AgentChildEngine._reject_runtime_event(reservation)
             else:
                 AgentChildEngine._fail_runtime_event_unknown(reservation, error)
             return
-        AgentChildEngine._settle_runtime_event_commit_error(
+        self._settle_runtime_event_commit_error(
             reservation,
             agent,
             error,
@@ -844,14 +885,14 @@ class AgentChildEngine:
                 or JournalError("runtime input append has unknown durable outcome")
             )
 
-    @staticmethod
     def _settle_runtime_event_commit_error(
+        self,
         reservation: _RuntimeEventReservation,
         agent: Agent,
         error: JournalCommitError,
     ) -> None:
         if error.commit_state is JournalCommitState.COMMITTED:
-            AgentChildEngine._commit_runtime_event(reservation, agent)
+            self._commit_runtime_event(reservation, agent)
         elif error.commit_state is JournalCommitState.NOT_COMMITTED:
             AgentChildEngine._reject_runtime_event(reservation)
         else:

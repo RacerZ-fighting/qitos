@@ -182,13 +182,15 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
     transcript_index: dict[str, int] = {}
     transcript_turns: dict[str, int] = {}
     own_transcript_ids: set[str] = set()
-    started: dict[str, tuple[int, ToolCall, str, float, bool]] = {}
-    terminals: dict[str, tuple[int, ToolCall, str, str, bool]] = {}
+    # Tool-call state is keyed by (owning run, call id): call ids are only
+    # unique within one run, and a fork prefix is a sequence of run segments.
+    started: dict[tuple[str, str], tuple[int, ToolCall, str, float, bool]] = {}
+    terminals: dict[tuple[str, str], tuple[int, ToolCall, str, str, bool]] = {}
     terminal_record_ids: set[str] = set()
     covered_terminal_ids: set[str] = set()
     covered_entry_ids: set[str] = set()
     commit_entry_ids: list[str] = []
-    unreferenced_tool_entries: dict[str, list[tuple[str, int]]] = {}
+    unreferenced_tool_entries: dict[tuple[str, str], list[tuple[str, int]]] = {}
     model_identity: tuple[str, str, str] | None = None
     thinking_level: ThinkingLevel | None = None
     tools_change_names: tuple[str, ...] | None = None
@@ -199,22 +201,27 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
     consumed_inputs: set[str] = set()
     outcome_status: AgentRunStatus | None = None
     outcome_error: str | None = None
+    input_accepted_seen = False
     last_turn = -1
     fork_seen = False
     prefix_closed = False
     last_inherited_type: JournalRecordType | None = None
     previous_top_type: JournalRecordType | None = None
+    previous_effective_type: JournalRecordType | None = None
+    current_segment_run = run_id
 
     def _turn_barrier(turn: int) -> None:
         nonlocal last_turn
         if turn < last_turn:
             raise JournalCorruptionError("journal turns must not regress")
-        for call_id, (started_turn, _c, _r, _e, _o) in started.items():
-            if started_turn < turn and call_id not in terminals:
+        for key, (started_turn, _c, _r, _e, _o) in started.items():
+            if key[0] == current_segment_run and started_turn < turn and key not in terminals:
                 raise JournalCorruptionError(
                     "journal continued past an unterminated tool call"
                 )
-        for entries in unreferenced_tool_entries.values():
+        for (segment, _call_id), entries in unreferenced_tool_entries.items():
+            if segment != current_segment_run:
+                continue
             for _record_id, entry_turn in entries:
                 if entry_turn < turn:
                     raise JournalCorruptionError(
@@ -223,25 +230,38 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
         last_turn = turn
 
     def _commit_barrier(kind: str) -> None:
-        for call_id in started:
-            if call_id not in terminals:
+        for key in started:
+            if key[0] == current_segment_run and key not in terminals:
                 raise JournalCorruptionError(f"{kind} covers an unterminated tool call")
-        if any(unreferenced_tool_entries.values()):
+        torn = [
+            entries
+            for (segment, _call_id), entries in unreferenced_tool_entries.items()
+            if segment == current_segment_run
+        ]
+        if any(torn):
             raise JournalCorruptionError(
                 f"{kind} covers a torn tool transcript entry"
             )
 
+    def _close_segment(kind: str) -> None:
+        # A fork prefix is a sequence of closed run segments: every segment
+        # ends at its committed boundary, and the younger run restarts its
+        # own turn numbering. Tool-call state stays keyed by run, since call
+        # ids are only unique within one run.
+        nonlocal last_turn
+        _commit_barrier(kind)
+        last_turn = -1
+
     def _close_inherited_prefix() -> None:
         # A forked run restarts its own turn numbering after the inherited
         # prefix, and the prefix itself is always one committed boundary.
-        nonlocal last_turn, prefix_closed
+        nonlocal prefix_closed
         if last_inherited_type is not JournalRecordType.STEP_COMMITTED:
             raise JournalCorruptionError(
                 "inherited prefix does not end at a committed boundary"
             )
-        _commit_barrier("inherited prefix")
+        _close_segment("inherited prefix")
         prefix_closed = True
-        last_turn = -1
 
     for index, (record, effective, is_own) in enumerate(resolved):
         if outcome_status is not None:
@@ -250,6 +270,23 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
             raise JournalCorruptionError("journal mixes records from another run")
         record_type = effective.type
         payload = effective.payload
+        if not is_own and effective.run_id != current_segment_run:
+            # Inside one nested fork prefix, each run's records form one
+            # contiguous segment. A new segment either opens a younger run's
+            # header (right after its run.forked) or follows the older
+            # segment's committed boundary.
+            if previous_effective_type is JournalRecordType.RUN_FORKED:
+                if record_type is not JournalRecordType.RUN_STARTED:
+                    raise JournalCorruptionError(
+                        "inherited segment does not start with run.started"
+                    )
+            elif previous_effective_type is JournalRecordType.STEP_COMMITTED:
+                _close_segment("inherited prefix")
+            else:
+                raise JournalCorruptionError(
+                    "inherited prefix is not a sequence of committed run segments"
+                )
+            current_segment_run = effective.run_id
         if not is_own:
             if not fork_seen:
                 raise JournalCorruptionError(
@@ -277,6 +314,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
             ):
                 _close_inherited_prefix()
         previous_top_type = record.type
+        previous_effective_type = record_type
         try:
             if record_type is JournalRecordType.RUN_STARTED:
                 if is_own and index != 0:
@@ -299,7 +337,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                 transcript.append(message)
                 if isinstance(message, ToolResultMessage):
                     unreferenced_tool_entries.setdefault(
-                        message.tool_call_id, []
+                        (entry_run, message.tool_call_id), []
                     ).append((effective.record_id, entry_turn))
                     if message.added_tool_names:
                         added_tool_entries.append((index, message.added_tool_names))
@@ -325,13 +363,14 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
             elif record_type is JournalRecordType.TOOL_STARTED:
                 turn, call = decode_tool_started(payload)
                 _turn_barrier(turn)
-                if call.id in started:
+                call_key = (effective.run_id, call.id)
+                if call_key in started:
                     raise JournalCorruptionError(
                         "journal contains a duplicate tool.started"
                     )
-                if call.id in terminals:
+                if call_key in terminals:
                     raise JournalCorruptionError("tool.started occurs after tool.terminal")
-                started[call.id] = (
+                started[call_key] = (
                     turn,
                     call,
                     effective.record_id,
@@ -341,7 +380,8 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
             elif record_type is JournalRecordType.TOOL_TERMINAL:
                 turn, call, message_record_id = decode_tool_terminal(payload)
                 _turn_barrier(turn)
-                if call.id in terminals:
+                call_key = (effective.run_id, call.id)
+                if call_key in terminals:
                     raise JournalCorruptionError(
                         "journal contains a duplicate tool.terminal"
                     )
@@ -359,11 +399,11 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                     raise JournalCorruptionError(
                         "tool.terminal does not match its transcript entry"
                     )
-                entries = unreferenced_tool_entries.get(call.id, [])
-                unreferenced_tool_entries[call.id] = [
+                entries = unreferenced_tool_entries.get(call_key, [])
+                unreferenced_tool_entries[call_key] = [
                     item for item in entries if item[0] != message_record_id
                 ]
-                terminals[call.id] = (
+                terminals[call_key] = (
                     turn,
                     call,
                     effective.record_id,
@@ -397,6 +437,8 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                 covered_terminal_ids.update(commit_terminal_ids)
                 commit_entry_ids.extend(commit_transcript_ids)
             elif record_type is JournalRecordType.INPUT_ACCEPTED:
+                if is_own:
+                    input_accepted_seen = True
                 for record_id in decode_input_accepted(payload):
                     if record_id not in transcript_index:
                         raise JournalCorruptionError(
@@ -501,14 +543,14 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
     # ── cross-record consistency ──────────────────────────────────────────
 
     unterminated: list[CrashedToolCall] = []
-    for call_id, (turn, call, record_id, timestamp, is_own) in started.items():
-        if call_id in terminals:
+    for call_key, (turn, call, record_id, timestamp, is_own) in started.items():
+        if call_key in terminals:
             continue
         if not is_own:
             raise JournalCorruptionError(
                 "inherited prefix contains an unterminated tool call"
             )
-        torn = unreferenced_tool_entries.get(call_id, [])
+        torn = unreferenced_tool_entries.get(call_key, [])
         if len(torn) > 1:
             raise JournalCorruptionError(
                 "tool call has multiple torn transcript entries"
@@ -532,10 +574,12 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
     for position, message in enumerate(transcript):
         if not isinstance(message, AssistantMessage):
             continue
+        entry_run = _parse_transcript_turn(transcript_ids[position])[0]
         open_calls = [
             call
             for call in message.tool_calls
-            if call.id not in started and call.id not in terminals
+            if (entry_run, call.id) not in started
+            and (entry_run, call.id) not in terminals
         ]
         if not open_calls or message.failed:
             # Failed assistant messages stop before Tool admission by
@@ -556,7 +600,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                 "an inherited tail assistant cannot hold unstarted calls"
             )
         for call in open_calls:
-            torn = unreferenced_tool_entries.get(call.id, [])
+            torn = unreferenced_tool_entries.get((entry_run, call.id), [])
             if len(torn) > 1:
                 raise JournalCorruptionError(
                     "tool call has multiple torn transcript entries"
@@ -670,6 +714,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
             thinking_level=thinking_level,
             active_tool_names=active_tool_names,
             recorded_message_count=len(transcript),
+            input_accepted=input_accepted_seen,
         ),
         crash_turn=crash_turn,
         crash_turn_transcript_entries=crash_turn_entries,

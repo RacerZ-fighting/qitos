@@ -1,11 +1,9 @@
 ---
 title: "Trace artifacts"
-description: "Inspect compatible QitOS trace directories with the read-only qita tools."
+description: "Inspect QitOS trace directories with the read-only qita tools."
 ---
 
-QitOS keeps the existing trace-directory format as a compatibility and inspection
-surface. `qita` can read directories produced by earlier releases or by an explicit
-application-side trace producer:
+QitOS runs write one trace directory per Run when a trace producer is attached:
 
 ```text
 <trace_logdir>/<run_id>/
@@ -14,12 +12,20 @@ application-side trace producer:
   steps.jsonl
 ```
 
-<Warning>
-The current `Agent` façade does not attach `TraceWriter` automatically. New Agent runs
-can journal loop transactions through `SessionJournal`, but they do not produce this
-three-file trace directory unless an application supplies a producer. Trace artifacts
-are not Session recovery truth.
-</Warning>
+`qitos.trace.AgentTraceProducer` reattaches this format to the `Agent` façade event
+stream. Each committed turn publishes its events (model, tool and turn phases)
+together with one `TraceStep` (step id = turn) as one transaction; lifecycle events
+write directly; the manifest finalizes with the terminal status (`completed`,
+`failed`, `stopped`) and a summary qita can read. Payloads carry Tool call ids,
+names and statuses — never credentials; the writer applies the established trace
+redaction. The `SessionHarness` attaches a producer to every journal run when it is
+constructed with `trace_directory=...`.
+
+<Note>
+Trace artifacts are an observational projection. Nothing in Session recovery reads
+them, and they cannot create an executable resume or fork — the canonical Session
+Journal is the only recovery truth.
+</Note>
 
 ## What each file means
 
@@ -27,7 +33,7 @@ are not Session recovery truth.
 | --- | --- |
 | `manifest.json` | Run summary and producer-supplied reproducibility metadata |
 | `events.jsonl` | Event stream recorded by the trace producer |
-| `steps.jsonl` | Completed legacy step records |
+| `steps.jsonl` | Committed turn markers with event index ranges |
 
 For one trace directory, these files are the evidence that `qita` displays. They do
 not replace the canonical Session Journal and cannot create an executable resume or
@@ -38,7 +44,7 @@ Older artifacts may contain fields such as `prompt_protocol`, `parser_name`,
 producer that wrote that artifact. They do not enable a parser, Decision/Action
 lifecycle, benchmark runner, or Engine in the current Agent path.
 
-## Inspect compatible artifacts
+## Inspect trace artifacts
 
 ```bash
 qita board --logdir ./runs
@@ -50,9 +56,9 @@ Use these commands to review, compare, and export existing evidence. Remote mode
 external environments remain nondeterministic, so artifact replay is an inspection
 operation rather than deterministic re-execution.
 
-To continue a Run from a safe boundary, use the canonical Session Journal once the
-authoritative Session/Harness migration exposes that workflow. Copying or editing a
-trace directory never creates a resumable Run.
+To continue a Run from a safe boundary, resume or fork its canonical Session Journal
+through `qitos.kit.session.SessionHarness`. Copying or editing a trace directory
+never creates a resumable Run.
 
 ## Related reading
 

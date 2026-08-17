@@ -254,6 +254,7 @@ class AgentLoopConfig:
     thinking_level: Optional[ThinkingLevel] = None
     runtime_context: Mapping[str, Any] = field(default_factory=dict)
     transaction: Optional[TurnTransactionBoundary] = None
+    turn_base: int = 0
     transform_context: Optional[TransformContextHook] = None
     before_tool_call: Optional[BeforeToolCallHook] = None
     after_tool_call: Optional[AfterToolCallHook] = None
@@ -261,6 +262,7 @@ class AgentLoopConfig:
     prepare_next_turn: Optional[PrepareNextTurnHook] = None
     get_steering_messages: Optional[QueueDrainHook] = None
     get_follow_up_messages: Optional[QueueDrainHook] = None
+    continuation_floor: int = 0
 
     def __post_init__(self) -> None:
         if not getattr(self.model, "provider_name", None) or not getattr(
@@ -277,6 +279,18 @@ class AgentLoopConfig:
             self.thinking_level, ThinkingLevel
         ):
             raise TypeError("thinking_level must be a ThinkingLevel or None")
+        if (
+            isinstance(self.turn_base, bool)
+            or not isinstance(self.turn_base, int)
+            or self.turn_base < 0
+        ):
+            raise ValueError("turn_base must be a non-negative integer")
+        if (
+            isinstance(self.continuation_floor, bool)
+            or not isinstance(self.continuation_floor, int)
+            or self.continuation_floor < 0
+        ):
+            raise ValueError("continuation_floor must be a non-negative integer")
 
 
 class _StreamAborted(Exception):
@@ -326,7 +340,7 @@ async def run_agent_loop(
         if cancel_token is not None:
             cancel_token.reset_step_event()
         await emit_to(emit, AgentStart())
-        await emit_to(emit, TurnStart(turn=0))
+        await emit_to(emit, TurnStart(turn=config.turn_base))
         for prompt in prompts:
             await emit_to(emit, MessageStart(message=prompt))
             await emit_to(emit, MessageEnd(message=prompt))
@@ -335,7 +349,13 @@ async def run_agent_loop(
             # effect; continuing a run adds no new input record.
             await config.transaction.input_accepted(tuple(prompts))
         return await _run_loop(
-            context, new_messages, config, emit, cancel_token, guard, turn=0
+            context,
+            new_messages,
+            config,
+            emit,
+            cancel_token,
+            guard,
+            turn=config.turn_base,
         )
     except asyncio.CancelledError:
         await guard.terminalize_interrupted(
@@ -377,9 +397,15 @@ async def run_agent_loop_continue(
         if cancel_token is not None:
             cancel_token.reset_step_event()
         await emit_to(emit, AgentStart())
-        await emit_to(emit, TurnStart(turn=0))
+        await emit_to(emit, TurnStart(turn=config.turn_base))
         return await _run_loop(
-            context, new_messages, config, emit, cancel_token, guard, turn=0
+            context,
+            new_messages,
+            config,
+            emit,
+            cancel_token,
+            guard,
+            turn=config.turn_base,
         )
     except asyncio.CancelledError:
         await guard.terminalize_interrupted(
@@ -675,7 +701,7 @@ def _turn_hook_context(
     )
 
 
-def _model_protocol(model: Any) -> str:
+def model_protocol_identity(model: Any) -> str:
     """The model adapter's API identity used for durable request records."""
 
     capabilities = getattr(model, "capabilities", None)
@@ -709,7 +735,7 @@ def _turn_config_snapshot(
     return TurnConfigSnapshot(
         provider=model.provider_name,
         model=model.model,
-        api=_model_protocol(model),
+        api=model_protocol_identity(model),
         thinking_level=_turn_thinking_level(model, config.thinking_level),
         tool_names=tuple(exposure.list_tools()),
     )
@@ -725,7 +751,7 @@ async def _run_loop(
     *,
     turn: int,
 ) -> AgentLoopResult:
-    turn_base = 0
+    turn_message_base = 0
 
     async def _finish(
         status: AgentRunStatus, error: Optional[str] = None
@@ -753,7 +779,8 @@ async def _run_loop(
             if first_iteration:
                 first_iteration = False
             else:
-                if config.max_turns is not None and turn + 1 >= config.max_turns:
+                turns_this_run = turn - config.turn_base + 1
+                if config.max_turns is not None and turns_this_run >= config.max_turns:
                     return await _finish(
                         AgentRunStatus.MAX_TURNS,
                         error=f"run reached the max turn budget ({config.max_turns})",
@@ -762,7 +789,7 @@ async def _run_loop(
                 if token is not None:
                     token.reset_step_event()
                 await emit_to(emit, TurnStart(turn=turn))
-                turn_base = len(new_messages)
+                turn_message_base = len(new_messages)
 
             for message in pending:
                 context.messages.append(message)
@@ -785,7 +812,7 @@ async def _run_loop(
             if status_override is not None or message.failed:
                 if config.transaction is not None:
                     await config.transaction.turn_committed(
-                        turn, tuple(new_messages[turn_base:])
+                        turn, tuple(new_messages[turn_message_base:])
                     )
                 try:
                     await emit_to(
@@ -823,7 +850,7 @@ async def _run_loop(
 
             if config.transaction is not None:
                 await config.transaction.turn_committed(
-                    turn, tuple(new_messages[turn_base:])
+                    turn, tuple(new_messages[turn_message_base:])
                 )
             try:
                 await emit_to(
@@ -909,7 +936,8 @@ async def _run_loop(
                 # it must stop before queue polling or another model request.
                 return await _finish(AgentRunStatus.ABORTED, error="run aborted")
 
-            if config.max_turns is not None and turn + 1 >= config.max_turns:
+            turns_this_run = turn - config.turn_base + 1
+            if config.max_turns is not None and turns_this_run >= config.max_turns:
                 # Queue hooks are destructive drains. Do not poll them when
                 # this run has no capacity for another provider turn: callers
                 # retain accepted steering/follow-up for an explicit
@@ -1207,7 +1235,7 @@ async def _stream_assistant(
         wire.insert(0, {"role": "system", "content": context.system_prompt})
 
     options: Dict[str, Any] = dict(config.extra_request_options)
-    protocol = _model_protocol(model)
+    protocol = model_protocol_identity(model)
     if len(exposure) > 0:
         built = model.build_tool_schema_request_options(
             exposure.get_all_specs(),
@@ -1491,10 +1519,15 @@ def _tail_continuation(
 
     New user/Tool messages may sit on top of the last assistant message, and
     failed assistant messages never reach the wire; the continuation chains
-    from the latest non-failed assistant message instead.
+    from the latest non-failed assistant message instead. Messages below the
+    run's ``continuation_floor`` are sealed: a wholesale transcript swap
+    (compaction) invalidates the handles those messages carry, so the next
+    request is always a full request. The Provider-side prefix digest guard
+    remains the second, independent check.
     """
 
-    for message in reversed(messages):
+    for index in range(len(messages) - 1, config.continuation_floor - 1, -1):
+        message = messages[index]
         if not isinstance(message, AssistantMessage):
             continue
         if message.failed:
@@ -1507,7 +1540,7 @@ def _tail_continuation(
             continuation.run_id == config.run_id
             and continuation.provider == model.provider_name
             and continuation.model == model.model
-            and continuation.protocol == _model_protocol(model)
+            and continuation.protocol == model_protocol_identity(model)
         ):
             return continuation
         return None
@@ -1575,6 +1608,7 @@ __all__ = [
     "TurnTransactionBoundary",
     "agent_loop",
     "agent_loop_continue",
+    "model_protocol_identity",
     "run_agent_loop",
     "run_agent_loop_continue",
 ]

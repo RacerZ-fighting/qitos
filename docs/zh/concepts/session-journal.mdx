@@ -68,6 +68,45 @@ compaction 切点，以及旧 Engine 时代的载荷形状。
 输入的消费以 `runtime_input.consumed` 写入 journal，因此未消费的输入在恢复后恰好重新
 投影一次，而继承的 fork 事实永远不会被重新投递。
 
+## Session Harness
+
+`qitos.kit.session.SessionHarness` 是这些 journal 之上 Session 生命周期的权威所有者。
+它以一个 journal 根目录（JSONL journal 目录）或一个共享的 `InMemoryJournalStore`
+构造，并可选用 `CompactionSettings` 与 trace 目录。
+
+```python
+from qitos.kit.session import SessionHarness
+
+harness = SessionHarness(".qitos/sessions")
+session = await harness.start(model=model, tool_registry=registry)
+result = await session.prompt("排查预发环境的部署")
+await session.close()
+```
+
+`resume(run_id, ...)` 原地继续一个未完成的 journal：通过纯恢复重放 journal，用显式
+cancelled 终态关闭崩溃窗口（绝不重新执行），把上下文消息、thinking level 和配置谱系
+恢复到新的 `Agent` 中，并把每个未消费的 runtime 输入恰好重新投影一次。预期的不匹配
+返回类型化的 `ResumeRejected` 而不是抛异常：`not_found`、`terminal`（fork 是显式的
+继续方式）、`model_mismatch`（journal 中的 provider/model/api 身份与提供的模型不一致）、
+`tools_missing`（journal 谱系中激活的 Tool——包括由更早 Tool 结果激活的——不在提供的
+registry 中，会附带缺失名称）以及 `busy`（其他写者持有 lease）。损坏抛出
+`JournalCorruptionError`；Tool 对象永远不会从 journal 重建。
+
+`fork(run_id, position=None, ...)` 在一个已提交的边界（默认最新）把 journal 分叉为一个
+嵌入继承前缀的、自包含的新 journal。对终态 Run 的 fork 是继续已完成工作的显式方式；
+在同一个 `SessionRun` 内，当前 leg 结束后再 prompt 也会沿同一 fork 机制前进，因此每个
+journal 都保持只追加，而会话保持可交互。一个 Run journal 只接受一条 `input.accepted`；
+向已恢复的 journal 发送新 prompt 会作为 steering 在下一个 turn 前注入。
+
+Compaction 遵循 Pi 的成熟算法：`compact()` 只在空闲时运行（`busy` 与
+`nothing_to_compact` 返回类型化拒绝），切点绝不落在 Tool 结果上、也绝不落在 Tool 调用
+与其结果之间，切分 turn 时会合并 turn 前缀摘要，迭代 compaction 会把上一次摘要折入新
+摘要。摘要由该 run 自己的模型生成（一次有界请求，不暴露 Tool），作为持久的
+`compaction` 记录落盘（摘要 usage 可用时一并记录），并通过替换 transcript 投影到
+façade——这同时封存 Provider continuation，使下一个请求成为完整请求。配置
+`CompactionSettings` 后，harness 还会在空闲边界按模型的 `context_window` 评估 token
+阈值，并在一次上下文溢出失败后执行一次"压缩并继续"的恢复尝试。
+
 ## 持久化与投影
 
 JSONL writer 每条记录都等待持久化确认。Darwin 使用 `F_FULLFSYNC`；其他 POSIX 系统优先
@@ -141,3 +180,5 @@ Child 监督在构造子 Agent 之前写入 `child.started`，在通知父级之
 
 发给活跃子级的父级消息会先作为 `runtime_input.posted` 写入 journal，再进入子级运行的
 steering 队列，因此 mailbox 接收可以从 journal 恢复，消息会在子级下一个 turn 安全点可见。
+当被 steering 的消息进入已提交的 transcript 后，子级引擎会追加幂等的
+`runtime_input.consumed` 记录；如果运行结束时消息尚未注入，则不产生任何消费记录。

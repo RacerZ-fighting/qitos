@@ -1,10 +1,9 @@
 ---
 title: "Trace artifact"
-description: "使用只读 qita 工具检查兼容的 QitOS trace 目录。"
+description: "使用只读 qita 工具检查 QitOS trace 目录。"
 ---
 
-QitOS 保留现有 trace 目录格式作为兼容与检查界面。`qita` 可以读取早期版本或
-应用显式 trace producer 产生的目录：
+连接 trace producer 后，QitOS 每个 Run 写入一个 trace 目录：
 
 ```text
 <trace_logdir>/<run_id>/
@@ -13,11 +12,18 @@ QitOS 保留现有 trace 目录格式作为兼容与检查界面。`qita` 可以
   steps.jsonl
 ```
 
-<Warning>
-当前 `Agent` façade 不会自动连接 `TraceWriter`。新的 Agent run 可以通过
-`SessionJournal` 记录 loop 事务，但除非应用提供 producer，否则不会生成这三个
-trace 文件。Trace artifact 不是 Session 恢复真源。
-</Warning>
+`qitos.trace.AgentTraceProducer` 把这一格式重新接到 `Agent` façade 的事件流上。
+每个已提交的 turn 把它的事件（model、tool、turn 阶段）连同一条 `TraceStep`
+（step id = turn）作为一个事务发布；生命周期事件直接写入；manifest 以终态
+（`completed`、`failed`、`stopped`）和 qita 可读的摘要收尾。载荷携带 Tool 调用
+id、名称和状态——绝不携带凭据；writer 会应用既有的 trace 脱敏。以
+`trace_directory=...` 构造 `SessionHarness` 时，每个 journal run 都会连接一个
+producer。
+
+<Note>
+Trace artifact 是观察性投影。Session 恢复的任何路径都不读取它们，它们也不能
+创建可执行的 resume 或 fork——canonical Session Journal 是唯一的恢复真源。
+</Note>
 
 ## 文件含义
 
@@ -25,7 +31,7 @@ trace 文件。Trace artifact 不是 Session 恢复真源。
 | --- | --- |
 | `manifest.json` | Run 摘要与 producer 写入的复现元信息 |
 | `events.jsonl` | Trace producer 记录的事件流 |
-| `steps.jsonl` | 已完成的旧 step 记录 |
+| `steps.jsonl` | 已提交 turn 的标记及事件索引区间 |
 
 对单个 trace 目录而言，这些文件是 `qita` 展示的证据。它们不会替代 canonical
 Session Journal，也不能创建可执行的 resume 或 fork。
@@ -35,7 +41,7 @@ Session Journal，也不能创建可执行的 resume 或 fork。
 producer，不会在当前 Agent 路径中启用 parser、Decision/Action lifecycle、
 benchmark runner 或 Engine。
 
-## 检查兼容 artifact
+## 检查 trace artifact
 
 ```bash
 qita board --logdir ./runs
@@ -46,7 +52,7 @@ qita export --run ./runs/<run_id> --html ./report.html
 这些命令用于审阅、比较和导出现有证据。远程模型与外部环境仍具有不确定性，因此
 artifact replay 是检查操作，不是确定性重新执行。
 
-要从安全边界继续 Run，应在权威 Session/Harness 迁移暴露该工作流后使用
+要从安全边界继续 Run，通过 `qitos.kit.session.SessionHarness` resume 或 fork 它的
 canonical Session Journal。复制或修改 trace 目录永远不会创建可恢复 Run。
 
 ## 继续阅读
