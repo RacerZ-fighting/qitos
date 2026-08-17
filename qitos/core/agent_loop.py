@@ -75,6 +75,7 @@ from .message import (
 from .model_request import ModelContinuation, ModelRequest
 from .model_response import ModelResponse
 from .model_stream import ModelStreamEvent, ModelStreamEventType
+from .thinking import ThinkingLevel, clamp_thinking_level
 from .tool_executor import (
     AfterToolCallHook,
     AgentContextSnapshot,
@@ -172,6 +173,7 @@ class NextTurnUpdate:
     messages: Optional[Tuple[Message, ...]] = None
     tools: Optional[Union[ToolExposure, ToolRegistry]] = None
     extra_request_options: Optional[Mapping[str, Any]] = None
+    thinking_level: Optional[ThinkingLevel] = None
 
 
 TransformContextHook = Callable[
@@ -208,6 +210,7 @@ class AgentLoopConfig:
     max_turns: Optional[int] = None
     deadline_monotonic: Optional[float] = None
     extra_request_options: Mapping[str, Any] = field(default_factory=dict)
+    thinking_level: Optional[ThinkingLevel] = None
     runtime_context: Mapping[str, Any] = field(default_factory=dict)
     transaction: Optional[TurnTransactionBoundary] = None
     transform_context: Optional[TransformContextHook] = None
@@ -229,6 +232,10 @@ class AgentLoopConfig:
             isinstance(self.max_turns, bool) or self.max_turns < 1
         ):
             raise ValueError("max_turns must be a positive integer or None")
+        if self.thinking_level is not None and not isinstance(
+            self.thinking_level, ThinkingLevel
+        ):
+            raise TypeError("thinking_level must be a ThinkingLevel or None")
 
 
 class _StreamAborted(Exception):
@@ -634,6 +641,20 @@ def _model_protocol(model: Any) -> str:
     return "legacy"
 
 
+def _turn_thinking_level(
+    model: Any, requested: ThinkingLevel | None
+) -> ThinkingLevel | None:
+    """Clamp the run's requested level to this turn's model capability."""
+
+    if requested is None:
+        return None
+    capabilities = getattr(model, "capabilities", None)
+    supported = getattr(capabilities, "thinking_levels", None)
+    if not isinstance(supported, tuple):
+        supported = ()
+    return clamp_thinking_level(requested, supported)
+
+
 async def _run_loop(
     context: AgentContext,
     new_messages: List[Message],
@@ -777,6 +798,11 @@ async def _run_loop(
                                         update.extra_request_options
                                     ),
                                 )
+                            if update.thinking_level is not None:
+                                config = dataclasses.replace(
+                                    config,
+                                    thinking_level=update.thinking_level,
+                                )
                     if config.should_stop_after_turn is not None:
                         # prepare_next_turn may replace history, tools, prompt or
                         # request options. Pi's stop hook observes that updated
@@ -900,7 +926,11 @@ async def _fail_truncated_calls(
         if config.transaction is not None:
             await config.transaction.tool_terminal(turn, call, result)
         result_message = ToolResultMessage(
-            tool_call_id=call.id, tool_name=call.name, result=result
+            tool_call_id=call.id,
+            tool_name=call.name,
+            result=result,
+            usage=result.usage,
+            added_tool_names=result.added_tool_names,
         )
         messages.append(result_message)
         context.messages.append(result_message)
@@ -988,7 +1018,11 @@ async def _execute_calls(
             ]
         for call, result in zip(calls, recovered):
             result_message = ToolResultMessage(
-                tool_call_id=call.id, tool_name=call.name, result=result
+                tool_call_id=call.id,
+                tool_name=call.name,
+                result=result,
+                usage=result.usage,
+                added_tool_names=result.added_tool_names,
             )
             context.messages.append(result_message)
             new_messages.append(result_message)
@@ -1009,7 +1043,11 @@ async def _execute_calls(
         if recovered is not None:
             for call, result in zip(calls, recovered):
                 result_message = ToolResultMessage(
-                    tool_call_id=call.id, tool_name=call.name, result=result
+                    tool_call_id=call.id,
+                    tool_name=call.name,
+                    result=result,
+                    usage=result.usage,
+                    added_tool_names=result.added_tool_names,
                 )
                 context.messages.append(result_message)
                 new_messages.append(result_message)
@@ -1017,7 +1055,11 @@ async def _execute_calls(
     messages: List[ToolResultMessage] = []
     for call, result in zip(calls, results):
         result_message = ToolResultMessage(
-            tool_call_id=call.id, tool_name=call.name, result=result
+            tool_call_id=call.id,
+            tool_name=call.name,
+            result=result,
+            usage=result.usage,
+            added_tool_names=result.added_tool_names,
         )
         messages.append(result_message)
         context.messages.append(result_message)
@@ -1120,6 +1162,7 @@ async def _stream_assistant(
         options=options,
         deadline_monotonic=config.deadline_monotonic,
         continuation=continuation,
+        thinking_level=_turn_thinking_level(model, config.thinking_level),
     )
 
     if token is not None and token.immediate_requested:

@@ -13,6 +13,7 @@ from ....core.child import (
     ChildLaunchRequest,
     ChildResult,
 )
+from ....core.model_response import ModelUsage
 from ....core.runtime_input import RuntimeInput
 from ....core.task import TaskBudget
 from ....core.tool import (
@@ -33,6 +34,26 @@ from ...child import (
 from ..internal.results import tool_result
 
 AgentExecutionMode = Literal["foreground", "optional_background", "background"]
+
+
+def _child_result_usage(result: ChildResult) -> ModelUsage | None:
+    """Project one terminal Child's accounting into typed Tool usage.
+
+    ``ChildResult`` tracks cumulative totals only, so ``total_tokens`` is the
+    available token fact and ``cost_usd`` rides as a lossless detail key.
+    A non-terminal (background launch) result has no finished accounting
+    yet and carries no usage; completeness flags stay in the output
+    payload either way.
+    """
+
+    if not result.ready:
+        return None
+    return ModelUsage.from_mapping(
+        {
+            "total_tokens": result.total_tokens,
+            "cost_usd": float(result.total_cost_usd),
+        }
+    )
 
 
 class AgentTool(BaseTool):
@@ -249,15 +270,17 @@ class AgentTool(BaseTool):
                 {"status": "error", "error": str(exc)}, status="error"
             )
         payload = self._supervisor.result_payload(result)
+        usage = _child_result_usage(result)
         lifecycle = str(payload.get("status") or "success")
         if lifecycle in {"error", "cancelled", "partial"}:
             return tool_result(
                 payload,
                 status=cast(ToolResultStatus, lifecycle),
+                usage=usage,
             )
         # A background Child's ``running`` value describes the Child domain;
         # launching it was a successful, terminal Tool call.
-        return payload
+        return tool_result(payload, status="success", usage=usage)
 
     def child_result(self, handle: ChildHandle) -> ChildResult | None:
         """Return one owned child's current immutable result."""

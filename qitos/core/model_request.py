@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Dict, List
 
+from .thinking import ThinkingLevel
 
 _SENSITIVE_KEYS = frozenset(
     {
@@ -172,6 +173,7 @@ class ModelRequest:
     )
     deadline_monotonic: float | None = field(default=None, compare=False, repr=False)
     continuation: ModelContinuation | None = None
+    thinking_level: ThinkingLevel | None = None
 
     def __post_init__(self) -> None:
         for name in ("run_id", "transaction_id", "provider", "model", "protocol"):
@@ -185,6 +187,10 @@ class ModelRequest:
                 raise TypeError("deadline_monotonic must be numeric or None")
             if not math.isfinite(float(self.deadline_monotonic)):
                 raise ValueError("deadline_monotonic must be finite")
+        if self.thinking_level is not None and not isinstance(
+            self.thinking_level, ThinkingLevel
+        ):
+            raise TypeError("thinking_level must be a ThinkingLevel or None")
         frozen_messages: List[Mapping[str, Any]] = []
         for index, message in enumerate(self.messages):
             frozen = _freeze_json(message, path=f"messages[{index}]")
@@ -212,6 +218,11 @@ class ModelRequest:
                 "protocol": self.protocol,
                 "messages": self.messages,
                 "options": self.options,
+                "thinking_level": (
+                    self.thinking_level.value
+                    if self.thinking_level is not None
+                    else None
+                ),
             }
         )
 
@@ -239,6 +250,7 @@ class ModelRequest:
             messages=self.messages,
             options=self.options,
             deadline_monotonic=self.deadline_monotonic,
+            thinking_level=self.thinking_level,
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -253,6 +265,11 @@ class ModelRequest:
             "cache_affinity": self.cache_affinity,
             "messages": _redact_json(self.messages),
             "options": _redact_json(self.options),
+            "thinking_level": (
+                self.thinking_level.value
+                if self.thinking_level is not None
+                else None
+            ),
             "request_digest": self.request_digest,
             "continuation": (
                 self.continuation.to_dict()
@@ -282,6 +299,17 @@ class ModelRequest:
             if isinstance(raw_continuation, Mapping)
             else None
         )
+        raw_thinking_level = value.get("thinking_level")
+        thinking_level: ThinkingLevel | None = None
+        if raw_thinking_level is not None:
+            if not isinstance(raw_thinking_level, str):
+                raise ValueError("persisted thinking_level must be text or null")
+            try:
+                thinking_level = ThinkingLevel(raw_thinking_level)
+            except ValueError as exc:
+                raise ValueError(
+                    "persisted thinking_level is not a ThinkingLevel"
+                ) from exc
         request = cls(
             run_id=str(value.get("run_id") or ""),
             transaction_id=str(value.get("transaction_id") or ""),
@@ -292,6 +320,7 @@ class ModelRequest:
             options=dict(raw_options),
             deadline_monotonic=deadline_monotonic,
             continuation=continuation,
+            thinking_level=thinking_level,
         )
         expected = value.get("request_digest")
         if expected is not None and str(expected) != request.request_digest:

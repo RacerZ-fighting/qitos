@@ -1080,6 +1080,8 @@ class ToolBatchExecutor:
                     metadata=metadata,
                     artifacts=reported.artifacts,
                     model_output=reported.model_output,
+                    usage=reported.usage,
+                    added_tool_names=reported.added_tool_names,
                 )
             except _ToolEventSinkFault:
                 raise

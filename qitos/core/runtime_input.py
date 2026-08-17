@@ -87,7 +87,14 @@ class RuntimeInput:
 
 
 def child_result_payload(result: ChildResult) -> dict[str, Any]:
-    """Return the stable model-facing projection of one child result."""
+    """Return the stable model-facing projection of one child result.
+
+    Token and cost accounting is not part of this untyped projection: at
+    the Tool boundary it rides the typed ``ToolResult.usage`` carrier, and
+    the durable ``child.terminal`` journal record keeps the full
+    ``ChildResult`` facts. Completeness flags stay here so the model can
+    tell whether the accounting it cannot see is known to be partial.
+    """
 
     from .child import ChildResult, ChildStatus
 
@@ -116,8 +123,6 @@ def child_result_payload(result: ChildResult) -> dict[str, Any]:
         "conclusion": result.conclusion.to_dict(),
         "error": result.error,
         "steps": result.steps,
-        "total_tokens": result.total_tokens,
-        "total_cost_usd": result.total_cost_usd,
         "usage_complete": result.usage_complete,
         "cost_complete": result.cost_complete,
         "elapsed_seconds": result.elapsed_seconds,

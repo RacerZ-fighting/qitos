@@ -496,7 +496,9 @@ acquire run-scoped resources without blocking the event loop. Each factory call 
 resolve to an independent Agent; sharing a mutable history or model client between
 concurrent children is unsupported.
 `execution_scope` can enforce an application-owned concurrency or lifecycle boundary.
-The result reports output, steps, total tokens, elapsed time, stop reason, and run id.
+The result payload reports output, steps, elapsed time, stop reason, run id and the
+`usage_complete` / `cost_complete` completeness flags; a terminal child's token and
+cost accounting rides the typed `ToolResult.usage` carrier instead of the payload.
 `child_budget` is an immutable `TaskBudget` and defaults to 200 steps. Invocation
 factories receive it on `ChildLaunchRequest.budget`, together with the task, profile,
 allowed tool groups, and working-directory fields needed by a product composition. The

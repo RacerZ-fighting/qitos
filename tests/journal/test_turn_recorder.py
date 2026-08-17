@@ -13,8 +13,10 @@ from qitos.core.message import (
     UserMessage,
     message_from_dict,
 )
+from qitos.core.model_response import ModelUsage
 from qitos.core.tool import tool
 from qitos.core.tool_registry import ToolRegistry
+from qitos.core.tool_result import ToolResult
 from qitos.kit.journal import JsonlSessionJournal, JournalTurnTransaction
 
 from tests.core.agent_fakes import ScriptedModel, text_events, tool_call_wire, tool_events
@@ -158,3 +160,69 @@ async def test_committed_tool_transaction_is_queryable_after_reopen(tmp_path) ->
     assert view.action.name == "echo"
     assert view.result.status == "success"
     assert view.committed_at.record_id == committed.record_id
+
+
+@tool(name="accounted_echo")
+def _accounted_echo(text: str) -> ToolResult:
+    return ToolResult(
+        output={"echo": text},
+        usage=ModelUsage.from_mapping({"total_tokens": 13, "cost_usd": 0.0004}),
+        added_tool_names=("late_skill_tool",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_terminal_and_commit_round_trip_usage_and_added_names(
+    tmp_path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    transaction = await JournalTurnTransaction.create(
+        journal, "run-journal-facts", {"purpose": "test"}
+    )
+    model = ScriptedModel(
+        [
+            tool_events([tool_call_wire("c1", "accounted_echo", {"text": "x"})]),
+            text_events("done"),
+        ]
+    )
+    context = AgentContext(
+        messages=[], tools=ToolRegistry().register(_accounted_echo).freeze()
+    )
+    config = AgentLoopConfig(
+        model=model, run_id="run-journal-facts", transaction=transaction
+    )
+    result = await run_agent_loop([UserMessage(content="go")], context, config, None)
+    assert result.status is AgentRunStatus.COMPLETED
+    await journal.close()
+
+    reopened = JsonlSessionJournal(tmp_path)
+    await reopened.open("run-journal-facts")
+    records = await reopened.replay()
+    await reopened.close()
+
+    terminal = next(
+        record
+        for record in records
+        if record.type is JournalRecordType.TOOL_TERMINAL
+    )
+    result_payload = terminal.payload["result"]
+    assert result_payload["usage"]["total_tokens"] == 13
+    assert result_payload["added_tool_names"] == ["late_skill_tool"]
+    restored_result = ToolResult.from_dict(result_payload)
+    assert restored_result.usage is not None
+    assert restored_result.usage.total_tokens == 13
+    assert restored_result.usage["cost_usd"] == 0.0004
+    assert restored_result.added_tool_names == ("late_skill_tool",)
+
+    committed = next(
+        record
+        for record in records
+        if record.type is JournalRecordType.STEP_COMMITTED
+    )
+    messages = [message_from_dict(item) for item in committed.payload["messages"]]
+    tool_message = next(
+        item for item in messages if isinstance(item, ToolResultMessage)
+    )
+    assert tool_message.usage is not None
+    assert tool_message.usage.total_tokens == 13
+    assert tool_message.added_tool_names == ("late_skill_tool",)

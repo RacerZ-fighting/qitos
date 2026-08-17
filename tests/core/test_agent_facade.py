@@ -647,3 +647,47 @@ async def test_agent_keeps_the_callers_tool_registry_instance() -> None:
     result = await agent.prompt("go")
     assert isinstance(result, AgentLoopResult)
     assert result.status is AgentRunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_facade_thinking_level_feeds_each_new_run() -> None:
+    from qitos.core.model_capabilities import ModelCapabilities
+    from qitos.core.thinking import ThinkingLevel
+
+    model = ScriptedModel(
+        [text_events("one"), text_events("two")],
+        capabilities=ModelCapabilities(
+            thinking_levels=(ThinkingLevel.LOW, ThinkingLevel.HIGH)
+        ),
+    )
+    agent = _agent(model, thinking_level=ThinkingLevel.LOW)
+
+    first = await agent.prompt("go")
+    assert isinstance(first, AgentLoopResult)
+    assert model.requests[0].thinking_level is ThinkingLevel.LOW
+
+    # The property is captured per run: assigning it never rewrites a frozen
+    # turn, and the next run picks the new value up.
+    agent.thinking_level = ThinkingLevel.HIGH
+    second = await agent.prompt("again")
+    assert isinstance(second, AgentLoopResult)
+    assert model.requests[1].thinking_level is ThinkingLevel.HIGH
+
+
+def test_facade_thinking_level_rejects_untyped_values() -> None:
+    from qitos.core.thinking import ThinkingLevel
+
+    with pytest.raises(TypeError, match="ThinkingLevel"):
+        _agent(
+            ScriptedModel([text_events("unused")]),
+            thinking_level="high",  # type: ignore[arg-type]
+        )
+
+    agent = _agent(ScriptedModel([text_events("unused")]))
+    assert agent.thinking_level is None
+    with pytest.raises(TypeError, match="ThinkingLevel"):
+        agent.thinking_level = "low"  # type: ignore[assignment]
+    agent.thinking_level = ThinkingLevel.LOW
+    assert agent.thinking_level is ThinkingLevel.LOW
+    agent.thinking_level = None
+    assert agent.thinking_level is None

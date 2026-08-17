@@ -266,11 +266,18 @@ class AssistantMessage:
 
 @dataclass(frozen=True, slots=True)
 class ToolResultMessage:
-    """The unique terminal result paired with one ``ToolCall``."""
+    """The unique terminal result paired with one ``ToolCall``.
+
+    ``usage`` and ``added_tool_names`` mirror the typed accounting and
+    Tool-activation facts of the committed ``ToolResult`` so the durable
+    transcript carries them without re-reading the result payload.
+    """
 
     tool_call_id: str
     tool_name: str
     result: ToolResult
+    usage: Optional[ModelUsage] = None
+    added_tool_names: Tuple[str, ...] = ()
     timestamp: float = field(default_factory=time.time)
     role: str = field(default="tool", init=False)
 
@@ -282,6 +289,16 @@ class ToolResultMessage:
             raise ValueError("tool result message tool_name must be non-empty")
         if not isinstance(self.result, ToolResult):
             raise TypeError("tool result message result must be a ToolResult")
+        if self.usage is not None and not isinstance(self.usage, ModelUsage):
+            raise TypeError("tool result message usage must be a ModelUsage or None")
+        if not isinstance(self.added_tool_names, tuple) or not all(
+            isinstance(name, str) and name.strip() for name in self.added_tool_names
+        ):
+            raise TypeError(
+                "tool result message added_tool_names must contain non-empty strings"
+            )
+        if len(self.added_tool_names) != len(set(self.added_tool_names)):
+            raise ValueError("tool result message added_tool_names must be unique")
         # Durable messages hold a deeply immutable result snapshot: listeners
         # receive the same object, and mutation must never make the journal's
         # tool terminal record and the committed turn payload disagree.
@@ -473,13 +490,18 @@ def message_to_dict(message: Message) -> Dict[str, Any]:
         }
         return payload
     if isinstance(message, ToolResultMessage):
-        return {
+        tool_payload: Dict[str, Any] = {
             "role": "tool",
             "tool_call_id": message.tool_call_id,
             "tool_name": message.tool_name,
             "result": message.result.to_dict(),
             "timestamp": message.timestamp,
         }
+        if message.usage is not None:
+            tool_payload["usage"] = message.usage.to_dict()
+        if message.added_tool_names:
+            tool_payload["added_tool_names"] = list(message.added_tool_names)
+        return tool_payload
     raise TypeError(f"unsupported message type: {type(message).__name__}")
 
 
@@ -588,7 +610,9 @@ def message_from_dict(value: Mapping[str, Any]) -> Message:
         )
     if role == "tool":
         required = {"role", "tool_call_id", "tool_name", "result", "timestamp"}
-        if set(value) != required:
+        optional = {"usage", "added_tool_names"}
+        fields = set(value)
+        if not required.issubset(fields) or not fields.issubset(required | optional):
             raise ValueError("tool result message fields are invalid")
         raw_result = value["result"]
         if not isinstance(raw_result, dict):
@@ -597,10 +621,24 @@ def message_from_dict(value: Mapping[str, Any]) -> Message:
         raw_tool_name = value["tool_name"]
         if not isinstance(raw_call_id, str) or not isinstance(raw_tool_name, str):
             raise ValueError("tool result message ids must be text")
+        raw_usage = value.get("usage")
+        if raw_usage is not None and not isinstance(raw_usage, dict):
+            raise ValueError("tool result message usage must be a mapping or null")
+        raw_added_tool_names = value.get("added_tool_names", [])
+        if not isinstance(raw_added_tool_names, list) or not all(
+            isinstance(name, str) for name in raw_added_tool_names
+        ):
+            raise ValueError("tool result message added_tool_names must be text")
         return ToolResultMessage(
             tool_call_id=raw_call_id,
             tool_name=raw_tool_name,
             result=ToolResult.from_dict(raw_result),
+            usage=(
+                ModelUsage.from_mapping(raw_usage)
+                if isinstance(raw_usage, Mapping)
+                else None
+            ),
+            added_tool_names=tuple(raw_added_tool_names),
             timestamp=_message_timestamp(value),
         )
     raise ValueError(f"unsupported message role: {role!r}")

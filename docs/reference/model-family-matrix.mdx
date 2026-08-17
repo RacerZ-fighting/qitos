@@ -39,6 +39,7 @@ capabilities = model.capabilities
 print(capabilities.api.value)       # responses
 print(capabilities.native_tool_calls)
 print(capabilities.reasoning)
+print(capabilities.thinking_levels)
 print(capabilities.hosted_tools)
 ```
 
@@ -49,6 +50,17 @@ Messages declare `web_search`; custom compatible endpoints stay conservative unl
 their adapter has a tested contract. Kimi's `/search` and `$web_search` remain managed
 capabilities and do not make a custom Anthropic-compatible endpoint claim Claude's
 server Tool. Unknown/custom adapters inherit conservative `legacy` capabilities.
+
+`capabilities.thinking_levels` lists the typed `ThinkingLevel` values
+(`off|minimal|low|medium|high|xhigh|max`) an adapter can translate onto its wire
+format; an empty tuple means no typed thinking support. The loop clamps the level
+requested on the `Agent` façade, `AgentLoopConfig` or a `NextTurnUpdate` against
+this set (nearest level up, then down) and stores it on
+`ModelRequest.thinking_level`. A typed level overrides construction-time reasoning
+kwargs for exactly the transport's wire keys — `reasoning.effort` on Responses,
+`reasoning_effort` on Chat Completions, the `thinking` budget config on Anthropic
+Messages (`output_config.effort` on the Kimi variant) — while `off` explicitly
+disables reasoning and an unset level leaves the configured defaults untouched.
 
 Terminal chunks and completed responses expose token counts through `ModelUsage`:
 

@@ -301,6 +301,13 @@ field. Use `needs_input` for a user question and `needs_approval` for permission
 execute. Background `running` and `partial` results remain non-successful operation
 states even when the executor successfully obtained the snapshot.
 
+Accounting and Tool activation are typed facts, not untyped output payload:
+`ToolResult.usage` carries the `ModelUsage` token/cost accounting of the work the
+Tool itself performed (for example a child Agent run), and `added_tool_names` lists
+the names of Tools this result activated, available from this transcript point
+onward. Both are validated, deeply immutable and persisted through the canonical
+codec; they are not provider wire data and never enter the model projection.
+
 ### Durable long outputs
 
 When tools can return output larger than the model budget, persist the complete

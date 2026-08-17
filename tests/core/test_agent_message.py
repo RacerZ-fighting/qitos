@@ -362,3 +362,97 @@ def test_assistant_metadata_is_deeply_immutable() -> None:
     decoded = message_from_dict(message_to_dict(message))
     assert isinstance(decoded, AssistantMessage)
     assert thaw_deep(decoded.metadata) == {"nested": {"count": 1}}
+
+
+# ── ToolResultMessage typed usage and added Tool names ───────────────────────
+
+
+def test_tool_result_message_usage_and_added_names_round_trip() -> None:
+    usage = ModelUsage.from_mapping({"total_tokens": 9, "cost_usd": 0.001})
+    result = ToolResult(
+        output={"child_status": "completed"},
+        usage=usage,
+        added_tool_names=("skill_tool",),
+    )
+    message = ToolResultMessage(
+        tool_call_id="c1",
+        tool_name="Agent",
+        result=result,
+        usage=result.usage,
+        added_tool_names=result.added_tool_names,
+        timestamp=5.0,
+    )
+
+    payload = message_to_dict(message)
+    assert payload["usage"] == {"total_tokens": 9, "cost_usd": 0.001}
+    assert payload["added_tool_names"] == ["skill_tool"]
+
+    decoded = message_from_dict(payload)
+    assert isinstance(decoded, ToolResultMessage)
+    assert decoded.usage is not None
+    assert decoded.usage.total_tokens == 9
+    assert decoded.added_tool_names == ("skill_tool",)
+    assert message_to_dict(decoded) == payload
+
+
+def test_tool_result_message_omits_absent_facts_and_decodes_legacy_shape() -> None:
+    message = ToolResultMessage(
+        tool_call_id="c1",
+        tool_name="echo",
+        result=ToolResult(output="ok"),
+        timestamp=1.0,
+    )
+
+    payload = message_to_dict(message)
+    assert "usage" not in payload
+    assert "added_tool_names" not in payload
+
+    decoded = message_from_dict(payload)
+    assert isinstance(decoded, ToolResultMessage)
+    assert decoded.usage is None
+    assert decoded.added_tool_names == ()
+
+
+def test_tool_result_message_validates_typed_facts() -> None:
+    result = ToolResult(output="ok")
+    with pytest.raises(TypeError, match="ModelUsage"):
+        ToolResultMessage(
+            tool_call_id="c1",
+            tool_name="t",
+            result=result,
+            usage={"total_tokens": 1},  # type: ignore[arg-type]
+        )
+    with pytest.raises(TypeError, match="added_tool_names"):
+        ToolResultMessage(
+            tool_call_id="c1",
+            tool_name="t",
+            result=result,
+            added_tool_names=("a", ""),
+        )
+    with pytest.raises(ValueError, match="unique"):
+        ToolResultMessage(
+            tool_call_id="c1",
+            tool_name="t",
+            result=result,
+            added_tool_names=("a", "a"),
+        )
+
+
+def test_tool_result_message_decoder_fails_closed_on_invalid_fact_fields() -> None:
+    base = message_to_dict(
+        ToolResultMessage(
+            tool_call_id="c1",
+            tool_name="t",
+            result=ToolResult(output="ok"),
+            timestamp=1.0,
+        )
+    )
+
+    with pytest.raises(ValueError, match="usage"):
+        message_from_dict({**base, "usage": "total_tokens"})
+    with pytest.raises(ValueError, match="added_tool_names"):
+        message_from_dict({**base, "added_tool_names": "a"})
+    with pytest.raises(ValueError, match="added_tool_names"):
+        message_from_dict({**base, "added_tool_names": [1]})
+    with pytest.raises(ValueError, match="fields"):
+        message_from_dict({**base, "unexpected": True})

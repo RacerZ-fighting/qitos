@@ -18,6 +18,7 @@ from .model_response import (
     ModelUsage,
     ModelUsageSource,
 )
+from .thinking import THINKING_LEVEL_ORDER, ThinkingLevel, clamp_thinking_level
 from .runtime_input import RuntimeInput
 from .child import (
     DEFAULT_CHILD_MAX_STEPS,
@@ -217,6 +218,9 @@ __all__ = [
     "ModelUsage",
     "ModelUsageSource",
     "ReasoningCapability",
+    "THINKING_LEVEL_ORDER",
+    "ThinkingLevel",
+    "clamp_thinking_level",
     "RuntimeInput",
     "DEFAULT_CHILD_MAX_STEPS",
     "AgentConclusion",

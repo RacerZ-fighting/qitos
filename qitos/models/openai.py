@@ -19,6 +19,7 @@ from ..core.model_capabilities import (
 )
 from ..core.model_request import ModelRequest
 from ..core.model_stream import ModelStreamEventType
+from ..core.thinking import THINKING_LEVEL_ORDER, thinking_request_options
 from ..core.multimodal import (
     content_to_text,
     ensure_data_url,
@@ -751,6 +752,7 @@ class OpenAICompatibleModel(Model):
                     ReasoningCapability.SUMMARY,
                     ReasoningCapability.OPAQUE_REPLAY,
                 ),
+                thinking_levels=THINKING_LEVEL_ORDER,
                 opaque_replay=True,
                 continuation=True,
                 usage=True,
@@ -762,6 +764,7 @@ class OpenAICompatibleModel(Model):
             api=ModelAPI.CHAT_COMPLETIONS,
             native_tool_calls=True,
             reasoning=(ReasoningCapability.SUMMARY,),
+            thinking_levels=THINKING_LEVEL_ORDER,
             usage=True,
             prompt_cache_usage=True,
             multimodal_input=True,
@@ -958,6 +961,24 @@ class OpenAICompatibleModel(Model):
             raise
         return _OwnedEventStream(stream, client)
 
+    def _typed_thinking_kwargs(self, request: ModelRequest) -> Dict[str, Any]:
+        """Project a typed request thinking level onto this wire transport.
+
+        The typed ``ModelRequest.thinking_level`` is the only runtime
+        mutation channel for reasoning: it overrides construction-time and
+        per-request reasoning kwargs for exactly this transport's wire keys
+        (``reasoning`` on Responses, ``reasoning_effort`` on Chat
+        Completions). ``None`` leaves the configured defaults untouched.
+        """
+
+        if request.thinking_level is None:
+            return {}
+        return thinking_request_options(
+            request.thinking_level,
+            wire_format="openai_effort",
+            api_mode=self.api_mode,
+        )
+
     async def stream(
         self,
         request: ModelRequest,
@@ -966,9 +987,14 @@ class OpenAICompatibleModel(Model):
 
         self.validate_request(request)
         effective_request = request
+        thinking_kwargs = self._typed_thinking_kwargs(request)
         continuation_fallback = False
         while True:
             request_kwargs = self._request_kwargs(effective_request.option_dict())
+            if thinking_kwargs:
+                request_kwargs = _merge_request_kwargs(
+                    request_kwargs, thinking_kwargs
+                )
 
             async def create_stream() -> AsyncIterator[ModelStreamEvent]:
                 return await self._open_stream(

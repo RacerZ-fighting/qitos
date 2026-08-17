@@ -9,8 +9,8 @@ from typing import Any, Deque, Iterable, List, Mapping, Optional, Sequence
 
 from qitos.core.agent_loop import TurnTransactionBoundary
 from qitos.core.message import AssistantMessage, ToolCall
+from qitos.core.model_capabilities import ModelCapabilities
 from qitos.core.model_request import ModelRequest
-from qitos.core.model_response import ModelResponse
 from qitos.core.model_stream import ModelStreamEvent, ModelStreamEventType
 from qitos.core.tool_result import ToolResult
 from qitos.models.base import Model
@@ -92,10 +92,18 @@ class ScriptedModel(Model):
         *,
         model: str = "scripted-model",
         provider_name: str = "scripted",
+        capabilities: Optional[ModelCapabilities] = None,
     ) -> None:
         super().__init__(model=model, provider_name=provider_name)
         self._responses: Deque[Any] = deque(responses)
+        self._capabilities = capabilities
         self.requests: List[ModelRequest] = []
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        if self._capabilities is not None:
+            return self._capabilities
+        return super().capabilities
 
     async def stream(self, request: ModelRequest) -> Any:
         self.requests.append(request)

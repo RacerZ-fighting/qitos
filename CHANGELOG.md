@@ -78,11 +78,49 @@ How to update:
   (`qitos.kit.journal.recover_run_outcome`), and closes it as `interrupted`
   only when no terminal record exists; journals written by the retired Engine
   taxonomy are rejected instead of being guessed.
+- **Typed provider-neutral thinking level.** `qitos.core.thinking` defines
+  `ThinkingLevel` (Pi's exact `off|minimal|low|medium|high|xhigh|max` values)
+  with `clamp_thinking_level` implementing Pi's nearest-up-then-down rule.
+  `ModelCapabilities.thinking_levels` declares the levels an adapter can
+  translate (empty means no typed support); the OpenAI Responses, OpenAI Chat
+  Completions and Anthropic Messages adapters declare the full range. The
+  `Agent` façade (`thinking_level=...`), `AgentLoopConfig.thinking_level` and
+  `NextTurnUpdate.thinking_level` feed one immutable level per turn; the loop
+  clamps it against the turn's model capability and stores the result on
+  `ModelRequest.thinking_level` (validated, durable codec, included in
+  `request_digest`). Adapters translate the typed field through the same wire
+  encoding the harness reasoning policy uses (`qitos.core.thinking.thinking_request_options`;
+  `qitos.harness` now delegates to it): Responses emits `reasoning.effort`,
+  Chat Completions emits `reasoning_effort`, Anthropic emits the manual
+  `thinking` budget config (or the Kimi Messages `thinking` +
+  `output_config.effort` variant, selected by provider identity), and `off`
+  is an explicit disable signal (`effort: "none"`, `thinking:
+  {"type": "disabled"}`). A typed `ModelRequest.thinking_level` overrides
+  construction-time and per-request reasoning kwargs for exactly those wire
+  keys; `None` leaves configured defaults untouched.
+- **Typed Tool-result usage and activated Tool names.** `ToolResult` gains
+  `usage` (`ModelUsage`, token/cost accounting for work the Tool itself
+  performed) and `added_tool_names` (names of Tools this result activated,
+  Pi's `addedToolNames`), both validated, deeply immutable and carried by the
+  exact fail-closed codec (never by `to_model_dict` — they are not provider
+  wire data). `ToolResultMessage` mirrors both fields, the loop propagates
+  them onto every committed message, and they survive the journal
+  `tool.terminal` / `step.committed` round trip.
 
 ### Changed
 
 - `CancelToken` / `CancelMode` moved from the retired Engine lifecycle to
   `qitos.core.cancellation`; the compatibility export is removed.
+- `AgentTool` (and the child completion/runtime projections in
+  `qitos.core.runtime_input.child_result_payload`) no longer report
+  `total_tokens` / `total_cost_usd` inside the untyped output payload. Child
+  token/cost accounting rides the typed `ToolResult.usage` carrier
+  (`cost_usd` as a lossless detail key) on terminal Child results; status,
+  conclusion, completeness flags (`usage_complete` / `cost_complete`), steps
+  and elapsed time stay in `output`. The Agent Tool now returns a typed
+  `ToolResult` on the success path instead of a plain payload mapping. The
+  durable `child.terminal` journal record still carries the full typed
+  `ChildResult` facts.
 
 ### Removed
 

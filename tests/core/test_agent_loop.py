@@ -35,9 +35,11 @@ from qitos.core.message import (
     UserMessage,
 )
 from qitos.core.model_request import ModelContinuation
+from qitos.core.model_response import ModelUsage
 from qitos.core.model_stream import ModelStreamEvent, ModelStreamEventType
 from qitos.core.tool import tool
 from qitos.core.tool_registry import ToolRegistry
+from qitos.core.tool_result import ToolResult
 
 from .agent_fakes import (
     RecordingTransaction,
@@ -1238,3 +1240,137 @@ async def test_hung_turn_hook_cannot_block_abort() -> None:
     result = await asyncio.wait_for(run, timeout=5)
     assert result.status is AgentRunStatus.ABORTED
     assert hook_settled.is_set()
+
+
+# ── typed thinking level ────────────────────────────────────────────────────
+
+
+def _thinking_capabilities(*levels: str):
+    from qitos.core.model_capabilities import ModelCapabilities
+    from qitos.core.thinking import ThinkingLevel
+
+    return ModelCapabilities(
+        thinking_levels=tuple(ThinkingLevel(level) for level in levels)
+    )
+
+
+@pytest.mark.asyncio
+async def test_config_thinking_level_lands_on_the_turn_request() -> None:
+    from qitos.core.thinking import ThinkingLevel
+
+    model = ScriptedModel(
+        [text_events("ok")],
+        capabilities=_thinking_capabilities("off", "low", "high"),
+    )
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(
+        model=model, run_id="run-thinking", thinking_level=ThinkingLevel.LOW
+    )
+    result = await run_agent_loop([UserMessage(content="go")], context, config, None)
+
+    assert result.status is AgentRunStatus.COMPLETED
+    assert model.requests[0].thinking_level is ThinkingLevel.LOW
+
+
+@pytest.mark.asyncio
+async def test_thinking_level_clamps_to_the_model_capability() -> None:
+    from qitos.core.thinking import ThinkingLevel
+
+    model = ScriptedModel(
+        [text_events("ok")], capabilities=_thinking_capabilities("low")
+    )
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(
+        model=model, run_id="run-thinking-clamp", thinking_level=ThinkingLevel.MAX
+    )
+    await run_agent_loop([UserMessage(content="go")], context, config, None)
+
+    assert model.requests[0].thinking_level is ThinkingLevel.LOW
+
+
+@pytest.mark.asyncio
+async def test_thinking_level_drops_when_the_model_has_no_typed_support() -> None:
+    from qitos.core.thinking import ThinkingLevel
+
+    model = ScriptedModel([text_events("ok")])
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(
+        model=model, run_id="run-thinking-none", thinking_level=ThinkingLevel.HIGH
+    )
+    await run_agent_loop([UserMessage(content="go")], context, config, None)
+
+    assert model.requests[0].thinking_level is None
+
+
+@pytest.mark.asyncio
+async def test_prepare_next_turn_thinking_level_applies_from_the_next_turn() -> None:
+    from qitos.core.thinking import ThinkingLevel
+
+    capabilities = _thinking_capabilities("off", "low", "high", "max")
+    model = ScriptedModel(
+        [
+            tool_events([tool_call_wire("c1", "echo", {"text": "x"})]),
+            text_events("done"),
+        ],
+        capabilities=capabilities,
+    )
+    context = AgentContext(messages=[], tools=_registry(_echo).freeze())
+    config = AgentLoopConfig(
+        model=model,
+        run_id="run-thinking-update",
+        thinking_level=ThinkingLevel.LOW,
+        prepare_next_turn=lambda hook: NextTurnUpdate(
+            thinking_level=ThinkingLevel.MAX
+        ),
+    )
+    result = await run_agent_loop([UserMessage(content="go")], context, config, None)
+
+    assert result.status is AgentRunStatus.COMPLETED
+    # The in-flight turn keeps its frozen snapshot; the replacement applies
+    # to the next turn's request only.
+    assert model.requests[0].thinking_level is ThinkingLevel.LOW
+    assert model.requests[1].thinking_level is ThinkingLevel.MAX
+
+
+@pytest.mark.asyncio
+async def test_loop_config_rejects_an_untyped_thinking_level() -> None:
+    model = ScriptedModel([text_events("ok")])
+    with pytest.raises(TypeError, match="ThinkingLevel"):
+        AgentLoopConfig(model=model, run_id="run-bad", thinking_level="high")
+
+
+# ── typed ToolResult usage and added Tool names ──────────────────────────────
+
+
+@tool(name="activating_echo")
+def _activating_echo(text: str) -> ToolResult:
+    return ToolResult(
+        output={"echo": text},
+        usage=ModelUsage.from_mapping({"total_tokens": 7, "cost_usd": 0.0001}),
+        added_tool_names=("loaded_skill_tool",),
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_result_usage_and_added_names_reach_the_committed_message() -> None:
+    model = ScriptedModel(
+        [
+            tool_events([tool_call_wire("c1", "activating_echo", {"text": "x"})]),
+            text_events("done"),
+        ]
+    )
+    context = AgentContext(
+        messages=[], tools=_registry(_activating_echo).freeze()
+    )
+    config = AgentLoopConfig(model=model, run_id="run-result-facts")
+    result = await run_agent_loop([UserMessage(content="go")], context, config, None)
+
+    assert result.status is AgentRunStatus.COMPLETED
+    tool_message = context.messages[2]
+    assert isinstance(tool_message, ToolResultMessage)
+    assert tool_message.usage is not None
+    assert tool_message.usage.total_tokens == 7
+    assert tool_message.usage["cost_usd"] == pytest.approx(0.0001)
+    assert tool_message.added_tool_names == ("loaded_skill_tool",)
+    assert tool_message.result.usage is tool_message.usage
+    assert tool_message.result.added_tool_names == ("loaded_skill_tool",)

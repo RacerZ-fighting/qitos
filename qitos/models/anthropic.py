@@ -16,6 +16,7 @@ from ..core.model_capabilities import (
 )
 from ..core.model_request import ModelRequest
 from ..core.model_stream import ModelStreamEventType
+from ..core.thinking import THINKING_LEVEL_ORDER, thinking_request_options
 from ..core.multimodal import content_to_text, normalize_content_block
 from .transport import (
     ModelRetryPolicy,
@@ -561,6 +562,7 @@ class AnthropicModel(Model):
             api=ModelAPI.ANTHROPIC_MESSAGES,
             native_tool_calls=True,
             reasoning=(ReasoningCapability.THINKING,),
+            thinking_levels=THINKING_LEVEL_ORDER,
             opaque_replay=True,
             usage=True,
             prompt_cache_usage=True,
@@ -793,6 +795,32 @@ class AnthropicModel(Model):
             model=self.model,
         )
 
+    def _typed_thinking_kwargs(self, request: ModelRequest) -> Dict[str, Any]:
+        """Project a typed request thinking level onto the Messages wire.
+
+        The typed ``ModelRequest.thinking_level`` is the only runtime
+        mutation channel for reasoning: it overrides construction-time and
+        per-request reasoning kwargs for exactly this transport's wire keys
+        (``thinking`` and, on the Kimi Messages variant, ``output_config``).
+        ``None`` leaves the configured defaults untouched. The Kimi variant
+        is selected by provider identity, mirroring the harness policy that
+        resolves the construction-time default for the same adapter.
+        """
+
+        if request.thinking_level is None:
+            return {}
+        wire_format = (
+            "kimi_anthropic_thinking"
+            if self.provider_name.strip().lower() == "kimi"
+            else "anthropic_manual_thinking"
+        )
+        return thinking_request_options(
+            request.thinking_level,
+            wire_format=wire_format,
+            api_mode="messages",
+            max_output_tokens=self.max_tokens,
+        )
+
     async def stream(
         self,
         request: ModelRequest,
@@ -804,6 +832,12 @@ class AnthropicModel(Model):
             self.default_request_kwargs,
             request.option_dict(),
         )
+        thinking_kwargs = self._typed_thinking_kwargs(request)
+        if thinking_kwargs:
+            request_kwargs = _merge_anthropic_request_kwargs(
+                request_kwargs,
+                thinking_kwargs,
+            )
 
         async def create_stream() -> AsyncIterator[ModelStreamEvent]:
             return await self._open_stream(

@@ -10,6 +10,7 @@ from typing import Any, Dict, Literal, Mapping, Sequence, TypeAlias, cast
 
 from ._freeze import thaw_deep
 from .artifact import ArtifactRef
+from .model_response import ModelUsage
 
 
 ToolResultStatus: TypeAlias = Literal[
@@ -66,7 +67,14 @@ def _freeze_json(value: Any, *, field_name: str) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class ToolResult:
-    """Normalized, deeply immutable tool execution result."""
+    """Normalized, deeply immutable tool execution result.
+
+    ``usage`` carries typed token/cost accounting for work the Tool itself
+    performed (for example a child Agent run); ``added_tool_names`` lists
+    the names of Tools this result activated, available from this transcript
+    point onward. Both are durable facts and ride the canonical codec; they
+    are not provider wire data and stay out of :meth:`to_model_dict`.
+    """
 
     status: ToolResultStatus = "success"
     output: Any = None
@@ -75,6 +83,8 @@ class ToolResult:
     artifacts: tuple[ArtifactRef, ...] = ()
     model_output: str | None = None
     call_id: str | None = None
+    usage: ModelUsage | None = None
+    added_tool_names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, str):
@@ -104,6 +114,14 @@ class ToolResult:
             isinstance(item, ArtifactRef) for item in self.artifacts
         ):
             raise TypeError("tool result artifacts must be a tuple of ArtifactRef")
+        if self.usage is not None and not isinstance(self.usage, ModelUsage):
+            raise TypeError("tool result usage must be a ModelUsage or None")
+        if not isinstance(self.added_tool_names, tuple) or not all(
+            isinstance(name, str) and name.strip() for name in self.added_tool_names
+        ):
+            raise TypeError("tool result added_tool_names must contain non-empty strings")
+        if len(self.added_tool_names) != len(set(self.added_tool_names)):
+            raise ValueError("tool result added_tool_names must be unique")
 
         object.__setattr__(self, "status", status)
         object.__setattr__(self, "error", error)
@@ -161,6 +179,10 @@ class ToolResult:
             payload["model_output"] = self.model_output
         if self.call_id is not None:
             payload["call_id"] = self.call_id
+        if self.usage is not None:
+            payload["usage"] = self.usage.to_dict()
+        if self.added_tool_names:
+            payload["added_tool_names"] = list(self.added_tool_names)
         return payload
 
     def to_model_dict(self) -> Dict[str, Any]:
@@ -184,7 +206,7 @@ class ToolResult:
         domain payloads. Journal replay relies on that exact wire round trip.
         """
         required = {"status", "output", "error", "metadata"}
-        optional = {"artifacts", "model_output", "call_id"}
+        optional = {"artifacts", "model_output", "call_id", "usage", "added_tool_names"}
         fields = set(payload)
         if not required.issubset(fields) or not fields.issubset(required | optional):
             raise ValueError("tool result fields are invalid")
@@ -222,6 +244,14 @@ class ToolResult:
             not isinstance(raw_call_id, str) or not raw_call_id
         ):
             raise ValueError("tool result call_id must be non-empty text or null")
+        raw_usage = payload.get("usage")
+        if raw_usage is not None and not isinstance(raw_usage, dict):
+            raise ValueError("tool result usage must be an object or null")
+        raw_added_tool_names = payload.get("added_tool_names", ())
+        if not isinstance(raw_added_tool_names, Sequence) or isinstance(
+            raw_added_tool_names, (str, bytes)
+        ):
+            raise ValueError("tool result added_tool_names must be a sequence")
 
         try:
             result = cls(
@@ -232,6 +262,12 @@ class ToolResult:
                 artifacts=artifacts,
                 model_output=raw_model_output,
                 call_id=raw_call_id,
+                usage=(
+                    ModelUsage.from_mapping(raw_usage)
+                    if raw_usage is not None
+                    else None
+                ),
+                added_tool_names=tuple(raw_added_tool_names),
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("tool result payload is invalid") from exc

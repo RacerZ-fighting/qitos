@@ -58,6 +58,7 @@ from .agent_loop import (
 from .cancellation import CancelSignalView, CancelToken
 from .env import Env
 from .message import AssistantMessage, Message, ToolResultMessage, UserMessage
+from .thinking import ThinkingLevel
 from .tool_executor import AfterToolCallHook, BeforeToolCallHook
 from .tool_registry import ToolRegistry
 
@@ -169,6 +170,7 @@ class Agent:
         max_turns: Optional[int] = None,
         run_timeout_s: Optional[float] = None,
         extra_request_options: Optional[Mapping[str, Any]] = None,
+        thinking_level: Optional[ThinkingLevel] = None,
         runtime_context: Optional[Mapping[str, Any]] = None,
         transaction_factory: Optional[
             Callable[[str], Optional[TurnTransactionBoundary]]
@@ -193,6 +195,7 @@ class Agent:
         self._max_turns = max_turns
         self._run_timeout_s = run_timeout_s
         self._extra_request_options = dict(extra_request_options or {})
+        self.thinking_level = thinking_level
         self._runtime_context = dict(runtime_context or {})
         self._transaction_factory = transaction_factory
         self._run_id_factory = run_id_factory or (lambda: uuid.uuid4().hex)
@@ -233,6 +236,23 @@ class Agent:
     @system_prompt.setter
     def system_prompt(self, value: str) -> None:
         self._system_prompt = value
+
+    @property
+    def thinking_level(self) -> Optional[ThinkingLevel]:
+        """Requested thinking level for runs started after the assignment.
+
+        The value is captured into each run's frozen loop configuration, so
+        a mid-run assignment never rewrites an in-flight turn; per-turn
+        changes inside one run go through ``prepare_next_turn``.
+        """
+
+        return self._thinking_level
+
+    @thinking_level.setter
+    def thinking_level(self, value: Optional[ThinkingLevel]) -> None:
+        if value is not None and not isinstance(value, ThinkingLevel):
+            raise TypeError("thinking_level must be a ThinkingLevel or None")
+        self._thinking_level = value
 
     @property
     def tool_registry(self) -> ToolRegistry:
@@ -471,6 +491,7 @@ class Agent:
             max_turns=self._max_turns,
             deadline_monotonic=deadline,
             extra_request_options=self._extra_request_options,
+            thinking_level=self._thinking_level,
             runtime_context=self._runtime_context,
             transaction=transaction,
             transform_context=self._transform_context,

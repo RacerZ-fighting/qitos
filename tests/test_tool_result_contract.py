@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from qitos.core.model_response import ModelUsage
 from qitos.core.tool_result import ToolResult
 
 
@@ -179,3 +180,92 @@ def test_tool_result_rejects_non_finite_json_numbers(number: float) -> None:
         ToolResult(output={"value": number})
     with pytest.raises(ValueError, match="finite"):
         ToolResult(metadata={"value": number})
+
+
+# ── typed usage and added Tool names ─────────────────────────────────────────
+
+
+def _usage() -> ModelUsage:
+    return ModelUsage.from_mapping({"total_tokens": 11, "cost_usd": 0.0025})
+
+
+def test_tool_result_usage_and_added_names_round_trip() -> None:
+    result = ToolResult(
+        output={"child_status": "completed"},
+        usage=_usage(),
+        added_tool_names=("skill_tool", "mcp_tool"),
+    )
+
+    payload = result.to_dict()
+    assert payload["usage"] == {"total_tokens": 11, "cost_usd": 0.0025}
+    assert payload["added_tool_names"] == ["skill_tool", "mcp_tool"]
+
+    restored = ToolResult.from_dict(payload)
+    assert restored.to_dict() == payload
+    assert restored.usage is not None
+    assert restored.usage.total_tokens == 11
+    assert restored.usage["cost_usd"] == 0.0025
+    assert restored.added_tool_names == ("skill_tool", "mcp_tool")
+
+
+def test_tool_result_omits_unset_usage_and_added_names_in_codec() -> None:
+    payload = ToolResult(output="ok").to_dict()
+
+    assert "usage" not in payload
+    assert "added_tool_names" not in payload
+    restored = ToolResult.from_dict(payload)
+    assert restored.usage is None
+    assert restored.added_tool_names == ()
+
+
+def test_tool_result_usage_and_added_names_stay_out_of_the_model_projection() -> None:
+    result = ToolResult(
+        output="ok",
+        usage=_usage(),
+        added_tool_names=("skill_tool",),
+    )
+
+    projected = result.to_model_dict()
+    assert "usage" not in projected
+    assert "added_tool_names" not in projected
+
+
+def test_tool_result_rejects_untyped_usage() -> None:
+    with pytest.raises(TypeError, match="ModelUsage"):
+        ToolResult(output="ok", usage={"total_tokens": 1})  # type: ignore[arg-type]
+
+
+def test_tool_result_rejects_invalid_added_tool_names() -> None:
+    with pytest.raises(TypeError, match="added_tool_names"):
+        ToolResult(output="ok", added_tool_names=["a"])  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="added_tool_names"):
+        ToolResult(output="ok", added_tool_names=("a", ""))
+    with pytest.raises(TypeError, match="added_tool_names"):
+        ToolResult(output="ok", added_tool_names=("a", "  "))
+    with pytest.raises(ValueError, match="unique"):
+        ToolResult(output="ok", added_tool_names=("a", "a"))
+
+
+def test_tool_result_from_dict_fails_closed_on_tampered_new_fields() -> None:
+    payload = ToolResult(
+        output="ok", usage=_usage(), added_tool_names=("a",)
+    ).to_dict()
+
+    tampered_usage = {**payload, "usage": {"total_tokens": -3}}
+    with pytest.raises(ValueError):
+        ToolResult.from_dict(tampered_usage)
+
+    with pytest.raises(ValueError, match="usage"):
+        ToolResult.from_dict({**payload, "usage": "total_tokens"})
+
+    with pytest.raises(ValueError, match="added_tool_names"):
+        ToolResult.from_dict({**payload, "added_tool_names": "a"})
+
+    with pytest.raises(ValueError):
+        ToolResult.from_dict({**payload, "added_tool_names": ["a", ""]})
+
+    with pytest.raises(ValueError):
+        ToolResult.from_dict({**payload, "added_tool_names": ["a", "a"]})
+
+    with pytest.raises(ValueError, match="fields"):
+        ToolResult.from_dict({**payload, "unknown_fact": 1})

@@ -182,8 +182,8 @@ async def test_agent_tool_setup_starts_fresh_root_run_limit_generation() -> None
         runtime_context={"run_id": "root-two"},
     )
 
-    assert first["child_status"] == ChildStatus.COMPLETED.value
-    assert second["child_status"] == ChildStatus.COMPLETED.value
+    assert first.output["child_status"] == ChildStatus.COMPLETED.value
+    assert second.output["child_status"] == ChildStatus.COMPLETED.value
     assert limiter.children_started == 1
     await tool.aclose()
 

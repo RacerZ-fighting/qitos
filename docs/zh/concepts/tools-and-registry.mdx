@@ -277,6 +277,12 @@ return {
 `needs_input`，需要执行审批时用 `needs_approval`。即使执行器成功取得了快照，后台
 `running` 和 `partial` 仍然不是操作成功终态。
 
+工具自身完成的计量和工具激活是类型化事实，不进入未类型化的 output 载荷：
+`ToolResult.usage` 保存该次执行（例如一次子 Agent 运行）的 `ModelUsage`
+token/成本计量，`added_tool_names` 列出由该结果激活、自该转录点起可用的工具名。
+两者都会校验、深度不可变，并随规范编解码持久化；它们不是 Provider wire 数据，
+不会出现在模型投影中。
+
 ### 持久化长输出
 
 工具可能返回超过模型预算的内容时，用 `FileArtifactStore` 持久化完整载荷，

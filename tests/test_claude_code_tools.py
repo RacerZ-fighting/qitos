@@ -338,19 +338,123 @@ class TestAgentTool:
             },
         )
 
-        assert first["status"] == "success"
-        assert first["child_status"] == "completed"
-        assert ToolResult.from_value(first).is_success
-        assert first["steps"] == 3
-        assert first["total_tokens"] == 42
-        assert second["status"] == "success"
-        assert second["child_status"] == "completed"
+        assert isinstance(first, ToolResult)
+        assert first.output["status"] == "success"
+        assert first.output["child_status"] == "completed"
+        assert first.is_success
+        assert first.output["steps"] == 3
+        # Child token accounting moved to the typed usage carrier.
+        assert "total_tokens" not in first.output
+        assert first.usage is not None
+        assert first.usage.total_tokens == 42
+        assert second.output["status"] == "success"
+        assert second.output["child_status"] == "completed"
         assert len(engines) == 2
         assert engines[0] is not engines[1]
         assert len(set(run_ids)) == 2
         assert scopes == ["enter", "exit", "enter", "exit"]
         assert tool.spec.concurrency_safe is True
         assert "run_in_background" not in tool.spec.parameters
+
+    @pytest.mark.asyncio
+    async def test_child_accounting_rides_the_typed_usage_carrier(self):
+        from qitos.core.tool_result import ToolResult
+        from qitos.kit.tool.agent import AgentTool
+
+        class FakeEngine(_ClosableEngine):
+            active_run_id = "child-run"
+
+            async def arun(self, task, **kwargs):
+                _ = task, kwargs
+                return SimpleNamespace(
+                    state=SimpleNamespace(
+                        final_result="child result",
+                        stop_reason="final",
+                    ),
+                    records=[],
+                    step_count=3,
+                    total_tokens=42,
+                    total_cost_usd=0.003,
+                    local_total_tokens=42,
+                    local_total_cost_usd=0.003,
+                    local_usage_complete=True,
+                    local_cost_complete=True,
+                )
+
+        tool = AgentTool(
+            invocation_factory=lambda request, _context: _ready_invocation(
+                engine=FakeEngine(),
+                task=request.task,
+            ),
+            execution_mode="foreground",
+        )
+        result = await tool.execute(
+            {"description": "scoped task", "prompt": "one"},
+            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
+        )
+
+        assert isinstance(result, ToolResult)
+        assert result.is_success
+        # Token/cost accounting is typed Tool-boundary data, not payload text.
+        assert result.usage is not None
+        assert result.usage.total_tokens == 42
+        assert result.usage["cost_usd"] == pytest.approx(0.003)
+        assert "total_tokens" not in result.output
+        assert "total_cost_usd" not in result.output
+        # Domain conclusion facts, including completeness flags, stay in output.
+        assert result.output["status"] == "success"
+        assert result.output["child_status"] == "completed"
+        assert result.output["steps"] == 3
+        assert result.output["usage_complete"] is True
+        assert result.output["cost_complete"] is True
+        assert "elapsed_seconds" in result.output
+
+    @pytest.mark.asyncio
+    async def test_background_launch_receipt_carries_no_finished_usage(self):
+        from qitos.core.tool_result import ToolResult
+        from qitos.kit.tool.agent import AgentTool
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class FakeEngine(_ClosableEngine):
+            active_run_id = "child-run"
+
+            async def arun(self, task, **kwargs):
+                _ = task, kwargs
+                started.set()
+                await release.wait()
+                return SimpleNamespace(
+                    state=SimpleNamespace(final_result="done", stop_reason="final"),
+                    records=[],
+                    step_count=1,
+                    total_tokens=1,
+                )
+
+            def cancel(self, mode):
+                _ = mode
+                release.set()
+
+        tool = AgentTool(
+            invocation_factory=lambda request, _context: _ready_invocation(
+                engine=FakeEngine(),
+                task=request.task,
+            ),
+            execution_mode="background",
+        )
+        result = await tool.execute(
+            {"description": "long route", "prompt": "wait"},
+            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
+        )
+
+        assert isinstance(result, ToolResult)
+        assert result.is_success
+        assert result.output["status"] == "running"
+        # A launch receipt has no finished Child accounting yet.
+        assert result.usage is None
+        await asyncio.wait_for(started.wait(), timeout=1)
+        release.set()
+        assert await tool.aclose(wait_seconds=1) == 0
 
     @pytest.mark.asyncio
     async def test_run_scoped_factory_rejects_recursive_agent(self):
@@ -411,8 +515,8 @@ class TestAgentTool:
             runtime_context=context,
         )
 
-        assert first["status"] == "success"
-        assert first["child_status"] == "completed"
+        assert first.output["status"] == "success"
+        assert first.output["child_status"] == "completed"
         assert isinstance(second, ToolResult)
         assert second.status == "error"
         assert second.error is not None
@@ -490,8 +594,8 @@ class TestAgentTool:
             runtime_context=runtime_context,
         )
 
-        assert first["status"] == "running"
-        assert second["status"] == "running"
+        assert first.output["status"] == "running"
+        assert second.output["status"] == "running"
         assert "run_in_background" not in tool.spec.parameters
         assert tool.spec.supports_background is True
         await asyncio.wait_for(both_started.wait(), timeout=1)
@@ -579,12 +683,12 @@ class TestAgentTool:
             },
         )
 
-        assert launched["status"] == "running"
+        assert launched.output["status"] == "running"
         await asyncio.wait_for(waiting.wait(), timeout=1)
         assert not factory_called.is_set()
         parent_messages.append(object())
         open_slot.set()
-        handle = ChildHandle.from_dict(launched["handle"])
+        handle = ChildHandle.from_dict(launched.output["handle"])
         result = await asyncio.wait_for(
             _wait_for_child_result(tool, handle),
             timeout=1,
@@ -638,10 +742,10 @@ class TestAgentTool:
             },
         )
 
-        assert launched["status"] == "running"
+        assert launched.output["status"] == "running"
         await asyncio.wait_for(delivery_started.wait(), timeout=1)
         assert tool.active_background_count == 0
-        handle = ChildHandle.from_dict(launched["handle"])
+        handle = ChildHandle.from_dict(launched.output["handle"])
         terminal = tool.child_result(handle)
         assert terminal is not None and terminal.status is ChildStatus.COMPLETED
         assert tool.cancel_child(handle) is False
@@ -707,7 +811,7 @@ class TestAgentTool:
 
         await asyncio.wait_for(completed.wait(), timeout=1)
 
-        assert launched["status"] == "running"
+        assert launched.output["status"] == "running"
         assert len(events) == 1
         assert events[0].payload["status"] == "partial"
         assert events[0].payload["child_status"] == "budget_exhausted"
@@ -780,7 +884,7 @@ class TestAgentTool:
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
-        assert launched["status"] == "running"
+        assert launched.output["status"] == "running"
         await asyncio.wait_for(started.wait(), timeout=1)
 
         snapshots = tool.snapshot_background_events()
@@ -788,9 +892,9 @@ class TestAgentTool:
         assert len(snapshots) == 1
         snapshot = snapshots[0]
         assert snapshot.kind == "agent.child.snapshot"
-        assert snapshot.event_id == f"{launched['child_id']}:conclude-snapshot"
-        assert snapshot.payload["child_id"] == launched["child_id"]
-        assert snapshot.payload["handle"] == launched["handle"]
+        assert snapshot.event_id == f"{launched.output['child_id']}:conclude-snapshot"
+        assert snapshot.payload["child_id"] == launched.output["child_id"]
+        assert snapshot.payload["handle"] == launched.output["handle"]
         assert snapshot.payload["status"] == "running"
         assert snapshot.payload["name"] == "extension-bypass"
         assert snapshot.payload["description"] == "validate extension bypass"
@@ -834,7 +938,7 @@ class TestAgentTool:
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
-        handle = ChildHandle.from_dict(launched["handle"])
+        handle = ChildHandle.from_dict(launched.output["handle"])
         await asyncio.wait_for(
             _wait_for_child_result(tool, handle),
             timeout=1,
@@ -883,7 +987,7 @@ class TestAgentTool:
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
-        assert result["status"] == "running"
+        assert result.output["status"] == "running"
         await asyncio.wait_for(started.wait(), timeout=1)
         assert await tool.aclose(wait_seconds=1) == 0
         assert cancelled.is_set()
@@ -928,7 +1032,7 @@ class TestAgentTool:
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
-        assert result["status"] == "running"
+        assert result.output["status"] == "running"
         await asyncio.wait_for(started.wait(), timeout=1)
         assert await tool.aclose(wait_seconds=0) == 0
 
@@ -976,10 +1080,10 @@ class TestAgentTool:
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
-        assert result["status"] == "running"
+        assert result.output["status"] == "running"
         await asyncio.wait_for(waiting.wait(), timeout=1)
         assert await tool.aclose(wait_seconds=1) == 0
-        handle = ChildHandle.from_dict(result["handle"])
+        handle = ChildHandle.from_dict(result.output["handle"])
         terminal = tool.child_result(handle)
         assert terminal is not None
         assert terminal.status is ChildStatus.CANCELLED
@@ -1018,7 +1122,7 @@ class TestAgentTool:
             },
         )
 
-        handle = ChildHandle.from_dict(launched["handle"])
+        handle = ChildHandle.from_dict(launched.output["handle"])
         terminal = await asyncio.wait_for(
             _wait_for_child_result(tool, handle),
             timeout=1,

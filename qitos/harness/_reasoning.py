@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from ..core.thinking import ThinkingLevel, thinking_request_options
+
 
 class ReasoningEffort(str, Enum):
     """Reasoning effort levels accepted by the QitOS harness."""
@@ -107,14 +109,6 @@ _ANTHROPIC_45_POLICY = ReasoningPolicy(
 _ENABLE_THINKING_POLICY = ReasoningPolicy(wire_format="enable_thinking")
 _THINKING_OBJECT_POLICY = ReasoningPolicy(wire_format="thinking_object")
 
-_ANTHROPIC_MANUAL_BUDGETS = {
-    ReasoningEffort.LOW: 1_024,
-    ReasoningEffort.MEDIUM: 2_048,
-    ReasoningEffort.HIGH: 4_096,
-    ReasoningEffort.XHIGH: 8_192,
-    ReasoningEffort.MAX: 16_384,
-}
-
 
 def parse_reasoning_effort(
     value: ReasoningEffort | str | None,
@@ -208,35 +202,16 @@ def _request_options(
     api_mode: str,
     max_output_tokens: int | None,
 ) -> dict[str, Any]:
-    if wire_format == "openai_effort":
-        if api_mode.strip().lower() == "responses":
-            return {"reasoning": {"effort": effort.value}}
-        return {"reasoning_effort": effort.value}
-    if wire_format == "glm_effort":
-        return {
-            "reasoning_effort": effort.value,
-            "extra_body": {"thinking": {"type": "enabled"}},
-        }
-    if wire_format == "enable_thinking":
-        return {"extra_body": {"enable_thinking": True}}
-    if wire_format == "thinking_object":
-        return {"extra_body": {"thinking": {"type": "enabled"}}}
-    if wire_format == "anthropic_manual_thinking":
-        budget = _ANTHROPIC_MANUAL_BUDGETS[effort]
-        if max_output_tokens is not None:
-            if isinstance(max_output_tokens, bool) or max_output_tokens < 2_048:
-                raise ValueError(
-                    "Anthropic manual thinking requires max_output_tokens >= 2048"
-                )
-            visible_reserve = max(1_024, max_output_tokens // 4)
-            budget = min(budget, max_output_tokens - visible_reserve)
-        return {"thinking": {"type": "enabled", "budget_tokens": budget}}
-    if wire_format == "kimi_anthropic_thinking":
-        return {
-            "thinking": {"type": "enabled"},
-            "output_config": {"effort": effort.value},
-        }
-    return {}
+    # The canonical thinking wire encoding lives in qitos.core.thinking so
+    # the harness policy and the typed ModelRequest.thinking_level adapter
+    # path share one mapping; ReasoningEffort values are a subset of
+    # ThinkingLevel values.
+    return thinking_request_options(
+        ThinkingLevel(effort.value),
+        wire_format=wire_format,
+        api_mode=api_mode,
+        max_output_tokens=max_output_tokens,
+    )
 
 
 __all__ = [

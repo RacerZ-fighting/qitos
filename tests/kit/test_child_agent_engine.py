@@ -1254,9 +1254,9 @@ async def test_agent_tool_preserves_parent_parameter_scope_denial(tmp_path) -> N
         },
     )
 
-    assert result["child_status"] == ChildStatus.COMPLETED.value
+    assert result.output["child_status"] == ChildStatus.COMPLETED.value
     assert executions == []
-    records = await _read_child_records(tmp_path, result["run_id"])
+    records = await _read_child_records(tmp_path, result.output["run_id"])
     denied = next(
         record
         for record in records

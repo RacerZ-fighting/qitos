@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from .thinking import ThinkingLevel
+
 
 class ModelAPI(str, Enum):
     """Provider transport semantics exposed by one model adapter."""
@@ -29,11 +31,15 @@ class ModelCapabilities:
 
     Capabilities describe adapter behavior, not model-family marketing claims.
     Features stay false until the adapter has a tested request/result contract.
+    ``thinking_levels`` lists the typed ``ThinkingLevel`` values the adapter
+    can translate onto its wire format; an empty tuple means no typed
+    thinking support, and a requested level then clamps to ``None``.
     """
 
     api: ModelAPI = ModelAPI.LEGACY
     native_tool_calls: bool = False
     reasoning: tuple[ReasoningCapability, ...] = ()
+    thinking_levels: tuple[ThinkingLevel, ...] = ()
     opaque_replay: bool = False
     continuation: bool = False
     usage: bool = False
@@ -60,6 +66,12 @@ class ModelCapabilities:
             raise TypeError("reasoning must contain ReasoningCapability values")
         if len(self.reasoning) != len(set(self.reasoning)):
             raise ValueError("reasoning capabilities must be unique")
+        if not isinstance(self.thinking_levels, tuple) or not all(
+            isinstance(item, ThinkingLevel) for item in self.thinking_levels
+        ):
+            raise TypeError("thinking_levels must contain ThinkingLevel values")
+        if len(self.thinking_levels) != len(set(self.thinking_levels)):
+            raise ValueError("thinking_levels must be unique")
         if not isinstance(self.hosted_tools, tuple) or not all(
             isinstance(item, str) and item.strip() for item in self.hosted_tools
         ):
