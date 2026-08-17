@@ -4,26 +4,33 @@
 
 Accepted migration plan on 2026-08-16. The target contracts are defined by the
 [QitOS Agent runtime architecture](../architecture/agent-runtime.md). The minimal loop,
-façade, and retired-runtime deletion slices are implemented on the migration branch;
-the Pi-parity items listed below, Session/Harness, and Task/Plan remain merge gates.
+façade, and retired-runtime deletion slices are implemented on the migration branch.
+The remaining merge gates land as three slices on the same branch:
+
+- S1 — milestone 2.1 parity items (typed thinking level, typed Tool usage and
+  result-activated Tool names).
+- S2 — milestone 2.3, the authoritative Session/Harness per the storage and
+  recovery contract in the architecture document and the dispositions below.
+- S3 — milestone 2.4, goal-bearing Task (S3a) and dependency-aware Plan (S3b).
 
 ## 1. Current gaps
 
 - Session/Harness is not yet the authoritative owner of compact, resume, fork, and
-  pure recovery.
+  pure recovery (S2).
 - Background Child terminal facts have deterministic completion-input projections, but
   recovery-time redelivery and consumed-event idempotence still depend on that
-  authoritative Session/Harness owner.
-- The façade cannot yet restore initial messages/Tool activation, and the loop has no
-  typed per-turn thinking-level update. Raw `extra_request_options` are provider wire
-  data, not an equivalent reasoning contract.
+  authoritative Session/Harness owner (S2).
+- The façade cannot yet restore initial messages/Tool activation (S2), and the loop
+  has no typed per-turn thinking-level update (S1). Raw `extra_request_options` are
+  provider wire data, not an equivalent reasoning contract.
 - Tool execution usage and the names of Tools activated by a result are not yet typed,
-  durable ToolResult facts. A live registry is re-frozen for the next turn, but that
-  alone cannot reproduce activation order after resume.
+  durable ToolResult facts (S1). A live registry is re-frozen for the next turn, but
+  that alone cannot reproduce activation order after resume (S2 verifies the lineage).
 - Task mixes objective identity with benchmark resources, environment probing, metrics
-  and free-form metadata.
-- WorkPlan is a flat single-active checklist rather than an owner/dependency graph.
-- The loop/façade event stream is not yet reattached to the trace writer.
+  and free-form metadata (S3a).
+- WorkPlan is a flat single-active checklist rather than an owner/dependency graph
+  (S3b).
+- The loop/façade event stream is not yet reattached to the trace writer (S2).
 
 Proven Tool transaction, cancellation, absolute deadline, result ordering, trace and
 recovery behavior is the conformance baseline. Legacy type names and package layout are
@@ -34,7 +41,7 @@ not compatibility requirements.
 ### 2.1 Freeze behavioral conformance
 
 Foundation implemented on `feat/pi-aligned-agent-loop` (commits `af8f8ef`,
-`306d3bc`); this milestone remains in progress until the parity items below land. Typed
+`306d3bc`); S1 lands the remaining parity items. Typed
 messages (`core/message.py`), loop events (`core/agent_events.py`),
 `AgentLoopResult`/rejection types, the minimal loop (`core/agent_loop.py`),
 the `Agent` façade (`core/agent.py`) and `ToolBatchExecutor`
@@ -63,14 +70,18 @@ Review-hardening dispositions recorded on the same branch:
   is rejected before Tool admission; terminal `ToolResult`s are deeply immutable before they
   cross journal, event and Message boundaries.
 
-Still required before this milestone is complete:
+S1 closes the remaining parity items:
 
-- restore initial façade messages and Tool activation through the authoritative
-  Session/Harness path;
-- add a provider-neutral typed thinking-level update owned by the Model boundary;
-- carry Tool execution usage and dynamically added Tool names as typed ToolResult /
-  transcript facts with resume tests. Metadata and raw request-option dictionaries do
-  not count as substitutes.
+- provider-neutral typed thinking level (`off|minimal|low|medium|high|xhigh|max`,
+  Pi's exact values) owned by the Model boundary: a typed `ModelRequest` field,
+  adapter translation keyed by declared model capability with Pi's
+  nearest-up-then-down clamping, and a per-turn `NextTurnUpdate` override;
+- typed `ToolResult.usage` (`ModelUsage`) and `ToolResult.added_tool_names`,
+  carried onto `ToolResultMessage` and through the durable codecs; the Agent
+  (Child) Tool moves its Child token/cost accounting out of the untyped output
+  payload into these fields;
+- restore of initial façade messages and Tool activation is part of S2, where
+  the authoritative Session/Harness path exists.
 
 ### 2.2 Replace loop and façade
 
@@ -79,34 +90,79 @@ façade are the only execution path: C2 (commit `e28b23e`) moved child agents
 onto the façade and removed the delegate/fanout tools, kit handoff tool
 chain, shared memory and repl; C3 (commit `9ad277e`) removed the zoo
 submodule, demo, recipes, benchmark execution adapters and the Engine-era
-examples; C4 (this slice) deletes `qitos/engine/`, the `core` old-lifecycle
+examples; C4 (commit `88da5bf`) deletes `qitos/engine/`, the `core` old-lifecycle
 modules, checkpoint, protocols, render, and the Engine-era kit
 parser/critic/planning/prompts/history packages. No composition subclasses
 AgentModule, and the old Engine is absent from exports, examples and tests.
 
-### 2.3 Make Session/Harness authoritative
+### 2.3 Make Session/Harness authoritative (S2)
 
-- Separate transcript entries from operation records in one canonical storage contract.
-- Move queue, compact, recovery, resume, fork and expected rejection out of Engine.
-- Restore initial messages and Tool activation, including result-originated Tool names,
-  without depending on a live pre-crash registry.
-- Provide memory/JSONL conformance and pure recovery tests.
-- Re-project unconsumed background Child completion inputs from terminal facts without
-  redelivering foreground results or inherited fork facts.
-- Reattach the trace writer to the loop/façade so new runs emit trace
-  artifacts (the Engine-era producer was removed with C4).
+Scope per the architecture document §4; concretely:
 
-Done when recovery never branches through a live Engine or guesses side effects.
+- Transcript entries (`transcript.message`, `compaction`) own message content;
+  operation records reference them by record id. `model.completed` keeps the
+  exact request audit plus the assistant transcript reference;
+  `tool.terminal` keeps the call plus the terminal transcript reference;
+  `step.committed` becomes a pure commit marker of record references;
+  `run.completed`/`run.interrupted` stop embedding messages.
+- `input.accepted` gains a writer and commits, with the initial prompt
+  transcript entries, before the first model side effect.
+- Pure recovery replays the log into transcript, configuration lineage, open
+  Tool operations, unconsumed runtime inputs and terminal outcome; crash-torn
+  Tool admissions close with explicit cancelled terminals; contradictions fail
+  closed.
+- Memory and JSONL journal implementations share one conformance suite.
+- Resume/fork restore the façade (transcript, thinking level, configuration
+  lineage) and verify the provided Model identity and Tool registry coverage
+  with typed rejections; the run's turn counter continues from recovery.
+- Compaction: manual at idle, automatic token-threshold at idle boundaries,
+  and one-shot overflow recovery; Pi's cut-point rule (never between a Tool
+  call and its result) and summary-as-user-message projection.
+- Unconsumed background Child completion inputs re-project from terminal facts
+  without redelivering foreground results or inherited fork facts
+  (`runtime_input.consumed` records consumption).
+- Reattach the trace writer to the loop/façade event stream so new runs emit
+  trace artifacts again; `qita` keeps reading the same three-file layout.
+- The run catalog reads the new payload shapes; Engine-era payload readers
+  (`stop_reason`, `reason`, `task`, terminal flags, legacy usage fallback)
+  are removed in favor of fail-closed decoders.
 
-### 2.4 Replace Task and Plan
+Done when recovery never branches through a live Engine or guesses side
+effects, and crash recovery is demonstrated at the model terminal, tool
+started, tool terminal and state commit boundaries.
 
-- Commit Root Task before side effects and persist lifecycle/usage.
-- Remove benchmark/environment/evaluation/free-metadata fields from canonical Task.
-- Replace flat WorkPlan with the dependency-aware owner graph.
-- Bind Child Task and parent assignment durably before launch.
+### 2.4 Replace Task and Plan (S3)
 
-Done when Task, Session, Run, Plan and Child identities stay distinct across recovery,
-and no TaskV2/Goal mirror or compatibility Plan remains.
+S3a (Task):
+
+- Replace `core/task.py` in place with the goal-bearing Task of architecture
+  §5: immutable definition (task id, optional parent task id, objective,
+  success criteria, constraints, stable resource/context references, budget,
+  creation provenance, optional parent Plan assignment reference) plus durable
+  lifecycle (`active|blocked|completed|failed|cancelled`, usage, typed
+  blocker/terminal reason) committed as `task.created` / `task.transition`.
+- Remove `TaskResource`, `TaskResult`, `TaskCriterionResult`,
+  `TaskResourceBinding`, `TaskValidationIssue`, environment probing
+  (`resolve_resources`, `validate_structured`) and free-form metadata from the
+  canonical Task; migrate `RepoEnv`, the evaluation context/DSL exposure and
+  the Child budget consumers.
+- Root Task commits before `input.accepted`; one unfinished Root Task per
+  Session lineage; blocked/terminal semantics per architecture §5; Child
+  launch creates the narrowed Child Task durably before runtime construction.
+
+S3b (Plan):
+
+- Replace `core/work_plan.py` in place with the dependency-aware graph:
+  stable node ids, dependencies, owners, explicit state, derived readiness,
+  per-owner in-progress limits, cycle/reference/transition validation.
+- Every accepted update commits one `plan.updated` record; recovery replays
+  the latest committed update through the lineage; TODO Markdown is the
+  deterministic topological projection.
+- Rework the `update_plan` tool onto the graph contract and bind Child launch
+  to a parent Plan assignment.
+
+Done when Task, Session, Run, Plan and Child identities stay distinct across
+recovery, and no TaskV2/Goal mirror or compatibility Plan remains.
 
 ### 2.5 Migrate application composition
 
@@ -138,7 +194,59 @@ Delete final callers, packages, exports, dependencies, tests, examples and docs 
 
 Do not keep V2 modules, legacy aliases, wrappers or mirror DTOs.
 
-## 3. Verification
+## 3. Session/Harness dispositions
+
+Decisions taken while designing S1–S3, recorded for review. Pi remains the
+primary reference; where QitOS deliberately deviates, the reason is stated.
+
+- D1 — Session = Run journal lineage, not a multi-Run file. Pi v3 appends
+  every Run of a session to one file; QitOS keeps its proven per-Run journal
+  (writer lease, tail repair, idempotent append) and links Runs by fork:
+  every journal embeds its inherited prefix, so each one is self-contained
+  recovery truth. Continuing a terminal Run always forks explicitly, which
+  keeps the side-effect boundary and the storage boundary identical.
+- D2 — Queues stay memory-only (Pi v3 parity). Pi v4's journaled queues live
+  in a harness whose runtime is still a stub in the Pi tree; QitOS does not
+  adopt an unproven design. Undelivered steering/follow-up messages are not
+  recovery truth.
+- D3 — Message content lives in exactly one record. Transcript entries carry
+  messages; `model.completed`/`tool.terminal`/`step.committed` reference
+  record ids instead of embedding copies. The exact model request audit
+  (including the message prefix) stays in `model.completed.request`; its
+  growth is the known storage concern owned by the application-side
+  long-context acceptance item, not by this contract.
+- D4 — Compaction follows Pi v3's proven algorithm: token estimation,
+  keep-recent cut search, cut never at a Tool result, split-turn handling,
+  summary injected as a user message, `firstKeptEntryId`-style reference
+  (resolved fail closed through `journal.inherited`). Pi v4's `retainedTail`
+  embedding is not adopted; reference resolution is already the journal's
+  established mechanism.
+- D5 — Configuration entries are written by the transaction boundary on
+  per-turn freeze diffs, never by façade setters, so the log cannot diverge
+  from the effective configuration. Restore verifies the provided Model
+  identity and Tool registry coverage and rejects mismatches with typed
+  values.
+- D6 — Tool activation restore is lineage plus verification, not object
+  reconstruction: `ToolResult.added_tool_names` and `tools.change` make the
+  activation order durable; application composition re-registers the Tool
+  objects; resume fails closed with the missing names otherwise.
+- D7 — Runtime input re-projection scans only records originating in the
+  current Run (never `journal.inherited` facts) and treats an input as
+  consumed only when a `runtime_input.consumed` record exists; consumption
+  commits when the steered message enters the committed transcript.
+  Foreground Child results are delivered by their ToolResult and are never
+  re-projected.
+- D8 — Engine-era payload readers are deleted, not tolerated: the run
+  catalog, the budget ledger and the transaction decoders fail closed on old
+  payload shapes instead of silently skipping them.
+- D9 — Thinking level uses Pi's exact seven values and clamping rule.
+  Construction-time provider reasoning kwargs remain adapter defaults; the
+  typed per-turn field is the only runtime mutation channel.
+- D10 — Plan updates remain whole-graph replacements (the model-facing shape
+  models already handle), validated as legal transitions; committed updates
+  are the Plan truth and TODO Markdown stays a deterministic projection.
+
+## 4. Verification
 
 Each slice needs focused behavior tests, followed by QitOS's independent pytest,
 flake8 and mypy checks. The final matrix covers terminal ToolResult pairing,

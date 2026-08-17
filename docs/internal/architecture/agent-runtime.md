@@ -68,17 +68,78 @@ ambiguous batch is rejected before Tool admission or side effects.
 
 ## 4. Agent façade and Session Harness
 
-The façade presents context, event subscription and the current Session/Harness. The
-Harness owns prompt, queue, abort, idle, compact, resume and fork operations. Expected
-rejections use typed results; corruption and implementation faults use exceptions.
+The façade presents context, event subscription and the current Session/Harness.
+The Harness owns prompt, queue, abort, idle, compact, resume and fork operations.
+Expected rejections use typed results; corruption and implementation faults use
+exceptions.
 
-Session keeps one canonical log with typed transcript entries and operation records.
-Memory and JSONL implementations share conformance behavior; a SQLite index is
-disposable. Pure recovery reconstructs open operations, incomplete Tools, queue, Task
-lifecycle and terminal outcomes, and fails closed on contradictions.
+### Canonical log
 
-Authoritative snapshots come from Session state. Progress events, trace files and UI
-projections are observational and cannot mutate recovery truth.
+One Run journal is one canonical append-only log; a Session is the lineage of
+Run journals linked by fork. Every journal embeds its inherited fork prefix, so
+each journal is self-contained recovery truth. Resuming an unfinished Run
+continues the same journal; continuing from a terminal Run explicitly forks a
+new journal (and, per §5, a new Task). One journal accepts at most one active
+writer and one unfinished Run.
+
+The log carries two typed record families in one sequence:
+
+- Transcript entries own message content: `transcript.message` (user,
+  assistant and Tool-result messages) and `compaction` (summary plus the first
+  kept transcript reference).
+- Operation records own lifecycle and side-effect boundaries: `run.started`,
+  `input.accepted`, `model.completed` (exact request audit plus the assistant
+  transcript reference), `tool.started` / `tool.terminal` (call plus terminal
+  transcript reference), `step.committed` (turn commit marker listing the
+  turn's transcript and Tool-terminal references), `run.completed` /
+  `run.interrupted`, `model.change` / `thinking.change` / `tools.change`
+  (per-turn configuration freeze diffs), `budget.committed`, `process.*`,
+  `child.*`, `runtime_input.posted` / `runtime_input.consumed`, `task.*`,
+  `plan.updated`, `run.forked` and `journal.inherited`.
+
+Records that carry references resolve fail closed through `journal.inherited`
+wrappers. Message content appears in exactly one record (its transcript
+entry); operation records reference it by record id.
+
+### Recovery
+
+Pure recovery replays the log into the transcript, the configuration lineage
+(model, thinking level, active Tools), open Tool operations, Task/Plan state,
+unconsumed runtime inputs and the terminal outcome, and fails closed on
+contradictions. A Tool call admitted but never terminated (crash window) is
+closed with an explicit cancelled terminal record; recovery never re-executes
+Tools and never guesses side effects. Runtime inputs posted by the current Run
+and never consumed are re-projected exactly once; inherited fork facts and
+foreground results are never redelivered. Queued steering/follow-up messages
+are memory-only and are not recovery truth.
+
+Memory and JSONL journal implementations share one conformance suite; a
+SQLite index remains a disposable projection. Authoritative snapshots come
+from Session state. Progress events, trace files and UI projections are
+observational and cannot mutate recovery truth.
+
+### Compaction
+
+Compaction replaces history before a cut point with a model-generated summary
+injected as a user message. The cut never lands between a Tool call and its
+result, so ToolCall/ToolResult pairing survives compaction, resume and fork.
+The compaction entry is durable; context rebuild keeps the latest compaction
+plus entries after its cut. Historical records are never rewritten or deleted.
+Manual compaction runs at idle; automatic compaction evaluates a token
+threshold at idle boundaries, and a one-shot overflow recovery compacts and
+continues once after a context-overflow model failure. Compaction invalidates
+Provider continuation, which is only an optimization.
+
+### Configuration lineage
+
+The transaction boundary writes `model.change`, `thinking.change` and
+`tools.change` when a per-turn freeze observes a diff, so configuration cannot
+diverge from the log through façade setters. Resume restores the transcript,
+thinking level and configuration lineage into a fresh façade, verifies the
+provided Model identity and Tool registry coverage against the lineage
+(including Tool names activated by earlier Tool results), and rejects with
+typed values on mismatch. Tool objects themselves are never reconstructed
+from the journal; application composition owns Tool construction.
 
 ## 5. Goal-bearing Task
 
@@ -104,6 +165,12 @@ boundaries retain Task identity; continuing from a terminal Task creates a new T
 explicitly. Blocked is durable and resumable only after explicit caller input or an
 observed external-state change. Completed, failed and cancelled commit once.
 
+The Task definition commits as one `task.created` record before `input.accepted` and
+the first model or Tool side effect; every lifecycle change commits as one
+`task.transition` record. Task state is rebuilt by replaying these records through
+the fork lineage; recovery fails closed on a second unfinished Root Task or a
+transition after a terminal state.
+
 Benchmark resources, environment probing, evaluation metrics and free-form metadata do
 not belong to Task. They remain at recipe/application boundaries and reference Task by
 id. The existing Task schema is replaced in place; there is no Goal alias, TaskV2 or
@@ -114,7 +181,11 @@ compatibility mirror.
 Plan is a dependency-aware graph with stable node identity, owner and explicit state.
 Readiness derives from dependency completion. Multiple owners may hold independent
 nodes in progress. QitOS validates graph, transition, reservation, budget and
-concurrency; applications or models choose the schedule.
+concurrency; applications or models choose the schedule. Every accepted update
+commits as one `plan.updated` record in the owning Run journal; the current Plan is
+the replay of the latest committed update through the fork lineage, and TODO
+Markdown is a deterministic projection of the committed Plan, never an editable
+second truth.
 
 Root and Child use the same Agent implementation. A Child has its own Task, Session,
 Plan, context and cancellation domain; authorization and budgets only narrow. Launch
