@@ -106,6 +106,42 @@ How to update:
   wire data). `ToolResultMessage` mirrors both fields, the loop propagates
   them onto every committed message, and they survive the journal
   `tool.terminal` / `step.committed` round trip.
+- **Canonical transcript/operation journal split, pure recovery and the
+  in-memory journal (S2a).** The Run journal now carries two record families
+  in one sequence: transcript entries (`transcript.message`, `compaction`)
+  own message content exactly once, and operation records reference them by
+  record id. `JournalTurnTransaction` writes one `transcript.message` per
+  accepted prompt followed by `input.accepted` before the first model side
+  effect, per-turn freeze diffs (`model.change` / `thinking.change` /
+  `tools.change`, full trio on the first turn), the assistant transcript
+  entry plus `model.completed` (exact request audit plus
+  `message_record_id`), the Tool-result transcript entry plus
+  `tool.terminal` (call plus `message_record_id`), a pure `step.committed`
+  commit marker of record references, and a `run.completed` /
+  `run.interrupted` carrying only `{status, error}`. The loop's
+  `TurnTransactionBoundary` gains `input_accepted` and `turn_frozen`
+  barriers with a typed `TurnConfigSnapshot`.
+  `qitos.kit.journal.recovery.recover_session` is a pure, total replay of one
+  journal (INHERITED wrappers resolved) into the typed transcript in
+  canonical conversation order, the compaction-projected context, the
+  configuration lineage (including Tools activated by earlier Tool results),
+  open Tool operations, unconsumed runtime inputs and the terminal outcome,
+  failing closed with `JournalCorruptionError` on contradictions.
+  `close_crashed_tool_calls` closes the legitimate crash window (admitted but
+  never terminated, or never admitted calls) with explicit cancelled
+  terminals and one closing commit — never re-executing, with deterministic
+  record ids so closing twice never double-appends.
+  `InMemorySessionJournal` implements the full `SessionJournal` contract
+  against a process-local `InMemoryJournalStore` and shares one conformance
+  suite with the JSONL implementation
+  (`tests/journal/test_session_journal_conformance.py`). The recorder accepts
+  a `RecoveredRecorderState` seed (next turn, last journaled config, recorded
+  message count) so a resumed run continues without rewriting history, and
+  can commit `budget.committed` per model terminal through an attached
+  `BudgetLedger` with the same idempotency-key scheme the Child boundary
+  uses. `runtime_input.consumed` records consumption of a posted runtime
+  input; recovery folds own-run records only and never redelivers inherited
+  fork facts.
 
 ### Changed
 
@@ -235,6 +271,20 @@ How to update:
   redundant security-audit Tool/ToolSet forwarding packages. Security research remains
   available from the explicit `qitos.kit.tool.experimental.security_research` owner,
   which is no longer loaded as a side effect of importing the generic kit.
+- **Breaking:** The Run journal record contract moved to the canonical
+  transcript/operation split. `state.snapshot` is deleted as a record type
+  (journals containing it now fail at envelope decode); `step.committed` no
+  longer embeds `messages` or legacy `terminal_record_ids`;
+  `model.completed` no longer embeds `message`; `tool.terminal` no longer
+  embeds `result`; `run.completed` / `run.interrupted` no longer embed
+  `messages`; `input.accepted` now carries `transcript_record_ids` instead of
+  a task payload. Journals written before this change fail closed in the
+  catalog, the transaction index, the budget ledger and pure recovery
+  instead of being silently skipped: the Engine-era payload readers
+  (`stop_reason`, `reason`, `task`, commit terminal flags, the legacy
+  aggregate budget fallback) are removed. The migration branch has never
+  been released, so no journal migration path is provided. `RunHandle.task`
+  reports empty until the goal-bearing Task slice lands.
 - Removed the unexported `WorktreeManager` helper and its self-only tests. No runtime
   called it, and its fallback created an invalid pseudo-worktree instead of an isolated
   repository. Applications that need isolation should own a real workspace runtime.

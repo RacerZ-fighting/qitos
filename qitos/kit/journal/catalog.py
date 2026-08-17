@@ -19,10 +19,14 @@ from ...core.journal import (
 from ...core.run import RunHandle, RunNotFoundError, RunStatus
 from ._paths import JOURNAL_FILENAME, journal_path, validate_run_id
 from ._reader import read_journal_records
+from .turn_recorder import (
+    decode_input_accepted,
+    decode_run_terminal,
+    decode_step_committed,
+)
 
 _COMMITTED_BOUNDARIES = {
     JournalRecordType.STEP_COMMITTED,
-    JournalRecordType.STATE_SNAPSHOT,
 }
 
 
@@ -147,15 +151,27 @@ def _summarize_run(
     committed_records: list[tuple[int, JournalRecord]] = []
     completed: JournalRecord | None = None
     interrupted: JournalRecord | None = None
-    task = ""
     agent_name = _optional_text(start.payload, "agent")
     for index, record in enumerate(records):
         effective = resolve_inherited_record(record)
-        if effective.type in _COMMITTED_BOUNDARIES:
-            committed_position = record.position
-            committed_records.append((index, record))
-        if effective.type is JournalRecordType.INPUT_ACCEPTED:
-            task = _optional_text(effective.payload, "task") or ""
+        try:
+            if effective.type in _COMMITTED_BOUNDARIES:
+                # Old-shape commits (legacy ``terminal_record_ids`` or
+                # Engine-era fields) fail closed instead of being skipped.
+                decode_step_committed(effective.payload)
+                committed_position = record.position
+                committed_records.append((index, record))
+            elif effective.type is JournalRecordType.INPUT_ACCEPTED:
+                # The task text arrives with the goal-bearing Task (S3);
+                # input.accepted references prompt transcript entries only.
+                decode_input_accepted(effective.payload)
+            elif effective.type in (
+                JournalRecordType.RUN_COMPLETED,
+                JournalRecordType.RUN_INTERRUPTED,
+            ):
+                decode_run_terminal(effective.type, effective.payload)
+        except ValueError as exc:
+            raise JournalCorruptionError(str(exc)) from exc
         if agent_name is None and effective.type is JournalRecordType.RUN_STARTED:
             agent_name = _optional_text(effective.payload, "agent")
         if record.type is JournalRecordType.RUN_INTERRUPTED:
@@ -181,17 +197,13 @@ def _summarize_run(
         forked_from=forked_from,
         record_count=len(records),
         agent_name=agent_name,
-        task=task,
+        task="",
         stop_reason=(
-            _optional_text(completed.payload, "stop_reason")
-            if completed is not None
-            else None
+            str(completed.payload["status"]) if completed is not None else None
         ),
         interrupted_at=interrupted.position if interrupted is not None else None,
         interruption_reason=(
-            _optional_text(interrupted.payload, "reason")
-            if interrupted is not None
-            else None
+            interrupted.payload["error"] if interrupted is not None else None
         ),
     )
 
@@ -222,30 +234,18 @@ def _continuation_position(
     records: tuple[JournalRecord, ...],
     committed_records: list[tuple[int, JournalRecord]],
 ) -> JournalPosition | None:
-    if not committed_records:
-        return None
+    """Return where this Run may be continued or explicitly forked from.
 
-    excluded: set[int] = set()
-    for index, record in committed_records:
-        effective = resolve_inherited_record(record)
-        if effective.type is JournalRecordType.STEP_COMMITTED:
-            terminal = effective.payload.get("terminal")
-            if terminal is not None and not isinstance(terminal, bool):
-                raise JournalCorruptionError("step.committed terminal flag is invalid")
-            if terminal is True:
-                excluded.add(index)
-        if (
-            effective.type is JournalRecordType.STATE_SNAPSHOT
-            and effective.payload.get("reason") == "terminal"
-        ):
-            excluded.add(index)
-            prior_index = index - 1
-            if prior_index >= 0:
-                prior = resolve_inherited_record(records[prior_index])
-                if prior.type is JournalRecordType.STEP_COMMITTED:
-                    excluded.add(prior_index)
-    for index, record in reversed(committed_records):
-        if index not in excluded:
+    That is the last own-run ``step.committed``; a forked journal without an
+    own commit continues at its fork boundary (the inherited prefix tip). A
+    root journal without any committed turn exposes no continuation point.
+    """
+
+    for _index, record in reversed(committed_records):
+        if record.type is not JournalRecordType.INHERITED:
+            return record.position
+    for record in reversed(records):
+        if record.type is JournalRecordType.INHERITED:
             return record.position
     return None
 

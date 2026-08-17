@@ -27,6 +27,7 @@ from ...core.agent_events import AgentEnd, TurnEnd, TurnStart
 from ...core.agent_loop import (
     AgentLoopResult,
     AgentRunStatus,
+    TurnConfigSnapshot,
     TurnHookContext,
     TurnTransactionBoundary,
 )
@@ -251,6 +252,14 @@ class _ChildTurnTransaction(TurnTransactionBoundary):
             self._budget_stop_reason = reason
         if self._delegate is not None:
             await self._delegate.model_terminal(turn, request, message)
+
+    async def input_accepted(self, prompts: tuple[Message, ...]) -> None:
+        if self._delegate is not None:
+            await self._delegate.input_accepted(prompts)
+
+    async def turn_frozen(self, turn: int, config: TurnConfigSnapshot) -> None:
+        if self._delegate is not None:
+            await self._delegate.turn_frozen(turn, config)
 
     async def tool_started(self, turn: int, call: ToolCall) -> None:
         if self._delegate is not None:

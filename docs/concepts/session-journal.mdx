@@ -13,17 +13,34 @@ operating-system writer lease for that Run. A competing process receives
 rejects mutations permanently, but its isolated replay and committed-tool query
 view remain available for diagnostics.
 
+## Transcript and operation records
+
+One journal carries two record families in one sequence. Transcript entries
+own message content: `transcript.message` (user, assistant and Tool-result
+messages) and `compaction` (summary plus the first kept transcript reference).
+Operation records own lifecycle and side-effect boundaries and reference
+transcript entries by record id — message content appears in exactly one
+record. `model.completed` keeps the exact request audit plus the assistant
+transcript reference; `tool.terminal` keeps the call plus the terminal
+transcript reference; `step.committed` is a pure commit marker listing the
+turn's transcript and Tool-terminal references; `run.completed` /
+`run.interrupted` carry only the terminal status and error. Records that
+carry references resolve them fail closed through `journal.inherited`
+wrappers.
+
 ## Loop transaction order
 
-The loop's `JournalTurnTransaction` records each turn in this order:
+The loop's `JournalTurnTransaction` records each run in this order:
 
-1. `model.completed` — one finalized model transaction, success or failure
-2. `tool.started` — a durable execution permit for one admitted ToolCall
-3. execute the handler
-4. finalize the canonical `ToolResult`
-5. `tool.terminal`
-6. `step.committed` — the turn's committed messages plus the
-   `terminal_record_ids` linking its Tool terminals
+1. one `transcript.message` per accepted prompt, then `input.accepted`
+   listing their record ids — before the first model side effect
+2. the per-turn freeze diffs `model.change` / `thinking.change` /
+   `tools.change` (the full trio on the first turn, diffs only afterwards)
+3. `transcript.message` for the assistant message, then `model.completed`
+4. `tool.started` — a durable execution permit for one admitted ToolCall
+5. execute the handler and finalize the canonical `ToolResult`
+6. `transcript.message` for the Tool-result message, then `tool.terminal`
+7. `step.committed` — the turn commit marker
 
 `tool.started` is a durable execution permit. If it cannot be written, the handler is
 not invoked. The finalized terminal result is persisted once and is the same deeply
@@ -32,10 +49,42 @@ input order, and every admitted call receives exactly one terminal result, inclu
 denied, timed-out, and cancelled calls.
 
 A run ends in exactly one terminal record: `run.completed` carries the terminal
-status (`completed`, `failed`, `max_turns`, `deadline_exceeded`) and the run's new
-messages; an aborted run appends `run.interrupted` instead. External task
+status (`completed`, `failed`, `max_turns`, `deadline_exceeded`); an aborted run
+appends `run.interrupted` instead. External task
 cancellation and faults terminalize started work and the run record before
 re-raising, so a run never ends without a terminal record.
+
+## Recovery
+
+`recover_session(records)` replays one journal into the typed transcript, the
+compaction-projected context, the configuration lineage (model, thinking
+level, active Tools, including Tools activated by earlier Tool results), open
+Tool operations, unconsumed runtime inputs and the terminal outcome. It is a
+pure function over one journal's replay — inherited fork prefixes resolve
+through their wrappers, so one forked journal is self-contained recovery
+truth — and it fails closed with `JournalCorruptionError` on contradictions:
+dangling transcript references, a Tool transcript entry without its
+`tool.terminal`, commits or run terminals covering open calls, unknown commit
+references, conflicting run terminals, records after a run terminal,
+regressing turns, invalid compaction cuts, or retired Engine-era payload
+shapes.
+
+A Tool call admitted but never terminated, or never admitted at all, is the
+legitimate crash window when no commit or run terminal covers it.
+`close_crashed_tool_calls(journal, recovered)` closes that window without
+re-executing anything and without guessing side effects: each call receives
+an explicit cancelled `tool.terminal` plus its transcript entry (a torn
+durable entry is linked, never replaced) and one closing `step.committed`.
+The synthesized errors distinguish "started, outcome unknown" from "never
+admitted, no side effects". Record ids and payloads are deterministic
+functions of the recovered journal, so closing twice never double-appends.
+
+`InMemorySessionJournal` implements the same `SessionJournal` contract in
+memory — durability scoped to a shared `InMemoryJournalStore` — and shares
+one conformance suite with the JSONL implementation. Consumption of a posted
+runtime input is journaled as `runtime_input.consumed`, so unconsumed inputs
+re-project exactly once on recovery while inherited fork facts are never
+redelivered.
 
 ## Durability and projections
 
@@ -102,7 +151,9 @@ if transaction is not None:
 ```
 
 The lookup is read-only and returns a fresh typed `ToolTransaction` only after the
-terminal is named by a `step.committed` record. Opening a journal rebuilds this query
+terminal is named by a `step.committed` record; the result is joined from the
+referenced `transcript.message` record, fail closed on a missing or mismatched
+reference. Opening a journal rebuilds this query
 view from its canonical JSONL records. A fork resolves inherited terminals by the
 parent's origin reference, so the child does not copy the result into a second store.
 Unknown, uncommitted, or child-renamed references return `None`. Only the loop's

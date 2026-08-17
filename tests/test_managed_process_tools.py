@@ -201,9 +201,13 @@ async def test_fork_does_not_inherit_parent_process_ownership(tmp_path: Path) ->
         record_id="parent:process:proc_parent:started",
     )
     boundary = await parent.append(
-        JournalRecordType.STATE_SNAPSHOT,
-        {"step_id": 0, "state": {}},
-        record_id="parent:snapshot:0",
+        JournalRecordType.STEP_COMMITTED,
+        {
+            "turn": 0,
+            "transcript_record_ids": [],
+            "tool_terminal_record_ids": [],
+        },
+        record_id="parent:turn:0:committed",
     )
     child = await parent.fork(boundary, "child")
     runtime = ManagedHostProcessRuntime(str(tmp_path))

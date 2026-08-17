@@ -20,11 +20,11 @@ from qitos.core import (
 from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 
 
-def _commit_payload(step_id: int = 0) -> dict[str, object]:
+def _commit_payload(turn: int = 0) -> dict[str, object]:
     return {
-        "step_id": step_id,
-        "transaction_id": f"transaction-{step_id}",
-        "terminal_record_ids": [],
+        "turn": turn,
+        "transcript_record_ids": [],
+        "tool_terminal_record_ids": [],
     }
 
 
@@ -64,13 +64,13 @@ async def test_catalog_inspects_active_writer_without_taking_ownership(
     await journal.create("active", {"agent": "worker"})
     await journal.append(
         JournalRecordType.INPUT_ACCEPTED,
-        {"task": "inspect target"},
-        record_id="input",
+        {"transcript_record_ids": ["active:turn:0:transcript:0"]},
+        record_id="active:input",
     )
     committed = await journal.append(
-        JournalRecordType.STATE_SNAPSHOT,
-        {"state": {}, "state_digest": "digest", "reason": "initial"},
-        record_id="snapshot",
+        JournalRecordType.STEP_COMMITTED,
+        _commit_payload(),
+        record_id="active:turn:0:committed",
     )
 
     handle = await JsonlRunCatalog(tmp_path).inspect_run("active")
@@ -83,11 +83,13 @@ async def test_catalog_inspects_active_writer_without_taking_ownership(
     assert handle.committed_position == committed
     assert handle.continuation_position == committed
     assert handle.agent_name == "worker"
-    assert handle.task == "inspect target"
+    # The task text arrives with the goal-bearing Task (S3); until then the
+    # handle carries no task.
+    assert handle.task == ""
     await journal.append(
         JournalRecordType.RUN_INTERRUPTED,
-        {"reason": "cancelled"},
-        record_id="interrupted",
+        {"status": "aborted", "error": "cancelled"},
+        record_id="active:run:terminal",
     )
     await journal.close()
 
@@ -145,8 +147,8 @@ async def test_catalog_rejects_non_final_corruption_and_missing_runs(
     await journal.create("broken", {})
     await journal.append(
         JournalRecordType.INPUT_ACCEPTED,
-        {"task": "one"},
-        record_id="input",
+        {"transcript_record_ids": ["broken:turn:0:transcript:0"]},
+        record_id="broken:input",
     )
     await journal.close()
     lines = journal.path.read_text(encoding="utf-8").splitlines()
@@ -176,13 +178,13 @@ async def test_catalog_lists_and_projects_terminal_lifecycle(tmp_path: Path) -> 
     await first.create("first", {"agent": "agent-a"})
     await first.append(
         JournalRecordType.INPUT_ACCEPTED,
-        {"task": "first task"},
-        record_id="first-input",
+        {"transcript_record_ids": ["first:turn:0:transcript:0"]},
+        record_id="first:input",
     )
     await first.append(
         JournalRecordType.RUN_INTERRUPTED,
-        {"reason": "cancelled"},
-        record_id="first-interrupted",
+        {"status": "aborted", "error": "cancelled"},
+        record_id="first:run:terminal",
     )
     await first.close()
 
@@ -190,8 +192,8 @@ async def test_catalog_lists_and_projects_terminal_lifecycle(tmp_path: Path) -> 
     await second.create("second", {"agent": "agent-b"})
     await second.append(
         JournalRecordType.RUN_COMPLETED,
-        {"stop_reason": "completed"},
-        record_id="second-complete",
+        {"status": "completed", "error": None},
+        record_id="second:run:terminal",
     )
     await second.close()
 
@@ -218,13 +220,13 @@ async def test_catalog_validates_lineage_children_and_nested_forks(
     await parent.create("parent", {"agent": "worker"})
     await parent.append(
         JournalRecordType.INPUT_ACCEPTED,
-        {"task": "trace lineage"},
-        record_id="parent-input",
+        {"transcript_record_ids": ["parent:turn:0:transcript:0"]},
+        record_id="parent:input",
     )
     boundary = await parent.append(
         JournalRecordType.STEP_COMMITTED,
         _commit_payload(),
-        record_id="parent-commit",
+        record_id="parent:turn:0:committed",
     )
     child = await parent.fork(boundary, "child")
     child_handle = await JsonlRunCatalog(tmp_path).inspect_run("child")
@@ -248,7 +250,7 @@ async def test_catalog_validates_lineage_children_and_nested_forks(
     ]
     assert {handle.lineage_id for handle in lineage} == {"parent"}
     assert [handle.run_id for handle in children] == ["child"]
-    assert lineage[-1].task == "trace lineage"
+    assert lineage[-1].task == ""
     assert lineage[-1].agent_name == "worker"
 
     (tmp_path / "parent" / "journal.jsonl").unlink()
@@ -264,7 +266,7 @@ async def test_catalog_validates_lineage_children_and_nested_forks(
 
 
 @pytest.mark.asyncio
-async def test_catalog_exposes_declared_lineage_and_ready_terminal_fork(
+async def test_catalog_exposes_declared_lineage_and_terminal_fork_boundary(
     tmp_path: Path,
 ) -> None:
     journal = JsonlSessionJournal(tmp_path)
@@ -273,35 +275,31 @@ async def test_catalog_exposes_declared_lineage_and_ready_terminal_fork(
         {"agent": "worker", "lineage_id": "session-stable"},
     )
     initial = await journal.append(
-        JournalRecordType.STATE_SNAPSHOT,
-        {"state": {}, "state_digest": "initial", "reason": "initial"},
-        record_id="initial",
+        JournalRecordType.STEP_COMMITTED,
+        _commit_payload(),
+        record_id="parent:turn:0:committed",
     )
     terminal_commit = await journal.append(
         JournalRecordType.STEP_COMMITTED,
-        _commit_payload(step_id=1),
-        record_id="terminal-commit",
-    )
-    terminal_snapshot = await journal.append(
-        JournalRecordType.STATE_SNAPSHOT,
-        {"state": {}, "state_digest": "terminal", "reason": "terminal"},
-        record_id="terminal-snapshot",
+        _commit_payload(turn=1),
+        record_id="parent:turn:1:committed",
     )
     await journal.append(
         JournalRecordType.RUN_COMPLETED,
-        {"stop_reason": "completed"},
-        record_id="completed",
+        {"status": "completed", "error": None},
+        record_id="parent:run:terminal",
     )
 
     parent = await JsonlRunCatalog(tmp_path).inspect_run("parent")
 
     assert parent.lineage_id == "session-stable"
-    assert parent.committed_position == terminal_snapshot
-    assert parent.continuation_position == initial
-    assert parent.continuation_position != terminal_commit
+    assert parent.committed_position == terminal_commit
+    assert parent.continuation_position == terminal_commit
+    assert parent.continuation_position != initial
     assert parent.can_resume is False
     assert parent.can_continue is True
     assert parent.has_terminal_state is True
+    assert parent.stop_reason == "completed"
 
     child = await journal.fork(parent.continuation_position, "child")
     await child.close()
@@ -315,33 +313,118 @@ async def test_catalog_exposes_declared_lineage_and_ready_terminal_fork(
 
 
 @pytest.mark.asyncio
-async def test_catalog_excludes_terminal_commit_before_snapshot_is_durable(
+async def test_catalog_continues_a_forked_journal_at_its_fork_boundary(
     tmp_path: Path,
 ) -> None:
-    journal = JsonlSessionJournal(tmp_path)
-    await journal.create("interrupted-terminal", {"agent": "worker"})
-    initial = await journal.append(
-        JournalRecordType.STATE_SNAPSHOT,
-        {"state": {}, "state_digest": "initial", "reason": "initial"},
-        record_id="initial",
-    )
-    terminal_payload = _commit_payload(step_id=1)
-    terminal_payload["terminal"] = True
-    terminal_commit = await journal.append(
+    parent = JsonlSessionJournal(tmp_path)
+    await parent.create("parent", {"agent": "worker"})
+    boundary = await parent.append(
         JournalRecordType.STEP_COMMITTED,
-        terminal_payload,
-        record_id="terminal-commit",
+        _commit_payload(),
+        record_id="parent:turn:0:committed",
     )
+    child = await parent.fork(boundary, "child")
+    await child.close()
+    await parent.close()
 
-    handle = await JsonlRunCatalog(tmp_path).inspect_run("interrupted-terminal")
+    handle = await JsonlRunCatalog(tmp_path).inspect_run("child")
 
     assert handle.status is RunStatus.RESUMABLE
     assert handle.can_resume is True
-    assert handle.committed_position == terminal_commit
-    assert handle.continuation_position == initial
-    assert handle.has_terminal_state is True
+    assert handle.committed_position is not None
+    assert handle.continuation_position is not None
+    # Without an own commit, the continuation point is the fork boundary:
+    # the last inherited record of the embedded prefix.
+    assert handle.continuation_position.record_id.endswith(
+        "parent:turn:0:committed"
+    )
+    assert handle.has_terminal_state is False
 
-    await journal.close()
+
+@pytest.mark.asyncio
+async def test_catalog_fails_closed_on_old_payload_shapes(tmp_path: Path) -> None:
+    # Retired commit shapes are rejected at the shared index boundary as soon
+    # as they are appended...
+    legacy_commit = JsonlSessionJournal(tmp_path / "legacy-commit")
+    await legacy_commit.create("run", {})
+    with pytest.raises(JournalCorruptionError):
+        await legacy_commit.append(
+            JournalRecordType.STEP_COMMITTED,
+            {"step_id": 0, "terminal_record_ids": []},
+            record_id="run:turn:0:committed",
+        )
+    await legacy_commit.close()
+
+    # ...and a legacy journal found on disk fails closed at catalog read.
+    legacy_dir = tmp_path / "legacy-on-disk" / "run"
+    legacy_dir.mkdir(parents=True)
+    start = JournalRecord.create(
+        seq=1,
+        record_id="run:start",
+        type=JournalRecordType.RUN_STARTED,
+        run_id="run",
+        payload={},
+    )
+    legacy_step = JournalRecord.create(
+        seq=2,
+        record_id="run:turn:0:committed",
+        type=JournalRecordType.STEP_COMMITTED,
+        run_id="run",
+        payload={},
+    ).to_dict()
+    legacy_step["payload"] = {"step_id": 0, "terminal_record_ids": []}
+    (legacy_dir / "journal.jsonl").write_text(
+        json.dumps(start.to_dict()) + "\n" + json.dumps(legacy_step) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(JournalCorruptionError):
+        await JsonlRunCatalog(tmp_path / "legacy-on-disk").inspect_run("run")
+
+    legacy_terminal = JsonlSessionJournal(tmp_path / "legacy-terminal")
+    await legacy_terminal.create("run", {})
+    await legacy_terminal.append(
+        JournalRecordType.RUN_COMPLETED,
+        {"stop_reason": "completed"},
+        record_id="run:run:terminal",
+    )
+    await legacy_terminal.close()
+    with pytest.raises(JournalCorruptionError):
+        await JsonlRunCatalog(tmp_path / "legacy-terminal").inspect_run("run")
+
+    legacy_input = JsonlSessionJournal(tmp_path / "legacy-input")
+    await legacy_input.create("run", {})
+    await legacy_input.append(
+        JournalRecordType.INPUT_ACCEPTED,
+        {"task": "inspect target"},
+        record_id="run:input",
+    )
+    await legacy_input.close()
+    with pytest.raises(JournalCorruptionError):
+        await JsonlRunCatalog(tmp_path / "legacy-input").inspect_run("run")
+
+    snapshot_run = tmp_path / "legacy-snapshot" / "run"
+    snapshot_run.mkdir(parents=True)
+    record = JournalRecord.create(
+        seq=1,
+        record_id="run:start",
+        type=JournalRecordType.RUN_STARTED,
+        run_id="run",
+        payload={},
+    )
+    snapshot = JournalRecord.create(
+        seq=2,
+        record_id="run:snapshot",
+        type=JournalRecordType.RUN_STARTED,
+        run_id="run",
+        payload={},
+    ).to_dict()
+    snapshot["type"] = "state.snapshot"
+    (snapshot_run / "journal.jsonl").write_text(
+        json.dumps(record.to_dict()) + "\n" + json.dumps(snapshot) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(JournalCorruptionError):
+        await JsonlRunCatalog(tmp_path / "legacy-snapshot").inspect_run("run")
 
 
 @pytest.mark.asyncio
@@ -349,9 +432,9 @@ async def test_catalog_rejects_missing_parent_and_lineage_cycle(tmp_path: Path) 
     parent = JsonlSessionJournal(tmp_path)
     await parent.create("parent", {})
     boundary = await parent.append(
-        JournalRecordType.STATE_SNAPSHOT,
-        {"state": {}, "state_digest": "digest", "reason": "initial"},
-        record_id="boundary",
+        JournalRecordType.STEP_COMMITTED,
+        _commit_payload(),
+        record_id="parent:turn:0:committed",
     )
     child = await parent.fork(boundary, "child")
     await child.close()
@@ -385,9 +468,13 @@ async def test_catalog_rejects_missing_parent_and_lineage_cycle(tmp_path: Path) 
         JournalRecord.create(
             seq=3,
             record_id="a:boundary",
-            type=JournalRecordType.STATE_SNAPSHOT,
+            type=JournalRecordType.STEP_COMMITTED,
             run_id="a",
-            payload={},
+            payload={
+                "turn": 0,
+                "transcript_record_ids": [],
+                "tool_terminal_record_ids": [],
+            },
         ),
     ]
     b_records = [

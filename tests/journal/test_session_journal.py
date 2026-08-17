@@ -772,13 +772,11 @@ async def test_fork_creates_an_independently_replayable_journal(tmp_path: Path) 
     position = await parent.append(
         JournalRecordType.STEP_COMMITTED,
         {
-            "step_id": 0,
-            "consumed_terminal_ids": [],
-            "state_delta": [],
-            "before_digest": "same",
-            "after_digest": "same",
+            "turn": 0,
+            "transcript_record_ids": [],
+            "tool_terminal_record_ids": [],
         },
-        record_id="parent-step",
+        record_id="parent:turn:0:committed",
     )
 
     child = await parent.fork(position, "child")
@@ -790,7 +788,7 @@ async def test_fork_creates_an_independently_replayable_journal(tmp_path: Path) 
         JournalRecordType.RUN_STARTED,
         JournalRecordType.RUN_FORKED,
     ]
-    assert inherited[-1].payload["origin_record_id"] == "parent-step"
+    assert inherited[-1].payload["origin_record_id"] == "parent:turn:0:committed"
     assert inherited[-1].payload["record"]["type"] == "step.committed"
     assert (
         json.loads(child.path.read_text(encoding="utf-8").splitlines()[0])["run_id"]
@@ -804,8 +802,28 @@ async def test_committed_tool_transaction_lookup_rebuilds_and_isolated(
 ) -> None:
     journal = JsonlSessionJournal(tmp_path)
     await journal.create("run-1", {})
-    terminal_id = "transaction-1:tool:0:terminal"
+    terminal_id = "run-1:turn:3:tool:call-1:terminal"
+    transcript_id = "run-1:turn:3:transcript:0"
     reference = JournalRecordRef("run-1", terminal_id)
+    await journal.append(
+        JournalRecordType.TRANSCRIPT_MESSAGE,
+        {
+            "message": {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "tool_name": "inspect",
+                "result": {
+                    "status": "timed_out",
+                    "output": {"process_status": "running"},
+                    "error": "",
+                    "metadata": {"evidence_id": "evidence-1"},
+                    "model_output": "service is reachable",
+                },
+                "timestamp": 1.0,
+            }
+        },
+        record_id=transcript_id,
+    )
     await journal.append(
         JournalRecordType.TOOL_TERMINAL,
         {
@@ -816,13 +834,7 @@ async def test_committed_tool_transaction_lookup_rebuilds_and_isolated(
                 "name": "inspect",
                 "arguments": {"target": "service"},
             },
-            "result": {
-                "status": "timed_out",
-                "output": {"process_status": "running"},
-                "error": "",
-                "metadata": {"evidence_id": "evidence-1"},
-                "model_output": "service is reachable",
-            },
+            "message_record_id": transcript_id,
         },
         record_id=terminal_id,
     )
@@ -833,10 +845,10 @@ async def test_committed_tool_transaction_lookup_rebuilds_and_isolated(
         JournalRecordType.STEP_COMMITTED,
         {
             "turn": 3,
-            "messages": [],
-            "terminal_record_ids": [terminal_id],
+            "transcript_record_ids": [transcript_id],
+            "tool_terminal_record_ids": [terminal_id],
         },
-        record_id="transaction-1:committed",
+        record_id="run-1:turn:3:committed",
     )
     transaction = journal.find_tool_transaction(reference)
 
@@ -868,8 +880,27 @@ async def test_fork_resolves_inherited_committed_tool_origin(
 ) -> None:
     parent = JsonlSessionJournal(tmp_path)
     await parent.create("parent", {})
-    terminal_id = "transaction-1:tool:0:terminal"
+    terminal_id = "parent:turn:0:tool:call-1:terminal"
+    transcript_id = "parent:turn:0:transcript:0"
     reference = JournalRecordRef("parent", terminal_id)
+    await parent.append(
+        JournalRecordType.TRANSCRIPT_MESSAGE,
+        {
+            "message": {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "tool_name": "inspect",
+                "result": {
+                    "status": "success",
+                    "output": "canonical",
+                    "error": None,
+                    "metadata": {},
+                },
+                "timestamp": 1.0,
+            }
+        },
+        record_id=transcript_id,
+    )
     await parent.append(
         JournalRecordType.TOOL_TERMINAL,
         {
@@ -880,12 +911,7 @@ async def test_fork_resolves_inherited_committed_tool_origin(
                 "name": "inspect",
                 "arguments": {},
             },
-            "result": {
-                "status": "success",
-                "output": "canonical",
-                "error": None,
-                "metadata": {},
-            },
+            "message_record_id": transcript_id,
         },
         record_id=terminal_id,
     )
@@ -893,10 +919,10 @@ async def test_fork_resolves_inherited_committed_tool_origin(
         JournalRecordType.STEP_COMMITTED,
         {
             "turn": 0,
-            "messages": [],
-            "terminal_record_ids": [terminal_id],
+            "transcript_record_ids": [transcript_id],
+            "tool_terminal_record_ids": [terminal_id],
         },
-        record_id="transaction-1:committed",
+        record_id="parent:turn:0:committed",
     )
 
     child = await parent.fork(position, "child")

@@ -110,8 +110,49 @@ class AgentLoopResult:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True, slots=True)
+class TurnConfigSnapshot:
+    """One turn's frozen model, thinking and Tool configuration.
+
+    The loop computes this snapshot at every per-turn freeze and hands it to
+    the transaction boundary before the model request, so the durable log
+    cannot diverge from the effective configuration. ``api`` is the model
+    adapter's protocol identity; ``thinking_level`` is the effective level
+    after clamping to the turn's model capability; ``tool_names`` is the
+    frozen turn exposure in deterministic order.
+    """
+
+    provider: str
+    model: str
+    api: str
+    thinking_level: Optional[ThinkingLevel]
+    tool_names: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        for name in ("provider", "model", "api"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"TurnConfigSnapshot.{name} must be non-empty text")
+        if self.thinking_level is not None and not isinstance(
+            self.thinking_level, ThinkingLevel
+        ):
+            raise TypeError("thinking_level must be a ThinkingLevel or None")
+        if not isinstance(self.tool_names, tuple) or not all(
+            isinstance(name, str) and name for name in self.tool_names
+        ):
+            raise TypeError("tool_names must be a tuple of non-empty strings")
+
+
 class TurnTransactionBoundary(ToolTransactionBoundary, Protocol):
     """Durable barriers the loop records around model and Tool side effects."""
+
+    async def input_accepted(self, prompts: Tuple[Message, ...]) -> None:
+        """Record the run's accepted prompts before the first model side effect."""
+        ...
+
+    async def turn_frozen(self, turn: int, config: TurnConfigSnapshot) -> None:
+        """Record one turn's frozen configuration before its model request."""
+        ...
 
     async def model_terminal(
         self, turn: int, request: ModelRequest, message: AssistantMessage
@@ -289,6 +330,10 @@ async def run_agent_loop(
         for prompt in prompts:
             await emit_to(emit, MessageStart(message=prompt))
             await emit_to(emit, MessageEnd(message=prompt))
+        if config.transaction is not None:
+            # The accepted prompts are durable before the first model side
+            # effect; continuing a run adds no new input record.
+            await config.transaction.input_accepted(tuple(prompts))
         return await _run_loop(
             context, new_messages, config, emit, cancel_token, guard, turn=0
         )
@@ -655,6 +700,21 @@ def _turn_thinking_level(
     return clamp_thinking_level(requested, supported)
 
 
+def _turn_config_snapshot(
+    exposure: ToolExposure, config: AgentLoopConfig
+) -> TurnConfigSnapshot:
+    """Freeze this turn's durable model/thinking/Tool configuration."""
+
+    model = config.model
+    return TurnConfigSnapshot(
+        provider=model.provider_name,
+        model=model.model,
+        api=_model_protocol(model),
+        thinking_level=_turn_thinking_level(model, config.thinking_level),
+        tool_names=tuple(exposure.list_tools()),
+    )
+
+
 async def _run_loop(
     context: AgentContext,
     new_messages: List[Message],
@@ -712,6 +772,12 @@ async def _run_loop(
             pending = []
 
             exposure = _turn_exposure(context)
+            if config.transaction is not None:
+                # One immutable model/thinking/Tool snapshot per turn, durable
+                # before the model request it governs.
+                await config.transaction.turn_frozen(
+                    turn, _turn_config_snapshot(exposure, config)
+                )
             message, status_override = await _stream_assistant(
                 turn, context, new_messages, exposure, config, emit, token
             )
@@ -1504,6 +1570,7 @@ __all__ = [
     "AgentLoopResult",
     "AgentRunStatus",
     "NextTurnUpdate",
+    "TurnConfigSnapshot",
     "TurnHookContext",
     "TurnTransactionBoundary",
     "agent_loop",

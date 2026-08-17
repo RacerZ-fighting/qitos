@@ -99,33 +99,39 @@ AgentModule, and the old Engine is absent from exports, examples and tests.
 
 Scope per the architecture document §4; concretely:
 
-- Transcript entries (`transcript.message`, `compaction`) own message content;
-  operation records reference them by record id. `model.completed` keeps the
-  exact request audit plus the assistant transcript reference;
-  `tool.terminal` keeps the call plus the terminal transcript reference;
-  `step.committed` becomes a pure commit marker of record references;
-  `run.completed`/`run.interrupted` stop embedding messages.
-- `input.accepted` gains a writer and commits, with the initial prompt
-  transcript entries, before the first model side effect.
-- Pure recovery replays the log into transcript, configuration lineage, open
-  Tool operations, unconsumed runtime inputs and terminal outcome; crash-torn
-  Tool admissions close with explicit cancelled terminals; contradictions fail
-  closed.
-- Memory and JSONL journal implementations share one conformance suite.
+- (done in S2a) Transcript entries (`transcript.message`, `compaction`) own
+  message content; operation records reference them by record id.
+  `model.completed` keeps the exact request audit plus the assistant
+  transcript reference; `tool.terminal` keeps the call plus the terminal
+  transcript reference; `step.committed` is a pure commit marker of record
+  references; `run.completed`/`run.interrupted` no longer embed messages.
+- (done in S2a) `input.accepted` gains a writer and commits, with the initial
+  prompt transcript entries, before the first model side effect.
+- (done in S2a) Pure recovery (`qitos.kit.journal.recovery.recover_session`)
+  replays the log into transcript, configuration lineage, open Tool
+  operations, unconsumed runtime inputs and terminal outcome; crash-torn Tool
+  admissions close with explicit cancelled terminals
+  (`close_crashed_tool_calls`); contradictions fail closed.
+- (done in S2a) Memory and JSONL journal implementations share one
+  conformance suite (`InMemorySessionJournal`,
+  `tests/journal/test_session_journal_conformance.py`).
 - Resume/fork restore the façade (transcript, thinking level, configuration
   lineage) and verify the provided Model identity and Tool registry coverage
-  with typed rejections; the run's turn counter continues from recovery.
+  with typed rejections; the run's turn counter continues from recovery
+  (S2b; the recorder already accepts the recovered seed).
 - Compaction: manual at idle, automatic token-threshold at idle boundaries,
   and one-shot overflow recovery; Pi's cut-point rule (never between a Tool
-  call and its result) and summary-as-user-message projection.
+  call and its result) and summary-as-user-message projection (S2b; the
+  `compaction` record codec and recovery projection are done in S2a).
 - Unconsumed background Child completion inputs re-project from terminal facts
   without redelivering foreground results or inherited fork facts
-  (`runtime_input.consumed` records consumption).
+  (`runtime_input.consumed` records consumption — record and recovery folding
+  done in S2a; harness re-projection wiring is S2b).
 - Reattach the trace writer to the loop/façade event stream so new runs emit
   trace artifacts again; `qita` keeps reading the same three-file layout.
-- The run catalog reads the new payload shapes; Engine-era payload readers
-  (`stop_reason`, `reason`, `task`, terminal flags, legacy usage fallback)
-  are removed in favor of fail-closed decoders.
+- (done in S2a) The run catalog reads the new payload shapes; Engine-era
+  payload readers (`stop_reason`, `reason`, `task`, terminal flags, legacy
+  usage fallback) are removed in favor of fail-closed decoders.
 
 Done when recovery never branches through a live Engine or guesses side
 effects, and crash recovery is demonstrated at the model terminal, tool

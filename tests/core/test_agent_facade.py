@@ -273,7 +273,13 @@ async def test_transaction_factory_receives_run_id_and_records() -> None:
     run_id, transaction = transactions[0]
     assert run_id
     kinds = [record[0] for record in transaction.records]
-    assert kinds == ["model_terminal", "turn_committed", "run_terminal"]
+    assert kinds == [
+        "input_accepted",
+        "turn_frozen",
+        "model_terminal",
+        "turn_committed",
+        "run_terminal",
+    ]
 
 
 @pytest.mark.asyncio
@@ -347,7 +353,13 @@ async def test_listener_fault_propagates_and_run_is_terminalized() -> None:
         await agent.prompt("go")
     # The run still reached its durable terminal state first.
     kinds = [record[0] for record in transaction.records]
-    assert kinds == ["model_terminal", "turn_committed", "run_terminal"]
+    assert kinds == [
+        "input_accepted",
+        "turn_frozen",
+        "model_terminal",
+        "turn_committed",
+        "run_terminal",
+    ]
     assert transaction.records[-1] == ("run_terminal", "failed")
     assert agent.error_message == "listener bug"
     await agent.wait_for_idle()
@@ -391,6 +403,8 @@ async def test_message_listener_fault_follows_model_terminal_record() -> None:
         await agent.prompt("go")
 
     assert [record[0] for record in transaction.records] == [
+        "input_accepted",
+        "turn_frozen",
         "model_terminal",
         "run_terminal",
     ]
@@ -423,6 +437,8 @@ async def test_tool_listener_fault_preserves_call_result_pair() -> None:
     # The façade listener failed before it could project the ToolResult event,
     # but both the in-memory transcript and durable transaction stay paired.
     assert [record[0] for record in transaction.records] == [
+        "input_accepted",
+        "turn_frozen",
         "model_terminal",
         "tool_started",
         "tool_terminal",
@@ -624,6 +640,8 @@ async def test_abort_interrupts_hanging_tool_and_preserves_terminal_result() -> 
     assert tool_message.tool_call_id == "c1"
     assert tool_message.result.status == "cancelled"
     assert [record[0] for record in transaction.records] == [
+        "input_accepted",
+        "turn_frozen",
         "model_terminal",
         "tool_started",
         "tool_terminal",

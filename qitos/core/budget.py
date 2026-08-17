@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .journal import (
@@ -202,7 +202,6 @@ class BudgetLedger:
             if record.type is not JournalRecordType.BUDGET_COMMITTED:
                 continue
             self._apply(_BudgetCommit.from_record(record))
-        self._restore_legacy_usage(effective_records)
         self._journal = journal
         self._root_run_id = normalized_run_id
 
@@ -245,8 +244,6 @@ class BudgetLedger:
 
         Recovery uses this to attribute a Root budget crossing to the Child
         that observed it, without applying later sibling usage retroactively.
-        Journals restored through legacy aggregate records have no reliable
-        transaction order, so attribution is unavailable rather than guessed.
         """
 
         normalized = str(origin_run_id or "").strip()
@@ -323,97 +320,6 @@ class BudgetLedger:
             self._origin_snapshots[commit.origin_run_id] = self.snapshot()
         else:
             self._ordered_attribution_complete = False
-
-    def _restore_legacy_usage(self, records: tuple[JournalRecord, ...]) -> None:
-        """Recover journals written before per-transaction budget records."""
-
-        for record in records:
-            if record.type is not JournalRecordType.MODEL_COMPLETED:
-                continue
-            payload = record.payload
-            transaction_id = str(payload.get("transaction_id") or "").strip()
-            raw_response = payload.get("model_response")
-            if not transaction_id or not isinstance(raw_response, Mapping):
-                continue
-            key = (record.run_id, transaction_id)
-            if key in self._commits:
-                continue
-            raw_usage = raw_response.get("usage")
-            tokens = _usage_total_tokens(raw_usage)
-            raw_cost = raw_response.get("cost_usd", 0.0)
-            cost = (
-                max(0.0, float(raw_cost))
-                if isinstance(raw_cost, (int, float))
-                and not isinstance(raw_cost, bool)
-                and math.isfinite(float(raw_cost))
-                else 0.0
-            )
-            self._apply(
-                _BudgetCommit.create(
-                    origin_run_id=record.run_id,
-                    transaction_id=transaction_id,
-                    tokens=tokens,
-                    cost_usd=cost,
-                    usage_complete=bool(raw_response.get("usage_complete", False)),
-                    cost_complete=bool(raw_response.get("cost_complete", False)),
-                ),
-                ordered=False,
-            )
-
-        committed_origins = {origin for origin, _transaction in self._commits}
-        for record in records:
-            if record.type is not JournalRecordType.CHILD_TERMINAL:
-                continue
-            payload = record.payload
-            child_run_id = str(payload.get("child_run_id") or "").strip()
-            if not child_run_id or child_run_id in committed_origins:
-                continue
-            raw_tokens = payload.get("total_tokens", 0)
-            tokens = (
-                max(0, raw_tokens)
-                if isinstance(raw_tokens, int) and not isinstance(raw_tokens, bool)
-                else 0
-            )
-            raw_cost = payload.get("total_cost_usd", 0.0)
-            cost = (
-                max(0.0, float(raw_cost))
-                if isinstance(raw_cost, (int, float))
-                and not isinstance(raw_cost, bool)
-                and math.isfinite(float(raw_cost))
-                else 0.0
-            )
-            self._apply(
-                _BudgetCommit.create(
-                    origin_run_id=child_run_id,
-                    transaction_id=f"legacy-child-terminal:{record.record_id}",
-                    tokens=tokens,
-                    cost_usd=cost,
-                    usage_complete=bool(payload.get("usage_complete", False)),
-                    cost_complete=bool(payload.get("cost_complete", False)),
-                ),
-                ordered=False,
-            )
-
-
-def _usage_total_tokens(value: object) -> int:
-    if not isinstance(value, Mapping):
-        return 0
-    total = value.get("total_tokens")
-    if isinstance(total, int) and not isinstance(total, bool):
-        return max(0, total)
-    prompt = value.get("prompt_tokens", value.get("input_tokens", 0))
-    completion = value.get("completion_tokens", value.get("output_tokens", 0))
-    prompt_tokens = (
-        max(0, prompt)
-        if isinstance(prompt, int) and not isinstance(prompt, bool)
-        else 0
-    )
-    completion_tokens = (
-        max(0, completion)
-        if isinstance(completion, int) and not isinstance(completion, bool)
-        else 0
-    )
-    return prompt_tokens + completion_tokens
 
 
 __all__ = ["BudgetLedger", "BudgetSnapshot"]

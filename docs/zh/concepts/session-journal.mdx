@@ -11,26 +11,62 @@ writer lease；其他进程若尝试同时写入，会得到 `JournalOwnershipEr
 第二个 writer。关闭后的实例永久拒绝修改，但仍可从隔离的内存值 replay 或查询已提交工具事务，
 便于诊断。
 
+## Transcript 与 operation 记录
+
+一份 Journal 在同一序列中携带两类记录。Transcript 条目拥有消息内容：
+`transcript.message`（user、assistant 与 Tool 结果消息）和 `compaction`（摘要加上
+第一个保留的 transcript 引用）。Operation 记录拥有生命周期与副作用边界，并按
+record id 引用 transcript 条目——消息内容只出现在恰好一条记录中。
+`model.completed` 保留精确的请求审计与 assistant transcript 引用；`tool.terminal`
+保留调用与终态 transcript 引用；`step.committed` 是纯提交标记，列出该 turn 的
+transcript 与 Tool 终态引用；`run.completed` / `run.interrupted` 只携带终态状态与
+错误。携带引用的记录通过 `journal.inherited` 包装 fail closed 解析。
+
 ## Loop 事务顺序
 
-loop 的 `JournalTurnTransaction` 按以下顺序记录每个 turn：
+loop 的 `JournalTurnTransaction` 按以下顺序记录每次运行：
 
-1. `model.completed`：一次已终结的模型事务（成功或失败）
-2. `tool.started`：一次已准入 ToolCall 的持久化执行许可
-3. 执行 Handler
-4. 生成唯一 canonical `ToolResult`
-5. `tool.terminal`
-6. `step.committed`：该 turn 提交的消息，以及链接其 Tool 终态记录的
-   `terminal_record_ids`
+1. 每个已接受的 prompt 一条 `transcript.message`，然后是列出其 record id 的
+   `input.accepted`——在第一个模型副作用之前
+2. 每 turn 冻结差异 `model.change` / `thinking.change` / `tools.change`
+   （首个 turn 写完整三元组，之后只写差异）
+3. assistant 消息的 `transcript.message`，然后是 `model.completed`
+4. `tool.started`：一次已准入 ToolCall 的持久化执行许可
+5. 执行 Handler 并生成唯一 canonical `ToolResult`
+6. Tool 结果消息的 `transcript.message`，然后是 `tool.terminal`
+7. `step.committed`：该 turn 的提交标记
 
 `tool.started` 是持久化执行许可；写入失败时不能执行 Handler。终态结果只持久化一次，
 并且与进入 transcript 的值是同一个深度不可变值。并行 Tool 批次按输入顺序提交结果，
 每个已准入调用（包括拒绝、超时、取消）都恰好得到一个终态结果。
 
 一次运行恰好以一个终态记录结束：`run.completed` 携带终态状态（`completed`、`failed`、
-`max_turns`、`deadline_exceeded`）与本次运行新增的消息；被中止的运行改为写入
+`max_turns`、`deadline_exceeded`）；被中止的运行改为写入
 `run.interrupted`。外部任务取消与故障会先终结已开始的工作和运行记录再重新抛出，
 因此一次运行永远不会缺少终态记录。
+
+## 恢复
+
+`recover_session(records)` 将一份 Journal 重放为类型化 transcript、compaction 投影
+后的上下文、配置 lineage（模型、thinking 级别、活跃 Tool——包括由早前 Tool 结果激活
+的 Tool）、未完成的 Tool 操作、未消费的 runtime 输入以及终态结果。它是对一份 Journal
+重放的纯函数——继承的 fork 前缀通过包装解析，因此一份 fork 出的 Journal 自包含完整
+恢复真相——并在矛盾处 fail closed 抛出 `JournalCorruptionError`：悬空的 transcript
+引用、缺少对应 `tool.terminal` 的 Tool transcript 条目、覆盖未完成调用的 commit 或运行
+终态、未知 commit 引用、冲突的运行终态、运行终态之后的记录、turn 回退、非法
+compaction 切点，以及旧 Engine 时代的载荷形状。
+
+已准入但从未终结、或从未准入的 Tool 调用，在没有 commit 或运行终态覆盖时是合法的崩溃
+窗口。`close_crashed_tool_calls(journal, recovered)` 关闭该窗口而不重新执行任何操作、
+不猜测副作用：每个调用得到一条显式 cancelled 的 `tool.terminal` 及其 transcript 条目
+（已持久化的撕裂条目会被链接而不是替换），以及一条收尾的 `step.committed`。合成的错误
+文本区分"已开始、结果未知"与"从未准入、无副作用"。record id 与载荷是恢复后 Journal
+的确定性函数，因此重复关闭不会重复追加。
+
+`InMemorySessionJournal` 在内存中实现同一个 `SessionJournal` 契约——持久化范围限定在
+共享的 `InMemoryJournalStore`——并与 JSONL 实现共享同一套一致性测试。已发布 runtime
+输入的消费以 `runtime_input.consumed` 写入 journal，因此未消费的输入在恢复后恰好重新
+投影一次，而继承的 fork 事实永远不会被重新投递。
 
 ## 持久化与投影
 
@@ -89,7 +125,8 @@ if transaction is not None:
 ```
 
 该查询是只读的，只有在终态记录被 `step.committed` 点名后才返回新的类型化
-`ToolTransaction`。打开 journal 时会从 canonical JSONL 记录重建这份查询视图。fork 通过
+`ToolTransaction`；结果从被引用的 `transcript.message` 记录联接得到，引用缺失或不
+匹配时 fail closed。打开 journal 时会从 canonical JSONL 记录重建这份查询视图。fork 通过
 父级来源引用解析继承的终态记录，子级不会把结果复制到第二个存储。未知、未提交或被
 子级改名的引用返回 `None`。只有 loop 的记录 schema 可以解码；旧 Engine taxonomy 写入的
 记录会 fail closed。

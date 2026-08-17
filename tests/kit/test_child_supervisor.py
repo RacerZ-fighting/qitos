@@ -1471,13 +1471,11 @@ async def test_fork_does_not_inherit_authority_over_parent_child(tmp_path) -> No
     position = await parent.append(
         JournalRecordType.STEP_COMMITTED,
         {
-            "step_id": 0,
-            "consumed_terminal_ids": [],
-            "state_delta": [],
-            "before_digest": "same",
-            "after_digest": "same",
+            "turn": 0,
+            "transcript_record_ids": [],
+            "tool_terminal_record_ids": [],
         },
-        record_id="parent-run:step:0",
+        record_id="parent-run:turn:0:committed",
     )
     child_journal = await parent.fork(position, "fork-run")
 

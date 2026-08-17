@@ -57,6 +57,19 @@ def _context(**kwargs: object) -> ChildLaunchContext:
     return ChildLaunchContext(parent_run_id="parent-run", **kwargs)
 
 
+def _terminal_result_payload(records, terminal):
+    """Join one tool.terminal with the transcript entry it references."""
+
+    referenced = terminal.payload["message_record_id"]
+    entry = next(
+        record
+        for record in records
+        if record.type is JournalRecordType.TRANSCRIPT_MESSAGE
+        and record.record_id == referenced
+    )
+    return entry.payload["message"]["result"]
+
+
 def _children_root(tmp_path):
     return tmp_path / "children"
 
@@ -168,7 +181,9 @@ async def test_child_tool_evidence_commits_in_order(tmp_path) -> None:
         tool_terminal[0].record_id
         == f"{result.child_run_id}:turn:0:tool:c1:terminal"
     )
-    assert tool_terminal[0].payload["result"]["output"] == "echo:ping"
+    assert _terminal_result_payload(child_records, tool_terminal[0])["output"] == (
+        "echo:ping"
+    )
     await supervisor.aclose()
 
 
@@ -911,65 +926,6 @@ async def test_recovery_attributes_root_budget_to_crossing_child_only(
 
 
 @pytest.mark.asyncio
-async def test_recovery_does_not_attribute_unordered_legacy_aggregate(
-    tmp_path,
-) -> None:
-    engine = AgentChildEngine(
-        model=ScriptedModel([text_events("answer", usage={"total_tokens": 2})]),
-        journal_factory=_child_journal_factory(tmp_path),
-    )
-    await engine.arun("inspect", run_id="run_childlegacy")
-    await engine.aclose()
-
-    parent_journal = JsonlSessionJournal(tmp_path / "parent")
-    await parent_journal.create("parent-run", {})
-    await parent_journal.append(
-        JournalRecordType.MODEL_COMPLETED,
-        {
-            "transaction_id": "legacy-root-model",
-            "model_response": {
-                "usage": {"prompt_tokens": 6, "completion_tokens": 4},
-            },
-        },
-        record_id="parent-run:model:legacy",
-    )
-    request = _request("inspect")
-    handle = ChildHandle(child_id="child-legacy", parent_run_id="parent-run")
-    await parent_journal.append(
-        JournalRecordType.CHILD_STARTED,
-        {
-            "handle": handle.to_dict(),
-            "request": request.to_dict(),
-            "child_run_id": "run_childlegacy",
-        },
-        record_id="parent-run:child:child-legacy:started",
-    )
-    ledger = BudgetLedger(max_tokens=1)
-    ledger.attach(
-        parent_journal,
-        root_run_id="parent-run",
-        records=await parent_journal.replay(),
-    )
-    assert ledger.snapshot().tokens_exhausted is True
-    assert ledger.snapshot_after_origin("run_childlegacy") is None
-    supervisor = ChildSupervisor(
-        invocation_factory=_unused_factory,
-        child_journal_factory=_child_journal_factory(tmp_path),
-    )
-
-    recovered = await supervisor.recover(
-        parent_run_id="parent-run",
-        journal=parent_journal,
-        budget_ledger=ledger,
-    )
-
-    assert len(recovered) == 1
-    assert recovered[0].status is ChildStatus.COMPLETED
-    await supervisor.aclose()
-    await parent_journal.close()
-
-
-@pytest.mark.asyncio
 async def test_recovery_rebuilds_interrupted_child_from_journal(tmp_path) -> None:
     started = asyncio.Event()
     never = asyncio.Event()
@@ -1262,8 +1218,9 @@ async def test_agent_tool_preserves_parent_parameter_scope_denial(tmp_path) -> N
         for record in records
         if record.type is JournalRecordType.TOOL_TERMINAL
     )
-    assert denied.payload["result"]["status"] == "denied"
-    assert denied.payload["result"]["metadata"]["permission_scope"] == "/secret"
+    denied_result = _terminal_result_payload(records, denied)
+    assert denied_result["status"] == "denied"
+    assert denied_result["metadata"]["permission_scope"] == "/secret"
     await agent_tool.aclose()
 
 
@@ -1569,7 +1526,7 @@ async def test_child_token_budget_blocks_tool_side_effects_in_exhausting_turn(
         for record in child_records
         if record.type is JournalRecordType.TOOL_TERMINAL
     )
-    assert terminal.payload["result"]["status"] == "denied"
+    assert _terminal_result_payload(child_records, terminal)["status"] == "denied"
     await supervisor.aclose()
 
 

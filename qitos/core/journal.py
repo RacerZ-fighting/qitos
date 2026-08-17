@@ -54,7 +54,12 @@ class JournalCommitState(str, Enum):
 class JournalRecordType(str, Enum):
     RUN_STARTED = "run.started"
     INPUT_ACCEPTED = "input.accepted"
+    TRANSCRIPT_MESSAGE = "transcript.message"
     MODEL_COMPLETED = "model.completed"
+    MODEL_CHANGE = "model.change"
+    THINKING_CHANGE = "thinking.change"
+    TOOLS_CHANGE = "tools.change"
+    COMPACTION = "compaction"
     BUDGET_COMMITTED = "budget.committed"
     TOOL_STARTED = "tool.started"
     TOOL_TERMINAL = "tool.terminal"
@@ -63,8 +68,8 @@ class JournalRecordType(str, Enum):
     CHILD_STARTED = "child.started"
     CHILD_TERMINAL = "child.terminal"
     RUNTIME_INPUT_POSTED = "runtime_input.posted"
+    RUNTIME_INPUT_CONSUMED = "runtime_input.consumed"
     STEP_COMMITTED = "step.committed"
-    STATE_SNAPSHOT = "state.snapshot"
     RUN_INTERRUPTED = "run.interrupted"
     RUN_COMPLETED = "run.completed"
     RUN_FORKED = "run.forked"
@@ -184,9 +189,11 @@ class JournalRecordRef:
 class ToolTransaction:
     """One committed canonical Tool terminal reconstructed from a Journal.
 
-    Only the minimal agent loop's schema is decodable: records carry ``turn``
-    and ``call`` (a ``ToolCall``). Records written by the retired Engine path
-    (``step_id`` / ``action_index`` / ``action``) fail closed at decode time.
+    Only the minimal agent loop's schema is decodable: the terminal record
+    carries ``turn``, ``call_id`` and ``call`` (a ``ToolCall``), and the
+    result is joined from the referenced ``transcript.message`` record.
+    Records written by the retired Engine path (``step_id`` /
+    ``action_index`` / ``action``) fail closed at decode time.
     """
 
     terminal: JournalRecordRef

@@ -124,6 +124,12 @@ class RecordingTransaction(TurnTransactionBoundary):
     def __init__(self) -> None:
         self.records: List[tuple[str, Any]] = []
 
+    async def input_accepted(self, prompts: tuple) -> None:
+        self.records.append(("input_accepted", len(prompts)))
+
+    async def turn_frozen(self, turn: int, config: Any) -> None:
+        self.records.append(("turn_frozen", turn, tuple(config.tool_names)))
+
     async def model_terminal(
         self, turn: int, request: ModelRequest, message: AssistantMessage
     ) -> None:

@@ -318,6 +318,8 @@ async def test_duplicate_provider_call_ids_preserve_evidence_and_fail_closed() -
     assert [call.arguments["text"] for call in assistant.tool_calls] == ["a", "b"]
     assert assistant.error == "assistant tool call ids must be unique"
     assert [record[0] for record in transaction.records] == [
+        "input_accepted",
+        "turn_frozen",
         "model_terminal",
         "turn_committed",
         "run_terminal",
@@ -655,10 +657,13 @@ async def test_transaction_barriers_wrap_model_and_tool_side_effects() -> None:
     assert result.status is AgentRunStatus.COMPLETED
     kinds = [record[0] for record in transaction.records]
     assert kinds == [
+        "input_accepted",
+        "turn_frozen",
         "model_terminal",
         "tool_started",
         "tool_terminal",
         "turn_committed",
+        "turn_frozen",
         "model_terminal",
         "turn_committed",
         "run_terminal",
@@ -942,6 +947,8 @@ async def test_after_step_requested_before_admission_finishes_one_turn() -> None
     assert result.status is AgentRunStatus.ABORTED
     assert len(model.requests) == 1
     assert [record[0] for record in transaction.records] == [
+        "input_accepted",
+        "turn_frozen",
         "model_terminal",
         "turn_committed",
         "run_terminal",
@@ -1034,8 +1041,13 @@ async def test_loop_task_cancellation_terminalizes_then_reraises() -> None:
 
     # Started work and the run reached durable terminal states first.
     kinds = [record[0] for record in transaction.records]
-    assert kinds == ["model_terminal", "run_terminal"]
-    assert transaction.records[1][1] == "aborted"
+    assert kinds == [
+        "input_accepted",
+        "turn_frozen",
+        "model_terminal",
+        "run_terminal",
+    ]
+    assert transaction.records[-1] == ("run_terminal", "aborted")
     assistant = context.messages[-1]
     assert isinstance(assistant, AssistantMessage)
     assert assistant.failed and "cancelled" in str(assistant.error)

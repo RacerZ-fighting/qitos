@@ -236,37 +236,21 @@ async def test_budget_ledger_restores_descendant_usage_from_root_jsonl(
 
 
 @pytest.mark.asyncio
-async def test_budget_ledger_recovers_legacy_root_and_child_usage(tmp_path) -> None:
+async def test_budget_ledger_attach_rejects_invalid_commit_shapes(tmp_path) -> None:
     journal = JsonlSessionJournal(tmp_path)
     await journal.create("root-run", {"agent": "root"})
     await journal.append(
-        JournalRecordType.MODEL_COMPLETED,
+        JournalRecordType.BUDGET_COMMITTED,
         {
+            "origin_run_id": "root-run",
             "transaction_id": "root-transaction",
-            "model_response": {
-                "usage": {"prompt_tokens": 7, "completion_tokens": 3},
-                "cost_usd": 1.5,
-            },
+            "tokens": 10,
+            "cost_usd": 1.0,
         },
-        record_id="root-run:model:legacy",
-    )
-    await journal.append(
-        JournalRecordType.CHILD_TERMINAL,
-        {
-            "child_run_id": "child-run",
-            "total_tokens": 30,
-        },
-        record_id="root-run:child:legacy:terminal",
+        record_id="root-run:budget:invalid",
     )
 
     ledger = BudgetLedger(max_tokens=100, max_cost_usd=10.0)
-    ledger.attach(journal, root_run_id="root-run", records=await journal.replay())
-
-    snapshot = ledger.snapshot()
-    assert snapshot.total_tokens == 40
-    assert snapshot.total_cost_usd == pytest.approx(1.5)
-    assert snapshot.usage_complete is False
-    assert snapshot.cost_complete is False
-    assert ledger.snapshot_after_origin("root-run") is None
-    assert ledger.snapshot_after_origin("child-run") is None
+    with pytest.raises(ValueError, match="budget.committed fields are invalid"):
+        ledger.attach(journal, root_run_id="root-run", records=await journal.replay())
     await journal.close()

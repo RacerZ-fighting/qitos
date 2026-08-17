@@ -18,7 +18,6 @@ from ...core.journal import (
     JournalClosedError,
     JournalCommitError,
     JournalCommitState,
-    JournalCorruptionError,
     JournalError,
     JournalOwnershipError,
     JournalPosition,
@@ -28,8 +27,6 @@ from ...core.journal import (
     ToolTransaction,
     resolve_inherited_record,
 )
-from ...core.message import ToolCall
-from ...core.tool_result import ToolResult
 from ._sqlite_index import (
     JournalFingerprint,
     JournalIndexError,
@@ -37,6 +34,7 @@ from ._sqlite_index import (
 )
 from ._paths import INDEX_FILENAME, JOURNAL_FILENAME, journal_path, validate_run_id
 from ._reader import read_journal_records
+from ._transaction_index import ToolTransactionIndex
 from ._writer_lease import JournalWriterLease
 
 FileSync = Callable[[int, str], None]
@@ -74,8 +72,7 @@ class JsonlSessionJournal:
         self._sqlite_index: SqliteJournalIndex | None = None
         self._lock = asyncio.Lock()
         self._query_lock = threading.RLock()
-        self._terminal_records: dict[JournalRecordRef, JournalRecord] = {}
-        self._terminal_commits: dict[JournalRecordRef, JournalRecord] = {}
+        self._tool_index = ToolTransactionIndex()
         self._poisoned_error: JournalCommitError | None = None
         self._owns_unstarted_run = False
 
@@ -400,55 +397,20 @@ class JsonlSessionJournal:
     ) -> ToolTransaction | None:
         """Return a fresh typed view of one committed Tool terminal."""
 
-        if not isinstance(reference, JournalRecordRef):
-            raise TypeError("reference must be a JournalRecordRef")
         self._require_records_available()
         with self._query_lock:
-            terminal = self._terminal_records.get(reference)
-            committed = self._terminal_commits.get(reference)
-            if terminal is None or committed is None:
-                return None
-            return _tool_transaction(terminal, committed)
+            return self._tool_index.find(reference)
 
     def _rebuild_tool_transaction_index(
         self,
         records: tuple[JournalRecord, ...] | list[JournalRecord],
     ) -> None:
         with self._query_lock:
-            self._terminal_records = {}
-            self._terminal_commits = {}
-            for record in records:
-                self._index_tool_transaction_record_locked(record)
+            self._tool_index.reset(records)
 
     def _index_tool_transaction_record(self, record: JournalRecord) -> None:
         with self._query_lock:
-            self._index_tool_transaction_record_locked(record)
-
-    def _index_tool_transaction_record_locked(self, record: JournalRecord) -> None:
-        effective = resolve_inherited_record(record)
-        if effective.type is JournalRecordType.TOOL_TERMINAL:
-            reference = JournalRecordRef(effective.run_id, effective.record_id)
-            existing = self._terminal_records.get(reference)
-            if existing is not None and existing.to_dict() != effective.to_dict():
-                raise JournalCorruptionError(
-                    "conflicting inherited Tool terminal reference"
-                )
-            self._terminal_records[reference] = effective
-            return
-        if effective.type is not JournalRecordType.STEP_COMMITTED:
-            return
-        raw_terminal_ids = effective.payload.get("terminal_record_ids", [])
-        if not isinstance(raw_terminal_ids, list) or any(
-            not isinstance(record_id, str) or not record_id
-            for record_id in raw_terminal_ids
-        ):
-            raise JournalCorruptionError(
-                "step.committed terminal_record_ids are invalid"
-            )
-        for record_id in raw_terminal_ids:
-            reference = JournalRecordRef(effective.run_id, record_id)
-            if reference in self._terminal_records:
-                self._terminal_commits[reference] = effective
+            self._tool_index.add(record)
 
     async def flush(self) -> None:
         async with self._lock:
@@ -477,10 +439,7 @@ class JsonlSessionJournal:
             source = self._records[parent_position.seq - 1]
             if source.record_id != parent_position.record_id:
                 raise ValueError("fork position does not match the journal")
-            if resolve_inherited_record(source).type not in {
-                JournalRecordType.STEP_COMMITTED,
-                JournalRecordType.STATE_SNAPSHOT,
-            }:
+            if resolve_inherited_record(source).type is not JournalRecordType.STEP_COMMITTED:
                 raise ValueError("fork position is not a committed boundary")
             inherited = tuple(
                 _clone_record(record) for record in self._records[: parent_position.seq]
@@ -777,43 +736,6 @@ async def _to_thread_settled(
 
 def _clone_record(record: JournalRecord) -> JournalRecord:
     return JournalRecord.from_dict(record.to_dict())
-
-
-def _tool_transaction(
-    terminal: JournalRecord,
-    committed: JournalRecord,
-) -> ToolTransaction:
-    payload = terminal.payload
-    raw_result = payload.get("result")
-    if not isinstance(raw_result, Mapping):
-        raise JournalCorruptionError("tool.terminal payload is invalid")
-    try:
-        result = ToolResult.from_dict(copy.deepcopy(dict(raw_result)))
-    except (TypeError, ValueError) as exc:
-        raise JournalCorruptionError("tool.terminal payload is invalid") from exc
-
-    # Only the minimal agent loop's schema is decodable: the typed ToolCall
-    # travels with the terminal record alongside its turn number. Retired
-    # Engine records (step_id/action_index/action) fail closed here.
-    raw_call = payload.get("call")
-    turn = payload.get("turn")
-    if (
-        isinstance(turn, bool)
-        or not isinstance(turn, int)
-        or turn < 0
-        or not isinstance(raw_call, Mapping)
-    ):
-        raise JournalCorruptionError("tool.terminal payload is invalid")
-    try:
-        call = ToolCall.from_dict(copy.deepcopy(dict(raw_call)))
-    except (TypeError, ValueError) as exc:
-        raise JournalCorruptionError("tool.terminal payload is invalid") from exc
-    return ToolTransaction(
-        terminal=JournalRecordRef(terminal.run_id, terminal.record_id),
-        committed_at=committed.position,
-        action=call,
-        result=result,
-    )
 
 
 def _file_sync_mode() -> str:
