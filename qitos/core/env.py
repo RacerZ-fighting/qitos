@@ -354,7 +354,7 @@ class Env(ABC):
             return await asyncio.shield(initialization)
         except asyncio.CancelledError as cancellation:
             # A worker thread cannot be stopped safely. Settle initialization
-            # before propagating cancellation so the Engine cannot tear down an
+            # before propagating cancellation so the Run owner cannot tear down an
             # Env while its legacy setup hook is still allocating resources.
             while not initialization.done():
                 try:

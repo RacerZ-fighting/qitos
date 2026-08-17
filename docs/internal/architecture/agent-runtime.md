@@ -2,13 +2,12 @@
 
 ## Status
 
-Accepted target architecture on 2026-08-16. Current releases still execute the
-`AgentModule + Engine` path; the migration replaces that path in place rather than
-publishing a parallel runtime.
+Accepted target architecture on 2026-08-16. The minimal loop and `Agent` façade are
+the only execution path; authoritative Session/Harness and Task/Plan work remains in
+the migration plan.
 
 This document owns the final QitOS runtime boundaries. The
-[migration plan](../plans/pi-aligned-agent-runtime.md) owns sequencing and deletion
-work; public API docs continue to describe shipped behavior until migration completes.
+[migration plan](../plans/pi-aligned-agent-runtime.md) owns the remaining sequencing.
 
 ## 1. Architecture
 
@@ -62,8 +61,10 @@ It does not discover resources, construct environments, load products, evaluate
 benchmarks, own Session storage or reduce application domain state.
 
 The loop receives a transaction boundary that can record model terminal, Tool admission,
-Tool terminal and turn commit around side effects. Every admitted or rejected ToolCall
-receives exactly one terminal ToolResult.
+Tool terminal and turn commit around side effects. Every uniquely identified call that
+reaches Tool admission, including a per-call rejection, receives exactly one terminal
+ToolResult. Duplicate raw call ids remain assistant protocol-failure evidence and the
+ambiguous batch is rejected before Tool admission or side effects.
 
 ## 4. Agent façade and Session Harness
 
@@ -140,7 +141,8 @@ loader or arbitrary loop/Session hooks.
   budget snapshot.
 - No model, Tool, user input or cleanup waits while a Session lock or storage
   transaction is held.
-- ToolCall and ToolResult remain paired across compact, resume, fork and interruption.
+- Admitted ToolCall and ToolResult remain paired across compact, resume, fork and
+  interruption; ambiguous duplicate ids never reach Tool admission.
 - Provider continuation, SQLite index, trace and projections are never recovery truth.
 - Cancellation is re-raised only after started work reaches durable terminal records.
 - Runtime and Child concurrency are bounded and leave no detached tasks.

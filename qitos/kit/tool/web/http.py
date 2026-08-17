@@ -9,7 +9,9 @@ from urllib.parse import urlparse
 import httpx
 
 from qitos.core.tool import BaseTool, RetryPolicy, ToolPermission, ToolSpec
+from qitos.core.tool_result import ToolResult
 from qitos.kit._html import extract_html_text
+from qitos.kit.tool.internal.results import error_result
 
 
 class HTTPRequest(BaseTool):
@@ -53,7 +55,7 @@ class HTTPRequest(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Execute an HTTP request and return a structured response payload.
 
@@ -82,10 +84,12 @@ class HTTPRequest(BaseTool):
         allow_redirects = bool(args.get("allow_redirects", True))
         max_content_chars = int(args.get("max_content_chars", 120_000))
         if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
-            return {"status": "error", "message": f"Unsupported HTTP method: {method}"}
+            return error_result(
+                {"status": "error", "message": f"Unsupported HTTP method: {method}"}
+            )
         err = self._validate_url(url)
         if err:
-            return {"status": "error", "message": err, "url": url}
+            return error_result({"status": "error", "message": err, "url": url})
 
         merged_headers = dict(self._headers)
         if headers:
@@ -115,7 +119,7 @@ class HTTPRequest(BaseTool):
             "status": "success" if response.status_code < 400 else "error",
             "ok": bool(response.ok),
             "method": method,
-            "url": response.url,
+            "url": str(response.url),
             "status_code": response.status_code,
             "reason": response.reason,
             "headers": dict(response.headers),
@@ -124,11 +128,13 @@ class HTTPRequest(BaseTool):
             "content_length": len(content),
             "truncated": truncated,
             "elapsed_ms": int(response.elapsed.total_seconds() * 1000),
-            "history": [h.url for h in response.history],
+            "history": [str(h.url) for h in response.history],
         }
         parsed_json = self._try_parse_json(response)
         if parsed_json is not None:
             payload["json"] = parsed_json
+        if response.status_code >= 400:
+            return error_result(payload)
         return payload
 
     async def aclose(self) -> None:
@@ -203,7 +209,7 @@ class HTTPGet(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Execute one HTTP GET request.
 
@@ -271,7 +277,7 @@ class HTTPPost(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Execute one HTTP POST request.
 
@@ -321,7 +327,7 @@ class HTMLExtractText(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Extract readable text from raw HTML.
 
@@ -336,7 +342,9 @@ class HTMLExtractText(BaseTool):
         max_chars = int(args.get("max_chars", 6000))
         keep_links = bool(args.get("keep_links", False))
         if not html:
-            return {"status": "error", "message": "html cannot be empty"}
+            return error_result(
+                {"status": "error", "message": "html cannot be empty"}
+            )
         try:
             text, title = self._to_text(html, keep_links=keep_links)
             if max_chars > 0 and len(text) > max_chars:
@@ -348,7 +356,7 @@ class HTMLExtractText(BaseTool):
                 "title": title,
             }
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return error_result({"status": "error", "message": str(e)})
 
     def _to_text(
         self, html: str, keep_links: bool = False

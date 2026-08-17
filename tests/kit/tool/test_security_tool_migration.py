@@ -1,6 +1,7 @@
 """Test that security research tools have needs_approval=True after migration."""
 
 from qitos.core.tool import FunctionTool
+from qitos.core.tool_result import ToolResult
 from qitos.kit.tool.experimental.security_research.security_audit import SecurityAuditToolSet
 from qitos.kit.tool.experimental.security_research.recon_toolset import ReconToolSet
 from qitos.kit.tool.experimental.security_research.password_toolset import PasswordToolSet
@@ -8,6 +9,34 @@ from qitos.kit.tool.experimental.security_research.web_test_toolset import WebTe
 from qitos.kit.tool.experimental.security_research.network_toolset import NetworkToolSet
 from qitos.kit.tool.experimental.security_research.vuln_scan_toolset import VulnScanToolSet
 from qitos.kit.tool.experimental.security_research.exploit_toolset import ExploitToolSet
+
+
+def test_exposed_security_tools_return_typed_errors(tmp_path):
+    missing = str(tmp_path / "missing")
+    results = [
+        ExploitToolSet(workspace_root=str(tmp_path)).port_forward(),
+        NetworkToolSet(workspace_root=str(tmp_path)).traffic_analyze(
+            pcap_file=missing
+        ),
+        PasswordToolSet(workspace_root=str(tmp_path)).john_crack(
+            hash_file=missing
+        ),
+        ReconToolSet(
+            authorized_targets=["example.com"], workspace_root=str(tmp_path)
+        ).host_discovery(target="other.example"),
+        VulnScanToolSet(
+            authorized_targets=["example.com"], workspace_root=str(tmp_path)
+        ).nuclei_scan(target="other.example"),
+        WebTestToolSet(
+            authorized_targets=["example.com"], workspace_root=str(tmp_path)
+        ).sqlmap_scan(target_url="https://other.example"),
+    ]
+
+    for result in results:
+        assert isinstance(result, ToolResult)
+        assert result.status == "error"
+        assert result.error
+        assert result.output["status"] == "error"
 
 
 def _all_tools_needs_approval(toolset_instance, tool_names):

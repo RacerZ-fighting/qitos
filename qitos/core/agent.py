@@ -30,6 +30,7 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    cast,
 )
 
 from .agent_events import (
@@ -54,7 +55,7 @@ from .agent_loop import (
     run_agent_loop,
     run_agent_loop_continue,
 )
-from .cancellation import CancelToken
+from .cancellation import CancelSignalView, CancelToken
 from .env import Env
 from .message import AssistantMessage, Message, ToolResultMessage, UserMessage
 from .tool_executor import AfterToolCallHook, BeforeToolCallHook
@@ -68,7 +69,7 @@ class QueueMode(str, Enum):
     """How a pending-message queue drains at its safe point."""
 
     ALL = "all"
-    ONE_AT_A_TIME = "one_at_a_time"
+    ONE_AT_A_TIME = "one-at-a-time"
 
 
 class AgentBusyError(RuntimeError):
@@ -76,7 +77,7 @@ class AgentBusyError(RuntimeError):
 
 
 class AgentListenerTimeoutError(RuntimeError):
-    """A listener ignored the run's cancellation or deadline while awaited."""
+    """A listener exceeded the active run's absolute deadline."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,8 +92,19 @@ AgentRunResult = Union[AgentLoopResult, AgentRunRejected]
 
 class _PendingMessageQueue:
     def __init__(self, mode: QueueMode) -> None:
+        self._mode = QueueMode.ONE_AT_A_TIME
         self.mode = mode
         self._messages: List[Message] = []
+
+    @property
+    def mode(self) -> QueueMode:
+        return self._mode
+
+    @mode.setter
+    def mode(self, value: QueueMode) -> None:
+        if not isinstance(value, QueueMode):
+            raise TypeError("queue mode must be a QueueMode")
+        self._mode = value
 
     def enqueue(self, message: Message) -> None:
         self._messages.append(message)
@@ -110,6 +122,12 @@ class _PendingMessageQueue:
         first, self._messages = self._messages[0], self._messages[1:]
         return [first]
 
+    def prepend(self, messages: Sequence[Message]) -> None:
+        """Restore an accepted batch that the loop never injected."""
+
+        if messages:
+            self._messages = list(messages) + self._messages
+
     def clear(self) -> None:
         self._messages = []
 
@@ -122,7 +140,12 @@ class _ActiveRun:
     idle: asyncio.Event = field(default_factory=asyncio.Event)
 
 
-AgentEventListener = Callable[[AgentEvent], Union[Awaitable[None], None]]
+AgentEventListener = Union[
+    Callable[[AgentEvent], Union[Awaitable[None], None]],
+    Callable[
+        [AgentEvent, CancelSignalView], Union[Awaitable[None], None]
+    ],
+]
 
 
 class Agent:
@@ -180,7 +203,7 @@ class Agent:
         self._prepare_next_turn = prepare_next_turn
 
         self._messages: List[Message] = []
-        self._listeners: List[AgentEventListener] = []
+        self._listeners: List[Tuple[AgentEventListener, bool]] = []
         self._steering = _PendingMessageQueue(steering_mode)
         self._follow_up = _PendingMessageQueue(follow_up_mode)
         self._active: Optional[_ActiveRun] = None
@@ -232,6 +255,12 @@ class Agent:
         return self._error_message
 
     @property
+    def signal(self) -> Optional[CancelSignalView]:
+        """Read-only cancellation signal for the active run, if any."""
+
+        return None if self._active is None else self._active.token.signal
+
+    @property
     def steering_mode(self) -> QueueMode:
         return self._steering.mode
 
@@ -256,16 +285,38 @@ class Agent:
         settlement: the run is not idle until every ``agent_end`` listener has
         finished. A raising listener is an implementation fault — it
         terminalizes the run's durable records and then propagates, since
-        persistence listeners must not silently lose records. A listener that
-        ignores the run's cancellation or deadline is cancelled and abandoned
-        with an :class:`AgentListenerTimeoutError` fault.
+        persistence listeners must not silently lose records. Pi-style
+        two-argument listeners receive the run's read-only
+        :class:`CancelSignalView`; existing one-argument listeners remain
+        accepted. Cancellation is visible through that signal but does not
+        forcibly cancel a listener; a configured absolute run deadline is the
+        bounded escape hatch. Cancelled listener tasks are awaited to
+        settlement.
         """
 
-        self._listeners.append(listener)
+        try:
+            signature = inspect.signature(listener)
+        except (TypeError, ValueError):
+            accepts_signal = False
+        else:
+            try:
+                signature.bind(object(), object())
+            except TypeError:
+                try:
+                    signature.bind(object())
+                except TypeError as exc:
+                    raise TypeError(
+                        "agent listener must accept (event) or (event, signal)"
+                    ) from exc
+                accepts_signal = False
+            else:
+                accepts_signal = True
+        subscription = (listener, accepts_signal)
+        self._listeners.append(subscription)
 
         def _unsubscribe() -> None:
             try:
-                self._listeners.remove(listener)
+                self._listeners.remove(subscription)
             except ValueError:
                 pass
 
@@ -394,6 +445,8 @@ class Agent:
         )
         steering_queue = self._steering
         follow_up_queue = self._follow_up
+        drained_steering: List[Message] = []
+        drained_follow_up: List[Message] = []
         skip_poll = skip_initial_steering_poll
 
         def _drain_steering() -> List[Message]:
@@ -401,7 +454,14 @@ class Agent:
             if skip_poll:
                 skip_poll = False
                 return []
-            return steering_queue.drain()
+            drained = steering_queue.drain()
+            drained_steering.extend(drained)
+            return drained
+
+        def _drain_follow_up() -> List[Message]:
+            drained = follow_up_queue.drain()
+            drained_follow_up.extend(drained)
+            return drained
 
         config = AgentLoopConfig(
             model=self._model,
@@ -419,7 +479,7 @@ class Agent:
             should_stop_after_turn=self._should_stop_after_turn,
             prepare_next_turn=self._prepare_next_turn,
             get_steering_messages=_drain_steering,
-            get_follow_up_messages=follow_up_queue.drain,
+            get_follow_up_messages=_drain_follow_up,
         )
         context = AgentContext(
             system_prompt=self._system_prompt,
@@ -440,13 +500,35 @@ class Agent:
             # everything else that raises here is an implementation fault
             # (listener, codec, persistence or loop bug) and propagates after
             # the loop has terminalized the run's durable records.
-            if prompts is None:
-                return await run_agent_loop_continue(
-                    context, config, self._process_event, token
-                )
-            return await run_agent_loop(
-                prompts, context, config, self._process_event, token
-            )
+            result: Optional[AgentLoopResult] = None
+            try:
+                if prompts is None:
+                    result = await run_agent_loop_continue(
+                        context, config, self._process_event, token
+                    )
+                else:
+                    result = await run_agent_loop(
+                        prompts, context, config, self._process_event, token
+                    )
+                return result
+            finally:
+                # A queue drain is an internal poll, not delivery. If a turn
+                # budget or fault stops the loop before those exact Message
+                # objects enter its context/result, restore them ahead of
+                # messages accepted later in the same run.
+                delivered = list(context.messages)
+                if result is not None:
+                    delivered.extend(result.messages)
+
+                def _undelivered(drained: Sequence[Message]) -> List[Message]:
+                    return [
+                        message
+                        for message in drained
+                        if not any(message is item for item in delivered)
+                    ]
+
+                steering_queue.prepend(_undelivered(drained_steering))
+                follow_up_queue.prepend(_undelivered(drained_follow_up))
 
         task = asyncio.create_task(_execute(), name=f"qitos-agent-{run_id[:8]}")
         active = _ActiveRun(task=task, token=token, deadline_monotonic=deadline)
@@ -459,6 +541,11 @@ class Agent:
             if not _done.cancelled():
                 fault = _done.exception()
                 if fault is not None:
+                    # Event listeners project façade state, but they are not
+                    # the canonical transcript owner. If projection fails,
+                    # recover the fully paired in-memory loop transcript
+                    # before exposing the implementation fault.
+                    self._messages = list(context.messages)
                     self._error_message = str(fault) or "agent run failed"
             active.idle.set()
             if self._active is active:
@@ -475,6 +562,16 @@ class Agent:
             while not task.done():
                 try:
                     await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    # Caller cancellation remains the public outcome, but only
+                    # after the owned run (including durable terminalization
+                    # and listener cleanup) has fully settled.
+                    break
+            while not active.idle.is_set():
+                try:
+                    await asyncio.shield(active.idle.wait())
                 except asyncio.CancelledError:
                     continue
             raise
@@ -499,8 +596,26 @@ class Agent:
         elif isinstance(event, AgentEnd):
             self._streaming_message = None
 
-        for listener in list(self._listeners):
-            outcome = listener(event)
+        active = self._active
+        if active is None:
+            raise RuntimeError("Agent listener invoked outside an active run")
+        signal: CancelSignalView = active.token.signal
+        for listener, accepts_signal in list(self._listeners):
+            if accepts_signal:
+                signal_listener = cast(
+                    Callable[
+                        [AgentEvent, CancelSignalView],
+                        Union[Awaitable[None], None],
+                    ],
+                    listener,
+                )
+                outcome = signal_listener(event, signal)
+            else:
+                event_listener = cast(
+                    Callable[[AgentEvent], Union[Awaitable[None], None]],
+                    listener,
+                )
+                outcome = event_listener(event)
             if inspect.isawaitable(outcome):
                 await self._bounded_listener(listener, outcome)
 
@@ -510,16 +625,17 @@ class Agent:
         """Await one listener bounded by the run's cancellation and deadline.
 
         Listener exceptions propagate as faults (persistence listeners must
-        not silently lose records). A listener that ignores cancellation or
-        outlives the run deadline is cancelled and abandoned, and an
-        :class:`AgentListenerTimeoutError` fails the run loudly instead of
-        blocking ``abort()``/``wait_for_idle()`` forever.
+        not silently lose records). Cancellation is exposed through the
+        listener's read-only signal but does not cancel the listener task: Pi
+        listeners settle in subscription order even for an aborted run. The
+        absolute run deadline remains the bounded escape hatch. A task that is
+        cancelled by its caller is still awaited during cleanup, so no callback
+        work is detached from the run.
         """
 
         active = self._active
-        token = active.token if active is not None else None
         deadline = active.deadline_monotonic if active is not None else None
-        if token is None and deadline is None:
+        if deadline is None:
             await outcome
             return
 
@@ -527,36 +643,27 @@ class Agent:
             await outcome
 
         task = asyncio.create_task(_await_outcome(), name="qitos-agent-listener")
-        tasks: set[asyncio.Task[Any]] = {task}
-        watcher: Optional[asyncio.Task[bool]] = None
-        if token is not None:
-            watcher = asyncio.create_task(token.wait_cancelled())
-            tasks.add(watcher)
-        remaining = (
-            None
-            if deadline is None
-            else max(0.0, deadline - time.monotonic())
-        )
+        remaining = max(0.0, deadline - time.monotonic())
         try:
             done, _pending = await asyncio.wait(
-                tasks, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                {task}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
             )
         except asyncio.CancelledError:
             task.cancel()
-            if watcher is not None:
-                watcher.cancel()
+            await asyncio.gather(task, return_exceptions=True)
             raise
         if task in done:
-            if watcher is not None:
-                watcher.cancel()
-                await asyncio.gather(watcher, return_exceptions=True)
             task.result()  # listener faults propagate
             return
         task.cancel()
-        if watcher is not None and not watcher.done():
-            watcher.cancel()
+        outcomes = await asyncio.gather(task, return_exceptions=True)
+        listener_outcome = outcomes[0]
+        if isinstance(listener_outcome, BaseException) and not isinstance(
+            listener_outcome, asyncio.CancelledError
+        ):
+            raise listener_outcome
         raise AgentListenerTimeoutError(
-            "agent listener ignored the run cancellation or deadline: "
+            "agent listener exceeded the run deadline: "
             f"{getattr(listener, '__name__', repr(listener))}"
         )
 

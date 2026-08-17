@@ -9,6 +9,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from .journal import (
+    JournalAppendCancelled,
+    JournalCommitState,
     JournalRecord,
     JournalRecordType,
     SessionJournal,
@@ -170,6 +172,8 @@ class BudgetLedger:
         self._total_cost_usd = 0.0
         self._usage_complete = True
         self._cost_complete = True
+        self._origin_snapshots: dict[str, BudgetSnapshot] = {}
+        self._ordered_attribution_complete = True
         self._journal: SessionJournal | None = None
         self._root_run_id = ""
         self._lock = asyncio.Lock()
@@ -236,6 +240,22 @@ class BudgetLedger:
             cost_complete=self._cost_complete,
         )
 
+    def snapshot_after_origin(self, origin_run_id: str) -> BudgetSnapshot | None:
+        """Return the aggregate as of one origin's latest exact commit.
+
+        Recovery uses this to attribute a Root budget crossing to the Child
+        that observed it, without applying later sibling usage retroactively.
+        Journals restored through legacy aggregate records have no reliable
+        transaction order, so attribution is unavailable rather than guessed.
+        """
+
+        normalized = str(origin_run_id or "").strip()
+        if not normalized:
+            raise ValueError("origin_run_id must be a non-empty string")
+        if not self._ordered_attribution_complete:
+            return None
+        return self._origin_snapshots.get(normalized)
+
     async def commit(
         self,
         *,
@@ -266,11 +286,16 @@ class BudgetLedger:
                 digest = hashlib.sha256(
                     f"{commit.origin_run_id}\0{commit.transaction_id}".encode("utf-8")
                 ).hexdigest()[:32]
-                await self._journal.append(
-                    JournalRecordType.BUDGET_COMMITTED,
-                    commit.to_payload(),
-                    record_id=f"{self._root_run_id}:budget:{digest}",
-                )
+                try:
+                    await self._journal.append(
+                        JournalRecordType.BUDGET_COMMITTED,
+                        commit.to_payload(),
+                        record_id=f"{self._root_run_id}:budget:{digest}",
+                    )
+                except JournalAppendCancelled as cancellation:
+                    if cancellation.commit_state is JournalCommitState.COMMITTED:
+                        self._apply(commit)
+                    raise
             self._apply(commit)
             return self.snapshot()
 
@@ -280,8 +305,10 @@ class BudgetLedger:
         self._total_cost_usd = 0.0
         self._usage_complete = True
         self._cost_complete = True
+        self._origin_snapshots.clear()
+        self._ordered_attribution_complete = True
 
-    def _apply(self, commit: _BudgetCommit) -> None:
+    def _apply(self, commit: _BudgetCommit, *, ordered: bool = True) -> None:
         existing = self._commits.get(commit.key)
         if existing is not None:
             if existing != commit:
@@ -292,6 +319,10 @@ class BudgetLedger:
         self._total_cost_usd += commit.cost_usd
         self._usage_complete = self._usage_complete and commit.usage_complete
         self._cost_complete = self._cost_complete and commit.cost_complete
+        if ordered:
+            self._origin_snapshots[commit.origin_run_id] = self.snapshot()
+        else:
+            self._ordered_attribution_complete = False
 
     def _restore_legacy_usage(self, records: tuple[JournalRecord, ...]) -> None:
         """Recover journals written before per-transaction budget records."""
@@ -325,7 +356,8 @@ class BudgetLedger:
                     cost_usd=cost,
                     usage_complete=bool(raw_response.get("usage_complete", False)),
                     cost_complete=bool(raw_response.get("cost_complete", False)),
-                )
+                ),
+                ordered=False,
             )
 
         committed_origins = {origin for origin, _transaction in self._commits}
@@ -358,7 +390,8 @@ class BudgetLedger:
                     cost_usd=cost,
                     usage_complete=bool(payload.get("usage_complete", False)),
                     cost_complete=bool(payload.get("cost_complete", False)),
-                )
+                ),
+                ordered=False,
             )
 
 

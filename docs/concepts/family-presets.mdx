@@ -1,134 +1,58 @@
 ---
 title: "Family presets"
-description: "Why QitOS v0.4 introduces family presets, harness policies, and transport adapters."
+description: "Resolve model-family adapters and request defaults without changing the Agent loop."
 ---
 
-QitOS keeps one minimal agent loop, and adds a stable authoring layer on top:
+Family presets let one `Agent` composition switch model families while preserving the
+same provider-neutral loop and Tool contracts.
 
-- `FamilyPreset`
-- `HarnessPolicy`
-- `ModelAdapter`
-- `ToolPolicy`
-- `ContextPolicy`
-
-This layer exists so one agent can switch model families without rewriting:
-
-- the agent state
-- the tool surface
-- the runtime loop
-- the tracing stack
-
-## The idea in one sentence
-
-A family preset bundles the research defaults for one model family — the transport, protocol, fallback chain, tool delivery mode, and context settings that work best out of the box.
-
-It says:
-
-- which transport (the client that communicates with the model API) to use
-- which protocol (the output format contract between model and parser) to prefer
-- which fallback chain (the ordered list of protocols to try if the first one fails) to keep
-- how to deliver tool schemas
-- what context defaults should apply
-
-## What stays stable
-
-The preset layer does **not** replace the kernel.
-
-It only resolves model-facing policy before the run starts:
-
-```text
-family preset -> harness policy -> model transport + protocol + parser
-```
-
-The rest stays the same:
-
-```text
-task -> state -> prepare -> llm -> parser -> Decision -> tools -> reduce -> trace
-```
-
-## The public v0.4 surface
+The public surface is:
 
 ```python
 from qitos.harness import (
+    ContextPolicy,
     FamilyPreset,
     HarnessPolicy,
     ModelAdapter,
     ToolPolicy,
-    ContextPolicy,
-    resolve_family_preset,
     build_harness_policy,
     build_model_for_preset,
+    resolve_family_preset,
 )
 ```
 
-## Gold presets in v0.4
+## What a preset controls
 
-The first QitOS gold presets are:
+`build_model_for_preset(...)` selects a model adapter, applies model-family request and
+reasoning defaults, and retains context-window hints as model metadata. The returned
+object implements QitOS's normal Model contract and enters the same minimal Agent loop.
 
-- `qwen`
-- `kimi`
-- `minimax`
-- `gpt-oss`
-- `gemma-4`
+```python
+from qitos.harness import build_model_for_preset
 
-In addition, five **compatibility presets** provide correct defaults for broader model families:
+model = build_model_for_preset(
+    model_name="Qwen/Qwen3-8B",
+    family_id="qwen",
+    api_key="...",
+    base_url="https://example.invalid/v1",
+)
+```
 
-- `openai`
-- `anthropic`
-- `gemini`
-- `deepseek`
-- `glm`
+You can also construct `OpenAICompatibleModel`, `OpenAIModel`, or `AnthropicModel`
+directly when you do not need family defaults.
 
-All 10 currently target OpenAI-compatible serving, but they do **not** all share the same protocol defaults.
+## Compatibility labels are not parsers
 
-That protocol default is not always the full story.
+`FamilyPreset.default_protocol`, `fallback_protocols`, and the corresponding
+`HarnessPolicy` fields are stable compatibility labels retained in harness metadata.
+The minimal Agent loop does not load a text parser, inject an output protocol, or run a
+fallback parser chain from those labels. Provider adapters deliver native typed
+messages and Tool calls.
 
-Qwen now prefers a **native tool-call lane** when an OpenAI-compatible endpoint returns structured `tool_calls`.
+This distinction matters when reading older preset examples: a value such as
+`json_decision_v1` does not add a second Decision/Action runtime.
 
-So for Qwen:
-
-- `json_decision_v1` is still the default text protocol
-- but native tool calls are preferred before the text parser chain
-- and `xml_decision_v1 -> react_text_v1` remain the stable fallback path
-
-That difference matters because QitOS now treats model family and transport as separate concerns.
-
-## Why not just instantiate `OpenAICompatibleModel(...)` directly?
-
-You still can.
-
-That is the right choice when:
-
-- you are hand-authoring one model path
-- you do not need family-level defaults
-- you are debugging a single provider integration
-
-But for research comparisons and reusable examples, presets are better because they keep:
-
-- protocol choice explicit
-- fallback chains stable
-- tool delivery mode visible in traces
-- context defaults reproducible
-
-## Where preset metadata appears
-
-Preset resolution is recorded into trace metadata through `RunSpec.metadata`.
-
-That means `qita` can show:
-
-- family preset
-- protocol
-- parser
-- tool delivery mode
-- decision source
-- native tool-call usage
-- context policy
-
-without inventing a second trace format.
-
-## Override a preset
-
-When a built-in preset does not match your needs, use `preset.override()` to create a customized copy without editing source:
+## Override immutable defaults
 
 ```python
 from dataclasses import replace
@@ -136,24 +60,18 @@ from qitos.harness import resolve_family_preset
 
 qwen = resolve_family_preset("qwen")
 custom = qwen.override(
-    context_policy=replace(qwen.context_policy, context_window_hint=256_000),
-    notes="Extended context for long-horizon runs",
+    context_policy=replace(
+        qwen.context_policy,
+        context_window_hint=256_000,
+    ),
 )
 ```
 
-The `override()` method returns a new `FamilyPreset` — the original is never mutated. Nested policies (`tool_policy`, `context_policy`) are replaced wholesale, so use `replace()` on the policy first.
+`override()` returns a new preset. It does not mutate process-global state.
 
-## Advisory defaults
+## Runtime boundary
 
-Gold presets include optional advisory fields for research baselines:
-
-| Field | Type | Meaning |
-|---|---|---|
-| `recommended_max_steps` | `int \| None` | Suggested step budget per run |
-| `recommended_max_tokens` | `int \| None` | Suggested total token budget |
-| `recommended_retry_budget` | `int \| None` | Max critic-retry attempts per step |
-| `recommended_temperature` | `float \| None` | Default sampling temperature |
-
-These fields are **advisory only** — the engine does not auto-apply them. They exist so that researchers can reference a documented baseline without guessing. Use them as starting points, then tune for your specific task.
-
-These fields appear in `preset.to_dict()` and in trace metadata, so you can always see what defaults were suggested even if you chose different values.
+- Presets choose model construction defaults; they do not replace the Agent loop.
+- Tool exposure still comes from the turn's frozen `ToolRegistry` snapshot.
+- Canonical protocol identity comes from the Model adapter's API capabilities.
+- Harness metadata is diagnostic and never Session recovery truth.

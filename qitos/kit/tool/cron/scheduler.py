@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from ....core.tool import BaseTool, ToolPermission, ToolSpec
+from ....core.tool_result import ToolResult
+from ..internal.results import error_result
 
 
 @dataclass
@@ -235,7 +237,7 @@ class CronCreateTool(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         _ = runtime_context
         cron = args.get("cron", "")
         prompt = args.get("prompt", "")
@@ -243,7 +245,9 @@ class CronCreateTool(BaseTool):
         durable = args.get("durable", False)
 
         if not cron or not prompt:
-            return {"status": "error", "error": "cron and prompt are required"}
+            return error_result(
+                {"status": "error", "error": "cron and prompt are required"}
+            )
 
         job = self._scheduler.create_job(
             cron=cron,
@@ -268,11 +272,13 @@ class CronDeleteTool(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         _ = runtime_context
         job_id = args.get("job_id", "")
         if not job_id:
-            return {"status": "error", "error": "job_id is required"}
+            return error_result(
+                {"status": "error", "error": "job_id is required"}
+            )
         deleted = self._scheduler.delete_job(job_id)
         return {
             "status": "success",

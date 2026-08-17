@@ -91,7 +91,7 @@ def _make_function_tool(
 
     The function wrapped by FunctionTool must accept keyword arguments
     matching the spec parameters, plus optional ``runtime_context``.
-    The closure remains async so the MCP transport, Engine, and Tool share the
+    The closure remains async so the MCP transport, Agent run, and Tool share the
     caller's event loop and cancellation domain.
     """
     # Build a callable with the right parameter signature for FunctionTool.

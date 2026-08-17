@@ -20,8 +20,12 @@ description: "在 2 分钟内基于 Agent façade 运行你的第一个 QitOS �
 <Steps>
   <Step title="安装 QitOS">
     ```bash
-    pip install "qitos[models]"
+    git clone https://github.com/Qitor/qitos.git
+    cd qitos
+    pip install ".[models]"
     ```
+
+    可运行示例位于源码仓库中，不随 wheel 安装，因此快速开始从源码 checkout 起步。
   </Step>
 
   <Step title="设置服务商配置">

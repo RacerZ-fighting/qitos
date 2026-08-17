@@ -22,10 +22,8 @@ executor, now expressed over typed ``ToolCall`` / ``ToolResult``:
   (cancelled results, journal records and events) and only then re-raises
   ``asyncio.CancelledError``;
 - a per-Tool ``RetryPolicy`` is the single retry owner;
-- ``before_tool_call`` receives the validated arguments and may block, or
-  return ``updated_args`` which are re-validated against the same schema and
-  permission before execution (QitOS strengthening over Pi, whose hook only
-  blocks); ``after_tool_call`` applies a field-level partial override. Hook
+- ``before_tool_call`` receives the validated arguments and may block;
+  ``after_tool_call`` applies a field-level partial override. Hook
   contexts carry the assistant message, an immutable agent-context snapshot,
   ``is_error`` and the active cancel/deadline runtime (Pi parity); hooks are
   bounded by that runtime so a hung hook cannot block abort or the deadline.
@@ -38,9 +36,11 @@ cancellation propagate.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import inspect
 import random
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional, Protocol, Sequence, Set, Tuple, Union
@@ -53,7 +53,7 @@ from .agent_events import (
     ToolExecutionUpdate,
     emit_to,
 )
-from .cancellation import CancelToken
+from .cancellation import CancelSignalView, CancelToken
 from .env import Env
 from .journal import JournalAppendCancelled
 from .message import AssistantMessage, Message, ToolCall
@@ -81,6 +81,22 @@ class ToolTransactionBoundary(Protocol):
         ...
 
 
+class _ToolEventSinkFault(Exception):
+    """Keep observational listener faults out of Tool failure handling."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+class _ToolImmediateCancelled(Exception):
+    """Internal signal that the run token interrupted a Tool invocation."""
+
+
+class _ToolHandlerCancelled(Exception):
+    """Internal signal that a handler raised CancelledError on its own."""
+
+
 @dataclass(frozen=True, slots=True)
 class AgentContextSnapshot:
     """Immutable view of the agent context at one turn boundary."""
@@ -96,11 +112,11 @@ class ToolHookRuntime:
     """Active cancellation/deadline view handed to Tool hooks (Pi's signal).
 
     Hooks receive the cooperative token and absolute deadline and must honor
-    them. The executor bounds every hook await by this runtime; a hook that
-    ignores cancellation is cancelled and abandoned, never awaited forever.
+    them. The executor bounds every hook await by this runtime and owns the
+    cancelled hook task until it settles.
     """
 
-    cancel_token: Optional[CancelToken] = None
+    cancel_signal: Optional[CancelSignalView] = None
     deadline_monotonic: Optional[float] = None
 
     def remaining_seconds(self) -> Optional[float]:
@@ -122,17 +138,11 @@ class BeforeToolCallContext:
 
 @dataclass(frozen=True, slots=True)
 class BeforeToolCallDecision:
-    """Admission override; ``block`` rejects the call before execution.
-
-    ``updated_args`` replace the validated arguments and are re-checked
-    against the Tool's permission and input schema before execution; a failed
-    re-check produces the corresponding denied/error terminal result.
-    """
+    """Pi-aligned admission override for rejecting a call before execution."""
 
     block: bool = False
     reason: str = ""
     terminate: bool = False
-    updated_args: Optional[Mapping[str, Any]] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +251,8 @@ class ToolBatchExecutor:
         self._transaction = transaction
         self._results: List[Optional[ToolResult]] = []
         self._started: Set[int] = set()
+        self._handler_cancelled_error_seen = False
+        self._events_failed = False
         #: Ordered terminal results of the last batch, including the results
         #: committed while an external cancellation was being drained. The
         #: loop reads them to keep the transcript paired when the batch task
@@ -252,8 +264,15 @@ class ToolBatchExecutor:
 
         if not calls:
             return []
+        call_ids = [call.id for call in calls]
+        if len(set(call_ids)) != len(call_ids):
+            raise ValueError(
+                "ToolCall ids must be unique within one assistant message"
+            )
         self._results = [None] * len(calls)
         self._started = set()
+        self._handler_cancelled_error_seen = False
+        self._events_failed = False
         try:
             if self._immediate():
                 for index, call in enumerate(calls):
@@ -267,11 +286,23 @@ class ToolBatchExecutor:
                     await self._run_serial(runnable)
                 else:
                     await self._run_segmented(runnable)
-            if self._externally_cancelled():
+            if self._handler_cancelled_error_seen:
                 # A swallowed CancelledError deep in the stack must still
                 # surface once every admitted call reached a terminal state.
                 raise asyncio.CancelledError()
             return await self._final_results(calls)
+        except _ToolEventSinkFault as fault:
+            # Event listeners are observational. Once one fails, stop before
+            # further Tool side effects, terminalize every call without
+            # dispatching more events, and only then surface the listener
+            # fault to the loop/façade.
+            for index, call in enumerate(calls):
+                if self._results[index] is None:
+                    self._results[index] = await self._prevented(
+                        index, call, "event_sink_fault"
+                    )
+            self.last_batch_results = await self._final_results(calls)
+            raise fault.cause
         except asyncio.CancelledError:
             # External task cancellation: every admitted call reaches a
             # terminal state before the cancellation propagates.
@@ -286,49 +317,9 @@ class ToolBatchExecutor:
     # ── batch admission ─────────────────────────────────────────────────
 
     async def _admit(self, calls: Sequence[ToolCall]) -> List[Tuple[int, ToolCall]]:
-        """Reject duplicate ToolCall ids before any Tool side effect.
+        """Return calls admitted by the already-validated batch identity."""
 
-        Journal record ids derive from the call id, so two calls sharing an
-        id could otherwise both perform side effects and then conflict or
-        fold inside the journal. Every duplicate occurrence is terminalized
-        as an admission error without executing its handler; the journal
-        records each duplicated id exactly once, under its first occurrence.
-        """
-
-        seen: Set[str] = set()
-        duplicate_ids: Set[str] = set()
-        for call in calls:
-            if call.id in seen:
-                duplicate_ids.add(call.id)
-            seen.add(call.id)
-        runnable: List[Tuple[int, ToolCall]] = []
-        journaled_ids: Set[str] = set()
-        for index, call in enumerate(calls):
-            if call.id not in duplicate_ids:
-                runnable.append((index, call))
-                continue
-            journaled = call.id not in journaled_ids
-            journaled_ids.add(call.id)
-            await self._start_call(index, call, journal=journaled)
-            result = ToolResult(
-                status="error",
-                output=None,
-                error=(
-                    f'Duplicate tool call id "{call.id}" in one assistant '
-                    "message; the call was not executed. Re-issue each tool "
-                    "call with a unique id."
-                ),
-                metadata={
-                    "tool_name": call.name,
-                    "error_category": "duplicate_tool_call_id",
-                    "recoverable": True,
-                    "started": False,
-                },
-            )
-            self._results[index] = await self._commit_terminal(
-                index, call, result, journal=journaled
-            )
-        return runnable
+        return list(enumerate(calls))
 
     # ── batch strategies ────────────────────────────────────────────────
 
@@ -346,15 +337,6 @@ class ToolBatchExecutor:
             else:
                 self._results[index] = await self._run_prepared(outcome)
             aborted = self._batch_abort_after(self._results[index]) or aborted
-        # A serial batch runs on the caller's task; an external cancellation
-        # converted to a cancelled result below still aborts the batch here.
-        if self._externally_cancelled():
-            for index, call in runnable:
-                if self._results[index] is None:
-                    self._results[index] = await self._prevented(
-                        index, call, "caller_cancelled"
-                    )
-            raise asyncio.CancelledError()
 
     def _batch_abort_after(self, result: Optional[ToolResult]) -> Optional[str]:
         if result is None:
@@ -422,13 +404,6 @@ class ToolBatchExecutor:
                     if result is not None and result.status in _FAILED_STATUSES:
                         aborted = "fail_fast"
                         break
-        if self._externally_cancelled():
-            for index, call in runnable:
-                if self._results[index] is None:
-                    self._results[index] = await self._prevented(
-                        index, call, "caller_cancelled"
-                    )
-            raise asyncio.CancelledError()
 
     async def _run_segment_concurrently(
         self, segment: List[_PreparedCall]
@@ -472,6 +447,8 @@ class ToolBatchExecutor:
                     item = tasks[task]
                     try:
                         self._results[item.index] = task.result()
+                    except _ToolEventSinkFault:
+                        raise
                     except JournalAppendCancelled:
                         raise
                     except asyncio.CancelledError:  # pragma: no cover - defensive
@@ -550,12 +527,6 @@ class ToolBatchExecutor:
     async def _start_call(
         self, index: int, call: ToolCall, *, journal: bool = True
     ) -> None:
-        await emit_to(
-            self._emit,
-            ToolExecutionStart(
-                tool_call_id=call.id, tool_name=call.name, args=call.arguments
-            ),
-        )
         if self._transaction is not None and journal:
             try:
                 await self._transaction.tool_started(self._config.turn, call)
@@ -565,6 +536,11 @@ class ToolBatchExecutor:
                 self._started.add(index)
                 raise
         self._started.add(index)
+        await self._emit_event(
+            ToolExecutionStart(
+                tool_call_id=call.id, tool_name=call.name, args=call.arguments
+            )
+        )
 
     async def _commit_terminal(
         self, index: int, call: ToolCall, result: ToolResult, *, journal: bool = True
@@ -580,16 +556,30 @@ class ToolBatchExecutor:
                 # cancellation propagates so nobody records a second terminal.
                 self._results[index] = final
                 raise
-        await emit_to(
-            self._emit,
+        # The canonical result wins before an observational listener runs.
+        # If that listener fails, batch recovery sees this slot as terminal
+        # and only cancels calls that have not started yet.
+        self._results[index] = final
+        await self._emit_event(
             ToolExecutionEnd(
                 tool_call_id=call.id,
                 tool_name=call.name,
                 result=final,
                 is_error=final.status != "success",
-            ),
+            )
         )
         return final
+
+    async def _emit_event(self, event: Any) -> None:
+        if self._events_failed:
+            return
+        try:
+            await emit_to(self._emit, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._events_failed = True
+            raise _ToolEventSinkFault(exc) from exc
 
     async def _preflight(
         self, index: int, call: ToolCall
@@ -748,80 +738,6 @@ class ToolBatchExecutor:
                         extra_metadata=extra,
                     ),
                 )
-            if decision is not None and decision.updated_args is not None:
-                candidate = dict(decision.updated_args)
-                recheck = tool.check_permissions(candidate, runtime_context)
-                if recheck.decision == "deny":
-                    return await self._commit_terminal(
-                        index,
-                        call,
-                        self._finish_result(
-                            call,
-                            status="denied",
-                            start=start,
-                            attempts=0,
-                            error=recheck.message or "Tool permission denied",
-                            output={
-                                "message": recheck.message,
-                                "scope": recheck.scope,
-                            },
-                            extra_metadata={
-                                **ordering_meta,
-                                "error_category": "permission_denied",
-                                "permission_scope": recheck.scope,
-                            },
-                        ),
-                    )
-                if recheck.decision == "ask":
-                    return await self._commit_terminal(
-                        index,
-                        call,
-                        self._finish_result(
-                            call,
-                            status="needs_approval",
-                            start=start,
-                            attempts=0,
-                            output={
-                                "message": recheck.message,
-                                "scope": recheck.scope,
-                            },
-                            extra_metadata={
-                                **ordering_meta,
-                                "error_category": "permission_ask",
-                                "permission_scope": recheck.scope,
-                            },
-                        ),
-                    )
-                candidate = dict(
-                    candidate
-                    if recheck.updated_args is None
-                    else recheck.updated_args
-                )
-                revalidation = self._validate(tool, candidate, runtime_context)
-                if not revalidation.valid:
-                    return await self._commit_terminal(
-                        index,
-                        call,
-                        self._finish_result(
-                            call,
-                            status="error",
-                            start=start,
-                            attempts=0,
-                            error=(
-                                "before_tool_call updated_args failed validation: "
-                                + (revalidation.message or "invalid arguments")
-                            ),
-                            extra_metadata={
-                                **ordering_meta,
-                                "error_category": (
-                                    revalidation.code or "validation_error"
-                                ),
-                                "started": False,
-                            },
-                        ),
-                    )
-                effective_args = candidate
-
         stopped = self._stop_result(call, start, attempts=0, deadline=deadline)
         if stopped is not None:
             return await self._commit_terminal(index, call, stopped)
@@ -1023,7 +939,10 @@ class ToolBatchExecutor:
             hook_task.cancel()
             if watcher is not None:
                 watcher.cancel()
-            self._abandon(hook_task, watcher)
+            await asyncio.gather(
+                *(task for task in (hook_task, watcher) if task is not None),
+                return_exceptions=True,
+            )
             raise
         if hook_task in done:
             if watcher is not None:
@@ -1039,17 +958,11 @@ class ToolBatchExecutor:
         hook_task.cancel()
         if watcher is not None and not watcher.done():
             watcher.cancel()
-        self._abandon(hook_task, watcher)
+        await asyncio.gather(
+            *(task for task in (hook_task, watcher) if task is not None),
+            return_exceptions=True,
+        )
         return outcome, None
-
-    @staticmethod
-    def _abandon(*tasks: Optional[asyncio.Task[Any]]) -> None:
-        """Leave cancelled hooks to finish on their own, consuming outcomes."""
-
-        for task in tasks:
-            if task is None or task.done():
-                continue
-            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
 
     def _assistant_message(self, call: ToolCall) -> AssistantMessage:
         configured = self._config.assistant_message
@@ -1065,7 +978,11 @@ class ToolBatchExecutor:
 
     def _hook_runtime(self) -> ToolHookRuntime:
         return ToolHookRuntime(
-            cancel_token=self._config.cancel_token,
+            cancel_signal=(
+                None
+                if self._config.cancel_token is None
+                else self._config.cancel_token.signal
+            ),
             deadline_monotonic=self._config.deadline_monotonic,
         )
 
@@ -1096,6 +1013,7 @@ class ToolBatchExecutor:
                 return stopped
             attempts += 1
             ordering_meta["started"] = True
+            self._set_progress_accepting(runtime_context, True)
             try:
                 try:
                     output = await self._invoke_tool(
@@ -1106,8 +1024,10 @@ class ToolBatchExecutor:
                     )
                 finally:
                     # ToolExecutionUpdate events mirror Pi's tool progress
-                    # callback; they drain after each attempt, success or not.
-                    await self._drain_progress_updates(call, runtime_context)
+                    # callback. They are scheduled immediately by the
+                    # callback and settle before the attempt can terminalize.
+                    self._set_progress_accepting(runtime_context, False)
+                    await self._drain_progress_updates(runtime_context)
                 if self._immediate():
                     return self._finish_result(
                         call,
@@ -1161,9 +1081,28 @@ class ToolBatchExecutor:
                     artifacts=reported.artifacts,
                     model_output=reported.model_output,
                 )
+            except _ToolEventSinkFault:
+                raise
             except JournalAppendCancelled:
                 raise
-            except asyncio.CancelledError:
+            except _ToolImmediateCancelled:
+                return self._finish_result(
+                    call,
+                    status="cancelled",
+                    start=start,
+                    attempts=attempts,
+                    error="tool call cancelled",
+                    extra_metadata={
+                        **ordering_meta,
+                        "error_category": "cancelled",
+                        "cancel_source": "cancel_token",
+                    },
+                )
+            except _ToolHandlerCancelled:
+                # A handler may raise CancelledError without cancellation
+                # having been requested on its owning executor task. Preserve
+                # the terminal ToolResult, then re-raise from execute_batch.
+                self._handler_cancelled_error_seen = True
                 # The terminal cancelled result is committed by the caller;
                 # batch-level cancellation then re-raises from execute_batch,
                 # so the cancellation itself is never silently swallowed.
@@ -1176,13 +1115,14 @@ class ToolBatchExecutor:
                     extra_metadata={
                         **ordering_meta,
                         "error_category": "cancelled",
-                        "cancel_source": (
-                            "cancel_token"
-                            if self._immediate()
-                            else "caller_cancelled"
-                        ),
+                        "cancel_source": "handler_cancelled",
                     },
                 )
+            except asyncio.CancelledError:
+                # Cancellation of the task that owns this invocation is not a
+                # handler result. Let the serial/parallel batch owner drain and
+                # terminalize every call before it re-raises.
+                raise
             except asyncio.TimeoutError as exc:
                 return self._finish_result(
                     call,
@@ -1293,17 +1233,40 @@ class ToolBatchExecutor:
     ) -> Dict[str, Any]:
         env = self._config.env
         progress_events: List[Dict[str, Any]] = []
-        progress_updates: List[Dict[str, Any]] = []
+        progress_updates: List[concurrent.futures.Future[None]] = []
+        progress_lock = threading.Lock()
+        progress_accepting = [False]
+        loop = asyncio.get_running_loop()
         artifacts: List[Dict[str, Any]] = []
 
         def _emit_progress(payload: Dict[str, Any]) -> None:
-            progress_events.append(dict(payload))
-            progress_updates.append(dict(payload))
+            update = dict(payload)
+            with progress_lock:
+                if not progress_accepting[0]:
+                    return
+                progress_events.append(update)
+                future = asyncio.run_coroutine_threadsafe(
+                    self._emit_event(
+                        ToolExecutionUpdate(
+                            tool_call_id=call.id,
+                            tool_name=call.name,
+                            args=call.arguments,
+                            partial_result=update,
+                        )
+                    ),
+                    loop,
+                )
+                progress_updates.append(future)
 
         def _record_artifact(payload: Dict[str, Any]) -> None:
             artifacts.append(dict(payload))
 
-        context: Dict[str, Any] = {
+        # Product context may add domain values (for example
+        # ``permission_context`` or Child lineage), but it must never replace
+        # the executor-owned authority, deadline, cancellation or callback
+        # capabilities for this frozen turn.
+        context: Dict[str, Any] = dict(self._config.extra_runtime_context)
+        context.update({
             "env": env,
             "ops": self._resolve_ops(tool, env),
             "tool_registry": self._exposure,
@@ -1315,27 +1278,38 @@ class ToolBatchExecutor:
             "deadline_monotonic": deadline_monotonic,
             "remaining_seconds": lambda: self._remaining_seconds(deadline_monotonic),
             "agent_cancelled": self._immediate,
-        }
+        })
         context["progress_updates"] = progress_updates
-        context.update(dict(self._config.extra_runtime_context))
+        context["progress_lock"] = progress_lock
+        context["progress_accepting"] = progress_accepting
         return context
 
+    @staticmethod
+    def _set_progress_accepting(
+        runtime_context: Dict[str, Any], accepting: bool
+    ) -> None:
+        lock = runtime_context.get("progress_lock")
+        state = runtime_context.get("progress_accepting")
+        if lock is None or not isinstance(state, list):
+            return
+        with lock:
+            state[0] = accepting
+
     async def _drain_progress_updates(
-        self, call: ToolCall, runtime_context: Dict[str, Any]
+        self, runtime_context: Dict[str, Any]
     ) -> None:
         updates = runtime_context.get("progress_updates")
-        if not isinstance(updates, list):
+        lock = runtime_context.get("progress_lock")
+        if not isinstance(updates, list) or lock is None:
             return
-        while updates:
-            payload = updates.pop(0)
-            await emit_to(
-                self._emit,
-                ToolExecutionUpdate(
-                    tool_call_id=call.id,
-                    tool_name=call.name,
-                    args=call.arguments,
-                    partial_result=payload,
-                ),
+        while True:
+            with lock:
+                pending = list(updates)
+                updates.clear()
+            if not pending:
+                return
+            await asyncio.gather(
+                *(asyncio.wrap_future(future) for future in pending)
             )
 
     def _resolve_ops(self, tool: BaseTool, env: Optional[Env]) -> Dict[str, Any]:
@@ -1363,11 +1337,6 @@ class ToolBatchExecutor:
 
         token = self._config.cancel_token
         return token is not None and token.immediate_requested
-
-    @staticmethod
-    def _externally_cancelled() -> bool:
-        task = asyncio.current_task()
-        return task is not None and task.cancelling() > 0
 
     def _resolve_call_deadline(
         self, call: ToolCall, started: float
@@ -1401,12 +1370,56 @@ class ToolBatchExecutor:
         runtime_context: Optional[Dict[str, Any]],
         timeout_s: Optional[float],
     ) -> Any:
-        invocation = tool.execute(args, runtime_context=runtime_context)
-        if timeout_s is None:
-            return await invocation
-        if timeout_s <= 0:
+        if timeout_s is not None and timeout_s <= 0:
             raise asyncio.TimeoutError("tool call deadline expired")
-        return await asyncio.wait_for(invocation, timeout=timeout_s)
+
+        invocation = asyncio.create_task(
+            tool.execute(args, runtime_context=runtime_context),
+            name=f"qitos-tool-invoke-{tool.name}",
+        )
+        watcher: Optional[asyncio.Task[bool]] = None
+        token = self._config.cancel_token
+        waits: Set[asyncio.Task[Any]] = {invocation}
+        if token is not None:
+            watcher = asyncio.create_task(
+                token.wait_immediate(), name=f"qitos-tool-cancel-{tool.name}"
+            )
+            waits.add(watcher)
+        try:
+            done, _pending = await asyncio.wait(
+                waits,
+                timeout=timeout_s,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            invocation.cancel()
+            if watcher is not None:
+                watcher.cancel()
+            await asyncio.gather(
+                *[task for task in (invocation, watcher) if task is not None],
+                return_exceptions=True,
+            )
+            raise
+
+        if invocation in done:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+            try:
+                return invocation.result()
+            except asyncio.CancelledError as exc:
+                raise _ToolHandlerCancelled from exc
+
+        invocation.cancel()
+        if watcher is not None and not watcher.done():
+            watcher.cancel()
+        await asyncio.gather(
+            *[task for task in (invocation, watcher) if task is not None],
+            return_exceptions=True,
+        )
+        if watcher is not None and watcher in done:
+            raise _ToolImmediateCancelled
+        raise asyncio.TimeoutError("tool call deadline expired")
 
     async def _wait_for_retry(
         self,

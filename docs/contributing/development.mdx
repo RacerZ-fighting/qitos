@@ -1,145 +1,91 @@
 ---
-title: "Development Guide"
-description: "Prerequisites, setup, common commands, and troubleshooting for QitOS contributors."
+title: "Development guide"
+description: "Contributor commands and change boundaries for the current QitOS runtime."
 ---
-
-# Development Guide
 
 ## Prerequisites
 
-- Python 3.10+
-- `pip`
+- Python 3.11 for contributor checks
+- `uv`
 - `git`
+- `rg` for repository search
 
-Optional but recommended:
+Run project commands through `uv`; do not borrow a parent repository environment.
 
-- `rg` for fast search
-- `pre-commit`
-
-## Local Setup
-
-Quickstart from a local clone:
+## Run the test suite
 
 ```bash
-pip install -r requirements.txt
+uv run --no-project --python 3.11 \
+  --with-editable . \
+  --with 'pytest>=7' \
+  --with 'pytest-asyncio>=0.23' \
+  --with 'openai>=1.66.0' \
+  pytest -q
 ```
 
-Full contributor setup:
+## Run stable-surface lint and type checks
 
 ```bash
-pip install -r requirements-dev.txt
-pre-commit install
+uv run --no-project --python 3.11 --with-editable . \
+  --with 'flake8>=6' flake8 qitos/core qitos/models qitos/trace
+
+uv run --no-project --python 3.11 --with-editable . \
+  --with 'mypy>=1' mypy qitos/core qitos/models qitos/trace
 ```
 
-## Common Commands
+The retired `qitos/engine` package is not a check target.
 
-Run tests:
+## Build release artifacts
 
 ```bash
-python -m pytest -q
+uv build
+uv run --no-project --python 3.11 --with 'twine>=5.1.1' twine check dist/*
 ```
 
-Run stable-surface lint:
-
-```bash
-python -m flake8 qitos/core qitos/engine qitos/models qitos/trace
-```
-
-Run stable-surface type checks:
-
-```bash
-python -m mypy qitos/core qitos/engine qitos/models qitos/trace
-```
-
-Run coverage gate:
-
-```bash
-pytest --cov=qitos.core --cov=qitos.trace --cov-report=term -q
-```
-
-Build the package:
-
-```bash
-python -m build
-```
-
-Audit Python dependencies:
-
-```bash
-pip-audit
-```
-
-Preview docs locally:
+## Preview documentation
 
 ```bash
 npx mintlify dev docs
-```
-
-Check docs links:
-
-```bash
 npx mintlify broken-links docs
 ```
 
-## Environment Configuration
+## Common change boundaries
 
-Copy `.env.example` and set only the provider variables you need.
+### Add a Tool
 
-Avoid committing:
+1. Implement the Tool under its canonical `qitos/kit/tool` owner.
+2. Keep strict input schema and execution together.
+3. Register it through an explicit `ToolRegistry` or maintained Tool set.
+4. Add behavior tests for validation, permission, success, failure, timeout, and
+   cancellation as applicable.
+5. Update public documentation when the supported surface changes.
 
-- `.env`
-- local API keys
-- temporary benchmark data
-- generated run artifacts
+Security-sensitive Tools require explicit opt-in imports. They do not enter generic
+`qitos`, `qitos.kit`, or quickstart imports.
 
-## Common Tasks
+### Change the Agent runtime
 
-### Adding A New Tool
+1. Preserve the `Message -> Model -> ToolCall -> ToolResult` contract.
+2. Keep Provider SDK objects at the adapter boundary.
+3. Preserve one terminal `ToolResult` per call, absolute deadlines, cancellation, and
+   source-ordered results.
+4. Update focused behavior tests, then run the full independent QitOS checks.
+5. Record public or behavioral changes in `CHANGELOG.md`.
 
-1. Implement it under the appropriate `qitos/kit/tool` module.
-2. Give it a clear docstring and tool spec.
-3. Register it through the canonical toolset or an explicit registry builder.
-4. Add behavior tests.
-5. Update docs if it changes the public surface.
+Do not restore `AgentModule`, Engine, parser/critic, checkpoint, or recipe compatibility
+layers. Session/Harness and Task/Plan migration follows the active architecture plan.
 
-Security-sensitive tools must require explicit opt-in imports and must not be exposed from `qitos`, default `qitos.kit` imports, or quickstart examples.
+### Add a product Agent
 
-### Adding A Product Agent
+Keep QitOS examples small and focused on one reusable kernel concept. Product-grade
+agents and product plugins belong in downstream application repositories.
 
-Keep QitOS examples small, teaching-first, and focused on one framework concept at a time; product-grade agents belong in downstream product repositories.
+## Release checklist
 
-### Removing Or Replacing APIs
+Before a release:
 
-1. Update examples, templates, and docs in the same change.
-2. Remove long-term compatibility layers rather than introducing new ones unless migration risk is high.
-3. Record the change in `CHANGELOG.md`.
-
-## Release Checklist
-
-When cutting a GitHub release, verify the repo-facing surfaces before you tag:
-
-1. Run `python -m pytest -q`.
-2. Run `python -m build`.
-3. Run `python -m twine check dist/*`.
-4. Run `npx mintlify broken-links docs`.
-5. Confirm `README.md`, `README.zh.md`, `CHANGELOG.md`, and the relevant `docs/` pages match the shipped behavior.
-6. Confirm GitHub auth works with `gh auth status`.
-7. Create or update the release body from the release notes.
-8. Push the release branch and tag, then publish with `gh release create`.
-
-## Troubleshooting
-
-If coverage flags are unavailable locally, reinstall the contributor environment:
-
-```bash
-pip install -r requirements-dev.txt
-```
-
-If build artifacts or caches cause confusion, remove:
-
-- `build/`
-- `dist/`
-- `.pytest_cache/`
-- `.mypy_cache/`
-
-If docs links appear stale, run `npx mintlify broken-links docs` and preview the site with `npx mintlify dev docs`.
+1. Run the full pytest, flake8, and mypy commands above.
+2. Build the package and run `twine check`.
+3. Run the documentation broken-link check when Mintlify is available.
+4. Confirm README, changelog, public docs, and examples describe the shipped Agent path.
+5. Review the diff for generated artifacts, credentials, and machine-local paths.

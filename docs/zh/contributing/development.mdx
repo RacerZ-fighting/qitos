@@ -1,151 +1,87 @@
 ---
 title: "开发指南"
-description: "QitOS 贡献者的前置条件、环境配置、常用命令和问题排查。"
+description: "当前 QitOS runtime 的贡献者命令与变更边界。"
 ---
-
-# 开发指南
 
 ## 前置条件
 
-- Python 3.10+
-- `pip`
+- Python 3.11（贡献检查版本）
+- `uv`
 - `git`
+- 用于仓库搜索的 `rg`
 
-可选但推荐：
+项目命令统一通过 `uv` 运行，不借用父仓库环境。
 
-- `rg` 用于快速搜索
-- `pre-commit`
-
-## 本地配置
-
-从本地克隆快速开始：
+## 运行测试
 
 ```bash
-pip install -r requirements.txt
+uv run --no-project --python 3.11 \
+  --with-editable . \
+  --with 'pytest>=7' \
+  --with 'pytest-asyncio>=0.23' \
+  --with 'openai>=1.66.0' \
+  pytest -q
 ```
 
-完整贡献者配置：
+## 运行稳定表面 lint 与类型检查
 
 ```bash
-pip install -r requirements-dev.txt
-pre-commit install
+uv run --no-project --python 3.11 --with-editable . \
+  --with 'flake8>=6' flake8 qitos/core qitos/models qitos/trace
+
+uv run --no-project --python 3.11 --with-editable . \
+  --with 'mypy>=1' mypy qitos/core qitos/models qitos/trace
 ```
 
-## 常用命令
+已退役的 `qitos/engine` 不是检查目标。
 
-运行测试：
+## 构建发布 artifact
 
 ```bash
-python -m pytest -q
+uv build
+uv run --no-project --python 3.11 --with 'twine>=5.1.1' twine check dist/*
 ```
 
-运行核心模块 lint：
-
-```bash
-python -m flake8 qitos/core qitos/engine qitos/models qitos/trace
-```
-
-运行核心模块类型检查：
-
-```bash
-python -m mypy qitos/core qitos/engine qitos/models qitos/trace
-```
-
-运行覆盖率门槛：
-
-```bash
-pytest --cov=qitos.core --cov=qitos.trace --cov-report=term -q
-```
-
-构建包：
-
-```bash
-python -m build
-```
-
-审计依赖：
-
-```bash
-pip-audit
-```
-
-本地预览文档：
+## 预览文档
 
 ```bash
 npx mintlify dev docs
-```
-
-检查文档链接：
-
-```bash
 npx mintlify broken-links docs
 ```
 
-## 环境配置
+## 常见变更边界
 
-复制 `.env.example` 并仅设置需要的 provider 变量。
+### 新增 Tool
 
-避免提交：
+1. 在 canonical `qitos/kit/tool` owner 下实现 Tool。
+2. 保持严格输入 schema 与执行逻辑共属一处。
+3. 通过显式 `ToolRegistry` 或已维护 Tool set 注册。
+4. 按需添加校验、权限、成功、失败、timeout 与 cancelled 行为测试。
+5. 支持面变化时更新公开文档。
 
-- `.env`
-- 本地 API 密钥
-- 临时 benchmark 数据
-- 生成的运行产物
+安全敏感 Tool 必须显式 opt-in，不进入通用 `qitos`、`qitos.kit` 或 quickstart import。
 
-## 常见任务
+### 修改 Agent runtime
 
-### 添加新工具
+1. 保持 `Message -> Model -> ToolCall -> ToolResult` 契约。
+2. Provider SDK 对象停在 adapter 边界。
+3. 保持每个调用唯一 terminal `ToolResult`、绝对 deadline、取消和按源顺序提交。
+4. 先更新聚焦行为测试，再运行 QitOS 独立全量检查。
+5. 在 `CHANGELOG.md` 记录公开或行为变化。
 
-1. 在相应的 `qitos/kit/tool` 模块下实现。
-2. 添加清晰的 docstring 和 tool spec。
-3. 通过规范 toolset 或显式 registry builder 注册。
-4. 添加行为测试。
-5. 如果影响公共接口，更新文档。
+不要恢复 `AgentModule`、Engine、parser/critic、checkpoint 或 recipe 兼容层。Session/Harness 与
+Task/Plan 迁移遵循当前架构计划。
 
-安全敏感工具必须要求显式 opt-in 导入，不得从 `qitos`、默认 `qitos.kit` 导入或快速开始示例中暴露。
+### 新增产品 Agent
 
-### 添加产品 Agent
-
-保持 QitOS 示例小巧、教学优先、专注于一个框架概念；产品级 Agent 属于下游产品仓库。
-
-### 修改引擎行为
-
-1. 保持 `Decision` 作为执行契约。
-2. 添加或更新 hook/trace 覆盖。
-3. 如果事件 payload 变化，验证 qita 和 parser 行为。
-
-### 移除或替换 API
-
-1. 在同一变更中更新示例、模板和文档。
-2. 优先移除长期兼容层，除非迁移风险高。
-3. 在 `CHANGELOG.md` 中记录变更。
+QitOS 示例应保持小巧，只聚焦一个可复用 kernel 概念。产品级 Agent 与产品插件属于下游应用仓库。
 
 ## 发布检查清单
 
-发布 GitHub release 前，验证仓库面向外部的接口：
+发布前：
 
-1. 运行 `python -m pytest -q`。
-2. 运行 `python -m build`。
-3. 运行 `python -m twine check dist/*`。
-4. 运行 `npx mintlify broken-links docs`。
-5. 确认 `README.md`、`README.zh.md`、`CHANGELOG.md` 和相关 `docs/` 页面与发布行为一致。
-6. 确认 GitHub 认证正常：`gh auth status`。
-7. 创建或更新 release body。
-8. 推送发布分支和标签，然后使用 `gh release create` 发布。
-
-## 问题排查
-
-如果覆盖率标记本地不可用，重新安装贡献者环境：
-
-```bash
-pip install -r requirements-dev.txt
-```
-
-如果构建产物或缓存造成混乱，删除：
-
-- `build/`
-- `dist/`
-- `.pytest_cache/`
-- `.mypy_cache/`
-
-如果文档链接过时，运行 `npx mintlify broken-links docs` 并用 `npx mintlify dev docs` 预览。
+1. 运行上述全量 pytest、flake8 与 mypy 命令。
+2. 构建包并运行 `twine check`。
+3. Mintlify 可用时运行文档死链检查。
+4. 确认 README、changelog、公开文档与示例都描述已交付的 Agent 路径。
+5. 检查 diff 中没有生成 artifact、凭据或机器本地路径。

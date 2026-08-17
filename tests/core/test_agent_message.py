@@ -20,7 +20,7 @@ from qitos.core.message import (
     message_to_wire,
 )
 from qitos.core.model_request import ModelContinuation
-from qitos.core.model_response import ModelResponse
+from qitos.core.model_response import ModelResponse, ModelUsage
 from qitos.core.tool_result import ToolResult
 
 
@@ -90,6 +90,20 @@ def test_assistant_message_wire_projection() -> None:
     assert wire["reasoning_content"] == "thinking"
     assert wire["tool_calls"][0]["function"]["name"] == "echo"
     assert wire["native_items"] == [{"type": "reasoning", "id": "r1"}]
+
+
+def test_assistant_message_preserves_duplicate_ids_as_protocol_failure() -> None:
+    first = ToolCall(id="duplicate", name="one", arguments={})
+    second = ToolCall(id="duplicate", name="two", arguments={})
+
+    message = AssistantMessage(tool_calls=(first, second))
+
+    assert message.tool_calls == (first, second)
+    assert message.failed
+    assert message.error == "assistant tool call ids must be unique"
+    restored = message_from_dict(message_to_dict(message))
+    assert isinstance(restored, AssistantMessage)
+    assert restored.tool_calls == (first, second)
 
 
 def test_assistant_message_dict_round_trip_preserves_usage_and_continuation() -> None:
@@ -208,15 +222,119 @@ def test_message_from_dict_fails_closed_on_non_text_fields() -> None:
                 "timestamp": 1.0,
             }
         )
-    with pytest.raises(ValueError):
-        message_from_dict(
-            {
-                "role": "assistant",
-                "text": "ok",
-                "tool_calls": [{"id": 7, "name": "echo", "arguments": {}}],
-                "timestamp": 1.0,
-            }
+    assistant_payload = message_to_dict(
+        AssistantMessage(
+            tool_calls=(ToolCall(id="c1", name="echo", arguments={}),),
+            timestamp=1.0,
         )
+    )
+    assistant_payload["tool_calls"][0]["id"] = 7
+    with pytest.raises(ValueError):
+        message_from_dict(assistant_payload)
+
+
+def test_message_from_dict_requires_the_exact_durable_shape() -> None:
+    assistant_payload = message_to_dict(AssistantMessage(text="ok", timestamp=1.0))
+    assistant_payload.pop("metadata")
+    with pytest.raises(ValueError, match="fields"):
+        message_from_dict(assistant_payload)
+
+    user_payload = message_to_dict(UserMessage(content="hello", timestamp=1.0))
+    user_payload["unexpected"] = True
+    with pytest.raises(ValueError, match="fields"):
+        message_from_dict(user_payload)
+
+    tool_payload = message_to_dict(
+        ToolResultMessage(
+            tool_call_id="c1",
+            tool_name="echo",
+            result=ToolResult(output="ok"),
+            timestamp=1.0,
+        )
+    )
+    tool_payload.pop("tool_name")
+    with pytest.raises(ValueError, match="fields"):
+        message_from_dict(tool_payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("tool_calls", None),
+        ("usage", []),
+        ("native_items", {}),
+        ("continuation", []),
+        ("metadata", None),
+    ],
+)
+def test_assistant_durable_decoder_does_not_default_invalid_values(
+    field: str, invalid: object
+) -> None:
+    payload = message_to_dict(AssistantMessage(text="ok", timestamp=1.0))
+    payload[field] = invalid
+
+    with pytest.raises(ValueError):
+        message_from_dict(payload)
+
+
+def test_durable_decoder_rejects_noncanonical_nested_fields() -> None:
+    assistant_payload = message_to_dict(
+        AssistantMessage(
+            tool_calls=(ToolCall(id="c1", name="echo", arguments={}),),
+            timestamp=1.0,
+        )
+    )
+    assistant_payload["tool_calls"][0].pop("arguments")
+    with pytest.raises(ValueError, match="tool call payload fields"):
+        message_from_dict(assistant_payload)
+
+    user_payload = message_to_dict(
+        UserMessage(content=(TextContent("hello"),), timestamp=1.0)
+    )
+    user_payload["content"][0]["unexpected"] = True
+    with pytest.raises(ValueError, match="content block"):
+        message_from_dict(user_payload)
+
+
+def test_durable_decoder_rejects_invalid_continuation_and_timestamp() -> None:
+    continuation = ModelContinuation(
+        run_id="run",
+        provider="provider",
+        model="model",
+        protocol="protocol",
+        response_id="response",
+        prefix_items=1,
+        prefix_digest="prefix",
+        settings_digest="settings",
+    )
+    payload = message_to_dict(
+        AssistantMessage(text="ok", continuation=continuation, timestamp=1.0)
+    )
+    payload["continuation"]["prefix_items"] = True
+    with pytest.raises(ValueError, match="prefix_items"):
+        message_from_dict(payload)
+
+    payload = message_to_dict(UserMessage(content="hello", timestamp=1.0))
+    payload["timestamp"] = float("inf")
+    with pytest.raises(ValueError, match="finite"):
+        message_from_dict(payload)
+
+
+@pytest.mark.parametrize("number", [float("nan"), float("inf"), float("-inf")])
+def test_message_json_boundaries_reject_non_finite_numbers(number: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        ToolCall(id="c1", name="echo", arguments={"value": number})
+    with pytest.raises(ValueError, match="finite"):
+        AssistantMessage(metadata={"value": number})
+    with pytest.raises(ValueError, match="finite"):
+        UserMessage(content="hello", timestamp=number)
+    with pytest.raises(ValueError, match="finite"):
+        ModelUsage.from_mapping({"provider_detail": number})
+
+
+def test_model_usage_rejects_non_string_detail_keys() -> None:
+    with pytest.raises(TypeError, match="keys must be strings"):
+        ModelUsage.from_mapping({1: "invalid"})
 
 
 def test_tool_result_message_result_is_deeply_immutable() -> None:

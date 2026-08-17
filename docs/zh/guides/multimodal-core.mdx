@@ -1,34 +1,59 @@
 ---
-title: "多模态内核与桌面入门"
-description: "解释 QitOS v0.5 如何把多模态基础真正收口成一条完整桌面路径。"
+title: "多模态消息"
+description: "通过当前 Agent façade 发送类型化文本与图像内容。"
 ---
 
-# 多模态内核与桌面入门
+最小 Agent loop 把多模态输入保留在 canonical `UserMessage` 契约中，不需要视觉专用 runtime、
+prompt protocol、parser 或 `Decision` 类型。
 
-QitOS v0.5 已经不只是多模态基础设施。
+## 构造类型化图像消息
 
-它已经把这一条主线接完整了：
+```python
+from qitos.core.message import ImageContent, TextContent, UserMessage
 
-- 截图优先的多模态输入
-- `DesktopEnv`
-- qita 可视化检查
+message = UserMessage(
+    content=(
+        TextContent(text="检查这张截图。"),
+        ImageContent(
+            source={
+                "type": "image_file",
+                "path": "screen.png",
+                "detail": "high",
+            }
+        ),
+    )
+)
 
-## qita 在 v0.5 里能看到什么
+result = await agent.prompt(message)
+```
 
-- 截图时间线
-- 回放截图预览
-- 基础动作叠加层
-- 接地元数据
-- 评估器重试信息
+`ImageContent.source` 在 durable message codec 中保留 Provider 中立 wire mapping。OpenAI-compatible 与
+Anthropic adapter 把支持的图像 block 投影成各自 API 格式。使用图像交付前，先检查
+`model.capabilities.multimodal_input`。
 
-## 当前边界
+同一契约也可承载 `image_url` 或 adapter 支持的 base64 source。非法 durable message 格式会在
+decode 时 fail closed。
 
-v0.5 仍然**不承诺**：
+## 环境 observation 由应用投影
 
-- 完整的官方 OSWorld 对等
-- v0.6 级别的完整可视化回放深度
-- 所有提供商的全面多模态对齐
+`ScreenshotEnv` 与 `DesktopEnv` 暴露带截图以及可选 DOM、OCR、可访问性或终端上下文的结构化
+observation。Agent loop 不会自动轮询环境。应用决定何时 observe，以及把哪些有界事实投影到
+下一条 `UserMessage`。
 
-它承诺的是一件事：
+这使三种职责保持分离：
 
-**一条完整可信的桌面入门路径**
+- 环境拥有 observation 与 controller 操作；
+- Model adapter 拥有多模态 wire 投影；
+- Agent loop 拥有类型化 message、Tool call 与 Tool result。
+
+## 当前 trace 边界
+
+`qita` 可以展示兼容 trace artifact 中的视觉字段。这些文件可能包含 producer 写入的旧
+step、parser 或 grounding 字段。新 Agent run 不会自动生成该 trace 格式，视觉 trace asset 也不是
+Session 恢复真源。
+
+要运行环境侧源码 checkout 冒烟测试，执行：
+
+```bash
+python examples/real/desktop_env_smoke.py
+```

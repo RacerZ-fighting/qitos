@@ -1,21 +1,20 @@
 ---
-title: "如何新增一个模型家族预设（preset）"
-description: "在不分叉运行时的前提下，为 QitOS v0.4 增加一个新的模型家族预设。"
+title: "如何新增模型家族预设"
+description: "在不分叉 Agent runtime 的前提下扩展模型构造默认值。"
 ---
 
-新增家族预设时，不要从"写一套新运行时"开始。
+Family preset 只选择模型构造策略，不会增加新 Agent loop、parser 或产品插件。
 
-先回答 5 个问题：
+新增 preset 前，先回答四个问题：
 
-1. 哪些模型名称应该命中这个家族？
-2. 该家族用什么传输层（transport，即与模型 API 通信的客户端）？
-3. 默认协议（protocol，即模型输出的格式契约）是什么？
-4. 后备（fallback）协议链是什么？
-5. 工具与上下文的默认策略是什么？
+1. 哪些模型名称应该命中该家族？
+2. 使用哪种 Provider transport 构造模型？
+3. 如何交付 Tool schema？
+4. 哪些上下文、reasoning 与请求默认值已经验证？
 
-## 最小实现路径
+## 增加最小 preset
 
-在 `qitos/harness/_presets.py` 中新增一个 `FamilyPreset`。
+在 `qitos/harness/_presets.py` 中新增一个 `FamilyPreset`：
 
 ```python
 FamilyPreset(
@@ -23,64 +22,45 @@ FamilyPreset(
     display_name="My Family",
     model_matchers=("my-family", "my-model-prefix"),
     adapter_kind="openai-compatible",
-    default_protocol="json_decision_v1",
-    fallback_protocols=("react_text_v1",),
+    default_protocol="legacy-label-v1",
+    fallback_protocols=(),
     tool_policy=ToolPolicy(
         primary_delivery="api_parameter",
-        fallback_delivery="prompt_injection",
+        fallback_delivery="api_parameter",
+        native_tool_call_preferred=True,
     ),
     context_policy=ContextPolicy(
         context_window_hint=128_000,
         fallback_context_window=128_000,
     ),
     recommended_models=("my-family-32b",),
-    recommended_max_steps=30,
-    recommended_max_tokens=500_000,
-    recommended_retry_budget=3,
     recommended_temperature=0.2,
 )
 ```
 
-## 优先复用已有协议
+`default_protocol` 和 `fallback_protocols` 是保留的兼容标签。最小 Agent loop 不会
+把它们解析为 protocol object、注入 prompt 或运行 fallback parser 链。为 artifact 兼容性使用
+稳定的描述性值，不要为了让标签“可执行”而新建 parser。
 
-QitOS v0.4 仍然复用 `ModelProtocol`。
+## 复用 Provider adapter
 
-多数情况下，你应该从这些协议里选：
+OpenAI-compatible 端点使用 `OpenAICompatibleAdapter`。只有确实需要对应 wire 契约时，
+才使用原生 Anthropic 或 OpenAI adapter。新增模型家族本身不构成新增 transport 的理由。
 
-- `react_text_v1`
-- `json_decision_v1`
-- `xml_decision_v1`
-- `terminus_json_v1`
-- `terminus_xml_v1`
-- `minimax_tool_call_v1`
+Adapter 拥有类型化模型事件、原生 Tool call、usage、continuation 与 capability 声明。Preset 只提供
+构造默认值。
 
-只有当模型真的输出另一种格式契约时，才值得新增协议。
+## 保持结果可检查
 
-## 优先复用适配器
-
-当前默认适配器（adapter）是：
-
-```python
-OpenAICompatibleAdapter
-```
-
-如果模型本身通过 OpenAI-compatible 端点提供服务，优先复用它。
-
-不要仅仅因为模型家族不同，就过早引入新的传输层适配器。
-
-## 让预设可追踪
-
-预设只有能被后续研究者看到才有价值。新增预设时，务必确保这些信息能进入：
-
-- `RunSpec.metadata`
-- 追踪记录（trace）清单
-- `qita`
+`build_model_for_preset(...)` 会把解析后的策略写入 `model.qitos_harness_metadata`。
+Adapter 通过 `model.capabilities` 暴露已验证行为。两者都是诊断快照，不是 canonical
+Session 状态或恢复真源。
 
 ## 验收检查
 
-- `resolve_family_preset(...)` 能同时从家族标识和模型名称正确解析
-- `build_harness_policy(...)` 返回正确的协议与解析器（parser，将原始模型输出解析为 Decision 的组件）
-- `infer_model_profile(...)` 与预设默认值保持一致
-- 旗舰示例无需修改智能体代码就能切换到这个家族
-- 如果家族已经过充分测试，`recommended_*` 字段应该设置稳定的基线建议值
-- `preset.override()` 能让用户在不修改源码的情况下调整你的预设
+- `resolve_family_preset(...)` 可以通过家族 id 和目标模型名解析 preset。
+- `build_harness_policy(...)` 选中预期 adapter、Tool policy、context policy 与兼容标签。
+- `build_model_for_preset(...)` 构造的 Model capability 与已测 Provider 行为一致。
+- 原生 Tool call、usage、continuation、取消与失败行为复用现有 adapter 契约测试。
+- 只有证据支持时才设置 `recommended_*` 字段。
+- `preset.override()` 返回新值，不修改全局状态。

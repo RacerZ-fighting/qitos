@@ -8,11 +8,12 @@ All operations help produce professional security assessment reports.
 
 import json
 import os
-import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool_result import ToolResult
+from qitos.kit.tool.internal.results import error_result
 
 
 class ReportToolSet:
@@ -171,7 +172,7 @@ class ReportToolSet:
         cve: str = "",
         attack_technique: str = "",
         references: List[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Add a security finding to the report.
 
@@ -191,10 +192,15 @@ class ReportToolSet:
         """
         valid_severities = ["critical", "high", "medium", "low", "info"]
         if severity.lower() not in valid_severities:
-            return {
-                "status": "error",
-                "message": f"Invalid severity '{severity}'. Choose from: {', '.join(valid_severities)}",
-            }
+            return error_result(
+                {
+                    "status": "error",
+                    "message": (
+                        f"Invalid severity '{severity}'. Choose from: "
+                        f"{', '.join(valid_severities)}"
+                    ),
+                }
+            )
 
         findings = self._load_findings()
 
@@ -307,7 +313,7 @@ class ReportToolSet:
                 if technique_entry not in tactic_mapping[tactic_id]["techniques"]:
                     tactic_mapping[tactic_id]["techniques"].append(technique_entry)
 
-        output = f"### 🎯 MITRE ATT&CK Mapping\n\n"
+        output = "### 🎯 MITRE ATT&CK Mapping\n\n"
 
         if not tactic_mapping:
             output += "No ATT&CK techniques have been mapped yet.\n"
@@ -409,16 +415,14 @@ class ReportToolSet:
         if scope:
             output += f"## Scope\n\n{scope}\n\n"
 
-        output += f"## Executive Summary\n\n"
-        output += (
-            f"A security assessment was conducted against the target environment. "
-        )
+        output += "## Executive Summary\n\n"
+        output += "A security assessment was conducted against the target environment. "
         output += f"The assessment identified **{total}** findings across {len(set(f.get('affected_component', '') for f in findings))} components.\n\n"
 
         output += f"### Risk Score: {risk_rating} ({risk_score})\n\n"
 
         # Findings by severity
-        output += f"### Findings Overview\n\n"
+        output += "### Findings Overview\n\n"
         output += "| Severity | Count | CVSS Range |\n"
         output += "|----------|-------|------------|\n"
         for sev in ["critical", "high", "medium", "low", "info"]:
@@ -433,7 +437,7 @@ class ReportToolSet:
             f for f in findings if f.get("severity") in ("critical", "high")
         ]
         if critical_high:
-            output += f"### Critical & High Severity Findings\n\n"
+            output += "### Critical & High Severity Findings\n\n"
             for f in critical_high[:10]:
                 sev_info = self._severity_to_cvss(f["severity"])
                 output += f"{sev_info['color']} **{f['id']}: {f['title']}** ({f['severity'].upper()})\n"
@@ -447,7 +451,7 @@ class ReportToolSet:
                 output += "\n"
 
         # Top recommendations
-        output += f"### Key Recommendations\n\n"
+        output += "### Key Recommendations\n\n"
         recommendations = []
         for f in findings:
             if f.get("remediation") and f.get("severity") in (
@@ -533,7 +537,7 @@ class ReportToolSet:
             with open(output_file, "w") as f:
                 json.dump(report_data, f, indent=2, default=str)
 
-            output = f"### 📄 JSON Report Generated\n\n"
+            output = "### 📄 JSON Report Generated\n\n"
             output += f"**File:** `{output_file}`\n"
             output += f"**Findings:** {len(findings)}\n"
 
@@ -546,7 +550,7 @@ class ReportToolSet:
         # Markdown format
         now = self._utc_now().strftime("%Y-%m-%d %H:%M UTC")
 
-        report = f"# Security Assessment Report\n\n"
+        report = "# Security Assessment Report\n\n"
         report += f"**Generated:** {now}\n"
         report += f"**Total Findings:** {len(findings)}\n\n"
 
@@ -582,9 +586,9 @@ class ReportToolSet:
         report += "## Detailed Findings\n\n"
         for f in sorted_findings:
             sev_info = self._severity_to_cvss(f["severity"])
-            report += f"---\n\n"
+            report += "---\n\n"
             report += f"### {sev_info['color']} {f['id']}: {f['title']}\n\n"
-            report += f"| Field | Value |\n|-------|-------|\n"
+            report += "| Field | Value |\n|-------|-------|\n"
             report += f"| **Severity** | {f['severity'].upper()} |\n"
             if f.get("affected_component"):
                 report += f"| **Component** | {f['affected_component']} |\n"
@@ -604,7 +608,7 @@ class ReportToolSet:
             if f.get("remediation"):
                 report += f"**Remediation:**\n\n{f['remediation']}\n\n"
             if f.get("references"):
-                report += f"**References:**\n\n"
+                report += "**References:**\n\n"
                 for ref in f["references"]:
                     report += f"- {ref}\n"
                 report += "\n"
@@ -637,9 +641,9 @@ class ReportToolSet:
         with open(output_file, "w") as f:
             f.write(report)
 
-        output = f"### 📄 Report Generated\n\n"
+        output = "### 📄 Report Generated\n\n"
         output += f"**File:** `{output_file}`\n"
-        output += f"**Format:** Markdown\n"
+        output += "**Format:** Markdown\n"
         output += f"**Findings:** {len(findings)}\n"
         output += f"**Size:** {os.path.getsize(output_file):,} bytes\n\n"
         output += f"Report preview:\n\n{report[:3000]}...\n"
@@ -656,7 +660,7 @@ class ReportToolSet:
     @function_tool(name="finding_export", needs_approval=True)
     def finding_export(
         self, format: str = "json", output_file: str = ""
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Export all findings in various formats.
 
@@ -674,10 +678,14 @@ class ReportToolSet:
         findings = self._load_findings()
 
         if not findings:
-            return {
-                "status": "error",
-                "message": "No findings to export. Add findings first using finding_add.",
-            }
+            return error_result(
+                {
+                    "status": "error",
+                    "message": (
+                        "No findings to export. Add findings first using finding_add."
+                    ),
+                }
+            )
 
         if not output_file:
             timestamp = self._utc_now().strftime("%Y%m%d_%H%M%S")
@@ -787,12 +795,17 @@ class ReportToolSet:
                 f.write("\n".join(lines))
 
         else:
-            return {
-                "status": "error",
-                "message": f"Unsupported format '{format}'. Choose from: json, csv, sarif, summary",
-            }
+            return error_result(
+                {
+                    "status": "error",
+                    "message": (
+                        f"Unsupported format '{format}'. Choose from: "
+                        "json, csv, sarif, summary"
+                    ),
+                }
+            )
 
-        output = f"### 📤 Findings Exported\n\n"
+        output = "### 📤 Findings Exported\n\n"
         output += f"**Format:** {format.upper()}\n"
         output += f"**File:** `{output_file}`\n"
         output += f"**Findings:** {len(findings)}\n"

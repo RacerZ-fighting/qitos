@@ -5,7 +5,13 @@ import asyncio
 import pytest
 
 from qitos.core.budget import BudgetLedger
-from qitos.core.journal import JournalError, JournalRecordType
+from qitos.core.journal import (
+    JournalAppendCancelled,
+    JournalCommitState,
+    JournalError,
+    JournalPosition,
+    JournalRecordType,
+)
 from qitos.kit.journal import JsonlSessionJournal
 
 
@@ -68,6 +74,38 @@ async def test_budget_ledger_rejects_conflicting_transaction_reuse() -> None:
 
 
 @pytest.mark.asyncio
+async def test_budget_ledger_preserves_each_origins_last_commit_snapshot() -> None:
+    ledger = BudgetLedger(max_tokens=10)
+
+    await ledger.commit(
+        origin_run_id="child-a",
+        transaction_id="a-1",
+        tokens=4,
+        cost_usd=0.0,
+        usage_complete=True,
+        cost_complete=False,
+    )
+    await ledger.commit(
+        origin_run_id="child-b",
+        transaction_id="b-1",
+        tokens=7,
+        cost_usd=0.0,
+        usage_complete=True,
+        cost_complete=False,
+    )
+
+    child_a = ledger.snapshot_after_origin("child-a")
+    child_b = ledger.snapshot_after_origin("child-b")
+    assert child_a is not None
+    assert child_a.total_tokens == 4
+    assert child_a.tokens_exhausted is False
+    assert child_b is not None
+    assert child_b.total_tokens == 11
+    assert child_b.tokens_exhausted is True
+    assert ledger.snapshot_after_origin("child-without-commit") is None
+
+
+@pytest.mark.asyncio
 async def test_failed_journal_append_does_not_advance_budget() -> None:
     class FailingJournal:
         run_id = "root-run"
@@ -90,6 +128,61 @@ async def test_failed_journal_append_does_not_advance_budget() -> None:
         )
 
     assert ledger.snapshot().total_tokens == 0
+
+
+@pytest.mark.parametrize(
+    ("commit_state", "expected_tokens"),
+    [
+        (JournalCommitState.COMMITTED, 10),
+        (JournalCommitState.UNKNOWN, 0),
+        (JournalCommitState.NOT_COMMITTED, 0),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cancelled_budget_append_respects_durable_commit_state(
+    commit_state: JournalCommitState,
+    expected_tokens: int,
+) -> None:
+    position = JournalPosition(
+        run_id="root-run",
+        seq=1,
+        record_id="root-run:budget:record",
+    )
+
+    class CancelledJournal:
+        run_id = "root-run"
+
+        async def append(self, *args, **kwargs):
+            _ = args, kwargs
+            raise JournalAppendCancelled(
+                position if commit_state is JournalCommitState.COMMITTED else None,
+                commit_state=commit_state,
+                pending_position=position,
+            )
+
+    ledger = BudgetLedger(max_tokens=100)
+    ledger.attach(
+        CancelledJournal(),  # type: ignore[arg-type]
+        root_run_id="root-run",
+    )
+
+    with pytest.raises(JournalAppendCancelled) as cancelled:
+        await ledger.commit(
+            origin_run_id="child-run",
+            transaction_id="transaction",
+            tokens=10,
+            cost_usd=0.0,
+            usage_complete=True,
+            cost_complete=False,
+        )
+
+    assert cancelled.value.commit_state is commit_state
+    assert ledger.snapshot().total_tokens == expected_tokens
+    origin = ledger.snapshot_after_origin("child-run")
+    if commit_state is JournalCommitState.COMMITTED:
+        assert origin is not None and origin.total_tokens == 10
+    else:
+        assert origin is None
 
 
 @pytest.mark.asyncio
@@ -174,4 +267,6 @@ async def test_budget_ledger_recovers_legacy_root_and_child_usage(tmp_path) -> N
     assert snapshot.total_cost_usd == pytest.approx(1.5)
     assert snapshot.usage_complete is False
     assert snapshot.cost_complete is False
+    assert ledger.snapshot_after_origin("root-run") is None
+    assert ledger.snapshot_after_origin("child-run") is None
     await journal.close()

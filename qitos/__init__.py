@@ -37,7 +37,6 @@ from .core.process import (
     ProcessStatus,
     ProcessTerminalNotifier,
 )
-from .core.history import HistorySnapshot
 from .core.tool_result import ToolResult, ToolResultStatus
 from .core.artifact import ArtifactRef, ArtifactStore, ArtifactStoreError
 from .core.work_plan import (
@@ -79,7 +78,7 @@ from .core.agent_loop import (
     agent_loop,
     agent_loop_continue,
 )
-from .core.cancellation import CancelMode, CancelToken
+from .core.cancellation import CancelMode, CancelSignalView, CancelToken
 from .core.message import (
     AssistantMessage,
     Message,
@@ -137,7 +136,6 @@ __all__ = [
     "ModelStreamEvent",
     "ModelStreamEventType",
     "ModelTiming",
-    "HistorySnapshot",
     "ToolResult",
     "ToolResultStatus",
     "ArtifactRef",
@@ -169,6 +167,7 @@ __all__ = [
     "agent_loop",
     "agent_loop_continue",
     "CancelMode",
+    "CancelSignalView",
     "CancelToken",
     "AssistantMessage",
     "Message",

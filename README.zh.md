@@ -8,17 +8,18 @@
 [![PyPI](https://img.shields.io/pypi/v/qitos.svg)](https://pypi.org/project/qitos/)
 [![Repo](https://img.shields.io/badge/github-Qitor%2Fqitos-black)](https://github.com/Qitor/qitos)
 
-QitOS 是面向 agent 研究者的 torch-flavor 框架。
+QitOS 是用于构建 Tool-using Agent 的 Provider 中立运行时。
 
-当前版本在 `Agent` façade 背后的 Provider 中立最小异步 Agent loop（`Message ->
-Model -> ToolCall -> ToolResult`）上原型化方法、检查长时轨迹，并内置 `qita` 可观测性。
+当前版本已把 `Agent` façade 背后的 Provider 中立最小异步 Agent loop
+（`Message -> Model -> ToolCall -> ToolResult`）作为唯一执行主线。`qita` 继续只读检查
+兼容的 trace artifact；新的 façade run 尚不会自动生成这类 artifact。
 已退役的 `AgentModule + Engine` 生命周期、checkpoint 存储、提示词注入式解析器/评估器、
 recipe 与基准测试执行适配器均已移除；迁移过程记录于更新日志。
 
 
 [快速开始](https://qitor.mintlify.app/zh/quickstart) · [教程课程](https://qitor.mintlify.app/zh/tutorials) · [CLI 参考](https://qitor.mintlify.app/zh/reference/cli) · [更新日志](CHANGELOG.md) · [English README](README.md)
 
-## 最新进展
+## 当前运行时
 
 - **与 Pi 对齐的运行时已成为主线**：`Agent` façade 驱动最小异步
   `Message -> Model -> ToolCall -> ToolResult` loop，具备类型化消息、逐 turn 不可变的
@@ -28,6 +29,19 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
   environment handle、metrics 与应用插件策略不进入 Task 契约。详见
   [目标架构](docs/internal/architecture/agent-runtime.md)和
   [迁移计划](docs/internal/plans/pi-aligned-agent-runtime.md)。
+
+- **类型化 Provider 与 Tool 事务**：OpenAI Responses、Anthropic Messages 与兼容的
+  Chat Completions 进入同一套 Provider 中立 Message 流。Tool 默认串行执行；有界并行
+  仍按输入顺序提交，并保证每个调用都有唯一 terminal `ToolResult`。
+- **明确的持久化边界**：loop 事务可以写入 Session Journal。让 Session/Harness 成为
+  compact、resume、fork 与 recovery 的权威 owner 仍是迁移中的工作；trace artifact 与
+  `qita` 只用于观察，不是恢复真源。
+
+## 迁移前版本历史
+
+以下条目记录已退役 v0.6 runtime 的行为，只保留为迁移背景。其中的 `Engine`、
+`AgentModule`、`Decision`、parser、critic、checkpoint 与 recipe 都不是当前执行 API。
+
 - **长程运行保持可缓存前缀**：两次明确压缩之间，canonical 模型历史严格 append-only。
   Engine 在 80% 告警、85% 压缩并记录 Provider cache/prefix 事实；应用状态通过新的
   `ContextSnapshot` 追加，不再改写旧 ToolResult。超大工具输出先完整持久化，模型侧统一使用
@@ -40,7 +54,7 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
   声明的开发环境已包含异步测试支持，build/audit job 也要求包含
   `PYSEC-2026-3447` 修复的 `setuptools` 版本。
 - **模型缓存由 Provider 持有**：已废弃的本地 response-cache 包和隐式
-  `Engine(cache_backend=...)` 模型改写已删除。QitOS 不再把历史 provider transaction
+  本地模型改写已删除。QitOS 不再把历史 provider transaction
   重放成一次新模型调用；Provider 原生 prompt cache、cache usage、deadline、续接与
   trace 事实继续作为权威来源。
 - **运行配置只保留一条主线**：未接入主运行时的 `qitos.config` YAML builder、平行的
@@ -66,8 +80,8 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
   产品应用由独立 `qitos-zoo` 仓库维护；QitOS 恢复只使用 canonical Session Journal 或
   checkpoint store。
 - **Agent 只保留一条可执行主线**：未被使用的 `qitos.func` decorator/compose 包已删除。
-  它的直接调用会绕过 Engine 事务，表面上的 `AgentModule` adapter 也不会执行被包装函数。
-  Agent 统一使用 `AgentModule + Engine`；普通 Python callable Tool 继续使用已维护的
+  它的直接调用会绕过 canonical 事务，表面上的 lifecycle adapter 也不会执行被包装函数。
+  Agent 统一使用 `Agent` façade；普通 Python callable Tool 继续使用已维护的
   function-tool decorator。
 - **只保留一条 canonical 可观测路径**：重复的进程级 tracing provider 及其 W&B/MLflow
   processors 已删除。运行时事件、`TraceWriter`、Session Journal 和只读 `qita` 现在组成
@@ -82,9 +96,9 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
   SDK context 由一个专用 task 持有到关闭，QitOS 继续负责有界目录发布和稳定
   ToolResult 错误。PTY 改由 `ptyprocess` 建立，官方 MCP 协议模型继续使用 Pydantic
   校验。来自 incomplete 或 failed 模型终态的 ToolCall 只保留诊断，不会执行。
-- **从 terminal fact 恢复完成通知**：后台 Child 与受管进程的完成输入现在都是 canonical Journal
-  terminal 的确定性投影。Resume 无需第二份存储即可补上 terminal 到 Mailbox 之间的崩溃窗口，也不会重复投递前台 Child ToolResult；
-  已消费 event id 保持幂等，Fork 继承的事实也不会变成新输入。canonical `ToolResult` 同时保存
+- **确定性的完成通知投影**：后台 Child 与受管进程的完成输入都是 canonical Journal
+  terminal 的确定性投影。旧 Engine 中负责恢复未消费输入的路径已经删除；补上 terminal 到
+  Mailbox 之间的崩溃窗口仍是 authoritative Session/Harness 迁移的明确合入门槛。canonical `ToolResult` 同时保存
   模型 `call_id`，Child factory 可以安全完成异步资源构造。前台 Child 自身取消会返回 terminal
   Child 结果，不再被误判为 Parent Task 取消。
 - **无 writer lease 的 Run 查询与 lineage**：`JsonlRunCatalog` 现在可以在 Engine
@@ -229,7 +243,10 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
   保留类型化输出项、并行函数调用、`call_id` 工具结果、流式事件和可重放工具上下文。
   现有 Chat Completions 行为仍是默认值。
 
-## v0.5.0 最新进展
+## v0.5.0 历史摘要
+
+以下特性属于 v0.5，其中包含已被当前 breaking migration 删除的 API。当前支持面以
+上面的“当前运行时”和 `CHANGELOG.md` 为准。
 
 - **方法 recipe**：Self-Refine、Reflexion、LATS、MoA 和 Magentic-One 作为可直接
   import 的 `qitos.recipes` 实现提供。
@@ -247,8 +264,8 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
 
 ## QitOS 适合谁
 
-- **方法研究者**：频繁改 prompt、parser、critic、tool 与 memory policy，但不想每次都重写 runtime。
-- **benchmark 使用者**：希望 GAIA、Tau-Bench、CyBench 跑在和 agent 开发同一套内核上。
+- **Agent 研究者**：希望比较模型、Tool policy 与上下文策略，而不替换运行时。
+- **评测工具作者**：希望把结构化运行产物转换成可比较、可审查的证据。
 - **长时 agent 调试者**：更关心 trajectory review、replay、diff 与 context collapse，而不是先拼应用脚手架。
 
 ## 2 分钟跑通 QitOS
@@ -256,7 +273,9 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
 QitOS 里的 minimal agent 直接组合 `Agent` façade：一个模型、一个工具注册表、一个提示词。
 
 ```bash
-pip install "qitos[models]"
+git clone https://github.com/Qitor/qitos.git
+cd qitos
+pip install ".[models]"
 export OPENAI_API_KEY="sk-..."
 export OPENAI_BASE_URL="https://api.siliconflow.cn/v1/"
 export QITOS_MODEL="Qwen/Qwen3-8B"
@@ -273,8 +292,8 @@ quickstart 通过 `agent.prompt(...)` 驱动 `Message -> Model -> ToolCall -> To
 
 | 如果你想要... | QitOS 提供... |
 |---|---|
-| 可复现的 agent 研究 | 一条具有 durable trajectory 的 canonical runtime |
-| 强可观测性 | `qita` board、replay、export 与 trace 工件 |
+| 可复现的 agent 研究 | 类型化 loop 事务与 canonical journal |
+| Artifact 检查 | 用只读 `qita` board、replay、export 与 diff 检查兼容 trace |
 | 更少框架胶水 | 一条 canonical 执行主线 |
 
 ## 工具层布局
@@ -308,7 +327,7 @@ registry = ToolRegistry().include_toolset(
 - 第一条成功路径： [快速开始](https://qitor.mintlify.app/zh/quickstart)
 - 安装方式： [安装](https://qitor.mintlify.app/zh/installation)
 - 组合自己的 agent： [Kit 参考](https://qitor.mintlify.app/zh/reference/kit)
-- 看 trace： [可观测性](https://qitor.mintlify.app/zh/guides/observability)
+- 检查兼容 trace： [可观测性](https://qitor.mintlify.app/zh/guides/observability)
 - 走完整课程： [教程](https://qitor.mintlify.app/zh/tutorials)
 - 看命令： [CLI 参考](https://qitor.mintlify.app/zh/reference/cli)
 
@@ -343,10 +362,9 @@ registry = ToolRegistry().include_toolset(
 
 QitOS 当前处于 **Beta**。
 
-- 迁移期间保持稳定的行为：trace/qita、canonical durable records、benchmark adapters，
-  以及官方可复现 run 契约。
-- 已确认的运行时方向：原地把 `AgentModule + Engine` 替换为上文的 Model、最小 Agent loop
-  和 Session/Harness 架构。
+- 当前稳定行为：最小 Agent loop 与 façade、loop journal 事务，以及对兼容 trace
+  artifact 的只读 qita 检查。
+- 已确认的运行时方向：继续完成权威 Session/Harness 与 Task/Plan 迁移。
 - 仍会演进：公开 Agent/runtime API、更高层 convenience API、部分 `kit` 模块和实验性 toolset。
 - 如果你正在评估接入，建议从 kernel 与 examples 开始，而不是假设所有高层表面都已冻结。
 - 持续演进和升级说明见 [CHANGELOG.md](CHANGELOG.md)。
@@ -356,7 +374,7 @@ QitOS 当前处于 **Beta**。
 - 支持的 Python 版本：**3.10+**
 - 普通用户安装：`pip install "qitos[models]"`
 - 版本检查：`qit --version`
-- 最小 agent 示例：`python examples/quickstart/minimal_agent.py`
+- 最小 agent 示例（从源码 checkout 运行）：`python examples/quickstart/minimal_agent.py`
 - 常见 provider 配置：`OPENAI_API_KEY`、`OPENAI_BASE_URL`、`QITOS_MODEL`
 - 仅核心安装：`pip install qitos`
 - 仓库源码安装：`pip install -r requirements.txt`
@@ -366,7 +384,7 @@ QitOS 当前处于 **Beta**。
 
 ## 参与贡献
 
-欢迎贡献方法 recipe、benchmark adapters、memory/history 工作流、qita UX 与核心框架能力。开发环境、recipe 贡献与文档贡献流程详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+欢迎贡献 Agent runtime、工具、Provider adapter、Session journal、qita UX 与文档。开发环境和贡献流程详见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## License
 

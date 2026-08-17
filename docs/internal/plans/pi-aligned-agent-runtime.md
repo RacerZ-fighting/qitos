@@ -3,21 +3,27 @@
 ## Status
 
 Accepted migration plan on 2026-08-16. The target contracts are defined by the
-[QitOS Agent runtime architecture](../architecture/agent-runtime.md). Current releases
-still execute `AgentModule + Engine`; a milestone is complete only after callers and
-superseded paths are removed.
+[QitOS Agent runtime architecture](../architecture/agent-runtime.md). The minimal loop,
+façade, and retired-runtime deletion slices are implemented on the migration branch;
+the Pi-parity items listed below, Session/Harness, and Task/Plan remain merge gates.
 
 ## 1. Current gaps
 
-- Public execution still centers on `AgentModule`, Observation, Decision, Action and
-  Engine rather than Model, minimal loop and Session/Harness.
-- Engine still owns application parser/critic/search/handoff, environment setup,
-  checkpoint compatibility and benchmark concerns.
+- Session/Harness is not yet the authoritative owner of compact, resume, fork, and
+  pure recovery.
+- Background Child terminal facts have deterministic completion-input projections, but
+  recovery-time redelivery and consumed-event idempotence still depend on that
+  authoritative Session/Harness owner.
+- The façade cannot yet restore initial messages/Tool activation, and the loop has no
+  typed per-turn thinking-level update. Raw `extra_request_options` are provider wire
+  data, not an equivalent reasoning contract.
+- Tool execution usage and the names of Tools activated by a result are not yet typed,
+  durable ToolResult facts. A live registry is re-frozen for the next turn, but that
+  alone cannot reproduce activation order after resume.
 - Task mixes objective identity with benchmark resources, environment probing, metrics
   and free-form metadata.
 - WorkPlan is a flat single-active checklist rather than an owner/dependency graph.
-- Application composition subclasses the old Agent lifecycle, so deleting historical
-  runtime surfaces is not yet possible.
+- The loop/façade event stream is not yet reattached to the trace writer.
 
 Proven Tool transaction, cancellation, absolute deadline, result ordering, trace and
 recovery behavior is the conformance baseline. Legacy type names and package layout are
@@ -27,7 +33,8 @@ not compatibility requirements.
 
 ### 2.1 Freeze behavioral conformance
 
-Done on `feat/pi-aligned-agent-loop` (commits `af8f8ef`, `306d3bc`): typed
+Foundation implemented on `feat/pi-aligned-agent-loop` (commits `af8f8ef`,
+`306d3bc`); this milestone remains in progress until the parity items below land. Typed
 messages (`core/message.py`), loop events (`core/agent_events.py`),
 `AgentLoopResult`/rejection types, the minimal loop (`core/agent_loop.py`),
 the `Agent` façade (`core/agent.py`) and `ToolBatchExecutor`
@@ -45,15 +52,25 @@ Review-hardening dispositions recorded on the same branch:
   closed typed set (`UserMessage`/`AssistantMessage`/`ToolResultMessage`)
   with a fail-closed codec; application-specific projections belong in
   journal records, events and metadata, not in LLM-bound messages.
-- `before_tool_call` may return `updated_args`; QitOS re-validates them
-  against the same input schema and permission before execution instead of
-  copying Pi's unvalidated mutation channel.
+- `before_tool_call` keeps Pi's `block` / `reason` / `terminate` surface. Tool
+  argument rewriting remains owned by the existing permission pipeline; the
+  hook does not introduce a second mutation channel.
 - Cancellation closes the loop: external task cancellation and faults
   terminalize started work plus the run record before re-raising;
   `CancelToken` `after_step` stops at turn boundaries and never interrupts
-  in-flight streams or Tool calls; duplicate Tool-call ids are rejected at
-  batch admission; terminal `ToolResult`s are deeply immutable before they
+  in-flight streams or Tool calls; duplicate Tool-call ids remain in the
+  assistant transcript as protocol-failure evidence and the malformed batch
+  is rejected before Tool admission; terminal `ToolResult`s are deeply immutable before they
   cross journal, event and Message boundaries.
+
+Still required before this milestone is complete:
+
+- restore initial façade messages and Tool activation through the authoritative
+  Session/Harness path;
+- add a provider-neutral typed thinking-level update owned by the Model boundary;
+- carry Tool execution usage and dynamically added Tool names as typed ToolResult /
+  transcript facts with resume tests. Metadata and raw request-option dictionaries do
+  not count as substitutes.
 
 ### 2.2 Replace loop and façade
 
@@ -71,7 +88,11 @@ AgentModule, and the old Engine is absent from exports, examples and tests.
 
 - Separate transcript entries from operation records in one canonical storage contract.
 - Move queue, compact, recovery, resume, fork and expected rejection out of Engine.
+- Restore initial messages and Tool activation, including result-originated Tool names,
+  without depending on a live pre-crash registry.
 - Provide memory/JSONL conformance and pure recovery tests.
+- Re-project unconsumed background Child completion inputs from terminal facts without
+  redelivering foreground results or inherited fork facts.
 - Reattach the trace writer to the loop/façade so new runs emit trace
   artifacts (the Engine-era producer was removed with C4).
 

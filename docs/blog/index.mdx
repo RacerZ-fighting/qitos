@@ -18,16 +18,13 @@ We expect the blog to grow around a few recurring themes:
 
 - **Design notes**: why the framework is structured the way it is
 - **Field reports**: what we learned from long-running coding and audit agents
-- **Benchmark reports**: GAIA, Tau-Bench, and CyBench observations
-- **Prompting and parsing**: model harness (the wiring layer that connects a transport, parser, and protocol) choices and protocol (the output format the model is asked to follow) tradeoffs
+- **Evaluation reports**: lessons from structured run artifacts
+- **Model adapters**: transport and native Tool-delivery tradeoffs
 - **Observability**: how `qita` turns traces (structured logs of all run events and steps) into research artifacts
 
 ## Start here
 
 <CardGroup cols={2}>
-  <Card title="Why QitOS keeps a single kernel" icon="cpu" href="/blog/single-kernel">
-    A short design note on the AgentModule + Engine split and why we avoid hidden second runtimes.
-  </Card>
   <Card title="Why reproducible runs matter" icon="flask" href="/blog/reproducible-runs">
     A short field note on official runs, normalized benchmark outputs, and best-effort replay.
   </Card>

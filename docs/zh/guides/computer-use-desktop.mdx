@@ -1,25 +1,56 @@
 ---
-title: "计算机操控与桌面环境"
-description: "在 QitOS 上构建 OSWorld 风格的桌面智能体，而不绑定某一家提供商的计算机操控 API。"
+title: "计算机操控与 DesktopEnv"
+description: "把 QitOS 桌面环境与 GUI Tool 原语组合进当前 Agent façade。"
 ---
 
-# 计算机操控与桌面环境
+QitOS 提供可复用桌面原语，而不是第二套 computer-use runtime：
 
-QitOS 把桌面/计算机操控作为一条官方主线。
+- `DesktopEnv` 提供截图、可访问性、终端与 GUI controller 操作；
+- `qitos.kit.tool.gui` 提供原子 GUI Tool；
+- `ComputerUseToolSet` 和 `computer_use_tools()` 用于显式注册 Tool；
+- 类型化 `UserMessage` 图像 block 提供 Provider 中立多模态输入。
 
-核心组成：
+当前 Agent loop 只消费类型化 message 与 Provider 原生 Tool call，不会加载
+`desktop_actions_*` protocol、文本 parser 或 `Decision` 对象。
 
-- `DesktopEnv`
-- `ComputerUseToolSet`
-- `desktop_actions_json_v1` / `desktop_actions_xml_v1`
-- qita 可视化回放
+## 构造环境与 Tool registry
 
-## 环境冒烟示例
+```python
+from qitos.kit.env import DesktopEnv
+from qitos.kit.toolset import computer_use_tools
 
-最小的纯环境循环：
+env = DesktopEnv.from_mock(
+    screenshot_path="screen.png",
+    instruction="点击可见的 Continue 按钮。",
+    accessibility_tree={"role": "window", "name": "Demo"},
+)
+registry = computer_use_tools()
+```
+
+GUI Tool 会从 Agent runtime 的 `env` 解析 `gui_controller` 操作。应用仍自行拥有环境
+setup、reset、teardown、授权，以及把每次新 observation 投影为下一条 user message 的策略。
+
+```python
+from qitos.core.agent import Agent
+
+agent = Agent(model=model, tool_registry=registry, env=env, max_turns=8)
+```
+
+`env=env` 不代表自动轮询 observation。应用应在安全点获取 observation，并构造类型化
+多模态 message；参见[多模态消息](/zh/guides/multimodal-core)。
+
+## 环境边界冒烟测试
 
 ```bash
 python examples/real/desktop_env_smoke.py
 ```
 
-它不依赖模型，直接演练 `DesktopEnv` 与计算机操控工具集。
+该源码 checkout 示例不调用模型，只验证 `DesktopEnv` 与 GUI Tool。
+
+## 当前边界
+
+QitOS 不声称提供端到端 OSWorld runner、自动截图观察 loop 或 Provider 专有 computer-use
+API。应用在同一 `Agent` façade 外组合这些策略，并把产品/benchmark 行为留在 kernel 之外。
+
+`qita` 仍可检查早期 runtime 或应用侧 producer 生成的兼容截图 trace artifact。新的
+façade run 不会自动生成这些 trace 目录。

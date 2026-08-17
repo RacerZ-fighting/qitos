@@ -25,6 +25,33 @@ class CancelMode(str, Enum):
     AFTER_STEP = "after_step"
 
 
+class CancelSignalView:
+    """Read-only cancellation view handed to hooks and event listeners."""
+
+    __slots__ = ("__token",)
+
+    def __init__(self, token: "CancelToken") -> None:
+        self.__token = token
+
+    @property
+    def mode(self) -> CancelMode:
+        return self.__token.mode
+
+    @property
+    def is_cancel_requested(self) -> bool:
+        return self.__token.is_cancel_requested
+
+    @property
+    def immediate_requested(self) -> bool:
+        return self.__token.immediate_requested
+
+    async def wait_cancelled(self) -> bool:
+        return await self.__token.wait_cancelled()
+
+    async def wait_immediate(self) -> bool:
+        return await self.__token.wait_immediate()
+
+
 class CancelToken:
     """Thread-safe cancellation signal shared between a run handle and the loop.
 
@@ -61,6 +88,13 @@ class CancelToken:
         self._immediate_waiters: list[
             tuple[asyncio.AbstractEventLoop, asyncio.Event]
         ] = []
+        self._signal = CancelSignalView(self)
+
+    @property
+    def signal(self) -> CancelSignalView:
+        """Stable read-only view for code that must observe, not own, cancel."""
+
+        return self._signal
 
     @property
     def mode(self) -> CancelMode:
@@ -90,8 +124,18 @@ class CancelToken:
             ``"immediate"`` interrupts in-flight work; ``"after_step"`` stops
             the run after the current turn commits.
         """
+        requested = CancelMode(mode)
+        if requested is CancelMode.NONE:
+            raise ValueError("cancel mode must be 'immediate' or 'after_step'")
         with self._lock:
-            self._mode = CancelMode(mode)
+            # Cancellation only strengthens. In particular, a late graceful
+            # request must never downgrade an already-immediate cancellation.
+            if self._mode is CancelMode.IMMEDIATE:
+                requested = CancelMode.IMMEDIATE
+            elif requested is CancelMode.IMMEDIATE:
+                self._mode = CancelMode.IMMEDIATE
+            elif self._mode is CancelMode.NONE:
+                self._mode = CancelMode.AFTER_STEP
             self._cancel_requested.set()
             waiters = list(self._async_waiters)
             self._async_waiters.clear()
@@ -175,4 +219,4 @@ class CancelToken:
         self._step_complete.clear()
 
 
-__all__ = ["CancelMode", "CancelToken"]
+__all__ = ["CancelMode", "CancelSignalView", "CancelToken"]

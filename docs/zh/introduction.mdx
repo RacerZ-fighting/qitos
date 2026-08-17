@@ -39,8 +39,8 @@ result = await agent.prompt("检查这个项目")
 
 你会从这些层开始：
 
-- 家族预设（family preset）
-- 适配层策略（harness policy）
+- 家族预设（family preset，用于选择 adapter 和请求默认值）
+- 适配层策略（harness policy，保存解析后的模型家族元信息与上下文提示）
 - 预设工具构建器
 
 这条路径尤其适合同一个智能体在 Qwen、Kimi、MiniMax、`gpt-oss` 与 Gemma 4 之间切换的场景。
@@ -61,13 +61,19 @@ started/terminal 记录、已提交 turn，以及恰好一个运行终态记录�
 
 ### 内置可观测性：qita
 
-`qita` 是 QitOS 自带的追踪记录查看器。任意一次运行结束后，启动看板即可查看逐步执行、回放运行轨迹，并导出（export）成独立 HTML。
+`qita` 是 QitOS 自带的 trace artifact 查看器。将它指向包含兼容 trace artifact
+的目录，即可检查运行、回放已记录的时间线，并导出成独立 HTML。
 
 ```bash
 qita board --logdir runs
 ```
 
 看板默认运行在 `http://127.0.0.1:8765`，当新运行出现时会自动刷新。
+
+<Note>
+最小 Agent loop 尚未自动挂接 `TraceWriter`。它的 canonical JSONL journal 是另一条
+持久化边界；自动 trace 投影属于 Session/Harness 迁移的待完成项。
+</Note>
 
 ### 严格准入的类型化工具
 

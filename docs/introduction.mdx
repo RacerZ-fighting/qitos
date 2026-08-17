@@ -40,8 +40,8 @@ This is the fastest path when you want a stable baseline or quick model-family s
 
 You start from:
 
-- family presets (pre-configured defaults for a model family, covering transport and tool delivery)
-- harness policies (rules that control how the model harness resolves at runtime)
+- family presets (pre-configured adapter and request defaults for a model family)
+- harness policies (resolved model-family metadata and context hints)
 - preset tool builders (pre-assembled tool bundles for common workflows)
 
 This path is especially useful when one agent should switch across Qwen, Kimi, MiniMax, `gpt-oss`, and Gemma 4 without rewriting the agent.
@@ -62,13 +62,21 @@ journal is the canonical source for replay, recovery, and fork.
 
 ### Built-in observability with qita
 
-`qita` is QitOS's built-in trace viewer. After any run, launch the board to inspect step-by-step execution, replay the trajectory (the temporal sequence of prompts, decisions, tool calls, and observations across steps), and export traces to standalone HTML.
+`qita` is QitOS's trace-artifact viewer. Point it at a directory containing
+compatible trace artifacts to inspect a run, replay its recorded timeline, and
+export it to standalone HTML.
 
 ```bash
 qita board --logdir runs
 ```
 
 The board runs at `http://127.0.0.1:8765` and auto-refreshes as new runs appear.
+
+<Note>
+The minimal Agent loop does not yet attach `TraceWriter` automatically. Its canonical
+JSONL journal is a separate persistence surface; automatic trace projection is tracked
+in the Session/Harness migration.
+</Note>
 
 ### Typed tools with strict admission
 

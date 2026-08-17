@@ -94,7 +94,6 @@
                 "root": "blog/index",
                 "pages": [
                   "blog/index",
-                  "blog/single-kernel",
                   "blog/reproducible-runs",
                   "blog/gold-presets-preview",
                   "blog/desktop-osworld-starter"
@@ -182,7 +181,6 @@
                 "root": "zh/blog/index",
                 "pages": [
                   "zh/blog/index",
-                  "zh/blog/single-kernel",
                   "zh/blog/reproducible-runs",
                   "zh/blog/gold-presets-preview",
                   "zh/blog/desktop-osworld-starter"

@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,models,benchmarks]"
+          python -m pip install -e ".[dev,models]"
 
       - name: Run tests
         run: pytest -q
@@ -41,10 +41,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,models,benchmarks]"
+          python -m pip install -e ".[dev,models]"
 
       - name: Enforce coverage floor
-        run: pytest --cov=qitos.core --cov=qitos.engine --cov=qitos.trace --cov-report=term --cov-fail-under=80 -q
+        run: pytest --cov=qitos.core --cov=qitos.models --cov=qitos.trace --cov-report=term --cov-fail-under=80 -q
 
   package:
     runs-on: ubuntu-latest
@@ -85,7 +85,7 @@ jobs:
           python -m pip install flake8
 
       - name: Lint stable surface
-        run: flake8 qitos/core qitos/engine qitos/models qitos/trace
+        run: flake8 qitos/core qitos/models qitos/trace
 
   type-stable:
     runs-on: ubuntu-latest
@@ -104,7 +104,7 @@ jobs:
           python -m pip install mypy "httpx[socks]>=0.27,<1" beautifulsoup4 pyyaml openai
 
       - name: Type-check stable surface
-        run: mypy qitos/core qitos/engine qitos/models qitos/trace
+        run: mypy qitos/core qitos/models qitos/trace
 
   audit:
     runs-on: ubuntu-latest
@@ -120,7 +120,7 @@ jobs:
       - name: Install audited environment
         run: |
           python -m pip install --upgrade pip "setuptools>=83"
-          python -m pip install -e ".[dev,models,benchmarks]"
+          python -m pip install -e ".[dev,models]"
 
       - name: Audit Python dependencies
         run: pip-audit --progress-spinner off

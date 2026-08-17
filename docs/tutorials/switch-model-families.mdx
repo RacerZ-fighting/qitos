@@ -1,157 +1,127 @@
 ---
 title: "Switch model families with presets"
-description: "Run the same agent across Qwen, Kimi, DeepSeek, and other model families using family presets — without rewriting agent code."
+description: "Run the same Agent façade with different model-family construction defaults."
 ---
 
-Family presets (pre-configured defaults for a model family) let you switch model families with minimal code changes. This tutorial shows you how to build an agent that runs on multiple families, override a preset when you need to, and compare the results in qita.
+Family presets select a Provider adapter and model request defaults without changing
+the minimal Agent loop. They do not install a parser or a second execution runtime.
 
 ## Step 1 — Build a model with a preset
-
-The fastest way to get a model configured for a specific family is `build_model_for_preset`:
 
 ```python
 from qitos.harness import build_model_for_preset
 
-llm = build_model_for_preset(
+model = build_model_for_preset(
+    family_id="qwen",
     model_name="Qwen/Qwen3-8B",
-    api_key="sk-...",
+    api_key="...",
     base_url="https://api.siliconflow.cn/v1/",
 )
 ```
 
-This returns a fully configured model object with the Qwen family preset already applied — the right protocol, parser, tool delivery mode, and context window.
+The returned object implements the ordinary QitOS Model contract. The preset chooses
+the adapter, request and reasoning defaults, Tool delivery policy, and context-window
+hints. Provider adapters still deliver typed assistant messages and native Tool calls
+to the same loop.
 
-## Step 2 — Run the same agent with different families
+`default_protocol` and `fallback_protocols` remain compatibility labels in
+`qitos_harness_metadata`. The current Agent loop does not load a parser or inject an
+output protocol from those labels.
 
-The key insight is that your agent code does not change. Only the model construction changes:
+## Step 2 — Run the same Agent composition
+
+Only model construction changes:
 
 ```python
+import asyncio
+
+from qitos.core.agent import Agent
 from qitos.harness import build_model_for_preset
 
-configs = [
-    ("qwen", "Qwen/Qwen3-8B", "https://api.siliconflow.cn/v1/"),
-    ("kimi", "moonshot-v1-128k", "https://api.moonshot.ai/v1/"),
-    ("deepseek", "deepseek-chat", "https://api.deepseek.com/v1/"),
-]
 
-for family_id, model_name, base_url in configs:
-    llm = build_model_for_preset(
-        model_name=model_name,
-        api_key="sk-...",
-        base_url=base_url,
-    )
-    # agent = MyAgent(llm=llm, ...)
-    # result = agent.run(task="...", max_steps=20)
+async def main() -> None:
+    configs = [
+        ("qwen", "Qwen/Qwen3-8B", "https://api.siliconflow.cn/v1/"),
+        ("kimi", "moonshot-v1-128k", "https://api.moonshot.ai/v1/"),
+        ("deepseek", "deepseek-chat", "https://api.deepseek.com/v1/"),
+    ]
+
+    for family_id, model_name, base_url in configs:
+        model = build_model_for_preset(
+            family_id=family_id,
+            model_name=model_name,
+            api_key="...",
+            base_url=base_url,
+        )
+        agent = Agent(model=model, max_turns=1)
+        result = await agent.prompt("Reply with the model family in one sentence.")
+        print(family_id, result.status.value)
+
+
+asyncio.run(main())
 ```
 
-Each `build_model_for_preset` call resolves the correct protocol, parser, tool delivery, and context policy for that family.
+Use the appropriate credential for each Provider in real code. Do not place API keys
+in source files.
 
-## Step 3 — Override a preset
-
-When a built-in preset does not match your needs, use `preset.override()` to create a customized copy:
+## Step 3 — Override immutable defaults
 
 ```python
 from dataclasses import replace
 from qitos.harness import resolve_family_preset
 
 qwen = resolve_family_preset("qwen")
-
-# Extend Qwen with a larger context window and different stop budget
 custom_qwen = qwen.override(
     context_policy=replace(qwen.context_policy, context_window_hint=256_000),
-    recommended_max_steps=50,
     notes="Extended context variant for long-horizon tasks",
 )
 ```
 
-The `override()` method returns a new `FamilyPreset` instance — the original is never mutated.
+`override()` returns a new `FamilyPreset`; it does not mutate process-global state.
+Pass the fields you need to `build_model_for_preset(...)` when constructing the actual
+model.
 
-## Step 4 — Explore available presets
-
-Use the CLI to see which presets are available:
+## Step 4 — Inspect available presets
 
 ```bash
 qit bench presets
 ```
 
-This prints a table showing each preset's ID, protocol, tool delivery mode, context window, and recommended models.
+The command prints preset identities, adapter kinds, Tool delivery policies, context
+hints, and compatibility labels. Those labels are diagnostic metadata, not an active
+fallback parser chain.
 
-## Step 5 — Compare runs in qita
+The `recommended_*` fields are also advisory. The Agent façade does not automatically
+apply step, token, retry, or temperature recommendations; applications choose their
+own run budgets and pass model request options explicitly.
 
-After running the same task with different families, launch qita to compare:
+## Step 5 — Compare the effective model boundary
 
-```bash
-qita board --logdir runs
-```
-
-In the board view, select two runs and click **Compare** to see:
-
-- which protocol each run used
-- the parser and tool delivery mode
-- step count, token usage, and cost
-- where runs diverged
-
-This makes it easy to see how different presets affect agent behavior on the same task.
-
-## Recommended defaults
-
-Gold presets (Qwen, Kimi, MiniMax, gpt-oss, Gemma 4) include advisory defaults for research baselines:
-
-| Field | Default | Meaning |
-|---|---|---|
-| `recommended_max_steps` | 30 | Suggested step budget per run |
-| `recommended_max_tokens` | 500,000 | Suggested total token budget |
-| `recommended_retry_budget` | 3 | Max critic-retry attempts per step |
-| `recommended_temperature` | 0.2 | Default sampling temperature |
-
-These are advisory — the engine does not auto-apply them. Use them as starting points for your own experiments.
-
-## The environment-driven switching pattern
-
-Keep model configuration outside the agent and drive it from the environment:
-
-```bash
-# Qwen
-export QITOS_MODEL_FAMILY=qwen
-export QITOS_MODEL="Qwen/Qwen3-8B"
-export OPENAI_BASE_URL="https://api.siliconflow.cn/v1/"
-
-# Kimi
-export QITOS_MODEL_FAMILY=kimi
-export QITOS_MODEL="kimi-k2-0905-preview"
-export OPENAI_BASE_URL="https://api.moonshot.ai/v1"
-```
+Inspect `model.capabilities` and `model.qitos_harness_metadata` before a run:
 
 ```python
-import os
-from qitos.harness import build_model_for_preset
-
-llm = build_model_for_preset(
-    family_id=os.environ["QITOS_MODEL_FAMILY"],
-    model_name=os.environ["QITOS_MODEL"],
-    api_key=os.environ["OPENAI_API_KEY"],
-    base_url=os.environ["OPENAI_BASE_URL"],
-)
+print(model.capabilities)
+print(model.qitos_harness_metadata)
 ```
 
-Priority order for model configuration:
+Capabilities describe behavior proven by the selected adapter. Harness metadata
+records how the preset was resolved. Neither object is Session recovery truth.
 
-1. explicit constructor arguments
-2. environment variables (`QITOS_MODEL_FAMILY`, `QITOS_MODEL`, `OPENAI_BASE_URL`)
-3. family preset defaults
-4. framework fallback
+If an application also emits a compatible trace artifact, read-only `qita` can compare
+the producer-recorded model metadata. The current Agent façade does not emit those
+trace directories automatically.
 
 <CardGroup cols={2}>
   <Card title="Family presets concept" icon="cube" href="/concepts/family-presets">
-    Understand what each preset field means
+    Understand the preset boundary
   </Card>
   <Card title="Model family matrix" icon="table" href="/reference/model-family-matrix">
-    See all 10 built-in presets and their defaults
+    Compare built-in defaults
   </Card>
   <Card title="Add a family preset" icon="plus" href="/guides/add-a-family-preset">
-    Extend QitOS with a new model family
+    Extend model construction defaults
   </Card>
   <Card title="Observability" icon="chart-line" href="/guides/observability">
-    Learn how preset metadata appears in traces
+    Inspect compatible trace artifacts
   </Card>
 </CardGroup>

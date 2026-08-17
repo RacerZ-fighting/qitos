@@ -1,11 +1,11 @@
 ---
-title: "Tracing"
-description: "QitOS writes structured trace artifacts for every run so you can replay, diff, export, and audit agent behavior."
+title: "Trace artifacts"
+description: "Inspect compatible QitOS trace directories with the read-only qita tools."
 ---
 
-Tracing is the persistence layer behind QitOS observability — every run writes structured artifacts (persistent output files like `manifest.json`, `steps.jsonl`, and `events.jsonl`) that capture what happened.
-
-Every traced run writes a self-contained directory:
+QitOS keeps the existing trace-directory format as a compatibility and inspection
+surface. `qita` can read directories produced by earlier releases or by an explicit
+application-side trace producer:
 
 ```text
 <trace_logdir>/<run_id>/
@@ -14,73 +14,31 @@ Every traced run writes a self-contained directory:
   steps.jsonl
 ```
 
+<Warning>
+The current `Agent` façade does not attach `TraceWriter` automatically. New Agent runs
+can journal loop transactions through `SessionJournal`, but they do not produce this
+three-file trace directory unless an application supplies a producer. Trace artifacts
+are not Session recovery truth.
+</Warning>
+
 ## What each file means
 
 | File | Purpose |
 | --- | --- |
-| `manifest.json` | Run summary, reproducibility metadata, benchmark metadata, and official-run fields |
-| `events.jsonl` | Event stream across runtime phases |
-| `steps.jsonl` | One structured record per completed step |
+| `manifest.json` | Run summary and producer-supplied reproducibility metadata |
+| `events.jsonl` | Event stream recorded by the trace producer |
+| `steps.jsonl` | Completed legacy step records |
 
-The raw files are the source of truth. `qita` is the human inspection surface built on top of them.
+For one trace directory, these files are the evidence that `qita` displays. They do
+not replace the canonical Session Journal and cannot create an executable resume or
+fork.
 
-`TraceWriter` commits runtime events and their completed step record as one
-ordered step transaction. Event payloads are flushed before the step marker is
-written, so a reader can treat each step record as the commit marker for its
-event range. Lifecycle events such as cancellation and final `END` remain
-visible immediately; an interrupted step is never represented by a completed
-step marker.
+Older artifacts may contain fields such as `prompt_protocol`, `parser_name`,
+`run_spec`, `experiment_spec`, or benchmark metadata. Those fields describe the
+producer that wrote that artifact. They do not enable a parser, Decision/Action
+lifecycle, benchmark runner, or Engine in the current Agent path.
 
-## Why tracing is a first-class feature
-
-QitOS is built for agent research, not only one-off demos, so the framework must preserve:
-
-- how a run stopped
-- what prompt/parser contract it used
-- what tool surface it saw
-- how context changed over time
-- which config fields matter for replay and comparison
-
-Tracing is enabled by default for runs for these reasons.
-
-## Trace metadata in v0.3
-
-The v0.3 closure adds stronger reproducibility metadata to the manifest, including:
-
-- `git_sha`
-- `package_version`
-- `benchmark_name`
-- `benchmark_split`
-- `model_family`
-- `prompt_protocol`
-- `parser_name`
-- `tool_manifest`
-- `run_spec`
-- `experiment_spec`
-- `official_run`
-- `replay_mode`
-- token / latency / cost summaries
-
-These fields support qita comparison and benchmark result normalization.
-
-## Best-effort replay
-
-Tracing in QitOS supports **best-effort research replay**.
-
-That means QitOS records enough information to inspect and compare runs well, but does not promise strict deterministic re-execution for remote models or external environments.
-
-Use traces for:
-
-- debugging long trajectories
-- comparing prompt/parser/tool changes
-- exporting artifacts for review
-- replaying benchmark failures
-
-Do not rely on traces for exact token-level reproducibility from remote providers.
-
-## qita on top of traces
-
-Once traces exist, use:
+## Inspect compatible artifacts
 
 ```bash
 qita board --logdir ./runs
@@ -88,15 +46,17 @@ qita replay --run ./runs/<run_id>
 qita export --run ./runs/<run_id> --html ./report.html
 ```
 
-`qita` also supports run comparison so you can ask why two runs diverged instead of reading raw JSON by hand.
+Use these commands to review, compare, and export existing evidence. Remote models and
+external environments remain nondeterministic, so artifact replay is an inspection
+operation rather than deterministic re-execution.
 
-`qita` is a read-only projection of these artifacts. It does not create executable
-forks by copying or editing trace files. To continue a Run from a prior safe boundary,
-fork its canonical Session Journal at the handle's committed continuation position;
-see [Session Journal](/concepts/session-journal).
+To continue a Run from a safe boundary, use the canonical Session Journal once the
+authoritative Session/Harness migration exposes that workflow. Copying or editing a
+trace directory never creates a resumable Run.
 
 ## Related reading
 
+- [Session Journal](/concepts/session-journal)
 - [Observability](/guides/observability)
 - [CLI reference](/reference/cli)
 - [Replay and inspect a failed run](/tutorials/replay-and-inspect-failed-runs)

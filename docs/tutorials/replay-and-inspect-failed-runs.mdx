@@ -1,9 +1,16 @@
 ---
-title: "Tutorial: Replay and Inspect a Failed Run"
-description: "Use qita board, replay, export, and diff to understand why an official QitOS run behaved differently."
+title: "Inspect a compatible trace artifact"
+description: "Use qita board, replay, export, and diff to inspect an existing QitOS trace directory."
 ---
 
 This tutorial starts after a run already exists.
+
+<Warning>
+This workflow reads compatible trace artifacts produced by earlier releases or an
+application-side producer. Parser, critic, step, and official-run fields below describe
+that artifact schema; they are not components of the current Agent loop. New façade
+runs do not emit trace directories automatically.
+</Warning>
 
 The question is no longer whether it finished. The question is why it behaved this way, and what changed between two runs.
 

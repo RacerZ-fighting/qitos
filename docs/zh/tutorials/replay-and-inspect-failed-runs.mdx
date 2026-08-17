@@ -1,9 +1,15 @@
 ---
-title: "教程：回放并检查失败运行"
-description: "使用 qita 面板、回放、导出和差异对比来理解一次官方 QitOS 运行为什么会失败或发生变化。"
+title: "检查兼容 trace artifact"
+description: "使用 qita 面板、回放、导出和差异对比检查现有 QitOS trace 目录。"
 ---
 
 这节课从运行已经存在开始。
+
+<Warning>
+这个工作流读取早期版本或应用侧 producer 生成的兼容 trace artifact。下文的 parser、
+critic、step 和 official-run 字段描述的是该 artifact schema，不是当前 Agent loop 组件。
+新的 façade run 不会自动生成 trace 目录。
+</Warning>
 
 问题不再是"它跑完了吗"，而是"它为什么会这样运行"，以及"两次运行到底差在哪里"。
 

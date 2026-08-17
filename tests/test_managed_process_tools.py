@@ -13,6 +13,7 @@ import pytest
 from qitos.core.journal import JournalRecordType
 from qitos.core.budget import BudgetLedger
 from qitos.core.process import ProcessStatus
+from qitos.core.tool_result import ToolResult
 from qitos.core.tool_registry import ToolRegistry
 from qitos.kit.env.host_env import HostCommandCapability
 from qitos.kit.env.managed_process import ManagedHostProcessRuntime
@@ -123,8 +124,10 @@ async def test_process_handles_are_bound_to_the_active_run(tmp_path: Path) -> No
         runtime_context=_runtime_context("run-2", journal=None),
     )
 
-    assert denied["status"] == "error"
-    assert "unknown process handle" in denied["message"]
+    assert isinstance(denied, ToolResult)
+    assert denied.status == "error"
+    assert denied.error is not None
+    assert "unknown process handle" in denied.error
     await tools.ateardown({})
 
 
@@ -263,8 +266,10 @@ async def test_reused_shell_toolset_creates_a_fresh_supervisor_for_each_run(
 
     assert terminal["status"] == "success"
     assert terminal["process_status"] == ProcessStatus.EXITED.value
-    assert stale["status"] == "error"
-    assert "unknown process handle" in stale["message"]
+    assert isinstance(stale, ToolResult)
+    assert stale.status == "error"
+    assert stale.error is not None
+    assert "unknown process handle" in stale.error
     await tools.ateardown({})
 
 
@@ -363,8 +368,10 @@ async def test_invalid_yield_does_not_start_a_process(tmp_path: Path) -> None:
     )
     listed = await tools.process_list.execute({}, runtime_context=context)
 
-    assert result["status"] == "error"
-    assert result["message"].endswith("must be finite and non-negative")
+    assert isinstance(result, ToolResult)
+    assert result.status == "error"
+    assert result.error is not None
+    assert result.error.endswith("must be finite and non-negative")
     assert listed["processes"] == []
     await tools.ateardown({})
 

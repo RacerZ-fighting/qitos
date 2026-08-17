@@ -24,8 +24,8 @@ How to update:
   (`Agent`), `qitos.core.message` (typed `UserMessage` / `AssistantMessage` /
   `ToolResultMessage` / `ToolCall` with wire and durable codecs),
   `qitos.core.agent_events`, and `qitos.core.tool_executor`
-  (`ToolBatchExecutor`) implement the target `Message -> Model -> ToolCall ->
-  ToolResult` path alongside the current Engine mainline. The loop freezes one
+  (`ToolBatchExecutor`) implement the `Message -> Model -> ToolCall ->
+  ToolResult` mainline. The loop freezes one
   model/Tool exposure/deadline snapshot per turn (a live `ToolRegistry` is
   re-frozen per turn, so Tools loaded mid-run become visible to the next
   turn), injects steering before each model request, revives on follow-up
@@ -37,20 +37,24 @@ How to update:
   `parallel` mode validation/permission/`before_tool_call` run sequentially
   in input order (Pi's preflight) and only prepared handlers share bounded
   concurrent segments; results in input order; exactly one terminal
-  `ToolResult` per admitted call; duplicate Tool-call ids are rejected at
-  batch admission before any side effect; terminal results are deeply
+  `ToolResult` per admitted call; duplicate Tool-call ids remain in the failed
+  assistant message as protocol evidence and are rejected before Tool
+  admission or any side effect (the executor also rejects a direct malformed
+  batch before admission); terminal results are deeply
   immutable snapshots; absolute downward-propagated deadlines; and
   cooperative `CancelToken` cancellation (now `qitos.core.cancellation`)
   where `immediate` interrupts in-flight work and `after_step` stops the run
   after the current turn commits. External task cancellation and faults
   terminalize started work and the run record before re-raising. Hook
   contracts mirror Pi: `before_tool_call` receives validated arguments and an
-  immutable agent-context snapshot and may block or return `updated_args`
-  (re-validated against schema and permission — a QitOS strengthening over
-  Pi); `after_tool_call` applies a field-level `AfterToolCallOverride`;
-  progress reported by Tools surfaces as `ToolExecutionUpdate` events; hooks
-  and listeners are bounded by the run's cancellation and deadline so a hung
-  callback cannot block `abort()` or `wait_for_idle()`. Error `ToolResult`s
+  immutable agent-context snapshot and may block the call;
+  `after_tool_call` applies a field-level `AfterToolCallOverride`;
+  progress reported by Tools surfaces as `ToolExecutionUpdate` events. Tool
+  hooks observe the run cancellation/deadline boundary. Event listeners settle
+  in subscription order, receive a read-only cancellation signal, and are not
+  forcibly cancelled by `abort()`; a configured absolute run deadline bounds
+  a listener that ignores that signal. Without a deadline, listener settlement
+  remains part of `prompt()` / `wait_for_idle()` settlement. Error `ToolResult`s
   project their error text and an `is_error` flag into provider payloads
   (including Anthropic `tool_result.is_error`). The façade returns typed
   values for expected rejections only; listener/codec/persistence bugs are
@@ -59,11 +63,15 @@ How to update:
   the `ChildEngine` contract over the new `Agent` façade, and
   `qitos.kit.child.build_agent_child_invocation_factory` wires one child run
   per invocation with a narrowed Tool registry (filtered to the request's
-  allowed groups), budgets tightened to the tightest of factory defaults,
+  allowed groups) and a value snapshot of the parent's effective Tool
+  permission/scope policy, budgets tightened to the tightest of factory defaults,
   request budget and the parent's remaining deadline, and a per-run
   `JournalTurnTransaction` journal (`journal_directory` or an explicit
   SessionJournal factory). Parent messages enter the child run's steering
-  queue with journaled acceptance (`runtime_input.posted`), and every abort
+  queue with journaled acceptance (`runtime_input.posted`) only while the run
+  can guarantee a following turn safe point; starting and terminal-settlement
+  windows reject instead of reporting false acceptance. Child control Tools
+  use the executor-owned Run identity, and every abort
   still ends in a durable `run.interrupted` record. Child recovery now
   rebuilds a started child's terminal `ChildResult` from its own loop journal
   when that journal holds a run terminal record
@@ -73,9 +81,8 @@ How to update:
 
 ### Changed
 
-- `CancelToken` / `CancelMode` moved from `qitos.engine.cancellation` to
-  `qitos.core.cancellation`; `qitos.engine` re-exports them until the Engine
-  mainline is replaced.
+- `CancelToken` / `CancelMode` moved from the retired Engine lifecycle to
+  `qitos.core.cancellation`; the compatibility export is removed.
 
 ### Removed
 
@@ -89,12 +96,11 @@ How to update:
   protocol registry), `qitos/render/` (Engine hook renderer), the Engine-era
   kit packages (`qitos.kit.{parser,critic,planning,prompts,history}`), and
   `qitos/prompting.py` / `qitos/core/_json_repair.py` (zero surviving
-  consumers). `qitos/core/errors.py` keeps only the model-facing error types;
-  `core/history.py` keeps only the `HistorySnapshot` closure used by
-  `core/turn.py`; `core/spec.py` (`RunSpec`/`ExperimentSpec`/
-  `BenchmarkRunResult`) stays because the engine-free benchmark core and the
-  leaderboard store consume it. The `Agent` façade over the minimal agent
-  loop is the only execution path.
+  consumers), plus the now-unreferenced `qitos/core/history.py` and
+  `qitos/core/turn.py`. `qitos/core/errors.py` keeps only the model-facing error
+  types; `core/spec.py` (`RunSpec`/`ExperimentSpec`/`BenchmarkRunResult`) stays
+  because result-file evaluation and the leaderboard store consume it. The
+  `Agent` façade over the minimal agent loop is the only execution path.
 - **Breaking:** `ToolTransaction` decodes only the loop's journal schema
   (`turn` + typed `ToolCall`); the retired Engine payload fields
   (`step_id`/`action_index`/`action`) fail closed on decode, consistent with
@@ -118,10 +124,14 @@ How to update:
   `desktop`, `gaia`, `osworld`, `tau_bench`), `qitos/benchmark/runner.py`, the
   `qit bench run` / `qit bench list` commands, the `qitos[benchmarks]` extra,
   `examples/benchmarks/`, and `examples/real/openai_cua_agent.py`.
-  `qitos.benchmark` keeps only the engine-free core: the adapter/scorer
-  protocols, `BenchmarkRunResult` file read/write, and result aggregation, so
-  `qit bench eval`, `replay`, `export`, and `presets` plus the leaderboard
-  store keep working on result files and run directories produced elsewhere.
+  The orphaned `BenchmarkAdapter`, `BenchmarkRuntimeHook`,
+  `BenchmarkEvaluator`, `BenchmarkScorer`, and `PreparedBenchmarkTask`
+  extension protocols are removed as part of the same deletion boundary;
+  they had no implementation or caller after the family adapters left.
+  `qitos.benchmark` keeps only `BenchmarkRunResult` file read/write and result
+  aggregation, so `qit bench eval`, `replay`, `export`, and `presets` plus the
+  leaderboard store keep working on result files and run directories produced
+  elsewhere. Stale `.[benchmarks]` installation references are removed.
   Benchmark docs move to git history; run inspection stays with `qita`.
 - **Breaking:** Removed the pattern method recipes
   (`qitos.recipes.{lats,magentic_one,moa,reflexion,self_refine}`): AgentModule
@@ -149,13 +159,13 @@ How to update:
   `qitos.kit.tool.delegate` (`DelegateTool`) and `qitos.kit.tool.fanout`
   (`FanOutTool`) together with `AgentRegistry.get_delegate_tools()` /
   `get_fanout_tool()` and their examples. Child agents now run through the
-  façade-driven `AgentChildEngine` (see Added); the remaining delegate/fanout
-  Engine event names leave with the Engine mainline.
+  façade-driven `AgentChildEngine` (see Added); the retired delegate/fanout
+  event names are removed with the Engine lifecycle.
 - **Breaking:** Removed the kit-side handoff tool chain:
   `qitos.kit.tool.handoff_tool` (`HandoffTool`),
   `AgentRegistry.get_handoff_tools()`, and the Engine's `handoff_targets`
-  auto-registration. The Engine's internal Decision-handoff policy is
-  untouched and leaves with the Engine mainline.
+  auto-registration. The internal Decision-handoff policy is removed with the
+  Engine lifecycle.
 - **Breaking:** Removed `qitos.core.shared_memory` (`SharedMemory`,
   `InMemorySharedMemory`, `FileSharedMemory`, `SharedMemoryNamespace`,
   `SharedMemoryManager`) and its wiring: the `Engine(shared_memory=...)` /
@@ -206,8 +216,8 @@ How to update:
 - **Breaking:** Removed the unused `qitos.func` decorator and composition package.
   Its `@agent`/`@task` callables bypassed Engine transactions, while its advertised
   `AgentModule` conversion never executed the wrapped function. Applications now use
-  `AgentModule + Engine` for Agents and the maintained function-tool decorator for
-  ordinary callable Tools.
+  the `Agent` façade for Agents and the maintained function-tool decorator for ordinary
+  callable Tools.
 - **Breaking:** Removed `qitos.checkpoint.fork`, including `fork_checkpoint()` and
   `list_fork_history()`. Copying a checkpoint snapshot did not create a canonical Run
   transaction or resumable lineage. Checkpoint persistence and snapshot resume remain;
@@ -231,12 +241,10 @@ How to update:
 
 ### Changed
 
-- Accepted a Pi-aligned runtime architecture that will replace `AgentModule + Engine`
-  in place with a provider-neutral Model, a minimal async Agent loop, and a durable
-  Session/Harness. The same plan makes a typed, goal-bearing Task the Root/Child work
-  root and removes benchmark, environment, metrics, and free-form metadata concerns
-  from that contract. This entry records the architecture decision; current releases
-  keep their documented runtime behavior until the replacement lands.
+- Adopted the Pi-aligned provider-neutral Model, minimal async Agent loop, and `Agent`
+  façade as the only execution path. The remaining plan makes Session/Harness
+  authoritative and replaces Task/Plan in place; it removes benchmark, environment,
+  metrics, and free-form metadata concerns from canonical Task.
 - Consolidated internal architecture history into one target architecture and one
   active migration plan, removing superseded Engine, handoff, WorkPlan, release-roadmap
   and completed task plans. Contributor instructions now use one short risk-based
@@ -387,6 +395,28 @@ How to update:
 
 ### Fixed
 
+- Concrete kit Tools now return explicit typed error results for execution failures;
+  ordinary mappings, including mappings with domain fields named `status`, remain
+  successful Tool output. HTTP 4xx/5xx, capability failures, invalid input, and
+  unavailable resources therefore keep their error lifecycle without making the
+  executor guess application payloads.
+- Durable Message, ToolResult, and Model usage codecs now reject non-string mapping
+  keys and non-finite numbers instead of accepting values that JSONL cannot reproduce.
+  Tool runtime contexts also keep the frozen Env permission context authoritative, so
+  caller-supplied context cannot replace the policy used at admission.
+- The public one-at-a-time queue value now matches Pi's `one-at-a-time` spelling and
+  invalid raw queue modes fail closed. Reaching `max_turns` no longer consumes steering
+  or follow-up input that cannot be injected, and the façade restores any input drained
+  immediately before a run rejection.
+- Child launch now intersects requested Tool groups with the parent's frozen exposure,
+  carries a value snapshot of the parent's permission/scope authority, and applies one
+  absolute deadline across limiter admission, factory construction, execution, and
+  cleanup. Child control Tools prefer the executor-owned parent Run identity, while
+  mailbox posting rejects startup, between-turn, and terminal-settlement windows where
+  no later safe point can be guaranteed. Posts reserved during a live turn settle in
+  FIFO order at Pi's existing prepare-next-turn boundary, before steering is drained;
+  cancellation and persistence faults preserve committed, rolled-back, and unknown
+  journal outcomes instead of returning a rejection beside a durable ghost input.
 - Canonical Tool results now use an exact Journal decoder, so terminal Runs containing
   an empty error string can be resumed without rewriting or rejecting durable records.
 - Terminal-synthesis Runs now commit a non-empty cancellation conclusion and

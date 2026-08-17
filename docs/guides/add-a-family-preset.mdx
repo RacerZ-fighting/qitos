@@ -1,21 +1,21 @@
 ---
 title: "Add a model-family preset"
-description: "How to extend QitOS v0.4 with a new family preset without forking the runtime."
+description: "Extend model construction defaults without forking the Agent runtime."
 ---
 
-A family preset (a configuration bundle that maps a model family to its default protocol, adapter, and tool delivery) lets you add support for a new model family without writing a new runtime. Do not start by writing one.
+A family preset selects model-construction policy. It does not add a new Agent loop,
+parser, or product plugin.
 
-Start by answering five questions:
+Before adding one, answer four questions:
 
-1. What model names should resolve to this family?
-2. Which transport (the adapter layer that handles API communication with the model provider) builds the model object?
-3. What is the default protocol (the output format the model is expected to follow)?
-4. What fallback protocol chain should remain stable?
-5. How should tools and context be delivered by default?
+1. Which model names resolve to this family?
+2. Which Provider transport constructs the model?
+3. How are Tool schemas delivered?
+4. Which context, reasoning, and request defaults have been verified?
 
-## The minimal path
+## Add the smallest preset
 
-Add one `FamilyPreset` entry under `qitos/harness/_presets.py`.
+Add one `FamilyPreset` entry in `qitos/harness/_presets.py`:
 
 ```python
 FamilyPreset(
@@ -23,64 +23,51 @@ FamilyPreset(
     display_name="My Family",
     model_matchers=("my-family", "my-model-prefix"),
     adapter_kind="openai-compatible",
-    default_protocol="json_decision_v1",
-    fallback_protocols=("react_text_v1",),
+    default_protocol="legacy-label-v1",
+    fallback_protocols=(),
     tool_policy=ToolPolicy(
         primary_delivery="api_parameter",
-        fallback_delivery="prompt_injection",
+        fallback_delivery="api_parameter",
+        native_tool_call_preferred=True,
     ),
     context_policy=ContextPolicy(
         context_window_hint=128_000,
         fallback_context_window=128_000,
     ),
     recommended_models=("my-family-32b",),
-    recommended_max_steps=30,
-    recommended_max_tokens=500_000,
-    recommended_retry_budget=3,
     recommended_temperature=0.2,
 )
 ```
 
-## Reuse protocol objects instead of inventing new ones
+`default_protocol` and `fallback_protocols` are retained compatibility labels. The
+minimal Agent loop does not resolve them to protocol objects, inject prompts, or run a
+fallback parser chain. Use a descriptive stable value for artifact compatibility; do
+not add a parser to make the label executable.
 
-QitOS v0.4 reuses the existing `ModelProtocol` set, so most new families should choose from:
+## Reuse Provider adapters
 
-- `react_text_v1`
-- `json_decision_v1`
-- `xml_decision_v1`
-- `terminus_json_v1`
-- `terminus_xml_v1`
-- `minimax_tool_call_v1`
+Use `OpenAICompatibleAdapter` for an OpenAI-compatible endpoint. Use the native
+Anthropic or OpenAI adapter only when its wire contract is the behavior you need.
+Adding a model family is not, by itself, a reason to add a new transport.
 
-Only create a new protocol when the model truly emits a different contract.
+The adapter owns typed model events, native Tool calls, usage, continuation, and
+capability reporting. A preset only supplies construction defaults.
 
-## Reuse adapters when possible
+## Keep the result inspectable
 
-For v0.4, the default adapter is:
-
-```python
-OpenAICompatibleAdapter
-```
-
-If the model is served through an OpenAI-compatible endpoint, prefer reusing that adapter.
-
-Only add a new adapter when the transport itself is different, not just because the family is different.
-
-## Keep the preset traceable
-
-The preset becomes valuable only if researchers can see it later.
-
-Make sure the resolved harness metadata is visible through:
-
-- `RunSpec.metadata`
-- trace manifest (the JSON record of the full run history)
-- `qita`
+`build_model_for_preset(...)` attaches the resolved policy to
+`model.qitos_harness_metadata`. The adapter exposes its tested behavior through
+`model.capabilities`. Both are diagnostic snapshots; neither is canonical Session
+state or recovery truth.
 
 ## Validation checklist
 
-- `resolve_family_preset(...)` resolves the family from both family id and model name
-- `build_harness_policy(...)` returns the right protocol and parser (the component that converts raw model output into a structured `Decision`)
-- `infer_model_profile(...)` stays aligned with preset defaults
-- the flagship example can switch into the new family without changing agent code
-- `recommended_*` fields are set if the family has been tested enough to provide stable baseline advice
-- `preset.override()` works for users who need to tweak your preset without editing source
+- `resolve_family_preset(...)` resolves both the family id and intended model names.
+- `build_harness_policy(...)` selects the intended adapter, Tool policy, context policy,
+  and compatibility labels.
+- `build_model_for_preset(...)` constructs a Model whose capabilities match the tested
+  Provider behavior.
+- Native Tool-call, usage, continuation, cancellation, and failure behavior use the
+  existing adapter contract tests.
+- `recommended_*` fields are set only when evidence supports the recommendation.
+- `preset.override()` returns a new value without mutating global state.

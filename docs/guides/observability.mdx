@@ -1,286 +1,74 @@
 ---
 title: "Observability"
-description: "Inspect, replay, and export agent runs with the qita web board."
+description: "Inspect, replay, and export compatible trace artifacts with qita."
 ---
 
-Every `agent.run()` call writes a trace (the structured log of decisions, actions, and observations recorded during a run) to `./runs/<run_id>/` by default. The `qita` CLI tool reads these traces and exposes them through a local web board with run inspection, step-by-step replay, and standalone HTML export.
+`qita` is a read-only viewer for QitOS trace artifacts. It discovers existing run
+directories, renders their recorded trajectory, replays events, and exports standalone
+HTML. It never becomes the canonical Session or journal owner.
 
-## Trace artifacts (persistent output files from a run)
+<Warning>
+The minimal `Agent` loop does not yet attach `TraceWriter` automatically. Do not expect
+`agent.prompt(...)` to create `./runs/<run_id>/`. Automatic projection from the new
+loop/façade event stream is tracked in the Session/Harness migration.
+</Warning>
 
-Each run directory contains three files:
+## Accepted input
 
-| File | Contents |
-|---|---|
-| `manifest.json` | Run metadata: `run_id`, `model_id`, `status`, `stop_reason`, `step_count`, `event_count`, `schema_version`, `prompt_hash`, `task_hash`, `run_config_hash`, `seed`, `summary` |
-| `events.jsonl` | One JSON object per line; each line is a `RuntimeEvent` with `step_id`, `phase`, `ts`, `ok`, `error`, and `payload` |
-| `steps.jsonl` | One JSON object per line; each line is a `StepRecord` with `step_id`, `decision` (the model's structured output), `actions` (the tool calls dispatched), `action_results`, `observation` (the environment's response), and `critic_outputs` |
+Point qita at a directory containing compatible trace run directories. Historical
+artifacts normally contain `manifest.json`, `events.jsonl`, and `steps.jsonl`; qita
+validates what it can read and treats missing provenance as incomplete rather than
+inventing it.
 
-`manifest.json` is written on initialization and finalized when the run ends.
-Runtime events are staged until their step reaches the trace boundary; the
-events are flushed before the corresponding `steps.jsonl` commit marker. This
-keeps each completed step replayable as one ordered transaction. Lifecycle
-events such as cancellation remain observable immediately.
+The Agent loop's append-only Session journal is a different format and remains the
+canonical source for model transactions, Tool terminals, committed turns, and run
+terminals. qita does not convert or repair that journal during reads.
 
-`task_hash` fingerprints the complete canonical Task package, including its stable
-task/sample ID. Plain-text tasks receive a content-derived ID rather than a
-wall-clock-derived ID; the trace `run_id` remains the execution-instance identity.
-`run_config_hash` fingerprints runtime configuration separately. Qita requires both
-when declaring two traces a same-spec comparison; older traces without `task_hash`
-remain readable but have incomplete comparison provenance.
-
----
-
-## qita board
-
-`qita board` starts a local HTTP server that discovers all run directories under a log root and renders a card grid.
-
-<Steps>
-
-<Step title="Start the board">
+## Board
 
 ```bash
 qita board --logdir ./runs
 ```
 
-The board starts at `http://127.0.0.1:8765` by default. Open it in a browser.
-
-Available flags:
+The board listens on `http://127.0.0.1:8765` by default.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--logdir` | `./runs` | Root directory containing run subdirectories |
+| `--logdir` | `./runs` | Root containing compatible trace directories |
 | `--host` | `127.0.0.1` | Bind address |
 | `--port` | `8765` | Bind port |
 
 ```bash
-# bind to all interfaces on a different port
 qita board --logdir ./runs --host 0.0.0.0 --port 9000
 ```
 
-</Step>
-
-<Step title="Browse runs">
-
-The board auto-refreshes every 2.5 seconds. Each run appears as a card showing:
-
-- Run ID
-- Status badge
-- Step count and event count
-- Stop reason
-- Last updated timestamp
-- Manifest metadata: model ID, schema version, seed, prompt hash
-
-Use the toolbar to search, filter, and sort:
-
-- **Search** — filters run ID, stop reason, and final result text
-- **Status filter** — show only runs with a given status (`completed`, `failed`, etc.)
-- **Sort** — by updated time (desc/asc), event count, or step count
-- **Auto refresh** — toggle the 2.5-second polling on or off
-
-The summary strip above the cards shows: success rate, average steps, average events, and the top-3 failure stop reasons across all visible runs.
-
-This board view is the primary way to compare runs:
+The board provides search, status filters, sorting, run metadata, recorded steps, and
+paired Tool-call/result evidence when the source artifact contains it.
 
 ![qita board overview](/images/qita-board.png)
 
-</Step>
-
-<Step title="Open a run">
-
-Click **view** on any run card to open the run detail page. The page has two tabs:
-
-**Traj tab**
-
-The trajectory (the ordered sequence of steps the agent took) view opens as a failure-diagnosis workbench. The first viewport includes:
-
-- **Diagnosis Strip** — outcome, primary failure, next step to inspect, and trace-derived risk flags
-- **Focus Navigator** — defaults to critical steps, submissions, errors, and phase changes, with an `All Steps` mode when you want the full trajectory
-- **Agent Behavior Story** — step cards organized as a causal `Input -> Thought -> Action Calls -> Environment Observation` chain
-- **Inspector** — a sticky right-side panel with step-level tabs and call-level Summary, Params, Result, and Raw tabs
-- **Run Metadata** — config, cost, context, parser, critic, and raw telemetry are folded away by default so they do not compete with the diagnostic path
-
-Each default step card is intentionally sparse:
-
-- **Role / phase** — why this step matters in the run narrative
-- **Input** — the complete prepared input delivered to the model, folded by default
-- **Thought** — the recorded rationale in an independent folded evidence block
-- **Action Calls** — numbered action controls followed by one paired unit per call, containing its parameters, execution status, latency, attempts, and corresponding result
-- **Environment Observation** — environment-only results in a separate, visually quieter folded lane so they are not mistaken for tool results
-- **Evidence links** — jump points for full thought/action/observation/parser/critic/raw evidence in the Inspector
-
-Input prefers the current step's `model_input.prepared_full`, then `prepared`, and falls back to the recorded step observation for older traces. Each evidence block shows its source and complete character count; expanded code views preserve every recorded character, newline, and field, wrap long lines inside the available width, and support copying the complete unmodified text.
-
-For each action call, qita prefers an explicit `action_id` when pairing results. Standard QitOS traces without IDs use the recorded action/result order. The call's Result view uses `observation_ready.action_results`, which is what the agent could observe, while the Inspector Raw view also preserves canonical `step.action_results`. Environment-only results are separated before pairing. Extra actions or results are shown as **Unmatched evidence** rather than assigned speculatively.
-
-The run API exposes this derived view as optional `step_interactions`. It is a qita presentation model, not a new stable core trace schema; `manifest.json`, `events.jsonl`, and `steps.jsonl` remain unchanged.
-
-The `tool_stats` projection is computed from those same pairs. One failed result is
-attributed only to its matching call, every exact lifecycle status has a count, and
-`unmatched_actions` / `unmatched_results` expose incomplete trace closure rather than
-guessing a pairing.
-
-Numbered call badges select and locate calls without hiding repeated tool names. Failed, blocked, `NO_TRIGGER`, and submission-error calls expand automatically; successful and verified calls stay folded until needed. On narrow screens, the causal chain and Inspector stack vertically without horizontal page overflow.
-
-Long evidence is not truncated as the only available view. qita uses short status labels for scanning, then keeps the full input, thought, raw model output, action parameters, tool results, environment observations, terminal output, parser diagnostics, critic output, and raw JSON in expandable scrollable detail blocks.
-
-The **Focus Navigator** sidebar lets you jump to important steps and shows small health markers for parser errors, tool/event errors, critic retries/stops, context pressure, CyberGym PoC submissions, and visual evidence. Use the controls to:
-- Filter by text across all step content
-- Filter by event phase
-- Sort steps ascending or descending
-- Switch between critical/submission/error/phase/all-step views
-- Adjust font size with `A-` / `A` / `A+`
-- Toggle between light and dark qita themes; the choice is saved in the browser and applies to board, run detail, replay, and comparison pages
-
-Click a navigator item, timeline row, or story card to synchronize the Inspector with that step. Click a numbered action badge or call unit to switch the Inspector into call mode, where **Params** and **Result** show complete wrapped evidence and **Raw** keeps action, invocation, model-visible result, and canonical raw result together.
-
-**Manifest tab**
-
-Displays the raw `manifest.json` as formatted JSON.
-
-The trajectory view is where parser (raw-output-to-Decision converter) behavior, tool calls, and step timing become easy to inspect:
-
-![qita trajectory view](/images/qita-traj.png)
-
-</Step>
-
-</Steps>
-
----
-
-## qita replay
-
-`qita replay` opens a single run in playback mode, stepping through events in time order.
+## Replay
 
 ```bash
-qita replay --run ./runs/my_agent_20260407_120000_000001
+qita replay --run ./runs/example-run
 ```
 
-Available flags:
+Replay walks the events recorded in one compatible run directory. It is a presentation
+of persisted evidence, not a resume operation and never executes a model or Tool.
 
-| Flag | Default | Description |
-|---|---|---|
-| `--run` | required | Path to the run directory |
-| `--host` | `127.0.0.1` | Bind address |
-| `--port` | `8765` | Bind port |
-
-The replay page adds a playback bar with configurable speed. Pass `?speed=300` in the URL to set the millisecond interval between frames (minimum 100 ms).
-
----
-
-## qita export
-
-`qita export` produces a single standalone HTML file that embeds all run data. Share it without running a server.
+## Export
 
 ```bash
-qita export --run ./runs/my_agent_20260407_120000_000001 --html out.html
+qita export --run ./runs/example-run --html out.html
 ```
 
-| Flag | Description |
-|---|---|
-| `--run` | Path to the run directory (required) |
-| `--html` | Output HTML file path (required) |
+The exported HTML embeds the readable run data, CSS, and JavaScript. Review the source
+artifact for secrets before sharing either the artifact or the export.
 
-The exported file is self-contained — all CSS, JavaScript, and run data are inlined. It renders the same trajectory view as the board's run detail page.
+## Current boundary
 
-You can also export directly from the board UI using the **export html** and **export raw** links on each run card, which download the file or the raw JSON payload respectively.
-
----
-
-## Configuring trace output
-
-By default, `agent.run()` writes traces to `./runs/` under a run ID constructed from the agent class name and a UTC timestamp. Override the output directory and prefix:
-
-```python
-result = agent.run(
-    task="...",
-    max_steps=10,
-    trace_logdir="./my_experiments",
-    trace_prefix="react_v2",
-    return_state=True,
-)
-```
-
-To disable tracing entirely, pass `trace=False`:
-
-```python
-result = agent.run(task="...", trace=False, return_state=True)
-```
-
-To pass a pre-configured `TraceWriter` (for example, to share a run ID across multiple agents), construct it explicitly:
-
-```python
-from qitos.trace import TraceWriter
-
-writer = TraceWriter(
-    output_dir="./runs",
-    run_id="my_custom_run_id",
-    strict_validate=True,
-    metadata={"model_id": "Qwen3-8B"},
-)
-
-result = agent.run(task="...", trace=writer, return_state=True)
-```
-
-<Note>
-Three files are required per run for `qita` to discover it: `manifest.json`, `events.jsonl`, and `steps.jsonl`. A run directory missing `manifest.json` is silently skipped by `qita board`.
-</Note>
-
----
-
-## Real-time streaming with SSE
-
-qita provides a Server-Sent Events (SSE) endpoint for each run that streams step events in real time. This is useful for building custom dashboards or integrating with external monitoring.
-
-### SSE endpoint
-
-```
-GET /api/stream/{run_id}
-```
-
-The endpoint emits events in SSE format with typed event names:
-
-| Event type | When emitted |
-|---|---|
-| `run_start` | Run begins (includes `run_id`, `task`, `agent_name`) |
-| `step_start` | A step begins (includes `step_id`, `agent_id`) |
-| `step_end` | A step completes |
-| `phase` | A runtime phase event (decide, act, reduce, etc.) |
-| `handoff` | An agent handoff event |
-| `delegate` | A delegate event (1:1 sub-task) |
-| `fanout` | A fanout event (1:N parallel sub-tasks) |
-| `run_end` | Run finishes (includes `step_count`, `stop_reason`) |
-
-### Client-side consumption
-
-From any web page:
-
-```javascript
-const es = new EventSource('/api/stream/my_run_id');
-es.addEventListener('step_start', e => {
-    const data = JSON.parse(e.data);
-    console.log('Step', data.step_id, 'agent:', data.agent_id);
-});
-es.addEventListener('handoff', e => {
-    console.log('Handoff:', JSON.parse(e.data));
-});
-es.addEventListener('run_end', e => {
-    es.close();
-});
-```
-
-### Live stream button
-
-The qita run detail page includes a **live stream** button that connects to the SSE endpoint and logs events to the browser console. This is useful for debugging and understanding the event flow of a completed run.
-
-### Streaming with the Agent façade
-
-For live runs, subscribe to façade lifecycle events programmatically:
-
-```python
-from qitos import Agent
-from qitos.core.agent_events import ToolExecutionEnd, TurnEnd
-
-agent = Agent(model=model, tool_registry=registry)
-agent.subscribe(lambda event: print(type(event).__name__))
-result = await agent.prompt("analyze the data")
-```
+- Session journals are canonical runtime state.
+- qita trace artifacts are observational projections.
+- Provider continuation and qita indexes are not recovery truth.
+- Trace production for the minimal loop remains pending; qita viewing existing
+  compatible artifacts is available now.

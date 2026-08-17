@@ -1,142 +1,56 @@
 ---
 title: "Family Presets"
-description: "理解 QitOS v0.4 为什么引入家族预设、适配层策略与传输层适配器。"
+description: "在不改变 Agent loop 的前提下解析模型家族 adapter 与请求默认值。"
 ---
 
-QitOS 保留同一条最小 agent loop（内核），并在模型接入层上提供一层稳定抽象：
+Family preset 让同一套 `Agent` 组合切换不同模型家族，同时保持 Provider 中立的 loop 与
+Tool 契约不变。
 
-- `FamilyPreset`
-- `HarnessPolicy`
-- `ModelAdapter`
-- `ToolPolicy`
-- `ContextPolicy`
-
-这层的目的不是替代内核，而是让**同一个智能体可以切换不同模型家族，而不必重写运行时**。
-
-## 一句话理解
-
-家族预设（family preset）就是一个模型家族的研究默认值。
-
-它会回答：
-
-- 用什么传输层（与模型 API 通信的客户端）
-- 默认走什么协议（模型输出的格式契约）
-- 后备协议链是什么
-- 工具模式应该如何交付
-- 上下文默认策略是什么
-
-## 不变的部分
-
-预设层不会改变主链路。
-
-它只是在运行开始前，先把模型侧策略解析出来：
-
-```text
-family preset -> harness policy -> model transport + protocol + parser
-```
-
-真正执行时仍然是：
-
-```text
-task -> state -> prepare -> llm -> parser -> Decision -> tools -> reduce -> trace
-```
-
-## v0.4 的公共表面
+公共入口包括：
 
 ```python
 from qitos.harness import (
+    ContextPolicy,
     FamilyPreset,
     HarnessPolicy,
     ModelAdapter,
     ToolPolicy,
-    ContextPolicy,
-    resolve_family_preset,
     build_harness_policy,
     build_model_for_preset,
+    resolve_family_preset,
 )
 ```
 
-## 第一批黄金预设
+## 预设实际控制什么
 
-QitOS v0.4 首批内建的黄金预设（gold presets）是：
+`build_model_for_preset(...)` 会选择 model adapter，应用模型家族的请求与 reasoning
+默认值，并把上下文窗口提示保留为模型元信息。返回对象实现普通 QitOS Model 契约，进入
+同一条最小 Agent loop。
 
-- `qwen`
-- `kimi`
-- `minimax`
-- `gpt-oss`
-- `gemma-4`
+```python
+from qitos.harness import build_model_for_preset
 
-此外，还有 5 个**兼容预设**为更广泛的模型家族提供正确默认值：
+model = build_model_for_preset(
+    model_name="Qwen/Qwen3-8B",
+    family_id="qwen",
+    api_key="...",
+    base_url="https://example.invalid/v1",
+)
+```
 
-- `openai`
-- `anthropic`
-- `gemini`
-- `deepseek`
-- `glm`
+如果不需要家族默认值，也可以直接构造 `OpenAICompatibleModel`、`OpenAIModel` 或
+`AnthropicModel`。
 
-这 10 个家族当前都走 OpenAI 兼容服务，但默认协议并不完全相同。
+## 兼容标签不是 parser
 
-例如：
+`FamilyPreset.default_protocol`、`fallback_protocols` 与对应的 `HarnessPolicy` 字段是
+保留在 harness metadata 中的稳定兼容标签。最小 Agent loop 不会根据这些标签加载文本
+parser、注入输出协议或运行 fallback parser 链。Provider adapter 直接交付类型化消息与
+Tool call。
 
-- Qwen、Kimi、`gpt-oss`、Gemma 4 默认走 `json_decision_v1`
-- MiniMax 保留 `minimax_tool_call_v1`
+因此，旧示例中的 `json_decision_v1` 不会引入第二套 Decision/Action runtime。
 
-但默认协议并不总能完整描述模型侧行为。
-
-现在 Qwen 在 OpenAI 兼容端点返回结构化 `tool_calls` 时，会优先命中**原生工具调用通道**。
-
-也就是说，对 Qwen 来说：
-
-- `json_decision_v1` 仍然是默认文本协议
-- 但原生工具调用会在文本解析器链之前优先尝试
-- `xml_decision_v1 -> react_text_v1` 则继续作为稳定后备
-
-这是 v0.4 的关键设计点：**模型家族**和**底层传输层**被正式拆开了。
-
-## 为什么不直接手写 `OpenAICompatibleModel(...)`
-
-当然仍然可以手写。
-
-如果你只是：
-
-- 手工接一个单独模型
-- 调试某一个服务端点
-- 暂时不需要家族级默认值
-
-那么直接创建传输层完全合理。
-
-但如果你的目标是：
-
-- 做研究比较
-- 让示例可复用
-- 让追踪记录更可解释
-
-那么预设更合适，因为它能稳定记录：
-
-- 协议选择
-- 后备链
-- 工具交付模式
-- 上下文默认值
-
-## 预设元信息会出现在哪里
-
-QitOS 通过 `RunSpec.metadata` 把预设和适配层信息写进追踪记录。
-
-因此 `qita` 可以直接展示：
-
-- 家族预设
-- 协议
-- 解析器
-- 工具交付模式
-- 决策来源
-- 原生工具调用使用情况
-- 上下文策略
-
-而不需要引入第二套追踪记录格式。
-
-## 覆盖预设
-
-当内建预设不完全符合需求时，用 `preset.override()` 创建自定义副本，无需修改源码：
+## 覆盖不可变默认值
 
 ```python
 from dataclasses import replace
@@ -144,24 +58,18 @@ from qitos.harness import resolve_family_preset
 
 qwen = resolve_family_preset("qwen")
 custom = qwen.override(
-    context_policy=replace(qwen.context_policy, context_window_hint=256_000),
-    notes="Extended context for long-horizon runs",
+    context_policy=replace(
+        qwen.context_policy,
+        context_window_hint=256_000,
+    ),
 )
 ```
 
-`override()` 返回一个新的 `FamilyPreset`——原始预设不会被修改。嵌套策略（`tool_policy`、`context_policy`）整体替换，因此需要先用 `replace()` 处理策略对象。
+`override()` 返回新 preset，不修改进程级全局状态。
 
-## 推荐默认值
+## 运行时边界
 
-黄金预设包含可选的推荐字段，用于研究基线：
-
-| 字段 | 类型 | 含义 |
-|---|---|---|
-| `recommended_max_steps` | `int \| None` | 建议的单次运行步数预算 |
-| `recommended_max_tokens` | `int \| None` | 建议的总 token 预算 |
-| `recommended_retry_budget` | `int \| None` | 每步最大 critic 重试次数 |
-| `recommended_temperature` | `float \| None` | 默认采样温度 |
-
-这些字段**仅供参考**——引擎不会自动应用它们。它们存在的目的是让研究者可以参考已记录的基线，而不是靠猜测。把它们作为起点，然后根据具体任务调优。
-
-这些字段会出现在 `preset.to_dict()` 和追踪元数据中，因此即使你选择了不同的值，也能看到推荐的默认值。
+- Preset 只选择模型构造默认值，不替换 Agent loop。
+- Tool exposure 仍来自当前 turn 的冻结 `ToolRegistry` 快照。
+- Canonical protocol identity 来自 Model adapter 的 API capabilities。
+- Harness metadata 只用于诊断，不是 Session recovery 真源。

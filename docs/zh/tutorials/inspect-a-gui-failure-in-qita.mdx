@@ -1,11 +1,12 @@
 ---
-title: "在 qita 中检查 GUI 故障"
-description: "使用 qita 的可视化时间轴与回放预览来理解桌面运行为什么失败。"
+title: "在 qita 中检查 GUI trace artifact"
+description: "使用 qita 的可视化时间轴检查兼容的桌面 trace artifact。"
 ---
 
-# 在 qita 中检查 GUI 故障
+# 在 qita 中检查 GUI trace artifact
 
-桌面运行失败不能只看解析器。
+本教程读取早期 runtime 或应用侧 producer 生成的兼容 trace artifact。下文的 parser、
+Decision 与 critic 字段属于该 artifact schema，不是当前 Agent loop 组件。
 
 你需要回答：
 

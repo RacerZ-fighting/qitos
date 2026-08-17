@@ -420,27 +420,18 @@ async def test_duplicate_tool_call_ids_are_rejected_before_any_side_effect() -> 
         ToolExecutionConfig(run_id="r"),
         transaction=transaction,
     )
-    results = await executor.execute_batch(
-        [
-            _call("echo", {"text": "ok"}, "c1"),
-            _call("tracked", {"text": "a"}, "dup"),
-            _call("tracked", {"text": "b"}, "dup"),
-        ]
-    )
-    # No handler with a duplicated id ever executed.
+    with pytest.raises(ValueError, match="ToolCall ids must be unique"):
+        await executor.execute_batch(
+            [
+                _call("echo", {"text": "ok"}, "c1"),
+                _call("tracked", {"text": "a"}, "dup"),
+                _call("tracked", {"text": "b"}, "dup"),
+            ]
+        )
+    # The whole malformed assistant batch fails closed before events,
+    # journal admission, or handler side effects.
     assert calls_run == []
-    assert results[0].status == "success"
-    assert results[1].status == "error" and results[2].status == "error"
-    assert results[1].metadata["error_category"] == "duplicate_tool_call_id"
-    assert results[2].metadata["error_category"] == "duplicate_tool_call_id"
-    assert results[1].metadata["started"] is False
-    # Each duplicated id is journaled exactly once, under its first
-    # occurrence, so deterministic record ids stay unique. Batch admission
-    # records rejections before any executed call.
-    started = [r[2] for r in transaction.records if r[0] == "tool_started"]
-    terminals = [r[2] for r in transaction.records if r[0] == "tool_terminal"]
-    assert started == ["dup", "c1"]
-    assert terminals == ["dup", "c1"]
+    assert transaction.records == []
 
 
 @pytest.mark.asyncio
@@ -480,37 +471,6 @@ async def test_parallel_preflight_is_sequential_and_precedes_execution() -> None
 
 
 @pytest.mark.asyncio
-async def test_before_hook_updated_args_are_revalidated_then_executed() -> None:
-    from qitos.core.tool_executor import BeforeToolCallDecision
-
-    executor = ToolBatchExecutor(
-        _exposure(_echo),
-        ToolExecutionConfig(
-            before_tool_call=lambda ctx: BeforeToolCallDecision(
-                updated_args={"text": "changed"}
-            )
-        ),
-    )
-    results = await executor.execute_batch([_call("echo", {"text": "orig"}, "c1")])
-    assert results[0].status == "success"
-    assert results[0].output == "echo:changed"
-
-    invalid = ToolBatchExecutor(
-        _exposure(_echo),
-        ToolExecutionConfig(
-            before_tool_call=lambda ctx: BeforeToolCallDecision(
-                updated_args={"wrong": 1}
-            )
-        ),
-    )
-    results = await invalid.execute_batch([_call("echo", {"text": "orig"}, "c1")])
-    # QitOS strengthening: updated args are re-validated against the schema.
-    assert results[0].status == "error"
-    assert results[0].metadata["error_category"] == "invalid_tool_arguments"
-    assert results[0].metadata["started"] is False
-
-
-@pytest.mark.asyncio
 async def test_hung_before_hook_is_cancelled_by_token() -> None:
     hook_started = asyncio.Event()
 
@@ -533,6 +493,44 @@ async def test_hung_before_hook_is_cancelled_by_token() -> None:
     # A hung hook cannot block abort: the call ends with a cancelled terminal.
     assert results[0].status == "cancelled"
     assert results[0].metadata["cancel_source"] == "cancel_token"
+
+
+@pytest.mark.asyncio
+async def test_immediate_token_interrupts_hung_async_handler_and_terminalizes() -> None:
+    handler_started = asyncio.Event()
+    handler_settled = asyncio.Event()
+
+    @tool(name="waiter")
+    async def _waiter() -> str:
+        try:
+            handler_started.set()
+            await asyncio.Event().wait()
+            return "unreachable"
+        finally:
+            handler_settled.set()
+
+    token = CancelToken()
+    transaction = RecordingTransaction()
+    executor = ToolBatchExecutor(
+        _exposure(_waiter),
+        ToolExecutionConfig(cancel_token=token),
+        transaction=transaction,
+    )
+    batch = asyncio.create_task(
+        executor.execute_batch([_call("waiter", {}, "c1")])
+    )
+    await handler_started.wait()
+
+    token.request_cancel("immediate")
+    results = await asyncio.wait_for(batch, timeout=1)
+
+    assert handler_settled.is_set()
+    assert results[0].status == "cancelled"
+    assert results[0].metadata["cancel_source"] == "cancel_token"
+    assert [record[0] for record in transaction.records] == [
+        "tool_started",
+        "tool_terminal",
+    ]
 
 
 @pytest.mark.asyncio
@@ -599,6 +597,70 @@ async def test_tool_progress_emits_tool_execution_update_events() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_progress_is_observable_while_handler_is_still_running() -> None:
+    update_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    @tool(name="progress")
+    async def _progress(text: str, runtime_context=None) -> str:
+        runtime_context["emit_progress"]({"stage": "running"})
+        await release.wait()
+        return text
+
+    async def _emit(event) -> None:
+        if isinstance(event, ToolExecutionUpdate):
+            update_seen.set()
+
+    executor = ToolBatchExecutor(
+        _exposure(_progress), ToolExecutionConfig(), emit=_emit
+    )
+    batch = asyncio.create_task(
+        executor.execute_batch([_call("progress", {"text": "x"}, "c1")])
+    )
+    await asyncio.wait_for(update_seen.wait(), timeout=1)
+    assert not batch.done()
+    release.set()
+    results = await batch
+    assert results[0].status == "success"
+
+
+@pytest.mark.asyncio
+async def test_handler_raised_cancelled_error_terminalizes_then_reraises() -> None:
+    @tool(name="self_cancel")
+    async def _self_cancel() -> None:
+        raise asyncio.CancelledError()
+
+    transaction = RecordingTransaction()
+    executor = ToolBatchExecutor(
+        _exposure(_self_cancel), ToolExecutionConfig(), transaction=transaction
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await executor.execute_batch([_call("self_cancel", {}, "c1")])
+
+    results = executor.last_batch_results
+    assert results is not None
+    assert results[0].status == "cancelled"
+    assert [record[0] for record in transaction.records] == [
+        "tool_started",
+        "tool_terminal",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_plain_mapping_status_is_domain_output_not_lifecycle_control() -> None:
+    @tool(name="launch")
+    def _launch() -> dict[str, object]:
+        return {"status": "running", "handle": "process-1"}
+
+    executor = ToolBatchExecutor(_exposure(_launch), ToolExecutionConfig())
+    result = (await executor.execute_batch([_call("launch", {}, "c1")]))[0]
+
+    assert result.status == "success"
+    assert result.output == {"status": "running", "handle": "process-1"}
+
+
+@pytest.mark.asyncio
 async def test_after_step_cancel_does_not_interrupt_tool_execution() -> None:
     token = CancelToken()
 
@@ -616,3 +678,140 @@ async def test_after_step_cancel_does_not_interrupt_tool_execution() -> None:
     # after_step never interrupts an in-flight batch; the agent loop stops
     # the run at the turn boundary instead.
     assert [r.status for r in results] == ["success", "success"]
+
+
+@pytest.mark.asyncio
+async def test_tool_hook_receives_read_only_cancel_signal() -> None:
+    token = CancelToken()
+    observed = []
+
+    def _before(context) -> None:
+        observed.append(context.runtime.cancel_signal)
+
+    executor = ToolBatchExecutor(
+        _exposure(_echo),
+        ToolExecutionConfig(cancel_token=token, before_tool_call=_before),
+    )
+    await executor.execute_batch([_call("echo", {"text": "x"}, "c1")])
+
+    assert observed == [token.signal]
+    assert not hasattr(observed[0], "request_cancel")
+    assert not hasattr(observed[0], "clear")
+
+
+@pytest.mark.asyncio
+async def test_extra_runtime_context_cannot_replace_executor_authority() -> None:
+    attacker_exposure = ToolRegistry().freeze()
+    observed = {}
+
+    @tool(name="inspect_runtime")
+    def _inspect_runtime(runtime_context=None) -> str:
+        observed.update(runtime_context)
+        return "ok"
+
+    exposure = _exposure(_inspect_runtime)
+    sentinel = object()
+    executor = ToolBatchExecutor(
+        exposure,
+        ToolExecutionConfig(
+            run_id="authoritative-run",
+            extra_runtime_context={
+                "tool_registry": attacker_exposure,
+                "run_id": "forged-run",
+                "deadline_monotonic": -1.0,
+                "remaining_seconds": sentinel,
+                "agent_cancelled": sentinel,
+                "emit_progress": sentinel,
+                "record_artifact": sentinel,
+                "permission_context": "kept",
+            },
+        ),
+    )
+
+    results = await executor.execute_batch([_call("inspect_runtime", {}, "c1")])
+
+    assert results[0].status == "success"
+    assert observed["tool_registry"] is exposure
+    assert observed["tool_registry"] is not attacker_exposure
+    assert observed["run_id"] == "authoritative-run"
+    assert observed["deadline_monotonic"] is None
+    assert callable(observed["remaining_seconds"])
+    assert callable(observed["agent_cancelled"])
+    assert callable(observed["emit_progress"])
+    assert callable(observed["record_artifact"])
+    assert observed["permission_context"] == "kept"
+
+
+@pytest.mark.asyncio
+async def test_event_fault_terminalizes_batch_before_propagating() -> None:
+    executed = []
+
+    @tool(name="side_effect")
+    def _side_effect() -> str:
+        executed.append(True)
+        return "unexpected"
+
+    def _broken(event) -> None:
+        if isinstance(event, ToolExecutionStart):
+            raise RuntimeError("event sink failed")
+
+    transaction = RecordingTransaction()
+    executor = ToolBatchExecutor(
+        _exposure(_side_effect, _echo),
+        ToolExecutionConfig(run_id="r"),
+        emit=_broken,
+        transaction=transaction,
+    )
+
+    with pytest.raises(RuntimeError, match="event sink failed"):
+        await executor.execute_batch(
+            [_call("side_effect", {}, "c1"), _call("echo", {"text": "x"}, "c2")]
+        )
+
+    assert executed == []
+    results = executor.last_batch_results
+    assert results is not None
+    assert [result.status for result in results] == ["cancelled", "cancelled"]
+    assert [record[0] for record in transaction.records] == [
+        "tool_started",
+        "tool_terminal",
+        "tool_started",
+        "tool_terminal",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parallel_end_event_fault_is_not_downgraded_to_tool_error() -> None:
+    @tool(name="first", concurrency_safe=True)
+    async def _first() -> str:
+        await asyncio.sleep(0)
+        return "first"
+
+    @tool(name="second", concurrency_safe=True)
+    async def _second() -> str:
+        await asyncio.sleep(0)
+        return "second"
+
+    def _broken(event) -> None:
+        if isinstance(event, ToolExecutionEnd):
+            raise RuntimeError("parallel event sink failed")
+
+    transaction = RecordingTransaction()
+    executor = ToolBatchExecutor(
+        _exposure(_first, _second),
+        ToolExecutionConfig(mode="parallel", max_concurrency=2),
+        emit=_broken,
+        transaction=transaction,
+    )
+
+    with pytest.raises(RuntimeError, match="parallel event sink failed"):
+        await executor.execute_batch(
+            [_call("first", {}, "c1"), _call("second", {}, "c2")]
+        )
+
+    results = executor.last_batch_results
+    assert results is not None
+    assert [result.status for result in results] == ["success", "success"]
+    assert len(
+        [record for record in transaction.records if record[0] == "tool_terminal"]
+    ) == 2

@@ -13,6 +13,9 @@ import subprocess
 from typing import Any, Dict, List, Optional
 
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool_result import ToolResult
+
+from qitos.kit.tool.internal.results import error_result
 
 
 class VulnScanToolSet:
@@ -193,7 +196,7 @@ class VulnScanToolSet:
         severity: str = "critical,high,medium",
         rate_limit: int = 150,
         timeout_sec: int = 10,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Run Nuclei vulnerability scanner against a target.
 
@@ -215,10 +218,10 @@ class VulnScanToolSet:
         :return: Structured list of vulnerability findings with severity, description, and remediation.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         cmd = [
             "nuclei",
@@ -239,10 +242,10 @@ class VulnScanToolSet:
         result = self._run_command(cmd, timeout=1800)
 
         if result["return_code"] != 0 and not result["stdout"]:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Nuclei scan failed: {result['stderr']}",
-            }
+            })
 
         findings = self._parse_nuclei_json(result["stdout"])
 
@@ -303,7 +306,7 @@ class VulnScanToolSet:
     @function_tool(name="nikto_scan", needs_approval=True)
     def nikto_scan(
         self, target: str, tuning: str = "123457890", ports: str = "80,443"
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Run Nikto web server scanner against a target.
 
@@ -327,10 +330,10 @@ class VulnScanToolSet:
         :return: Structured list of findings with OSVDB IDs, descriptions, and affected URLs.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         cmd = [
             "nikto",
@@ -348,10 +351,10 @@ class VulnScanToolSet:
         result = self._run_command(cmd, timeout=1800)
 
         if result["return_code"] != 0 and not result["stdout"]:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Nikto scan failed: {result['stderr']}",
-            }
+            })
 
         findings = self._parse_nikto_output(result["stdout"])
 
@@ -385,7 +388,7 @@ class VulnScanToolSet:
     @function_tool(name="searchsploit", needs_approval=True)
     def searchsploit(
         self, query: str, exclude_sourced: bool = False, exact: bool = False
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Search Exploit-DB for public exploits and vulnerabilities.
 
@@ -414,10 +417,10 @@ class VulnScanToolSet:
                 cmd_text.append("--exact")
             result_text = self._run_command(cmd_text, timeout=120)
             if not result_text["stdout"]:
-                return {
+                return error_result({
                     "status": "error",
                     "message": f"No exploits found for '{query}'.",
-                }
+                })
 
             entries = self._parse_searchsploit(result_text["stdout"])
         else:
@@ -466,7 +469,7 @@ class VulnScanToolSet:
         }
 
     @function_tool(name="vuln_quick", needs_approval=True)
-    def vuln_quick(self, target: str) -> Dict[str, Any]:
+    def vuln_quick(self, target: str) -> Dict[str, Any] | ToolResult:
         """
         Quick vulnerability assessment combining multiple scanners.
 
@@ -477,10 +480,10 @@ class VulnScanToolSet:
         :return: Combined vulnerability findings from all scanners.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         # Run nuclei with critical+high severity only
         nuclei_cmd = [

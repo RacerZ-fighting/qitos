@@ -484,9 +484,7 @@ tool = AgentTool(
     execution_mode="background",
     max_delegate_depth=1,
     child_budget=TaskBudget(max_steps=200),
-    child_profile="restricted",
     child_allowed_tool_groups=("filesystem.read", "network"),
-    child_working_directory="/workspace",
 )
 registry.register(tool)
 registry.register_toolset(ChildControlToolSet(tool.supervisor), namespace="")
@@ -501,7 +499,13 @@ concurrent children is unsupported.
 The result reports output, steps, total tokens, elapsed time, stop reason, and run id.
 `child_budget` is an immutable `TaskBudget` and defaults to 200 steps. Invocation
 factories receive it on `ChildLaunchRequest.budget`, together with the task, profile,
-allowed tool groups, and working-directory fields needed by a product composition.
+allowed tool groups, and working-directory fields needed by a product composition. The
+built-in factory accepts only `profile="default"` and `working_directory=None`; it
+rejects any other profile or working-directory request before model construction.
+Products that resolve those policies must do so in their own invocation factory.
+The built-in factory also carries the frozen parent Tool permission/scope policy into
+the Child. A configured Child Env with a different policy is rejected because equality
+alone is the only narrowing relation this generic factory can prove.
 The async factory returns a `ChildInvocation`; live Agent objects never enter persisted child
 requests or results. If the invocation creates a model client, trace, or other live
 resource, set its async `cleanup` callback. The supervisor awaits cleanup after success,
@@ -511,27 +515,30 @@ must close every partially created resource before propagating the error.
 
 `execution_mode` accepts `"foreground"`, `"optional_background"`, or `"background"`.
 The optional mode exposes `run_in_background` to the model. The background mode omits
-that argument, always returns a running receipt with a parent-scoped `ChildHandle`, and posts an
-`agent.child.completed` `RuntimeInput` to the exact parent run when the child
-terminates. `AgentTool` snapshots the parent history at launch, then delegates lifecycle
-ownership to a Run-scoped `ChildSupervisor`. The supervisor does not call the invocation
-factory until `execution_scope` admits the task. Queued work therefore retains
+that argument, always returns a running receipt with a parent-scoped `ChildHandle`, and
+attempts an `agent.child.completed` `RuntimeInput` to the exact parent run when a
+parent mailbox callback is available. `AgentTool` retains an explicitly supplied
+parent-history or snapshot value at launch; the minimal façade does not implicitly copy
+its full transcript into every Child. It then delegates lifecycle ownership to a
+Run-scoped `ChildSupervisor`. The supervisor does not call the invocation factory until
+`execution_scope` admits the task. Queued work therefore retains
 its launch context without allocating a model, Agent, or trace before it can run. If a
 child has no final answer, the completion payload contains a bounded projection of its
 recent tool evidence instead of silently dropping useful work.
 
 The parent runtime supplies the async callback through
-`ChildLaunchContext.post_runtime_event`. Child supervision stores its terminal result
-before awaiting that callback; on Journal-backed parents, successful delivery is
-durable before the parent wakes.
+`ChildLaunchContext.post_runtime_event` and owns durable mailbox acceptance. Child
+supervision stores its terminal result before awaiting that callback.
 It also appends `child.started` before constructing the child Agent and
 `child.terminal` before delivery. Resume rebuilds a started child from its own loop
 journal when that journal holds a durable run terminal record, and otherwise closes it
 as `interrupted` without replaying the Agent. Fork recovery ignores inherited
 parent lifecycle records, so a fork cannot query or interrupt the parent's live Child.
-If execution stops between `child.terminal` and mailbox acceptance, resume derives the
-same stable completion input from the terminal fact and delivers it once for a background
-invocation. Foreground results are returned only through the original Agent ToolResult.
+If mailbox acceptance fails after `child.terminal`, the terminal result remains
+queryable through the control tools. Re-projecting unconsumed background completion
+inputs during resume belongs to the authoritative Session/Harness migration; the
+current façade path does not claim recovery-time redelivery. Foreground results are
+returned only through the original Agent ToolResult.
 
 `active_background_count`, `child_result(handle)`, `wait_child(handle)`,
 `interrupt_child(handle)`, `cancel_child(handle)`,

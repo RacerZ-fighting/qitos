@@ -1,158 +1,62 @@
 ---
-title: "Multimodal Core and Desktop Starter"
-description: "How QitOS v0.5 turns the multimodal foundation into one complete desktop research path."
+title: "Multimodal messages"
+description: "Send typed text and image content through the current Agent façade."
 ---
 
-# Multimodal Core and Desktop Starter
+The minimal Agent loop keeps multimodal input in the canonical `UserMessage` contract.
+It does not need a vision-only runtime, prompt protocol, parser, or `Decision` type.
 
-QitOS v0.5 now has one complete multimodal release path:
-
-- screenshot-first multimodal input
-- `DesktopEnv`
-- qita visual inspection
-
-The point is no longer just laying a multimodal foundation.
-The point is that one desktop / computer-use story now holds together end to end.
-
-## The first wire target: OpenAI-compatible chat completions
-
-The first multimodal request shape QitOS now supports is the OpenAI-compatible `chat.completions` content-array format:
-
-```json
-{
-  "role": "user",
-  "content": [
-    {"type": "text", "text": "Inspect this screenshot."},
-    {"type": "image_url", "image_url": {"url": "https://..."}}
-  ]
-}
-```
-
-QitOS also supports the same shape with:
-
-- local image files
-- base64 / data URLs
-- multiple images in one user turn
-
-Pure-text requests still keep the previous text-only path.
-
-## The new core vocabulary
-
-Instead of teaching each model adapter and environment its own image schema, QitOS now normalizes multimodal input and observations through a small set of shared types:
-
-- `ContentBlock`
-- `MessageEnvelope`
-- `ObservationPack`
-- `GroundingMetadata`
-- `VisualTraceAsset`
-
-These shared types provide one place to define:
-
-- what counts as an image input
-- how screenshot observations are represented
-- what qita should record and display
-
-## Multimodal input does not replace parsers or protocols
-
-The key design point is this:
-
-In QitOS:
-
-- **multimodal input** answers: what did the model see?
-- **protocol** (output format definition) **+ parser** (raw-output-to-Decision converter) answer: how must the model respond?
-- **tool schema** answers: what can the model call?
-
-Visual input works alongside the protocols you already know:
-
-- `react_text_v1`
-- `json_decision_v1`
-- `xml_decision_v1`
-- `terminus_*`
-- `minimax_tool_call_v1`
-
-This means we can combine:
-
-- screenshot input
-- OpenAI-compatible multimodal wire format
-- existing JSON/XML/native-tool-call parsers
-
-without inventing a separate vision-only runtime.
-
-## Screenshot-first environment support
-
-The first built-in multimodal environment is `ScreenshotEnv`.
-
-It provides a minimal, benchmark-agnostic path for:
-
-- a screenshot observation
-- optional DOM / OCR / accessibility hints
-- mock GUI control hooks
-
-The result is a stable SDK surface before heavier GUI environments are plugged in.
+## Construct a typed image message
 
 ```python
-from qitos.kit import ScreenshotEnv
+from qitos.core.message import ImageContent, TextContent, UserMessage
 
-env = ScreenshotEnv(
-    screenshot_path="screen.png",
-    text="This screenshot shows a login page.",
-    dom={"title": "Login"},
-    accessibility_tree={"role": "window"},
+message = UserMessage(
+    content=(
+        TextContent(text="Inspect this screenshot."),
+        ImageContent(
+            source={
+                "type": "image_file",
+                "path": "screen.png",
+                "detail": "high",
+            }
+        ),
+    )
 )
+
+result = await agent.prompt(message)
 ```
 
-## Minimal visual path
+`ImageContent.source` retains the Provider-neutral wire mapping in the durable message
+codec. OpenAI-compatible and Anthropic adapters project supported image blocks to their
+own API shape. Check `model.capabilities.multimodal_input` before relying on image
+delivery.
 
-A complete visual inspection path stays small:
+The same message contract can carry an `image_url` or adapter-supported base64 source.
+Invalid durable message shapes fail closed during decode.
 
-1. create a screenshot-backed task
-2. expose a screenshot-first env (`ScreenshotEnv`)
-3. call an OpenAI-compatible multimodal model
-4. keep the response on the existing JSON decision lane
-5. inspect the run in qita with visual assets visible
+## Environment observations are application projections
 
-`examples/real/desktop_env_smoke.py` exercises the environment half of this path
-without a model and is a better starting point for visual-web / GUI research than
-jumping straight into a benchmark harness.
+`ScreenshotEnv` and `DesktopEnv` expose structured observations with screenshots and
+optional DOM, OCR, accessibility, or terminal context. The Agent loop does not poll an
+environment automatically. Applications decide when to observe and which bounded facts
+to project into the next `UserMessage`.
 
-## qita support in v0.5
+This keeps three responsibilities separate:
 
-qita now records and shows:
+- the environment owns observation and controller operations;
+- the Model adapter owns multimodal wire projection;
+- the Agent loop owns typed messages, Tool calls, and Tool results.
 
-- whether a step had screenshot-backed observations
-- visual asset metadata
-- the current step's observation modalities
-- whether the model input included images
-- screenshot timeline cards
-- replay screenshot preview
-- basic action overlays
-- grounding metadata visibility
+## Current trace boundary
 
-## Why this matters for OSWorld-style work
+`qita` can display visual fields in compatible trace artifacts. Those files may include
+legacy step, parser, or grounding fields written by their producer. New Agent runs do
+not emit that trace format automatically, and visual trace assets are not Session
+recovery truth.
 
-OSWorld and similar GUI benchmarks need more than image input:
+For the environment-only source-checkout smoke path, run:
 
-- screenshot observations
-- structured actions
-- grounding metadata
-- traceable visual state
-
-The current phase gives QitOS a clean foundation for that work:
-
-- multimodal messages are now first-class
-- screenshot observations now fit the loop/trace (structured run log)/qita model
-- GUI capability hooks now exist in the environment contract
-
-So desktop adapters can be built **on top of** the minimal agent loop instead of beside it.
-
-## Current boundary
-
-v0.5 still does **not** promise:
-
-- full official OSWorld parity
-- full visual replay depth planned for v0.6
-- broad provider parity across every multimodal runtime
-
-The release bar is narrower and clearer:
-
-**one strong desktop starter path**
+```bash
+python examples/real/desktop_env_smoke.py
+```

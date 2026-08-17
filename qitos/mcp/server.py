@@ -100,7 +100,7 @@ class MCPServer(ABC):
         self._tools_changed_handler = handler
 
     def notify_tools_changed(self) -> None:
-        """Mark this server's catalog dirty at the next Engine safe point."""
+        """Mark this server's catalog dirty at the next Agent turn safe point."""
 
         handler = self._tools_changed_handler
         if handler is not None:

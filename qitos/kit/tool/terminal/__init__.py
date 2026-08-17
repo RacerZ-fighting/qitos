@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from qitos.core.tool import BaseTool, ToolPermission, ToolSpec
+from qitos.core.tool_result import ToolResult
+from qitos.kit.tool.internal.results import error_result
 
 
 class SendTerminalKeys(BaseTool):
@@ -35,7 +37,7 @@ class SendTerminalKeys(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Send raw keystrokes to the active interactive terminal session.
 
@@ -61,7 +63,9 @@ class SendTerminalKeys(BaseTool):
         ops = runtime_context.get("ops", {})
         terminal_ops = ops.get("terminal")
         if terminal_ops is None or not hasattr(terminal_ops, "send_keys"):
-            return {"status": "error", "error": "terminal ops are not available"}
+            return error_result(
+                {"status": "error", "error": "terminal ops are not available"}
+            )
         effective_keystrokes = keystrokes
         if submit and keystrokes and not keystrokes.endswith("\n"):
             effective_keystrokes = f"{keystrokes}\n"
@@ -75,6 +79,8 @@ class SendTerminalKeys(BaseTool):
             enriched = dict(result)
             enriched.setdefault("submit", submit)
             enriched.setdefault("execution_mode", "submit" if submit else "verbatim")
+            if enriched.get("status") == "error":
+                return error_result(enriched)
             return enriched
         return {
             "status": "success",

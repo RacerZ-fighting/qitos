@@ -3,6 +3,7 @@
 import asyncio
 import os
 import tempfile
+import time
 from types import SimpleNamespace
 from typing import Any, Protocol
 
@@ -15,6 +16,7 @@ from qitos.core.child import (
     ChildRuntimeContext,
     ChildStatus,
 )
+from qitos.core.tool_result import ToolResult
 
 from qitos.kit.tool.internal.coding_utils import (
     is_image_file,
@@ -29,7 +31,8 @@ async def _ready_invocation(**kwargs: Any) -> ChildInvocation:
 
 
 class _ChildResultReader(Protocol):
-    def child_result(self, handle: ChildHandle) -> ChildResult | None: ...
+    def child_result(self, handle: ChildHandle) -> ChildResult | None:
+        ...
 
 
 async def _wait_for_child_result(
@@ -201,7 +204,8 @@ class TestCronTools:
             scheduler = CronScheduler(workspace_root=tmpdir)
             tool = CronCreateTool(scheduler)
             result = await tool.execute({})
-            assert result["status"] == "error"
+            assert isinstance(result, ToolResult)
+            assert result.status == "error"
 
     @pytest.mark.asyncio
     async def test_delete_tool(self):
@@ -250,7 +254,9 @@ class TestAgentTool:
 
         tool = AgentTool(invocation_factory=lambda request, _context: None)
         result = await tool.execute({"description": "missing task"})
-        assert result == {"status": "error", "error": "prompt is required"}
+        assert isinstance(result, ToolResult)
+        assert result.status == "error"
+        assert result.output == {"status": "error", "error": "prompt is required"}
 
     @pytest.mark.asyncio
     async def test_run_scoped_factory_creates_fresh_invocation_per_call(self):
@@ -359,8 +365,10 @@ class TestAgentTool:
             runtime_context={"delegate_depth": 1, "parent_run_id": "parent-run"},
         )
 
-        assert result["status"] == "error"
-        assert "cannot launch another Agent" in result["error"]
+        assert isinstance(result, ToolResult)
+        assert result.status == "error"
+        assert result.error is not None
+        assert "cannot launch another Agent" in result.error
 
     @pytest.mark.asyncio
     async def test_run_child_budget_rejects_calls_beyond_limit(self):
@@ -405,8 +413,10 @@ class TestAgentTool:
 
         assert first["status"] == "success"
         assert first["child_status"] == "completed"
-        assert second["status"] == "error"
-        assert "max_children=1" in second["error"]
+        assert isinstance(second, ToolResult)
+        assert second.status == "error"
+        assert second.error is not None
+        assert "max_children=1" in second.error
 
     @pytest.mark.asyncio
     async def test_forced_background_children_launch_concurrently_and_notify_parent(
@@ -983,11 +993,12 @@ class TestAgentTool:
         from qitos.kit.tool.agent import AgentTool
 
         factory_called = asyncio.Event()
+        never = asyncio.Event()
 
         @asynccontextmanager
         async def expired_scope(_runtime_context):
-            raise TimeoutError("deadline expired before child slot opened")
-            yield  # pragma: no cover
+            await never.wait()
+            yield
 
         def invocation_factory(request, _context):
             factory_called.set()
@@ -1000,7 +1011,11 @@ class TestAgentTool:
         )
         launched = await tool.execute(
             {"description": "queued route", "prompt": "wait"},
-            runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
+            runtime_context={
+                "deadline_monotonic": time.monotonic() + 0.02,
+                "delegate_depth": 0,
+                "parent_run_id": "parent-run",
+            },
         )
 
         handle = ChildHandle.from_dict(launched["handle"])

@@ -1,48 +1,37 @@
 ---
 title: "可观测性"
-description: "通过 qita 网页看板检查、回放并导出智能体运行。"
+description: "使用 qita 检查、回放并导出兼容的 trace artifact。"
 ---
 
-默认情况下，每次 `agent.run()` 都会把追踪记录（trace）写到 `./runs/<run_id>/`。`qita` 命令行工具会读取这些追踪记录，并通过本地网页看板提供运行检查、逐步回放与独立 HTML 导出。
+`qita` 是 QitOS trace artifact 的只读查看器。它发现已有运行目录、展示已记录的轨迹、
+回放事件并导出独立 HTML。qita 不会成为 canonical Session 或 journal owner。
 
-## 追踪记录产物
+<Warning>
+最小 `Agent` loop 尚未自动挂接 `TraceWriter`。不要假设 `agent.prompt(...)` 会创建
+`./runs/<run_id>/`。从新 loop/façade 事件流自动生成 trace 属于 Session/Harness
+迁移的待完成项。
+</Warning>
 
-每个运行目录都包含三个文件：
+## 可读取的输入
 
-| 文件 | 内容 |
-|---|---|
-| `manifest.json` | 运行元数据：`run_id`、`model_id`、`status`、`stop_reason`、`step_count`、`event_count`、`schema_version`、`prompt_hash`、`task_hash`、`run_config_hash`、`seed`、`summary` |
-| `events.jsonl` | 每行一个 `RuntimeEvent`，包含 `step_id`、`phase`、`ts`、`ok`、`error` 与 `payload` |
-| `steps.jsonl` | 每行一个 `StepRecord`，包含 `step_id`、决策（decision，智能体每步的结构化决策）、动作（action，标准化工具调用）、动作结果、观测结果（observation，每步后智能体接收的结构化观察结果）与评估器输出 |
+将 qita 指向包含兼容 trace 运行目录的根目录。历史 artifact 通常包含
+`manifest.json`、`events.jsonl` 与 `steps.jsonl`。qita 会校验能够读取的数据；缺少的
+provenance 会被标为不完整，不会被猜测补齐。
 
-`manifest.json` 会在初始化时写出，并在运行结束时完成定稿。`events.jsonl` 与 `steps.jsonl` 都是只追加写入。
+Agent loop 的 append-only Session journal 是另一种格式，也是模型事务、Tool 终态、
+已提交 turn 和 run 终态的 canonical 真源。qita 读取时不会转换或修复这份 journal。
 
-`task_hash` 对完整的 canonical Task 包计算指纹，其中包含稳定的任务或样本 ID。
-纯文本任务使用内容生成 ID，不再使用挂钟时间；trace `run_id` 才是执行实例标识。
-`run_config_hash` 单独标识运行配置。qita 只有在两者都完整且匹配时才会声明
-same-spec；缺少 `task_hash` 的旧 trace 仍可读取，但其比较 provenance 会被标为不完整。
-
----
-
-## qita 看板
-
-`qita board` 会启动一个本地 HTTP 服务器，发现日志根目录下所有运行目录并渲染成卡片网格。
-
-<Steps>
-
-<Step title="启动看板">
+## 看板
 
 ```bash
 qita board --logdir ./runs
 ```
 
-默认地址为 `http://127.0.0.1:8765`。
-
-常用参数：
+默认监听 `http://127.0.0.1:8765`。
 
 | 参数 | 默认值 | 说明 |
 |---|---|---|
-| `--logdir` | `./runs` | 包含各个运行子目录的根路径 |
+| `--logdir` | `./runs` | 包含兼容 trace 目录的根目录 |
 | `--host` | `127.0.0.1` | 绑定地址 |
 | `--port` | `8765` | 监听端口 |
 
@@ -50,207 +39,32 @@ qita board --logdir ./runs
 qita board --logdir ./runs --host 0.0.0.0 --port 9000
 ```
 
-</Step>
-
-<Step title="浏览运行记录">
-
-看板每 2.5 秒自动刷新一次。每个运行会以卡片形式展示：
-
-- 运行标识
-- 状态徽标
-- 步数与事件数
-- 停止原因
-- 更新时间
-- 清单元数据，如模型标识、模式版本、种子、提示词哈希
-
-你可以通过工具栏：
-
-- **搜索**：按运行标识、停止原因、最终结果搜索
-- **状态筛选**：按状态筛选
-- **排序**：按更新时间、事件数或步数排序
-- **自动刷新**：开关自动刷新
-
-页面顶部还会展示摘要指标，如成功率、平均步数、平均事件数和主要失败停止原因。
-
-这是最常用的总览界面。
+当源 artifact 包含相应数据时，看板会提供搜索、状态筛选、排序、运行元数据、已记录步骤，
+以及配对的 Tool call/result 证据。
 
 ![qita 看板总览](/images/qita-board.png)
 
-</Step>
-
-<Step title="打开一个运行">
-
-点击任意运行卡片的 **查看** 即可进入详情页。详情页通常有两个标签页：
-
-**轨迹标签页**
-
-轨迹视图会把每一步显示成一张卡片，通常包含这些折叠区块：
-
-- **状态**：当前观测结果中的关键状态字段
-- **思考**：模型推理文本
-- **动作**：本步调用的动作
-- **直接观测**：动作结果；搜索结果会表格化，错误会高亮
-- **评估器**：评估器输出
-- **追踪事件**：该步骤的原始 `RuntimeEvent`
-
-qita 会优先按 `action_id`，否则按记录的原始顺序把每个动作与结果配对。工具统计复用
-同一配对，因此一个失败结果只会归到对应调用；每个精确生命周期状态都会单独计数，
-`unmatched_actions` 与 `unmatched_results` 则直接暴露不完整的 trace 闭包，不会猜测归属。
-
-左侧**步骤导航器**支持：
-
-- 全文过滤
-- 按事件阶段过滤
-- 升序或降序排序
-- 开关观测结果/评估器区块
-- 全部折叠或展开
-- 调整字号
-
-顶部还有一个甘特图风格的阶段时间线，用颜色表示各阶段时长。
-
-**清单标签页**
-
-直接展示格式化后的 `manifest.json`。
-
-这是逐步检查智能体行为时最重要的界面。
-
-![qita 轨迹视图](/images/qita-traj.png)
-
-</Step>
-
-</Steps>
-
----
-
-## qita 回放（replay）
-
-`qita replay` 用于把单次运行以时间序方式回放出来。
+## 回放
 
 ```bash
-qita replay --run ./runs/my_agent_20260407_120000_000001
+qita replay --run ./runs/example-run
 ```
 
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `--run` | 必填 | 运行目录路径 |
-| `--host` | `127.0.0.1` | 绑定地址 |
-| `--port` | `8765` | 监听端口 |
+回放只展示一个兼容运行目录中已经持久化的事件。它不是 resume 操作，也不会执行模型或
+Tool。
 
-回放页面支持调整播放速度，URL 上可使用 `?speed=300` 指定毫秒级间隔。
-
----
-
-## qita 导出（export）
-
-`qita export` 会生成一个自包含的 HTML 文件，便于分享而不必运行本地服务器。
+## 导出
 
 ```bash
-qita export --run ./runs/my_agent_20260407_120000_000001 --html out.html
+qita export --run ./runs/example-run --html out.html
 ```
 
-| 参数 | 说明 |
-|---|---|
-| `--run` | 运行目录路径，必填 |
-| `--html` | 输出 HTML 文件路径，必填 |
+导出的 HTML 会嵌入可读运行数据、CSS 和 JavaScript。分享 artifact 或导出文件前，请先
+检查其中是否含有敏感信息。
 
-导出文件会内联全部 CSS、JavaScript 与运行数据，因此可以直接作为审阅产物发送给同事或审稿人。
+## 当前边界
 
----
-
-## 配置追踪记录输出
-
-默认情况下，`agent.run()` 会把追踪记录写到 `./runs/`，运行标识由智能体类名与 UTC 时间戳组成。你也可以自定义目录和前缀：
-
-```python
-result = agent.run(
-    task="...",
-    max_steps=10,
-    trace_logdir="./my_experiments",
-    trace_prefix="react_v2",
-    return_state=True,
-)
-```
-
-如果完全不想写追踪记录，可以传：
-
-```python
-result = agent.run(task="...", trace=False, return_state=True)
-```
-
-也可以传入一个预配置的 `TraceWriter`：
-
-```python
-from qitos.trace import TraceWriter
-
-writer = TraceWriter(
-    output_dir="./runs",
-    run_id="my_custom_run_id",
-    strict_validate=True,
-    metadata={"model_id": "Qwen3-8B"},
-)
-
-result = agent.run(task="...", trace=writer, return_state=True)
-```
-
-<Note>
-  `qita` 发现运行至少需要三个文件：`manifest.json`、`events.jsonl` 和 `steps.jsonl`。缺少 `manifest.json` 的目录会被 `qita board` 静默跳过。
-</Note>
-
----
-
-## 实时流式推送（SSE）
-
-qita 为每个运行提供了 Server-Sent Events（SSE）端点，可以实时流式推送步骤事件。这对构建自定义仪表盘或对接外部监控系统非常有用。
-
-### SSE 端点
-
-```
-GET /api/stream/{run_id}
-```
-
-该端点以 SSE 格式发出带类型名称的事件：
-
-| 事件类型 | 何时发出 |
-|---|---|
-| `run_start` | 运行开始（包含 `run_id`、`task`、`agent_name`） |
-| `step_start` | 一个步骤开始（包含 `step_id`、`agent_id`） |
-| `step_end` | 一个步骤完成 |
-| `phase` | 运行时阶段事件（decide、act、reduce 等） |
-| `handoff` | 智能体切换事件 |
-| `delegate` | 委托事件（1:1 子任务） |
-| `fanout` | 扇出事件（1:N 并行子任务） |
-| `run_end` | 运行结束（包含 `step_count`、`stop_reason`） |
-
-### 客户端消费
-
-在任何网页中：
-
-```javascript
-const es = new EventSource('/api/stream/my_run_id');
-es.addEventListener('step_start', e => {
-    const data = JSON.parse(e.data);
-    console.log('步骤', data.step_id, '智能体:', data.agent_id);
-});
-es.addEventListener('handoff', e => {
-    console.log('切换:', JSON.parse(e.data));
-});
-es.addEventListener('run_end', e => {
-    es.close();
-});
-```
-
-### 实时流按钮
-
-qita 运行详情页包含一个 **live stream** 按钮，点击后会连接 SSE 端点并在浏览器控制台输出事件日志。这对于调试和理解已完成运行的事件流很有用。
-
-### 使用 Agent façade 订阅事件
-
-对于实时运行，可以通过 façade 的生命周期事件订阅以编程方式消费事件：
-
-```python
-from qitos import Agent
-
-agent = Agent(model=model, tool_registry=registry)
-agent.subscribe(lambda event: print(type(event).__name__))
-result = await agent.prompt("分析数据")
-```
+- Session journal 是 canonical runtime state。
+- qita trace artifact 是观测投影。
+- Provider continuation 与 qita index 不是 recovery 真源。
+- 最小 loop 的 trace 产出仍待完成；qita 目前可以读取已有的兼容 artifact。

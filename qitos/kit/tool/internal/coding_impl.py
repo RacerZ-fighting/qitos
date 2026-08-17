@@ -32,7 +32,7 @@ from qitos.core.process import (
     ProcessTerminalNotifier,
 )
 from qitos.core.runtime_input import process_terminal_runtime_input
-from qitos.core.tool_result import ToolResult
+from qitos.core.tool_result import ToolResult, ToolResultStatus
 from qitos.kit.env.host_env import HostCommandCapability, HostFSCapability
 from qitos.kit._html import extract_html_text
 from qitos.kit.tool.internal.coding_utils import (
@@ -43,6 +43,7 @@ from qitos.kit.tool.internal.coding_utils import (
     truncate_text,
     utc_now,
 )
+from qitos.kit.tool.internal.results import error_result, tool_result
 from qitos.kit.tool.internal.work_plan import UpdateWorkPlanTool
 from qitos.kit.tool.internal.runtime_ops import select_runtime_ops
 from qitos.kit.tool.notebook import NotebookToolSet
@@ -171,6 +172,36 @@ def _process_snapshot_payload(snapshot: ProcessSnapshot) -> Dict[str, Any]:
     return payload
 
 
+def _process_tool_output(snapshot: ProcessSnapshot) -> Dict[str, Any] | ToolResult:
+    """Project one process snapshot at the Coding Tool boundary."""
+
+    payload = _process_snapshot_payload(snapshot)
+    status = _tool_status_for_process(snapshot)
+    if status == "partial":
+        return tool_result(payload, status="partial")
+    if status == "error":
+        return tool_result(payload, status="error")
+    # A running background process is domain state; starting it completed the
+    # current Tool call successfully.
+    return payload
+
+
+def _foreground_command_output(
+    payload: Mapping[str, Any],
+) -> Dict[str, Any] | ToolResult:
+    """Convert the documented CommandCapability failure states explicitly."""
+
+    output = dict(payload)
+    status = str(output.get("status") or "").strip().lower()
+    if status == "timed_out":
+        return tool_result(output, status="timed_out")
+    if status == "cancelled":
+        return tool_result(output, status="cancelled")
+    if status == "error":
+        return tool_result(output, status="error")
+    return output
+
+
 def _join_capability_path(base: str, child: str) -> str:
     normalized_base = str(base or ".").replace("\\", "/").strip("/")
     normalized_child = str(child or "").replace("\\", "/")
@@ -258,9 +289,9 @@ def _search_error_payload(
     *,
     pattern: str,
     path: str,
-) -> Dict[str, Any]:
+) -> ToolResult:
     if isinstance(error, _SearchProcessError):
-        return {
+        payload = {
             "status": error.status,
             "message": str(error),
             "error_category": error.category,
@@ -269,11 +300,19 @@ def _search_error_payload(
             "pattern": pattern,
             "path": path,
         }
+        status: ToolResultStatus
+        if error.status == "timed_out":
+            status = "timed_out"
+        elif error.status == "cancelled":
+            status = "cancelled"
+        else:
+            status = "error"
+        return tool_result(payload, status=status)
     if isinstance(error, subprocess.TimeoutExpired):
         stderr = error.stderr or ""
         if isinstance(stderr, bytes):
             stderr = stderr.decode("utf-8", errors="replace")
-        return {
+        payload = {
             "status": "timed_out",
             "message": str(error),
             "error_category": "process_timeout",
@@ -282,8 +321,9 @@ def _search_error_payload(
             "pattern": pattern,
             "path": path,
         }
+        return tool_result(payload, status="timed_out")
     if isinstance(error, FileNotFoundError):
-        return {
+        payload = {
             "status": "error",
             "message": f"ripgrep is unavailable: {error}",
             "error_category": "search_tool_unavailable",
@@ -292,7 +332,8 @@ def _search_error_payload(
             "pattern": pattern,
             "path": path,
         }
-    return {
+        return tool_result(payload, status="error")
+    payload = {
         "status": "error",
         "message": str(error),
         "error_category": (
@@ -303,6 +344,7 @@ def _search_error_payload(
         "pattern": pattern,
         "path": path,
     }
+    return tool_result(payload, status="error")
 
 
 class CodingToolSet:
@@ -548,7 +590,7 @@ class CodingToolSet:
     def _process_error_payload(
         exc: Exception,
         **fields: Any,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         payload: Dict[str, Any] = {
             "status": "error",
             "message": str(exc),
@@ -562,7 +604,7 @@ class CodingToolSet:
                     "facility": exc.facility,
                 }
             )
-        return payload
+        return tool_result(payload, status="error")
 
     @staticmethod
     def _remember_process_interruption(
@@ -571,9 +613,8 @@ class CodingToolSet:
     ) -> None:
         """Keep a bounded process receipt available if the tool task is cancelled."""
 
-        runtime_context["interruption_result"] = ToolResult.from_value(
-            _process_snapshot_payload(snapshot)
-        )
+        projected = _process_tool_output(snapshot)
+        runtime_context["interruption_result"] = ToolResult.from_value(projected)
 
     async def _refresh_process_interruption(
         self,
@@ -848,14 +889,15 @@ class CodingToolSet:
         verify_tls: bool = True,
         allow_redirects: bool = True,
         max_content_chars: int = 120_000,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         parsed = urlparse(str(url or ""))
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            return {
+            payload = {
                 "status": "error",
                 "message": "URL must be an absolute http or https URL",
                 "url": url,
             }
+            return tool_result(payload, status="error")
         try:
             async with httpx.AsyncClient(
                 verify=verify_tls,
@@ -875,7 +917,7 @@ class CodingToolSet:
                 "status": "success" if response.status_code < 400 else "error",
                 "ok": bool(response.ok),
                 "method": str(method or "GET").upper(),
-                "url": response.url,
+                "url": str(response.url),
                 "status_code": response.status_code,
                 "reason": response.reason,
                 "headers": dict(response.headers),
@@ -883,15 +925,23 @@ class CodingToolSet:
                 "content": text,
                 "content_length": len(text),
                 "truncated": truncated,
-                "history": [item.url for item in response.history],
+                "history": [str(item.url) for item in response.history],
             }
             try:
                 payload["json"] = response.json()
             except Exception:
                 pass
+            if response.status_code >= 400:
+                return tool_result(payload, status="error")
             return payload
         except Exception as e:
-            return {"status": "error", "message": str(e), "url": url, "method": method}
+            payload = {
+                "status": "error",
+                "message": str(e),
+                "url": url,
+                "method": method,
+            }
+            return tool_result(payload, status="error")
 
     def _extract_html_text(self, html: str) -> Dict[str, Any]:
         extracted = extract_html_text(html or "", layout="lines")
@@ -919,7 +969,7 @@ class CodingToolSet:
         tty: bool = False,
         yield_time_ms: int = 10000,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Execute one shell command inside the configured working directory.
 
@@ -931,7 +981,10 @@ class CodingToolSet:
         """
         text = str(command or "").strip()
         if not text:
-            return {"status": "error", "message": "Command cannot be empty"}
+            return tool_result(
+                {"status": "error", "message": "Command cannot be empty"},
+                status="error",
+            )
         try:
             yield_seconds = _non_negative_seconds(
                 yield_time_ms,
@@ -947,12 +1000,15 @@ class CodingToolSet:
                 if remaining is not None:
                     timeout = min(timeout, remaining)
                 if timeout <= 0:
-                    return {
+                    payload = {
                         "status": "error",
                         "message": "command deadline expired before execution",
                         "command": text,
                     }
-                return await process_ops.arun(text, timeout=timeout)
+                    return tool_result(payload, status="error")
+                return _foreground_command_output(
+                    await process_ops.arun(text, timeout=timeout)
+                )
             if tty:
                 self._require_runtime_facility(
                     context,
@@ -968,7 +1024,7 @@ class CodingToolSet:
             )
             self._remember_process_interruption(context, snapshot)
             if run_in_background:
-                return _process_snapshot_payload(snapshot)
+                return _process_tool_output(snapshot)
             deadline = asyncio.get_running_loop().time() + yield_seconds
             raw_deadline = context.get("deadline_monotonic")
             if raw_deadline is not None:
@@ -986,7 +1042,7 @@ class CodingToolSet:
                 )
                 raise
             self._remember_process_interruption(context, snapshot)
-            return _process_snapshot_payload(snapshot)
+            return _process_tool_output(snapshot)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1001,7 +1057,7 @@ class CodingToolSet:
     async def process_list(
         self,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """List background processes owned by the active Run."""
 
         try:
@@ -1026,7 +1082,7 @@ class CodingToolSet:
         cursor: int = 0,
         wait_seconds: float = 0.0,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """Read incremental output from one active-Run process."""
 
         try:
@@ -1052,7 +1108,7 @@ class CodingToolSet:
                 await self._refresh_process_interruption(context, process_ops, handle)
                 raise
             self._remember_process_interruption(context, snapshot)
-            return _process_snapshot_payload(snapshot)
+            return _process_tool_output(snapshot)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1069,7 +1125,7 @@ class CodingToolSet:
         process_id: str,
         data: str,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """Write UTF-8 input to one active-Run process."""
 
         try:
@@ -1078,7 +1134,7 @@ class CodingToolSet:
                 self._process_handle(process_id, run_id),
                 data,
             )
-            return _process_snapshot_payload(snapshot)
+            return _process_tool_output(snapshot)
         except Exception as exc:
             return self._process_error_payload(exc, process_id=process_id)
 
@@ -1093,7 +1149,7 @@ class CodingToolSet:
         process_id: str,
         timeout_seconds: Optional[float] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """Wait for one process without exceeding the current absolute deadline."""
 
         try:
@@ -1119,7 +1175,7 @@ class CodingToolSet:
                 await self._refresh_process_interruption(context, process_ops, handle)
                 raise
             self._remember_process_interruption(context, snapshot)
-            return _process_snapshot_payload(snapshot)
+            return _process_tool_output(snapshot)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1134,7 +1190,7 @@ class CodingToolSet:
         self,
         process_id: str,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """Terminate one active-Run process group and await cleanup."""
 
         try:
@@ -1142,7 +1198,7 @@ class CodingToolSet:
             snapshot = await process_ops.aterminate(
                 self._process_handle(process_id, run_id)
             )
-            return _process_snapshot_payload(snapshot)
+            return _process_tool_output(snapshot)
         except Exception as exc:
             return self._process_error_payload(exc, process_id=process_id)
 
@@ -1153,7 +1209,7 @@ class CodingToolSet:
         limit: int = 200,
         max_chars: int = 20_000,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Read one workspace file as a bounded whole-line text chunk.
 
@@ -1168,7 +1224,9 @@ class CodingToolSet:
             file_ops = self._file_ops(runtime_context)
             info = file_ops.stat(path)
             if info.is_directory:
-                return {"status": "error", "message": f"Path is a directory: {path}"}
+                return error_result(
+                    {"status": "error", "message": f"Path is a directory: {path}"}
+                )
             start = max(0, int(offset))
             size = min(1000, max(1, int(limit)))
             byte_limit = 100 * 1024
@@ -1195,9 +1253,11 @@ class CodingToolSet:
                 "truncated": chunk.truncated,
             }
         except FileNotFoundError:
-            return {"status": "error", "message": f"File not found: {path}"}
+            return error_result(
+                {"status": "error", "message": f"File not found: {path}"}
+            )
         except Exception as e:
-            return {"status": "error", "message": str(e), "path": path}
+            return error_result({"status": "error", "message": str(e), "path": path})
 
     @function_tool(
         name="read_file",
@@ -1211,7 +1271,7 @@ class CodingToolSet:
         line_offset: int = 0,
         line_count: int = 1000,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Read a bounded text chunk from a workspace file.
 
@@ -1227,7 +1287,7 @@ class CodingToolSet:
             max_chars=100 * 1024,
             runtime_context=runtime_context,
         )
-        if result.get("status") != "success":
+        if isinstance(result, ToolResult):
             return result
         offset = int(result.get("offset", line_offset))
         content = str(result.get("content", ""))
@@ -1249,7 +1309,7 @@ class CodingToolSet:
     )
     def list_files(
         self, path: str = ".", runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         List files and directories under a workspace-relative path.
 
@@ -1259,10 +1319,12 @@ class CodingToolSet:
         try:
             file_ops = self._file_ops(runtime_context)
             if not file_ops.stat(path).is_directory:
-                return {
-                    "status": "error",
-                    "message": f"Path is not a directory: {path}",
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": f"Path is not a directory: {path}",
+                    }
+                )
             items = []
             for item in sorted(
                 file_ops.list_entries(path),
@@ -1288,7 +1350,7 @@ class CodingToolSet:
                 "files": items,
             }
         except Exception as e:
-            return {"status": "error", "message": str(e), "path": path}
+            return error_result({"status": "error", "message": str(e), "path": path})
 
     @function_tool(
         name="write_file",
@@ -1302,7 +1364,7 @@ class CodingToolSet:
         content: str,
         expected_sha256: Optional[str] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Write text content to a workspace file.
 
@@ -1330,7 +1392,7 @@ class CodingToolSet:
         except FileRevisionConflictError as exc:
             return self._revision_conflict_result(exc)
         except Exception as e:
-            return {"status": "error", "message": str(e), "path": path}
+            return error_result({"status": "error", "message": str(e), "path": path})
 
     @function_tool(
         name="edit_file",
@@ -1347,7 +1409,7 @@ class CodingToolSet:
         expected_mtime: Optional[float] = None,
         expected_sha256: Optional[str] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """Replace exact text in one workspace file.
 
         :param path: Path relative to the workspace root.
@@ -1361,7 +1423,9 @@ class CodingToolSet:
         try:
             file_ops = self._file_ops(runtime_context)
             if not file_ops.stat(path).is_file:
-                return {"status": "error", "message": f"Not a file: {path}"}
+                return error_result(
+                    {"status": "error", "message": f"Not a file: {path}"}
+                )
             old_content, line_ending, current_mtime, current_sha256 = self._read_text_file(
                 path,
                 runtime_context,
@@ -1370,37 +1434,47 @@ class CodingToolSet:
                 expected_mtime is not None
                 and abs(float(expected_mtime) - float(current_mtime)) > 1e-6
             ):
-                return {
-                    "status": "error",
-                    "message": "File was modified since the expected mtime.",
-                    "path": path,
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": "File was modified since the expected mtime.",
+                        "path": path,
+                    }
+                )
             if not old_text:
-                return {
-                    "status": "error",
-                    "message": "old_text cannot be empty",
-                    "path": path,
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": "old_text cannot be empty",
+                        "path": path,
+                    }
+                )
             if old_text == new_text:
-                return {
-                    "status": "error",
-                    "message": "old_text and new_text are identical",
-                    "path": path,
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": "old_text and new_text are identical",
+                        "path": path,
+                    }
+                )
             count = old_content.count(old_text)
             if count == 0:
-                return {
-                    "status": "error",
-                    "message": f"Text not found in {path}",
-                    "path": path,
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": f"Text not found in {path}",
+                        "path": path,
+                    }
+                )
             if count > 1 and not replace_all:
-                return {
-                    "status": "error",
-                    "message": "Text replacement must be unique",
-                    "path": path,
-                    "occurrences": count,
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": "Text replacement must be unique",
+                        "path": path,
+                        "occurrences": count,
+                    }
+                )
             replacement_count = count if replace_all else 1
             new_content = old_content.replace(
                 old_text,
@@ -1432,24 +1506,28 @@ class CodingToolSet:
         except FileRevisionConflictError as exc:
             return self._revision_conflict_result(exc)
         except FileNotFoundError:
-            return {
-                "status": "error",
-                "message": f"File not found: {path}",
-                "path": path,
-            }
+            return error_result(
+                {
+                    "status": "error",
+                    "message": f"File not found: {path}",
+                    "path": path,
+                }
+            )
         except Exception as e:
-            return {"status": "error", "message": str(e), "path": path}
+            return error_result({"status": "error", "message": str(e), "path": path})
 
     @staticmethod
-    def _revision_conflict_result(exc: FileRevisionConflictError) -> Dict[str, Any]:
-        return {
-            "status": "error",
-            "error_category": "file_revision_conflict",
-            "message": str(exc),
-            "path": exc.path,
-            "expected_sha256": exc.expected_sha256,
-            "current_sha256": exc.current_sha256,
-        }
+    def _revision_conflict_result(exc: FileRevisionConflictError) -> ToolResult:
+        return error_result(
+            {
+                "status": "error",
+                "error_category": "file_revision_conflict",
+                "message": str(exc),
+                "path": exc.path,
+                "expected_sha256": exc.expected_sha256,
+                "current_sha256": exc.current_sha256,
+            }
+        )
 
     @function_tool(
         name="make_directory",
@@ -1459,7 +1537,7 @@ class CodingToolSet:
     )
     def make_directory(
         self, path: str, runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Create a directory inside the workspace.
 
@@ -1470,7 +1548,7 @@ class CodingToolSet:
             self._file_ops(runtime_context).make_directory(path, parents=True)
             return {"status": "success", "path": path}
         except Exception as e:
-            return {"status": "error", "message": str(e), "path": path}
+            return error_result({"status": "error", "message": str(e), "path": path})
 
     @function_tool(
         name="glob",
@@ -1486,7 +1564,7 @@ class CodingToolSet:
         include_ignored: bool = False,
         limit: int = 200,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Find files under the workspace that match a glob pattern.
 
@@ -1498,7 +1576,9 @@ class CodingToolSet:
         :param runtime_context: Optional runtime context injected by the executor.
         """
         if not str(pattern or "").strip():
-            return {"status": "error", "message": "Pattern cannot be empty"}
+            return error_result(
+                {"status": "error", "message": "Pattern cannot be empty"}
+            )
         try:
             result_limit = _search_limit(limit)
             self._require_search_directory(path, runtime_context)
@@ -1550,7 +1630,7 @@ class CodingToolSet:
         include_hidden: bool = False,
         include_ignored: bool = False,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Search workspace files for a regex or literal text pattern.
 
@@ -1568,7 +1648,9 @@ class CodingToolSet:
         :param runtime_context: Optional runtime context injected by the executor.
         """
         if not str(pattern or "").strip():
-            return {"status": "error", "message": "Pattern cannot be empty"}
+            return error_result(
+                {"status": "error", "message": "Pattern cannot be empty"}
+            )
         try:
             result_limit = _search_limit(limit)
             context_lines = int(context)
@@ -1643,7 +1725,7 @@ class CodingToolSet:
         length: int = 256,
         width: int = 16,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """Inspect an exact bounded byte range from a workspace file.
 
         :param path: Path relative to the workspace root.
@@ -1665,7 +1747,9 @@ class CodingToolSet:
             file_ops = self._file_ops(runtime_context)
             info = file_ops.stat(path)
             if not info.is_file:
-                return {"status": "error", "message": f"Not a file: {path}"}
+                return error_result(
+                    {"status": "error", "message": f"Not a file: {path}"}
+                )
             if start >= info.size:
                 return {
                     "status": "success",
@@ -1698,7 +1782,7 @@ class CodingToolSet:
                 "has_more": start + len(raw) < info.size,
             }
         except Exception as e:
-            return {"status": "error", "message": str(e), "path": path}
+            return error_result({"status": "error", "message": str(e), "path": path})
 
     @function_tool(
         name="list_tree",
@@ -1711,7 +1795,7 @@ class CodingToolSet:
         path: str = ".",
         depth: int = 3,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         List directory structure in a tree format.
 
@@ -1720,10 +1804,12 @@ class CodingToolSet:
         """
         try:
             if not self._file_ops(runtime_context).stat(path).is_directory:
-                return {
-                    "status": "error",
-                    "message": f"Path is not a directory: {path}",
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": f"Path is not a directory: {path}",
+                    }
+                )
             normalized_depth = min(max(int(depth), 1), 10)
             lines = self._tree_lines(path, normalized_depth, runtime_context)
             return {
@@ -1734,7 +1820,7 @@ class CodingToolSet:
                 "lines": lines,
             }
         except Exception as e:
-            return {"status": "error", "message": str(e), "path": path}
+            return error_result({"status": "error", "message": str(e), "path": path})
 
     @function_tool(
         name="http_request",
@@ -1752,7 +1838,7 @@ class CodingToolSet:
         verify_tls: bool = True,
         allow_redirects: bool = True,
         max_content_chars: int = 120_000,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Execute an HTTP request and return a structured response payload.
 
@@ -1793,7 +1879,7 @@ class CodingToolSet:
         timeout: Optional[int] = None,
         verify_tls: bool = True,
         allow_redirects: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Execute one HTTP GET request.
 
@@ -1827,7 +1913,7 @@ class CodingToolSet:
         timeout: Optional[int] = None,
         verify_tls: bool = True,
         allow_redirects: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Execute one HTTP POST request.
 
@@ -1874,7 +1960,7 @@ class CodingToolSet:
         url: str,
         prompt: str = "",
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Fetch one URL and extract concise text for coding workflows.
 
@@ -1884,7 +1970,7 @@ class CodingToolSet:
         """
         _ = runtime_context
         response = await self.http_get(url=url, allow_redirects=False)
-        if response.get("status") == "error":
+        if isinstance(response, ToolResult):
             return response
         if response.get("status_code") in {301, 302, 303, 307, 308}:
             headers = response.get("headers", {})
@@ -1923,7 +2009,7 @@ class CodingToolSet:
         self,
         questions: List[Dict[str, Any]],
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Emit a structured user-input request.
 
@@ -1931,7 +2017,10 @@ class CodingToolSet:
         :param runtime_context: Optional runtime context injected by the executor.
         """
         _ = runtime_context
-        return {"status": "needs_input", "questions": list(questions or [])}
+        return tool_result(
+            {"status": "needs_input", "questions": list(questions or [])},
+            status="needs_input",
+        )
 
     @function_tool(name="tool_search", read_only=True)
     def tool_search(
@@ -2027,7 +2116,7 @@ class CodingToolSet:
         symbol: str = "",
         runtime_context: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Query an injected LSP backend.
 
@@ -2038,8 +2127,13 @@ class CodingToolSet:
         ops = (runtime_context or {}).get("ops") or {}
         lsp = ops.get("lsp")
         if lsp is None or not hasattr(lsp, "query"):
-            return {"status": "error", "message": "LSP capability unavailable"}
-        return lsp.query(operation=operation, symbol=symbol, **kwargs)
+            return error_result(
+                {"status": "error", "message": "LSP capability unavailable"}
+            )
+        payload = lsp.query(operation=operation, symbol=symbol, **kwargs)
+        if isinstance(payload, Mapping) and payload.get("status") == "error":
+            return error_result(payload)
+        return payload
 
     @function_tool(
         name="task_create",
@@ -2053,7 +2147,7 @@ class CodingToolSet:
         metadata: Optional[Dict[str, Any]] = None,
         status: str = "pending",
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Create a session-native task record.
 
@@ -2067,10 +2161,12 @@ class CodingToolSet:
         _ = runtime_context
         normalized_status = str(status or "pending").strip()
         if normalized_status not in TASK_STATUSES:
-            return {
-                "status": "error",
-                "message": f"Unsupported status: {normalized_status}",
-            }
+            return error_result(
+                {
+                    "status": "error",
+                    "message": f"Unsupported status: {normalized_status}",
+                }
+            )
         task_id = self._next_task_id()
         task = {
             "id": task_id,
@@ -2091,7 +2187,7 @@ class CodingToolSet:
     @function_tool(name="task_get", read_only=True)
     def task_get(
         self, task_id: str, runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Fetch one session-native task by id.
 
@@ -2101,7 +2197,9 @@ class CodingToolSet:
         _ = runtime_context
         task = self._session_tasks.get(str(task_id))
         if task is None:
-            return {"status": "error", "message": f"Task not found: {task_id}"}
+            return error_result(
+                {"status": "error", "message": f"Task not found: {task_id}"}
+            )
         return {"status": "success", "task": dict(task)}
 
     @function_tool(name="task_list", read_only=True)
@@ -2139,7 +2237,7 @@ class CodingToolSet:
         remove_blocks: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Update a session-native task.
 
@@ -2153,14 +2251,18 @@ class CodingToolSet:
         _ = runtime_context
         task = self._session_tasks.get(str(task_id))
         if task is None:
-            return {"status": "error", "message": f"Task not found: {task_id}"}
+            return error_result(
+                {"status": "error", "message": f"Task not found: {task_id}"}
+            )
         if status:
             normalized_status = str(status).strip()
             if normalized_status not in TASK_STATUSES:
-                return {
-                    "status": "error",
-                    "message": f"Unsupported status: {normalized_status}",
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": f"Unsupported status: {normalized_status}",
+                    }
+                )
             task["status"] = normalized_status
         blocks = list(task.get("blocks", []))
         for item in list(add_blocks or []):
@@ -2193,7 +2295,7 @@ class CodingToolSet:
     @function_tool(name="mcp_read_resource", read_only=True)
     def mcp_read_resource(
         self, server: str, uri: str, runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Read one MCP resource from injected snapshots.
 
@@ -2205,7 +2307,9 @@ class CodingToolSet:
         for item in list(resources.get(server) or []):
             if isinstance(item, dict) and str(item.get("uri", "")) == str(uri):
                 return {"status": "success", "resource": item}
-        return {"status": "error", "message": f"Resource not found: {server}:{uri}"}
+        return error_result(
+            {"status": "error", "message": f"Resource not found: {server}:{uri}"}
+        )
 
     @function_tool(name="cron_create")
     def cron_create(

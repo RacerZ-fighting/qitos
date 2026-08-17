@@ -7,6 +7,5 @@
 # For optional provider SDKs and contributor tooling, use:
 #   pip install -r requirements-dev.txt
 #   pip install -e ".[models]"
-#   pip install -e ".[benchmarks]"
 
 -e .

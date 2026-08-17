@@ -42,10 +42,10 @@ class _StartupDiscovery:
 
 
 class MCPRuntime:
-    """Own MCP transports and their published Tool catalogs for one Engine run.
+    """Own MCP transports and their published Tool catalogs for one Agent run.
 
     Refresh requests are only applied when :meth:`refresh_pending` is awaited by
-    the Engine at a turn safe point. A failed refresh leaves that server's last
+    the run owner at a turn safe point. A failed refresh leaves that server's last
     complete catalog installed. Cancellation propagates without consuming the
     pending generation.
     """

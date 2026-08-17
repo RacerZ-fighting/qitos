@@ -169,6 +169,31 @@ async def test_unknown_or_foreign_handle_has_stable_status() -> None:
 
 
 @pytest.mark.asyncio
+async def test_control_tools_use_executor_owned_run_id() -> None:
+    engine = _MailboxEngine()
+    supervisor = _supervisor(engine)
+    launched = await _launch(supervisor)
+    await asyncio.wait_for(engine.started.wait(), timeout=1)
+    tool = ChildStatusTool(supervisor)
+
+    owned = await tool.execute(
+        {"child_id": launched.handle.child_id},
+        runtime_context={"run_id": "parent-run"},
+    )
+    conflicting_legacy_parent = await tool.execute(
+        {"child_id": launched.handle.child_id},
+        runtime_context={
+            "run_id": "different-run",
+            "parent_run_id": "parent-run",
+        },
+    )
+
+    assert owned["child_status"] == "running"
+    assert conflicting_legacy_parent["child_status"] == "unknown"
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_terminal_child_rejects_message_with_actionable_result() -> None:
     engine = _MailboxEngine()
     supervisor = _supervisor(engine)

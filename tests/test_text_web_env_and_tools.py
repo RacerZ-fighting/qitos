@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from qitos.core.tool_result import ToolResult
 from qitos.kit.env import TextWebBrowserOps, TextWebEnv
 from qitos.kit.tool import FindInPage, FindNext, PageDown, PageUp
 
@@ -110,4 +111,5 @@ async def test_text_web_atomic_tools_use_ops_context():
     assert find["matched_line"] == 42
 
     next_match = await FindNext().execute({}, runtime_context=ctx)
-    assert next_match["status"] == "error"
+    assert isinstance(next_match, ToolResult)
+    assert next_match.status == "error"

@@ -8,7 +8,9 @@ from typing import Any, Dict, List, Optional
 import xml.etree.ElementTree as ET
 
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool_result import ToolResult
 from qitos.kit._html import extract_html_text
+from qitos.kit.tool.internal.results import error_result
 
 
 class EpubToolSet:
@@ -33,7 +35,7 @@ class EpubToolSet:
         name="list_chapters", description="List chapter files and titles from an EPUB",
         read_only=True,
     )
-    def list_chapters(self, path: str) -> Dict[str, Any]:
+    def list_chapters(self, path: str) -> Dict[str, Any] | ToolResult:
         """
         List chapter files and detected titles from one EPUB archive.
 
@@ -56,12 +58,12 @@ class EpubToolSet:
                 "chapters": rows,
             }
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return error_result({"status": "error", "message": str(e)})
 
     @function_tool(name="read_chapter", description="Read one chapter text from an EPUB", read_only=True)
     def read_chapter(
         self, path: str, chapter_index: int, max_chars: int = 8000
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Read one EPUB chapter as plain text.
 
@@ -75,10 +77,10 @@ class EpubToolSet:
             epub_path = self._resolve(path)
             chapter_files = self._chapter_files(epub_path)
             if chapter_index < 0 or chapter_index >= len(chapter_files):
-                return {
+                return error_result({
                     "status": "error",
                     "message": f"Invalid chapter_index: {chapter_index}",
-                }
+                })
             href = chapter_files[chapter_index]
             raw = self._read_zip_text(epub_path, href)
             extracted = extract_html_text(raw)
@@ -93,12 +95,12 @@ class EpubToolSet:
                 "content": text,
             }
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return error_result({"status": "error", "message": str(e)})
 
     @function_tool(name="search", description="Search keyword in EPUB chapters", read_only=True)
     def search(
         self, path: str, query: str, top_k: int = 3, snippet_chars: int = 240
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Search all EPUB chapters for a keyword and return matching snippets.
 
@@ -108,7 +110,9 @@ class EpubToolSet:
         :param snippet_chars: Approximate snippet length around each match.
         """
         if not query.strip():
-            return {"status": "error", "message": "query cannot be empty"}
+            return error_result(
+                {"status": "error", "message": "query cannot be empty"}
+            )
         try:
             epub_path = self._resolve(path)
             chapter_files = self._chapter_files(epub_path)
@@ -138,7 +142,7 @@ class EpubToolSet:
                 "hit_count": len(hits),
             }
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return error_result({"status": "error", "message": str(e)})
 
     def _resolve(self, path: str) -> Path:
         p = (

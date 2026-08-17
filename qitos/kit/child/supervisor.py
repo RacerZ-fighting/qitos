@@ -11,6 +11,7 @@ from contextlib import AbstractAsyncContextManager, AbstractContextManager, null
 from dataclasses import dataclass, replace
 from typing import Any
 
+from ...core.budget import BudgetLedger, BudgetSnapshot
 from ...core.child import (
     AgentConclusion,
     ChildEngine,
@@ -34,13 +35,19 @@ from ...core.journal import (
     SessionJournal,
 )
 from ...core.message import AssistantMessage, ToolResultMessage
+from ...core.model_response import ModelPricing
 from ...core.runtime_input import (
     RuntimeInput,
     child_result_payload,
     child_terminal_runtime_input,
 )
 from ..journal import recover_run_outcome
-from .agent_engine import child_final_text, child_run_stats, child_stop_reason
+from .agent_engine import (
+    child_budget_stop_reason,
+    child_final_text,
+    child_run_stats,
+    child_stop_reason,
+)
 from .limits import ChildRunLimiter, _ChildRunLease
 
 _logger = logging.getLogger(__name__)
@@ -317,12 +324,15 @@ class ChildSupervisor:
         *,
         parent_run_id: str,
         journal: SessionJournal,
+        budget_ledger: BudgetLedger | None = None,
     ) -> tuple[ChildResult, ...]:
         """Recover terminal facts and close interrupted children without replay."""
 
         normalized_parent = str(parent_run_id or "").strip()
         if not normalized_parent:
             raise ValueError("parent_run_id must be a non-empty string")
+        if budget_ledger is not None and not isinstance(budget_ledger, BudgetLedger):
+            raise TypeError("budget_ledger must be a BudgetLedger or None")
         if normalized_parent in self._recovered_runs:
             return self._results_for_parent(normalized_parent)
         lifecycle_lock = await self._lifecycle_lock(normalized_parent)
@@ -342,6 +352,7 @@ class ChildSupervisor:
             return await self._recover_once(
                 parent_run_id=normalized_parent,
                 journal=journal,
+                budget_ledger=budget_ledger,
             )
 
     async def _recover_once(
@@ -349,6 +360,7 @@ class ChildSupervisor:
         *,
         parent_run_id: str,
         journal: SessionJournal,
+        budget_ledger: BudgetLedger | None,
     ) -> tuple[ChildResult, ...]:
         """Recover one parent while its lifecycle admission is serialized."""
 
@@ -402,7 +414,15 @@ class ChildSupervisor:
         for handle, start in started.items():
             if handle in recovered:
                 continue
-            result = await self._recover_interrupted_result(handle, start)
+            result = await self._recover_interrupted_result(
+                handle,
+                start,
+                root_budget=(
+                    budget_ledger.snapshot_after_origin(start.child_run_id)
+                    if budget_ledger is not None and start.child_run_id
+                    else None
+                ),
+            )
             try:
                 await journal.append(
                     JournalRecordType.CHILD_TERMINAL,
@@ -490,6 +510,11 @@ class ChildSupervisor:
             raise ValueError("content must be a non-empty string")
         if timeout_seconds is not None and timeout_seconds < 0:
             raise ValueError("timeout_seconds must be non-negative or None")
+        deadline = (
+            None
+            if timeout_seconds is None
+            else time.monotonic() + timeout_seconds
+        )
         owned = self._owned(handle)
         if owned is None:
             return False, None
@@ -499,7 +524,11 @@ class ChildSupervisor:
         try:
             await self._wait_until_ready_or_terminal(
                 owned,
-                timeout_seconds=timeout_seconds,
+                timeout_seconds=(
+                    None
+                    if deadline is None
+                    else max(0.0, deadline - time.monotonic())
+                ),
             )
         except TimeoutError:
             return False, self._current_result(owned)
@@ -519,7 +548,17 @@ class ChildSupervisor:
             source="qitos.parent",
             payload={"content": text},
         )
-        accepted = await post_runtime_event(event, run_id=child_run_id)
+        post = post_runtime_event(event, run_id=child_run_id)
+        try:
+            if deadline is None:
+                accepted = await post
+            else:
+                accepted = await asyncio.wait_for(
+                    post,
+                    timeout=max(0.0, deadline - time.monotonic()),
+                )
+        except asyncio.TimeoutError:
+            return False, self._current_result(owned)
         return bool(accepted), self._current_result(owned)
 
     def request_interrupt(self, handle: ChildHandle) -> bool:
@@ -593,14 +632,21 @@ class ChildSupervisor:
             )
         return events
 
-    def setup(self) -> None:
-        """Open this supervisor for a fresh owner Run."""
+    def setup(self, *, reset_run_limiter: bool = False) -> None:
+        """Open this supervisor for a fresh owner Run.
+
+        A shared recursive ``ChildRunLimiter`` has one root lifecycle owner.
+        Nested supervisors therefore leave its cumulative Run-tree accounting
+        intact unless their composition owner explicitly starts a new root Run.
+        """
 
         if any(
             owned.task is not None and not owned.task.done()
             for owned in self._children.values()
         ):
             raise RuntimeError("cannot reopen a child supervisor with owned tasks")
+        if reset_run_limiter and self._run_limiter is not None:
+            self._run_limiter.reset_for_new_run()
         self._limit = asyncio.Semaphore(self._max_concurrency)
         self._admission_lock = asyncio.Lock()
         self._children_started = 0
@@ -672,10 +718,89 @@ class ChildSupervisor:
         return result
 
     async def _run_request_with_limit(self, owned: _OwnedChild) -> ChildResult:
-        """Apply the supervisor limit uniformly to foreground and background runs."""
+        """Apply concurrency and the parent's absolute deadline to all run work."""
 
-        async with self._limit:
-            return await self._run_request(owned)
+        launch_context = owned.launch_context
+        if launch_context is None:
+            raise RuntimeError("Child launch context was released before execution")
+        deadline = launch_context.deadline_monotonic
+        started = time.monotonic()
+        if deadline is not None and started >= deadline:
+            return self._budget_exhausted_result(
+                owned,
+                error="Child deadline expired before execution admission.",
+                elapsed_seconds=0.0,
+            )
+
+        async def _run_admitted() -> ChildResult:
+            async with self._limit:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return self._budget_exhausted_result(
+                        owned,
+                        error="Child deadline expired before execution.",
+                        elapsed_seconds=max(0.0, time.monotonic() - started),
+                    )
+                return await self._run_request(owned)
+
+        if deadline is None:
+            return await _run_admitted()
+
+        async def _wait_for_deadline() -> None:
+            await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+
+        request_task = asyncio.create_task(
+            _run_admitted(),
+            name=f"qitos-{owned.handle.child_id}-deadline-request",
+        )
+        deadline_task = asyncio.create_task(
+            _wait_for_deadline(),
+            name=f"qitos-{owned.handle.child_id}-deadline-timer",
+        )
+        try:
+            completed, _pending = await asyncio.wait(
+                (request_task, deadline_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            self._cancel_engine(owned)
+            await self._cancel_and_drain_tasks(request_task, deadline_task)
+            raise
+        if request_task in completed:
+            caller_cancelled = await self._cancel_and_drain_tasks(deadline_task)
+            if caller_cancelled:
+                self._cancel_engine(owned)
+                raise asyncio.CancelledError
+            return await request_task
+
+        self._cancel_engine(owned)
+        caller_cancelled = await self._cancel_and_drain_tasks(
+            request_task,
+            deadline_task,
+        )
+        if caller_cancelled:
+            raise asyncio.CancelledError
+        return self._budget_exhausted_result(
+            owned,
+            error="Child deadline expired.",
+            elapsed_seconds=max(0.0, time.monotonic() - started),
+        )
+
+    @staticmethod
+    async def _cancel_and_drain_tasks(*tasks: asyncio.Task[Any]) -> bool:
+        """Cancel owned tasks, await settlement, and report caller cancellation."""
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        waiter = asyncio.gather(*tasks, return_exceptions=True)
+        caller_cancelled = False
+        while not waiter.done():
+            try:
+                await asyncio.shield(waiter)
+            except asyncio.CancelledError:
+                caller_cancelled = True
+        waiter.result()
+        return caller_cancelled
 
     async def _run_request(self, owned: _OwnedChild) -> ChildResult:
         started = time.monotonic()
@@ -697,6 +822,9 @@ class ChildSupervisor:
         async def _run_in_scope() -> ChildResult:
             if owned.cancel_event.is_set():
                 raise RuntimeError("Child agent was cancelled before it started")
+            budget_error = self._budget_admission_error(launch_context)
+            if budget_error is not None:
+                return self._budget_exhausted_result(owned, error=budget_error)
             return await self._run_invocation(owned, scoped_context)
 
         try:
@@ -713,16 +841,6 @@ class ChildSupervisor:
         except Exception as exc:
             if owned.cancel_event.is_set():
                 result = self._cancelled_result(owned, error=str(exc))
-            elif isinstance(exc, TimeoutError):
-                error = str(exc) or "Child deadline expired."
-                result = ChildResult(
-                    handle=owned.handle,
-                    request=owned.request,
-                    status=ChildStatus.BUDGET_EXHAUSTED,
-                    conclusion=AgentConclusion(unknowns=(error,)),
-                    error=error,
-                    child_run_id=self._child_run_id(owned),
-                )
             else:
                 result = self._failed_result(owned, exc)
         return replace(
@@ -1144,6 +1262,8 @@ class ChildSupervisor:
         self,
         handle: ChildHandle,
         start: _RecoveredChildStart,
+        *,
+        root_budget: BudgetSnapshot | None,
     ) -> ChildResult:
         """Rebuild one started Child's terminal fact from its own run journal.
 
@@ -1166,6 +1286,8 @@ class ChildSupervisor:
                         handle=handle,
                         start=start,
                         outcome=outcome,
+                        records=records,
+                        root_budget=root_budget,
                     )
         return ChildResult(
             handle=handle,
@@ -1186,11 +1308,25 @@ class ChildSupervisor:
         handle: ChildHandle,
         start: _RecoveredChildStart,
         outcome: Any,
+        records: Sequence[JournalRecord],
+        root_budget: BudgetSnapshot | None,
     ) -> ChildResult:
-        stop_reason = child_stop_reason(outcome.status, outcome.error)
+        model_pricing = self._model_pricing(records)
+        stats = child_run_stats(
+            outcome.messages,
+            model_pricing=model_pricing,
+        )
+        budget_reason = (
+            child_budget_stop_reason(stats, start.request.budget, root_budget)
+            if outcome.status.value == "completed"
+            else None
+        )
+        stop_reason = budget_reason or child_stop_reason(
+            outcome.status,
+            outcome.error,
+        )
         status = self._child_status(stop_reason)
         status_detail = stop_reason or "unknown stop reason"
-        stats = child_run_stats(outcome.messages)
         summary = child_final_text(outcome.messages) or self._partial_result(outcome)
         return ChildResult(
             handle=handle,
@@ -1207,9 +1343,36 @@ class ChildSupervisor:
             error=outcome.error,
             steps=stats.steps,
             total_tokens=stats.total_tokens,
+            total_cost_usd=stats.total_cost_usd,
             usage_complete=stats.usage_complete,
-            cost_complete=False,
+            cost_complete=stats.cost_complete,
         )
+
+    @staticmethod
+    def _model_pricing(records: Sequence[JournalRecord]) -> ModelPricing | None:
+        starts = [
+            record
+            for record in records
+            if record.type is JournalRecordType.RUN_STARTED
+        ]
+        if not starts:
+            return None
+        raw = starts[0].payload.get("model_pricing")
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "input_usd_per_million",
+            "output_usd_per_million",
+            "cache_read_usd_per_million",
+            "cache_write_usd_per_million",
+        }:
+            raise ChildPersistenceError("child model pricing metadata is invalid")
+        try:
+            return ModelPricing(**dict(raw))
+        except (TypeError, ValueError) as exc:
+            raise ChildPersistenceError(
+                "child model pricing metadata is invalid"
+            ) from exc
 
     async def _descendant_launch_ids(
         self,
@@ -1379,6 +1542,46 @@ class ChildSupervisor:
             usage_complete=usage_complete,
             cost_complete=cost_complete,
         )
+
+    def _budget_exhausted_result(
+        self,
+        owned: _OwnedChild,
+        *,
+        error: str,
+        elapsed_seconds: float = 0.0,
+    ) -> ChildResult:
+        tokens, cost, usage_complete, cost_complete = self._engine_usage(owned)
+        return ChildResult(
+            handle=owned.handle,
+            request=owned.request,
+            status=ChildStatus.BUDGET_EXHAUSTED,
+            conclusion=AgentConclusion(unknowns=(error,)),
+            child_run_id=self._child_run_id(owned),
+            error=error,
+            total_tokens=tokens,
+            total_cost_usd=cost,
+            usage_complete=usage_complete,
+            cost_complete=cost_complete,
+            elapsed_seconds=elapsed_seconds,
+        )
+
+    @staticmethod
+    def _budget_admission_error(context: ChildLaunchContext) -> str | None:
+        ledger = context.budget_ledger
+        if ledger is None:
+            return None
+        snapshot = ledger.snapshot()
+        if snapshot.max_tokens is not None:
+            if not snapshot.usage_complete:
+                return "Root token usage is incomplete; Child admission is closed."
+            if snapshot.tokens_exhausted:
+                return "Root token budget is exhausted."
+        if snapshot.max_cost_usd is not None:
+            if not snapshot.cost_complete:
+                return "Root cost usage is incomplete; Child admission is closed."
+            if snapshot.cost_exhausted:
+                return "Root cost budget is exhausted."
+        return None
 
     def _failed_result(self, owned: _OwnedChild, exc: Exception) -> ChildResult:
         error = str(exc) or type(exc).__name__

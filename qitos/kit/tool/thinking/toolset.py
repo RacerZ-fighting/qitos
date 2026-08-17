@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool_result import ToolResult
+from qitos.kit.tool.internal.results import error_result
 
 
 @dataclass
@@ -55,7 +57,7 @@ class ThinkingToolSet:
         branch_from_thought: Optional[int] = None,
         branch_id: Optional[str] = None,
         needs_more_thoughts: Optional[bool] = None,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Record one structured thought step, optionally as a revision or branch.
 
@@ -70,39 +72,49 @@ class ThinkingToolSet:
         :param needs_more_thoughts: Whether the current total should be expanded.
         """
         if thought_number < 1:
-            return {
-                "status": "error",
-                "message": "thought_number must be a positive integer",
-            }
+            return error_result(
+                {
+                    "status": "error",
+                    "message": "thought_number must be a positive integer",
+                }
+            )
         if total_thoughts < 1:
-            return {
-                "status": "error",
-                "message": "total_thoughts must be a positive integer",
-            }
+            return error_result(
+                {
+                    "status": "error",
+                    "message": "total_thoughts must be a positive integer",
+                }
+            )
         if thought_number > total_thoughts:
             total_thoughts = thought_number
 
         if is_revision and revises_thought is not None:
             if revises_thought < 1 or revises_thought > len(self.thought_history):
-                return {
-                    "status": "error",
-                    "message": (
-                        f"revises_thought index {revises_thought} is out of range for thought history "
-                        f"of length {len(self.thought_history)}"
-                    ),
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": (
+                            f"revises_thought index {revises_thought} is out of "
+                            f"range for thought history of length "
+                            f"{len(self.thought_history)}"
+                        ),
+                    }
+                )
 
         if branch_from_thought is not None:
             if branch_from_thought < 1 or branch_from_thought > len(
                 self.thought_history
             ):
-                return {
-                    "status": "error",
-                    "message": (
-                        f"branch_from_thought index {branch_from_thought} is out of range for thought history "
-                        f"of length {len(self.thought_history)}"
-                    ),
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": (
+                            f"branch_from_thought index {branch_from_thought} is "
+                            f"out of range for thought history of length "
+                            f"{len(self.thought_history)}"
+                        ),
+                    }
+                )
 
         thought_data = ThoughtData(
             thought=thought,

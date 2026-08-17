@@ -373,7 +373,7 @@ def resolve_inherited_record(record: JournalRecord) -> JournalRecord:
 
 @runtime_checkable
 class SessionJournal(Protocol):
-    """Durable single-Run journal used by the Engine.
+    """Durable single-Run journal used by the Agent Session boundary.
 
     An append cancelled before admission raises ordinary ``CancelledError`` and
     commits nothing. Once canonical I/O starts, implementations settle it before

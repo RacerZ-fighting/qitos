@@ -115,6 +115,19 @@ class ChildRunLimiter:
             self._restored_launches.update(unseen)
             self._children_started += len(unseen)
 
+    def reset_for_new_run(self) -> None:
+        """Clear cumulative admission state at an owner-Run boundary.
+
+        The composition root calls this only after every supervisor-owned task
+        has settled.  Resetting a limiter with an active lease would detach
+        that lease from its accounting owner, so it fails closed instead.
+        """
+
+        if self._active_children:
+            raise RuntimeError("cannot reset Child Run limits with active children")
+        self._children_started = 0
+        self._restored_launches.clear()
+
     async def _release(
         self,
         lease: _ChildRunLease,

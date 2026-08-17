@@ -239,6 +239,27 @@ class _HookTimedOut(Exception):
     """Internal signal: a loop hook exceeded the remaining run deadline."""
 
 
+class _EventSinkFault(Exception):
+    """Internal wrapper preventing listener faults from becoming model errors."""
+
+    def __init__(self, cause: Exception) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+
+
+async def _emit_during_model_stream(
+    emit: EventSink | None, event: AgentEvent
+) -> None:
+    """Emit a streaming event without classifying listener faults as model faults."""
+
+    try:
+        await emit_to(emit, event)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise _EventSinkFault(exc) from exc
+
+
 async def run_agent_loop(
     prompts: Sequence[Message],
     context: AgentContext,
@@ -253,10 +274,10 @@ async def run_agent_loop(
     new_messages: List[Message] = list(prompts)
     context.messages.extend(prompts)
     guard = _RunTerminalGuard()
-    await emit_to(emit, AgentStart())
     try:
         if cancel_token is not None:
             cancel_token.reset_step_event()
+        await emit_to(emit, AgentStart())
         await emit_to(emit, TurnStart(turn=0))
         for prompt in prompts:
             await emit_to(emit, MessageStart(message=prompt))
@@ -300,10 +321,10 @@ async def run_agent_loop_continue(
         raise ValueError("cannot continue from an assistant message")
     new_messages: List[Message] = []
     guard = _RunTerminalGuard()
-    await emit_to(emit, AgentStart())
     try:
         if cancel_token is not None:
             cancel_token.reset_step_event()
+        await emit_to(emit, AgentStart())
         await emit_to(emit, TurnStart(turn=0))
         return await _run_loop(
             context, new_messages, config, emit, cancel_token, guard, turn=0
@@ -335,6 +356,15 @@ class _RunTerminalGuard:
 
     def __init__(self) -> None:
         self._written = False
+        self._end_attempted = False
+
+    async def _emit_end_once(
+        self, emit: EventSink | None, new_messages: Sequence[Message]
+    ) -> None:
+        if self._end_attempted:
+            return
+        self._end_attempted = True
+        await emit_to(emit, AgentEnd(messages=tuple(new_messages)))
 
     async def finish(
         self,
@@ -350,7 +380,7 @@ class _RunTerminalGuard:
         self._written = True
         if config.transaction is not None:
             await config.transaction.run_terminal(result)
-        await emit_to(emit, AgentEnd(messages=tuple(new_messages)))
+        await self._emit_end_once(emit, new_messages)
         return result
 
     async def terminalize_interrupted(
@@ -372,7 +402,7 @@ class _RunTerminalGuard:
                     status=status, messages=tuple(new_messages), error=error
                 )
                 await config.transaction.run_terminal(result)
-        await emit_to(emit, AgentEnd(messages=tuple(new_messages)))
+        await self._emit_end_once(emit, new_messages)
 
 
 def agent_loop(
@@ -383,12 +413,14 @@ def agent_loop(
 ) -> "AgentEventStream":
     """Start a loop run and return its push-based event stream."""
 
+    run_token = cancel_token if cancel_token is not None else CancelToken()
+
     async def _runner() -> AgentLoopResult:
         return await run_agent_loop(
-            prompts, context, config, stream.push, cancel_token
+            prompts, context, config, stream.push, run_token
         )
 
-    stream = AgentEventStream(_runner(), cancel_token=cancel_token)
+    stream = AgentEventStream(_runner(), cancel_token=run_token)
     return stream
 
 
@@ -399,12 +431,14 @@ def agent_loop_continue(
 ) -> "AgentEventStream":
     """Continue a loop run from the context tail and return its event stream."""
 
+    run_token = cancel_token if cancel_token is not None else CancelToken()
+
     async def _runner() -> AgentLoopResult:
         return await run_agent_loop_continue(
-            context, config, stream.push, cancel_token
+            context, config, stream.push, run_token
         )
 
-    stream = AgentEventStream(_runner(), cancel_token=cancel_token)
+    stream = AgentEventStream(_runner(), cancel_token=run_token)
     return stream
 
 
@@ -453,6 +487,13 @@ class AgentEventStream:
         except asyncio.CancelledError:
             if self._cancel_token is not None:
                 self._cancel_token.request_cancel("immediate")
+            while not self._task.done():
+                try:
+                    await asyncio.shield(self._task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
             raise
         if item is _STREAM_SENTINEL:
             raise StopAsyncIteration
@@ -488,10 +529,11 @@ async def _bounded_await(
 ) -> Any:
     """Await one loop hook bounded by cancellation and the run deadline.
 
-    Hook exceptions propagate as faults; cancellation raises
+    Hook exceptions propagate as faults; immediate cancellation raises
     :class:`_StreamAborted`; deadline expiry raises :class:`_HookTimedOut`.
-    A hook that ignores cancellation is cancelled and abandoned, never
-    awaited forever.
+    Cancelled hook tasks are awaited to settlement so the loop never leaves
+    detached callback work behind. Graceful ``after_step`` cancellation is
+    observed only at the committed turn boundary.
     """
 
     if not inspect.isawaitable(value):
@@ -504,7 +546,7 @@ async def _bounded_await(
     tasks: Set[asyncio.Task[Any]] = {hook_task}
     watcher: Optional[asyncio.Task[bool]] = None
     if token is not None:
-        watcher = asyncio.create_task(token.wait_cancelled())
+        watcher = asyncio.create_task(token.wait_immediate())
         tasks.add(watcher)
     remaining = (
         None
@@ -519,7 +561,10 @@ async def _bounded_await(
         hook_task.cancel()
         if watcher is not None:
             watcher.cancel()
-        _abandon(hook_task, watcher)
+        await asyncio.gather(
+            *[task for task in (hook_task, watcher) if task is not None],
+            return_exceptions=True,
+        )
         raise
     if hook_task in done:
         if watcher is not None:
@@ -529,21 +574,18 @@ async def _bounded_await(
     hook_task.cancel()
     if watcher is not None and not watcher.done():
         watcher.cancel()
-    _abandon(hook_task, watcher)
+    outcomes = await asyncio.gather(
+        *[task for task in (hook_task, watcher) if task is not None],
+        return_exceptions=True,
+    )
+    hook_outcome = outcomes[0]
+    if isinstance(hook_outcome, BaseException) and not isinstance(
+        hook_outcome, asyncio.CancelledError
+    ):
+        raise hook_outcome
     if watcher is not None and watcher in done:
         raise _StreamAborted
     raise _HookTimedOut
-
-
-def _abandon(*tasks: Optional[asyncio.Task[Any]]) -> None:
-    """Leave cancelled hooks to finish on their own, consuming outcomes."""
-
-    for task in tasks:
-        if task is None or task.done():
-            continue
-        task.add_done_callback(
-            lambda done: done.exception() if not done.cancelled() else None
-        )
 
 
 def _turn_exposure(context: AgentContext) -> ToolExposure:
@@ -555,6 +597,30 @@ def _turn_exposure(context: AgentContext) -> ToolExposure:
     if isinstance(tools, ToolRegistry):
         return tools.freeze()
     return tools
+
+
+def _turn_hook_context(
+    *,
+    turn: int,
+    message: AssistantMessage,
+    tool_results: Sequence[ToolResultMessage],
+    new_messages: Sequence[Message],
+    context: AgentContext,
+) -> TurnHookContext:
+    """Build a fresh hook view from the current next-turn runtime state."""
+
+    return TurnHookContext(
+        turn=turn,
+        message=message,
+        tool_results=tuple(tool_results),
+        new_messages=tuple(new_messages),
+        context=AgentContextSnapshot(
+            system_prompt=context.system_prompt,
+            messages=tuple(context.messages),
+            tools=_turn_exposure(context),
+            env=context.env,
+        ),
+    )
 
 
 def _model_protocol(model: Any) -> str:
@@ -579,15 +645,24 @@ async def _run_loop(
     turn: int,
 ) -> AgentLoopResult:
     turn_base = 0
-    pending = await _drain_queue(
-        config.get_steering_messages, token, config.deadline_monotonic
-    )
-    first_iteration = True
 
     async def _finish(
         status: AgentRunStatus, error: Optional[str] = None
     ) -> AgentLoopResult:
         return await guard.finish(status, new_messages, config, emit, error=error)
+
+    try:
+        pending = await _drain_queue(
+            config.get_steering_messages, token, config.deadline_monotonic
+        )
+    except _StreamAborted:
+        return await _finish(AgentRunStatus.ABORTED, error="run aborted")
+    except _HookTimedOut:
+        return await _finish(
+            AgentRunStatus.DEADLINE_EXCEEDED,
+            error="run deadline expired while draining steering messages",
+        )
+    first_iteration = True
 
     # Outer loop: continue when follow-up messages arrive as the agent stops.
     while True:
@@ -609,10 +684,10 @@ async def _run_loop(
                 turn_base = len(new_messages)
 
             for message in pending:
-                await emit_to(emit, MessageStart(message=message))
-                await emit_to(emit, MessageEnd(message=message))
                 context.messages.append(message)
                 new_messages.append(message)
+                await emit_to(emit, MessageStart(message=message))
+                await emit_to(emit, MessageEnd(message=message))
             pending = []
 
             exposure = _turn_exposure(context)
@@ -621,9 +696,17 @@ async def _run_loop(
             )
 
             if status_override is not None or message.failed:
-                await emit_to(
-                    emit, TurnEnd(turn=turn, message=message, tool_results=())
-                )
+                if config.transaction is not None:
+                    await config.transaction.turn_committed(
+                        turn, tuple(new_messages[turn_base:])
+                    )
+                try:
+                    await emit_to(
+                        emit, TurnEnd(turn=turn, message=message, tool_results=())
+                    )
+                finally:
+                    if token is not None:
+                        token.mark_step_complete()
                 if status_override is not None:
                     return await _finish(status_override, error=message.error)
                 return await _finish(AgentRunStatus.FAILED, error=message.error)
@@ -636,7 +719,7 @@ async def _run_loop(
                     # A token-limit stop may carry silently incomplete call
                     # arguments; fail the whole batch without executing.
                     tool_results = await _fail_truncated_calls(
-                        calls, turn, config, emit
+                        calls, turn, context, new_messages, config, emit
                     )
                 else:
                     tool_results = await _execute_calls(
@@ -650,80 +733,104 @@ async def _run_loop(
                         token,
                     )
                 has_more_tool_calls = not _should_terminate_batch(tool_results)
-                for result_message in tool_results:
-                    context.messages.append(result_message)
-                    new_messages.append(result_message)
 
-            await emit_to(
-                emit,
-                TurnEnd(
-                    turn=turn, message=message, tool_results=tuple(tool_results)
-                ),
-            )
             if config.transaction is not None:
                 await config.transaction.turn_committed(
                     turn, tuple(new_messages[turn_base:])
                 )
-            if token is not None:
-                token.mark_step_complete()
-
-            hook_context = TurnHookContext(
-                turn=turn,
-                message=message,
-                tool_results=tuple(tool_results),
-                new_messages=tuple(new_messages),
-                context=AgentContextSnapshot(
-                    system_prompt=context.system_prompt,
-                    messages=tuple(context.messages),
-                    tools=exposure,
-                    env=context.env,
-                ),
-            )
             try:
-                if config.prepare_next_turn is not None:
-                    update = await _bounded_await(
-                        config.prepare_next_turn(hook_context),
-                        token,
-                        config.deadline_monotonic,
-                    )
-                    if update is not None:
-                        if update.system_prompt is not None:
-                            context.system_prompt = update.system_prompt
-                        if update.model is not None:
-                            config = dataclasses.replace(config, model=update.model)
-                        if update.messages is not None:
-                            context.messages = list(update.messages)
-                        if update.tools is not None:
-                            context.tools = update.tools
-                        if update.extra_request_options is not None:
-                            config = dataclasses.replace(
-                                config,
-                                extra_request_options=dict(
-                                    update.extra_request_options
-                                ),
-                            )
-                if config.should_stop_after_turn is not None:
-                    should_stop = await _bounded_await(
-                        config.should_stop_after_turn(hook_context),
-                        token,
-                        config.deadline_monotonic,
-                    )
-                    if should_stop:
-                        return await _finish(AgentRunStatus.COMPLETED)
-            except _StreamAborted:
-                return await _finish(
-                    AgentRunStatus.ABORTED, error="run aborted"
+                await emit_to(
+                    emit,
+                    TurnEnd(
+                        turn=turn,
+                        message=message,
+                        tool_results=tuple(tool_results),
+                    ),
                 )
-            except _HookTimedOut:
-                return await _finish(
-                    AgentRunStatus.DEADLINE_EXCEEDED,
-                    error="run deadline expired in a turn-boundary hook",
+                hook_context = _turn_hook_context(
+                    turn=turn,
+                    message=message,
+                    tool_results=tool_results,
+                    new_messages=new_messages,
+                    context=context,
                 )
+                try:
+                    if config.prepare_next_turn is not None:
+                        update = await _bounded_await(
+                            config.prepare_next_turn(hook_context),
+                            token,
+                            config.deadline_monotonic,
+                        )
+                        if update is not None:
+                            if update.system_prompt is not None:
+                                context.system_prompt = update.system_prompt
+                            if update.model is not None:
+                                config = dataclasses.replace(config, model=update.model)
+                            if update.messages is not None:
+                                context.messages = list(update.messages)
+                            if update.tools is not None:
+                                context.tools = update.tools
+                            if update.extra_request_options is not None:
+                                config = dataclasses.replace(
+                                    config,
+                                    extra_request_options=dict(
+                                        update.extra_request_options
+                                    ),
+                                )
+                    if config.should_stop_after_turn is not None:
+                        # prepare_next_turn may replace history, tools, prompt or
+                        # request options. Pi's stop hook observes that updated
+                        # next-turn context, not the stale pre-update snapshot.
+                        hook_context = _turn_hook_context(
+                            turn=turn,
+                            message=message,
+                            tool_results=tool_results,
+                            new_messages=new_messages,
+                            context=context,
+                        )
+                        should_stop = await _bounded_await(
+                            config.should_stop_after_turn(hook_context),
+                            token,
+                            config.deadline_monotonic,
+                        )
+                        if should_stop:
+                            return await _finish(AgentRunStatus.COMPLETED)
+                except _StreamAborted:
+                    return await _finish(
+                        AgentRunStatus.ABORTED, error="run aborted"
+                    )
+                except _HookTimedOut:
+                    return await _finish(
+                        AgentRunStatus.DEADLINE_EXCEEDED,
+                        error="run deadline expired in a turn-boundary hook",
+                    )
+            finally:
+                # A step includes the terminal TurnEnd listener and both
+                # Pi-style turn-boundary hooks. Observers waiting for graceful
+                # cancellation must not wake while any of them is still live.
+                if token is not None:
+                    token.mark_step_complete()
 
             if token is not None and token.is_cancel_requested:
-                # ``after_step`` and ``immediate`` both stop here: the current
-                # turn has committed, so no further work starts.
+                # A graceful request raised while turn-boundary hooks were
+                # settling still belongs to the turn that already committed;
+                # it must stop before queue polling or another model request.
                 return await _finish(AgentRunStatus.ABORTED, error="run aborted")
+
+            if config.max_turns is not None and turn + 1 >= config.max_turns:
+                # Queue hooks are destructive drains. Do not poll them when
+                # this run has no capacity for another provider turn: callers
+                # retain accepted steering/follow-up for an explicit
+                # continuation instead of losing it behind MAX_TURNS.
+                if has_more_tool_calls:
+                    return await _finish(
+                        AgentRunStatus.MAX_TURNS,
+                        error=(
+                            "run reached the max turn budget "
+                            f"({config.max_turns})"
+                        ),
+                    )
+                return await _finish(AgentRunStatus.COMPLETED)
 
             try:
                 pending = await _drain_queue(
@@ -765,17 +872,13 @@ def _should_terminate_batch(results: Sequence[ToolResultMessage]) -> bool:
 async def _fail_truncated_calls(
     calls: Sequence[ToolCall],
     turn: int,
+    context: AgentContext,
+    new_messages: List[Message],
     config: AgentLoopConfig,
     emit: EventSink | None,
 ) -> List[ToolResultMessage]:
     messages: List[ToolResultMessage] = []
     for call in calls:
-        await emit_to(
-            emit,
-            ToolExecutionStart(
-                tool_call_id=call.id, tool_name=call.name, args=call.arguments
-            ),
-        )
         if config.transaction is not None:
             await config.transaction.tool_started(turn, call)
         result = ToolResult(
@@ -796,21 +899,33 @@ async def _fail_truncated_calls(
         ).frozen()
         if config.transaction is not None:
             await config.transaction.tool_terminal(turn, call, result)
+        result_message = ToolResultMessage(
+            tool_call_id=call.id, tool_name=call.name, result=result
+        )
+        messages.append(result_message)
+        context.messages.append(result_message)
+        new_messages.append(result_message)
+
+    # All call/result pairs are canonical before observational events run, so
+    # one broken listener cannot leave the rest of a truncated batch orphaned.
+    for call, result_message in zip(calls, messages):
+        await emit_to(
+            emit,
+            ToolExecutionStart(
+                tool_call_id=call.id, tool_name=call.name, args=call.arguments
+            ),
+        )
         await emit_to(
             emit,
             ToolExecutionEnd(
                 tool_call_id=call.id,
                 tool_name=call.name,
-                result=result,
+                result=result_message.result,
                 is_error=True,
             ),
         )
-        result_message = ToolResultMessage(
-            tool_call_id=call.id, tool_name=call.name, result=result
-        )
         await emit_to(emit, MessageStart(message=result_message))
         await emit_to(emit, MessageEnd(message=result_message))
-        messages.append(result_message)
     return messages
 
 
@@ -875,30 +990,54 @@ async def _execute_calls(
             result_message = ToolResultMessage(
                 tool_call_id=call.id, tool_name=call.name, result=result
             )
-            await emit_to(emit, MessageStart(message=result_message))
-            await emit_to(emit, MessageEnd(message=result_message))
             context.messages.append(result_message)
             new_messages.append(result_message)
+            try:
+                await emit_to(emit, MessageStart(message=result_message))
+                await emit_to(emit, MessageEnd(message=result_message))
+            except Exception:
+                # Caller cancellation remains the externally observable fault;
+                # canonical Tool terminals and transcript pairing already won.
+                pass
+        raise
+    except Exception:
+        # A Tool event listener may fail after the executor has already made
+        # every terminal result durable. Preserve those canonical call/result
+        # pairs in the local transcript before propagating the implementation
+        # fault; no further observational events are attempted here.
+        recovered = executor.last_batch_results
+        if recovered is not None:
+            for call, result in zip(calls, recovered):
+                result_message = ToolResultMessage(
+                    tool_call_id=call.id, tool_name=call.name, result=result
+                )
+                context.messages.append(result_message)
+                new_messages.append(result_message)
         raise
     messages: List[ToolResultMessage] = []
     for call, result in zip(calls, results):
         result_message = ToolResultMessage(
             tool_call_id=call.id, tool_name=call.name, result=result
         )
+        messages.append(result_message)
+        context.messages.append(result_message)
+        new_messages.append(result_message)
+    for result_message in messages:
         await emit_to(emit, MessageStart(message=result_message))
         await emit_to(emit, MessageEnd(message=result_message))
-        messages.append(result_message)
     return messages
 
 
 def _runtime_context(config: AgentLoopConfig, context: AgentContext) -> Dict[str, Any]:
-    merged: Dict[str, Any] = {}
+    # Product context may contribute domain values, but an initialized Env is
+    # the authority for its permission context. Merge that fact last so a
+    # caller cannot replace the frozen turn's Scope/Permission boundary.
+    merged: Dict[str, Any] = dict(config.runtime_context)
     env = context.env
     if env is not None:
         permission_context = getattr(env, "tool_permission_context", None)
         if permission_context is not None:
             merged["permission_context"] = permission_context
-    merged.update(dict(config.runtime_context))
     return merged
 
 
@@ -960,9 +1099,12 @@ async def _stream_assistant(
         wire.insert(0, {"role": "system", "content": context.system_prompt})
 
     options: Dict[str, Any] = dict(config.extra_request_options)
+    protocol = _model_protocol(model)
     if len(exposure) > 0:
         built = model.build_tool_schema_request_options(
-            exposure.get_all_specs(), protocol=None, delivery="api_parameter"
+            exposure.get_all_specs(),
+            protocol=protocol,
+            delivery="api_parameter",
         )
         if built:
             options.update(built)
@@ -973,14 +1115,14 @@ async def _stream_assistant(
         transaction_id=f"{config.run_id}:turn:{turn}:{uuid.uuid4().hex[:8]}",
         provider=model.provider_name,
         model=model.model,
-        protocol=_model_protocol(model),
+        protocol=protocol,
         messages=tuple(wire),
         options=options,
         deadline_monotonic=config.deadline_monotonic,
         continuation=continuation,
     )
 
-    if token is not None and token.is_cancel_requested:
+    if token is not None and token.immediate_requested:
         message = AssistantMessage(
             error="run aborted before model admission",
             model_name=model.model,
@@ -1050,7 +1192,9 @@ async def _stream_assistant(
             if observable and not started:
                 started = True
                 context.messages.append(partial)
-                await emit_to(emit, MessageStart(message=partial))
+                await _emit_during_model_stream(
+                    emit, MessageStart(message=partial)
+                )
             if chunk.text:
                 accumulated_text.append(chunk.text)
             if chunk.reasoning_content:
@@ -1072,7 +1216,7 @@ async def _stream_assistant(
                 )
                 if started:
                     context.messages[-1] = partial
-                await emit_to(
+                await _emit_during_model_stream(
                     emit,
                     MessageUpdate(message=partial, stream_event=chunk),
                 )
@@ -1145,6 +1289,34 @@ async def _stream_assistant(
             started=started,
         )
         raise
+    except _EventSinkFault as exc:
+        message = dataclasses.replace(
+            partial,
+            error=str(exc.cause) or "agent event listener failed",
+        )
+        # The event stream is already faulty. Commit the open model
+        # transaction without dispatching further message events, then let the
+        # original listener fault reach run terminalization.
+        await _finalize_model_message(
+            message,
+            context,
+            new_messages,
+            None,
+            config,
+            turn,
+            request,
+            started=started,
+        )
+        try:
+            # The start/update event may have reached earlier subscribers
+            # before one failed. Still offer the terminal projection after
+            # the canonical model record is safe; preserve the first fault.
+            await emit_to(emit, MessageEnd(message=message))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+        raise exc.cause
     except Exception as exc:
         message = dataclasses.replace(
             partial,
@@ -1195,11 +1367,12 @@ async def _finalize_model_message(
         context.messages[-1] = message
     else:
         context.messages.append(message)
-        await emit_to(emit, MessageStart(message=message))
-    await emit_to(emit, MessageEnd(message=message))
     new_messages.append(message)
     if request is not None and config.transaction is not None:
         await config.transaction.model_terminal(turn, request, message)
+    if not started:
+        await emit_to(emit, MessageStart(message=message))
+    await emit_to(emit, MessageEnd(message=message))
 
 
 def _tail_continuation(

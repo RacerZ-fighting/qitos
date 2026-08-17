@@ -1,9 +1,9 @@
 ---
 title: "模型家族矩阵"
-description: "QitOS v0.4 内建家族预设的默认适配层策略矩阵。"
+description: "内建模型构造 preset、adapter 选择与兼容标签。"
 ---
 
-| 家族 | 传输层 | 默认协议 | 后备链 | 工具交付方式 | 上下文窗口 | 推荐模型 |
+| 家族 | 传输层 | 兼容标签 | 附加标签 | 工具交付方式 | 上下文窗口 | 推荐模型 |
 |---|---|---|---|---|---|---|
 | Qwen | OpenAI 兼容 | `json_decision_v1` | `xml_decision_v1 → react_text_v1` | `api_parameter` | 128k | `Qwen/Qwen3-8B`, `qwen-plus`, `Qwen/Qwen3-32B` |
 | Kimi | OpenAI 兼容 | `json_decision_v1` | `react_text_v1` | `api_parameter` | 128k | `kimi-k2-0905-preview`, `moonshot-v1-128k` |
@@ -38,11 +38,12 @@ Kimi 的 `/search` 与 `$web_search` 继续作为 managed capability 使用。�
 
 这张表不是模型排行榜。
 
-它表达的是：当你在 QitOS 里选择某个家族预设（预配置的模型家族默认值）时，框架默认会采用什么模型侧契约。
+它表达的是每个家族 preset 选择的 model adapter 与构造默认值。表中 protocol 列是为
+现有 artifact 保留的兼容 metadata。最小 Agent loop 不会加载 parser 或执行这些 fallback 链。
 
 如果你需要改某一项，请显式覆盖：
 
-- 用 `build_model_for_preset(protocol=...)` 覆盖协议
+- 用 `build_model_for_preset(protocol=...)` 覆盖兼容标签
 - 用 `build_model_for_preset(tool_delivery=...)` 覆盖工具交付方式
 - 用 `preset.override()` 扩展预设——参见[家族预设](/zh/concepts/family-presets)
 

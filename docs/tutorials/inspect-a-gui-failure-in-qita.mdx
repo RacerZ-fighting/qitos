@@ -1,11 +1,15 @@
 ---
-title: "Inspect a GUI Failure in qita"
-description: "Use qita's visual timeline and replay preview to understand a failed desktop run."
+title: "Inspect a GUI trace artifact in qita"
+description: "Use qita's visual timeline to inspect a compatible desktop trace artifact."
 ---
 
-# Inspect a GUI Failure in qita
+# Inspect a GUI trace artifact in qita
 
-Desktop failures are rarely just parser failures (a parser converts raw model output into a typed Decision). Usually the cause is more nuanced.
+This tutorial reads a compatible trace artifact from an earlier runtime or an explicit
+application-side producer. Parser, Decision, and critic fields mentioned below belong
+to that artifact schema, not the current Agent loop.
+
+Desktop failures usually require more than one piece of evidence.
 
 You need to answer:
 

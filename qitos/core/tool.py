@@ -248,7 +248,7 @@ class RetryPolicy:
     """Per-tool retry configuration with exponential backoff and exception filtering.
 
     When attached to a tool via ``@function_tool(retry_policy=...)`` or
-    ``ToolSpec.retry_policy``, the :class:`ActionExecutor` uses it as the sole
+    ``ToolSpec.retry_policy``, the Tool batch executor uses it as the sole
     owner of invocation retries. Tools without a policy run exactly once.
 
     Attributes:

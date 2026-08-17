@@ -29,7 +29,7 @@ class ModelStreamEvent:
     """One validated event in a logical Provider transaction.
 
     ``event_type`` retains the raw Provider event name for diagnostics. ``type``
-    is the stable QitOS discriminant consumed by Engine and cache code.
+    is the stable QitOS discriminant consumed by the Agent loop and adapters.
     """
 
     type: ModelStreamEventType

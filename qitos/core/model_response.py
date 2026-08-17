@@ -1,4 +1,4 @@
-"""Completed provider-neutral model transaction used by the Engine."""
+"""Completed provider-neutral model transaction used by the Agent loop."""
 
 from __future__ import annotations
 
@@ -158,12 +158,18 @@ def _first_token_count(
 
 def _freeze_usage_value(value: Any) -> Any:
     if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("model usage detail keys must be strings")
         return MappingProxyType(
-            {str(key): _freeze_usage_value(item) for key, item in value.items()}
+            {key: _freeze_usage_value(item) for key, item in value.items()}
         )
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_usage_value(item) for item in value)
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("model usage detail numbers must be finite")
+        return value
+    if isinstance(value, (str, int, bool)) or value is None:
         return value
     raise TypeError("model usage details must contain JSON-compatible values")
 

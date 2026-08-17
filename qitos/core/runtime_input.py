@@ -1,4 +1,4 @@
-"""Canonical external input delivered to an active Engine run."""
+"""Canonical external input delivered to an active Agent run."""
 
 from __future__ import annotations
 

@@ -15,6 +15,9 @@ import time
 from typing import Any, Dict, List, Optional
 
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool_result import ToolResult
+
+from qitos.kit.tool.internal.results import error_result
 
 
 class NetworkToolSet:
@@ -119,7 +122,7 @@ class NetworkToolSet:
         count: int = 0,
         output_file: str = "",
         verbose: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Capture network packets using tcpdump.
 
@@ -136,10 +139,10 @@ class NetworkToolSet:
         :return: Capture summary with packet count, protocol distribution, and key observations.
         """
         if target and not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         if not output_file:
             timestamp = int(time.time())
@@ -173,10 +176,10 @@ class NetworkToolSet:
             full_cmd = f"timeout {duration} {cmd_str}"
             result = self._run_command(["bash", "-c", full_cmd], timeout=duration + 10)
         else:
-            return {
+            return error_result({
                 "status": "error",
                 "message": "Non-timed captures require manual execution. Set duration > 0.",
-            }
+            })
 
         output = f"### 📡 Packet Capture\n\n"
         output += f"**Interface:** {interface or 'auto'}\n"
@@ -239,7 +242,7 @@ class NetworkToolSet:
         display_filter: str = "",
         protocol: str = "",
         count: int = 50,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Analyze captured PCAP file using tshark.
 
@@ -253,7 +256,7 @@ class NetworkToolSet:
         :return: Structured analysis with protocol distribution, top talkers, and filtered results.
         """
         if not os.path.isfile(pcap_file):
-            return {"status": "error", "message": f"PCAP file not found: {pcap_file}"}
+            return error_result({"status": "error", "message": f"PCAP file not found: {pcap_file}"})
 
         output = f"### 📊 Traffic Analysis: `{pcap_file}`\n\n"
 
@@ -424,7 +427,7 @@ class NetworkToolSet:
         }
 
     @function_tool(name="arp_scan", needs_approval=True)
-    def arp_scan(self, target: str, interface: str = "") -> Dict[str, Any]:
+    def arp_scan(self, target: str, interface: str = "") -> Dict[str, Any] | ToolResult:
         """
         Perform ARP scan to discover hosts on a local network.
 
@@ -436,10 +439,10 @@ class NetworkToolSet:
         :return: List of discovered hosts with IP and MAC addresses.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         cmd = ["arp-scan", "--interface=" + interface if interface else "", target]
         cmd = [c for c in cmd if c]
@@ -447,10 +450,10 @@ class NetworkToolSet:
         result = self._run_command(cmd, timeout=120)
 
         if result["return_code"] != 0 and not result["stdout"]:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"ARP scan failed: {result['stderr']}",
-            }
+            })
 
         hosts = []
         for line in result["stdout"].split("\n"):
@@ -491,7 +494,7 @@ class NetworkToolSet:
     @function_tool(name="traceroute", needs_approval=True)
     def traceroute(
         self, target: str, max_hops: int = 30, method: str = "udp"
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Trace the network path to a target host.
 
@@ -507,10 +510,10 @@ class NetworkToolSet:
         :return: Traceroute output with hop-by-hop details including latency.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         if method == "tcp":
             cmd = ["traceroute", "-T", "-m", str(max_hops), target]
@@ -522,10 +525,10 @@ class NetworkToolSet:
         result = self._run_command(cmd, timeout=120)
 
         if result["return_code"] != 0 and not result["stdout"]:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Traceroute failed: {result['stderr']}",
-            }
+            })
 
         output = f"### 🗺️ Traceroute: {target} (method: {method})\n\n"
         output += "```\n"

@@ -7,25 +7,26 @@ description: "QitOS 中与运行、运行轨迹、产物、回放和基准测试
 
 ### 运行（Run）
 
-一次 `Agent.prompt(...)` 调用，产出一份持久化 journal，以及（启用追踪时）一组追踪记录产物。
+一次被接受的 `Agent.prompt(...)` 调用。应用可以连接 journal transaction factory；trace 目录不会自动生成。
 
 ### 运行轨迹（Trajectory）
 
-一次运行的时间序列记录，包括提示词、决策（智能体每步的结构化决策）、工具调用、观测结果（每步后智能体接收的结构化观察结果）、归约与停止条件。
+一次运行的时间序列记录，包括类型化 message、Tool call、Tool result、模型事件、usage 与终态。
 
 ## 复现术语
 
 ### 产物（Artifact）
 
-运行持久化下来的任何输出文件，尤其是 `manifest.json`、`events.jsonl`、`steps.jsonl`、导出的 HTML 与基准测试结果 JSONL。
+由 run 或检查工作流引用的任何持久化输出。Session Journal 记录、兼容 trace 文件、导出 HTML 与
+benchmark 结果 JSONL 分属不同 owner，不能当作同一恢复格式。
 
 ### 回放（Replay）
 
-基于已有产物对一次运行进行回放和审阅，通常通过 `qita replay` 完成。
+通过 `qita replay` 检查现有兼容 trace artifact。该操作不会 resume 或确定性重新执行 Run。
 
 ### 官方运行（Official Run）
 
-满足 QitOS 官方契约的运行：有规格说明、有标准产物，并支持 qita 回放/导出/比较。
+旧 trace artifact 中表示 producer 声明的复现契约的标签，不是当前 Agent 的特殊执行模式。
 
 ### 基准测试结果（Benchmark Result）
 
@@ -39,15 +40,13 @@ description: "QitOS 中与运行、运行轨迹、产物、回放和基准测试
 
 ### 提示词协议（Prompt Protocol）
 
-模型输出遵循的格式契约（协议），例如 ReAct 文本、JSON、XML 或模型特定适配层。
-
-### 解析器（Parser）
-
-将原始模型输出转成 `Decision` 的组件。解析器必须和提示词协议匹配。
+一次模型事务记录的 API 契约标识，例如 Chat Completions 或 Responses API。Family preset
+中的旧 protocol 名称只是兼容 metadata。
 
 ### 上下文压缩（Context Compaction）
 
-在长时运行中压缩上下文的策略。QitOS 会把上下文压缩遥测记录到追踪记录里。
+Session/Harness 在安全事务边界缩减模型历史的操作。让它成为权威操作仍是迁移工作；兼容 trace
+artifact 可能包含 producer 特定的 compaction telemetry。
 
 ### qita 面板 / 回放 / 差异比较
 
@@ -61,14 +60,14 @@ description: "QitOS 中与运行、运行轨迹、产物、回放和基准测试
 
 ### 推荐默认值（Advisory defaults）
 
-`FamilyPreset` 上的可选字段（`recommended_max_steps`、`recommended_max_tokens`、`recommended_retry_budget`、`recommended_temperature`），记录经过测试的基线值。这些仅供参考——引擎不会自动应用它们。
+`FamilyPreset` 上的可选字段（`recommended_max_steps`、`recommended_max_tokens`、`recommended_retry_budget`、`recommended_temperature`），记录经过测试的基线值。这些仅供参考——Agent façade 不会自动应用它们。
 
 ## 追踪术语
 
 ### TraceWriter
 
-QitOS canonical append-only writer，负责持久化 Run manifest、运行时事件和已完成的 step
-事务。`qita` 基于这些产物提供检查、回放和比较。
+用于 trace manifest、运行时事件与旧 step 事务的兼容 writer。`qita` 读取这些 artifact 进行检查与
+比较。当前 Agent façade 不会自动连接它，trace 文件也不是 Session 恢复真源。
 
 ### ToolPermissionSpec
 

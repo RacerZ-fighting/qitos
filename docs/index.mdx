@@ -9,7 +9,7 @@ QitOS is a PyTorch-style framework for agent researchers. Current releases let y
 
 QitOS offers two top-level ways to build agents:
 
-- **Research-first**: handwrite the prompt, parser, protocol (the output format contract between model and parser), transport (the client that talks to the model API), and tool surface so you can study and optimize the kernel directly.
+- **Façade-first**: choose the prompt, provider-neutral Model, and frozen Tool surface explicitly.
 - **Preset-first**: start from family presets (pre-configured model-family defaults) and preset tool builders when you want a fast baseline or quick multi-family switching.
 
 Both paths are first-class citizens in the framework.
@@ -40,7 +40,9 @@ Both paths are first-class citizens in the framework.
 <Steps>
   <Step title="Install QitOS">
     ```bash
-    pip install "qitos[models]"
+    git clone https://github.com/Qitor/qitos.git
+    cd qitos
+    pip install ".[models]"
     ```
   </Step>
   <Step title="Set your provider config">
@@ -65,10 +67,10 @@ Both paths are first-class citizens in the framework.
     Task-focused lessons: tools, presets, observability, and run lifecycle
   </Card>
   <Card title="Observability" icon="chart-line" href="/guides/observability">
-    Built-in tracing with qita board, replay, and HTML export
+    Inspect compatible trace artifacts with qita board, replay, and HTML export
   </Card>
   <Card title="Kit Toolkit" icon="toolbox" href="/reference/kit">
-    Parsers, memory adapters, toolsets, critics, and planners
+    Tools, memory adapters, environments, journals, and child agents
   </Card>
 </CardGroup>
 

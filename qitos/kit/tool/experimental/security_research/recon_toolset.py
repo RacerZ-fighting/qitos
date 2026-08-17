@@ -15,6 +15,9 @@ import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
 
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool_result import ToolResult
+
+from qitos.kit.tool.internal.results import error_result
 
 
 class ReconToolSet:
@@ -301,7 +304,7 @@ class ReconToolSet:
         return records
 
     @function_tool(name="host_discovery", needs_approval=True)
-    def host_discovery(self, target: str, scan_type: str = "ping") -> Dict[str, Any]:
+    def host_discovery(self, target: str, scan_type: str = "ping") -> Dict[str, Any] | ToolResult:
         """
         Discover live hosts on a network.
 
@@ -318,10 +321,10 @@ class ReconToolSet:
         :return: Structured result with list of live hosts and their response times.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         scan_args = {
             "ping": ["-sn", "-PE"],  # Ping sweep
@@ -332,10 +335,10 @@ class ReconToolSet:
         }
 
         if scan_type not in scan_args:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Invalid scan_type '{scan_type}'. Choose from: {', '.join(scan_args.keys())}",
-            }
+            })
 
         args = scan_args[scan_type]
         cmd = ["nmap"] + args + [target, "-oX", "-"]
@@ -343,7 +346,7 @@ class ReconToolSet:
         result = self._run_command(cmd, timeout=600)
 
         if result["return_code"] not in (0, 1):
-            return {"status": "error", "message": f"Scan failed: {result['stderr']}"}
+            return error_result({"status": "error", "message": f"Scan failed: {result['stderr']}"})
 
         parsed = self._parse_nmap_xml(result["stdout"])
 
@@ -382,7 +385,7 @@ class ReconToolSet:
     @function_tool(name="port_scan", needs_approval=True)
     def port_scan(
         self, target: str, ports: str = "1-1000", scan_type: str = "syn"
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Scan target for open ports.
 
@@ -405,10 +408,10 @@ class ReconToolSet:
         :return: Structured result with open ports, states, and protocol information.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         scan_flags = {
             "syn": ["-sS"],
@@ -420,10 +423,10 @@ class ReconToolSet:
         }
 
         if scan_type not in scan_flags:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Invalid scan_type '{scan_type}'. Choose from: {', '.join(scan_flags.keys())}",
-            }
+            })
 
         cmd = (
             ["nmap"]
@@ -433,7 +436,7 @@ class ReconToolSet:
         result = self._run_command(cmd, timeout=600)
 
         if result["return_code"] not in (0, 1):
-            return {"status": "error", "message": f"Scan failed: {result['stderr']}"}
+            return error_result({"status": "error", "message": f"Scan failed: {result['stderr']}"})
 
         parsed = self._parse_nmap_xml(result["stdout"])
 
@@ -469,7 +472,7 @@ class ReconToolSet:
     @function_tool(name="service_scan", needs_approval=True)
     def service_scan(
         self, target: str, ports: str = "1-10000", intensity: int = 5
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Perform service and version detection on open ports.
 
@@ -486,13 +489,13 @@ class ReconToolSet:
         :return: Structured result with detailed service version information for each open port.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         if not 0 <= intensity <= 9:
-            return {"status": "error", "message": "Intensity must be between 0 and 9."}
+            return error_result({"status": "error", "message": "Intensity must be between 0 and 9."})
 
         cmd = [
             "nmap",
@@ -508,10 +511,10 @@ class ReconToolSet:
         result = self._run_command(cmd, timeout=900)
 
         if result["return_code"] not in (0, 1):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Service scan failed: {result['stderr']}",
-            }
+            })
 
         parsed = self._parse_nmap_xml(result["stdout"])
 
@@ -561,7 +564,7 @@ class ReconToolSet:
         }
 
     @function_tool(name="os_detect", needs_approval=True)
-    def os_detect(self, target: str) -> Dict[str, Any]:
+    def os_detect(self, target: str) -> Dict[str, Any] | ToolResult:
         """
         Detect the operating system of the target host.
 
@@ -572,19 +575,19 @@ class ReconToolSet:
         :return: Structured result with OS guesses ranked by accuracy percentage.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         cmd = ["nmap", "-O", "--osscan-guess", target, "-oX", "-"]
         result = self._run_command(cmd, timeout=600)
 
         if result["return_code"] not in (0, 1):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"OS detection failed: {result['stderr']}",
-            }
+            })
 
         parsed = self._parse_nmap_xml(result["stdout"])
 
@@ -612,7 +615,7 @@ class ReconToolSet:
         }
 
     @function_tool(name="subnet_scan", needs_approval=True)
-    def subnet_scan(self, target: str, scan_types: str = "default") -> Dict[str, Any]:
+    def subnet_scan(self, target: str, scan_types: str = "default") -> Dict[str, Any] | ToolResult:
         """
         Comprehensive network scan combining host discovery, port scanning, service detection, and OS fingerprinting.
 
@@ -629,10 +632,10 @@ class ReconToolSet:
         :return: Comprehensive structured result with all scan data combined.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         profiles = {
             "default": ["-sS", "-sV", "-O", "--default-script-level", "-T4"],
@@ -643,10 +646,10 @@ class ReconToolSet:
         }
 
         if scan_types not in profiles:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Invalid profile '{scan_types}'. Choose from: {', '.join(profiles.keys())}",
-            }
+            })
 
         cmd = ["nmap"] + profiles[scan_types] + [target, "-oX", "-"]
         timeout = 1800 if scan_types == "aggressive" else 900
@@ -654,7 +657,7 @@ class ReconToolSet:
         result = self._run_command(cmd, timeout=timeout)
 
         if result["return_code"] not in (0, 1):
-            return {"status": "error", "message": f"Scan failed: {result['stderr']}"}
+            return error_result({"status": "error", "message": f"Scan failed: {result['stderr']}"})
 
         parsed = self._parse_nmap_xml(result["stdout"])
 
@@ -711,7 +714,7 @@ class ReconToolSet:
     @function_tool(name="dns_lookup", needs_approval=True)
     def dns_lookup(
         self, domain: str, record_types: str = "ANY", dns_server: str = ""
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Perform DNS lookups for a domain.
 
@@ -733,10 +736,10 @@ class ReconToolSet:
         :return: Structured DNS records with type, name, TTL, and data for each record.
         """
         if not self._validate_target(domain):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Domain '{domain}' is not in the authorized scope.",
-            }
+            })
 
         cmd = ["dig", "+noall", "+answer", domain, record_types]
         if dns_server:
@@ -784,7 +787,7 @@ class ReconToolSet:
         }
 
     @function_tool(name="dns_enum", needs_approval=True)
-    def dns_enum(self, domain: str, wordlist: str = "") -> Dict[str, Any]:
+    def dns_enum(self, domain: str, wordlist: str = "") -> Dict[str, Any] | ToolResult:
         """
         Enumerate DNS records using DNSRecon.
 
@@ -796,10 +799,10 @@ class ReconToolSet:
         :return: Structured result with discovered subdomains, IPs, and DNS records.
         """
         if not self._validate_target(domain):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Domain '{domain}' is not in the authorized scope.",
-            }
+            })
 
         cmd = ["dnsrecon", "-d", domain, "-t", "std,brt,srv"]
         if wordlist:
@@ -808,10 +811,10 @@ class ReconToolSet:
         result = self._run_command(cmd, timeout=300)
 
         if result["return_code"] != 0 and not result["stdout"]:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"DNS enumeration failed: {result['stderr']}",
-            }
+            })
 
         # Parse DNSRecon output
         records = []
@@ -840,7 +843,7 @@ class ReconToolSet:
         }
 
     @function_tool(name="whois_lookup", needs_approval=True)
-    def whois_lookup(self, target: str) -> Dict[str, Any]:
+    def whois_lookup(self, target: str) -> Dict[str, Any] | ToolResult:
         """
         Perform WHOIS lookup for a domain or IP address.
 
@@ -851,19 +854,19 @@ class ReconToolSet:
         :return: Structured WHOIS information with key registration fields.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         cmd = ["whois", target]
         result = self._run_command(cmd, timeout=120)
 
         if result["return_code"] != 0 and not result["stdout"]:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"WHOIS lookup failed: {result['stderr']}",
-            }
+            })
 
         parsed = self._parse_whois(result["stdout"])
 
@@ -904,7 +907,7 @@ class ReconToolSet:
     @function_tool(name="subdomain_enum", needs_approval=True)
     def subdomain_enum(
         self, domain: str, sources: str = "all", depth: int = 2
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Enumerate subdomains using Subfinder.
 
@@ -919,10 +922,10 @@ class ReconToolSet:
         :return: List of discovered subdomains with their source information.
         """
         if not self._validate_target(domain):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Domain '{domain}' is not in the authorized scope.",
-            }
+            })
 
         cmd = ["subfinder", "-d", domain, "-silent", "-json"]
         if sources != "all":
@@ -931,10 +934,10 @@ class ReconToolSet:
         result = self._run_command(cmd, timeout=600)
 
         if result["return_code"] != 0 and not result["stdout"]:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Subdomain enumeration failed: {result['stderr']}",
-            }
+            })
 
         subdomains = []
         try:

@@ -1,9 +1,10 @@
 ---
-title: "Tracing"
-description: "QitOS 会为每次运行写出结构化追踪记录产物，从而支持回放、差异比较、导出与审计。"
+title: "Trace artifact"
+description: "使用只读 qita 工具检查兼容的 QitOS trace 目录。"
 ---
 
-追踪记录（tracing）是 QitOS 可观测性的持久化层。每次启用追踪记录的运行都会写出一个自包含目录：
+QitOS 保留现有 trace 目录格式作为兼容与检查界面。`qita` 可以读取早期版本或
+应用显式 trace producer 产生的目录：
 
 ```text
 <trace_logdir>/<run_id>/
@@ -12,66 +13,29 @@ description: "QitOS 会为每次运行写出结构化追踪记录产物，从而
   steps.jsonl
 ```
 
-## 三个文件分别表示什么
+<Warning>
+当前 `Agent` façade 不会自动连接 `TraceWriter`。新的 Agent run 可以通过
+`SessionJournal` 记录 loop 事务，但除非应用提供 producer，否则不会生成这三个
+trace 文件。Trace artifact 不是 Session 恢复真源。
+</Warning>
+
+## 文件含义
 
 | 文件 | 作用 |
 | --- | --- |
-| `manifest.json` | 运行摘要、复现元信息、基准测试元信息与官方运行字段 |
-| `events.jsonl` | 运行时阶段的事件流 |
-| `steps.jsonl` | 每个已完成步骤的结构化记录 |
+| `manifest.json` | Run 摘要与 producer 写入的复现元信息 |
+| `events.jsonl` | Trace producer 记录的事件流 |
+| `steps.jsonl` | 已完成的旧 step 记录 |
 
-原始文件是事实来源，`qita` 是建立在这些产物之上的人工检查层。
+对单个 trace 目录而言，这些文件是 `qita` 展示的证据。它们不会替代 canonical
+Session Journal，也不能创建可执行的 resume 或 fork。
 
-## 为什么追踪记录是一等特性
+旧 artifact 可能包含 `prompt_protocol`、`parser_name`、`run_spec`、
+`experiment_spec` 或 benchmark metadata。这些字段只描述写入该 artifact 的
+producer，不会在当前 Agent 路径中启用 parser、Decision/Action lifecycle、
+benchmark runner 或 Engine。
 
-QitOS 面向的是智能体研究，而不仅是一次性演示。
-
-这意味着框架必须能回答下列问题：
-
-- 运行是怎么停下来的
-- 它用的是什么提示词/解析器契约
-- 它看到了哪些工具
-- 上下文在长时运行中如何变化
-- 哪些配置字段决定了回放和比较的意义
-
-因此运行默认开启追踪记录。
-
-## v0.3 中的重要追踪记录元信息
-
-v0.3 补强了清单中的复现字段，包括：
-
-- `git_sha`
-- `package_version`
-- `benchmark_name`
-- `benchmark_split`
-- `model_family`
-- `prompt_protocol`
-- `parser_name`
-- `tool_manifest`
-- `run_spec`
-- `experiment_spec`
-- `official_run`
-- `replay_mode`
-- 令牌/延迟/成本汇总
-
-这些字段让 `qita compare` 与基准测试结果归一化真正有了稳定语义。
-
-## 尽力回放
-
-QitOS 的追踪记录支持的是**研究级尽力回放**。
-
-也就是说，它会尽量完整记录复盘需要的信息，但不会承诺远程模型服务提供商或外部环境能被严格确定性重放。
-
-这套追踪记录适合：
-
-- 调试长轨迹智能体
-- 比较提示词/解析器/工具变化
-- 导出审阅产物
-- 回放基准测试失败
-
-但不应被理解为远程模型永远返回完全相同的令牌。
-
-## 用 qita 检查追踪记录
+## 检查兼容 artifact
 
 ```bash
 qita board --logdir ./runs
@@ -79,14 +43,15 @@ qita replay --run ./runs/<run_id>
 qita export --run ./runs/<run_id> --html ./report.html
 ```
 
-`qita` 还支持运行比较，你可以直接回答两次运行为什么不同，不需要手工读 JSON。
+这些命令用于审阅、比较和导出现有证据。远程模型与外部环境仍具有不确定性，因此
+artifact replay 是检查操作，不是确定性重新执行。
 
-`qita` 只是这些产物的只读投影，不会通过复制或修改 trace 文件来创建可执行 fork。若要从此前的
-安全边界继续 Run，请在 handle 的 committed continuation position 上 fork canonical Session
-Journal；详见 [Session Journal](/zh/concepts/session-journal)。
+要从安全边界继续 Run，应在权威 Session/Harness 迁移暴露该工作流后使用
+canonical Session Journal。复制或修改 trace 目录永远不会创建可恢复 Run。
 
 ## 继续阅读
 
+- [Session Journal](/zh/concepts/session-journal)
 - [可观测性](/zh/guides/observability)
 - [CLI 参考](/zh/reference/cli)
 - [回放并检查失败运行](/zh/tutorials/replay-and-inspect-failed-runs)

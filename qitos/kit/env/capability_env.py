@@ -18,7 +18,7 @@ class CapabilityEnv(Env):
 
     The environment does not own provider lifecycles. Composition roots remain
     responsible for closing attempt-scoped, shared, or externally managed
-    providers after the Engine has finished using the environment.
+    providers after the Agent run has finished using the environment.
 
     Args:
         ops: Mapping from capability group names to concrete providers.

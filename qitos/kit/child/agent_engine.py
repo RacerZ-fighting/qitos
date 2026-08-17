@@ -15,24 +15,45 @@ terminal journal record before the engine reports a result.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple, Union
 
 from ...core.agent import Agent, AgentRunRejected
-from ...core.agent_loop import AgentLoopResult, AgentRunStatus
+from ...core.agent_events import AgentEnd, TurnEnd, TurnStart
+from ...core.agent_loop import (
+    AgentLoopResult,
+    AgentRunStatus,
+    TurnHookContext,
+    TurnTransactionBoundary,
+)
+from ...core.budget import BudgetLedger, BudgetSnapshot
 from ...core.child import (
     ChildInvocation,
     ChildLaunchRequest,
     ChildRuntimeContext,
 )
 from ...core.env import Env
-from ...core.journal import JournalRecordType, SessionJournal
-from ...core.message import AssistantMessage, Message, UserMessage
+from ...core.journal import (
+    JournalAppendCancelled,
+    JournalCommitError,
+    JournalCommitState,
+    JournalError,
+    JournalRecordType,
+    SessionJournal,
+)
+from ...core.message import AssistantMessage, Message, ToolCall, UserMessage
+from ...core.model_request import ModelRequest
+from ...core.model_response import ModelPricing, ModelUsage
 from ...core.runtime_input import RuntimeInput
-from ...core.tool_registry import ToolRegistry
+from ...core.task import TaskBudget
+from ...core.tool import ToolPermissionContext
+from ...core.tool_executor import BeforeToolCallContext, BeforeToolCallDecision
+from ...core.tool_registry import ToolExposure, ToolRegistry
+from ...core.tool_result import ToolResult
 from ..journal import JournalTurnTransaction, JsonlSessionJournal
 
 if TYPE_CHECKING:
@@ -71,48 +92,213 @@ def child_final_text(messages: Sequence[Message]) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ChildRunStats:
-    """Step and token aggregation over one run's committed messages."""
+    """Usage aggregation over one run's committed messages."""
 
     steps: int
     total_tokens: int
+    total_cost_usd: float
     usage_complete: bool
+    cost_complete: bool
 
 
-def child_run_stats(messages: Sequence[Message]) -> ChildRunStats:
-    """Aggregate turn count and token usage from assistant messages.
-
-    Cost is not part of the canonical message usage, so cost stays unknown
-    to the caller; messages without usage make the aggregate incomplete
-    instead of inventing numbers.
-    """
+def child_run_stats(
+    messages: Sequence[Message],
+    *,
+    model_pricing: ModelPricing | None = None,
+) -> ChildRunStats:
+    """Aggregate complete token and explicitly-priced cost usage."""
 
     steps = 0
     total_tokens = 0
+    total_cost_usd = 0.0
     usage_complete = True
+    cost_complete = True
     saw_assistant = False
     for message in messages:
         if not isinstance(message, AssistantMessage):
             continue
         saw_assistant = True
         steps += 1
-        usage = message.usage
-        tokens: Optional[int] = None
-        if usage is not None:
-            if usage.total_tokens is not None:
-                tokens = usage.total_tokens
-            elif (
-                usage.input_tokens is not None
-                or usage.output_tokens is not None
-            ):
-                tokens = (usage.input_tokens or 0) + (usage.output_tokens or 0)
-        if tokens is None:
-            usage_complete = False
-        else:
-            total_tokens += tokens
+        tokens, cost, tokens_known, cost_known = _usage_values(
+            message.usage,
+            model_pricing=model_pricing,
+        )
+        total_tokens += tokens
+        total_cost_usd += cost
+        usage_complete = usage_complete and tokens_known
+        cost_complete = cost_complete and cost_known
     return ChildRunStats(
         steps=steps,
         total_tokens=total_tokens,
+        total_cost_usd=total_cost_usd,
         usage_complete=usage_complete and saw_assistant,
+        cost_complete=cost_complete and saw_assistant,
+    )
+
+
+def _usage_values(
+    usage: ModelUsage | None,
+    *,
+    model_pricing: ModelPricing | None,
+) -> tuple[int, float, bool, bool]:
+    if usage is None:
+        return (0, 0.0, False, False)
+    if usage.total_tokens is not None:
+        tokens = usage.total_tokens
+        tokens_known = True
+    elif usage.input_tokens is not None and usage.output_tokens is not None:
+        tokens = usage.input_tokens + usage.output_tokens
+        tokens_known = True
+    else:
+        tokens = 0
+        tokens_known = False
+    cost_known = (
+        model_pricing is not None
+        and usage.input_tokens is not None
+        and usage.output_tokens is not None
+    )
+    cost = model_pricing.cost_usd(usage) if cost_known and model_pricing else 0.0
+    return (tokens, cost, tokens_known, cost_known)
+
+
+def child_budget_stop_reason(
+    stats: ChildRunStats,
+    budget: TaskBudget,
+    root_budget: BudgetSnapshot | None = None,
+) -> str | None:
+    if budget.max_tokens is not None:
+        if not stats.usage_complete:
+            return "budget_tokens_unknown"
+        if stats.total_tokens >= budget.max_tokens:
+            return "budget_tokens"
+    if budget.max_cost_usd is not None:
+        if not stats.cost_complete:
+            return "budget_cost_unknown"
+        if stats.total_cost_usd >= budget.max_cost_usd:
+            return "budget_cost"
+    if root_budget is not None:
+        if root_budget.max_tokens is not None:
+            if not root_budget.usage_complete:
+                return "budget_tokens_unknown"
+            if root_budget.tokens_exhausted:
+                return "budget_tokens"
+        if root_budget.max_cost_usd is not None:
+            if not root_budget.cost_complete:
+                return "budget_cost_unknown"
+            if root_budget.cost_exhausted:
+                return "budget_cost"
+    return None
+
+
+class _ChildTurnTransaction(TurnTransactionBoundary):
+    """Add Child budget accounting to the loop's durable barriers."""
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        delegate: TurnTransactionBoundary | None,
+        budget: TaskBudget,
+        budget_ledger: BudgetLedger | None,
+        model_pricing: ModelPricing | None,
+        settle_runtime_events: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._run_id = run_id
+        self._delegate = delegate
+        self._budget = budget
+        self._budget_ledger = budget_ledger
+        self._model_pricing = model_pricing
+        self._settle_runtime_events = settle_runtime_events
+        self._model_messages: dict[int, AssistantMessage] = {}
+        self._budget_stop_reason: str | None = None
+
+    @property
+    def budget_stop_reason(self) -> str | None:
+        return self._budget_stop_reason
+
+    async def model_terminal(
+        self,
+        turn: int,
+        request: ModelRequest,
+        message: AssistantMessage,
+    ) -> None:
+        previous = self._model_messages.get(turn)
+        if previous is not None and previous != message:
+            raise RuntimeError("Child model transaction conflicts with its turn")
+        if previous is not None:
+            return
+        root_budget: BudgetSnapshot | None = None
+        usage = child_run_stats((message,), model_pricing=self._model_pricing)
+        if self._budget_ledger is not None:
+            root_budget = await self._budget_ledger.commit(
+                origin_run_id=self._run_id,
+                transaction_id=f"{self._run_id}:turn:{turn}:model",
+                tokens=usage.total_tokens,
+                cost_usd=usage.total_cost_usd,
+                usage_complete=usage.usage_complete,
+                cost_complete=usage.cost_complete,
+            )
+        self._model_messages[turn] = message
+        reason = child_budget_stop_reason(
+            child_run_stats(
+                tuple(self._model_messages[index] for index in sorted(self._model_messages)),
+                model_pricing=self._model_pricing,
+            ),
+            self._budget,
+            root_budget,
+        )
+        if not message.failed and self._budget_stop_reason is None:
+            self._budget_stop_reason = reason
+        if self._delegate is not None:
+            await self._delegate.model_terminal(turn, request, message)
+
+    async def tool_started(self, turn: int, call: ToolCall) -> None:
+        if self._delegate is not None:
+            await self._delegate.tool_started(turn, call)
+
+    async def tool_terminal(
+        self,
+        turn: int,
+        call: ToolCall,
+        result: ToolResult,
+    ) -> None:
+        if self._delegate is not None:
+            await self._delegate.tool_terminal(turn, call, result)
+
+    async def turn_committed(
+        self,
+        turn: int,
+        new_messages: tuple[Message, ...],
+    ) -> None:
+        if self._delegate is not None:
+            await self._delegate.turn_committed(turn, new_messages)
+
+    async def run_terminal(self, result: AgentLoopResult) -> None:
+        # External cancellation can skip TurnEnd, while the journal terminal
+        # barrier still has to follow every parent message reserved during the
+        # open turn.
+        await self._settle_runtime_events()
+        if self._delegate is not None:
+            await self._delegate.run_terminal(result)
+
+
+@dataclass(slots=True)
+class _RuntimeEventReservation:
+    """One ordered parent message awaiting its turn-boundary decision."""
+
+    event: RuntimeInput
+    message: UserMessage
+    result: asyncio.Future[bool]
+    phase: Literal[
+        "pending",
+        "appending",
+        "committed",
+        "rejected",
+        "unknown",
+        "withdrawn",
+    ] = "pending"
+    withdrawal_requested: asyncio.Event = dataclass_field(
+        default_factory=asyncio.Event
     )
 
 
@@ -135,22 +321,29 @@ class _AgentChildStateView:
 class AgentChildRunResult:
     """``ChildRunResult`` projection of one terminal façade run."""
 
-    def __init__(self, *, run_id: str, result: AgentLoopResult) -> None:
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        result: AgentLoopResult,
+        model_pricing: ModelPricing | None = None,
+        stop_reason: str | None = None,
+    ) -> None:
         self.run_id = run_id
         self._result = result
-        stats = child_run_stats(result.messages)
+        stats = child_run_stats(result.messages, model_pricing=model_pricing)
         self.step_count = stats.steps
         self.total_tokens = stats.total_tokens
-        self.total_cost_usd = 0.0
+        self.total_cost_usd = stats.total_cost_usd
         self.local_total_tokens = stats.total_tokens
-        self.local_total_cost_usd = 0.0
+        self.local_total_cost_usd = stats.total_cost_usd
         self.usage_complete = stats.usage_complete
-        self.cost_complete = False
+        self.cost_complete = stats.cost_complete
         self.local_usage_complete = stats.usage_complete
-        self.local_cost_complete = False
+        self.local_cost_complete = stats.cost_complete
         self._state = _AgentChildStateView(
             final_result=child_final_text(result.messages),
-            stop_reason=child_stop_reason(result.status, result.error),
+            stop_reason=stop_reason or child_stop_reason(result.status, result.error),
         )
 
     @property
@@ -189,6 +382,9 @@ class AgentChildEngine:
         max_tool_concurrency: int = 8,
         max_turns: Optional[int] = None,
         run_timeout_s: Optional[float] = None,
+        budget: Optional[TaskBudget] = None,
+        budget_ledger: Optional[BudgetLedger] = None,
+        model_pricing: Optional[ModelPricing] = None,
         extra_request_options: Optional[Mapping[str, Any]] = None,
         runtime_context: Optional[Mapping[str, Any]] = None,
         journal_factory: Optional[Callable[[], SessionJournal]] = None,
@@ -202,6 +398,15 @@ class AgentChildEngine:
         self._max_tool_concurrency = max_tool_concurrency
         self._max_turns = max_turns
         self._run_timeout_s = run_timeout_s
+        self._budget = budget or TaskBudget()
+        if not isinstance(self._budget, TaskBudget):
+            raise TypeError("budget must be a TaskBudget or None")
+        if budget_ledger is not None and not isinstance(budget_ledger, BudgetLedger):
+            raise TypeError("budget_ledger must be a BudgetLedger or None")
+        if model_pricing is not None and not isinstance(model_pricing, ModelPricing):
+            raise TypeError("model_pricing must be a ModelPricing or None")
+        self._budget_ledger = budget_ledger
+        self._model_pricing = model_pricing
         self._extra_request_options = dict(extra_request_options or {})
         self._runtime_context = dict(runtime_context or {})
         self._journal_factory = journal_factory
@@ -211,7 +416,9 @@ class AgentChildEngine:
         self._journal: Optional[SessionJournal] = None
         self._run_id = ""
         self._cancel_requested = False
-        self._pending_events: list[tuple[RuntimeInput, str]] = []
+        self._runtime_started = asyncio.Event()
+        self._accepting_runtime_events = False
+        self._runtime_event_reservations: list[_RuntimeEventReservation] = []
         self._closed = False
         self._result: Optional[AgentLoopResult] = None
 
@@ -230,23 +437,26 @@ class AgentChildEngine:
 
     @property
     def step_count(self) -> int:
-        return child_run_stats(self.messages).steps
+        return self._stats().steps
 
     @property
     def token_usage(self) -> int:
-        return child_run_stats(self.messages).total_tokens
+        return self._stats().total_tokens
 
     @property
     def cost_usage_usd(self) -> float:
-        return 0.0
+        return self._stats().total_cost_usd
 
     @property
     def usage_complete(self) -> bool:
-        return child_run_stats(self.messages).usage_complete
+        return self._stats().usage_complete
 
     @property
     def cost_complete(self) -> bool:
-        return False
+        return self._stats().cost_complete
+
+    def _stats(self) -> ChildRunStats:
+        return child_run_stats(self.messages, model_pricing=self._model_pricing)
 
     async def arun(self, task: str, **kwargs: Any) -> AgentChildRunResult:
         """Run the child task once under the supervisor-assigned Run id."""
@@ -265,18 +475,64 @@ class AgentChildEngine:
         run_id = run_id.strip()
         self._run_id = run_id
 
-        transaction: Optional[JournalTurnTransaction] = None
+        journal_transaction: Optional[JournalTurnTransaction] = None
         if self._journal_factory is not None:
             journal = self._journal_factory()
             if not isinstance(journal, SessionJournal):
                 raise TypeError("journal_factory must return a SessionJournal")
             await journal.create(run_id, dict(self._journal_metadata))
             self._journal = journal
-            transaction = JournalTurnTransaction(journal)
+            journal_transaction = JournalTurnTransaction(journal)
+        transaction = _ChildTurnTransaction(
+            run_id=run_id,
+            delegate=journal_transaction,
+            budget=self._budget,
+            budget_ledger=self._budget_ledger,
+            model_pricing=self._model_pricing,
+            settle_runtime_events=self._reject_runtime_event_admissions,
+        )
 
         runtime_context = dict(self._runtime_context)
         if self._journal is not None:
             runtime_context.setdefault("journal", self._journal)
+
+        async def _post_descendant_event(event: RuntimeInput) -> bool:
+            return await self.apost_runtime_event(event, run_id=run_id)
+
+        # A recursively launched background Child reports to this Child's
+        # active mailbox, not directly to the Root. Products may provide a
+        # stricter durable callback explicitly; otherwise the façade engine is
+        # the natural parent-run endpoint.
+        runtime_context.setdefault("post_runtime_event", _post_descendant_event)
+
+        def _block_tools_after_budget(
+            _context: BeforeToolCallContext,
+        ) -> BeforeToolCallDecision | None:
+            if transaction.budget_stop_reason is None:
+                return None
+            return BeforeToolCallDecision(
+                block=True,
+                reason="Child budget was exhausted by the model transaction.",
+                terminate=True,
+            )
+
+        def _stop_after_budget(_context: TurnHookContext) -> bool:
+            return transaction.budget_stop_reason is not None
+
+        async def _prepare_child_next_turn(context: TurnHookContext) -> None:
+            can_continue = (
+                not self._cancel_requested
+                and transaction.budget_stop_reason is None
+                and (
+                    self._max_turns is None
+                    or context.turn + 1 < self._max_turns
+                )
+            )
+            await self._settle_runtime_event_admissions(
+                accept=can_continue,
+                agent=agent,
+            )
+
         agent = Agent(
             model=self._model,
             tool_registry=self._tool_registry,
@@ -290,33 +546,46 @@ class AgentChildEngine:
             runtime_context=runtime_context,
             transaction_factory=lambda _run_id: transaction,
             run_id_factory=lambda: run_id,
+            before_tool_call=_block_tools_after_budget,
+            should_stop_after_turn=_stop_after_budget,
+            prepare_next_turn=_prepare_child_next_turn,
         )
         self._agent = agent
 
-        def _abort_if_cancelled(_event: Any) -> None:
+        async def _observe_run(event: Any) -> None:
+            if isinstance(event, TurnStart):
+                self._accepting_runtime_events = True
+                self._runtime_started.set()
+            elif isinstance(event, TurnEnd):
+                # Close admission before observing the reservations. No await
+                # separates a post's open-state check from its reservation, so
+                # later posts fail. The existing prepare-next-turn hook then
+                # decides and settles reservations immediately before the
+                # loop's stop checks and steering drain.
+                self._close_runtime_event_admission()
+            elif isinstance(event, AgentEnd):
+                await self._reject_runtime_event_admissions()
             if self._cancel_requested:
                 agent.abort()
 
-        unsubscribe = agent.subscribe(_abort_if_cancelled)
-        pending, self._pending_events = self._pending_events, []
-        for event, text in pending:
-            if transaction is not None:
-                await transaction.journal.append(
-                    JournalRecordType.RUNTIME_INPUT_POSTED,
-                    event.to_dict(),
-                    record_id=f"{run_id}:runtime:{event.event_id}",
-                )
-            agent.steer(UserMessage(content=text))
+        unsubscribe_observer = agent.subscribe(_observe_run)
         try:
             outcome = await agent.prompt(task)
         finally:
-            unsubscribe()
+            await self._reject_runtime_event_admissions()
+            self._runtime_started.set()
+            unsubscribe_observer()
         if isinstance(outcome, AgentRunRejected):
             raise RuntimeError(
                 f"a fresh child Agent rejected its only run: {outcome.reason}"
             )
         self._result = outcome
-        return AgentChildRunResult(run_id=run_id, result=outcome)
+        return AgentChildRunResult(
+            run_id=run_id,
+            result=outcome,
+            model_pricing=self._model_pricing,
+            stop_reason=transaction.budget_stop_reason,
+        )
 
     def cancel(self, mode: str) -> None:
         """Cooperatively abort the active run; every mode maps to abort."""
@@ -334,35 +603,252 @@ class AgentChildEngine:
     ) -> bool:
         """Accept one parent message into the child run's steering queue.
 
-        Acceptance is durable when the engine keeps a journal; the message
-        itself becomes visible to the child at the next turn safe point. A
-        message posted while the child is still starting is buffered and
-        drained into the run's initial steering poll.
+        Acceptance is durable when the engine keeps a journal and means the
+        message was queued for the next turn safe point. Starting, between-turn
+        and terminal-settlement windows reject. A post made during an open turn
+        first reserves ordered admission; the existing prepare-next-turn hook
+        accepts it only when the one-shot Child can continue, and settles the
+        journal plus steering queue before the loop drains that queue. Terminal
+        turns reject without writing a runtime-input record.
         """
 
         if not isinstance(event, RuntimeInput):
             raise TypeError("event must be a RuntimeInput")
         if run_id is not None and run_id != self._run_id:
             return False
-        if self._closed or self._result is not None:
+        if not self._run_id or self._closed or self._result is not None:
             return False
         text = str(event.payload.get("content") or "").strip()
         if not text:
             return False
+        await self._runtime_started.wait()
         agent = self._agent
-        if agent is None:
-            # The run journal opens inside arun; buffer so acceptance stays
-            # durable and the message reaches the initial steering poll.
-            self._pending_events.append((event, text))
-            return True
-        if self._journal is not None:
-            await self._journal.append(
-                JournalRecordType.RUNTIME_INPUT_POSTED,
-                event.to_dict(),
-                record_id=f"{self._run_id}:runtime:{event.event_id}",
+        if agent is None or not self._accepting_runtime_events:
+            return False
+        outcome: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        reservation = _RuntimeEventReservation(
+            event=event,
+            message=UserMessage(content=text),
+            result=outcome,
+        )
+        self._runtime_event_reservations.append(reservation)
+        try:
+            return await asyncio.shield(outcome)
+        except asyncio.CancelledError as cancellation:
+            # Pending withdrawal wins without I/O. Once TurnEnd atomically
+            # moves the reservation to appending, durable settlement wins the
+            # race: wait_for observes True if the record committed, while a
+            # rolled-back append preserves the caller's cancellation.
+            if reservation.phase == "pending":
+                reservation.phase = "withdrawn"
+                try:
+                    self._runtime_event_reservations.remove(reservation)
+                except ValueError:
+                    pass
+                if not outcome.done():
+                    outcome.set_result(False)
+                raise
+            reservation.withdrawal_requested.set()
+            while not outcome.done():
+                try:
+                    await asyncio.shield(outcome)
+                except asyncio.CancelledError:
+                    continue
+            accepted = outcome.result()
+            if accepted:
+                return True
+            raise cancellation
+
+    def _close_runtime_event_admission(self) -> None:
+        """Prevent reservations after the current TurnEnd boundary."""
+
+        self._accepting_runtime_events = False
+
+    async def _reject_runtime_event_admissions(self) -> None:
+        """Reject every reservation when no next-turn safe point exists."""
+
+        await self._settle_runtime_event_admissions(accept=False)
+
+    async def _settle_runtime_event_admissions(
+        self,
+        *,
+        accept: bool,
+        agent: Agent | None = None,
+    ) -> None:
+        """Settle this turn's ordered reservations at its next-turn hook."""
+
+        self._accepting_runtime_events = False
+        while self._runtime_event_reservations:
+            reservation = self._runtime_event_reservations.pop(0)
+            if reservation.phase == "withdrawn":
+                continue
+            if not accept:
+                self._reject_runtime_event(reservation)
+                continue
+            if agent is None:
+                raise RuntimeError("runtime event admission requires an Agent")
+            # This phase transition is the cancellation linearization point;
+            # it occurs before journal append can suspend.
+            reservation.phase = "appending"
+            await self._accept_runtime_event(reservation, agent)
+
+    @staticmethod
+    def _reject_runtime_event(reservation: _RuntimeEventReservation) -> None:
+        reservation.phase = "rejected"
+        if not reservation.result.done():
+            reservation.result.set_result(False)
+
+    @staticmethod
+    def _commit_runtime_event(
+        reservation: _RuntimeEventReservation,
+        agent: Agent,
+    ) -> None:
+        reservation.phase = "committed"
+        agent.steer(reservation.message)
+        if not reservation.result.done():
+            reservation.result.set_result(True)
+
+    async def _accept_runtime_event(
+        self,
+        reservation: _RuntimeEventReservation,
+        agent: Agent,
+    ) -> None:
+        """Persist then queue one reservation at the next-turn hook."""
+
+        if self._journal is None:
+            self._commit_runtime_event(reservation, agent)
+            return
+
+        async def _append_settled() -> JournalAppendCancelled | JournalCommitError | None:
+            try:
+                await self._journal.append(
+                    JournalRecordType.RUNTIME_INPUT_POSTED,
+                    reservation.event.to_dict(),
+                    record_id=(
+                        f"{self._run_id}:runtime:{reservation.event.event_id}"
+                    ),
+                )
+            except (JournalAppendCancelled, JournalCommitError) as exc:
+                # CancelledError subclasses lose their concrete type when they
+                # cross an asyncio.Task boundary. Preserve the journal's
+                # durable outcome as an ordinary Task result instead.
+                return exc
+            return None
+
+        append = asyncio.create_task(
+            _append_settled(),
+            name=f"qitos-{self._run_id}-runtime-input-append",
+        )
+        withdrawal = asyncio.create_task(
+            reservation.withdrawal_requested.wait(),
+            name=f"qitos-{self._run_id}-runtime-input-withdrawal",
+        )
+        cancelled_for_withdrawal = False
+        try:
+            done, _pending = await asyncio.wait(
+                (append, withdrawal),
+                return_when=asyncio.FIRST_COMPLETED,
             )
-        agent.steer(UserMessage(content=text))
-        return True
+            if withdrawal in done and not append.done():
+                cancelled_for_withdrawal = True
+                append.cancel()
+            try:
+                append_error = await asyncio.shield(append)
+            except asyncio.CancelledError:
+                if cancelled_for_withdrawal:
+                    self._reject_runtime_event(reservation)
+                    return
+                raise
+            except JournalCommitError as exc:
+                self._settle_runtime_event_commit_error(
+                    reservation,
+                    agent,
+                    exc,
+                )
+                return
+            except Exception as exc:
+                reservation.phase = "rejected"
+                if not reservation.result.done():
+                    reservation.result.set_exception(exc)
+                return
+            if append_error is not None:
+                self._settle_runtime_event_append_error(
+                    reservation,
+                    agent,
+                    append_error,
+                )
+                return
+        except asyncio.CancelledError:
+            append.cancel()
+            try:
+                append_error = await append
+            except asyncio.CancelledError:
+                self._reject_runtime_event(reservation)
+            except Exception as exc:
+                reservation.phase = "rejected"
+                if not reservation.result.done():
+                    reservation.result.set_exception(exc)
+            else:
+                if append_error is None:
+                    self._commit_runtime_event(reservation, agent)
+                else:
+                    self._settle_runtime_event_append_error(
+                        reservation,
+                        agent,
+                        append_error,
+                    )
+            raise
+        finally:
+            withdrawal.cancel()
+            await asyncio.gather(withdrawal, return_exceptions=True)
+        self._commit_runtime_event(reservation, agent)
+
+    @staticmethod
+    def _settle_runtime_event_append_error(
+        reservation: _RuntimeEventReservation,
+        agent: Agent,
+        error: JournalAppendCancelled | JournalCommitError,
+    ) -> None:
+        if isinstance(error, JournalAppendCancelled):
+            if error.commit_state is JournalCommitState.COMMITTED:
+                AgentChildEngine._commit_runtime_event(reservation, agent)
+            elif error.commit_state is JournalCommitState.NOT_COMMITTED:
+                AgentChildEngine._reject_runtime_event(reservation)
+            else:
+                AgentChildEngine._fail_runtime_event_unknown(reservation, error)
+            return
+        AgentChildEngine._settle_runtime_event_commit_error(
+            reservation,
+            agent,
+            error,
+        )
+
+    @staticmethod
+    def _fail_runtime_event_unknown(
+        reservation: _RuntimeEventReservation,
+        error: JournalAppendCancelled,
+    ) -> None:
+        reservation.phase = "unknown"
+        if not reservation.result.done():
+            reservation.result.set_exception(
+                error.commit_error
+                or JournalError("runtime input append has unknown durable outcome")
+            )
+
+    @staticmethod
+    def _settle_runtime_event_commit_error(
+        reservation: _RuntimeEventReservation,
+        agent: Agent,
+        error: JournalCommitError,
+    ) -> None:
+        if error.commit_state is JournalCommitState.COMMITTED:
+            AgentChildEngine._commit_runtime_event(reservation, agent)
+        elif error.commit_state is JournalCommitState.NOT_COMMITTED:
+            AgentChildEngine._reject_runtime_event(reservation)
+        else:
+            reservation.phase = "unknown"
+            if not reservation.result.done():
+                reservation.result.set_exception(error)
 
     async def aclose(self) -> None:
         """Abort any active run, wait for settlement and close the journal."""
@@ -370,9 +856,12 @@ class AgentChildEngine:
         if self._closed:
             return
         self._closed = True
+        self._accepting_runtime_events = False
+        self._runtime_started.set()
         agent = self._agent
         if agent is not None:
             agent.abort()
+            await self._reject_runtime_event_admissions()
             await agent.wait_for_idle()
         if self._journal is not None:
             await self._journal.close()
@@ -381,17 +870,30 @@ class AgentChildEngine:
 def _narrow_tool_registry(
     base: ToolRegistry,
     allowed_groups: Tuple[str, ...],
+    parent_authority: ToolExposure | None,
 ) -> ToolRegistry:
-    """Copy ``base`` into a fresh registry narrowed to allowed Tool groups."""
+    """Intersect the configured Child pool with one frozen parent exposure."""
 
     registry = ToolRegistry()
-    for name in base.list_tools():
-        tool = base.get(name)
-        if tool is None:
+    if parent_authority is None:
+        return registry
+    parent_names = set(parent_authority.list_tools())
+    for name in sorted(parent_names.intersection(base.list_tools())):
+        base_tool = base.get(name)
+        parent_tool = parent_authority.get(name)
+        if base_tool is None or parent_tool is None:
             continue
-        if allowed_groups and tool.spec.group not in allowed_groups:
+        # ToolExposure freezes each selected BaseTool behind an internal
+        # handler wrapper.  Name equality alone is not authority: require the
+        # frozen definition to point at this exact configured Tool and retain
+        # the same immutable spec, otherwise fail closed on the collision.
+        if getattr(parent_tool, "_handler", None) is not base_tool:
             continue
-        registry.register(tool)
+        if parent_tool.spec != base_tool.spec:
+            continue
+        if allowed_groups and base_tool.spec.group not in allowed_groups:
+            continue
+        registry.register(base_tool)
     return registry
 
 
@@ -405,6 +907,7 @@ def build_agent_child_invocation_factory(
     max_tool_concurrency: int = 8,
     max_turns: Optional[int] = None,
     run_timeout_s: Optional[float] = None,
+    model_pricing: Optional[ModelPricing] = None,
     extra_request_options: Optional[Mapping[str, Any]] = None,
     journal_directory: Union[str, Path, None] = None,
     journal_factory: Optional[Callable[[], SessionJournal]] = None,
@@ -421,6 +924,8 @@ def build_agent_child_invocation_factory(
 
     if journal_directory is not None and journal_factory is not None:
         raise ValueError("journal_directory and journal_factory are exclusive")
+    if model_pricing is not None and not isinstance(model_pricing, ModelPricing):
+        raise TypeError("model_pricing must be a ModelPricing or None")
     if journal_directory is not None:
         journal_root = Path(journal_directory)
 
@@ -431,6 +936,46 @@ def build_agent_child_invocation_factory(
         request: ChildLaunchRequest,
         runtime_context: ChildRuntimeContext,
     ) -> ChildInvocation:
+        if request.profile != "default":
+            raise ValueError(
+                "build_agent_child_invocation_factory has no profile resolver; "
+                f"unsupported Child profile: {request.profile}"
+            )
+        if request.working_directory is not None:
+            raise ValueError(
+                "build_agent_child_invocation_factory has no working-directory "
+                "resolver"
+            )
+        parent_permission = runtime_context.parent_permission_context
+        env_permission = getattr(env, "tool_permission_context", None)
+        if isinstance(env_permission, Mapping):
+            env_permission = ToolPermissionContext.from_dict(dict(env_permission))
+        if env_permission is not None and not isinstance(
+            env_permission, ToolPermissionContext
+        ):
+            raise TypeError(
+                "Child Env tool_permission_context must be a "
+                "ToolPermissionContext, mapping, or None"
+            )
+        if (
+            parent_permission is not None
+            and env_permission is not None
+            and env_permission != parent_permission
+        ):
+            raise ValueError(
+                "Child Env permission policy differs from the frozen parent policy; "
+                "the built-in factory cannot prove that it only narrows authority"
+            )
+        root_budget = (
+            runtime_context.budget_ledger.snapshot()
+            if runtime_context.budget_ledger is not None
+            else None
+        )
+        cost_limit = request.budget.max_cost_usd is not None or (
+            root_budget is not None and root_budget.max_cost_usd is not None
+        )
+        if cost_limit and model_pricing is None:
+            raise ValueError("a Child cost budget requires explicit model_pricing")
         resolved_model = model() if callable(model) else model
         budget = request.budget
         resolved_max_turns = _tightest_int(max_turns, budget.max_steps)
@@ -448,7 +993,11 @@ def build_agent_child_invocation_factory(
         engine = AgentChildEngine(
             model=resolved_model,
             tool_registry=(
-                _narrow_tool_registry(tool_registry, request.allowed_tool_groups)
+                _narrow_tool_registry(
+                    tool_registry,
+                    request.allowed_tool_groups,
+                    runtime_context.parent_tool_authority,
+                )
                 if tool_registry is not None
                 else None
             ),
@@ -458,12 +1007,21 @@ def build_agent_child_invocation_factory(
             max_tool_concurrency=resolved_concurrency or 1,
             max_turns=resolved_max_turns,
             run_timeout_s=resolved_timeout,
+            budget=budget,
+            budget_ledger=runtime_context.budget_ledger,
+            model_pricing=model_pricing,
             extra_request_options=extra_request_options,
             runtime_context={
                 "parent_run_id": runtime_context.child_run_id,
                 "delegate_depth": runtime_context.delegate_depth + 1,
                 "deadline_monotonic": runtime_context.deadline_monotonic,
                 "budget_ledger": runtime_context.budget_ledger,
+                "permission_context": runtime_context.parent_permission_context,
+                "max_children": _tightest_int(
+                    runtime_context.launch.max_children or None,
+                    budget.max_children,
+                )
+                or 0,
             },
             journal_factory=journal_factory,
             journal_metadata={
@@ -471,6 +1029,20 @@ def build_agent_child_invocation_factory(
                 "child_id": runtime_context.handle.child_id,
                 "agent_type": request.agent_type,
                 "description": request.description,
+                "model_pricing": (
+                    None
+                    if model_pricing is None
+                    else {
+                        "input_usd_per_million": model_pricing.input_usd_per_million,
+                        "output_usd_per_million": model_pricing.output_usd_per_million,
+                        "cache_read_usd_per_million": (
+                            model_pricing.cache_read_usd_per_million
+                        ),
+                        "cache_write_usd_per_million": (
+                            model_pricing.cache_write_usd_per_million
+                        ),
+                    }
+                ),
             },
         )
         task = request.task
@@ -496,6 +1068,7 @@ __all__ = [
     "AgentChildRunResult",
     "build_agent_child_invocation_factory",
     "child_final_text",
+    "child_budget_stop_reason",
     "child_run_stats",
     "child_stop_reason",
     "ChildRunStats",

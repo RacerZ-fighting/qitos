@@ -6,8 +6,16 @@ import asyncio
 
 import pytest
 
-from qitos.core.agent import Agent, AgentBusyError, AgentRunRejected, QueueMode
+from qitos.core.agent import (
+    Agent,
+    AgentBusyError,
+    AgentListenerTimeoutError,
+    AgentRunRejected,
+    QueueMode,
+)
+from qitos.core.agent_events import AgentEnd, AgentStart, MessageEnd, ToolExecutionEnd
 from qitos.core.agent_loop import AgentLoopResult, AgentRunStatus
+from qitos.core.cancellation import CancelSignalView
 from qitos.core.message import AssistantMessage, UserMessage
 from qitos.core.tool import tool
 from qitos.core.tool_registry import ToolRegistry
@@ -30,6 +38,19 @@ def _echo(text: str) -> str:
 def _agent(model, **kwargs) -> Agent:
     registry = ToolRegistry().register(_echo)
     return Agent(model=model, tool_registry=registry, **kwargs)
+
+
+def test_queue_mode_uses_pi_wire_value_and_rejects_raw_strings() -> None:
+    assert QueueMode.ONE_AT_A_TIME.value == "one-at-a-time"
+    with pytest.raises(TypeError, match="QueueMode"):
+        _agent(
+            ScriptedModel([text_events("unused")]),
+            steering_mode="all",  # type: ignore[arg-type]
+        )
+
+    agent = _agent(ScriptedModel([text_events("unused")]))
+    with pytest.raises(TypeError, match="QueueMode"):
+        agent.follow_up_mode = "all"  # type: ignore[assignment]
 
 
 @pytest.mark.asyncio
@@ -101,6 +122,40 @@ async def test_steer_during_run_lands_before_the_next_model_call() -> None:
     }
     roles = [m.role for m in agent.messages]
     assert roles == ["user", "assistant", "tool", "user", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_max_turns_restores_steering_drained_before_rejection() -> None:
+    model = ScriptedModel(
+        [
+            tool_events([tool_call_wire("c1", "echo", {"text": "x"})]),
+            text_events("continued"),
+        ]
+    )
+    agent = _agent(model, max_turns=1)
+    queued = UserMessage(content="keep this")
+
+    def _steer_after_turn(event) -> None:
+        if event.type == "turn_end":
+            agent.steer(queued)
+
+    unsubscribe = agent.subscribe(_steer_after_turn)
+    first = await agent.prompt("go")
+    unsubscribe()
+
+    assert first.status is AgentRunStatus.MAX_TURNS
+    assert agent.has_queued_messages() is True
+    assert not any(message is queued for message in agent.messages)
+
+    second = await agent.continue_run()
+
+    assert isinstance(second, AgentLoopResult)
+    assert second.status is AgentRunStatus.COMPLETED
+    assert model.requests[1].messages[-1] == {
+        "role": "user",
+        "content": "keep this",
+    }
+    assert sum(message is queued for message in agent.messages) == 1
 
 
 @pytest.mark.asyncio
@@ -292,10 +347,131 @@ async def test_listener_fault_propagates_and_run_is_terminalized() -> None:
         await agent.prompt("go")
     # The run still reached its durable terminal state first.
     kinds = [record[0] for record in transaction.records]
-    assert "run_terminal" in kinds
+    assert kinds == ["model_terminal", "turn_committed", "run_terminal"]
     assert transaction.records[-1] == ("run_terminal", "failed")
     assert agent.error_message == "listener bug"
     await agent.wait_for_idle()
+
+
+@pytest.mark.asyncio
+async def test_agent_start_listener_fault_still_records_run_terminal() -> None:
+    transaction = RecordingTransaction()
+    agent = _agent(
+        ScriptedModel([text_events("never reached")]),
+        transaction_factory=lambda run_id: transaction,
+    )
+
+    def _broken(event) -> None:
+        if isinstance(event, AgentStart):
+            raise RuntimeError("start listener bug")
+
+    agent.subscribe(_broken)
+    with pytest.raises(RuntimeError, match="start listener bug"):
+        await agent.prompt("go")
+
+    assert transaction.records == [("run_terminal", "failed")]
+
+
+@pytest.mark.asyncio
+async def test_message_listener_fault_follows_model_terminal_record() -> None:
+    transaction = RecordingTransaction()
+    agent = _agent(
+        ScriptedModel([text_events("answer")]),
+        transaction_factory=lambda run_id: transaction,
+    )
+
+    def _broken(event) -> None:
+        if isinstance(event, MessageEnd) and isinstance(
+            event.message, AssistantMessage
+        ):
+            raise RuntimeError("message listener bug")
+
+    agent.subscribe(_broken)
+    with pytest.raises(RuntimeError, match="message listener bug"):
+        await agent.prompt("go")
+
+    assert [record[0] for record in transaction.records] == [
+        "model_terminal",
+        "run_terminal",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_listener_fault_preserves_call_result_pair() -> None:
+    transaction = RecordingTransaction()
+    agent = _agent(
+        ScriptedModel(
+            [tool_events([tool_call_wire("c1", "echo", {"text": "x"})])]
+        ),
+        transaction_factory=lambda run_id: transaction,
+    )
+
+    def _broken(event) -> None:
+        if isinstance(event, ToolExecutionEnd):
+            raise RuntimeError("tool listener bug")
+
+    agent.subscribe(_broken)
+    with pytest.raises(RuntimeError, match="tool listener bug"):
+        await agent.prompt("go")
+
+    assert [message.role for message in agent.messages] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assert agent.messages[-1].tool_call_id == "c1"
+    # The façade listener failed before it could project the ToolResult event,
+    # but both the in-memory transcript and durable transaction stay paired.
+    assert [record[0] for record in transaction.records] == [
+        "model_terminal",
+        "tool_started",
+        "tool_terminal",
+        "run_terminal",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_listener_receives_read_only_cancel_signal() -> None:
+    seen: list[CancelSignalView] = []
+    agent = _agent(ScriptedModel([text_events("never reached")]))
+
+    def _abort_on_start(event, signal: CancelSignalView) -> None:
+        if isinstance(event, AgentStart):
+            seen.append(signal)
+            assert not hasattr(signal, "request_cancel")
+            assert signal is agent.signal
+            agent.abort()
+
+    agent.subscribe(_abort_on_start)
+    result = await agent.prompt("go")
+
+    assert isinstance(result, AgentLoopResult)
+    assert result.status is AgentRunStatus.ABORTED
+    assert len(seen) == 1
+    assert seen[0].immediate_requested is True
+    assert agent.signal is None
+
+
+@pytest.mark.asyncio
+async def test_single_argument_listener_remains_supported() -> None:
+    seen = []
+    agent = _agent(ScriptedModel([text_events("ok")]))
+    agent.subscribe(lambda event: seen.append(event.type))
+
+    await agent.prompt("go")
+
+    assert seen[0] == "agent_start"
+    assert seen[-1] == "agent_end"
+
+
+def test_listener_signature_is_validated_at_subscription() -> None:
+    agent = _agent(ScriptedModel([text_events("unused")]))
+
+    def _invalid(_event, _signal, _extra) -> None:
+        return None
+
+    with pytest.raises(TypeError, match="must accept"):
+        agent.subscribe(_invalid)
 
 
 @pytest.mark.asyncio
@@ -323,7 +499,137 @@ async def test_prompt_cancellation_settles_the_run_before_raising() -> None:
     # The run reached its durable terminal state before the caller observed
     # the cancellation.
     assert transaction.records[-1] == ("run_terminal", "aborted")
+    assert agent.is_streaming is False
     await agent.wait_for_idle()
+
+
+@pytest.mark.asyncio
+async def test_prompt_cancellation_awaits_listener_cleanup() -> None:
+    listener_started = asyncio.Event()
+    listener_settled = asyncio.Event()
+    transaction = RecordingTransaction()
+    agent = _agent(
+        ScriptedModel([text_events("never reached")]),
+        transaction_factory=lambda run_id: transaction,
+    )
+
+    async def _listener(event, signal: CancelSignalView) -> None:
+        if not isinstance(event, AgentStart):
+            return
+        try:
+            listener_started.set()
+            await signal.wait_immediate()
+        finally:
+            await asyncio.sleep(0)
+            listener_settled.set()
+
+    agent.subscribe(_listener)
+    prompt_task = asyncio.create_task(agent.prompt("go"))
+    await listener_started.wait()
+    prompt_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await prompt_task
+
+    assert listener_settled.is_set()
+    assert transaction.records[-1] == ("run_terminal", "aborted")
+
+
+@pytest.mark.asyncio
+async def test_aborted_run_awaits_agent_end_listener_normally() -> None:
+    gate = asyncio.Event()
+    listener_completed = asyncio.Event()
+    agent = _agent(ScriptedModel([make_hanging_model(gate, first_text="w")]))
+
+    async def _listener(event, _signal: CancelSignalView) -> None:
+        if isinstance(event, AgentEnd):
+            await asyncio.sleep(0)
+            listener_completed.set()
+
+    agent.subscribe(_listener)
+    run = asyncio.create_task(agent.prompt("go"))
+    while agent.streaming_message is None:
+        await asyncio.sleep(0)
+
+    agent.abort()
+    result = await run
+
+    assert result.status is AgentRunStatus.ABORTED
+    assert listener_completed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_run_deadline_bounds_a_hanging_listener() -> None:
+    listener_started = asyncio.Event()
+    listener_settled = asyncio.Event()
+    agent = _agent(
+        ScriptedModel([text_events("never reached")]), run_timeout_s=0.05
+    )
+
+    async def _listener(event) -> None:
+        if not isinstance(event, AgentStart):
+            return
+        try:
+            listener_started.set()
+            await asyncio.Event().wait()
+        finally:
+            listener_settled.set()
+
+    agent.subscribe(_listener)
+    with pytest.raises(AgentListenerTimeoutError):
+        await agent.prompt("go")
+
+    assert listener_started.is_set()
+    assert listener_settled.is_set()
+    await agent.wait_for_idle()
+
+
+@pytest.mark.asyncio
+async def test_abort_interrupts_hanging_tool_and_preserves_terminal_result() -> None:
+    tool_started = asyncio.Event()
+    tool_settled = asyncio.Event()
+
+    @tool(name="waiter")
+    async def _waiter() -> str:
+        try:
+            tool_started.set()
+            await asyncio.Event().wait()
+            return "unreachable"
+        finally:
+            tool_settled.set()
+
+    registry = ToolRegistry().register(_waiter)
+    transaction = RecordingTransaction()
+    agent = Agent(
+        model=ScriptedModel(
+            [tool_events([tool_call_wire("c1", "waiter", {})])]
+        ),
+        tool_registry=registry,
+        transaction_factory=lambda _run_id: transaction,
+    )
+    run = asyncio.create_task(agent.prompt("go"))
+    await tool_started.wait()
+
+    agent.abort()
+    result = await asyncio.wait_for(run, timeout=1)
+
+    assert result.status is AgentRunStatus.ABORTED
+    assert tool_settled.is_set()
+    assert [message.role for message in agent.messages] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+    tool_message = agent.messages[-1]
+    assert tool_message.tool_call_id == "c1"
+    assert tool_message.result.status == "cancelled"
+    assert [record[0] for record in transaction.records] == [
+        "model_terminal",
+        "tool_started",
+        "tool_terminal",
+        "turn_committed",
+        "run_terminal",
+    ]
 
 
 @pytest.mark.asyncio

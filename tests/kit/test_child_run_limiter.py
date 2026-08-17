@@ -24,6 +24,7 @@ from qitos.core.child import (
 from qitos.core.journal import JournalRecordType, SessionJournal
 from qitos.kit.child import ChildRunLimiter, ChildSupervisor
 from qitos.kit.journal import JsonlSessionJournal
+from qitos.kit.tool.agent import AgentTool
 
 
 def _request(task: str) -> ChildLaunchRequest:
@@ -133,6 +134,61 @@ async def test_recursive_supervisors_share_cumulative_child_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_nested_supervisor_setup_does_not_reset_shared_run_budget() -> None:
+    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
+    root = _supervisor(limiter, _Engine)
+    nested = _supervisor(limiter, _Engine)
+
+    first = await root.launch(
+        _request("one"),
+        _context("root-run"),
+        background=False,
+    )
+    nested.setup()
+
+    assert first.status is ChildStatus.COMPLETED
+    assert limiter.children_started == 1
+    with pytest.raises(ChildRunLimitError, match="max_children=1"):
+        await nested.launch(
+            _request("nested"),
+            _context("child-run"),
+            background=False,
+        )
+
+    await root.aclose()
+    await nested.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_setup_starts_fresh_root_run_limit_generation() -> None:
+    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
+
+    async def build(
+        request: ChildLaunchRequest,
+        _context: ChildRuntimeContext,
+    ) -> ChildInvocation:
+        return ChildInvocation(engine=_Engine(), task=request.task)
+
+    tool = AgentTool(invocation_factory=build, run_limiter=limiter)
+    first = await tool.execute(
+        {"description": "first", "prompt": "one"},
+        runtime_context={"run_id": "root-one"},
+    )
+    await tool.aclose()
+
+    tool.setup()
+    second = await tool.execute(
+        {"description": "second", "prompt": "two"},
+        runtime_context={"run_id": "root-two"},
+    )
+
+    assert first["child_status"] == ChildStatus.COMPLETED.value
+    assert second["child_status"] == ChildStatus.COMPLETED.value
+    assert limiter.children_started == 1
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_active_limit_rejects_without_consuming_cumulative_budget() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
@@ -220,6 +276,8 @@ async def test_provisional_admission_can_be_rolled_back() -> None:
 
     assert limiter.active_children == 1
     assert limiter.children_started == 1
+    with pytest.raises(RuntimeError, match="active children"):
+        limiter.reset_for_new_run()
     await lease.rollback()
     await lease.rollback()
 

@@ -16,7 +16,7 @@ from .context_registry import infer_context_window
 
 
 class Model(ABC):
-    """Asynchronous provider interface consumed by the QitOS Engine.
+    """Asynchronous provider interface consumed by the QitOS Agent loop.
 
     Provider implementations accept QitOS's existing normalized message
     dictionaries and expose one async stream. The absolute monotonic deadline

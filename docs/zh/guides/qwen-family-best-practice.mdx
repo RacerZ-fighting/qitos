@@ -1,106 +1,77 @@
 ---
 title: "Qwen 家族最佳实践"
-description: "如何在 QitOS 中用原生工具调用通道运行 Qwen 与 qwen-plus。"
+description: "通过类型化原生 Tool call 在最小 Agent loop 中运行 Qwen 与 qwen-plus。"
 ---
 
-在 QitOS 里，Qwen 已经不再只是默认走 JSON 的普通家族。
-
-对于 OpenAI-compatible 的 Qwen 端点，QitOS 现在优先采用这条链路：
+对 OpenAI-compatible Qwen 端点，QitOS 优先使用 Provider 的类型化 Tool-call 通道：
 
 ```text
-原生工具调用 -> Decision.act(...) -> 工具执行
-后备：json_decision_v1 -> xml_decision_v1 -> react_text_v1
+Provider ToolCall -> ToolBatchExecutor -> ToolResult -> 下一次模型 turn
 ```
 
-这和 Qwen-Agent 的精神是一致的：如果后端干净地暴露了函数调用，就应该优先利用它。
+当前 Agent runtime 不存在 `Decision.act(...)` 转换或文本 parser fallback。Family preset 中的
+protocol 名称只保留为兼容 metadata。
 
-## v0.4 之后实际改变了什么
+## 何时使用原生 Tool call
 
-现在 `qwen` 家族预设（preset，预配置的模型家族默认值）会把三件事绑定在一起：
+`qwen` preset 选择 OpenAI-compatible adapter，并把当前准入的 Tool schema 放入 API
+请求。如果端点返回 `tool_calls`，adapter 会把 call id 和参数保留为类型化 QitOS
+`ToolCall`。
 
-- 工具模式默认通过 `api_parameter` 交付
-- 如果端点返回了 `tool_calls`，优先走原生通道
-- 文本协议链继续保留，作为稳定后备
+Loop 会对其应用和其他 Provider 相同的校验、权限、deadline、取消与终态结果规则：
 
-所以默认协议（protocol，模型输出的格式契约）仍然是 `json_decision_v1`，但对 Qwen 来说，它现在更准确的角色是**文本后备**，而不是最优路径本身。
+- 非法或非 object 参数会带着 `parse_error` 保留在 transcript 中；
+- 非法调用永远不执行 Tool；
+- 每个调用都会按源顺序得到唯一 terminal `ToolResult`。
 
-## 什么时候会命中原生通道
+如果端点只返回普通文本而没有 Tool call，该文本就是 assistant response。QitOS 不会再通过
+已删除的 parser/Decision runtime 重新解释看似结构化的文本。
 
-QitOS 会在以下条件同时满足时优先走原生通道：
+## 配置 qwen-plus
 
-- 模型被解析为 `qwen` 家族预设
-- 适配层（harness，负责将协议、传输层、工具交付等组合在一起的模型适配层）元数据中 `native_tool_call_preferred = true`
-- OpenAI-compatible 响应里确实带有 `tool_calls`
+```python
+from qitos.core.agent import Agent
+from qitos.harness import build_model_for_preset
 
-只要其中任意一个条件不满足，QitOS 就会自动回退到原来的解析器链。
+model = build_model_for_preset(
+    family_id="qwen",
+    model_name="qwen-plus",
+    api_key="...",
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
 
-当端点没有返回 `tool_calls`、而是返回文本时，QitOS 会区分两种情况：普通自然语言结论仍会成为最终答案；如果文本带有结构化动作字段但解析失败，则会保留 parser 恢复路径，避免把待执行工具动作误报为任务完成。对应 trace 会保留原始响应、parser diagnostics 和该恢复步骤的 `decision_source: parser`。
+agent = Agent(model=model, max_turns=8)
+```
+
+Preset 贡献模型请求默认值与 metadata。Agent loop 仍在每个 turn 独立冻结实际模型与
+Tool exposure。
 
 ## 使用 Qwen Web 搜索
 
-当应用准入了名为 `web_search` 的 managed Tool 后，Qwen 可以直接使用 Provider
-原生搜索契约，无需再增加一个 Tool 名称：
+当应用准入名为 `web_search` 的 Tool，且 `model.capabilities.hosted_tools` 声明支持时，
+Qwen adapter 可以把它投影为 Provider hosted-search 契约：
 
 - Responses 发送 `tools=[{"type": "web_search"}]`。
-- Chat Completions 发送 `enable_search: true`，首次请求不再携带 managed function
+- Chat Completions 发送 `enable_search: true`。
+- 只有 Provider 在任何可观察输出前明确拒绝时，才可回退到已准入的 managed Tool
   schema。
-- 如果 Provider 在输出任何流事件前明确拒绝原生搜索，QitOS 会用原来的 managed
-  function schema 重试这次请求。
 
-一旦已经出现文本、推理、ToolCall 增量或原生 output item，就不会再 fallback，避免在
-可能已经计费或产生有效结果后重放同一个模型 turn。
+一旦已经出现文本、reasoning、ToolCall delta 或原生 output item，QitOS 就不会 fallback，
+避免重放可能已计费或产生外部意义的模型 turn。
 
-需要 client-side fallback 时，可以构造 `QwenWebSearchCapability`。它通过 Chat
-端点的 `enable_search` 执行搜索，并把结构化的
-`search_info.search_results` 以及答案中的来源 URL 投影成有界的 `WebSource`。
+需要 client-side managed 实现时，可构造 `QwenWebSearchCapability`。它会把结构化
+`search_info.search_results` 和来源 URL 投影成有界 `WebSource`。
 
-## 为什么不直接照搬 Qwen-Agent 的哨兵提示词
-
-官方 Qwen-Agent 为不提供原生工具通道的 Qwen 聊天接口设计了一套专门的函数调用提示词。
-
-QitOS 在 OpenAI-compatible 的 Qwen 路径里**没有照搬**它，原因是：
-
-- OpenAI-compatible 服务已经提供结构化的 `tool_calls`
-- 保留结构化信息比先序列化回文本再解析更干净
-- 这样做也更容易被未来其他支持原生工具调用的家族复用
-
-换句话说：
-
-- Qwen-Agent 解决的是更一般的 Qwen 聊天接口问题
-- QitOS 这里解决的是同一个适配层里如何优先用好 OpenAI-compatible 托管 Qwen 的问题
-
-## 推荐的 `qwen-plus` 配置方式
-
-通过 Qwen 家族预设构建模型，接入 OpenAI 兼容的 Qwen 端点：
+## 验证实际边界
 
 ```python
-from qitos.harness import build_model_for_preset
-
-llm = build_model_for_preset(
-    family_id="qwen",
-    model_name="qwen-plus",
-    api_key="...",  # OPENAI_API_KEY
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
-print(llm.qitos_harness_metadata)
+print(model.capabilities.native_tool_calls)
+print(model.capabilities.hosted_tools)
+print(model.qitos_harness_metadata)
 ```
 
-你应该能看到适配层元数据里有这些字段：
+`model.capabilities` 是 adapter 经测试验证的契约。Preset metadata 说明模型构造方式，
+不会启用 parser，也不是 Session 恢复真源。
 
-- `family_preset: qwen`
-- `tool_delivery: api_parameter`
-- `native_tool_call_preferred: True`
-- `decision_lane_preference: native_tool_calls`
-
-## 如何在 qita 里确认
-
-打开 `qita` 后，重点看这些字段：
-
-- 家族预设
-- 提示词协议
-- 工具交付方式
-- 决策来源
-- `native_tool_call_used`
-- `native_tool_call_fallback_reason`
-
-如果端点没有返回原生工具调用，QitOS 仍然会继续运行，但追踪记录（trace）中会明确告诉你它为什么回退到了解析器（parser，将原始模型输出解析为 Decision 的组件）通道。
+如果应用生成兼容 trace 目录，`qita` 可以展示 producer 记录的模型与 Tool 事实。
+当前 Agent façade 不会自动写入这些 trace artifact。

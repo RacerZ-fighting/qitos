@@ -1,9 +1,9 @@
 ---
 title: "Model family matrix"
-description: "The built-in QitOS v0.4 family presets and their default harness policies."
+description: "Built-in model construction presets, adapter choices, and compatibility labels."
 ---
 
-| Family | Transport | Default protocol | Fallback chain | Tool delivery | Context window | Recommended models |
+| Family | Transport | Compatibility label | Additional labels | Tool delivery | Context window | Recommended models |
 |---|---|---|---|---|---|---|
 | Qwen | OpenAI-compatible | `json_decision_v1` | `xml_decision_v1 → react_text_v1` | `api_parameter` | 128k | `Qwen/Qwen3-8B`, `qwen-plus`, `Qwen/Qwen3-32B` |
 | Kimi | OpenAI-compatible | `json_decision_v1` | `react_text_v1` | `api_parameter` | 128k | `kimi-k2-0905-preview`, `moonshot-v1-128k` |
@@ -108,11 +108,13 @@ the Anthropic wire.
 
 This table is not a ranking.
 
-It shows the default harness (the wiring layer that connects a transport, parser, and protocol) contract QitOS will use when you ask for a family preset (a reusable configuration bundle for a model family).
+It shows the model adapter and construction defaults selected by each family preset.
+The protocol columns are compatibility metadata retained for existing artifacts. The
+minimal Agent loop does not load parsers or execute those fallback chains.
 
 If you need to override one part, do it explicitly:
 
-- override the protocol with `build_model_for_preset(protocol=...)`
+- override the compatibility label with `build_model_for_preset(protocol=...)`
 - override the tool delivery with `build_model_for_preset(tool_delivery=...)`
 - override the wire adapter with `build_model_for_preset(adapter_kind=...)`
 - extend a preset with `preset.override()` — see [Family presets](/concepts/family-presets)

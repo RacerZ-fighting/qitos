@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool_result import ToolResult
+
+from qitos.kit.tool.internal.results import error_result
 from qitos.core.tool import ToolPermission
 
 try:  # Python 3.11+
@@ -1103,18 +1106,18 @@ class SecurityAuditToolSet:
         read_only=True,
         needs_approval=True,
     )
-    def audit_dependency_audit(self) -> Dict[str, Any]:
+    def audit_dependency_audit(self) -> Dict[str, Any] | ToolResult:
         """
         Run optional external dependency auditors such as pip-audit, npm audit, or osv-scanner when available.
         """
         commands = self._dependency_audit_commands()
         if not commands:
-            return {
+            return error_result({
                 "status": "error",
                 "error_category": "unavailable",
                 "stdout": "No supported dependency audit command is available for this repository or environment.",
                 "data": {"findings": [], "scans": []},
-            }
+            })
 
         findings: List[Dict[str, Any]] = []
         scans: List[Dict[str, Any]] = []

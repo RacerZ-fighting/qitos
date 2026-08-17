@@ -8,19 +8,19 @@
 [![PyPI](https://img.shields.io/pypi/v/qitos.svg)](https://pypi.org/project/qitos/)
 [![Repo](https://img.shields.io/badge/github-Qitor%2Fqitos-black)](https://github.com/Qitor/qitos)
 
-QitOS is the torch-flavor framework for agent researchers.
+QitOS is a provider-neutral runtime for building Tool-using agents.
 
-Current releases prototype methods and inspect long-horizon
-trajectories on the provider-neutral minimal async Agent loop (`Message ->
-Model -> ToolCall -> ToolResult`) behind the `Agent` façade, with built-in
-`qita` observability. The retired `AgentModule + Engine` lifecycle, checkpoint
-store, prompt-injected parsers/critics, recipes, and benchmark execution
-adapters are removed; the changelog records the migration.
+Current releases run the minimal async Agent loop (`Message -> Model ->
+ToolCall -> ToolResult`) behind the `Agent` façade. `qita` remains a read-only
+viewer for compatible trace artifacts; new façade runs do not yet emit those
+artifacts automatically. The retired `AgentModule + Engine` lifecycle,
+checkpoint store, prompt-injected parsers/critics, recipes, and benchmark
+execution adapters are removed; the changelog records the migration.
 
 
 [Quickstart](https://qitor.mintlify.app/quickstart) · [Tutorial Track](https://qitor.mintlify.app/tutorials) · [CLI Reference](https://qitor.mintlify.app/reference/cli) · [Changelog](CHANGELOG.md) · [Chinese README](README.zh.md)
 
-## What's New
+## Current runtime
 
 - **Pi-aligned runtime is the mainline**: the `Agent` façade drives the minimal
   async `Message -> Model -> ToolCall -> ToolResult` loop with typed messages,
@@ -29,6 +29,22 @@ adapters are removed; the changelog records the migration.
   removed. See the
   [target architecture](docs/internal/architecture/agent-runtime.md) and
   [migration plan](docs/internal/plans/pi-aligned-agent-runtime.md).
+
+- **Typed Provider and Tool transactions**: OpenAI Responses, Anthropic
+  Messages, and compatible Chat Completions enter one provider-neutral Message
+  stream. Tool execution is serial by default, preserves input order under
+  bounded parallelism, and produces one terminal `ToolResult` for every call.
+- **Explicit persistence boundary**: loop transactions can be written to the
+  Session Journal. Making Session/Harness authoritative for compact, resume,
+  fork, and recovery is still active migration work. Trace artifacts and
+  `qita` are observational, not recovery truth.
+
+## Historical pre-migration highlights
+
+The entries below describe behavior from the retired v0.6 runtime. They remain
+as migration context; names such as `Engine`, `AgentModule`, `Decision`, parser,
+critic, checkpoint, and recipe are not current execution APIs.
+
 - **Cache-stable long runs**: canonical model history stays append-only between explicit
   compactions. Engine warns at 80%, compacts at 85%, records Provider cache/prefix facts,
   and appends changed application `ContextSnapshot` revisions without rewriting an old
@@ -54,7 +70,7 @@ adapters are removed; the changelog records the migration.
   development environment includes async-test support, and build/audit jobs require a
   `setuptools` release fixed for `PYSEC-2026-3447`.
 - **Provider-owned model caching**: the deprecated local response-cache package and
-  implicit `Engine(cache_backend=...)` model mutation are gone. QitOS no longer replays
+  implicit local model mutation are gone. QitOS no longer replays
   a previous provider transaction as a new model call; provider-native prompt caching,
   cache usage, deadlines, continuation, and trace facts remain authoritative.
 - **One runtime configuration path**: the disconnected `qitos.config` YAML builder,
@@ -86,8 +102,8 @@ adapters are removed; the changelog records the migration.
   `qitos-zoo` repository; QitOS recovery uses only canonical Session Journals or
   checkpoint stores.
 - **One executable Agent path**: the unused `qitos.func` decorator/compose package is
-  gone. Its direct calls bypassed Engine transactions, and its apparent `AgentModule`
-  adapter never ran the wrapped function. Agents now use `AgentModule + Engine`;
+  gone. Its direct calls bypassed canonical transactions, and its apparent lifecycle
+  adapter never ran the wrapped function. Agents now use the `Agent` façade;
   ordinary Python callables continue to use the maintained function-tool decorator.
 - **One canonical observability path**: the duplicate process-global tracing provider
   and its W&B/MLflow processors are gone. Runtime events, `TraceWriter`, the Session
@@ -114,10 +130,11 @@ adapters are removed; the changelog records the migration.
   official MCP protocol models retain their Pydantic validation. ToolCalls from
   incomplete or failed model terminals are retained only as diagnostics and never
   execute.
-- **Terminal facts recover completion delivery**: Background Child and managed-process completion
-  inputs are now deterministic projections of canonical Journal terminals. Resume
-  closes the terminal-to-mailbox crash window without a second store, does not redeliver
-  foreground Child results, keeps consumed event ids idempotent, and never turns inherited fork facts into new input. Canonical
+- **Deterministic completion projections**: Background Child and managed-process completion
+  inputs are deterministic projections of canonical Journal terminals. The retired
+  Engine recovery path that re-projected unconsumed inputs has been removed; closing
+  the terminal-to-mailbox crash window now remains an explicit authoritative
+  Session/Harness migration gate. Canonical
   `ToolResult` values also carry their model `call_id`, and Child factories may finish
   async resource construction safely. Foreground Child-local cancellation returns a
   terminal Child result without being misclassified as parent Task cancellation.
@@ -386,7 +403,11 @@ adapters are removed; the changelog records the migration.
 - **CyberGym integration hardening**: v0.6 integration runs now preserve valid OpenAI-compatible tool schemas, redact persisted secrets across traces/results/render artifacts, and keep CyberGym PoC-generation shell commands out of the interactive review path while preserving the default coding-tool guard.
 - **Lighter-weight CyberGym bootstrap guidance**: the CyberGym PoC agent now derives a compact task-spec summary, ranks likely parser/harness/sample paths more aggressively, tracks richer candidate provenance, and records a lightweight internal failure taxonomy without changing the single-agent runtime.
 
-## What's New in v0.5.0
+## Historical v0.5.0 highlights
+
+These features describe the v0.5 release and include APIs removed by the
+current breaking migration. Use the current runtime section and changelog for
+the supported surface.
 
 - **Method recipes**: Self-Refine, Reflexion, LATS, MoA, and Magentic-One are available
   as importable `qitos.recipes` implementations.
@@ -404,7 +425,8 @@ See [CHANGELOG.md](CHANGELOG.md) for the full list.
 
 ## Who QitOS is For
 
-- **Method researchers** who want to change prompts, parsers, critics, tools, and memory policies without rewriting the runtime.
+- **Agent researchers** who want to compare models, Tool policies, and context
+  strategies without replacing the runtime.
 - **Long-running agent debuggers** who care about trajectory review, replay, diff, and context-collapse diagnosis instead of app scaffolding alone.
 
 ## Run QitOS in 2 Minutes
@@ -413,7 +435,9 @@ The minimal agent in QitOS composes the `Agent` façade directly: one model, one
 Tool registry, one prompt.
 
 ```bash
-pip install "qitos[models]"
+git clone https://github.com/Qitor/qitos.git
+cd qitos
+pip install ".[models]"
 export OPENAI_API_KEY="sk-..."
 export OPENAI_BASE_URL="https://api.siliconflow.cn/v1/"
 export QITOS_MODEL="Qwen/Qwen3-8B"
@@ -431,8 +455,8 @@ Then go deeper:
 
 | If you want... | QitOS gives you... |
 |---|---|
-| reproducible agent research | one canonical runtime with durable trajectories |
-| observability | `qita` board, replay, export, and trace artifacts |
+| reproducible agent research | typed loop transactions and canonical journals |
+| artifact inspection | read-only `qita` board, replay, export, and diff for compatible traces |
 | less framework glue code | one canonical execution loop |
 
 ## Tooling Layout
@@ -466,7 +490,7 @@ Security-sensitive tools are explicit opt-in imports and are not part of `qitos`
 - First successful run: [Quickstart](https://qitor.mintlify.app/quickstart)
 - Install options: [Installation](https://qitor.mintlify.app/installation)
 - Compose your own agent: [Kit Reference](https://qitor.mintlify.app/reference/kit)
-- Inspect traces: [Observability](https://qitor.mintlify.app/guides/observability)
+- Inspect compatible traces: [Observability](https://qitor.mintlify.app/guides/observability)
 - Follow the course: [Tutorials](https://qitor.mintlify.app/tutorials)
 - Check commands: [CLI Reference](https://qitor.mintlify.app/reference/cli)
 
@@ -502,7 +526,7 @@ Security-sensitive tools are explicit opt-in imports and are not part of `qitos`
 QitOS is currently **Beta**.
 
 - Stable behavior: the minimal Agent loop and façade, canonical durable
-  journals, and the trace/qita flow.
+  journals, and qita inspection of compatible trace artifacts.
 - Likely to evolve: public Agent/runtime APIs, higher-level convenience APIs, some
   `kit` modules, and experimental toolsets.
 - If you are evaluating adoption, start from the kernel and examples, not assumptions about frozen surface area.
@@ -513,7 +537,7 @@ QitOS is currently **Beta**.
 - Supported Python version: **3.10+**
 - User install: `pip install "qitos[models]"`
 - Version check: `qit --version`
-- Minimal agent example: `python examples/quickstart/minimal_agent.py`
+- Minimal agent example (from a source checkout): `python examples/quickstart/minimal_agent.py`
 - Optional provider config: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `QITOS_MODEL`
 - Core-only install: `pip install qitos`
 - Repo source install: `pip install -r requirements.txt`
@@ -523,7 +547,13 @@ QitOS is currently **Beta**.
 
 ## Contributing
 
-Contributions are welcome, especially around method recipes, benchmark adapters, memory/history workflows, qita UX, and framework contracts. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for the PR process, [DEVELOPMENT.md](DEVELOPMENT.md) for the local workflow, [ARCHITECTURE.md](ARCHITECTURE.md) for system design, [SECURITY.md](SECURITY.md) for disclosure guidance, and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
+Contributions are welcome, especially around the Agent runtime, tools, provider adapters,
+Session journals, qita UX, and documentation. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md) for the PR process,
+[DEVELOPMENT.md](DEVELOPMENT.md) for the local workflow,
+[ARCHITECTURE.md](ARCHITECTURE.md) for system design,
+[SECURITY.md](SECURITY.md) for disclosure guidance, and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations.
 
 ## License
 

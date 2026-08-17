@@ -9,7 +9,7 @@ QitOS 是面向智能体（agent）研究者的类 PyTorch 风格框架。当前
 
 QitOS 提供两种顶层的智能体编写方式：
 
-- 研究优先（research-first）：手写提示词（prompt）、解析器（parser）、协议（protocol，模型输出的格式契约）、传输层（transport，与模型 API 通信的客户端）和工具面（tool surface），直接研究与优化内核（kernel，执行内核）。
+- façade 优先：显式选择提示词、Provider 中立 Model 与冻结的工具面（tool surface）。
 - 预设优先（preset-first）：从家族预设（family preset，预配置的模型家族默认值）和预设工具构建器出发，快速得到稳定基线（baseline）与多模型切换能力。
 
 这两种方式都是一等公民。
@@ -40,7 +40,9 @@ QitOS 提供两种顶层的智能体编写方式：
 <Steps>
   <Step title="安装 QitOS">
     ```bash
-    pip install "qitos[models]"
+    git clone https://github.com/Qitor/qitos.git
+    cd qitos
+    pip install ".[models]"
     ```
   </Step>
   <Step title="设置提供商配置">
@@ -65,10 +67,10 @@ QitOS 提供两种顶层的智能体编写方式：
     按主题组织的课程：工具、预设、可观测性与运行生命周期
   </Card>
   <Card title="可观测性" icon="chart-line" href="/zh/guides/observability">
-    内置 `qita` 看板、回放与 HTML 导出
+    用 `qita` 看板检查、回放并导出兼容 trace artifact
   </Card>
   <Card title="Kit 工具箱" icon="toolbox" href="/zh/reference/kit">
-    解析器、工具集、记忆、历史、规划器与评估器（critic）
+    工具、记忆适配器、环境、journal 与子智能体
   </Card>
 </CardGroup>
 

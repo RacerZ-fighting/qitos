@@ -13,6 +13,9 @@ import os
 from typing import Any, Dict, List, Optional
 
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool_result import ToolResult
+
+from qitos.kit.tool.internal.results import error_result
 
 
 class PasswordToolSet:
@@ -280,7 +283,7 @@ class PasswordToolSet:
         format: str = "",
         rules: str = "",
         extra_args: str = "",
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Crack password hashes using John the Ripper.
 
@@ -295,10 +298,10 @@ class PasswordToolSet:
         :return: Cracking results with cracked passwords and statistics.
         """
         if not os.path.isfile(hash_file):
-            return {"status": "error", "message": f"Hash file not found: {hash_file}"}
+            return error_result({"status": "error", "message": f"Hash file not found: {hash_file}"})
 
         if not os.path.isfile(wordlist):
-            return {"status": "error", "message": f"Wordlist not found: {wordlist}"}
+            return error_result({"status": "error", "message": f"Wordlist not found: {wordlist}"})
 
         cmd = ["john"]
 
@@ -383,7 +386,7 @@ class PasswordToolSet:
         mask: str = "",
         rules_file: str = "",
         force: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Crack password hashes using Hashcat.
 
@@ -406,18 +409,18 @@ class PasswordToolSet:
         :return: Cracking results with cracked passwords and performance statistics.
         """
         if not os.path.isfile(hash_file):
-            return {"status": "error", "message": f"Hash file not found: {hash_file}"}
+            return error_result({"status": "error", "message": f"Hash file not found: {hash_file}"})
 
         if attack_mode in (0, 1, 6) and not wordlist:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Wordlist required for attack mode {attack_mode}.",
-            }
+            })
         if attack_mode == 3 and not mask:
-            return {
+            return error_result({
                 "status": "error",
                 "message": "Mask pattern required for mask attack (mode 3).",
-            }
+            })
 
         cmd = [
             "hashcat",
@@ -510,7 +513,7 @@ class PasswordToolSet:
         threads: int = 4,
         port: int = 0,
         extra_args: str = "",
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Brute-force login credentials using Hydra.
 
@@ -537,13 +540,13 @@ class PasswordToolSet:
         :return: Brute-force results with discovered credentials.
         """
         if not self._validate_target(target):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target}' is not in the authorized scope.",
-            }
+            })
 
         if not os.path.isfile(wordlist):
-            return {"status": "error", "message": f"Wordlist not found: {wordlist}"}
+            return error_result({"status": "error", "message": f"Wordlist not found: {wordlist}"})
 
         valid_services = [
             "ssh",
@@ -561,10 +564,10 @@ class PasswordToolSet:
         ]
 
         if service not in valid_services:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Invalid service '{service}'. Choose from: {', '.join(valid_services)}",
-            }
+            })
 
         cmd = [
             "hydra",
@@ -643,7 +646,7 @@ class PasswordToolSet:
         max_length: int = 0,
         charset: str = "",
         rules: str = "",
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Manage and transform password wordlists.
 
@@ -670,17 +673,17 @@ class PasswordToolSet:
 
         valid_actions = ["filter", "unique", "sort", "combine", "stats", "generate"]
         if action not in valid_actions:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Invalid action '{action}'. Choose from: {', '.join(valid_actions)}",
-            }
+            })
 
         if (
             action != "generate"
             and action != "combine"
             and not os.path.isfile(input_file)
         ):
-            return {"status": "error", "message": f"Input file not found: {input_file}"}
+            return error_result({"status": "error", "message": f"Input file not found: {input_file}"})
 
         if action == "stats":
             # Count lines and analyze wordlist
@@ -688,7 +691,7 @@ class PasswordToolSet:
                 lines = [l.strip() for l in f if l.strip()]
 
             if not lines:
-                return {"status": "error", "message": "Wordlist is empty."}
+                return error_result({"status": "error", "message": "Wordlist is empty."})
 
             lengths = [len(l) for l in lines]
             unique = set(lines)
@@ -727,10 +730,10 @@ class PasswordToolSet:
                 timeout=300,
             )
             if result["return_code"] != 0:
-                return {
+                return error_result({
                     "status": "error",
                     "message": f"Failed to process: {result['stderr']}",
-                }
+                })
 
             with open(output_file, "r", errors="ignore") as f:
                 count = sum(1 for _ in f)
@@ -751,10 +754,10 @@ class PasswordToolSet:
                 ["sort", input_file, "-o", output_file], timeout=300
             )
             if result["return_code"] != 0:
-                return {
+                return error_result({
                     "status": "error",
                     "message": f"Failed to sort: {result['stderr']}",
-                }
+                })
 
             output = f"### 📋 Wordlist Sorted\n\n"
             output += f"**Output:** `{output_file}`\n"
@@ -794,4 +797,4 @@ class PasswordToolSet:
                 "data": {"output_file": output_file, "filtered_count": count},
             }
 
-        return {"status": "error", "message": f"Action '{action}' not yet implemented."}
+        return error_result({"status": "error", "message": f"Action '{action}' not yet implemented."})

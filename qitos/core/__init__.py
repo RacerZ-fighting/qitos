@@ -47,7 +47,6 @@ from .process import (
     ProcessStatus,
     ProcessTerminalNotifier,
 )
-from .history import HistoryMessage, HistorySnapshot
 from .journal import (
     JournalAppendCancelled,
     JournalClosedError,
@@ -118,7 +117,6 @@ from .tool import (
 from .tool_schema import function_schema, type_to_json_schema, parse_docstring
 from .function_tool_decorator import function_tool
 from .tool_registry import ToolExposure, ToolRegistry
-from .turn import TurnBudgetSnapshot, TurnRuntimeCapabilities, TurnSnapshot
 from .work_plan import (
     MAX_WORK_PLAN_EXPLANATION_CHARS,
     MAX_WORK_PLAN_ITEMS,
@@ -135,7 +133,7 @@ from .work_plan import (
     work_plan_state_from_dict,
     work_plan_state_to_dict,
 )
-from .cancellation import CancelMode, CancelToken
+from .cancellation import CancelMode, CancelSignalView, CancelToken
 from .message import (
     AssistantMessage,
     ImageContent,
@@ -244,8 +242,6 @@ __all__ = [
     "ProcessSnapshot",
     "ProcessStatus",
     "ProcessTerminalNotifier",
-    "HistoryMessage",
-    "HistorySnapshot",
     "JournalAppendCancelled",
     "JournalClosedError",
     "JournalCommitError",
@@ -317,9 +313,6 @@ __all__ = [
     "function_tool",
     "ToolRegistry",
     "ToolExposure",
-    "TurnBudgetSnapshot",
-    "TurnRuntimeCapabilities",
-    "TurnSnapshot",
     "MAX_WORK_PLAN_EXPLANATION_CHARS",
     "MAX_WORK_PLAN_ITEMS",
     "MAX_WORK_PLAN_STEP_CHARS",
@@ -335,6 +328,7 @@ __all__ = [
     "work_plan_state_from_dict",
     "work_plan_state_to_dict",
     "CancelMode",
+    "CancelSignalView",
     "CancelToken",
     "AssistantMessage",
     "ImageContent",

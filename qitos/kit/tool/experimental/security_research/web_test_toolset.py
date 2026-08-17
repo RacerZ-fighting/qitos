@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from qitos.core.function_tool_decorator import function_tool
+from qitos.core.tool_result import ToolResult
+
+from qitos.kit.tool.internal.results import error_result
 
 
 class WebTestToolSet:
@@ -255,7 +258,7 @@ class WebTestToolSet:
         risk: int = 2,
         dbms: str = "",
         threads: int = 5,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Run SQLMap to detect and exploit SQL injection vulnerabilities.
 
@@ -274,15 +277,15 @@ class WebTestToolSet:
         """
         target_url = self._normalize_url(target_url)
         if not self._validate_target(target_url):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target_url}' is not in the authorized scope.",
-            }
+            })
 
         if not 1 <= level <= 5:
-            return {"status": "error", "message": "Level must be between 1 and 5."}
+            return error_result({"status": "error", "message": "Level must be between 1 and 5."})
         if not 1 <= risk <= 3:
-            return {"status": "error", "message": "Risk must be between 1 and 3."}
+            return error_result({"status": "error", "message": "Risk must be between 1 and 3."})
 
         cmd = [
             "sqlmap",
@@ -309,7 +312,7 @@ class WebTestToolSet:
         result = self._run_command(cmd, timeout=1800)
 
         if result["return_code"] not in (0, 1):
-            return {"status": "error", "message": f"SQLMap failed: {result['stderr']}"}
+            return error_result({"status": "error", "message": f"SQLMap failed: {result['stderr']}"})
 
         parsed = self._parse_sqlmap_output(
             result.get("stdout", "") + result.get("stderr", "")
@@ -355,7 +358,7 @@ class WebTestToolSet:
         extensions: str = "",
         threads: int = 10,
         status_codes: str = "200,204,301,302,403",
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Discover hidden directories and files using Gobuster.
 
@@ -372,10 +375,10 @@ class WebTestToolSet:
         """
         target_url = self._normalize_url(target_url)
         if not self._validate_target(target_url):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target_url}' is not in the authorized scope.",
-            }
+            })
 
         cmd = [
             "gobuster",
@@ -398,10 +401,10 @@ class WebTestToolSet:
         result = self._run_command(cmd, timeout=1200)
 
         if result["return_code"] != 0 and not result["stdout"]:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Directory brute-force failed: {result['stderr']}",
-            }
+            })
 
         findings = self._parse_gobuster_output(result["stdout"])
 
@@ -442,7 +445,7 @@ class WebTestToolSet:
         }
 
     @function_tool(name="header_check", needs_approval=True)
-    def header_check(self, target_url: str) -> Dict[str, Any]:
+    def header_check(self, target_url: str) -> Dict[str, Any] | ToolResult:
         """
         Analyze HTTP security headers of a target.
 
@@ -454,19 +457,19 @@ class WebTestToolSet:
         """
         target_url = self._normalize_url(target_url)
         if not self._validate_target(target_url):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target_url}' is not in the authorized scope.",
-            }
+            })
 
         cmd = ["curl", "-sI", "-L", "--max-time", "15", target_url]
         result = self._run_command(cmd, timeout=30)
 
         if result["return_code"] != 0 and not result["stdout"]:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Failed to fetch headers: {result['stderr']}",
-            }
+            })
 
         headers = self._parse_headers(result["stdout"])
         findings = self._check_security_headers(headers)
@@ -510,7 +513,7 @@ class WebTestToolSet:
         }
 
     @function_tool(name="ssl_check", needs_approval=True)
-    def ssl_check(self, target_url: str) -> Dict[str, Any]:
+    def ssl_check(self, target_url: str) -> Dict[str, Any] | ToolResult:
         """
         Check SSL/TLS configuration of a target.
 
@@ -522,10 +525,10 @@ class WebTestToolSet:
         """
         target_url = self._normalize_url(target_url)
         if not self._validate_target(target_url):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target_url}' is not in the authorized scope.",
-            }
+            })
 
         parsed = urlparse(target_url)
         host = parsed.hostname or target_url.replace("https://", "").replace(
@@ -592,7 +595,7 @@ class WebTestToolSet:
         }
 
     @function_tool(name="tech_detect", needs_approval=True)
-    def tech_detect(self, target_url: str) -> Dict[str, Any]:
+    def tech_detect(self, target_url: str) -> Dict[str, Any] | ToolResult:
         """
         Detect technologies used by a web application.
 
@@ -604,10 +607,10 @@ class WebTestToolSet:
         """
         target_url = self._normalize_url(target_url)
         if not self._validate_target(target_url):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target_url}' is not in the authorized scope.",
-            }
+            })
 
         cmd = ["whatweb", "-q", "--color=never", target_url]
         result = self._run_command(cmd, timeout=60)
@@ -663,10 +666,10 @@ class WebTestToolSet:
                     "data": {"technologies": technologies, "target_url": target_url},
                 }
 
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Technology detection failed: {result['stderr']}",
-            }
+            })
 
         # Parse WhatWeb output
         technologies = []
@@ -713,7 +716,7 @@ class WebTestToolSet:
         target_url: str,
         wordlist: str = "/usr/share/seclists/Discovery/DNS/subdomains-top1million-5000.txt",
         threads: int = 20,
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Enumerate virtual hosts on a target server.
 
@@ -727,10 +730,10 @@ class WebTestToolSet:
         """
         target_url = self._normalize_url(target_url)
         if not self._validate_target(target_url):
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"Target '{target_url}' is not in the authorized scope.",
-            }
+            })
 
         cmd = [
             "gobuster",
@@ -748,10 +751,10 @@ class WebTestToolSet:
         result = self._run_command(cmd, timeout=1200)
 
         if result["return_code"] != 0 and not result["stdout"]:
-            return {
+            return error_result({
                 "status": "error",
                 "message": f"VHost enumeration failed: {result['stderr']}",
-            }
+            })
 
         vhosts = []
         for line in result["stdout"].strip().split("\n"):

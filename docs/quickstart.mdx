@@ -20,8 +20,13 @@ Need a provider first? Read [Prerequisites](/prerequisites). It explains how to 
 <Steps>
   <Step title="Install QitOS">
     ```bash
-    pip install "qitos[models]"
+    git clone https://github.com/Qitor/qitos.git
+    cd qitos
+    pip install ".[models]"
     ```
+
+    The runnable examples live in the source repository rather than the wheel,
+    so the quickstart starts from a source checkout.
   </Step>
 
   <Step title="Set your provider config">

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from qitos.core.tool import BaseTool, ToolPermission, ToolSpec, ToolValidationResult
+from qitos.kit.tool.internal.results import error_result
 
 from qitos.kit.env.desktop.actions import GUI_ACTION_NAMES, KEYBOARD_KEYS, normalize_gui_action
 
@@ -48,12 +49,25 @@ class _GUIActionTool(BaseTool):
         )
         super().__init__(spec)
 
-    async def execute(self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None) -> Any:
+    async def execute(
+        self,
+        args: Dict[str, Any],
+        runtime_context: Optional[Dict[str, Any]] = None,
+    ) -> Any:
         controller = _controller_from_context(runtime_context)
         if controller is None:
-            raise RuntimeError("GUI controller ops are not available in the current runtime context")
-        payload = normalize_gui_action({"name": self.action_name, "args": dict(args or {})})
-        return controller.perform(payload, state=(runtime_context or {}).get("state"))
+            raise RuntimeError(
+                "GUI controller ops are not available in the current runtime context"
+            )
+        payload = normalize_gui_action(
+            {"name": self.action_name, "args": dict(args or {})}
+        )
+        result = controller.perform(
+            payload, state=(runtime_context or {}).get("state")
+        )
+        if isinstance(result, dict) and result.get("status") == "error":
+            return error_result(result)
+        return result
 
 
 class MoveTo(_GUIActionTool):

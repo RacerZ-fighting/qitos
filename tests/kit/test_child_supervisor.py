@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -43,11 +44,13 @@ def _context(
     *,
     journal: SessionJournal | None = None,
     post_runtime_event: ChildPostRuntimeEvent | None = None,
+    deadline_monotonic: float | None = None,
 ) -> ChildLaunchContext:
     return ChildLaunchContext(
         parent_run_id="parent-run",
         journal=journal,
         post_runtime_event=post_runtime_event,
+        deadline_monotonic=deadline_monotonic,
     )
 
 
@@ -168,6 +171,153 @@ class _CommitErrorJournal(JsonlSessionJournal):
 
 
 @pytest.mark.asyncio
+async def test_parent_deadline_bounds_waiting_invocation_factory(
+    monkeypatch,
+) -> None:
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    def unsupported_timeout_at(*_args, **_kwargs):
+        raise AssertionError("the Child deadline path requires Python 3.10 support")
+
+    monkeypatch.setattr(asyncio, "timeout_at", unsupported_timeout_at, raising=False)
+
+    async def build(_request, _context):
+        started.set()
+        await never.wait()
+        raise AssertionError("unreachable")
+
+    supervisor = ChildSupervisor(invocation_factory=build)
+    result = await supervisor.launch(
+        _request(),
+        _context(deadline_monotonic=time.monotonic() + 0.02),
+        background=False,
+    )
+
+    assert started.is_set()
+    assert result.status is ChildStatus.BUDGET_EXHAUSTED
+    assert result.ready is True
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parent_deadline_drains_engine_and_invocation_cleanup() -> None:
+    started = asyncio.Event()
+    engine_cancelled = asyncio.Event()
+    engine_settled = asyncio.Event()
+    invocation_cleaned = asyncio.Event()
+
+    class BlockingEngine(_ClosableEngine):
+        active_run_id = "child-run"
+
+        async def arun(self, task: str, **kwargs: object) -> object:
+            _ = task, kwargs
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                engine_settled.set()
+
+        def cancel(self, mode: str) -> None:
+            assert mode == "immediate"
+            engine_cancelled.set()
+
+    async def cleanup() -> None:
+        invocation_cleaned.set()
+
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=BlockingEngine(),
+            task=request.task,
+            cleanup=cleanup,
+        )
+    )
+    result = await supervisor.launch(
+        _request(),
+        _context(deadline_monotonic=time.monotonic() + 0.02),
+        background=False,
+    )
+
+    assert started.is_set()
+    assert result.status is ChildStatus.BUDGET_EXHAUSTED
+    assert engine_cancelled.is_set()
+    assert engine_settled.is_set()
+    assert invocation_cleaned.is_set()
+    assert not {
+        task.get_name()
+        for task in asyncio.all_tasks()
+        if not task.done() and "deadline-" in task.get_name()
+    }
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parent_deadline_bounds_waiting_supervisor_slot() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    factory_calls = 0
+
+    class BlockingEngine(_ClosableEngine):
+        active_run_id = "child-run"
+
+        async def arun(self, task: str, **kwargs: object) -> object:
+            _ = task, kwargs
+            started.set()
+            await release.wait()
+            return SimpleNamespace(
+                state=SimpleNamespace(final_result="done", stop_reason="completed"),
+                records=[],
+                step_count=1,
+                total_tokens=0,
+                run_id="child-run",
+            )
+
+        def cancel(self, mode: str) -> None:
+            _ = mode
+            release.set()
+
+    async def build(request, _context):
+        nonlocal factory_calls
+        factory_calls += 1
+        return ChildInvocation(engine=BlockingEngine(), task=request.task)
+
+    supervisor = ChildSupervisor(invocation_factory=build, max_concurrency=1)
+    first = await supervisor.launch(_request("first"), _context(), background=True)
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    second = await supervisor.launch(
+        _request("second"),
+        _context(deadline_monotonic=time.monotonic() + 0.02),
+        background=False,
+    )
+
+    assert first.status is ChildStatus.RUNNING
+    assert second.status is ChildStatus.BUDGET_EXHAUSTED
+    assert factory_calls == 1
+    release.set()
+    terminal = await supervisor.wait(first.handle, timeout_seconds=1)
+    assert terminal is not None and terminal.status is ChildStatus.COMPLETED
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_factory_timeout_fault_is_not_misreported_as_parent_deadline() -> None:
+    async def build(_request, _context):
+        raise TimeoutError("factory fault")
+
+    supervisor = ChildSupervisor(invocation_factory=build)
+    result = await supervisor.launch(
+        _request(),
+        _context(deadline_monotonic=time.monotonic() + 1.0),
+        background=False,
+    )
+
+    assert result.status is ChildStatus.FAILED
+    assert result.error == "factory fault"
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_foreground_children_share_supervisor_concurrency_limit() -> None:
     started: asyncio.Queue[str] = asyncio.Queue()
     release_first = asyncio.Event()
@@ -252,6 +402,7 @@ async def test_foreground_child_local_cancellation_does_not_cancel_parent() -> N
 @pytest.mark.asyncio
 async def test_foreground_child_preserves_real_caller_cancellation() -> None:
     factory_started = asyncio.Event()
+    factory_settled = asyncio.Event()
 
     async def waiting_factory(
         request: ChildLaunchRequest,
@@ -259,12 +410,18 @@ async def test_foreground_child_preserves_real_caller_cancellation() -> None:
     ) -> ChildInvocation:
         _ = request
         factory_started.set()
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")  # pragma: no cover
+        try:
+            await asyncio.Event().wait()
+        finally:
+            factory_settled.set()
 
     supervisor = ChildSupervisor(invocation_factory=waiting_factory)
     launch_task = asyncio.create_task(
-        supervisor.launch(_request(), _context(), background=False)
+        supervisor.launch(
+            _request(),
+            _context(deadline_monotonic=time.monotonic() + 10),
+            background=False,
+        )
     )
     await factory_started.wait()
     launch_task.cancel()
@@ -272,6 +429,12 @@ async def test_foreground_child_preserves_real_caller_cancellation() -> None:
     with pytest.raises(asyncio.CancelledError):
         await launch_task
 
+    assert factory_settled.is_set()
+    assert not {
+        task.get_name()
+        for task in asyncio.all_tasks()
+        if not task.done() and "deadline-" in task.get_name()
+    }
     assert await supervisor.aclose() == 0
 
 

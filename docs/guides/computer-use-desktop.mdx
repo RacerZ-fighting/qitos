@@ -1,144 +1,67 @@
 ---
-title: "Computer Use and Desktop Env"
-description: "Build OSWorld-inspired desktop agents on QitOS without binding yourself to a provider-specific computer-use API."
+title: "Computer use and DesktopEnv"
+description: "Compose QitOS desktop environment and GUI Tool primitives with the current Agent façade."
 ---
 
-QitOS v0.5 now has a first official provider-neutral **computer-use lane** (a complete execution path for GUI and desktop interaction) for desktop and GUI work.
+QitOS provides reusable desktop primitives rather than a second computer-use runtime:
 
-This lane is inspired by the original OSWorld architecture and task loop, but it is implemented in QitOS-native pieces:
+- `DesktopEnv` for screenshot, accessibility, terminal, and GUI-controller operations;
+- `qitos.kit.tool.gui` for atomic GUI Tools;
+- `ComputerUseToolSet` and `computer_use_tools()` for explicit Tool registration;
+- typed `UserMessage` image blocks for Provider-neutral multimodal input.
 
-- `DesktopEnv` for screenshot + accessibility + terminal observations (the data returned by the environment after each action)
-- `qitos.kit.tool.gui` for atomic GUI actions
-- `ComputerUseToolSet` / `computer_use_tools()` for composition-first authoring
-- `desktop_actions_json_v1` and `desktop_actions_xml_v1` for protocol-aware (each protocol defines the output format the model must follow) scaffolding
-- OpenAI-compatible multimodal image input for the current screenshot turn
+The current Agent loop consumes typed messages and native Provider Tool calls. It does
+not load `desktop_actions_*` protocols, text parsers, or `Decision` objects.
 
-## Why this lane exists
-
-The official OpenAI computer-use APIs are useful, but they are also provider-specific. QitOS takes a different default path for research:
-
-- keep the **model input** on the existing OpenAI-compatible image-input lane,
-- keep the **output contract** in QitOS protocols (output format definitions) and parsers (components that convert raw model output into structured Decisions),
-- keep the **desktop runtime** in a provider-neutral environment adapter.
-
-The same computer-use harness (the configured adapter + protocol + toolset combination) can be used with:
-
-- OpenAI-compatible multimodal APIs,
-- open-source models that only understand JSON or XML scaffolding,
-
-## Core pieces
-
-### `DesktopEnv`
-
-Use `DesktopEnv` when you want an OSWorld-style desktop environment with QitOS contracts.
+## Build an environment and Tool registry
 
 ```python
 from qitos.kit.env import DesktopEnv
+from qitos.kit.toolset import computer_use_tools
 
 env = DesktopEnv.from_mock(
-    screenshot_path="/tmp/desktop.png",
+    screenshot_path="screen.png",
     instruction="Click the visible Continue button.",
     accessibility_tree={"role": "window", "name": "Demo"},
 )
-```
-
-Current provider layers:
-
-- `MockDesktopProvider` for smoke runs and deterministic examples
-- `ContainerDesktopProvider` for container-first desktop kernels
-
-### GUI tools
-
-Atomic GUI tools live under `qitos.kit.tool.gui`.
-
-```python
-from qitos.kit.tool.gui import Click, TypeText, Hotkey
-```
-
-The action vocabulary aligns with OSWorld-style desktop actions:
-
-- `move_to`
-- `click`
-- `mouse_down`
-- `mouse_up`
-- `right_click`
-- `double_click`
-- `drag_to`
-- `scroll`
-- `type_text`
-- `press_key`
-- `key_down`
-- `key_up`
-- `hotkey`
-- `wait`
-- `done`
-- `fail`
-
-### Composition-first toolset
-
-Most users should not register each GUI tool by hand. Start from the preset bundle:
-
-```python
-from qitos.kit.toolset import computer_use_tools
-
 registry = computer_use_tools()
 ```
 
-Or stay on the list-first authoring path:
+The GUI Tools resolve `gui_controller` operations from the Agent's runtime `env`. The
+application still owns environment setup, reset, teardown, authorization, and the
+projection of each fresh observation into the next user message.
 
 ```python
-from qitos.kit import ComputerUseToolSet
+from qitos.core.agent import Agent
 
-agent = MyAgent(
-    toolset=[ComputerUseToolSet()],
-    llm=model,
-    model_protocol="desktop_actions_json_v1",
-)
+agent = Agent(model=model, tool_registry=registry, env=env, max_turns=8)
 ```
 
-## Protocol choice
+Do not treat `env=env` as automatic observation polling. Capture the observation at an
+application safe point and construct a typed multimodal message; see
+[Multimodal messages](/guides/multimodal-core).
 
-QitOS keeps **multimodal input** and **output scaffolding** as separate concerns.
+## Atomic GUI actions
 
-- multimodal input answers: what can the model see?
-- protocol/parser answers: how should the model respond?
+The Tool set exposes pointer, keyboard, scroll, wait, done, and fail actions. They use
+the same Tool validation, permission, deadline, cancellation, and terminal-result
+contract as other QitOS Tools. Tool execution is serial unless a Tool explicitly
+declares safe concurrency; GUI actions do not.
 
-For desktop work, QitOS now ships two protocol presets:
-
-- `desktop_actions_json_v1`
-- `desktop_actions_xml_v1`
-
-Use JSON first when the model is comfortable with structured JSON.
-Use XML when the model tends to follow tag-based contracts more reliably.
-
-```python
-agent = MyAgent(
-    toolset=[ComputerUseToolSet()],
-    llm=model,
-    model_protocol="desktop_actions_xml_v1",
-)
-```
-
-The design principle is the same one used elsewhere in QitOS: adapt the scaffolding to the model, instead of assuming one parser/prompt shape fits every family.
-
-## Environment smoke example
-
-The smallest environment-only loop is:
+## Smoke-test the environment boundary
 
 ```bash
 python examples/real/desktop_env_smoke.py
 ```
 
-It exercises `DesktopEnv` and the computer-use toolset without a model.
+This source-checkout example exercises `DesktopEnv` and the GUI Tools without a model.
 
-## Container-first direction
+## Current boundary
 
-The desktop lane is designed to be **container-first**.
-This keeps desktop runs aligned with:
+QitOS does not claim an end-to-end OSWorld runner, an automatic screenshot-observe
+loop, or a provider-specific computer-use API. Applications compose those policies
+around the same `Agent` façade and keep product/benchmark behavior outside the kernel.
 
-- reproducible desktop state
-- provider isolation
-- clean env lifecycles
-
-The qita visual inspection surface covers screenshot-backed runs.
-It still does not claim full OSWorld parity or full v0.6 replay depth.
+`qita` can still inspect compatible screenshot-backed trace artifacts produced by an
+older runtime or an explicit application-side producer. New façade runs do not emit
+those trace directories automatically.

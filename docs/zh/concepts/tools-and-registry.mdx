@@ -29,7 +29,7 @@ def read_file(path: str) -> str:
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
-| `name` | `str \| None` | 在 `Decision.actions` 中使用的工具名。默认是函数 `__name__`。 |
+| `name` | `str \| None` | 模型 `ToolCall` 中使用的工具名。默认是函数 `__name__`。 |
 | `description` | `str \| None` | 展示给大模型的工具说明。默认回退到文档字符串。 |
 | `group` | `str` | 由应用定义的 exposure 分组。默认是 `"default"`。 |
 | `timeout_s` | `float \| None` | 整个 action 的超时，包括预检、重试和实际调用。 |
@@ -163,7 +163,7 @@ pipeline 时的后备行为。
 
 每个完成的模型事务都会记录 `prompt_metadata.tool_exposure`，其中包含源 registry
 revision、精确工具名、Schema 摘要和应用选择元数据。journal replay 因此可以解释历史
-决策实际使用的工具面，而不把当前可变 registry 当作历史真源。
+模型事务实际使用的工具面，而不把当前可变 registry 当作历史真源。
 
 ---
 

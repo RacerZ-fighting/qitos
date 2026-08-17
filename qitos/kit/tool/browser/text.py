@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from qitos.core.tool import BaseTool, ToolPermission, ToolSpec
+from qitos.core.tool_result import ToolResult
+from qitos.kit.tool.internal.results import error_result
 
 
 class _WebBrowserTool(BaseTool):
@@ -43,7 +45,7 @@ class WebSearch(_WebBrowserTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Search the web and return top readable results through the browser env.
 
@@ -55,7 +57,12 @@ class WebSearch(_WebBrowserTool):
         """
         query = str(args.get("query", ""))
         max_results = int(args.get("max_results", 8))
-        return self._ops(runtime_context).search(query=query, max_results=max_results)
+        payload = self._ops(runtime_context).search(
+            query=query, max_results=max_results
+        )
+        if payload.get("status") == "error":
+            return error_result(payload)
+        return payload
 
 
 class VisitURL(_WebBrowserTool):
@@ -82,7 +89,7 @@ class VisitURL(_WebBrowserTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Visit a URL and load its readable text into the browser state.
 
@@ -94,7 +101,10 @@ class VisitURL(_WebBrowserTool):
         """
         url = str(args.get("url", ""))
         max_chars = int(args.get("max_chars", 30000))
-        return self._ops(runtime_context).visit(url=url, max_chars=max_chars)
+        payload = self._ops(runtime_context).visit(url=url, max_chars=max_chars)
+        if payload.get("status") == "error":
+            return error_result(payload)
+        return payload
 
 
 class PageDown(_WebBrowserTool):
@@ -114,7 +124,7 @@ class PageDown(_WebBrowserTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Scroll the current text page downward.
 
@@ -122,7 +132,10 @@ class PageDown(_WebBrowserTool):
         :param runtime_context: Optional runtime ops injected by the engine.
         """
         lines = int(args.get("lines", 40))
-        return self._ops(runtime_context).page_down(lines=lines)
+        payload = self._ops(runtime_context).page_down(lines=lines)
+        if payload.get("status") == "error":
+            return error_result(payload)
+        return payload
 
 
 class PageUp(_WebBrowserTool):
@@ -142,7 +155,7 @@ class PageUp(_WebBrowserTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Scroll the current text page upward.
 
@@ -150,7 +163,10 @@ class PageUp(_WebBrowserTool):
         :param runtime_context: Optional runtime ops injected by the engine.
         """
         lines = int(args.get("lines", 40))
-        return self._ops(runtime_context).page_up(lines=lines)
+        payload = self._ops(runtime_context).page_up(lines=lines)
+        if payload.get("status") == "error":
+            return error_result(payload)
+        return payload
 
 
 class FindInPage(_WebBrowserTool):
@@ -170,7 +186,7 @@ class FindInPage(_WebBrowserTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Find a keyword in the current page and jump to its first occurrence.
 
@@ -178,7 +194,10 @@ class FindInPage(_WebBrowserTool):
         :param runtime_context: Optional runtime ops injected by the engine.
         """
         keyword = str(args.get("keyword", ""))
-        return self._ops(runtime_context).find(keyword=keyword)
+        payload = self._ops(runtime_context).find(keyword=keyword)
+        if payload.get("status") == "error":
+            return error_result(payload)
+        return payload
 
 
 class FindNext(_WebBrowserTool):
@@ -198,14 +217,17 @@ class FindNext(_WebBrowserTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Jump to the next occurrence of the most recent page search.
 
         :param runtime_context: Optional runtime ops injected by the engine.
         """
         _ = args
-        return self._ops(runtime_context).find_next()
+        payload = self._ops(runtime_context).find_next()
+        if payload.get("status") == "error":
+            return error_result(payload)
+        return payload
 
 
 class ArchiveSearch(_WebBrowserTool):
@@ -228,7 +250,7 @@ class ArchiveSearch(_WebBrowserTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Search archived web snapshots through the browser env.
 
@@ -238,9 +260,12 @@ class ArchiveSearch(_WebBrowserTool):
         """
         query = str(args.get("query", ""))
         max_results = int(args.get("max_results", 8))
-        return self._ops(runtime_context).archive_search(
+        payload = self._ops(runtime_context).archive_search(
             query=query, max_results=max_results
         )
+        if payload.get("status") == "error":
+            return error_result(payload)
+        return payload
 
 
 __all__ = [

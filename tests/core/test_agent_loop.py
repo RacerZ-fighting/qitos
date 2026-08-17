@@ -10,20 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 from typing import List
 
 import pytest
 
 from qitos.core.agent_events import (
-    AgentEnd,
-    AgentStart,
-    MessageEnd,
-    MessageStart,
     MessageUpdate,
-    ToolExecutionEnd,
-    ToolExecutionStart,
     TurnEnd,
-    TurnStart,
 )
 from qitos.core.agent_loop import (
     AgentContext,
@@ -34,7 +28,7 @@ from qitos.core.agent_loop import (
     run_agent_loop,
     run_agent_loop_continue,
 )
-from qitos.core.cancellation import CancelToken
+from qitos.core.cancellation import CancelMode, CancelToken
 from qitos.core.message import (
     AssistantMessage,
     ToolResultMessage,
@@ -158,6 +152,44 @@ async def test_tool_schema_is_projected_into_request_options() -> None:
 
 
 @pytest.mark.asyncio
+async def test_env_permission_context_cannot_be_replaced_by_runtime_context() -> None:
+    env_authority = object()
+    forged_authority = object()
+    observed = []
+
+    @tool(name="inspect_permission_context")
+    def _inspect_permission_context(runtime_context=None) -> str:
+        observed.append(runtime_context["permission_context"])
+        return "ok"
+
+    model = ScriptedModel(
+        [
+            tool_events(
+                [tool_call_wire("c1", "inspect_permission_context", {})]
+            ),
+            text_events("done"),
+        ]
+    )
+    context = AgentContext(
+        messages=[],
+        tools=_registry(_inspect_permission_context).freeze(),
+        env=SimpleNamespace(tool_permission_context=env_authority),
+    )
+    config = AgentLoopConfig(
+        model=model,
+        run_id="run-env-authority",
+        runtime_context={"permission_context": forged_authority},
+    )
+
+    result = await run_agent_loop(
+        [UserMessage(content="inspect")], context, config, None
+    )
+
+    assert result.status is AgentRunStatus.COMPLETED
+    assert observed == [env_authority]
+
+
+@pytest.mark.asyncio
 async def test_unknown_tool_gets_terminal_error_without_execution() -> None:
     model = ScriptedModel(
         [tool_events([tool_call_wire("c1", "missing", {})]), text_events("ok")]
@@ -245,6 +277,49 @@ async def test_truncated_message_fails_whole_batch_without_execution() -> None:
     assert len(results) == 2
     assert all(r.status == "error" for r in results)
     assert all(r.metadata["error_category"] == "arguments_truncated" for r in results)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_provider_call_ids_preserve_evidence_and_fail_closed() -> None:
+    executed: list[str] = []
+
+    @tool(name="tracked")
+    def _tracked(text: str) -> str:
+        executed.append(text)
+        return text
+
+    model = ScriptedModel(
+        [
+            tool_events(
+                [
+                    tool_call_wire("duplicate", "tracked", {"text": "a"}),
+                    tool_call_wire("duplicate", "tracked", {"text": "b"}),
+                ]
+            )
+        ]
+    )
+    transaction = RecordingTransaction()
+    context = AgentContext(messages=[], tools=_registry(_tracked).freeze())
+    config = AgentLoopConfig(
+        model=model, run_id="run-duplicate", transaction=transaction
+    )
+
+    result = await run_agent_loop(
+        [UserMessage(content="go")], context, config, None
+    )
+
+    assert result.status is AgentRunStatus.FAILED
+    assert executed == []
+    assistant = context.messages[-1]
+    assert isinstance(assistant, AssistantMessage)
+    assert [call.id for call in assistant.tool_calls] == ["duplicate", "duplicate"]
+    assert [call.arguments["text"] for call in assistant.tool_calls] == ["a", "b"]
+    assert assistant.error == "assistant tool call ids must be unique"
+    assert [record[0] for record in transaction.records] == [
+        "model_terminal",
+        "turn_committed",
+        "run_terminal",
+    ]
 
 
 @pytest.mark.asyncio
@@ -418,6 +493,40 @@ async def test_max_turns_stops_a_tool_calling_run() -> None:
 
     assert result.status is AgentRunStatus.MAX_TURNS
     assert len(model.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_max_turns_does_not_drain_queues_without_next_turn_capacity() -> None:
+    steering_polls = 0
+    follow_up_polls = 0
+
+    def _steering():
+        nonlocal steering_polls
+        steering_polls += 1
+        return []
+
+    def _follow_up():
+        nonlocal follow_up_polls
+        follow_up_polls += 1
+        return [UserMessage(content="still queued")]
+
+    model = ScriptedModel([text_events("done")])
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(
+        model=model,
+        run_id="run-max-queue",
+        max_turns=1,
+        get_steering_messages=_steering,
+        get_follow_up_messages=_follow_up,
+    )
+
+    result = await run_agent_loop(
+        [UserMessage(content="go")], context, config, None
+    )
+
+    assert result.status is AgentRunStatus.COMPLETED
+    assert steering_polls == 1
+    assert follow_up_polls == 0
 
 
 @pytest.mark.asyncio
@@ -689,9 +798,11 @@ async def test_event_stream_consumer_cancellation_aborts_the_run() -> None:
     gate = asyncio.Event()
     model = ScriptedModel([make_hanging_model(gate, first_text="chunk")])
     context = AgentContext(messages=[])
-    token = CancelToken()
-    config = AgentLoopConfig(model=model, run_id="run-27")
-    stream = agent_loop([UserMessage(content="go")], context, config, token)
+    transaction = RecordingTransaction()
+    config = AgentLoopConfig(
+        model=model, run_id="run-27", transaction=transaction
+    )
+    stream = agent_loop([UserMessage(content="go")], context, config)
 
     # Drain every event the producer can emit before it blocks on the model
     # stream: agent_start, turn_start, prompt message_start/end, then the
@@ -711,6 +822,9 @@ async def test_event_stream_consumer_cancellation_aborts_the_run() -> None:
     consumer.cancel()
     with pytest.raises(asyncio.CancelledError):
         await consumer
+    # Consumer cancellation is not surfaced until the owned producer has
+    # reached its durable run terminal.
+    assert transaction.records[-1] == ("run_terminal", "aborted")
     try:
         result = await asyncio.wait_for(stream.result(), timeout=5)
     finally:
@@ -795,6 +909,101 @@ async def test_after_step_stops_after_current_turn_commits() -> None:
     # No further model call started after the stop request.
     assert len(model.requests) == 1
     # The step boundary is observable by the cancel owner.
+    assert token.wait_for_step_complete(timeout=0) is True
+
+
+def test_cancel_mode_only_strengthens() -> None:
+    token = CancelToken()
+    token.request_cancel("after_step")
+    assert token.mode is CancelMode.AFTER_STEP
+    token.request_cancel("immediate")
+    token.request_cancel("after_step")
+    assert token.mode is CancelMode.IMMEDIATE
+    assert token.immediate_requested is True
+
+
+@pytest.mark.asyncio
+async def test_after_step_requested_before_admission_finishes_one_turn() -> None:
+    token = CancelToken()
+    token.request_cancel("after_step")
+    transaction = RecordingTransaction()
+    model = ScriptedModel([text_events("done")])
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(
+        model=model, run_id="run-after-step-before", transaction=transaction
+    )
+
+    result = await run_agent_loop(
+        [UserMessage(content="go")], context, config, None, token
+    )
+
+    assert result.status is AgentRunStatus.ABORTED
+    assert len(model.requests) == 1
+    assert [record[0] for record in transaction.records] == [
+        "model_terminal",
+        "turn_committed",
+        "run_terminal",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_after_step_waits_for_turn_boundary_hook_settlement() -> None:
+    hook_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _hook(_context) -> bool:
+        hook_started.set()
+        await release.wait()
+        return False
+
+    token = CancelToken()
+    model = ScriptedModel([text_events("done")])
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(
+        model=model,
+        run_id="run-after-step-hook",
+        should_stop_after_turn=_hook,
+    )
+    run = asyncio.create_task(
+        run_agent_loop([UserMessage(content="go")], context, config, None, token)
+    )
+    await hook_started.wait()
+    assert token.wait_for_step_complete(timeout=0) is False
+    token.request_cancel("after_step")
+    await asyncio.sleep(0)
+    assert not run.done()
+    release.set()
+
+    result = await run
+    assert result.status is AgentRunStatus.ABORTED
+    assert len(model.requests) == 1
+    assert token.wait_for_step_complete(timeout=0) is True
+
+
+@pytest.mark.asyncio
+async def test_step_complete_waits_for_turn_end_listener_settlement() -> None:
+    turn_end_started = asyncio.Event()
+    release = asyncio.Event()
+    token = CancelToken()
+    model = ScriptedModel([text_events("done")])
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(model=model, run_id="run-turn-end-settlement")
+
+    async def _listener(event) -> None:
+        if isinstance(event, TurnEnd):
+            turn_end_started.set()
+            await release.wait()
+
+    run = asyncio.create_task(
+        run_agent_loop([UserMessage(content="go")], context, config, _listener, token)
+    )
+    await turn_end_started.wait()
+    assert token.wait_for_step_complete(timeout=0) is False
+
+    release.set()
+    result = await run
+
+    assert result.status is AgentRunStatus.COMPLETED
     assert token.wait_for_step_complete(timeout=0) is True
 
 
@@ -901,6 +1110,38 @@ async def test_next_turn_update_replaces_history_for_next_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_should_stop_observes_prepare_next_turn_context() -> None:
+    observed: List[str] = []
+
+    def _should_stop(hook_context) -> bool:
+        observed.extend(
+            message.content
+            for message in hook_context.context.messages
+            if isinstance(message, UserMessage)
+            and isinstance(message.content, str)
+        )
+        return True
+
+    model = ScriptedModel([text_events("done")])
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(
+        model=model,
+        run_id="run-stop-updated-context",
+        prepare_next_turn=lambda _context: NextTurnUpdate(
+            messages=(UserMessage(content="prepared context"),)
+        ),
+        should_stop_after_turn=_should_stop,
+    )
+
+    result = await run_agent_loop(
+        [UserMessage(content="original")], context, config, None
+    )
+
+    assert result.status is AgentRunStatus.COMPLETED
+    assert observed == ["prepared context"]
+
+
+@pytest.mark.asyncio
 async def test_standalone_usage_event_accumulates() -> None:
     events = [
         ModelStreamEvent(type=ModelStreamEventType.TEXT_DELTA, text="hi"),
@@ -926,16 +1167,25 @@ async def test_request_protocol_uses_model_api_identity() -> None:
     from qitos.core.model_capabilities import ModelAPI, ModelCapabilities
 
     class ResponsesModel(ScriptedModel):
+        schema_protocols: List[str] = []
+
         @property
         def capabilities(self) -> ModelCapabilities:
             return ModelCapabilities(api=ModelAPI.RESPONSES)
 
+        def build_tool_schema_request_options(
+            self, payload, *, protocol=None, delivery="api_parameter"
+        ):
+            self.schema_protocols.append(protocol)
+            return {}
+
     model = ResponsesModel([text_events("ok")])
-    context = AgentContext(messages=[])
+    context = AgentContext(messages=[], tools=_registry(_echo).freeze())
     config = AgentLoopConfig(model=model, run_id="run-proto")
     await run_agent_loop([UserMessage(content="go")], context, config, None)
 
     assert model.requests[0].protocol == "responses"
+    assert model.schema_protocols == ["responses"]
 
 
 @pytest.mark.asyncio
@@ -964,11 +1214,15 @@ async def test_after_tool_call_override_terminate_stops_the_batch() -> None:
 @pytest.mark.asyncio
 async def test_hung_turn_hook_cannot_block_abort() -> None:
     hook_started = asyncio.Event()
+    hook_settled = asyncio.Event()
 
     async def _hung(hook_context) -> bool:
-        hook_started.set()
-        await asyncio.Event().wait()
-        return False
+        try:
+            hook_started.set()
+            await asyncio.Event().wait()
+            return False
+        finally:
+            hook_settled.set()
 
     token = CancelToken()
     model = ScriptedModel([text_events("ok")])
@@ -983,3 +1237,4 @@ async def test_hung_turn_hook_cannot_block_abort() -> None:
     token.request_cancel("immediate")
     result = await asyncio.wait_for(run, timeout=5)
     assert result.status is AgentRunStatus.ABORTED
+    assert hook_settled.is_set()

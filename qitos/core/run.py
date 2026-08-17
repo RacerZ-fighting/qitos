@@ -89,7 +89,7 @@ class RunHandle:
 
     @property
     def can_resume(self) -> bool:
-        """Whether Engine recovery may continue this Run in place."""
+        """Whether Session recovery may continue this Run in place."""
 
         return self.status is RunStatus.RESUMABLE
 

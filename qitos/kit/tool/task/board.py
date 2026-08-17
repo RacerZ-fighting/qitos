@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from qitos.core.tool import BaseTool, ToolPermission, ToolSpec
+from qitos.core.tool_result import ToolResult
+from qitos.kit.tool.internal.results import error_result
 from qitos.kit.tool.internal.workspace import resolve_workspace_path
 
 TASK_STATUSES = {"pending", "in_progress", "blocked", "completed", "cancelled"}
@@ -162,7 +164,7 @@ class CreateTask(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Create a new task record in the task board.
 
@@ -183,7 +185,9 @@ class CreateTask(BaseTool):
         status = str(args.get("status", "pending"))
         normalized = str(status or "pending").strip()
         if normalized not in TASK_STATUSES:
-            return {"status": "error", "message": f"Unsupported status: {normalized}"}
+            return error_result(
+                {"status": "error", "message": f"Unsupported status: {normalized}"}
+            )
         task = TaskRecord(
             id=uuid4().hex[:10],
             subject=subject,
@@ -224,7 +228,7 @@ class ListTaskBoard(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         List task records from the task board.
 
@@ -280,7 +284,9 @@ class GetTask(BaseTool):
         task_id = str(args.get("task_id", ""))
         task = self._store.get_task(task_id)
         if task is None:
-            return {"status": "error", "message": f"Task not found: {task_id}"}
+            return error_result(
+                {"status": "error", "message": f"Task not found: {task_id}"}
+            )
         return {
             "status": "success",
             "task": task.to_dict(),
@@ -321,7 +327,7 @@ class UpdateTask(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Update fields, status, ownership, or dependency links for one task.
 
@@ -354,14 +360,18 @@ class UpdateTask(BaseTool):
         metadata = args.get("metadata")
         task = self._store.get_task(task_id)
         if task is None:
-            return {"status": "error", "message": f"Task not found: {task_id}"}
+            return error_result(
+                {"status": "error", "message": f"Task not found: {task_id}"}
+            )
         if status is not None:
             normalized = str(status).strip()
             if normalized not in TASK_STATUSES:
-                return {
-                    "status": "error",
-                    "message": f"Unsupported status: {normalized}",
-                }
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": f"Unsupported status: {normalized}",
+                    }
+                )
             task.status = normalized
         if subject is not None:
             task.subject = subject
@@ -423,7 +433,7 @@ class AppendTaskNote(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Append a timestamped note to one task record.
 
@@ -440,7 +450,9 @@ class AppendTaskNote(BaseTool):
         kind = str(args.get("kind", "note"))
         task = self._store.get_task(task_id)
         if task is None:
-            return {"status": "error", "message": f"Task not found: {task_id}"}
+            return error_result(
+                {"status": "error", "message": f"Task not found: {task_id}"}
+            )
         task.notes.append(
             TaskNote(created_at=_utc_now(), text=text, kind=str(kind or "note"))
         )

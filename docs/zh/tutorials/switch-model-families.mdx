@@ -1,157 +1,120 @@
 ---
 title: "用预设切换模型家族"
-description: "使用家族预设让同一个智能体在 Qwen、Kimi、DeepSeek 等模型家族之间切换——无需重写智能体代码。"
+description: "让同一 Agent façade 使用不同模型家族的构造默认值。"
 ---
 
-家族预设（预配置的模型家族默认值）让你只需极少代码改动就能切换模型家族。本教程展示如何构建可在多个家族上运行的智能体、如何覆盖预设、以及如何在 qita 中对比结果。
+Family preset 在不改变最小 Agent loop 的前提下选择 Provider adapter 和模型请求
+默认值。它不会安装 parser，也不会引入第二套执行运行时。
 
-## Step 1 — 用预设构建模型
-
-最快的方式是使用 `build_model_for_preset`：
+## Step 1 — 用 preset 构建模型
 
 ```python
 from qitos.harness import build_model_for_preset
 
-llm = build_model_for_preset(
+model = build_model_for_preset(
+    family_id="qwen",
     model_name="Qwen/Qwen3-8B",
-    api_key="sk-...",
+    api_key="...",
     base_url="https://api.siliconflow.cn/v1/",
 )
 ```
 
-它会返回一个已应用 Qwen 家族预设的完整模型对象——正确的协议、解析器、工具交付模式和上下文窗口。
+返回对象实现普通 QitOS Model 契约。Preset 选择 adapter、请求与 reasoning 默认值、
+Tool 交付策略和上下文窗口提示。Provider adapter 仍把类型化 assistant message 与
+原生 Tool call 交给同一条 loop。
 
-## Step 2 — 用不同家族运行同一个智能体
+`default_protocol` 和 `fallback_protocols` 只是 `qitos_harness_metadata` 中保留的兼容
+标签。当前 Agent loop 不会根据这些标签加载 parser 或注入输出协议。
 
-核心要点：智能体代码不变，只有模型构造变化：
+## Step 2 — 运行同一份 Agent 组合
+
+只改变模型构造：
 
 ```python
+import asyncio
+
+from qitos.core.agent import Agent
 from qitos.harness import build_model_for_preset
 
-configs = [
-    ("qwen", "Qwen/Qwen3-8B", "https://api.siliconflow.cn/v1/"),
-    ("kimi", "moonshot-v1-128k", "https://api.moonshot.ai/v1/"),
-    ("deepseek", "deepseek-chat", "https://api.deepseek.com/v1/"),
-]
 
-for family_id, model_name, base_url in configs:
-    llm = build_model_for_preset(
-        model_name=model_name,
-        api_key="sk-...",
-        base_url=base_url,
-    )
-    # agent = MyAgent(llm=llm, ...)
-    # result = agent.run(task="...", max_steps=20)
+async def main() -> None:
+    configs = [
+        ("qwen", "Qwen/Qwen3-8B", "https://api.siliconflow.cn/v1/"),
+        ("kimi", "moonshot-v1-128k", "https://api.moonshot.ai/v1/"),
+        ("deepseek", "deepseek-chat", "https://api.deepseek.com/v1/"),
+    ]
+
+    for family_id, model_name, base_url in configs:
+        model = build_model_for_preset(
+            family_id=family_id,
+            model_name=model_name,
+            api_key="...",
+            base_url=base_url,
+        )
+        agent = Agent(model=model, max_turns=1)
+        result = await agent.prompt("用一句话返回模型家族。")
+        print(family_id, result.status.value)
+
+
+asyncio.run(main())
 ```
 
-每次 `build_model_for_preset` 调用都会解析对应家族的正确协议、解析器、工具交付和上下文策略。
+真实代码应为每个 Provider 使用对应凭据，不要把 API key 写进源文件。
 
-## Step 3 — 覆盖预设
-
-当内建预设不完全符合需求时，用 `preset.override()` 创建自定义副本：
+## Step 3 — 覆盖不可变默认值
 
 ```python
 from dataclasses import replace
 from qitos.harness import resolve_family_preset
 
 qwen = resolve_family_preset("qwen")
-
-# 扩展 Qwen 预设：更大的上下文窗口和不同的步数预算
 custom_qwen = qwen.override(
     context_policy=replace(qwen.context_policy, context_window_hint=256_000),
-    recommended_max_steps=50,
     notes="Extended context variant for long-horizon tasks",
 )
 ```
 
-`override()` 返回一个新的 `FamilyPreset` 实例——原始预设不会被修改。
+`override()` 返回新的 `FamilyPreset`，不会修改进程级全局状态。构造真实模型时，
+把所需字段显式传给 `build_model_for_preset(...)`。
 
-## Step 4 — 查看可用预设
-
-用 CLI 查看所有可用预设：
+## Step 4 — 查看可用 preset
 
 ```bash
 qit bench presets
 ```
 
-输出表格包含每个预设的 ID、协议、工具交付模式、上下文窗口和推荐模型。
+该命令会输出 preset 标识、adapter 类型、Tool 交付策略、上下文提示与兼容标签。
+这些标签是诊断 metadata，不是活跃的 fallback parser 链。
 
-## Step 5 — 在 qita 中对比运行
+`recommended_*` 字段也只是建议。Agent façade 不会自动套用 step、token、retry 或
+temperature 建议；应用自行选择 run budget 并显式传入模型请求选项。
 
-用不同家族跑完同一个任务后，启动 qita 对比：
+## Step 5 — 比较实际模型边界
 
-```bash
-qita board --logdir runs
-```
-
-在面板视图中，选择两个运行并点击 **Compare**，可以看到：
-
-- 每次运行使用的协议
-- 解析器和工具交付模式
-- 步数、token 用量和费用
-- 运行在哪里产生分歧
-
-这让不同预设如何影响智能体行为变得一目了然。
-
-## 推荐默认值
-
-黄金预设（Qwen、Kimi、MiniMax、gpt-oss、Gemma 4）包含研究基线的推荐默认值：
-
-| 字段 | 默认值 | 含义 |
-|---|---|---|
-| `recommended_max_steps` | 30 | 建议的单次运行步数预算 |
-| `recommended_max_tokens` | 500,000 | 建议的总 token 预算 |
-| `recommended_retry_budget` | 3 | 每步最大 critic 重试次数 |
-| `recommended_temperature` | 0.2 | 默认采样温度 |
-
-这些值仅供参考——引擎不会自动应用它们。可以作为你自己实验的起点。
-
-## 环境变量驱动的切换模式
-
-把模型配置放在智能体代码之外，通过环境变量驱动：
-
-```bash
-# Qwen
-export QITOS_MODEL_FAMILY=qwen
-export QITOS_MODEL="Qwen/Qwen3-8B"
-export OPENAI_BASE_URL="https://api.siliconflow.cn/v1/"
-
-# Kimi
-export QITOS_MODEL_FAMILY=kimi
-export QITOS_MODEL="kimi-k2-0905-preview"
-export OPENAI_BASE_URL="https://api.moonshot.ai/v1"
-```
+在 run 前检查 `model.capabilities` 与 `model.qitos_harness_metadata`：
 
 ```python
-import os
-from qitos.harness import build_model_for_preset
-
-llm = build_model_for_preset(
-    family_id=os.environ["QITOS_MODEL_FAMILY"],
-    model_name=os.environ["QITOS_MODEL"],
-    api_key=os.environ["OPENAI_API_KEY"],
-    base_url=os.environ["OPENAI_BASE_URL"],
-)
+print(model.capabilities)
+print(model.qitos_harness_metadata)
 ```
 
-模型配置的优先级顺序：
+Capabilities 描述选中 adapter 已由测试证明的行为；harness metadata 记录 preset 的解析
+方式。两者都不是 Session 恢复真源。
 
-1. 显式构造参数
-2. 环境变量（`QITOS_MODEL_FAMILY`、`QITOS_MODEL`、`OPENAI_BASE_URL`）
-3. 家族预设默认值
-4. 框架后备值
+如果应用另外生成兼容 trace artifact，只读 `qita` 可以比较 producer 记录的模型
+metadata。当前 Agent façade 不会自动生成这些 trace 目录。
 
 <CardGroup cols={2}>
   <Card title="家族预设概念" icon="cube" href="/zh/concepts/family-presets">
-    理解每个预设字段的含义
+    理解 preset 边界
   </Card>
   <Card title="模型家族矩阵" icon="table" href="/zh/reference/model-family-matrix">
-    查看全部 10 个内建预设及其默认值
+    比较内建默认值
   </Card>
   <Card title="新增家族预设" icon="plus" href="/zh/guides/add-a-family-preset">
-    为 QitOS 增加新的模型家族
+    扩展模型构造默认值
   </Card>
   <Card title="可观测性" icon="chart-line" href="/zh/guides/observability">
-    了解预设元信息如何出现在追踪记录中
+    检查兼容 trace artifact
   </Card>
 </CardGroup>

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Dict, Literal, Mapping, Sequence, TypeAlias, cast
 
-from ._freeze import freeze_deep, thaw_deep
+from ._freeze import thaw_deep
 from .artifact import ArtifactRef
 
 
@@ -38,37 +40,79 @@ _KNOWN_STATUSES = frozenset(
     )
 )
 
-_MESSAGE_ERROR_STATUSES = frozenset(
-    {"error", "denied", "timed_out", "cancelled"}
-)
+
+def _freeze_json(value: Any, *, field_name: str) -> Any:
+    """Validate and deeply freeze one strict JSON value."""
+
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError(f"tool result {field_name} keys must be strings")
+        return MappingProxyType(
+            {
+                key: _freeze_json(item, field_name=field_name)
+                for key, item in value.items()
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_json(item, field_name=field_name) for item in value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"tool result {field_name} numbers must be finite")
+        return value
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    raise TypeError(f"tool result {field_name} must contain JSON-compatible values")
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class ToolResult:
-    """Normalized tool execution result."""
+    """Normalized, deeply immutable tool execution result."""
 
     status: ToolResultStatus = "success"
     output: Any = None
     error: str | None = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
     artifacts: tuple[ArtifactRef, ...] = ()
     model_output: str | None = None
     call_id: str | None = None
 
     def __post_init__(self) -> None:
-        raw_status = str(self.status).strip()
+        if not isinstance(self.status, str):
+            raise TypeError("tool result status must be text")
+        if self.error is not None and not isinstance(self.error, str):
+            raise TypeError("tool result error must be text or null")
+        if self.model_output is not None and not isinstance(self.model_output, str):
+            raise TypeError("tool result model_output must be text or null")
+        raw_status = self.status.strip()
         if raw_status in _KNOWN_STATUSES:
-            self.status = cast(ToolResultStatus, raw_status)
+            status = cast(ToolResultStatus, raw_status)
+            error = self.error
         else:
-            self.status = "error"
-            if self.error in (None, ""):
-                self.error = f"unknown tool result status: {raw_status}"
-        if self.status == "success" and self.error not in (None, ""):
-            self.status = "error"
+            status = cast(ToolResultStatus, "error")
+            error = self.error
+            if error in (None, ""):
+                error = f"unknown tool result status: {raw_status}"
+        if status == "success" and error not in (None, ""):
+            status = cast(ToolResultStatus, "error")
         if self.call_id is not None and (
             not isinstance(self.call_id, str) or not self.call_id
         ):
             raise ValueError("tool result call_id must be non-empty text or null")
+        if not isinstance(self.metadata, Mapping):
+            raise TypeError("tool result metadata must be a mapping")
+        if not isinstance(self.artifacts, tuple) or not all(
+            isinstance(item, ArtifactRef) for item in self.artifacts
+        ):
+            raise TypeError("tool result artifacts must be a tuple of ArtifactRef")
+
+        object.__setattr__(self, "status", status)
+        object.__setattr__(self, "error", error)
+        object.__setattr__(
+            self, "output", _freeze_json(self.output, field_name="output")
+        )
+        object.__setattr__(
+            self, "metadata", _freeze_json(self.metadata, field_name="metadata")
+        )
 
     @property
     def is_success(self) -> bool:
@@ -94,24 +138,15 @@ class ToolResult:
         return self.output
 
     def frozen(self) -> "ToolResult":
-        """Return a deeply immutable snapshot of this result.
+        """Return this already deeply immutable result.
 
-        The executor freezes every terminal result before it crosses the
-        journal, event and Message boundaries, so a listener mutating nested
-        output or metadata cannot make two durable records contradict each
-        other. Serialization helpers thaw the snapshot back to plain
-        containers, keeping the persisted shape unchanged.
+        Construction freezes every result before it can cross journal, event
+        or Message boundaries, so a listener cannot make durable records
+        contradict each other. This method remains as the explicit boundary
+        marker used by the executor; serialization thaws plain copies.
         """
 
-        return ToolResult(
-            status=self.status,
-            output=freeze_deep(self.output),
-            error=self.error,
-            metadata=freeze_deep(self.metadata),
-            artifacts=tuple(self.artifacts),
-            model_output=self.model_output,
-            call_id=self.call_id,
-        )
+        return self
 
     def to_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -188,15 +223,18 @@ class ToolResult:
         ):
             raise ValueError("tool result call_id must be non-empty text or null")
 
-        result = cls(
-            status=cast(ToolResultStatus, raw_status),
-            output=payload["output"],
-            error=raw_error,
-            metadata=dict(raw_metadata),
-            artifacts=artifacts,
-            model_output=raw_model_output,
-            call_id=raw_call_id,
-        )
+        try:
+            result = cls(
+                status=cast(ToolResultStatus, raw_status),
+                output=payload["output"],
+                error=raw_error,
+                metadata=dict(raw_metadata),
+                artifacts=artifacts,
+                model_output=raw_model_output,
+                call_id=raw_call_id,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("tool result payload is invalid") from exc
         if result.to_dict() != dict(payload):
             raise ValueError("tool result payload is not canonical")
         return result
@@ -204,85 +242,11 @@ class ToolResult:
     @classmethod
     def from_value(cls, payload: Any) -> "ToolResult":
         if isinstance(payload, ToolResult):
-            return cls(
-                status=payload.status,
-                output=payload.output,
-                error=payload.error,
-                metadata=dict(payload.metadata),
-                artifacts=tuple(payload.artifacts),
-                model_output=payload.model_output,
-                call_id=payload.call_id,
-            )
-        if isinstance(payload, dict):
-            if "status" not in payload:
-                return cls(status="success", output=payload)
-            raw_status = str(payload.get("status")).strip()
-            raw_error = payload.get("error")
-            error: str | None = None
-            if raw_error not in (None, ""):
-                error = str(raw_error)
-            elif raw_status in _MESSAGE_ERROR_STATUSES:
-                message = payload.get("message")
-                if message not in (None, ""):
-                    error = str(message)
-
-            domain_payload = {
-                str(key): value
-                for key, value in payload.items()
-                if key
-                not in {
-                    "status",
-                    "error",
-                    "metadata",
-                    "artifacts",
-                    "model_output",
-                    "call_id",
-                }
-            }
-            output = (
-                domain_payload["output"]
-                if set(domain_payload) == {"output"}
-                else domain_payload
-            )
-            raw_artifacts = payload.get("artifacts", ())
-            if not isinstance(raw_artifacts, Sequence) or isinstance(
-                raw_artifacts, (str, bytes)
-            ):
-                raise ValueError("tool result artifacts must be a sequence")
-            artifacts = tuple(
-                item
-                if isinstance(item, ArtifactRef)
-                else ArtifactRef.from_dict(item)
-                for item in raw_artifacts
-                if isinstance(item, (ArtifactRef, dict))
-            )
-            if len(artifacts) != len(raw_artifacts):
-                raise ValueError("tool result artifacts must contain references")
-            raw_model_output = payload.get("model_output")
-            if raw_model_output is not None and not isinstance(
-                raw_model_output, str
-            ):
-                raise ValueError("tool result model_output must be text or null")
-            raw_call_id = payload.get("call_id")
-            if raw_call_id is not None and (
-                not isinstance(raw_call_id, str) or not raw_call_id
-            ):
-                raise ValueError("tool result call_id must be non-empty text or null")
-            return cls(
-                status=cast(ToolResultStatus, raw_status),
-                output=output,
-                error=error,
-                metadata=(
-                    dict(payload.get("metadata", {}))
-                    if isinstance(payload.get("metadata"), dict)
-                    else {}
-                ),
-                artifacts=artifacts,
-                model_output=raw_model_output,
-                call_id=raw_call_id,
-            )
-        if isinstance(payload, str):
-            return cls(status="success", output=payload)
+            return payload
+        # Plain handler values are successful domain output. Lifecycle status
+        # is explicit and typed: only a ToolResult can set it. In particular,
+        # a domain mapping with a key named ``status`` must not be reinterpreted
+        # as executor control state.
         return cls(status="success", output=payload)
 
 

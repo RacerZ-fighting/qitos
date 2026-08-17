@@ -1,113 +1,84 @@
 ---
 title: "Qwen family best practice"
-description: "How to run Qwen and qwen-plus with the native tool-call lane in QitOS."
+description: "Run Qwen and qwen-plus through typed native Tool calls in the minimal Agent loop."
 ---
 
-Qwen in QitOS is no longer just JSON-first by default.
-
-For OpenAI-compatible Qwen endpoints, QitOS now prefers this order:
+For OpenAI-compatible Qwen endpoints, QitOS prefers the Provider's typed Tool-call
+channel:
 
 ```text
-native tool calls -> Decision.act(...) -> tool execution
-fallback: json_decision_v1 -> xml_decision_v1 -> react_text_v1
+Provider ToolCall -> ToolBatchExecutor -> ToolResult -> next model turn
 ```
 
-This matches the spirit of Qwen-Agent: function calling is the preferred lane when the backend exposes it cleanly.
+There is no `Decision.act(...)` conversion or text-parser fallback in the current
+Agent runtime. Family-preset protocol names remain compatibility metadata only.
 
-## What changed in v0.4
+## When native Tool calls are available
 
-The `qwen` family preset (a configuration bundle that maps the Qwen model family to its default protocol, adapter, and tool delivery) now keeps three ideas together:
+The `qwen` preset selects the OpenAI-compatible adapter and sends admitted Tool schemas
+through the API request. If the endpoint returns `tool_calls`, the adapter preserves
+their call ids and arguments as typed QitOS `ToolCall` values.
 
-- tool schemas are delivered through `api_parameter`
-- native tool calls are preferred when the endpoint returns `tool_calls`
-- text protocols remain available as a stable fallback chain
+The loop then applies the same validation, permission, deadline, cancellation, and
+terminal-result rules as every other Provider:
 
-The default protocol (output format the model is expected to follow) is still `json_decision_v1`, but for Qwen it is now the **text fallback**, not the ideal path itself.
+- malformed or non-object arguments remain in the transcript with `parse_error`;
+- malformed calls never execute a Tool;
+- every call receives one terminal `ToolResult` in source order.
 
-## When the native lane is used
+If the endpoint returns ordinary text without Tool calls, that text is an assistant
+response. QitOS does not reinterpret structured-looking text through the removed
+parser/Decision runtime.
 
-QitOS will prefer the native lane when all of these are true:
+## Configure qwen-plus
 
-- the model resolves to the `qwen` family preset
-- the harness (the configured adapter + protocol + toolset combination) metadata says `native_tool_call_preferred = true`
-- the OpenAI-compatible response actually contains `tool_calls`
+```python
+from qitos.core.agent import Agent
+from qitos.harness import build_model_for_preset
 
-If any of those conditions fail, QitOS falls back to the normal parser (raw-output-to-Decision converter) chain.
+model = build_model_for_preset(
+    family_id="qwen",
+    model_name="qwen-plus",
+    api_key="...",
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
 
-When the endpoint returns text without `tool_calls`, QitOS distinguishes two
-outcomes. Ordinary natural-language conclusions become final answers. Text that
-contains structured action fields but fails parsing stays on the parser recovery
-path, so an intended tool action cannot be reported as successful completion.
-The trace retains the raw response, parser diagnostics, and
-`decision_source: parser` for that recovery step.
+agent = Agent(model=model, max_turns=8)
+```
+
+The preset contributes model request defaults and metadata. The Agent loop still
+freezes the actual model and Tool exposure independently for each turn.
 
 ## Use Qwen Web search
 
-When your application admits a managed Tool named `web_search`, a Qwen model can use
-the provider's native search contract without introducing another Tool name:
+When your application admits a Tool named `web_search`, the Qwen adapter can project it
+to the Provider's hosted-search contract when `model.capabilities.hosted_tools`
+declares support:
 
 - Responses sends `tools=[{"type": "web_search"}]`.
-- Chat Completions sends `enable_search: true` and removes the managed function schema
-  from that first request.
-- If the provider explicitly rejects native search before streaming any output, QitOS
-  retries that request with the original managed function schema.
+- Chat Completions sends `enable_search: true`.
+- An explicit Provider rejection before any observable output may fall back to the
+  admitted managed Tool schema.
 
-QitOS never performs this fallback after text, reasoning, ToolCall deltas, or native
-output items become observable. This prevents one model turn from being replayed after
-it may already have produced a billable or externally meaningful result.
+QitOS never performs that fallback after text, reasoning, ToolCall deltas, or native
+output items become observable. This prevents replaying a model turn after it may have
+already produced a billable or externally meaningful result.
 
-For a client-side fallback, construct `QwenWebSearchCapability`. It calls the Chat
-endpoint with `enable_search` and projects structured
-`search_info.search_results`—plus source URLs found in the answer—into bounded
+For a client-side managed implementation, construct `QwenWebSearchCapability`. It
+projects structured `search_info.search_results` and source URLs into bounded
 `WebSource` values.
 
-## Why QitOS does not copy the Qwen-Agent sentinel prompt
-
-The official Qwen-Agent project includes a Qwen-specific function-calling prompt format for chat interfaces that do not provide a native tool channel.
-
-QitOS does **not** copy that prompt format directly for the OpenAI-compatible Qwen path because:
-
-- OpenAI-compatible serving already gives us a structured `tool_calls` channel
-- preserving that structure is cleaner than serializing it back into text
-- it keeps the runtime generic enough for other families that also expose native tool calls
-
-Put differently:
-
-- Qwen-Agent solves the more general Qwen chat interface problem
-- QitOS solves the OpenAI-compatible served Qwen inside one reusable harness layer problem
-
-## Recommended `qwen-plus` configuration
-
-Build the model through the Qwen family preset against an OpenAI-compatible Qwen endpoint:
+## Verify the effective boundary
 
 ```python
-from qitos.harness import build_model_for_preset
-
-llm = build_model_for_preset(
-    family_id="qwen",
-    model_name="qwen-plus",
-    api_key="...",  # OPENAI_API_KEY
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
-print(llm.qitos_harness_metadata)
+print(model.capabilities.native_tool_calls)
+print(model.capabilities.hosted_tools)
+print(model.qitos_harness_metadata)
 ```
 
-You should expect the harness metadata to show:
+`model.capabilities` is the adapter's tested contract. Preset metadata explains model
+construction but does not activate a parser or become Session recovery truth.
 
-- `family_preset: qwen`
-- `tool_delivery: api_parameter` (via `tool_policy`)
-- `native_tool_call_preferred: True`
-- `decision_lane_preference: native_tool_calls`
-
-## How to confirm it in qita
-
-Inspect the run in `qita` and check:
-
-- `family preset` (configuration bundle for a model family)
-- `prompt protocol` (output format definition)
-- `tool delivery`
-- `decision_source` (how the Decision was produced)
-- `native_tool_call_used` (whether the native tool-call path was taken)
-- `native_tool_call_fallback_reason`
-
-If the endpoint did not return native tool calls, QitOS will still run, but you should see the fallback reason and the parser lane in the trace (the structured run log).
+If an application produces a compatible trace directory, `qita` can display the
+producer-recorded model and Tool facts. The current Agent façade does not write those
+trace artifacts automatically.

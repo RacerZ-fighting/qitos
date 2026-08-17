@@ -6,9 +6,11 @@ existing wire mappings, so each message owns a one-way ``to_wire`` projection
 plus a strict ``to_dict``/``from_dict`` round trip used by persistence.
 
 Invariants:
-- A ``ToolCall`` carried by an assistant message is paired with exactly one
-  terminal ``ToolResultMessage`` produced by the loop; transcripts never
-  delete a call.
+- Every uniquely identified call that reaches Tool admission is paired with
+  exactly one terminal ``ToolResultMessage``; transcripts never delete a call.
+- Duplicate raw call ids remain in a failed assistant message as pre-admission
+  protocol evidence. They are not executed because no unambiguous result
+  pairing or durable record identity exists.
 - Assistant tool-call arguments that are not a valid JSON object stay in the
   transcript with ``parse_error`` set; the loop turns them into an admission
   error result instead of executing or dropping the call.
@@ -17,14 +19,15 @@ Invariants:
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 from .model_request import ModelContinuation
 from .model_response import ModelResponse, ModelUsage
-from ._freeze import freeze_deep, thaw_deep
+from ._freeze import thaw_deep
 from .tool_result import ToolResult
 
 
@@ -46,7 +49,7 @@ class ImageContent:
     def __post_init__(self) -> None:
         if not isinstance(self.source, Mapping):
             raise TypeError("image content must be a mapping")
-        object.__setattr__(self, "source", freeze_deep(self.source))
+        object.__setattr__(self, "source", _freeze_json(self.source))
 
 
 UserContent = Union[str, Tuple[Union[TextContent, ImageContent], ...]]
@@ -145,10 +148,13 @@ class ToolCall:
     def from_dict(cls, value: Mapping[str, Any]) -> "ToolCall":
         if not isinstance(value, Mapping):
             raise ValueError("tool call payload must be a mapping")
-        if not set(value) <= {"id", "name", "arguments", "parse_error"}:
+        required = {"id", "name", "arguments"}
+        optional = {"parse_error"}
+        fields = set(value)
+        if not required.issubset(fields) or not fields.issubset(required | optional):
             raise ValueError("tool call payload fields are invalid")
-        raw_arguments = value.get("arguments", {})
-        if not isinstance(raw_arguments, Mapping):
+        raw_arguments = value["arguments"]
+        if not isinstance(raw_arguments, dict):
             raise ValueError("tool call arguments must be a mapping")
         raw_error = value.get("parse_error")
         if raw_error is not None and not isinstance(raw_error, str):
@@ -172,6 +178,7 @@ class UserMessage:
     role: str = field(default="user", init=False)
 
     def __post_init__(self) -> None:
+        _validate_message_timestamp(self.timestamp)
         if isinstance(self.content, str):
             return
         if not isinstance(self.content, tuple) or not self.content:
@@ -200,12 +207,24 @@ class AssistantMessage:
     role: str = field(default="assistant", init=False)
 
     def __post_init__(self) -> None:
+        _validate_message_timestamp(self.timestamp)
         if not isinstance(self.text, str):
             raise TypeError("assistant text must be a string")
         if not isinstance(self.tool_calls, tuple) or not all(
             isinstance(call, ToolCall) for call in self.tool_calls
         ):
             raise TypeError("assistant tool_calls must be a tuple of ToolCall")
+        call_ids = [call.id for call in self.tool_calls]
+        if len(call_ids) != len(set(call_ids)):
+            # A duplicate id is a provider/model protocol failure, but the raw
+            # calls remain canonical evidence. The loop sees ``failed`` and
+            # stops before Tool admission, so no ambiguous side effect runs.
+            if self.error is None:
+                object.__setattr__(
+                    self,
+                    "error",
+                    "assistant tool call ids must be unique",
+                )
         if self.reasoning_content is not None and not isinstance(
             self.reasoning_content, str
         ):
@@ -230,7 +249,7 @@ class AssistantMessage:
             raise TypeError("continuation must be a ModelContinuation or None")
         if not isinstance(self.metadata, Mapping):
             raise TypeError("metadata must be a mapping")
-        object.__setattr__(self, "metadata", freeze_deep(self.metadata))
+        object.__setattr__(self, "metadata", _freeze_json(self.metadata))
 
     @property
     def failed(self) -> bool:
@@ -256,6 +275,7 @@ class ToolResultMessage:
     role: str = field(default="tool", init=False)
 
     def __post_init__(self) -> None:
+        _validate_message_timestamp(self.timestamp)
         if not isinstance(self.tool_call_id, str) or not self.tool_call_id:
             raise ValueError("tool result message tool_call_id must be non-empty")
         if not isinstance(self.tool_name, str) or not self.tool_name:
@@ -277,12 +297,25 @@ Message = Union[UserMessage, AssistantMessage, ToolResultMessage]
 
 def _freeze_json(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return MappingProxyType({str(key): _freeze_json(item) for key, item in value.items()})
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("message payload mapping keys must be strings")
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_json(item) for item in value)
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("message payload numbers must be finite")
+        return value
+    if isinstance(value, (str, int, bool)) or value is None:
         return value
     raise TypeError("message payloads must contain JSON-compatible values")
+
+
+def _validate_message_timestamp(value: Any) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("message timestamp must be numeric")
+    if not math.isfinite(float(value)):
+        raise ValueError("message timestamp must be finite")
 
 
 def _thaw_json(value: Any) -> Any:
@@ -457,23 +490,29 @@ def message_from_dict(value: Mapping[str, Any]) -> Message:
         raise ValueError("message payload must be a mapping")
     role = value.get("role")
     if role == "user":
-        allowed = {"role", "content", "timestamp"}
-        if not set(value) <= allowed:
+        required = {"role", "content", "timestamp"}
+        if set(value) != required:
             raise ValueError("user message fields are invalid")
-        raw_content = value.get("content")
+        raw_content = value["content"]
         if isinstance(raw_content, str):
             content: UserContent = raw_content
-        elif isinstance(raw_content, Sequence) and not isinstance(
-            raw_content, (str, bytes)
-        ):
+        elif isinstance(raw_content, list):
             blocks: List[Union[TextContent, ImageContent]] = []
             for item in raw_content:
-                if not isinstance(item, Mapping):
+                if not isinstance(item, dict):
                     raise ValueError("user content blocks must be mappings")
                 block_type = item.get("type")
-                if block_type == "text" and isinstance(item.get("text"), str):
+                if (
+                    block_type == "text"
+                    and set(item) == {"type", "text"}
+                    and isinstance(item["text"], str)
+                ):
                     blocks.append(TextContent(text=item["text"]))
-                elif block_type == "image" and isinstance(item.get("source"), Mapping):
+                elif (
+                    block_type == "image"
+                    and set(item) == {"type", "source"}
+                    and isinstance(item["source"], dict)
+                ):
                     blocks.append(ImageContent(source=item["source"]))
                 else:
                     raise ValueError("user content block type is unsupported")
@@ -485,7 +524,7 @@ def message_from_dict(value: Mapping[str, Any]) -> Message:
             timestamp=_message_timestamp(value),
         )
     if role == "assistant":
-        allowed = {
+        required = {
             "role",
             "text",
             "tool_calls",
@@ -500,59 +539,62 @@ def message_from_dict(value: Mapping[str, Any]) -> Message:
             "metadata",
             "timestamp",
         }
-        if not set(value) <= allowed:
+        if set(value) != required:
             raise ValueError("assistant message fields are invalid")
-        raw_calls = value.get("tool_calls") or []
-        if not isinstance(raw_calls, Sequence) or isinstance(raw_calls, (str, bytes)):
-            raise ValueError("assistant tool_calls must be a sequence")
-        raw_usage = value.get("usage")
-        raw_native = value.get("native_items")
+        raw_calls = value["tool_calls"]
+        if not isinstance(raw_calls, list):
+            raise ValueError("assistant tool_calls must be a list")
+        raw_usage = value["usage"]
+        if raw_usage is not None and not isinstance(raw_usage, dict):
+            raise ValueError("assistant usage must be a mapping or null")
+        raw_native = value["native_items"]
         if raw_native is not None and (
-            not isinstance(raw_native, Sequence)
-            or isinstance(raw_native, (str, bytes))
-            or not all(isinstance(item, Mapping) for item in raw_native)
+            not isinstance(raw_native, list)
+            or not all(isinstance(item, dict) for item in raw_native)
         ):
-            raise ValueError("assistant native_items must be a sequence of mappings")
-        raw_continuation = value.get("continuation")
-        raw_metadata = value.get("metadata") or {}
-        if not isinstance(raw_metadata, Mapping):
+            raise ValueError("assistant native_items must be a list of mappings")
+        raw_continuation = value["continuation"]
+        if raw_continuation is not None and not isinstance(raw_continuation, dict):
+            raise ValueError("assistant continuation must be a mapping or null")
+        raw_metadata = value["metadata"]
+        if not isinstance(raw_metadata, dict):
             raise ValueError("assistant metadata must be a mapping")
-        raw_text = value.get("text")
+        raw_text = value["text"]
         if not isinstance(raw_text, str):
             raise ValueError("assistant text must be text")
         return AssistantMessage(
             text=raw_text,
             tool_calls=tuple(ToolCall.from_dict(item) for item in raw_calls),
-            reasoning_content=_optional_text(value.get("reasoning_content")),
+            reasoning_content=_optional_text(value["reasoning_content"]),
             usage=(
                 ModelUsage.from_mapping(raw_usage)
                 if isinstance(raw_usage, Mapping)
                 else None
             ),
-            finish_reason=_optional_text(value.get("finish_reason")),
-            error=_optional_text(value.get("error")),
+            finish_reason=_optional_text(value["finish_reason"]),
+            error=_optional_text(value["error"]),
             native_items=(
                 tuple(raw_native) if raw_native is not None else None
             ),
             continuation=(
-                ModelContinuation.from_dict(raw_continuation)
+                _continuation_from_dict(raw_continuation)
                 if isinstance(raw_continuation, Mapping)
                 else None
             ),
-            model_name=_optional_text(value.get("model_name")),
-            provider=_optional_text(value.get("provider")),
+            model_name=_optional_text(value["model_name"]),
+            provider=_optional_text(value["provider"]),
             metadata=raw_metadata,
             timestamp=_message_timestamp(value),
         )
     if role == "tool":
-        allowed = {"role", "tool_call_id", "tool_name", "result", "timestamp"}
-        if not set(value) <= allowed:
+        required = {"role", "tool_call_id", "tool_name", "result", "timestamp"}
+        if set(value) != required:
             raise ValueError("tool result message fields are invalid")
-        raw_result = value.get("result")
-        if not isinstance(raw_result, Mapping):
+        raw_result = value["result"]
+        if not isinstance(raw_result, dict):
             raise ValueError("tool result message result must be a mapping")
-        raw_call_id = value.get("tool_call_id")
-        raw_tool_name = value.get("tool_name")
+        raw_call_id = value["tool_call_id"]
+        raw_tool_name = value["tool_name"]
         if not isinstance(raw_call_id, str) or not isinstance(raw_tool_name, str):
             raise ValueError("tool result message ids must be text")
         return ToolResultMessage(
@@ -573,10 +615,35 @@ def _optional_text(value: Any) -> Optional[str]:
 
 
 def _message_timestamp(value: Mapping[str, Any]) -> float:
-    raw = value.get("timestamp")
+    raw = value["timestamp"]
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         raise ValueError("message timestamp must be numeric")
-    return float(raw)
+    timestamp = float(raw)
+    if not math.isfinite(timestamp):
+        raise ValueError("message timestamp must be finite")
+    return timestamp
+
+
+def _continuation_from_dict(value: Mapping[str, Any]) -> ModelContinuation:
+    fields = {
+        "run_id",
+        "provider",
+        "model",
+        "protocol",
+        "response_id",
+        "prefix_items",
+        "prefix_digest",
+        "settings_digest",
+    }
+    if set(value) != fields:
+        raise ValueError("assistant continuation fields are invalid")
+    text_fields = fields - {"prefix_items"}
+    if any(not isinstance(value[name], str) for name in text_fields):
+        raise ValueError("assistant continuation text fields must be text")
+    prefix_items = value["prefix_items"]
+    if isinstance(prefix_items, bool) or not isinstance(prefix_items, int):
+        raise ValueError("assistant continuation prefix_items must be an integer")
+    return ModelContinuation.from_dict(value)
 
 
 __all__ = [

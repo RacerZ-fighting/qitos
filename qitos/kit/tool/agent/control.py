@@ -7,7 +7,9 @@ from typing import Any
 
 from ....core.child import ChildHandle, ChildResult, ChildStatus
 from ....core.tool import BaseTool, ToolPermission, ToolSpec
+from ....core.tool_result import ToolResult
 from ...child import ChildSupervisor
+from ..internal.results import tool_result
 
 
 class _ChildControlTool(BaseTool):
@@ -50,7 +52,13 @@ class _ChildControlTool(BaseTool):
         child_id = str(args.get("child_id") or "").strip()
         if not child_id:
             raise ValueError("child_id is required")
-        parent_run_id = str((runtime_context or {}).get("parent_run_id") or "").strip()
+        context = runtime_context or {}
+        # ToolBatchExecutor owns ``run_id`` for the frozen turn. Keep the
+        # explicit parent id for direct application callers, but never let it
+        # replace the executor-owned identity when both are present.
+        parent_run_id = str(
+            context.get("run_id") or context.get("parent_run_id") or ""
+        ).strip()
         if not parent_run_id:
             raise ValueError("parent_run_id is required for child ownership")
         return ChildHandle(child_id=child_id, parent_run_id=parent_run_id)
@@ -109,11 +117,13 @@ class ChildStatusTool(_ChildControlTool):
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ToolResult:
         try:
             handle = self._handle(args, runtime_context)
         except (TypeError, ValueError) as exc:
-            return {"status": "error", "error": str(exc)}
+            return tool_result(
+                {"status": "error", "error": str(exc)}, status="error"
+            )
         result = self._supervisor.result(handle)
         return self._unknown(handle) if result is None else self._projection(result)
 
@@ -144,7 +154,7 @@ class ChildWaitTool(_ChildControlTool):
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ToolResult:
         try:
             handle = self._handle(args, runtime_context)
             timeout = min(
@@ -156,7 +166,9 @@ class ChildWaitTool(_ChildControlTool):
                 timeout_seconds=timeout,
             )
         except (TypeError, ValueError) as exc:
-            return {"status": "error", "error": str(exc)}
+            return tool_result(
+                {"status": "error", "error": str(exc)}, status="error"
+            )
         return self._unknown(handle) if result is None else self._projection(result)
 
 
@@ -190,7 +202,7 @@ class ChildMessageTool(_ChildControlTool):
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ToolResult:
         try:
             handle = self._handle(args, runtime_context)
             timeout = min(
@@ -203,7 +215,9 @@ class ChildMessageTool(_ChildControlTool):
                 timeout_seconds=timeout,
             )
         except (TypeError, ValueError, RuntimeError) as exc:
-            return {"status": "error", "error": str(exc)}
+            return tool_result(
+                {"status": "error", "error": str(exc)}, status="error"
+            )
         if result is None:
             payload = self._unknown(handle)
         else:
@@ -243,7 +257,7 @@ class ChildInterruptTool(_ChildControlTool):
         self,
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | ToolResult:
         try:
             handle = self._handle(args, runtime_context)
             timeout = min(
@@ -255,7 +269,9 @@ class ChildInterruptTool(_ChildControlTool):
                 wait_seconds=timeout,
             )
         except (TypeError, ValueError) as exc:
-            return {"status": "error", "error": str(exc)}
+            return tool_result(
+                {"status": "error", "error": str(exc)}, status="error"
+            )
         return self._unknown(handle) if result is None else self._projection(result)
 
 

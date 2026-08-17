@@ -13,6 +13,8 @@ from .budget import BudgetLedger
 from .journal import JournalRecordRef, SessionJournal
 from .runtime_input import RuntimeInput
 from .task import TaskBudget
+from .tool import ToolPermissionContext
+from .tool_registry import ToolExposure
 
 DEFAULT_CHILD_MAX_STEPS = 200
 ChildInvocationCleanup = Callable[[], Awaitable[None]]
@@ -193,6 +195,8 @@ class ChildLaunchContext:
     budget_ledger: BudgetLedger | None = None
     journal: SessionJournal | None = None
     post_runtime_event: ChildPostRuntimeEvent | None = None
+    parent_tool_authority: ToolExposure | None = None
+    parent_permission_context: ToolPermissionContext | None = None
     parent_history: tuple[object, ...] = ()
     parent_history_snapshot: object | None = None
 
@@ -232,6 +236,29 @@ class ChildLaunchContext:
         ):
             raise TypeError(
                 "ChildLaunchContext.post_runtime_event must be callable or None"
+            )
+        if self.parent_tool_authority is not None and not isinstance(
+            self.parent_tool_authority, ToolExposure
+        ):
+            raise TypeError(
+                "ChildLaunchContext.parent_tool_authority must be a "
+                "ToolExposure or None"
+            )
+        if self.parent_permission_context is not None:
+            if not isinstance(self.parent_permission_context, ToolPermissionContext):
+                raise TypeError(
+                    "ChildLaunchContext.parent_permission_context must be a "
+                    "ToolPermissionContext or None"
+                )
+            # The parent Tool turn is immutable. Retain a value snapshot rather
+            # than a mutable policy object that another turn can widen after
+            # Child admission.
+            object.__setattr__(
+                self,
+                "parent_permission_context",
+                ToolPermissionContext.from_dict(
+                    self.parent_permission_context.to_dict()
+                ),
             )
         if not isinstance(self.parent_history, tuple):
             raise TypeError("ChildLaunchContext.parent_history must be a tuple")
@@ -273,6 +300,14 @@ class ChildRuntimeContext:
     @property
     def budget_ledger(self) -> BudgetLedger | None:
         return self.launch.budget_ledger
+
+    @property
+    def parent_tool_authority(self) -> ToolExposure | None:
+        return self.launch.parent_tool_authority
+
+    @property
+    def parent_permission_context(self) -> ToolPermissionContext | None:
+        return self.launch.parent_permission_context
 
     @property
     def parent_history(self) -> tuple[object, ...]:

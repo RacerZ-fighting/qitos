@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from qitos.core.tool import BaseTool, ToolPermission, ToolSpec
+from qitos.core.tool_result import ToolResult
+from qitos.kit.tool.internal.results import error_result
 from qitos.kit.tool.internal.workspace import resolve_workspace_path
 
 
@@ -61,7 +63,7 @@ class ReadNotebook(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Read a window of cells from a notebook file.
 
@@ -101,7 +103,7 @@ class ReadNotebook(BaseTool):
                 "has_more": start + limit < len(cells),
             }
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return error_result({"status": "error", "message": str(e)})
 
 
 class ReplaceNotebookCell(BaseTool):
@@ -129,7 +131,7 @@ class ReplaceNotebookCell(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Replace the source text of one notebook cell.
 
@@ -149,7 +151,12 @@ class ReplaceNotebookCell(BaseTool):
             cells = data["cells"]
             idx = int(cell_index)
             if idx < 0 or idx >= len(cells):
-                return {"status": "error", "message": f"Cell index out of range: {idx}"}
+                return error_result(
+                    {
+                        "status": "error",
+                        "message": f"Cell index out of range: {idx}",
+                    }
+                )
             cells[idx]["source"] = source.splitlines(keepends=True)
             _dump_notebook(resolved, data)
             return {
@@ -159,7 +166,7 @@ class ReplaceNotebookCell(BaseTool):
                 "cell_type": str(cells[idx].get("cell_type", "")),
             }
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return error_result({"status": "error", "message": str(e)})
 
 
 class InsertNotebookCell(BaseTool):
@@ -188,7 +195,7 @@ class InsertNotebookCell(BaseTool):
 
     async def execute(
         self, args: Dict[str, Any], runtime_context: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, Any]:
+    ) -> Dict[str, Any] | ToolResult:
         """
         Insert a new notebook cell into a `.ipynb` file.
 
@@ -208,10 +215,12 @@ class InsertNotebookCell(BaseTool):
         index = int(args.get("index", -1))
         normalized_type = str(cell_type or "").strip().lower()
         if normalized_type not in {"code", "markdown", "raw"}:
-            return {
-                "status": "error",
-                "message": f"Unsupported cell_type: {normalized_type}",
-            }
+            return error_result(
+                {
+                    "status": "error",
+                    "message": f"Unsupported cell_type: {normalized_type}",
+                }
+            )
         try:
             resolved, data = _load_notebook(self._root_dir, path)
             cells = data["cells"]
@@ -235,7 +244,7 @@ class InsertNotebookCell(BaseTool):
                 "cell_type": normalized_type,
             }
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return error_result({"status": "error", "message": str(e)})
 
 
 class NotebookToolSet:
