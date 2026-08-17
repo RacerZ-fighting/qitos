@@ -42,6 +42,7 @@ from ...core.message import (
 )
 from ...core.model_request import ModelRequest
 from ...core.model_response import ModelPricing, ModelUsage
+from ...core.plan import Plan, plan_from_dict, plan_to_dict
 from ...core.task import Task, TaskBlocker, TaskStatus, validate_task_transition
 from ...core.thinking import ThinkingLevel
 from ...core.tool_result import ToolResult
@@ -333,6 +334,29 @@ def decode_runtime_input_consumed(payload: Mapping[str, Any]) -> str:
     if set(payload) != {"event_id"}:
         raise ValueError("runtime_input.consumed fields are invalid")
     return _decode_record_id(payload["event_id"], "event_id")
+
+
+def encode_plan_updated(task_id: str, plan: Plan) -> dict[str, Any]:
+    """Payload of one whole-graph ``plan.updated`` replacement."""
+
+    payload = {"task_id": task_id, "plan": plan_to_dict(plan)}
+    decode_plan_updated(payload)
+    return payload
+
+
+def decode_plan_updated(payload: Mapping[str, Any]) -> tuple[str, Plan]:
+    """Decode one exact Plan replacement, failing closed on shape."""
+
+    if set(payload) != {"task_id", "plan"}:
+        raise ValueError("plan.updated fields are invalid")
+    task_id = _decode_record_id(payload["task_id"], "task_id")
+    raw_plan = payload["plan"]
+    if not isinstance(raw_plan, Mapping):
+        raise ValueError("plan.updated plan must be a mapping")
+    try:
+        return task_id, plan_from_dict(raw_plan)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("plan.updated is not decodable") from exc
 
 
 def encode_task_created(task: Task) -> dict[str, Any]:
@@ -840,6 +864,7 @@ __all__ = [
     "decode_input_accepted",
     "decode_model_change",
     "decode_model_completed",
+    "decode_plan_updated",
     "decode_run_terminal",
     "decode_step_committed",
     "decode_task_created",
@@ -853,6 +878,7 @@ __all__ = [
     "encode_compaction",
     "encode_model_change",
     "encode_model_completed",
+    "encode_plan_updated",
     "encode_run_terminal",
     "encode_step_committed",
     "encode_task_created",

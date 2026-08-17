@@ -164,7 +164,7 @@ class ChildLaunchRequest:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ChildLaunchRequest":
-        legacy = {
+        expected = {
             "task",
             "description",
             "name",
@@ -174,9 +174,10 @@ class ChildLaunchRequest:
             "allowed_tool_groups",
             "working_directory",
             "budget",
+            "parent_task_id",
+            "plan_assignment",
         }
-        expected = legacy | {"parent_task_id", "plan_assignment"}
-        if set(value) not in (legacy, expected):
+        if set(value) != expected:
             raise ValueError("ChildLaunchRequest fields are invalid")
         raw_groups = value["allowed_tool_groups"]
         raw_budget = value["budget"]
@@ -194,8 +195,8 @@ class ChildLaunchRequest:
             allowed_tool_groups=tuple(raw_groups),
             working_directory=value["working_directory"],
             budget=_budget_from_dict(raw_budget),
-            parent_task_id=value.get("parent_task_id"),
-            plan_assignment=value.get("plan_assignment"),
+            parent_task_id=value["parent_task_id"],
+            plan_assignment=value["plan_assignment"],
         )
 
 

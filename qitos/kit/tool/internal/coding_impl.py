@@ -44,7 +44,7 @@ from qitos.kit.tool.internal.coding_utils import (
     utc_now,
 )
 from qitos.kit.tool.internal.results import error_result, tool_result
-from qitos.kit.tool.internal.work_plan import UpdateWorkPlanTool
+from qitos.kit.tool.internal.plan import UpdatePlanTool
 from qitos.kit.tool.internal.runtime_ops import select_runtime_ops
 from qitos.kit.tool.notebook import NotebookToolSet
 
@@ -474,7 +474,7 @@ class CodingToolSet:
         )
         self._session_tasks: Dict[str, Dict[str, Any]] = {}
         self._task_counter = 0
-        self.update_plan = UpdateWorkPlanTool()
+        self.update_plan = UpdatePlanTool()
 
     def setup(self, context: Dict[str, Any]) -> None:
         _ = context

@@ -48,7 +48,12 @@ from qitos.harness import build_harness_policy, build_model_for_preset
 
 ### 规划
 
-- `UpdateWorkPlanTool` / `update_plan`：维护一份强类型、可随 journal 恢复的轻量清单
+- `UpdatePlanTool` / `update_plan`：把完整的依赖图 Plan 提交到当前 Session journal。Node
+  使用稳定 id、dependencies、显式持久状态和可选 Child owner；readiness 由已完成依赖派生。
+  空 Plan 不产生 TODO 投影，无依赖、无 owner 的 Plan 投影为普通 TODO。
+
+模型不能自行写入 Child owner。调用 Agent Tool 时把 ready node id 作为 `plan_assignment`；Child
+supervisor 会先把生成的稳定 handle 提交到 Plan，再写入 `child.started`。
 
 ---
 

@@ -46,14 +46,12 @@ def test_child_launch_request_is_immutable_and_round_trips() -> None:
         request.task = "changed"  # type: ignore[misc]
 
 
-def test_child_launch_request_decodes_legacy_payload_without_task_keys() -> None:
+def test_child_launch_request_rejects_payload_without_task_binding_fields() -> None:
     payload = _request().to_dict()
     del payload["parent_task_id"]
     del payload["plan_assignment"]
-    restored = ChildLaunchRequest.from_dict(payload)
-    assert restored.parent_task_id is None
-    assert restored.plan_assignment is None
-    assert restored.to_dict() == _request().to_dict()
+    with pytest.raises(ValueError):
+        ChildLaunchRequest.from_dict(payload)
 
 
 def test_child_launch_request_round_trips_task_binding() -> None:

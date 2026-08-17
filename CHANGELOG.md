@@ -210,12 +210,30 @@ How to update:
   terminal rejects with `AgentRunRejected("task_terminal")`; taskless
   Sessions are unchanged. Child launch binds the narrowed Child Task
   durably: `ChildLaunchRequest` carries `parent_task_id` / `plan_assignment`
-  (legacy payloads without them still decode), the façade Child engine
-  commits the Child `task.created` before its `input.accepted`, and the
-  Agent Tool threads the binding from the runtime context the parent
-  Harness publishes.
+  fields, the façade Child engine commits the Child `task.created` before its
+  `input.accepted`, and the Agent Tool binds a new assignment explicitly
+  instead of copying the parent's assignment.
+- **Dependency-aware durable Plan (S3b).** `qitos.core.plan` replaces the flat
+  checklist with immutable `Plan` / `PlanNode` / `PlanStatus` contracts: stable
+  node ids, dependencies, optional typed `ChildHandle` owners, derived readiness,
+  topological rendering, cycle/reference checks, legal whole-graph replacements,
+  and at most one in-progress node per owner. Task-bound `plan.updated` records are
+  the sole Plan truth and pure recovery folds each Task's graph through fork lineage,
+  so a terminal follow-up starts without the previous Task's Plan. `UpdatePlanTool`
+  commits accepted replacements through the current Session journal; models cannot
+  invent a Child owner. Agent Tool calls may name a ready `plan_assignment`; the
+  supervisor commits the generated handle before `child.started` and durably
+  releases it if admission fails. Root and Child use this one optional contract,
+  while a dependency-free Child Plan renders as an ordinary TODO.
 
 ### Breaking
+
+- **Flat WorkPlan replaced in place (S3b).** `WorkPlanState`, `WorkPlanItem`,
+  `WorkPlanStatus`, `WorkPlanUpdate`, `UpdateWorkPlanTool` and their codecs/reducer
+  are removed rather than aliased. Use `Plan`, `PlanNode`, `PlanStatus`,
+  `PlanUpdate`, `UpdatePlanTool` and the Plan codecs. `ChildLaunchRequest.from_dict`
+  now requires the canonical task-binding keys, including explicit `null` values.
+  The unused `qitos.kit.state` package is removed.
 
 - **`Task` schema replaced in place (S3a).** `Task` loses `id` (renamed
   `task_id`), `inputs`, `resources`, `env_spec`, `metadata`, `validate`,

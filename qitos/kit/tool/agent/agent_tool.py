@@ -156,6 +156,13 @@ class AgentTool(BaseTool):
                     "general-purpose child."
                 ),
             },
+            "plan_assignment": {
+                "type": "string",
+                "description": (
+                    "Optional ready parent Plan node id assigned to this child. "
+                    "The runtime durably reserves it before the child starts."
+                ),
+            },
         }
         if execution_mode == "optional_background":
             parameters["run_in_background"] = {
@@ -250,23 +257,30 @@ class AgentTool(BaseTool):
             self._execution_mode == "optional_background" and requested_background
         )
         context_values = runtime_context or {}
-        task_binding: dict[str, str | None] = {}
-        for context_key in ("task_id", "plan_assignment"):
-            context_value = context_values.get(context_key)
-            if context_value is not None and (
-                not isinstance(context_value, str) or not context_value.strip()
-            ):
-                return tool_result(
-                    {
-                        "status": "error",
-                        "error": (
-                            f"runtime context {context_key} must be a "
-                            "non-empty string or None"
-                        ),
-                    },
-                    status="error",
-                )
-            task_binding[context_key] = context_value
+        parent_task_id = context_values.get("task_id")
+        if parent_task_id is not None and (
+            not isinstance(parent_task_id, str) or not parent_task_id.strip()
+        ):
+            return tool_result(
+                {
+                    "status": "error",
+                    "error": (
+                        "runtime context task_id must be a non-empty string or None"
+                    ),
+                },
+                status="error",
+            )
+        raw_assignment = args.get("plan_assignment")
+        if raw_assignment is not None and (
+            not isinstance(raw_assignment, str) or not raw_assignment.strip()
+        ):
+            return tool_result(
+                {
+                    "status": "error",
+                    "error": "plan_assignment must be a non-empty string or omitted",
+                },
+                status="error",
+            )
         request = ChildLaunchRequest(
             task=prompt,
             description=description,
@@ -276,8 +290,12 @@ class AgentTool(BaseTool):
             allowed_tool_groups=self._child_allowed_tool_groups,
             working_directory=self._child_working_directory,
             budget=self._child_budget,
-            parent_task_id=task_binding["task_id"],
-            plan_assignment=task_binding["plan_assignment"],
+            parent_task_id=parent_task_id,
+            plan_assignment=(
+                raw_assignment.strip()
+                if isinstance(raw_assignment, str)
+                else None
+            ),
         )
         try:
             result = await self._supervisor.launch(

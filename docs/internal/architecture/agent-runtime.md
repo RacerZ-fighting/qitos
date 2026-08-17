@@ -3,8 +3,8 @@
 ## Status
 
 Accepted target architecture on 2026-08-16. The minimal loop, the `Agent`
-façade and the authoritative Session/Harness are the shipped execution and
-recovery path; Task/Plan work remains in the migration plan.
+façade, the authoritative Session/Harness, the goal-bearing Task and the
+dependency-aware Plan are the shipped execution and recovery path.
 
 This document owns the final QitOS runtime boundaries. The
 [migration plan](../plans/pi-aligned-agent-runtime.md) owns the remaining sequencing.
@@ -179,19 +179,27 @@ compatibility mirror.
 ## 6. Plan and Child
 
 Plan is a dependency-aware graph with stable node identity, owner and explicit state.
-Readiness derives from dependency completion. Multiple owners may hold independent
-nodes in progress. QitOS validates graph, transition, reservation, budget and
-concurrency; applications or models choose the schedule. Every accepted update
-commits as one `plan.updated` record in the owning Run journal; the current Plan is
-the replay of the latest committed update through the fork lineage, and TODO
+`ready` is a derived view of a pending node whose dependencies are completed, not a
+persisted state. One owner may hold at most one node in progress; independent owners
+may work concurrently. QitOS validates graph, transition, reservation and concurrency;
+applications or models choose the schedule. Every accepted update
+commits as one `plan.updated` record with its owning Task id in the Run journal. Plans
+are replayed per Task through the fork lineage, so an explicit terminal follow-up Task
+does not inherit the previous Task's strategy. TODO
 Markdown is a deterministic projection of the committed Plan, never an editable
 second truth.
 
+Plan is optional and uses one contract for Root and Child. Root normally uses a graph
+with dependencies and Child owners. A simple Child may have no Plan, or use the same
+graph with no dependencies or owners as a linear TODO. Parent and Child Plans remain
+independent; a Child conclusion drives the parent assignment node but the Child Plan is
+never merged into the parent Plan.
+
 Root and Child use the same Agent implementation. A Child has its own Task, Session,
-Plan, context and cancellation domain; authorization and budgets only narrow. Launch
-creates the Child Task and durable parent Plan assignment before runtime construction.
-Parent control uses stable handles and bounded conclusions, never live Agents or Child
-transcripts.
+optional Plan, context and cancellation domain; authorization and budgets only narrow.
+Launch commits the accepted parent Plan assignment before Child lifecycle persistence
+and runtime construction. Parent control uses stable handles and bounded conclusions,
+never live Agents or Child transcripts.
 
 ## 7. Tool, Runtime and extension boundary
 

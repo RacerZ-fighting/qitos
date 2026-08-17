@@ -32,8 +32,11 @@ from qitos.core.journal import (
     JournalRecordType,
     SessionJournal,
 )
+from qitos.core.plan import Plan, PlanNode, PlanStatus
+from qitos.core.task import Task
 from qitos.kit.child import ChildRunLimiter, ChildSupervisor
-from qitos.kit.journal import JsonlSessionJournal
+from qitos.kit.journal import JsonlSessionJournal, recover_session
+from qitos.kit.journal.turn_recorder import encode_plan_updated, encode_task_created
 
 
 def _request(task: str = "inspect") -> ChildLaunchRequest:
@@ -60,6 +63,30 @@ async def _set_event(event: asyncio.Event) -> None:
 
 async def _ready_invocation(**kwargs: Any) -> ChildInvocation:
     return ChildInvocation(**kwargs)
+
+
+async def _seed_parent_plan(
+    journal: SessionJournal,
+    node_ids: tuple[str, ...] = ("delegate",),
+) -> None:
+    await journal.append(
+        JournalRecordType.TASK_CREATED,
+        encode_task_created(Task(task_id="parent-task", objective="Parent work")),
+        record_id="parent-run:task:parent-task:created",
+    )
+    await journal.append(
+        JournalRecordType.PLAN_UPDATED,
+        encode_plan_updated(
+            "parent-task",
+            Plan(
+                tuple(
+                    PlanNode(node_id, f"Delegate {node_id}")
+                    for node_id in node_ids
+                )
+            )
+        ),
+        record_id="parent-run:plan:initial",
+    )
 
 
 class _ClosableEngine:
@@ -959,6 +986,159 @@ async def test_invocation_factory_receives_persisted_child_handle(tmp_path) -> N
         record for record in records if record.type is JournalRecordType.CHILD_STARTED
     )
     assert observed_handle == ChildHandle.from_dict(started.payload["handle"])
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_plan_assignment_commits_before_child_started(tmp_path) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal-assignment")
+    await journal.create("parent-run", {})
+    await _seed_parent_plan(journal)
+    request = ChildLaunchRequest(
+        task="inspect",
+        description="inspect task",
+        parent_task_id="parent-task",
+        plan_assignment="delegate",
+    )
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=_CompletingEngine(), task=request.task
+        )
+    )
+
+    result = await supervisor.launch(
+        request,
+        _context(journal=journal),
+        background=False,
+    )
+    records = await journal.replay()
+    assignment_index = next(
+        index
+        for index, record in enumerate(records)
+        if record.type is JournalRecordType.PLAN_UPDATED
+        and record.record_id.endswith(result.handle.child_id)
+    )
+    started_index = next(
+        index
+        for index, record in enumerate(records)
+        if record.type is JournalRecordType.CHILD_STARTED
+    )
+    recovered = recover_session(records)
+
+    assert assignment_index < started_index
+    assert recovered.plan is not None
+    assigned = recovered.plan.node("delegate")
+    assert assigned.status is PlanStatus.IN_PROGRESS
+    assert assigned.owner == result.handle
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_child_assignments_preserve_independent_owners(
+    tmp_path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal-concurrent-assignment")
+    await journal.create("parent-run", {})
+    await _seed_parent_plan(journal, ("first", "second"))
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=_CompletingEngine(), task=request.task
+        )
+    )
+
+    results = await asyncio.gather(
+        *(
+            supervisor.launch(
+                ChildLaunchRequest(
+                    task=node_id,
+                    description=f"{node_id} task",
+                    parent_task_id="parent-task",
+                    plan_assignment=node_id,
+                ),
+                _context(journal=journal),
+                background=True,
+            )
+            for node_id in ("first", "second")
+        )
+    )
+    recovered = recover_session(await journal.replay())
+
+    assert recovered.plan is not None
+    assert {
+        recovered.plan.node(node_id).owner for node_id in ("first", "second")
+    } == {result.handle for result in results}
+    await asyncio.gather(*(supervisor.wait(result.handle) for result in results))
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_plan_assignment_never_constructs_child(tmp_path) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal-invalid-assignment")
+    await journal.create("parent-run", {})
+    await _seed_parent_plan(journal)
+    factory_called = False
+
+    def invocation_factory(request, _context):
+        nonlocal factory_called
+        factory_called = True
+        return _ready_invocation(engine=_CompletingEngine(), task=request.task)
+
+    supervisor = ChildSupervisor(invocation_factory=invocation_factory)
+    with pytest.raises(ValueError, match="Unknown Plan node"):
+        await supervisor.launch(
+            ChildLaunchRequest(
+                task="inspect",
+                description="inspect task",
+                parent_task_id="parent-task",
+                plan_assignment="missing",
+            ),
+            _context(journal=journal),
+            background=False,
+        )
+
+    assert factory_called is False
+    assert all(
+        record.type is not JournalRecordType.CHILD_STARTED
+        for record in await journal.replay()
+    )
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_child_started_failure_releases_plan_assignment(tmp_path) -> None:
+    journal = _FailingChildJournal(
+        tmp_path / "journal-release-assignment",
+        fail_type=JournalRecordType.CHILD_STARTED,
+    )
+    await journal.create("parent-run", {})
+    await _seed_parent_plan(journal)
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=_CompletingEngine(), task=request.task
+        )
+    )
+
+    with pytest.raises(ChildPersistenceError, match="was not executed"):
+        await supervisor.launch(
+            ChildLaunchRequest(
+                task="inspect",
+                description="inspect task",
+                parent_task_id="parent-task",
+                plan_assignment="delegate",
+            ),
+            _context(journal=journal),
+            background=False,
+        )
+    recovered = recover_session(await journal.replay())
+
+    assert recovered.plan is not None
+    released = recovered.plan.node("delegate")
+    assert released.status is PlanStatus.PENDING
+    assert released.owner is None
     await supervisor.aclose()
     await journal.close()
 

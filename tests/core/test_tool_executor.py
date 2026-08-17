@@ -122,6 +122,27 @@ async def test_unknown_tool_and_schema_violation_are_terminal_errors() -> None:
 
 
 @pytest.mark.asyncio
+async def test_frozen_nested_arguments_are_thawed_before_schema_and_handler() -> None:
+    observed: list[list[str]] = []
+
+    @tool(name="collect")
+    def _collect(items: list[str]) -> int:
+        observed.append(items)
+        return len(items)
+
+    executor = ToolBatchExecutor(_exposure(_collect), ToolExecutionConfig())
+    result = (
+        await executor.execute_batch(
+            [_call("collect", {"items": ["a", "b"]}, "nested")]
+        )
+    )[0]
+
+    assert result.status == "success"
+    assert result.output == 2
+    assert observed == [["a", "b"]]
+
+
+@pytest.mark.asyncio
 async def test_retry_policy_is_the_single_retry_owner() -> None:
     attempts = 0
 

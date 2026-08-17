@@ -4,24 +4,16 @@
 
 Accepted migration plan on 2026-08-16. The target contracts are defined by the
 [QitOS Agent runtime architecture](../architecture/agent-runtime.md). The minimal loop,
-façade, retired-runtime deletion slices, S1 parity items, and the authoritative
-Session/Harness (S2) are implemented on the migration branch. The remaining merge
-gates land on the same branch:
-
-- S3 — milestone 2.4, dependency-aware Plan (S3b). The goal-bearing Task (S3a)
-  is implemented.
+façade, retired-runtime deletion slices, S1 parity items, the authoritative
+Session/Harness (S2), goal-bearing Task (S3a), and dependency-aware Plan (S3b) are
+implemented on the migration branch. The branch has passed its independent pytest,
+flake8 and mypy gates and now awaits architecture review before merge.
 
 ## 1. Current gaps
 
-- WorkPlan is a flat single-active checklist rather than an owner/dependency graph
-  (S3b); `Task.plan_assignment` is already a durable plain reference whose real
-  Plan binding lands with S3b.
-- Background Child terminal facts have deterministic completion-input projections,
-  and the Session/Harness now re-projects a run's own unconsumed inputs exactly
-  once; Task durable lifecycle (blocked/terminal transitions) is journaled and
-  recovered (S3a), and Plan update replay is what remains for recovery beyond
-  that (S3b). Parent-side narrowing enforcement of the Child Task binding also
-  remains with S3b.
+- QitOS runtime migration S1-S3 is complete on the feature branch. PentestAgent
+  application composition, gitlink movement, and product-domain migration remain
+  separate cross-repository work and are not part of this branch gate.
 
 Proven Tool transaction, cancellation, absolute deadline, result ordering, trace and
 recovery behavior is the conformance baseline. Legacy type names and package layout are
@@ -167,15 +159,19 @@ S3a (Task), done on `feat/pi-aligned-agent-loop`:
   binding `plan_assignment` to a real parent Plan node and parent-side
   narrowing enforcement of the Child Task.
 
-S3b (Plan):
+S3b (Plan), done on `feat/pi-aligned-agent-loop`:
 
-- Replace `core/work_plan.py` in place with the dependency-aware graph:
+- (done) Replaced `core/work_plan.py` in place with the dependency-aware graph:
   stable node ids, dependencies, owners, explicit state, derived readiness,
   per-owner in-progress limits, cycle/reference/transition validation.
-- Every accepted update commits one `plan.updated` record; recovery replays
-  the latest committed update through the lineage; TODO Markdown is the
-  deterministic topological projection.
-- Rework the `update_plan` tool onto the graph contract and bind Child launch
+- (done) Kept one optional Plan contract for Root and Child: Root normally uses the full
+  dependency/owner graph; a simple Child may have no Plan or a flat graph whose
+  deterministic projection is a TODO. Parent and Child Plans never merge.
+- (done) Every accepted update commits one Task-bound `plan.updated` record; recovery
+  replays each Task's latest committed update through the lineage, so terminal
+  follow-up starts without the previous Task's Plan; TODO Markdown is the deterministic
+  topological projection.
+- (done) Reworked the `update_plan` tool onto the graph contract and bound Child launch
   to a parent Plan assignment.
 
 Done when Task, Session, Run, Plan and Child identities stay distinct across

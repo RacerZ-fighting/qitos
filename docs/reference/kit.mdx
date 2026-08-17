@@ -61,7 +61,15 @@ Use this page as a capability map for QitOS authoring.
 
 ### Planning
 
-- `UpdateWorkPlanTool` / `update_plan` for one typed, journal-friendly checklist
+- `UpdatePlanTool` / `update_plan` commits a complete dependency-aware Plan to the
+  current Session journal. Nodes have stable ids, dependencies, explicit durable
+  states, and optional Child owners. Readiness is derived from completed dependencies.
+  An empty Plan has no TODO projection; a Plan without dependencies or owners renders
+  as a plain TODO list.
+
+Child ownership is not model-authored. Pass a ready node id as the Agent Tool's
+`plan_assignment`; the Child supervisor commits the generated handle to the Plan before
+it writes `child.started`.
 
 ---
 

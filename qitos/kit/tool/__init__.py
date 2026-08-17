@@ -14,7 +14,7 @@ from .advanced import (
     MCPReadResourceTool,
     ToolSearchTool,
 )
-from .internal.work_plan import UpdateWorkPlanTool
+from .internal.plan import UpdatePlanTool
 from .coding import CodingToolSet
 from .epub import EpubToolSet
 from .notebook import (
@@ -101,7 +101,7 @@ __all__ = [
     "BundledSkillSnapshot",
     "SkillToolSet",
     "WorkspaceAwareMixin",
-    "UpdateWorkPlanTool",
+    "UpdatePlanTool",
     "ToolSearchTool",
     "math_tools",
     "editor_tools",

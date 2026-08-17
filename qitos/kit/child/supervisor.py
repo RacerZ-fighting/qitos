@@ -42,6 +42,7 @@ from ...core.runtime_input import (
     child_terminal_runtime_input,
 )
 from ..journal import recover_run_outcome
+from ..plan import assign_plan_node, release_plan_node
 from .agent_engine import (
     child_budget_stop_reason,
     child_final_text,
@@ -190,14 +191,38 @@ class ChildSupervisor:
                 raise
 
             try:
+                await self._persist_plan_assignment(owned)
+            except JournalAppendCancelled as cancellation:
+                await self._discard_unstarted(
+                    owned,
+                    release_assignment=(
+                        cancellation.commit_state is JournalCommitState.COMMITTED
+                    ),
+                )
+                raise
+            except JournalCommitError as commit_error:
+                await self._discard_unstarted(
+                    owned,
+                    release_assignment=(
+                        commit_error.commit_state is JournalCommitState.COMMITTED
+                    ),
+                )
+                raise ChildPersistenceError(
+                    "failed to persist the parent Plan assignment; "
+                    "child was not admitted"
+                ) from commit_error
+            except BaseException:
+                await self._discard_unstarted(owned, release_assignment=False)
+                raise
+
+            try:
                 await self._persist_started(owned)
             except JournalAppendCancelled as cancellation:
                 if cancellation.commit_state is JournalCommitState.NOT_COMMITTED:
-                    async with self._admission_lock:
-                        self._children.pop(handle, None)
-                        self._children_started -= 1
-                    if run_lease is not None:
-                        await run_lease.rollback()
+                    await self._discard_unstarted(
+                        owned,
+                        release_assignment=True,
+                    )
                     raise
 
                 if cancellation.commit_state is JournalCommitState.COMMITTED:
@@ -225,11 +250,10 @@ class ChildSupervisor:
                 raise
             except JournalCommitError as commit_error:
                 if commit_error.commit_state is JournalCommitState.NOT_COMMITTED:
-                    async with self._admission_lock:
-                        self._children.pop(handle, None)
-                        self._children_started -= 1
-                    if run_lease is not None:
-                        await run_lease.rollback()
+                    await self._discard_unstarted(
+                        owned,
+                        release_assignment=True,
+                    )
                 else:
                     await self._retain_failed_admission(
                         owned,
@@ -239,11 +263,10 @@ class ChildSupervisor:
                     "failed to persist child.started; child was not executed"
                 ) from commit_error
             except BaseException:
-                async with self._admission_lock:
-                    self._children.pop(handle, None)
-                    self._children_started -= 1
-                if run_lease is not None:
-                    await run_lease.rollback()
+                await self._discard_unstarted(
+                    owned,
+                    release_assignment=True,
+                )
                 raise
             if run_lease is not None:
                 run_lease.commit()
@@ -978,6 +1001,63 @@ class ChildSupervisor:
             raise ChildPersistenceError(
                 "failed to persist child.started; child was not executed"
             ) from exc
+
+    async def _persist_plan_assignment(self, owned: _OwnedChild) -> None:
+        node_id = owned.request.plan_assignment
+        if node_id is None:
+            return
+        if owned.journal is None:
+            raise ChildPersistenceError(
+                "a Child Plan assignment requires the parent Session Journal"
+            )
+        await assign_plan_node(
+            owned.journal,
+            node_id,
+            owned.handle,
+            parent_task_id=owned.request.parent_task_id,
+            record_id=(
+                f"{owned.handle.parent_run_id}:plan:assign:"
+                f"{owned.handle.child_id}"
+            ),
+        )
+
+    async def _discard_unstarted(
+        self,
+        owned: _OwnedChild,
+        *,
+        release_assignment: bool,
+    ) -> None:
+        """Release a durable assignment and local admission after launch failure."""
+
+        release_error: BaseException | None = None
+        try:
+            if (
+                release_assignment
+                and owned.request.plan_assignment is not None
+                and owned.journal is not None
+            ):
+                await release_plan_node(
+                    owned.journal,
+                    owned.request.parent_task_id or "",
+                    owned.request.plan_assignment,
+                    owned.handle,
+                    record_id=(
+                        f"{owned.handle.parent_run_id}:plan:release:"
+                        f"{owned.handle.child_id}"
+                    ),
+                )
+        except BaseException as exc:
+            release_error = exc
+        finally:
+            async with self._admission_lock:
+                self._children.pop(owned.handle, None)
+                self._children_started -= 1
+            if owned.run_lease is not None:
+                await owned.run_lease.rollback()
+        if release_error is not None:
+            raise ChildPersistenceError(
+                "failed to release a Plan assignment after child admission failed"
+            ) from release_error
 
     async def _store_terminal(
         self,

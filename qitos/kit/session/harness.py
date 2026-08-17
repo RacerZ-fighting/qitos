@@ -52,6 +52,7 @@ from ...core.journal import (
 )
 from ...core.message import AssistantMessage, Message, UserMessage
 from ...core.model_response import ModelPricing, ModelUsage
+from ...core.plan import Plan
 from ...core.runtime_input import RuntimeInput
 from ...core.task import (
     Task,
@@ -466,8 +467,12 @@ def _seed_task_state(recovered: RecoveredSession | None) -> RecoveredTask | None
     return latest
 
 
-_TASK_CARRY_TYPES = frozenset(
-    {JournalRecordType.TASK_CREATED, JournalRecordType.TASK_TRANSITION}
+_STATE_CARRY_TYPES = frozenset(
+    {
+        JournalRecordType.TASK_CREATED,
+        JournalRecordType.TASK_TRANSITION,
+        JournalRecordType.PLAN_UPDATED,
+    }
 )
 
 
@@ -601,6 +606,7 @@ class SessionRun:
         self._runtime_inputs: SessionRuntimeInputs | None = None
         self._trace_producer: AgentTraceProducer | None = None
         self._task_state: RecoveredTask | None = None
+        self._plan: Plan | None = None
         self._run_started = False
         self._leg_prepared = False
         self._leg_has_input = False
@@ -643,6 +649,12 @@ class SessionRun:
 
         state = self._task_state
         return state.lifecycle if state is not None else None
+
+    @property
+    def plan(self) -> Plan | None:
+        """The latest committed Plan in this Session lineage, when present."""
+
+        return self._plan
 
     # ── run control ───────────────────────────────────────────────────────
 
@@ -952,6 +964,7 @@ class SessionRun:
         self._journal = journal
         self._recovered = recovered
         self._task_state = _seed_task_state(recovered)
+        self._plan = recovered.plan if recovered is not None else None
         self._context_entries = (
             _context_entries(recovered) if recovered is not None else []
         )
@@ -1077,6 +1090,7 @@ class SessionRun:
         records = await self._journal.replay()
         recovered = recover_session(records)
         self._recovered = recovered
+        self._plan = recovered.plan
         self._context_entries = _context_entries(recovered)
         self._latest_compaction_ts = _latest_compaction_timestamp(records)
         self._leg_has_input = any(
@@ -1105,11 +1119,12 @@ class SessionRun:
         carried = [
             record
             for record in records[position.seq :]
-            if record.type in _TASK_CARRY_TYPES
+            if record.type in _STATE_CARRY_TYPES
         ]
         child = await journal.fork(position, self._harness._run_id_factory())
         await journal.close()
         transition_counts: dict[str, int] = {}
+        plan_sequence = 0
         for record in carried:
             if record.type is JournalRecordType.TASK_CREATED:
                 carried_id = str(record.payload.get("task_id") or "")
@@ -1119,16 +1134,24 @@ class SessionRun:
                     record_id=f"{child.run_id}:task:{carried_id}:created",
                 )
                 continue
-            task_id = decode_task_transition(record.payload)[0]
-            sequence = transition_counts.get(task_id, 0)
-            transition_counts[task_id] = sequence + 1
+            if record.type is JournalRecordType.TASK_TRANSITION:
+                task_id = decode_task_transition(record.payload)[0]
+                sequence = transition_counts.get(task_id, 0)
+                transition_counts[task_id] = sequence + 1
+                await child.append(
+                    JournalRecordType.TASK_TRANSITION,
+                    record.payload,
+                    record_id=(
+                        f"{child.run_id}:task:{task_id}:transition:{sequence}"
+                    ),
+                )
+                continue
             await child.append(
-                JournalRecordType.TASK_TRANSITION,
+                JournalRecordType.PLAN_UPDATED,
                 record.payload,
-                record_id=(
-                    f"{child.run_id}:task:{task_id}:transition:{sequence}"
-                ),
+                record_id=f"{child.run_id}:plan:carried:{plan_sequence}",
             )
+            plan_sequence += 1
         if task is not None:
             await child.append(
                 JournalRecordType.TASK_CREATED,

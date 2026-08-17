@@ -685,9 +685,11 @@ class ToolBatchExecutor:
             )
 
         effective_args = dict(
-            call.arguments
-            if permission.updated_args is None
-            else permission.updated_args
+            thaw_deep(
+                call.arguments
+                if permission.updated_args is None
+                else permission.updated_args
+            )
         )
         validation = self._validate(tool, effective_args, runtime_context)
         if not validation.valid:
@@ -1277,6 +1279,7 @@ class ToolBatchExecutor:
             "emit_progress": _emit_progress,
             "record_artifact": _record_artifact,
             "run_id": self._config.run_id,
+            "tool_call_id": call.id,
             "deadline_monotonic": deadline_monotonic,
             "remaining_seconds": lambda: self._remaining_seconds(deadline_monotonic),
             "agent_cancelled": self._immediate,

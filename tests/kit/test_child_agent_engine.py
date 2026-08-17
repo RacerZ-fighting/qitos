@@ -24,7 +24,8 @@ from qitos.core.journal import (
 )
 from qitos.core.model_response import ModelPricing
 from qitos.core.model_stream import ModelStreamEvent, ModelStreamEventType
-from qitos.core.task import TaskBudget
+from qitos.core.plan import Plan, PlanNode
+from qitos.core.task import Task, TaskBudget
 from qitos.core.tool import ToolPermissionContext, ToolPermissionRule, tool
 from qitos.core.tool_registry import ToolRegistry
 from qitos.core.runtime_input import RuntimeInput
@@ -34,6 +35,7 @@ from qitos.kit.child import (
     build_agent_child_invocation_factory,
 )
 from qitos.kit.journal import JsonlSessionJournal
+from qitos.kit.journal.turn_recorder import encode_plan_updated, encode_task_created
 from qitos.kit.tool.agent import AgentTool
 
 from tests.core.agent_fakes import (
@@ -140,6 +142,55 @@ async def test_foreground_child_completes_and_journals_turns(tmp_path) -> None:
     assert terminal.record_id == f"{result.child_run_id}:run:terminal"
     assert terminal.payload["status"] == "completed"
     await supervisor.aclose()
+    await parent_journal.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
+    parent_journal = JsonlSessionJournal(tmp_path / "parent-plan")
+    await parent_journal.create("parent-run", {})
+    await parent_journal.append(
+        JournalRecordType.TASK_CREATED,
+        encode_task_created(Task(task_id="parent-task", objective="Parent work")),
+        record_id="parent-run:task:parent-task:created",
+    )
+    await parent_journal.append(
+        JournalRecordType.PLAN_UPDATED,
+        encode_plan_updated(
+            "parent-task",
+            Plan((PlanNode("delegate", "Delegate work"),)),
+        ),
+        record_id="parent-run:plan:initial",
+    )
+    agent_tool = AgentTool(
+        invocation_factory=build_agent_child_invocation_factory(
+            model=ScriptedModel([text_events("child answer")]),
+            journal_directory=_children_root(tmp_path),
+        )
+    )
+
+    result = await agent_tool.execute(
+        {
+            "description": "inspect",
+            "prompt": "inspect",
+            "plan_assignment": "delegate",
+        },
+        runtime_context={
+            "run_id": "parent-run",
+            "task_id": "parent-task",
+            "journal": parent_journal,
+        },
+    )
+    started = next(
+        record
+        for record in await parent_journal.replay()
+        if record.type is JournalRecordType.CHILD_STARTED
+    )
+
+    assert result.output["child_status"] == ChildStatus.COMPLETED.value
+    assert started.payload["request"]["parent_task_id"] == "parent-task"
+    assert started.payload["request"]["plan_assignment"] == "delegate"
+    await agent_tool.aclose()
     await parent_journal.close()
 
 

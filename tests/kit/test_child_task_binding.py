@@ -10,13 +10,18 @@ from qitos.core.child import (
     ChildStatus,
 )
 from qitos.core.journal import JournalRecordType
-from qitos.core.task import TaskBudget
+from qitos.core.plan import Plan, PlanNode
+from qitos.core.task import Task, TaskBudget
 from qitos.kit.child import (
     ChildSupervisor,
     build_agent_child_invocation_factory,
 )
 from qitos.kit.journal import JsonlSessionJournal, recover_session
-from qitos.kit.journal.turn_recorder import decode_task_created
+from qitos.kit.journal.turn_recorder import (
+    decode_task_created,
+    encode_plan_updated,
+    encode_task_created,
+)
 
 from tests.core.agent_fakes import ScriptedModel, text_events
 
@@ -48,6 +53,19 @@ async def test_child_journal_commits_narrowed_task_before_input(tmp_path) -> Non
     )
     parent_journal = JsonlSessionJournal(tmp_path / "parent")
     await parent_journal.create("parent-run", {})
+    await parent_journal.append(
+        JournalRecordType.TASK_CREATED,
+        encode_task_created(Task(task_id="root-task", objective="Root work")),
+        record_id="parent-run:task:root-task:created",
+    )
+    await parent_journal.append(
+        JournalRecordType.PLAN_UPDATED,
+        encode_plan_updated(
+            "root-task",
+            Plan((PlanNode("plan-node-1", "Enumerate the target"),))
+        ),
+        record_id="parent-run:plan:initial",
+    )
 
     request = ChildLaunchRequest(
         task="enumerate the target",

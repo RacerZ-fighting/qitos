@@ -36,6 +36,7 @@ from ...core.message import (
     ToolResultMessage,
     UserMessage,
 )
+from ...core.plan import Plan, validate_plan_transition
 from ...core.runtime_input import RuntimeInput
 from ...core.task import Task, TaskLifecycle, TaskStatus
 from ...core.thinking import ThinkingLevel
@@ -46,6 +47,7 @@ from .turn_recorder import (
     decode_input_accepted,
     decode_model_change,
     decode_model_completed,
+    decode_plan_updated,
     decode_run_terminal,
     decode_runtime_input_consumed,
     decode_step_committed,
@@ -113,7 +115,9 @@ class RecoveredSession:
     name the tail records no ``step.committed`` covers yet; the crash closure
     folds them into its closing commit. ``tasks`` projects every
     ``task.created`` definition with its lifecycle folded from the
-    ``task.transition`` records through the fork lineage.
+    ``task.transition`` records through the fork lineage. ``plans`` folds
+    Task-bound ``plan.updated`` replacements without treating one Task's
+    strategy as another Task's state.
     """
 
     run_id: str
@@ -134,6 +138,7 @@ class RecoveredSession:
     uncommitted_transcript_record_ids: tuple[str, ...]
     uncommitted_terminal_record_ids: tuple[str, ...]
     tasks: Mapping[str, RecoveredTask]
+    plans: Mapping[str, Plan]
 
     @property
     def unfinished_root(self) -> RecoveredTask | None:
@@ -146,6 +151,15 @@ class RecoveredSession:
             ):
                 return task
         return None
+
+    @property
+    def plan(self) -> Plan | None:
+        """The Plan bound to the latest Task in this journal lineage."""
+
+        if not self.tasks:
+            return None
+        task_id = next(reversed(self.tasks))
+        return self.plans.get(task_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +242,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
     posted_inputs: dict[str, RuntimeInput] = {}
     consumed_inputs: set[str] = set()
     tasks: dict[str, RecoveredTask] = {}
+    plans: dict[str, Plan] = {}
     # Run segments (own or inherited) that already folded a model, Tool,
     # transcript or input side effect; a root task.created must precede them.
     segment_side_effects: set[str] = set()
@@ -578,6 +593,14 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                         terminal_reason=reason,
                     ),
                 )
+            elif record_type is JournalRecordType.PLAN_UPDATED:
+                task_id, proposed = decode_plan_updated(payload)
+                if task_id not in tasks:
+                    raise JournalCorruptionError(
+                        "plan.updated references an unknown task"
+                    )
+                validate_plan_transition(plans.get(task_id), proposed)
+                plans[task_id] = proposed
             elif record_type in (
                 JournalRecordType.RUN_COMPLETED,
                 JournalRecordType.RUN_INTERRUPTED,
@@ -817,6 +840,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
         uncommitted_transcript_record_ids=tuple(tail_entry_ids),
         uncommitted_terminal_record_ids=uncommitted_terminal_ids,
         tasks=MappingProxyType(tasks),
+        plans=MappingProxyType(plans),
     )
 
 

@@ -21,7 +21,7 @@ from .tool import (
     ReportToolSet,
     SendTerminalKeys,
     TaskToolSet,
-    UpdateWorkPlanTool,
+    UpdatePlanTool,
     WorkspaceAwareMixin,
 )
 from .tool.toolset import toolset_from_tools
@@ -35,7 +35,6 @@ _LAZY_MODULE_EXPORTS = {
     "evaluate",
     "memory",
     "metric",
-    "state",
     "tool",
     "toolset",
 }
@@ -55,7 +54,6 @@ __all__ = [
     "evaluate",
     "memory",
     "metric",
-    "state",
     "tool",
     "toolset",
     "CodingToolSet",
@@ -66,7 +64,7 @@ __all__ = [
     "ReportToolSet",
     "EpubToolSet",
     "TaskToolSet",
-    "UpdateWorkPlanTool",
+    "UpdatePlanTool",
     "WorkspaceAwareMixin",
     "toolset_from_tools",
     "coding_tools",

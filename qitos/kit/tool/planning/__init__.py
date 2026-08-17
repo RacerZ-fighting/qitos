@@ -16,7 +16,7 @@ from qitos.kit.tool.advanced import (
     MCPReadResourceTool,
     ToolSearchTool,
 )
-from qitos.kit.tool.internal.work_plan import UpdateWorkPlanTool
+from qitos.kit.tool.internal.plan import UpdatePlanTool
 
 __all__ = [
     "AskUserChoiceTool",
@@ -30,6 +30,6 @@ __all__ = [
     "LSPQueryTool",
     "MCPListResourcesTool",
     "MCPReadResourceTool",
-    "UpdateWorkPlanTool",
+    "UpdatePlanTool",
     "ToolSearchTool",
 ]
