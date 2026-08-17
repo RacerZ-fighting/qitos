@@ -1,40 +1,12 @@
 ---
 title: "CLI 参考"
-description: "QitOS 的 qita 与 qit 命令行参考，包括最小编码智能体演示和 v0.3 中加入的基准测试官方入口。"
+description: "QitOS 的 qita 与 qit 命令行参考，包括 v0.3 中加入的基准测试官方入口。"
 ---
 
 QitOS 提供两个顶层命令行工具：
 
 - `qita`：追踪记录检查与回放
-- `qit`：演示、基准测试与开发者工作流入口
-
-## qit demo
-
-当你想最快拿到一次真正的模型驱动 QitOS 运行时，使用 `qit demo`。
-
-### `qit demo minimal`
-
-```bash
-qit demo minimal
-```
-
-这个命令会：
-
-- 从环境变量或标志位读取 OpenAI 兼容模型配置
-- 先创建一个最小缺陷工作区
-- 运行最小编码智能体去修这个缺陷
-- 把 qita 可识别的追踪记录写到 `./runs`
-
-可选参数：
-
-- `--workspace ./playground/minimal_coding_agent`
-- `--logdir ./runs`
-- `--model-name Qwen/Qwen3-8B`
-- `--base-url https://api.siliconflow.cn/v1/`
-- `--api-key sk-...`
-- `--task "Fix the bug in buggy_module.py and make the verification command pass."`
-- `--max-steps 8`
-- `--render`
+- `qit`：基准测试与开发者工作流入口
 
 ## qita
 
@@ -72,37 +44,7 @@ qita export --run ./runs/<run_id> --html ./report.html
 
 ## qit bench
 
-`qit bench` 是 v0.3 中基准测试的官方命令行。
-
-### `qit bench run`
-
-```bash
-qit bench run \
-  --benchmark tau-bench \
-  --split test \
-  --subset retail \
-  --limit 10 \
-  --output ./results/tau.jsonl
-```
-
-这个命令会：
-
-- 加载基准测试任务
-- 构造 `RunSpec` 与 `ExperimentSpec`
-- 输出统一的 `BenchmarkRunResult`
-
-现在常见的基准测试名称包括：
-
-- `desktop-starter`：标准入门基准测试族
-- `osworld`：基准测试专用 OSWorld 适配器路径
-- `gaia`、`tau-bench`、`cybench`：已经迁入 `qitos.benchmark.*` 的基准测试族
-- `desktop`：`desktop-starter` 的兼容别名
-
-当前命令行默认遵循三层结构：
-
-- `qitos.benchmark.*`：基准测试适配器与评估器
-- `qitos.recipes.*`：标准基线方法
-- `examples/*`：最薄的入口封装
+`qit bench` 处理统一的基准测试结果文件与运行产物。
 
 ### `qit bench eval`
 
@@ -133,15 +75,13 @@ qit bench export --run ./runs/<run_id> --html ./report.html
 第一次跑通时，推荐：
 
 1. `export OPENAI_API_KEY=...`
-2. `qit demo minimal`
-3. `qita board`
+2. `python examples/quickstart/minimal_agent.py`
 
-做基准测试工作时，推荐：
+处理外部产出的基准测试结果文件时，推荐：
 
-1. `qit bench run`
-2. `qit bench eval`
-3. `qita board`
-4. `qit bench replay`
-5. `qit bench export`
+1. `qit bench eval`
+2. `qita board`
+3. `qit bench replay`
+4. `qit bench export`
 
-如果你还想理解这条路径背后的设计，请继续阅读 [官方运行](/zh/concepts/official-runs) 与 [追踪](/zh/concepts/tracing)。
+如果你还想理解这条路径背后的设计，请继续阅读 [追踪](/zh/concepts/tracing)。

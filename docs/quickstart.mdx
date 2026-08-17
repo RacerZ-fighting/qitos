@@ -1,13 +1,9 @@
 ---
 title: "Quickstart"
-description: "Run your first QitOS minimal coding agent in under 2 minutes, then inspect it with qita."
+description: "Run your first QitOS agent on the Agent façade in under 2 minutes."
 ---
 
-This guide takes you from a fresh environment to a model-backed minimal coding agent and a live trace view in under 2 minutes.
-
-Here is what the runtime looks like when you watch it work:
-
-![QitOS runtime snapshot](/images/qitos-cli.png)
+This guide takes you from a fresh environment to a model-backed agent run in under 2 minutes.
 
 <Note>
 Need a provider first? Read [Prerequisites](/prerequisites). It explains how to get an OpenAI-compatible API key and validate your endpoint before running QitOS.
@@ -31,8 +27,8 @@ Need a provider first? Read [Prerequisites](/prerequisites). It explains how to 
   <Step title="Set your provider config">
     ```bash
     export OPENAI_API_KEY="sk-..."
-    export OPENAI_BASE_URL="https://api.siliconflow.cn/v1/"
-    export QITOS_MODEL="Qwen/Qwen3-8B"
+    export OPENAI_BASE_URL="https://api.openai.com/v1"
+    export QITOS_MODEL="gpt-4o-mini"
     ```
 
     <Tip>
@@ -40,52 +36,43 @@ Need a provider first? Read [Prerequisites](/prerequisites). It explains how to 
     </Tip>
   </Step>
 
-  <Step title="Run the minimal coding agent">
+  <Step title="Run the minimal agent">
     ```bash
-    qit demo minimal
+    python examples/quickstart/minimal_agent.py
     ```
 
-    This demo creates a small workspace with a buggy file, configures a real model, asks a minimal coding agent to fix the bug, runs verification, and writes a qita-ready trace. You should see output similar to:
-
-    ```
-    model_name: Qwen/Qwen3-8B
-    workspace: .../playground/minimal_coding_agent
-    target_file: buggy_module.py
-    trace_run: .../runs/qitos_minimal_coding_<timestamp>
-    final_result: Patch applied and verification passed.
-    stop_reason: final
-    next_step: qita board --logdir runs
-    ```
+    The example composes the minimal agent loop directly: one `Agent` façade, one
+    `OpenAICompatibleModel`, and one `echo` Tool in a `ToolRegistry`. `agent.prompt(...)`
+    drives the `Message -> Model -> ToolCall -> ToolResult` loop and returns a typed
+    `AgentLoopResult`; the example prints the final assistant message.
   </Step>
 
-  <Step title="Inspect the run with qita">
-    ```bash
-    qita board --logdir runs
+  <Step title="Read the composition">
+    Open [`examples/quickstart/minimal_agent.py`](https://github.com/Qitor/qitos/blob/main/examples/quickstart/minimal_agent.py):
+
+    ```python
+    agent = Agent(
+        model=model,
+        tool_registry=ToolRegistry().register(echo),
+        system_prompt="You are a minimal helpful agent. Answer concisely.",
+        max_turns=4,
+    )
+    result = await agent.prompt("Call the echo tool once, then reply with what it returned.")
     ```
 
-    Open [http://127.0.0.1:8765](http://127.0.0.1:8765) in your browser. The board shows every run in your log directory with step counts, stop reasons, and final results. Click **view** on any run to inspect its step-by-step trajectory (the temporal sequence of prompts, decisions, tool calls, and observations), or **replay** to play it back.
-
-    <Tip>
-      The packaged demo and [`examples/quickstart/minimal_agent.py`](https://github.com/Qitor/qitos/blob/main/examples/quickstart/minimal_agent.py) follow the same minimal coding-agent path. Start from the example file when you want to read or customize the code directly.
-    </Tip>
+    Everything is explicit: the model, the Tool surface, the prompt, and the turn budget.
+    Child agents, journaling, and supervision compose from the same façade — see the
+    [kit reference](/reference/kit).
   </Step>
 </Steps>
 
 ## What's next
 
-You've run a minimal coding agent and inspected its trace. Here's where to go from here:
-
 <CardGroup cols={2}>
-  <Card title="Build your first agent" icon="code" href="/guides/build-your-first-agent">
-    A walkthrough of the minimal coding-agent shape: state, model, tools, run, and qita
-  </Card>
-  <Card title="Tutorial track" icon="graduation-cap" href="/tutorials">
-    Learn agent design step by step through ReAct, PlanAct, Claude Code-style, and security audit lessons
+  <Card title="Kit reference" icon="toolbox" href="/reference/kit">
+    Tools, child agents, journals, memory, and environment building blocks
   </Card>
   <Card title="Observability" icon="chart-line" href="/guides/observability">
     Everything qita can do: board, replay, and export
-  </Card>
-  <Card title="Benchmarks" icon="trophy" href="/benchmarks/overview">
-    Run GAIA, Tau-Bench, and CyBench on the QitOS kernel
   </Card>
 </CardGroup>

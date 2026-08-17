@@ -44,8 +44,13 @@ minimal loop (`core/agent_loop.py`), the `Agent` façade (`core/agent.py`) and
 with narrowed tools/budgets and a `JournalTurnTransaction` journal, supervisor
 recovery rebuilds terminal Child facts from the child's loop journal, and the
 Engine-coupled `DelegateTool`/`FanOutTool`, the kit `HandoffTool` chain,
-`core/shared_memory.py` and `kit/repl` are removed. Old-lifecycle callers
-remain until the rest of milestone 2.2.
+`core/shared_memory.py` and `kit/repl` are removed. The showcase layer is
+gone: the `qitos_zoo` submodule, `qitos.demo` and `qit demo`, the whole
+`qitos.recipes` package, the recipe-coupled `qitos.benchmark` adapters and
+`runner.py` (`qit bench` keeps the engine-free `eval`/`replay`/`export`/
+`presets`), and the Engine-era examples/tutorial course; the quickstart
+example composes the façade directly. Old-lifecycle callers remain until the
+rest of milestone 2.2.
 
 Review-hardening dispositions recorded on the same branch:
 
@@ -106,14 +111,19 @@ runtime wrapper.
 
 ### 2.6 Remove historical surface
 
+Done in the C2/C3 slices: delegate/fanout kit tools, the kit handoff tool
+chain and shared-memory multi-Agent paths; the `qitos_zoo` submodule,
+`qitos.demo`, the pattern recipes, the whole `qitos.recipes` package, and the
+recipe-coupled benchmark execution layer (`qitos.benchmark` adapter
+subpackages and `runner.py`, `qit bench run`/`list`).
+
 Delete final callers, packages, exports, dependencies, tests, examples and docs for:
 
 - AgentModule, Observation, Decision and Action public lifecycle;
 - checkpoint as a second persistence owner;
-- handoff, delegate, fanout and shared-memory multi-Agent paths;
+- the Engine-internal handoff policy and its event names;
 - Engine critic, search, branch selector, text parser and prompt-injected protocol;
 - planning/workflow runtimes that compete with Task + Plan + Child;
-- duplicate benchmark, evaluate, metric, leaderboard and recipe paths;
 - unconsumed environment, memory, parser, ToolSet, renderer and demo surfaces;
 - sync bridges below the outermost application/CLI boundary.
 

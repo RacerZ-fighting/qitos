@@ -103,29 +103,3 @@ QitOS canonical append-only writer，负责持久化 Run manifest、运行时事
 ### ToolPermissionSpec
 
 通过 `ToolRegistry.export_permissions()` 生成的不可变可序列化工具权限与能力概要。包含 `name`、`permissions`、`needs_approval`、`read_only`、`concurrency_safe` 和 `required_ops`。
-
-## 方法模板术语
-
-### 方法模板（Method Template）
-
-现成的 Agent + Critic 组合，实现了知名的智能体推理模式。QitOS 在 `qitos.recipes` 中内置了 Self-Refine、Reflexion、LATS、MoA 和 Magentic-One 模板。每个模板封装了专用的状态、评论器和智能体。
-
-### Self-Refine
-
-迭代精炼模式（Madaan et al. 2023），智能体生成草稿、接收批评、反复精炼直到质量达到阈值。`SelfRefineCritic` 通过启发式评分驱动循环；`SelfRefineAgent` 在提示词中注入当前草稿和批评历史。
-
-### Reflexion
-
-迭代反思模式（Shinn et al. 2023），智能体行动、评估结果，在失败时生成语言反思存储在状态中。`ReflexionCritic` 检测失败并以指令补丁形式产生反思；`ReflexionAgent` 将先前的反思注入系统提示词，使 LLM 能从过去的错误中学习。
-
-### LATS
-
-语言智能体树搜索（Zhou et al. 2023），将蒙特卡洛树搜索应用于语言智能体。`LATSAgent` 探索解路，`LATSCritic` 使用 UCB1 风格评分评估每条路径并在失败轨迹上生成反思，`LATSState` 跟踪树统计信息包括最佳奖励、失败路径和反思。
-
-### MoA（混合智能体）
-
-分层模式（Wang et al. 2024），多个提议者独立生成响应，聚合器综合最佳见解。`MoAOrchestrator` 管理提议收集和聚合；`MoACritic` 通过检查提议数量驱动循环，提示收集或综合。
-
-### Magentic-One
-
-双账本编排模式（Furtado et al. 2024），编排器维护事实库和任务账本，委派给专家智能体，在停滞时重新规划。`ProgressCritic` 检测停滞并触发重新规划；`MagenticOneOrchestrator` 在提示词中注入事实和任务进度。

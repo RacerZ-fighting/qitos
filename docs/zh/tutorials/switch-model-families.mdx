@@ -76,12 +76,6 @@ qit bench presets
 
 输出表格包含每个预设的 ID、协议、工具交付模式、上下文窗口和推荐模型。
 
-也可以列出可用的基准测试：
-
-```bash
-qit bench list
-```
-
 ## Step 5 — 在 qita 中对比运行
 
 用不同家族跑完同一个任务后，启动 qita 对比：
@@ -112,33 +106,37 @@ qita board --logdir runs
 
 这些值仅供参考——引擎不会自动应用它们。可以作为你自己实验的起点。
 
-## 命令行切换模式
+## 环境变量驱动的切换模式
 
-`examples/real/claude_code_agent.py` 示例展示了完整的 CLI 切换工作流：
+把模型配置放在智能体代码之外，通过环境变量驱动：
 
 ```bash
 # Qwen
-python examples/real/claude_code_agent.py \
-  --model-family qwen \
-  --model-name Qwen/Qwen3-8B \
-  --base-url https://api.siliconflow.cn/v1/
+export QITOS_MODEL_FAMILY=qwen
+export QITOS_MODEL="Qwen/Qwen3-8B"
+export OPENAI_BASE_URL="https://api.siliconflow.cn/v1/"
 
 # Kimi
-python examples/real/claude_code_agent.py \
-  --model-family kimi \
-  --model-name kimi-k2-0905-preview \
-  --base-url https://api.moonshot.ai/v1
+export QITOS_MODEL_FAMILY=kimi
+export QITOS_MODEL="kimi-k2-0905-preview"
+export OPENAI_BASE_URL="https://api.moonshot.ai/v1"
+```
 
-# DeepSeek
-python examples/real/claude_code_agent.py \
-  --model-family deepseek \
-  --model-name deepseek-chat \
-  --base-url https://api.deepseek.com/v1
+```python
+import os
+from qitos.harness import build_model_for_preset
+
+llm = build_model_for_preset(
+    family_id=os.environ["QITOS_MODEL_FAMILY"],
+    model_name=os.environ["QITOS_MODEL"],
+    api_key=os.environ["OPENAI_API_KEY"],
+    base_url=os.environ["OPENAI_BASE_URL"],
+)
 ```
 
 模型配置的优先级顺序：
 
-1. 显式命令行参数
+1. 显式构造参数
 2. 环境变量（`QITOS_MODEL_FAMILY`、`QITOS_MODEL`、`OPENAI_BASE_URL`）
 3. 家族预设默认值
 4. 框架后备值

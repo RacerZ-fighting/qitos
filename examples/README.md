@@ -5,36 +5,23 @@
 The learning path is:
 
 ```text
-StateSchema -> prepare -> Engine/Model decide -> tool/env -> reduce -> trace/qita
+Agent(model, tool_registry) -> prompt -> Model stream -> ToolCall -> ToolResult -> next turn
 ```
 
 ## Directory Map
 
-- `examples/quickstart/`: the smallest runnable coding agent
+- `examples/quickstart/`: the smallest runnable façade composition
 - `examples/patterns/`: one design axis per example
-- `examples/real/`: minimal real agents only
-- `examples/benchmarks/`: thin wrappers over `qitos.recipes` and `qitos.benchmark`
+- `examples/real/`: minimal environment smoke examples only
 
-## Recommended First Run Order
+## Recommended First Run
 
 ```bash
 export OPENAI_API_KEY="your_api_key"
-qit demo minimal
+export OPENAI_BASE_URL="https://api.openai.com/v1"
 python examples/quickstart/minimal_agent.py
-python examples/patterns/react.py
-python examples/patterns/planact.py
-python examples/patterns/reflexion.py
-python examples/patterns/tot.py
-python examples/real/research_harness_agent.py
-python examples/real/coding_agent.py
-```
-
-Benchmark wrappers:
-
-```bash
-python examples/benchmarks/gaia_eval.py --help
-python examples/benchmarks/tau_bench_eval.py --help
-python examples/benchmarks/cybench_eval.py --help
+python examples/patterns/function_tool_custom.py
+python examples/real/desktop_env_smoke.py
 ```
 
 ## Examples Policy
@@ -43,15 +30,4 @@ python examples/benchmarks/cybench_eval.py --help
 - No heavy hidden dependencies.
 - No local absolute paths.
 - No product clone as a canonical example.
-- Benchmark wrappers call framework recipes/adapters and do not own canonical logic.
 - Security-sensitive workflows are opt-in and not part of the quickstart.
-
-## Full Applications
-
-Full applications live in `qitos-zoo`, including:
-
-- `qitos-coder`: a Claude Code-inspired coding agent built with QitOS.
-- `qitos-cyber-agent`: a PentAGI-inspired cybersecurity agent built with QitOS.
-
-Some product-like files remain temporarily in `examples/real/` with migration banners;
-the independent `qitos-zoo` repository owns maintained product applications.

@@ -39,10 +39,6 @@ Use extras to add support for models, benchmarks, or everything at once.
 pip install "qitos[models]"
 ```
 
-```bash Benchmark adapters
-pip install "qitos[benchmarks]"
-```
-
 ```bash Everything
 pip install "qitos[all]"
 ```
@@ -52,7 +48,6 @@ pip install "qitos[all]"
 | Extra | What it adds |
 |---|---|
 | `models` | `openai>=1.66.0` — required for Chat Completions and optional Responses API model endpoints |
-| `benchmarks` | `datasets` and `huggingface_hub` — required for GAIA, Tau-Bench, and CyBench adapters |
 | `all` | All of the above |
 
 <Tip>
@@ -66,7 +61,7 @@ Clone the repository and install in editable mode with all development dependenc
 ```bash
 git clone https://github.com/Qitor/qitos.git
 cd qitos
-pip install -e ".[dev,models,benchmarks]"
+pip install -e ".[dev,models]"
 ```
 
 The `dev` extra adds `pytest`, `black`, `flake8`, `mypy`, and the build tools used by the QitOS team.
@@ -85,10 +80,9 @@ You should see output like:
 0.3.0
 ```
 
-You can also verify the minimal coding agent and both CLIs are on your path:
+You can also verify both CLIs are on your path:
 
 ```bash
-qit demo minimal
 qit --help
 qita --help
 ```

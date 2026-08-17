@@ -76,12 +76,6 @@ qit bench presets
 
 This prints a table showing each preset's ID, protocol, tool delivery mode, context window, and recommended models.
 
-You can also list available benchmarks:
-
-```bash
-qit bench list
-```
-
 ## Step 5 — Compare runs in qita
 
 After running the same task with different families, launch qita to compare:
@@ -112,33 +106,37 @@ Gold presets (Qwen, Kimi, MiniMax, gpt-oss, Gemma 4) include advisory defaults f
 
 These are advisory — the engine does not auto-apply them. Use them as starting points for your own experiments.
 
-## The CLI switching pattern
+## The environment-driven switching pattern
 
-The `examples/real/claude_code_agent.py` example demonstrates the full switching workflow via CLI:
+Keep model configuration outside the agent and drive it from the environment:
 
 ```bash
 # Qwen
-python examples/real/claude_code_agent.py \
-  --model-family qwen \
-  --model-name Qwen/Qwen3-8B \
-  --base-url https://api.siliconflow.cn/v1/
+export QITOS_MODEL_FAMILY=qwen
+export QITOS_MODEL="Qwen/Qwen3-8B"
+export OPENAI_BASE_URL="https://api.siliconflow.cn/v1/"
 
 # Kimi
-python examples/real/claude_code_agent.py \
-  --model-family kimi \
-  --model-name kimi-k2-0905-preview \
-  --base-url https://api.moonshot.ai/v1
+export QITOS_MODEL_FAMILY=kimi
+export QITOS_MODEL="kimi-k2-0905-preview"
+export OPENAI_BASE_URL="https://api.moonshot.ai/v1"
+```
 
-# DeepSeek
-python examples/real/claude_code_agent.py \
-  --model-family deepseek \
-  --model-name deepseek-chat \
-  --base-url https://api.deepseek.com/v1
+```python
+import os
+from qitos.harness import build_model_for_preset
+
+llm = build_model_for_preset(
+    family_id=os.environ["QITOS_MODEL_FAMILY"],
+    model_name=os.environ["QITOS_MODEL"],
+    api_key=os.environ["OPENAI_API_KEY"],
+    base_url=os.environ["OPENAI_BASE_URL"],
+)
 ```
 
 Priority order for model configuration:
 
-1. explicit CLI flags
+1. explicit constructor arguments
 2. environment variables (`QITOS_MODEL_FAMILY`, `QITOS_MODEL`, `OPENAI_BASE_URL`)
 3. family preset defaults
 4. framework fallback

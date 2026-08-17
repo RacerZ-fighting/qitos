@@ -69,21 +69,23 @@ QitOS 在 OpenAI-compatible 的 Qwen 路径里**没有照搬**它，原因是：
 - Qwen-Agent 解决的是更一般的 Qwen 聊天接口问题
 - QitOS 这里解决的是同一个适配层里如何优先用好 OpenAI-compatible 托管 Qwen 的问题
 
-## 推荐的 `qwen-plus` 运行方式
+## 推荐的 `qwen-plus` 配置方式
 
-建议直接用旗舰示例：
+通过 Qwen 家族预设构建模型，接入 OpenAI 兼容的 Qwen 端点：
 
-```bash
-export OPENAI_API_KEY="your_api_key"
-export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+```python
+from qitos.harness import build_model_for_preset
 
-python examples/real/claude_code_agent.py \
-  --model-family qwen \
-  --model-name qwen-plus \
-  --print-harness
+llm = build_model_for_preset(
+    family_id="qwen",
+    model_name="qwen-plus",
+    api_key="...",  # OPENAI_API_KEY
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
+print(llm.qitos_harness_metadata)
 ```
 
-你应该能看到适配层摘要里有这些字段：
+你应该能看到适配层元数据里有这些字段：
 
 - `family_preset: qwen`
 - `tool_delivery: api_parameter`

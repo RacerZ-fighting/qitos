@@ -37,19 +37,13 @@
                 "root": "tutorials/index",
                 "pages": [
                   "tutorials/index",
-                  "tutorials/react",
-                  "tutorials/planact",
-                  "tutorials/claude-code",
-                  "tutorials/code-security-audit",
                   "tutorials/critic-system",
                   "tutorials/hook-lifecycle",
                   "tutorials/func-api",
                   "tutorials/mcp-integration",
                   "tutorials/checkpoint-and-fork",
                   "tutorials/switch-model-families",
-                  "tutorials/reproducible-benchmark-runs",
                   "tutorials/replay-and-inspect-failed-runs",
-                  "tutorials/run-your-first-desktop-benchmark",
                   "tutorials/inspect-a-gui-failure-in-qita"
                 ]
               }
@@ -69,37 +63,20 @@
                   "concepts/tools-and-registry",
                   "concepts/family-presets",
                   "concepts/tracing",
-                  "concepts/official-runs",
                   "concepts/glossary"
                 ]
               },
               {
                 "group": "Guides",
-              "pages": [
-                "guides/build-your-first-agent",
-                "guides/computer-use-desktop",
-                "guides/multimodal-core",
-                "guides/agent-patterns",
-                "guides/desktop-benchmark-starter",
-                "guides/benchmarks-and-recipes",
-                "guides/third-party-benchmark-integration",
+                "pages": [
+                  "guides/build-your-first-agent",
+                  "guides/computer-use-desktop",
+                  "guides/multimodal-core",
                   "guides/add-a-family-preset",
                   "guides/qwen-family-best-practice",
                   "guides/memory-and-history",
                   "guides/critics-and-stop-criteria",
-                  "guides/method-templates",
                   "guides/observability"
-                ]
-              },
-              {
-                "group": "Benchmarks",
-                "pages": [
-                  "benchmarks/overview",
-                  "benchmarks/desktop-starter",
-                  "benchmarks/osworld",
-                  "benchmarks/gaia",
-                  "benchmarks/tau-bench",
-                  "benchmarks/cybench"
                 ]
               },
               {
@@ -160,19 +137,13 @@
                 "root": "zh/tutorials/index",
                 "pages": [
                   "zh/tutorials/index",
-                  "zh/tutorials/react",
-                  "zh/tutorials/planact",
-                  "zh/tutorials/claude-code",
-                  "zh/tutorials/code-security-audit",
                   "zh/tutorials/critic-system",
                   "zh/tutorials/hook-lifecycle",
                   "zh/tutorials/func-api",
                   "zh/tutorials/mcp-integration",
                   "zh/tutorials/checkpoint-and-fork",
                   "zh/tutorials/switch-model-families",
-                  "zh/tutorials/reproducible-benchmark-runs",
                   "zh/tutorials/replay-and-inspect-failed-runs",
-                  "zh/tutorials/run-your-first-desktop-benchmark",
                   "zh/tutorials/inspect-a-gui-failure-in-qita"
                 ]
               }
@@ -192,38 +163,20 @@
                   "zh/concepts/tools-and-registry",
                   "zh/concepts/family-presets",
                   "zh/concepts/tracing",
-                  "zh/concepts/official-runs",
                   "zh/concepts/glossary"
                 ]
               },
               {
                 "group": "指南",
                 "pages": [
-                "zh/guides/build-your-first-agent",
-                "zh/guides/computer-use-desktop",
-                "zh/guides/multimodal-core",
-                "zh/guides/agent-patterns",
-                "zh/guides/desktop-benchmark-starter",
-                "zh/guides/benchmarks-and-recipes",
-                "zh/guides/third-party-benchmark-integration",
+                  "zh/guides/build-your-first-agent",
+                  "zh/guides/computer-use-desktop",
+                  "zh/guides/multimodal-core",
                   "zh/guides/add-a-family-preset",
                   "zh/guides/qwen-family-best-practice",
                   "zh/guides/memory-and-history",
                   "zh/guides/critics-and-stop-criteria",
-                  "zh/guides/method-templates",
                   "zh/guides/observability"
-                ]
-              },
-              {
-                "group": "基准测试",
-                "pages": [
-                  "zh/benchmarks/overview",
-                  "zh/benchmarks/desktop-starter",
-                  "zh/benchmarks/osworld",
-                  "zh/benchmarks/gaia",
-                  "zh/benchmarks/tau-bench",
-                  "zh/benchmarks/cybench",
-                  "zh/benchmarks/cybergym"
                 ]
               },
               {

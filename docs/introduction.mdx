@@ -158,7 +158,7 @@ This trace-first design is why the same kernel works well for experiments, bench
 
 One of the strongest design features in QitOS is that domain agents are still ordinary QitOS agents — they do not need a separate runtime.
 
-Product-style agents, benchmark runners, and domain agents all reuse the same runtime. Full product applications belong in `qitos-zoo`; domain behavior is expressed through:
+Product-style agents, benchmark runners, and domain agents all reuse the same runtime. Domain behavior is expressed through:
 
 - state design
 - prompt policy
@@ -187,9 +187,6 @@ QitOS is currently **Beta**. Trace/qita behavior, canonical durable records, exa
   </Card>
   <Card title="Core concepts" icon="book" href="/concepts/agent-module">
     Understand AgentModule, Engine, State, and Tools
-  </Card>
-  <Card title="Agent patterns" icon="diagram-project" href="/guides/agent-patterns">
-    ReAct, PlanAct, Tree-of-Thought, and Reflexion examples
   </Card>
   <Card title="Kit reference" icon="toolbox" href="/reference/kit">
     Explore pre-built tools, memory, parsers, planners, and history strategies

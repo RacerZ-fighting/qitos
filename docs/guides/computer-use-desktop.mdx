@@ -25,7 +25,6 @@ The same computer-use harness (the configured adapter + protocol + toolset combi
 
 - OpenAI-compatible multimodal APIs,
 - open-source models that only understand JSON or XML scaffolding,
-- the official `desktop-starter` benchmark starter and the separate `osworld` benchmark adapter path.
 
 ## Core pieces
 
@@ -122,63 +121,24 @@ agent = MyAgent(
 
 The design principle is the same one used elsewhere in QitOS: adapt the scaffolding to the model, instead of assuming one parser/prompt shape fits every family.
 
-## Example: `openai_cua_agent.py`
+## Environment smoke example
 
-The main reference example is:
-
-- `examples/real/openai_cua_agent.py`
-
-It keeps the file name close to OSWorld’s original `openai_cua_agent.py` so the lineage is easy to follow, but the implementation is intentionally QitOS-native.
-
-The actual baseline implementation now lives in the recipe layer:
-
-- `qitos/recipes/desktop/osworld_starter.py`
-
-The public example file is now only a thin entrypoint:
-
-- `examples/real/openai_cua_agent.py`
-
-It is now the **benchmark-grade starter baseline**, not just a thin demo loop:
-
-- current-step screenshot goes into the model via OpenAI-compatible multimodal messages
-- GUI actions are returned as QitOS JSON/XML decisions
-- GUI execution goes through `ComputerUseToolSet`
-- environment state refresh goes through `DesktopEnv`
-- the baseline prompt and state implement planner / grounding / action-selector discipline
-- critic (a step-level validator) retries can reject obviously weak actions before the run continues
-
-Smoke run:
-
-```bash
-python examples/real/openai_cua_agent.py
-```
-
-If you want the smallest environment-only loop, use:
+The smallest environment-only loop is:
 
 ```bash
 python examples/real/desktop_env_smoke.py
 ```
 
-## Official benchmark path
-
-The official v0.5 entrypoint is:
-
-```bash
-qit bench run \
-  --benchmark desktop-starter \
-  --split starter \
-  --strategy desktop_smoke \
-  --output ./artifacts/desktop-starter.jsonl
-```
+It exercises `DesktopEnv` and the computer-use toolset without a model.
 
 ## Container-first direction
 
 The desktop lane is designed to be **container-first**.
-This keeps the future OSWorld-style adapter direction aligned with:
+This keeps desktop runs aligned with:
 
 - reproducible desktop state
 - provider isolation
-- benchmark-friendly env lifecycles
+- clean env lifecycles
 
-The current implementation now ships the first official desktop starter benchmark path, the separate `osworld` benchmark adapter layer, and the qita visual inspection surface.
+The qita visual inspection surface covers screenshot-backed runs.
 It still does not claim full OSWorld parity or full v0.6 replay depth.

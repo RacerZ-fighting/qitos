@@ -7,34 +7,6 @@ from qitos.benchmark import evaluate_benchmark_results, read_benchmark_results
 from qitos.cli import main as qit_main
 
 
-def test_desktop_benchmark_cli_smoke(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.chdir(tmp_path)
-    output = tmp_path / "desktop_results.jsonl"
-    rc = qit_main(
-        [
-            "bench",
-            "run",
-            "--benchmark",
-            "desktop",
-            "--split",
-            "starter",
-            "--strategy",
-            "desktop_smoke",
-            "--output",
-            str(output),
-            "--trace-logdir",
-            str(tmp_path / "runs"),
-        ]
-    )
-    assert rc == 0
-    rows = read_benchmark_results(output)
-    assert rows
-    assert rows[0].benchmark == "desktop-starter"
-    assert rows[0].metadata.get("action_count", 0) >= 1
-    summary = evaluate_benchmark_results(rows)
-    assert "failure_tag_distribution" in summary
-
-
 def test_desktop_benchmark_eval_json(tmp_path: Path, capsys) -> None:
     row = {
         "task_id": "desktop_continue_button",

@@ -9,8 +9,6 @@ QitOS v0.5 now has one complete multimodal release path:
 
 - screenshot-first multimodal input
 - `DesktopEnv`
-- the official `desktop` benchmark family
-- the `openai_cua_agent.py` baseline
 - qita visual inspection
 
 The point is no longer just laying a multimodal foundation.
@@ -103,21 +101,19 @@ env = ScreenshotEnv(
 )
 ```
 
-## Example: `visual_inspect_agent.py`
+## Minimal visual path
 
-The first baseline example is:
-
-- `examples/real/visual_inspect_agent.py`
-
-It demonstrates a very small but complete path:
+A complete visual inspection path stays small:
 
 1. create a screenshot-backed task
-2. expose a screenshot-first env
+2. expose a screenshot-first env (`ScreenshotEnv`)
 3. call an OpenAI-compatible multimodal model
 4. keep the response on the existing JSON decision lane
 5. inspect the run in qita with visual assets visible
 
-This example is a better starting point for visual-web / GUI research than jumping straight into a benchmark runner.
+`examples/real/desktop_env_smoke.py` exercises the environment half of this path
+without a model and is a better starting point for visual-web / GUI research than
+jumping straight into a benchmark harness.
 
 ## qita support in v0.5
 

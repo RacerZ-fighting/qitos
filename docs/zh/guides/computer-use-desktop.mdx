@@ -5,44 +5,21 @@ description: "在 QitOS 上构建 OSWorld 风格的桌面智能体，而不绑�
 
 # 计算机操控与桌面环境
 
-QitOS v0.5 把桌面/计算机操控正式提升成一条官方主线。
+QitOS 把桌面/计算机操控作为一条官方主线。
 
 核心组成：
 
 - `DesktopEnv`
 - `ComputerUseToolSet`
 - `desktop_actions_json_v1` / `desktop_actions_xml_v1`
-- 官方 `desktop-starter` 基准测试入门
-- 独立的 `osworld` 基准测试适配器
-- `examples/real/openai_cua_agent.py`
 - qita 可视化回放
 
-## 规范基线
+## 环境冒烟示例
 
-`examples/real/openai_cua_agent.py` 不再只是演示。
-
-真正的基线实现现在在配方层：
-
-- `qitos/recipes/desktop/osworld_starter.py`
-
-公开示例只保留为薄入口：
-
-- `examples/real/openai_cua_agent.py`
-
-它现在是基准测试级别的入门基线，包含以下关键组件：
-
-- 规划器
-- 接地
-- 动作选择器
-- 评估器/重试
-- 显式停止/失败
-
-## 官方基准测试入口
+最小的纯环境循环：
 
 ```bash
-qit bench run \
-  --benchmark desktop-starter \
-  --split starter \
-  --strategy desktop_smoke \
-  --output ./artifacts/desktop-starter.jsonl
+python examples/real/desktop_env_smoke.py
 ```
+
+它不依赖模型，直接演练 `DesktopEnv` 与计算机操控工具集。

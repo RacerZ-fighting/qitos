@@ -56,33 +56,22 @@ QitOS 提供两种顶层的智能体编写方式：
     export QITOS_MODEL="Qwen/Qwen3-8B"
     ```
   </Step>
-  <Step title="运行最小编程智能体">
+  <Step title="运行最小智能体">
     ```bash
-    qit demo minimal
+    python examples/quickstart/minimal_agent.py
     ```
-  </Step>
-  <Step title="用 qita 查看运行轨迹">
-    ```bash
-    qita board --logdir runs
-    ```
-    打开 [http://127.0.0.1:8765](http://127.0.0.1:8765)，查看追踪记录、回放（replay）和导出（export）结果。
+    一个 `Agent` façade、一个模型、一个工具——示例会打印最终回复。
   </Step>
 </Steps>
 
 ## QitOS 提供什么
 
 <CardGroup cols={2}>
-  <Card title="智能体模式" icon="diagram-project" href="/zh/guides/agent-patterns">
-    开箱即用的 ReAct、PlanAct、Tree-of-Thought 和 Reflexion
-  </Card>
-  <Card title="课程式教程" icon="graduation-cap" href="/zh/tutorials">
-    从 ReAct 到代码安全审计智能体的完整进阶路径
+  <Card title="教程" icon="graduation-cap" href="/zh/tutorials">
+    按主题组织的课程：工具、预设、可观测性与运行生命周期
   </Card>
   <Card title="可观测性" icon="chart-line" href="/zh/guides/observability">
     内置 `qita` 看板、回放与 HTML 导出
-  </Card>
-  <Card title="基准测试" icon="trophy" href="/zh/benchmarks/overview">
-    在同一个内核上运行 GAIA、Tau-Bench 与 CyBench
   </Card>
   <Card title="Kit 工具箱" icon="toolbox" href="/zh/reference/kit">
     解析器、工具集、记忆、历史、规划器与评估器（critic）

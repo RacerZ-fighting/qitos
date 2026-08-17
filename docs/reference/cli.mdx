@@ -1,40 +1,12 @@
 ---
 title: "CLI Reference"
-description: "Reference for qita and qit, including the minimal coding-agent demo and the official benchmark CLI added in QitOS v0.3."
+description: "Reference for qita and qit, including the official benchmark CLI added in QitOS v0.3."
 ---
 
 QitOS ships two top-level CLIs:
 
 - `qita` for trace inspection
-- `qit` for demos, benchmarks, and developer workflows
-
-## qit demo
-
-Use `qit demo` when you want the fastest path to a real model-backed QitOS run.
-
-### `qit demo minimal`
-
-```bash
-qit demo minimal
-```
-
-This command:
-
-- reads your OpenAI-compatible model config from env vars or flags
-- seeds a tiny buggy workspace
-- runs the minimal coding agent on that workspace
-- writes a qita-ready trace under `./runs`
-
-Optional flags:
-
-- `--workspace ./playground/minimal_coding_agent`
-- `--logdir ./runs`
-- `--model-name Qwen/Qwen3-8B`
-- `--base-url https://api.siliconflow.cn/v1/`
-- `--api-key sk-...`
-- `--task "Fix the bug in buggy_module.py and make the verification command pass."`
-- `--max-steps 8`
-- `--render`
+- `qit` for benchmarks and developer workflows
 
 ## qita
 
@@ -72,37 +44,7 @@ Export a standalone HTML artifact.
 
 ## qit bench
 
-`qit bench` is the canonical benchmark CLI in v0.3.
-
-### `qit bench run`
-
-```bash
-qit bench run \
-  --benchmark tau-bench \
-  --split test \
-  --subset retail \
-  --limit 10 \
-  --output ./results/tau.jsonl
-```
-
-This command:
-
-- loads benchmark tasks
-- constructs `RunSpec` (metadata describing how a single run was configured) and `ExperimentSpec` (metadata grouping runs into an experiment)
-- produces normalized `BenchmarkRunResult` (a standardized result row for one benchmark task) rows
-
-Common benchmark names now include:
-
-- `desktop-starter` for the canonical starter benchmark family
-- `osworld` for the benchmark-specific OSWorld adapter path
-- `gaia`, `tau-bench`, and `cybench` for the migrated benchmark families now living under `qitos.benchmark.*`
-- `desktop` as a compatibility alias for `desktop-starter`
-
-The CLI now assumes a three-layer structure:
-
-- `qitos.benchmark.*` for benchmark adapters and evaluators
-- `qitos.recipes.*` for canonical baseline methods
-- `examples/*` as thin entrypoints only
+`qit bench` handles normalized benchmark result files and run artifacts.
 
 ### `qit bench eval`
 
@@ -133,15 +75,13 @@ Exports one benchmark run as standalone HTML.
 For a first run:
 
 1. `export OPENAI_API_KEY=...`
-2. `qit demo minimal`
-3. `qita board`
+2. `python examples/quickstart/minimal_agent.py`
 
-For benchmark work:
+For benchmark result files produced outside this repository:
 
-1. `qit bench run`
-2. `qit bench eval`
-3. `qita board`
-4. `qit bench replay`
-5. `qit bench export`
+1. `qit bench eval`
+2. `qita board`
+3. `qit bench replay`
+4. `qit bench export`
 
-For deeper background, continue to [Official runs](/concepts/official-runs) and [Tracing](/concepts/tracing).
+For deeper background, continue to [Tracing](/concepts/tracing).

@@ -11,17 +11,9 @@ def _read(path: str) -> str:
 def test_canonical_examples_exist_and_parse() -> None:
     canonical = [
         "examples/quickstart/minimal_agent.py",
-        "examples/patterns/react.py",
-        "examples/patterns/planact.py",
-        "examples/patterns/reflexion.py",
-        "examples/patterns/tot.py",
-        "examples/real/coding_agent.py",
-        "examples/real/research_harness_agent.py",
+        "examples/patterns/embedding_vectorstore.py",
+        "examples/patterns/function_tool_custom.py",
         "examples/real/desktop_env_smoke.py",
-        "examples/real/react_compact_agent.py",
-        "examples/benchmarks/gaia_eval.py",
-        "examples/benchmarks/tau_bench_eval.py",
-        "examples/benchmarks/cybench_eval.py",
     ]
     for rel in canonical:
         path = ROOT / rel
@@ -49,29 +41,4 @@ def test_examples_readme_points_to_canonical_layout() -> None:
     assert "`examples/quickstart/`" in readme
     assert "`examples/patterns/`" in readme
     assert "`examples/real/`" in readme
-    assert "`examples/benchmarks/`" in readme
     assert "benchmark/eval runners remain under `examples/real/`" not in readme
-
-
-def test_benchmark_docs_use_benchmarks_directory() -> None:
-    candidate_groups = [
-        [
-            "docs/builder/benchmark_gaia.md",
-            "docs/builder/benchmark_tau.md",
-            "docs/zh/builder/benchmark_gaia.md",
-            "docs/zh/builder/benchmark_tau.md",
-        ],
-        [
-            "docs/benchmarks/gaia.mdx",
-            "docs/benchmarks/tau-bench.mdx",
-        ],
-    ]
-    existing_groups = [
-        group for group in candidate_groups if all((ROOT / rel).exists() for rel in group)
-    ]
-    assert existing_groups, "No benchmark documentation files were found."
-    for rel in existing_groups[0]:
-        text = _read(rel)
-        if "examples/benchmarks/" in text:
-            assert "examples/real/open_deep_research_gaia_agent.py" not in text, rel
-            assert "examples/real/tau_bench_eval.py" not in text, rel

@@ -5,7 +5,6 @@ from pathlib import Path
 import pytest
 
 from examples._support import SequenceModel
-from examples.real.terminus_2 import Terminus2Agent
 from qitos.core import HistoryMessage, TerminalCapability
 from qitos.kit import (
     SendTerminalKeys,
@@ -252,47 +251,3 @@ def test_token_budget_history_summarizes_older_messages() -> None:
     )
     assert len(retrieved) <= 3
     assert retrieved[0].metadata.get("summary") is True
-
-
-def test_terminus_agent_roundtrip_uses_parser_feedback_and_double_confirmation(
-    tmp_path: Path,
-) -> None:
-    llm = SequenceModel(
-        [
-            "not valid json",
-            '{"analysis":"Need to inspect files","plan":"Run ls","commands":[{"keystrokes":"ls\\n","duration":0.1}]}',
-            '{"analysis":"The task looks complete","plan":"Finish","commands":[],"task_complete":true}',
-            '{"analysis":"Confirmed completion","plan":"Finish","commands":[],"task_complete":true}',
-        ],
-        model="dummy-terminus",
-    )
-    terminal = FakeTerminal()
-    env = TmuxEnv(
-        workspace_root=str(tmp_path),
-        session_name="terminus-loop",
-        terminal=terminal,
-        auto_kill=False,
-    )
-    agent = Terminus2Agent(llm=llm)
-
-    result = agent.run(
-        task="Inspect the workspace and summarize it.",
-        workspace=str(tmp_path),
-        env=env,
-        protocol="terminus_json_v1",
-        max_steps=8,
-        parser_format="json",
-        render=False,
-        trace=False,
-        return_state=True,
-    )
-
-    assert result.state.stop_reason in ("success", "final")
-    assert result.state.final_result == "Confirmed completion"
-    assert terminal.sent == ["ls\n"]
-    assert len(llm.calls) == 4
-    assert "Parser feedback from previous response" in llm.calls[1][-1]["content"]
-    assert (
-        "Are you sure you want to mark the task as complete?"
-        in llm.calls[3][-1]["content"]
-    )

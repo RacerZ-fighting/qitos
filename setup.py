@@ -53,7 +53,6 @@ setup(
             "docs*",
             "plans*",
             "qitos.examples*",
-            "qitos_zoo*",
         ]
     ),
     python_requires=">=3.10",
@@ -76,7 +75,6 @@ setup(
             "openai>=1.66.0",
         ],
         "yaml": ["pyyaml>=6.0"],
-        "benchmarks": ["datasets>=2.20.0", "huggingface_hub>=0.24.0"],
         "hf": ["huggingface_hub>=0.24.0"],
         "web": ["playwright>=1.40.0"],
         "dev": [
@@ -99,16 +97,8 @@ setup(
             "openai>=1.66.0",
             "litellm>=1.52.0",
             "pyyaml>=6.0",
-            "datasets>=2.20.0",
             "huggingface_hub>=0.24.0",
         ],
-    },
-    package_data={
-        "qitos.benchmark.desktop": ["data/*.json"],
-        "qitos.benchmark.tau_bench.port.envs.retail.data": ["*.json", "*.md"],
-        "qitos.benchmark.tau_bench.port.envs.airline.data": ["*.json", "*.md"],
-        "qitos.benchmark.tau_bench.port.envs.retail": ["*.md"],
-        "qitos.benchmark.tau_bench.port.envs.airline": ["*.md"],
     },
     license_files=("LICENSE",),
     include_package_data=True,

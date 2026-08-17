@@ -56,33 +56,22 @@ Both paths are first-class citizens in the framework.
     export QITOS_MODEL="Qwen/Qwen3-8B"
     ```
   </Step>
-  <Step title="Run the minimal coding agent">
+  <Step title="Run the minimal agent">
     ```bash
-    qit demo minimal
+    python examples/quickstart/minimal_agent.py
     ```
-  </Step>
-  <Step title="Inspect your run with qita">
-    ```bash
-    qita board --logdir runs
-    ```
-    Open [http://127.0.0.1:8765](http://127.0.0.1:8765) to view trace, replay, and export your run.
+    One `Agent` façade, one model, one Tool — the example prints the final reply.
   </Step>
 </Steps>
 
 ## What QitOS gives you
 
 <CardGroup cols={2}>
-  <Card title="Agent Patterns" icon="diagram-project" href="/guides/agent-patterns">
-    ReAct, PlanAct, Tree-of-Thought, and Reflexion out of the box
-  </Card>
-  <Card title="Course-style tutorials" icon="graduation-cap" href="/tutorials">
-    ReAct, PlanAct, Claude Code-style, and security audit lessons
+  <Card title="Tutorials" icon="graduation-cap" href="/tutorials">
+    Task-focused lessons: tools, presets, observability, and run lifecycle
   </Card>
   <Card title="Observability" icon="chart-line" href="/guides/observability">
     Built-in tracing with qita board, replay, and HTML export
-  </Card>
-  <Card title="Benchmarks" icon="trophy" href="/benchmarks/overview">
-    GAIA, Tau-Bench, and CyBench adapters on the same kernel
   </Card>
   <Card title="Kit Toolkit" icon="toolbox" href="/reference/kit">
     Parsers, memory adapters, toolsets, critics, and planners

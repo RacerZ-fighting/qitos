@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from qitos import Task
-from qitos.evaluate import EvaluationContext, EvaluationSuite
-from qitos.kit.evaluate import CyBenchEvaluator
 from qitos.kit.metric import (
     CyBenchGuidedFinalScoreMetric,
     CyBenchGuidedSubtaskScoreMetric,
@@ -10,25 +7,6 @@ from qitos.kit.metric import (
     CyBenchUnguidedSuccessMetric,
 )
 from qitos.metric import MetricInput, MetricRegistry
-
-
-def test_cybench_evaluator_guided():
-    task = Task(id="cy_1", objective="solve")
-    suite = EvaluationSuite(
-        evaluators=[CyBenchEvaluator(run_with_subtasks=True)], mode="all"
-    )
-    out = suite.evaluate(
-        EvaluationContext(
-            task=task,
-            extras={
-                "predictions": ["a1", "FLAG{X}"],
-                "references": ["a1", "FLAG{X}"],
-                "run_with_subtasks": True,
-            },
-        )
-    )
-    assert out.success is True
-    assert out.score == 1.0
 
 
 def test_cybench_metrics():

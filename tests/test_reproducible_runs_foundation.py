@@ -141,39 +141,6 @@ def test_benchmark_run_result_roundtrip():
     assert loaded.run_spec_ref == "abc"
 
 
-def test_qit_bench_run_and_eval(tmp_path: Path, capsys):
-    out = tmp_path / "tau_results.jsonl"
-    rc = qit_main(
-        [
-            "bench",
-            "run",
-            "--benchmark",
-            "tau-bench",
-            "--split",
-            "test",
-            "--subset",
-            "retail",
-            "--limit",
-            "2",
-            "--output",
-            str(out),
-        ]
-    )
-    assert rc == 0
-    assert out.exists()
-    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
-    assert len(rows) == 2
-    assert rows[0]["benchmark"] == "tau-bench"
-    assert rows[0]["run_spec_ref"]
-
-    capsys.readouterr()
-    rc = qit_main(["bench", "eval", "--input", str(out), "--json"])
-    assert rc == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["total"] == 2
-    assert "success_rate" in payload
-
-
 def test_qit_bench_replay_and_export(tmp_path: Path, capsys):
     run = _make_run_dir(tmp_path, "bench_run")
     out = tmp_path / "bench_run.html"

@@ -79,6 +79,39 @@ How to update:
 
 ### Removed
 
+- **Breaking:** Removed the benchmark execution layer: `qitos.recipes` is gone
+  entirely (`benchmarks/`, `desktop/`, and the pattern recipes), together with
+  the recipe-coupled `qitos.benchmark` adapter subpackages (`cybench`,
+  `desktop`, `gaia`, `osworld`, `tau_bench`), `qitos/benchmark/runner.py`, the
+  `qit bench run` / `qit bench list` commands, the `qitos[benchmarks]` extra,
+  `examples/benchmarks/`, and `examples/real/openai_cua_agent.py`.
+  `qitos.benchmark` keeps only the engine-free core: the adapter/scorer
+  protocols, `BenchmarkRunResult` file read/write, and result aggregation, so
+  `qit bench eval`, `replay`, `export`, and `presets` plus the leaderboard
+  store keep working on result files and run directories produced elsewhere.
+  Benchmark docs move to git history; run inspection stays with `qita`.
+- **Breaking:** Removed the pattern method recipes
+  (`qitos.recipes.{lats,magentic_one,moa,reflexion,self_refine}`): AgentModule
+  Agent + Critic templates with no caller outside their own tests. The
+  surviving composition path is the Agent façade plus child agents; the
+  method-templates guide and glossary entries leave with them.
+- **Breaking:** Removed the `qitos_zoo` submodule (gitlink and `.gitmodules`).
+  The fork carries no product showcase agents; the zoo's coder/cyber
+  applications were Engine-era compositions with no remaining consumer.
+- **Breaking:** Removed `qitos.demo` and the `qit demo` command. The packaged
+  minimal coding demo was an `AgentModule + Engine` composition; the
+  quickstart example now composes the `Agent` façade directly.
+- **Breaking:** Removed the Engine-coupled example set: `examples/patterns/`
+  `react.py`, `planact.py`, `reflexion.py`, `tot.py` and `handoff.py`, all
+  `AgentModule`-based `examples/real/` agents (the env-only
+  `desktop_env_smoke.py` stays), the Engine-based `examples/zh/` agents, and
+  the tutorial course that taught them (`docs/tutorials/react|planact|
+  claude-code|code-security-audit|multi-agent` and `docs/guides/agent-patterns`,
+  English and Chinese). `examples/quickstart/minimal_agent.py` is ported to
+  the Agent façade (`Agent(model=..., tool_registry=...)` +
+  `await agent.prompt(...)`); engine-free examples
+  (`patterns/function_tool_custom.py`, `patterns/embedding_vectorstore.py`,
+  `zh/embedding_vectorstore.py`) remain.
 - **Breaking:** Removed the Engine-coupled delegation tools
   `qitos.kit.tool.delegate` (`DelegateTool`) and `qitos.kit.tool.fanout`
   (`FanOutTool`) together with `AgentRegistry.get_delegate_tools()` /

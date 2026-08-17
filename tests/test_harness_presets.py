@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from examples._support import SequenceModel
-from qitos_zoo.qitos_coder.preset_agent import ClaudeCodeAgent, _resolve_runtime_config
 import qitos.core.agent_module as agent_module_module
-from qitos import HistoryPolicy, Task
+from qitos import AgentModule, Decision, HistoryPolicy, StateSchema, Task, ToolRegistry
 from qitos.harness import (
     build_harness_policy,
     build_model_for_preset,
@@ -17,6 +16,32 @@ from qitos.harness import (
 from qitos.models.profile_registry import infer_default_protocol, infer_model_profile
 from qitos.qita.cli import _build_run_diff
 from qitos.qita.data import _load_run_payload
+
+
+class _PresetAgent(AgentModule):
+    """Minimal engine agent exercising harness presets without product code."""
+
+    def __init__(self, *, llm, model_parser=None, model_protocol=None) -> None:
+        super().__init__(
+            tool_registry=ToolRegistry(),
+            llm=llm,
+            model_parser=model_parser,
+            model_protocol=model_protocol,
+        )
+
+    def init_state(self, task: str, **kwargs):
+        return StateSchema(task=task, max_steps=int(kwargs.get("max_steps", 2)))
+
+    def build_system_prompt(self, state):
+        return "You are a preset conformance agent."
+
+    def prepare(self, state):
+        return f"Task: {state.task}"
+
+    def reduce(self, state, observation, decision):
+        if isinstance(decision, Decision) and decision.mode == "final":
+            state.final_result = str(decision.final_answer or "")
+        return state
 
 
 def test_resolve_family_preset_for_gold_families() -> None:
@@ -105,34 +130,6 @@ def test_build_model_for_glm_preset_attaches_native_tool_call_metadata() -> None
     assert metadata["effective_tool_delivery"] == "api_parameter"
 
 
-def test_claude_code_runtime_config_prefers_cli_over_env() -> None:
-    config = _resolve_runtime_config(
-        type(
-            "_Args",
-            (),
-            {
-                "model_family": "minimax",
-                "model_name": "MiniMax-M2.5",
-                "base_url": "https://api.minimax.chat/v1",
-                "api_key": "cli-key",
-                "protocol": "minimax_tool_call_v1",
-            },
-        )(),
-        env={
-            "QITOS_MODEL_FAMILY": "kimi",
-            "QITOS_MODEL": "moonshot-v1-128k",
-            "OPENAI_BASE_URL": "https://api.moonshot.ai/v1",
-            "OPENAI_API_KEY": "env-key",
-            "QITOS_PROTOCOL": "react_text_v1",
-        },
-    )
-    assert config["model_family"] == "minimax"
-    assert config["model_name"] == "MiniMax-M2.5"
-    assert config["base_url"] == "https://api.minimax.chat/v1"
-    assert config["api_key"] == "cli-key"
-    assert config["protocol"] == "minimax_tool_call_v1"
-
-
 def test_same_claude_code_agent_switches_across_gold_families(tmp_path: Path) -> None:
     final_outputs = {
         "qwen": '{"thought":"done","final_answer":"ok"}',
@@ -165,9 +162,8 @@ def test_same_claude_code_agent_switches_across_gold_families(tmp_path: Path) ->
         )
         workspace = tmp_path / family_id
         workspace.mkdir(parents=True, exist_ok=True)
-        agent = ClaudeCodeAgent(
+        agent = _PresetAgent(
             llm=llm,
-            workspace_root=str(workspace),
             model_parser=harness.parser,
             model_protocol=harness.protocol,
         )
@@ -202,12 +198,11 @@ def test_harness_metadata_reaches_trace_manifest(tmp_path: Path) -> None:
     )
     workspace = tmp_path / "kimi"
     workspace.mkdir(parents=True, exist_ok=True)
-    agent = ClaudeCodeAgent(
-        llm=llm,
-        workspace_root=str(workspace),
-        model_parser=harness.parser,
-        model_protocol=harness.protocol,
-    )
+    agent = _PresetAgent(
+            llm=llm,
+            model_parser=harness.parser,
+            model_protocol=harness.protocol,
+        )
     agent.run(
         task="finish",
         workspace=str(workspace),
@@ -281,9 +276,8 @@ def test_scripted_runs_produce_a_same_spec_comparison(
                 "context_policy": harness.context_policy.to_dict(),
             },
         )
-        agent = ClaudeCodeAgent(
+        agent = _PresetAgent(
             llm=llm,
-            workspace_root=str(workspace),
             model_parser=harness.parser,
             model_protocol=harness.protocol,
         )

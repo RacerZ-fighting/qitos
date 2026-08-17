@@ -45,10 +45,6 @@ pip install qitos
 pip install "qitos[models]"
 ```
 
-```bash 基准测试适配器
-pip install "qitos[benchmarks]"
-```
-
 ```bash 全部安装
 pip install "qitos[all]"
 ```
@@ -58,7 +54,6 @@ pip install "qitos[all]"
 | 扩展组件 | 增加的内容 |
 |---|---|
 | `models` | `openai>=1.66.0`，用于 Chat Completions 与可选 Responses API 模型接口 |
-| `benchmarks` | `datasets`、`huggingface_hub` 等基准测试适配器依赖 |
 | `all` | 以上全部 |
 
 <Tip>
@@ -72,7 +67,7 @@ pip install "qitos[all]"
 ```bash
 git clone https://github.com/Qitor/qitos.git
 cd qitos
-pip install -e ".[dev,models,benchmarks]"
+pip install -e ".[dev,models]"
 ```
 
 `dev` 扩展组件会安装 `pytest`、`black`、`flake8`、`mypy` 以及 QitOS 团队使用的打包工具。
@@ -91,10 +86,9 @@ python -c "import qitos; print(qitos.__version__)"
 0.3.0
 ```
 
-也可以顺便验证最小编程智能体和两个命令行工具（CLI）是否已进入 PATH：
+也可以顺便验证两个命令行工具（CLI）是否已进入 PATH：
 
 ```bash
-qit demo minimal
 qit --help
 qita --help
 ```

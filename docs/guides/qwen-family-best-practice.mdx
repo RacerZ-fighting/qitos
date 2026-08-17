@@ -76,24 +76,26 @@ Put differently:
 - Qwen-Agent solves the more general Qwen chat interface problem
 - QitOS solves the OpenAI-compatible served Qwen inside one reusable harness layer problem
 
-## Recommended `qwen-plus` example
+## Recommended `qwen-plus` configuration
 
-Use the flagship example with an OpenAI-compatible Qwen endpoint:
+Build the model through the Qwen family preset against an OpenAI-compatible Qwen endpoint:
 
-```bash
-export OPENAI_API_KEY="your_api_key"
-export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+```python
+from qitos.harness import build_model_for_preset
 
-python examples/real/claude_code_agent.py \
-  --model-family qwen \
-  --model-name qwen-plus \
-  --print-harness
+llm = build_model_for_preset(
+    family_id="qwen",
+    model_name="qwen-plus",
+    api_key="...",  # OPENAI_API_KEY
+    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
+print(llm.qitos_harness_metadata)
 ```
 
-You should expect the harness summary to show:
+You should expect the harness metadata to show:
 
 - `family_preset: qwen`
-- `tool_delivery: api_parameter`
+- `tool_delivery: api_parameter` (via `tool_policy`)
 - `native_tool_call_preferred: True`
 - `decision_lane_preference: native_tool_calls`
 
