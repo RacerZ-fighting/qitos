@@ -83,9 +83,15 @@ class AgentListenerTimeoutError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class AgentRunRejected:
-    """Typed expected rejection for run-entry operations."""
+    """Typed expected rejection for run-entry operations.
 
-    reason: Literal["busy", "empty_history", "assistant_tail"]
+    ``task_terminal`` is returned by the Session Harness when a
+    task-bearing Session whose Root Task is terminal is prompted for new
+    work; continuing requires an explicit new Task
+    (``SessionRun.start_follow_up``).
+    """
+
+    reason: Literal["busy", "empty_history", "assistant_tail", "task_terminal"]
 
 
 AgentRunResult = Union[AgentLoopResult, AgentRunRejected]

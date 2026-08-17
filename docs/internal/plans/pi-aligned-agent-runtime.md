@@ -8,18 +8,20 @@ façade, retired-runtime deletion slices, S1 parity items, and the authoritative
 Session/Harness (S2) are implemented on the migration branch. The remaining merge
 gates land on the same branch:
 
-- S3 — milestone 2.4, goal-bearing Task (S3a) and dependency-aware Plan (S3b).
+- S3 — milestone 2.4, dependency-aware Plan (S3b). The goal-bearing Task (S3a)
+  is implemented.
 
 ## 1. Current gaps
 
-- Task mixes objective identity with benchmark resources, environment probing, metrics
-  and free-form metadata (S3a).
 - WorkPlan is a flat single-active checklist rather than an owner/dependency graph
-  (S3b).
+  (S3b); `Task.plan_assignment` is already a durable plain reference whose real
+  Plan binding lands with S3b.
 - Background Child terminal facts have deterministic completion-input projections,
   and the Session/Harness now re-projects a run's own unconsumed inputs exactly
-  once; Task/Plan-owned durable lifecycle (blocked/terminal Task transitions and
-  Plan update replay) is what remains for recovery beyond that (S3).
+  once; Task durable lifecycle (blocked/terminal transitions) is journaled and
+  recovered (S3a), and Plan update replay is what remains for recovery beyond
+  that (S3b). Parent-side narrowing enforcement of the Child Task binding also
+  remains with S3b.
 
 Proven Tool transaction, cancellation, absolute deadline, result ordering, trace and
 recovery behavior is the conformance baseline. Legacy type names and package layout are
@@ -141,22 +143,29 @@ live Engine or guesses side effects.
 
 ### 2.4 Replace Task and Plan (S3)
 
-S3a (Task):
+S3a (Task), done on `feat/pi-aligned-agent-loop`:
 
-- Replace `core/task.py` in place with the goal-bearing Task of architecture
-  §5: immutable definition (task id, optional parent task id, objective,
-  success criteria, constraints, stable resource/context references, budget,
-  creation provenance, optional parent Plan assignment reference) plus durable
-  lifecycle (`active|blocked|completed|failed|cancelled`, usage, typed
-  blocker/terminal reason) committed as `task.created` / `task.transition`.
-- Remove `TaskResource`, `TaskResult`, `TaskCriterionResult`,
+- (done) Replaced `core/task.py` in place with the goal-bearing Task of
+  architecture §5: immutable definition (task id, optional parent task id,
+  objective, success criteria, string constraints, stable typed references,
+  budget, creation provenance, optional parent Plan assignment reference)
+  plus durable lifecycle (`active|blocked|completed|failed|cancelled`,
+  usage, typed blocker/terminal reason) committed as `task.created` /
+  `task.transition`.
+- (done) Removed `TaskResource`, `TaskResult`, `TaskCriterionResult`,
   `TaskResourceBinding`, `TaskValidationIssue`, environment probing
-  (`resolve_resources`, `validate_structured`) and free-form metadata from the
-  canonical Task; migrate `RepoEnv`, the evaluation context/DSL exposure and
-  the Child budget consumers.
-- Root Task commits before `input.accepted`; one unfinished Root Task per
-  Session lineage; blocked/terminal semantics per architecture §5; Child
-  launch creates the narrowed Child Task durably before runtime construction.
+  (`resolve_resources`, `validate_structured`) and free-form metadata from
+  the canonical Task; migrated `RepoEnv` (Task coupling and
+  `required_missing` probing removed), the evaluation context/DSL exposure
+  (new `task.to_dict()` shape) and the Child budget consumers.
+- (done) Root Task commits before `input.accepted`; one unfinished Root Task
+  per Session lineage; blocked/terminal semantics per architecture §5
+  (`unblock_task` is the only blocked → active path; run termination never
+  auto-transitions the Task; `start_follow_up` starts a new Task explicitly
+  on a terminal-task lineage); Child launch commits the narrowed Child Task
+  into the child journal before its `input.accepted`. Remainder for S3b:
+  binding `plan_assignment` to a real parent Plan node and parent-side
+  narrowing enforcement of the Child Task.
 
 S3b (Plan):
 

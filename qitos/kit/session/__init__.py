@@ -18,7 +18,7 @@ from .compaction import (
     should_compact,
     usage_context_tokens,
 )
-from .harness import ResumeRejected, SessionHarness, SessionRun
+from .harness import ResumeRejected, SessionHarness, SessionRun, TaskTransitionRejected
 from .runtime_inputs import SessionRuntimeInputs
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
     "SessionRun",
     "SessionRuntimeInputs",
     "SummarizationError",
+    "TaskTransitionRejected",
     "compact_context",
     "estimate_context_tokens",
     "estimate_tokens",

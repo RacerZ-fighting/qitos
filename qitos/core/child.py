@@ -105,6 +105,8 @@ class ChildLaunchRequest:
     budget: TaskBudget = field(
         default_factory=lambda: TaskBudget(max_steps=DEFAULT_CHILD_MAX_STEPS)
     )
+    parent_task_id: str | None = None
+    plan_assignment: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("task", "description", "agent_type", "profile"):
@@ -116,6 +118,14 @@ class ChildLaunchRequest:
         for name in ("name", "context"):
             if not isinstance(getattr(self, name), str):
                 raise TypeError(f"ChildLaunchRequest.{name} must be a string")
+        for name in ("parent_task_id", "plan_assignment"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(
+                    f"ChildLaunchRequest.{name} must be a non-empty string or None"
+                )
         if not isinstance(self.allowed_tool_groups, tuple) or any(
             not isinstance(group, str) or not group.strip()
             for group in self.allowed_tool_groups
@@ -148,11 +158,13 @@ class ChildLaunchRequest:
             "allowed_tool_groups": list(self.allowed_tool_groups),
             "working_directory": self.working_directory,
             "budget": _budget_to_dict(self.budget),
+            "parent_task_id": self.parent_task_id,
+            "plan_assignment": self.plan_assignment,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ChildLaunchRequest":
-        expected = {
+        legacy = {
             "task",
             "description",
             "name",
@@ -163,7 +175,8 @@ class ChildLaunchRequest:
             "working_directory",
             "budget",
         }
-        if set(value) != expected:
+        expected = legacy | {"parent_task_id", "plan_assignment"}
+        if set(value) not in (legacy, expected):
             raise ValueError("ChildLaunchRequest fields are invalid")
         raw_groups = value["allowed_tool_groups"]
         raw_budget = value["budget"]
@@ -181,6 +194,8 @@ class ChildLaunchRequest:
             allowed_tool_groups=tuple(raw_groups),
             working_directory=value["working_directory"],
             budget=_budget_from_dict(raw_budget),
+            parent_task_id=value.get("parent_task_id"),
+            plan_assignment=value.get("plan_assignment"),
         )
 
 
@@ -585,28 +600,11 @@ class ChildResult:
 
 
 def _budget_to_dict(budget: TaskBudget) -> dict[str, Any]:
-    return {
-        "max_steps": budget.max_steps,
-        "max_runtime_seconds": budget.max_runtime_seconds,
-        "max_tokens": budget.max_tokens,
-        "max_cost_usd": budget.max_cost_usd,
-        "max_tool_concurrency": budget.max_tool_concurrency,
-        "max_children": budget.max_children,
-    }
+    return budget.to_dict()
 
 
 def _budget_from_dict(value: Mapping[str, Any]) -> TaskBudget:
-    expected = {
-        "max_steps",
-        "max_runtime_seconds",
-        "max_tokens",
-        "max_cost_usd",
-        "max_tool_concurrency",
-        "max_children",
-    }
-    if set(value) != expected:
-        raise ValueError("TaskBudget fields are invalid")
-    return TaskBudget(**dict(value))
+    return TaskBudget.from_dict(value)
 
 
 def _string_tuple(value: Any, name: str) -> tuple[str, ...]:

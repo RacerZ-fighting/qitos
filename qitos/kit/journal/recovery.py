@@ -14,8 +14,10 @@ terminal records and never re-executes anything.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
+from types import MappingProxyType
 from typing import Sequence
 
 from ...core.agent_loop import AgentRunStatus
@@ -35,6 +37,7 @@ from ...core.message import (
     UserMessage,
 )
 from ...core.runtime_input import RuntimeInput
+from ...core.task import Task, TaskLifecycle, TaskStatus
 from ...core.thinking import ThinkingLevel
 from ...core.tool_result import ToolResult
 from .turn_recorder import (
@@ -46,6 +49,8 @@ from .turn_recorder import (
     decode_run_terminal,
     decode_runtime_input_consumed,
     decode_step_committed,
+    decode_task_created,
+    decode_task_transition,
     decode_thinking_change,
     decode_tool_started,
     decode_tool_terminal,
@@ -91,6 +96,14 @@ class CrashedToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class RecoveredTask:
+    """One Task definition plus its lifecycle folded from the journal."""
+
+    definition: Task
+    lifecycle: TaskLifecycle
+
+
+@dataclass(frozen=True, slots=True)
 class RecoveredSession:
     """Everything a harness needs to resume, fork or close one Run journal.
 
@@ -98,7 +111,9 @@ class RecoveredSession:
     commit order, then the uncommitted tail in journal order.
     ``uncommitted_transcript_record_ids`` / ``uncommitted_terminal_record_ids``
     name the tail records no ``step.committed`` covers yet; the crash closure
-    folds them into its closing commit.
+    folds them into its closing commit. ``tasks`` projects every
+    ``task.created`` definition with its lifecycle folded from the
+    ``task.transition`` records through the fork lineage.
     """
 
     run_id: str
@@ -118,6 +133,19 @@ class RecoveredSession:
     crash_turn_transcript_entries: int
     uncommitted_transcript_record_ids: tuple[str, ...]
     uncommitted_terminal_record_ids: tuple[str, ...]
+    tasks: Mapping[str, RecoveredTask]
+
+    @property
+    def unfinished_root(self) -> RecoveredTask | None:
+        """The lineage's single unfinished Root Task, when one exists."""
+
+        for task in self.tasks.values():
+            if (
+                task.definition.parent_task_id is None
+                and not task.lifecycle.status.terminal
+            ):
+                return task
+        return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +227,10 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
     compactions: list[_CompactionFact] = []
     posted_inputs: dict[str, RuntimeInput] = {}
     consumed_inputs: set[str] = set()
+    tasks: dict[str, RecoveredTask] = {}
+    # Run segments (own or inherited) that already folded a model, Tool,
+    # transcript or input side effect; a root task.created must precede them.
+    segment_side_effects: set[str] = set()
     outcome_status: AgentRunStatus | None = None
     outcome_error: str | None = None
     input_accepted_seen = False
@@ -323,6 +355,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                 pass
             elif record_type is JournalRecordType.TRANSCRIPT_MESSAGE:
                 message = decode_transcript_message(payload)
+                segment_side_effects.add(effective.run_id)
                 entry_run, entry_turn = _parse_transcript_turn(effective.record_id)
                 if is_own:
                     if entry_run != run_id:
@@ -343,6 +376,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                         added_tool_entries.append((index, message.added_tool_names))
             elif record_type is JournalRecordType.MODEL_COMPLETED:
                 turn, _request, message_record_id = decode_model_completed(payload)
+                segment_side_effects.add(effective.run_id)
                 _turn_barrier(turn)
                 entry_position = transcript_index.get(message_record_id)
                 if entry_position is None:
@@ -362,6 +396,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                 tools_change_index = index
             elif record_type is JournalRecordType.TOOL_STARTED:
                 turn, call = decode_tool_started(payload)
+                segment_side_effects.add(effective.run_id)
                 _turn_barrier(turn)
                 call_key = (effective.run_id, call.id)
                 if call_key in started:
@@ -379,6 +414,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                 )
             elif record_type is JournalRecordType.TOOL_TERMINAL:
                 turn, call, message_record_id = decode_tool_terminal(payload)
+                segment_side_effects.add(effective.run_id)
                 _turn_barrier(turn)
                 call_key = (effective.run_id, call.id)
                 if call_key in terminals:
@@ -437,6 +473,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                 covered_terminal_ids.update(commit_terminal_ids)
                 commit_entry_ids.extend(commit_transcript_ids)
             elif record_type is JournalRecordType.INPUT_ACCEPTED:
+                segment_side_effects.add(effective.run_id)
                 if is_own:
                     input_accepted_seen = True
                 for record_id in decode_input_accepted(payload):
@@ -482,6 +519,65 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                     if event_id in consumed_inputs:
                         raise JournalCorruptionError("runtime input was consumed twice")
                     consumed_inputs.add(event_id)
+            elif record_type is JournalRecordType.TASK_CREATED:
+                task = decode_task_created(payload)
+                existing = tasks.get(task.task_id)
+                if existing is not None and existing.definition != task:
+                    raise JournalCorruptionError(
+                        "task.created conflicts with the recorded task definition"
+                    )
+                if existing is None:
+                    if task.parent_task_id is None:
+                        if effective.run_id in segment_side_effects:
+                            raise JournalCorruptionError(
+                                "root task.created follows the run's model or "
+                                "transcript side effects"
+                            )
+                        if any(
+                            recorded.definition.parent_task_id is None
+                            and not recorded.lifecycle.status.terminal
+                            for recorded in tasks.values()
+                        ):
+                            raise JournalCorruptionError(
+                                "journal holds a second unfinished root task"
+                            )
+                    tasks[task.task_id] = RecoveredTask(
+                        definition=task,
+                        lifecycle=TaskLifecycle(status=TaskStatus.ACTIVE),
+                    )
+                # An identical duplicate settles as an idempotent append.
+            elif record_type is JournalRecordType.TASK_TRANSITION:
+                (
+                    task_id,
+                    from_status,
+                    to_status,
+                    reason,
+                    blocker,
+                    usage,
+                ) = decode_task_transition(payload)
+                current = tasks.get(task_id)
+                if current is None:
+                    raise JournalCorruptionError(
+                        "task.transition references an unknown task"
+                    )
+                folded = current.lifecycle
+                if folded.status.terminal:
+                    raise JournalCorruptionError(
+                        "task.transition follows a terminal task status"
+                    )
+                if folded.status is not from_status:
+                    raise JournalCorruptionError(
+                        "task.transition from_status does not match the folded state"
+                    )
+                tasks[task_id] = RecoveredTask(
+                    definition=current.definition,
+                    lifecycle=TaskLifecycle(
+                        status=to_status,
+                        usage=usage,
+                        blocker=blocker,
+                        terminal_reason=reason,
+                    ),
+                )
             elif record_type in (
                 JournalRecordType.RUN_COMPLETED,
                 JournalRecordType.RUN_INTERRUPTED,
@@ -720,6 +816,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
         crash_turn_transcript_entries=crash_turn_entries,
         uncommitted_transcript_record_ids=tuple(tail_entry_ids),
         uncommitted_terminal_record_ids=uncommitted_terminal_ids,
+        tasks=MappingProxyType(tasks),
     )
 
 
@@ -851,6 +948,7 @@ __all__ = [
     "CrashedToolCall",
     "RecoveredRunOutcome",
     "RecoveredSession",
+    "RecoveredTask",
     "close_crashed_tool_calls",
     "recover_run_outcome",
     "recover_session",

@@ -55,9 +55,11 @@ from .core.work_plan import (
 from .core.spec import BenchmarkRunResult, ExperimentSpec, RunSpec
 from .core.task import (
     Task,
+    TaskBlocker,
     TaskBudget,
-    TaskResource,
-    TaskResult,
+    TaskLifecycle,
+    TaskReference,
+    TaskStatus,
 )
 from .core.tool import (
     BaseTool,
@@ -117,9 +119,11 @@ __all__ = [
     "ProcessStatus",
     "ProcessTerminalNotifier",
     "Task",
-    "TaskResource",
+    "TaskBlocker",
     "TaskBudget",
-    "TaskResult",
+    "TaskLifecycle",
+    "TaskReference",
+    "TaskStatus",
     "WorkPlanContractError",
     "WorkPlanItem",
     "WorkPlanState",

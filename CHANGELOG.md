@@ -182,6 +182,52 @@ How to update:
   across resume. Journal recovery now replays nested fork prefixes as a
   sequence of closed per-run segments (turn barriers and Tool-call pairing
   are scoped per segment, since call ids are unique only within one run).
+- **Goal-bearing Task with a durable journal lifecycle (S3a).** `qitos.core.task`
+  is replaced in place with the architecture §5 contract: an immutable `Task`
+  definition (`task_id`, optional `parent_task_id`, `objective`,
+  `success_criteria`, string `constraints`, stable typed `references`
+  (`TaskReference`, no filesystem probing), `budget`, `created_at` UTC
+  provenance, `created_by_run_id`, optional `plan_assignment`) plus
+  `TaskStatus` / `TaskBlocker` / `TaskLifecycle` lifecycle values with
+  invariant validation (blocker exactly while blocked, terminal reason
+  exactly at a terminal status) and exact fail-closed codecs throughout.
+  The journal gains `task.created` (the definition, committed before
+  `input.accepted` and any model/Tool side effect) and `task.transition`
+  records; `recover_session` folds them through the fork lineage into
+  `RecoveredSession.tasks` (with an `unfinished_root` accessor) and fails
+  closed on a second unfinished Root Task, terminal-once violations,
+  from-status mismatches, unknown-task transitions, conflicting duplicate
+  creations and root creations that follow model/transcript side effects.
+  `SessionHarness.start` accepts the Root Task and commits it first;
+  `SessionRun` gains `complete_task` / `fail_task` / `cancel_task` /
+  `block_task` / `unblock_task` (durable before returning, with a budget
+  usage snapshot when a ledger is attached, typed `TaskTransitionRejected`
+  for expected misuse) and `start_follow_up(task, prompt)` for continuing a
+  terminal-task lineage with an explicit new Task. A settled leg keeps its
+  run terminal last, so post-run transitions commit into the advanced leg;
+  leg advances carry Task facts that would otherwise be truncated by the
+  fork boundary. Prompting a task-bearing Session whose Root Task is
+  terminal rejects with `AgentRunRejected("task_terminal")`; taskless
+  Sessions are unchanged. Child launch binds the narrowed Child Task
+  durably: `ChildLaunchRequest` carries `parent_task_id` / `plan_assignment`
+  (legacy payloads without them still decode), the façade Child engine
+  commits the Child `task.created` before its `input.accepted`, and the
+  Agent Tool threads the binding from the runtime context the parent
+  Harness publishes.
+
+### Breaking
+
+- **`Task` schema replaced in place (S3a).** `Task` loses `id` (renamed
+  `task_id`), `inputs`, `resources`, `env_spec`, `metadata`, `validate`,
+  `validate_structured` and `resolve_resources`; `TaskResource`,
+  `TaskResult`, `TaskCriterionResult`, `TaskResourceBinding` and
+  `TaskValidationIssue` are deleted with no aliases or mirrors. Benchmark
+  resources, environment probing, metrics and free-form metadata stay at
+  application boundaries and reference the Task by id. The evaluation DSL
+  `task` variable now exposes the new `task.to_dict()` shape, and `RepoEnv`
+  no longer accepts or probes a Task (the `required_missing` observation key
+  is gone). `TaskBudget.to_dict` / `from_dict` is the canonical budget codec
+  (unchanged six-key payload).
 
 ### Changed
 

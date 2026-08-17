@@ -15,7 +15,7 @@ from qitos.metric import MetricInput, MetricRegistry
 
 
 def test_evaluation_suite_rule_and_dsl():
-    task = Task(id="t1", objective="solve")
+    task = Task(task_id="t1", objective="solve")
     context = EvaluationContext(
         task=task,
         manifest={"summary": {"stop_reason": "final_result", "final_result": "done"}},

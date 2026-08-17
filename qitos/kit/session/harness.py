@@ -51,8 +51,15 @@ from ...core.journal import (
     resolve_inherited_record,
 )
 from ...core.message import AssistantMessage, Message, UserMessage
-from ...core.model_response import ModelPricing
+from ...core.model_response import ModelPricing, ModelUsage
 from ...core.runtime_input import RuntimeInput
+from ...core.task import (
+    Task,
+    TaskBlocker,
+    TaskLifecycle,
+    TaskStatus,
+    validate_task_transition,
+)
 from ...core.thinking import ThinkingLevel
 from ...core.tool_registry import ToolRegistry
 from ...trace.producer import AgentTraceProducer, trace_producer_metadata
@@ -63,10 +70,16 @@ from ..journal import (
     JsonlSessionJournal,
     JournalTurnTransaction,
     RecoveredSession,
+    RecoveredTask,
     close_crashed_tool_calls,
     recover_session,
 )
 from ..journal._paths import JOURNAL_FILENAME, validate_run_id
+from ..journal.turn_recorder import (
+    decode_task_transition,
+    encode_task_created,
+    encode_task_transition,
+)
 from .compaction import (
     CompactRejected,
     CompactResult,
@@ -111,6 +124,32 @@ class ResumeRejected:
             isinstance(name, str) and name for name in self.missing_tools
         ):
             raise TypeError("missing_tools must be a tuple of non-empty strings")
+        if not isinstance(self.detail, str):
+            raise TypeError("detail must be a string")
+
+
+_TaskTransitionReason = Literal["unknown", "terminal", "invalid"]
+_TASK_TRANSITION_REASONS = frozenset({"unknown", "terminal", "invalid"})
+
+
+@dataclass(frozen=True, slots=True)
+class TaskTransitionRejected:
+    """Typed expected rejection for Task lifecycle operations.
+
+    ``unknown``: the session lineage holds no Root Task. ``terminal``: the
+    Task already committed a terminal status. ``invalid``: the requested
+    move is not a legal transition from the folded state. Corruption and
+    implementation faults raise instead of returning this value.
+    """
+
+    reason: _TaskTransitionReason
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if self.reason not in _TASK_TRANSITION_REASONS:
+            raise ValueError(
+                f"unknown task transition rejection reason: {self.reason!r}"
+            )
         if not isinstance(self.detail, str):
             raise TypeError("detail must be a string")
 
@@ -196,10 +235,23 @@ class SessionHarness:
         model_pricing: Optional[ModelPricing] = None,
         post_runtime_event: Optional[Callable[[RuntimeInput], Any]] = None,
         run_metadata: Optional[Mapping[str, Any]] = None,
+        task: Optional[Task] = None,
         **agent_kwargs: Any,
     ) -> "SessionRun":
-        """Create a fresh journal and an Agent ready for its first run."""
+        """Create a fresh journal and an Agent ready for its first run.
 
+        When ``task`` is given it must be a Root Task (no parent): it
+        commits as one ``task.created`` record before ``input.accepted``
+        and any model or Tool side effect. A fresh lineage cannot already
+        hold an unfinished Root Task — the Run id is minted here and journal
+        creation fails on collision — so start has no task rejection path.
+        """
+
+        if task is not None:
+            if not isinstance(task, Task):
+                raise TypeError("task must be a Task or None")
+            if task.parent_task_id is not None:
+                raise ValueError("SessionHarness.start commits a Root Task")
         run_id = self._run_id_factory()
         journal = self._new_journal()
         metadata = {
@@ -220,7 +272,16 @@ class SessionHarness:
         transferred = False
         try:
             await journal.create(run_id, metadata)
-            session_run._install(journal, (), None)
+            if task is None:
+                session_run._install(journal, (), None)
+            else:
+                await journal.append(
+                    JournalRecordType.TASK_CREATED,
+                    encode_task_created(task),
+                    record_id=f"{run_id}:task:{task.task_id}:created",
+                )
+                records = await journal.replay()
+                session_run._install(journal, records, recover_session(records))
             transferred = True
             return session_run
         finally:
@@ -393,6 +454,23 @@ class SessionHarness:
         )
 
 
+def _seed_task_state(recovered: RecoveredSession | None) -> RecoveredTask | None:
+    """Seed the lineage's latest Root Task (terminal or unfinished), if any."""
+
+    if recovered is None:
+        return None
+    latest: RecoveredTask | None = None
+    for task in recovered.tasks.values():
+        if task.definition.parent_task_id is None:
+            latest = task
+    return latest
+
+
+_TASK_CARRY_TYPES = frozenset(
+    {JournalRecordType.TASK_CREATED, JournalRecordType.TASK_TRANSITION}
+)
+
+
 def _verify_lineage(
     recovered: RecoveredSession,
     model: "Model",
@@ -522,6 +600,7 @@ class SessionRun:
         self._budget_ledger: BudgetLedger | None = None
         self._runtime_inputs: SessionRuntimeInputs | None = None
         self._trace_producer: AgentTraceProducer | None = None
+        self._task_state: RecoveredTask | None = None
         self._run_started = False
         self._leg_prepared = False
         self._leg_has_input = False
@@ -529,6 +608,7 @@ class SessionRun:
         self._closed = False
         self._last_result: AgentLoopResult | None = None
         self._leg_lock = asyncio.Lock()
+        self._task_lock = asyncio.Lock()
 
     # ── views ─────────────────────────────────────────────────────────────
 
@@ -550,6 +630,20 @@ class SessionRun:
 
         return self._budget_ledger
 
+    @property
+    def task(self) -> Task | None:
+        """The lineage's current Root Task definition, when task-bearing."""
+
+        state = self._task_state
+        return state.definition if state is not None else None
+
+    @property
+    def task_lifecycle(self) -> TaskLifecycle | None:
+        """The folded lifecycle of the current Root Task, when task-bearing."""
+
+        state = self._task_state
+        return state.lifecycle if state is not None else None
+
     # ── run control ───────────────────────────────────────────────────────
 
     async def prompt(
@@ -560,27 +654,39 @@ class SessionRun:
         One Run journal accepts one initial input. On a journal that
         already committed its ``input.accepted`` (a resumed run), the new
         prompt enters as steering before the next turn instead of writing
-        a second input record.
+        a second input record. In a task-bearing session whose Root Task is
+        terminal, prompting for new work rejects with
+        ``AgentRunRejected("task_terminal")``: continue explicitly with
+        :meth:`start_follow_up`. A blocked Task does not block prompting;
+        only :meth:`unblock_task` returns it to active.
         """
 
         self._require_open()
         async with self._leg_lock:
+            state = self._task_state
+            if state is not None and state.lifecycle.status.terminal:
+                return AgentRunRejected("task_terminal")
             await self._prepare_next_leg()
-            if self._leg_has_input:
-                for prompt_message in normalize_prompt_messages(message):
-                    self._agent.steer(prompt_message)
-                try:
-                    result = await self._agent.continue_run()
-                except BaseException:
-                    self._run_started = True
-                    raise
-                return await self._settle_leg(result)
+            return await self._prompt_locked(message)
+
+    async def _prompt_locked(
+        self, message: Union[str, Message, Sequence[Message]]
+    ) -> AgentRunResult:
+        if self._leg_has_input:
+            for prompt_message in normalize_prompt_messages(message):
+                self._agent.steer(prompt_message)
             try:
-                result = await self._agent.prompt(message)
+                result = await self._agent.continue_run()
             except BaseException:
                 self._run_started = True
                 raise
             return await self._settle_leg(result)
+        try:
+            result = await self._agent.prompt(message)
+        except BaseException:
+            self._run_started = True
+            raise
+        return await self._settle_leg(result)
 
     async def continue_run(self) -> AgentRunResult:
         """Continue from the current transcript tail (user or Tool result)."""
@@ -614,6 +720,184 @@ class SessionRun:
         if tracker is None:
             return False
         return await tracker.post(event)
+
+    # ── task lifecycle ────────────────────────────────────────────────────
+
+    async def complete_task(self, reason: str) -> TaskLifecycle | TaskTransitionRejected:
+        """Commit the current Root Task's ``completed`` terminal transition."""
+
+        return await self._transition_task(TaskStatus.COMPLETED, reason=reason)
+
+    async def fail_task(self, reason: str) -> TaskLifecycle | TaskTransitionRejected:
+        """Commit the current Root Task's ``failed`` terminal transition."""
+
+        return await self._transition_task(TaskStatus.FAILED, reason=reason)
+
+    async def cancel_task(self, reason: str) -> TaskLifecycle | TaskTransitionRejected:
+        """Commit the current Root Task's ``cancelled`` terminal transition."""
+
+        return await self._transition_task(TaskStatus.CANCELLED, reason=reason)
+
+    async def block_task(
+        self, blocker: TaskBlocker
+    ) -> TaskLifecycle | TaskTransitionRejected:
+        """Commit the current Root Task's active → blocked transition."""
+
+        if not isinstance(blocker, TaskBlocker):
+            raise TypeError("blocker must be a TaskBlocker")
+        return await self._transition_task(TaskStatus.BLOCKED, blocker=blocker)
+
+    async def unblock_task(self) -> TaskLifecycle | TaskTransitionRejected:
+        """Commit the only blocked → active path: explicit caller input or
+        an observed external-state change, delivered by the application."""
+
+        return await self._transition_task(TaskStatus.ACTIVE)
+
+    async def start_follow_up(
+        self,
+        task: Task,
+        prompt: Union[str, Message, Sequence[Message]],
+    ) -> AgentRunResult | TaskTransitionRejected:
+        """Start a new Root Task on a terminal-task lineage, then prompt.
+
+        The leg advances along the existing explicit-fork machinery and the
+        new ``task.created`` commits before the prompt's ``input.accepted``.
+        When the current leg never accepted input there is nothing to fork,
+        so the new Task commits in place instead. A taskless session or an
+        unfinished current Task returns a typed rejection; corruption
+        raises.
+        """
+
+        self._require_open()
+        if not isinstance(task, Task):
+            raise TypeError("task must be a Task")
+        if task.parent_task_id is not None:
+            raise ValueError("a terminal follow-up starts a new Root Task")
+        async with self._leg_lock:
+            state = self._task_state
+            if state is None:
+                return TaskTransitionRejected(
+                    "unknown",
+                    detail=(
+                        "session lineage holds no Root Task; "
+                        "prompt() runs taskless work"
+                    ),
+                )
+            if not state.lifecycle.status.terminal:
+                return TaskTransitionRejected(
+                    "invalid",
+                    detail=(
+                        "the current Root Task is not terminal; complete, "
+                        "fail or cancel it first, or use prompt()"
+                    ),
+                )
+            if self._run_started or self._leg_has_input:
+                await self._advance(task)
+            else:
+                await self._commit_task_created_in_place(task)
+            if not self._leg_prepared:
+                self._leg_prepared = True
+                await self._auto_compact_threshold()
+            return await self._prompt_locked(prompt)
+
+    async def _transition_task(
+        self,
+        to_status: TaskStatus,
+        *,
+        reason: str | None = None,
+        blocker: TaskBlocker | None = None,
+    ) -> TaskLifecycle | TaskTransitionRejected:
+        self._require_open()
+        async with self._task_lock:
+            state = self._task_state
+            if state is None:
+                return TaskTransitionRejected(
+                    "unknown", detail="session lineage holds no Root Task"
+                )
+            current = state.lifecycle
+            if current.status.terminal:
+                return TaskTransitionRejected(
+                    "terminal",
+                    detail=(
+                        f"task {state.definition.task_id!r} is already "
+                        f"{current.status.value}"
+                    ),
+                )
+            try:
+                validate_task_transition(current.status, to_status)
+            except ValueError as exc:
+                return TaskTransitionRejected("invalid", detail=str(exc))
+            if self._run_started:
+                # A settled leg keeps its run terminal as its last record,
+                # so the transition commits into the next leg, ahead of
+                # that leg's input and model side effects.
+                async with self._leg_lock:
+                    if self._run_started:
+                        await self._advance()
+                state = self._task_state
+                if state is None or state.lifecycle.status is not current.status:
+                    raise JournalError("task state diverged across the leg advance")
+                current = state.lifecycle
+            usage: ModelUsage | None = None
+            ledger = self._budget_ledger
+            if ledger is not None:
+                snapshot = ledger.snapshot()
+                usage = ModelUsage.from_mapping(
+                    {
+                        "total_tokens": snapshot.total_tokens,
+                        "cost_usd": float(snapshot.total_cost_usd),
+                    }
+                )
+            lifecycle = TaskLifecycle(
+                status=to_status,
+                usage=usage,
+                blocker=blocker,
+                terminal_reason=reason,
+            )
+            task_id = state.definition.task_id
+            payload = encode_task_transition(
+                task_id=task_id,
+                from_status=current.status,
+                to_status=to_status,
+                reason=reason,
+                blocker=blocker,
+                usage=usage,
+            )
+            run_id = self._journal.run_id
+            sequence = await self._own_transition_count(run_id, task_id)
+            await self._journal.append(
+                JournalRecordType.TASK_TRANSITION,
+                payload,
+                record_id=f"{run_id}:task:{task_id}:transition:{sequence}",
+            )
+            records = await self._journal.replay()
+            self._task_state = _seed_task_state(recover_session(records))
+            return lifecycle
+
+    async def _own_transition_count(self, run_id: str, task_id: str) -> int:
+        records = await self._journal.replay()
+        return sum(
+            1
+            for record in records
+            if record.type is JournalRecordType.TASK_TRANSITION
+            and record.run_id == run_id
+            and record.payload.get("task_id") == task_id
+        )
+
+    async def _commit_task_created_in_place(self, task: Task) -> None:
+        """Commit a new Root Task into a leg that never accepted input."""
+
+        journal = self._journal
+        await journal.append(
+            JournalRecordType.TASK_CREATED,
+            encode_task_created(task),
+            record_id=f"{journal.run_id}:task:{task.task_id}:created",
+        )
+        producer = self._trace_producer
+        if producer is not None and not producer.finalized:
+            producer.finalize(self._last_result)
+        records = await journal.replay()
+        self._install(journal, records, recover_session(records))
 
     async def compact(self) -> CompactResult | CompactRejected:
         """Manually compact at idle; terminal legs advance first."""
@@ -667,6 +951,7 @@ class SessionRun:
         )
         self._journal = journal
         self._recovered = recovered
+        self._task_state = _seed_task_state(recovered)
         self._context_entries = (
             _context_entries(recovered) if recovered is not None else []
         )
@@ -686,6 +971,15 @@ class SessionRun:
         }
         runtime_context = dict(self._agent_kwargs.get("runtime_context") or {})
         runtime_context.setdefault("journal", journal)
+        if self._task_state is not None:
+            # Publish the current Root Task identity for Tools that bind
+            # their work to it (the Agent Tool reads these keys for its
+            # Child launch request).
+            runtime_context["task_id"] = self._task_state.definition.task_id
+            if self._task_state.definition.plan_assignment is not None:
+                runtime_context["plan_assignment"] = (
+                    self._task_state.definition.plan_assignment
+                )
         runtime_context["post_runtime_event"] = (
             self._post_runtime_event or self.post_runtime_event
         )
@@ -789,8 +1083,16 @@ class SessionRun:
             record.type is JournalRecordType.INPUT_ACCEPTED for record in records
         )
 
-    async def _advance(self) -> None:
-        """Fork the settled journal at its latest committed boundary."""
+    async def _advance(self, task: Task | None = None) -> None:
+        """Fork the settled journal at its latest committed boundary.
+
+        Task facts committed after that boundary (between the last turn
+        commit and the run terminal, or in a leg whose run never reached an
+        own commit) would be truncated by the fork, so they are carried
+        into the new leg ahead of its input; ``task`` is an optional new
+        Root Task committed right after them, before any of the new leg's
+        side effects.
+        """
 
         journal = self._journal
         records = await journal.replay()
@@ -800,8 +1102,39 @@ class SessionRun:
             raise JournalError(
                 "cannot continue a run without a committed boundary"
             )
+        carried = [
+            record
+            for record in records[position.seq :]
+            if record.type in _TASK_CARRY_TYPES
+        ]
         child = await journal.fork(position, self._harness._run_id_factory())
         await journal.close()
+        transition_counts: dict[str, int] = {}
+        for record in carried:
+            if record.type is JournalRecordType.TASK_CREATED:
+                carried_id = str(record.payload.get("task_id") or "")
+                await child.append(
+                    JournalRecordType.TASK_CREATED,
+                    record.payload,
+                    record_id=f"{child.run_id}:task:{carried_id}:created",
+                )
+                continue
+            task_id = decode_task_transition(record.payload)[0]
+            sequence = transition_counts.get(task_id, 0)
+            transition_counts[task_id] = sequence + 1
+            await child.append(
+                JournalRecordType.TASK_TRANSITION,
+                record.payload,
+                record_id=(
+                    f"{child.run_id}:task:{task_id}:transition:{sequence}"
+                ),
+            )
+        if task is not None:
+            await child.append(
+                JournalRecordType.TASK_CREATED,
+                encode_task_created(task),
+                record_id=f"{child.run_id}:task:{task.task_id}:created",
+            )
         child_records = await child.replay()
         child_recovered = recover_session(child_records)
         self._install(child, child_records, child_recovered)
@@ -951,4 +1284,5 @@ __all__ = [
     "ResumeRejected",
     "SessionHarness",
     "SessionRun",
+    "TaskTransitionRejected",
 ]

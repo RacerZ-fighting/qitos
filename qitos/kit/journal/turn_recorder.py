@@ -42,6 +42,7 @@ from ...core.message import (
 )
 from ...core.model_request import ModelRequest
 from ...core.model_response import ModelPricing, ModelUsage
+from ...core.task import Task, TaskBlocker, TaskStatus, validate_task_transition
 from ...core.thinking import ThinkingLevel
 from ...core.tool_result import ToolResult
 
@@ -332,6 +333,115 @@ def decode_runtime_input_consumed(payload: Mapping[str, Any]) -> str:
     if set(payload) != {"event_id"}:
         raise ValueError("runtime_input.consumed fields are invalid")
     return _decode_record_id(payload["event_id"], "event_id")
+
+
+def encode_task_created(task: Task) -> dict[str, Any]:
+    """Payload of one ``task.created`` record: the Task definition dict."""
+
+    payload = task.to_dict()
+    # Validate before writing: the codec round trip is the fail-closed gate.
+    decode_task_created(payload)
+    return payload
+
+
+def decode_task_created(payload: Mapping[str, Any]) -> Task:
+    try:
+        return Task.from_dict(payload)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("task.created is not decodable") from exc
+
+
+def encode_task_transition(
+    *,
+    task_id: str,
+    from_status: TaskStatus,
+    to_status: TaskStatus,
+    reason: str | None = None,
+    blocker: TaskBlocker | None = None,
+    usage: ModelUsage | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "from_status": from_status.value,
+        "to_status": to_status.value,
+    }
+    if reason is not None:
+        payload["reason"] = reason
+    if blocker is not None:
+        payload["blocker"] = blocker.to_dict()
+    if usage is not None:
+        payload["usage"] = usage.to_dict()
+    # Validate before writing: the codec round trip is the fail-closed gate.
+    decode_task_transition(payload)
+    return payload
+
+
+def decode_task_transition(
+    payload: Mapping[str, Any],
+) -> tuple[
+    str,
+    TaskStatus,
+    TaskStatus,
+    str | None,
+    TaskBlocker | None,
+    ModelUsage | None,
+]:
+    """Decode one ``task.transition`` payload, failing closed on shape.
+
+    The reason is present exactly when the target is terminal (it becomes
+    the lifecycle's terminal reason); the blocker is present exactly when
+    the target is BLOCKED; a usage snapshot is allowed on any transition.
+    The decoded ``(from, to)`` pair must be a legal lifecycle move.
+    """
+
+    if not {"task_id", "from_status", "to_status"}.issubset(payload) or not set(
+        payload
+    ).issubset(
+        {"task_id", "from_status", "to_status", "reason", "blocker", "usage"}
+    ):
+        raise ValueError("task.transition fields are invalid")
+    task_id = _decode_record_id(payload["task_id"], "task_id")
+    try:
+        from_status = TaskStatus(str(payload["from_status"]))
+        to_status = TaskStatus(str(payload["to_status"]))
+    except ValueError as exc:
+        raise ValueError("task.transition status is not a TaskStatus") from exc
+    raw_reason = payload.get("reason")
+    if raw_reason is not None and (
+        not isinstance(raw_reason, str) or not raw_reason.strip()
+    ):
+        raise ValueError("task.transition reason must be non-empty text or absent")
+    if (raw_reason is not None) is not to_status.terminal:
+        raise ValueError(
+            "task.transition reason is present exactly at a terminal target"
+        )
+    raw_blocker = payload.get("blocker")
+    blocker: TaskBlocker | None = None
+    if raw_blocker is not None:
+        if not isinstance(raw_blocker, Mapping):
+            raise ValueError("task.transition blocker must be a mapping")
+        try:
+            blocker = TaskBlocker.from_dict(raw_blocker)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("task.transition blocker is not decodable") from exc
+    if (blocker is not None) is not (to_status is TaskStatus.BLOCKED):
+        raise ValueError(
+            "task.transition blocker is present exactly at a blocked target"
+        )
+    raw_usage = payload.get("usage")
+    usage: ModelUsage | None = None
+    if raw_usage is not None:
+        if not isinstance(raw_usage, Mapping):
+            raise ValueError("task.transition usage must be a mapping or absent")
+        try:
+            usage = ModelUsage.from_mapping(raw_usage)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("task.transition usage is not decodable") from exc
+    try:
+        validate_task_transition(from_status, to_status)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("task.transition is not a legal lifecycle move") from exc
+    return (task_id, from_status, to_status, raw_reason, blocker, usage)
 
 
 # ── recorder ──────────────────────────────────────────────────────────────
@@ -732,6 +842,8 @@ __all__ = [
     "decode_model_completed",
     "decode_run_terminal",
     "decode_step_committed",
+    "decode_task_created",
+    "decode_task_transition",
     "decode_thinking_change",
     "decode_tool_started",
     "decode_tool_terminal",
@@ -743,6 +855,8 @@ __all__ = [
     "encode_model_completed",
     "encode_run_terminal",
     "encode_step_committed",
+    "encode_task_created",
+    "encode_task_transition",
     "encode_thinking_change",
     "encode_tool_started",
     "encode_tool_terminal",

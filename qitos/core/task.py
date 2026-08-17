@@ -1,67 +1,103 @@
-"""Canonical task schema for QitOS agentic workloads."""
+"""Goal-bearing Task contract for QitOS Sessions.
+
+A Task is the durable goal of one Root or Child execution. The immutable
+definition carries the objective, success criteria, constraints, stable
+resource/context references, budget and creation provenance; the durable
+lifecycle (``active | blocked | completed | failed | cancelled``, usage,
+typed blocker or terminal reason) is folded from ``task.created`` /
+``task.transition`` journal records. Benchmark resources, environment
+probing, evaluation metrics and free-form metadata do not belong here; they
+stay at application boundaries and reference the Task by id.
+"""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field as dc_field
 import math
-import os
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import Enum
+from types import MappingProxyType
+from typing import Any, Literal, Optional
 
-from .env import EnvSpec
-
-
-@dataclass
-class TaskValidationIssue:
-    code: str
-    message: str
-    field: str
-    details: Dict[str, Any] = dc_field(default_factory=dict)
+from .model_response import ModelUsage
 
 
-@dataclass
-class TaskResourceBinding:
+class TaskStatus(str, Enum):
+    """Durable lifecycle state of one Task."""
+
+    ACTIVE = "active"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @property
+    def terminal(self) -> bool:
+        """Completed, failed and cancelled commit exactly once."""
+
+        return self in _TERMINAL_STATUSES
+
+
+_TERMINAL_STATUSES = frozenset(
+    {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+
+_TASK_REFERENCE_KINDS = frozenset({"file", "dir", "url", "artifact", "image"})
+
+_TASK_BUDGET_FIELDS = {
+    "max_steps",
+    "max_runtime_seconds",
+    "max_tokens",
+    "max_cost_usd",
+    "max_tool_concurrency",
+    "max_children",
+}
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _optional_text(value: Any, field_name: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string or None")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskReference:
+    """Stable typed reference to Task context; never probed at runtime."""
+
     kind: str
-    source: str
-    target: Optional[str] = None
-    exists: bool = False
-    required: bool = True
-    metadata: Dict[str, Any] = dc_field(default_factory=dict)
-
-
-@dataclass
-class TaskCriterionResult:
-    criterion: str
-    passed: bool
-    evidence: str = ""
-
-
-@dataclass
-class TaskResult:
-    task_id: str
-    success: bool
-    stop_reason: Optional[str]
-    final_result: Any
-    criteria: List[TaskCriterionResult] = dc_field(default_factory=list)
-    artifacts: List[TaskResourceBinding] = dc_field(default_factory=list)
-    metrics: Dict[str, Any] = dc_field(default_factory=dict)
-    metadata: Dict[str, Any] = dc_field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass
-class TaskResource:
-    """One resource entry required by a task."""
-
-    kind: str  # file | dir | url | artifact | image
-    path: Optional[str] = None
-    uri: Optional[str] = None
-    mount_to: Optional[str] = None
-    required: bool = True
+    uri: str
     description: str = ""
-    metadata: Dict[str, Any] = dc_field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.kind not in _TASK_REFERENCE_KINDS:
+            raise ValueError(f"unsupported TaskReference.kind: {self.kind!r}")
+        if not isinstance(self.uri, str) or not self.uri.strip():
+            raise ValueError("TaskReference.uri must be a non-empty string")
+        if not isinstance(self.description, str):
+            raise TypeError("TaskReference.description must be a string")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "uri": self.uri,
+            "description": self.description,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "TaskReference":
+        if set(value) != {"kind", "uri", "description"}:
+            raise ValueError("TaskReference fields are invalid")
+        return cls(
+            kind=value["kind"],
+            uri=value["uri"],
+            description=value["description"],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,261 +134,265 @@ class TaskBudget:
             if not math.isfinite(float(value)) or float(value) <= 0:
                 raise ValueError(f"{name} must be positive or None")
 
-
-@dataclass
-class Task:
-    """Task package with objective, resources, and environment requirements."""
-
-    id: str
-    objective: str
-    inputs: Dict[str, Any] = dc_field(default_factory=dict)
-    resources: List[TaskResource] = dc_field(default_factory=list)
-    env_spec: Optional[EnvSpec] = None
-    constraints: Dict[str, Any] = dc_field(default_factory=dict)
-    success_criteria: List[str] = dc_field(default_factory=list)
-    budget: TaskBudget = dc_field(default_factory=TaskBudget)
-    metadata: Dict[str, Any] = dc_field(default_factory=dict)
-
-    def resolve_resources(
-        self, workspace: Optional[str] = None
-    ) -> List[TaskResourceBinding]:
-        root = Path(workspace).resolve() if workspace else None
-        out: List[TaskResourceBinding] = []
-        for item in self.resources:
-            source = item.path or item.uri or ""
-            target = item.mount_to
-            exists = False
-            if root is not None and item.path:
-                exists = (root / item.path).exists()
-                if target is None:
-                    target = item.path
-            out.append(
-                TaskResourceBinding(
-                    kind=item.kind,
-                    source=source,
-                    target=target,
-                    exists=exists,
-                    required=item.required,
-                    metadata=dict(item.metadata),
-                )
-            )
-        return out
-
-    def validate(self) -> None:
-        issues = self.validate_structured()
-        if issues:
-            first = issues[0]
-            raise ValueError(f"{first.code}: {first.message}")
-
-    def validate_structured(
-        self, workspace: Optional[str] = None
-    ) -> List[TaskValidationIssue]:
-        issues: List[TaskValidationIssue] = []
-        if not self.id or not isinstance(self.id, str):
-            issues.append(
-                TaskValidationIssue(
-                    code="TASK_ID_INVALID",
-                    message="Task.id must be a non-empty string",
-                    field="id",
-                )
-            )
-        if not self.objective or not isinstance(self.objective, str):
-            issues.append(
-                TaskValidationIssue(
-                    code="TASK_OBJECTIVE_INVALID",
-                    message="Task.objective must be a non-empty string",
-                    field="objective",
-                )
-            )
-
-        if self.budget.max_steps is not None and int(self.budget.max_steps) <= 0:
-            issues.append(
-                TaskValidationIssue(
-                    code="TASK_BUDGET_STEPS_INVALID",
-                    message="Task budget max_steps must be > 0",
-                    field="budget.max_steps",
-                    details={"value": self.budget.max_steps},
-                )
-            )
-        if (
-            self.budget.max_runtime_seconds is not None
-            and float(self.budget.max_runtime_seconds) <= 0
-        ):
-            issues.append(
-                TaskValidationIssue(
-                    code="TASK_BUDGET_RUNTIME_INVALID",
-                    message="Task budget max_runtime_seconds must be > 0",
-                    field="budget.max_runtime_seconds",
-                    details={"value": self.budget.max_runtime_seconds},
-                )
-            )
-        if self.budget.max_tokens is not None and int(self.budget.max_tokens) <= 0:
-            issues.append(
-                TaskValidationIssue(
-                    code="TASK_BUDGET_TOKENS_INVALID",
-                    message="Task budget max_tokens must be > 0",
-                    field="budget.max_tokens",
-                    details={"value": self.budget.max_tokens},
-                )
-            )
-
-        if self.env_spec is not None:
-            if (
-                not isinstance(self.env_spec.type, str)
-                or not self.env_spec.type.strip()
-            ):
-                issues.append(
-                    TaskValidationIssue(
-                        code="TASK_ENV_SPEC_INVALID",
-                        message="env_spec.type must be a non-empty string",
-                        field="env_spec.type",
-                    )
-                )
-
-        root = Path(workspace).resolve() if workspace else None
-        for idx, item in enumerate(self.resources):
-            if item.kind not in {"file", "dir", "url", "artifact", "image"}:
-                issues.append(
-                    TaskValidationIssue(
-                        code="TASK_RESOURCE_KIND_INVALID",
-                        message=f"Unsupported TaskResource.kind: {item.kind}",
-                        field=f"resources[{idx}].kind",
-                        details={"kind": item.kind},
-                    )
-                )
-            if not item.path and not item.uri:
-                issues.append(
-                    TaskValidationIssue(
-                        code="TASK_RESOURCE_LOCATOR_MISSING",
-                        message="TaskResource requires path or uri",
-                        field=f"resources[{idx}]",
-                    )
-                )
-            if item.mount_to is not None and (
-                not isinstance(item.mount_to, str) or not item.mount_to.strip()
-            ):
-                issues.append(
-                    TaskValidationIssue(
-                        code="TASK_RESOURCE_MOUNT_INVALID",
-                        message="TaskResource.mount_to must be a non-empty string when provided",
-                        field=f"resources[{idx}].mount_to",
-                    )
-                )
-            if root is None or not item.path:
-                continue
-            candidate = (root / item.path).resolve()
-            if item.required and not candidate.exists():
-                issues.append(
-                    TaskValidationIssue(
-                        code="TASK_RESOURCE_MISSING",
-                        message=f"Required resource does not exist: {item.path}",
-                        field=f"resources[{idx}].path",
-                        details={"path": item.path},
-                    )
-                )
-                continue
-            if candidate.exists():
-                if not _is_writable(candidate):
-                    issues.append(
-                        TaskValidationIssue(
-                            code="TASK_RESOURCE_NOT_WRITABLE",
-                            message=f"Resource is not writable: {item.path}",
-                            field=f"resources[{idx}].path",
-                            details={"path": item.path},
-                        )
-                    )
-            else:
-                parent = candidate.parent
-                if not _is_writable(parent):
-                    issues.append(
-                        TaskValidationIssue(
-                            code="TASK_RESOURCE_PARENT_NOT_WRITABLE",
-                            message=f"Parent directory is not writable for: {item.path}",
-                            field=f"resources[{idx}].path",
-                            details={"path": item.path, "parent": str(parent)},
-                        )
-                    )
-        return issues
-
-    def to_dict(self) -> Dict[str, Any]:
-        payload = asdict(self)
-        if self.env_spec is not None:
-            payload["env_spec"] = asdict(self.env_spec)
-        return payload
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_steps": self.max_steps,
+            "max_runtime_seconds": self.max_runtime_seconds,
+            "max_tokens": self.max_tokens,
+            "max_cost_usd": self.max_cost_usd,
+            "max_tool_concurrency": self.max_tool_concurrency,
+            "max_children": self.max_children,
+        }
 
     @classmethod
-    def from_dict(cls, payload: Dict[str, Any]) -> "Task":
-        resources_raw = payload.get("resources", [])
-        resources: List[TaskResource] = []
-        if isinstance(resources_raw, list):
-            for item in resources_raw:
-                if isinstance(item, TaskResource):
-                    resources.append(item)
-                elif isinstance(item, dict):
-                    resources.append(TaskResource(**item))
+    def from_dict(cls, value: Mapping[str, Any]) -> "TaskBudget":
+        if set(value) != _TASK_BUDGET_FIELDS:
+            raise ValueError("TaskBudget fields are invalid")
+        return cls(**dict(value))
 
-        budget_raw = payload.get("budget", {})
-        if isinstance(budget_raw, TaskBudget):
-            budget = budget_raw
-        elif isinstance(budget_raw, dict):
-            budget = TaskBudget(**budget_raw)
-        else:
-            budget = TaskBudget()
 
-        env_raw = payload.get("env_spec")
-        if isinstance(env_raw, EnvSpec):
-            env_spec = env_raw
-        elif isinstance(env_raw, dict):
-            env_spec = EnvSpec(**env_raw)
-        else:
-            env_spec = None
+@dataclass(frozen=True, slots=True)
+class TaskBlocker:
+    """Durable blocker on one Task.
 
-        obj = cls(
-            id=str(payload.get("id", "")),
-            objective=str(payload.get("objective", "")),
-            inputs=(
-                payload.get("inputs", {})
-                if isinstance(payload.get("inputs", {}), dict)
-                else {}
+    A blocked Task is resumable only after explicit caller input or an
+    observed external-state change, delivered through an explicit unblock
+    transition.
+    """
+
+    awaiting: Literal["input", "external"]
+    detail: str
+
+    def __post_init__(self) -> None:
+        if self.awaiting not in ("input", "external"):
+            raise ValueError("TaskBlocker.awaiting must be 'input' or 'external'")
+        if not isinstance(self.detail, str) or not self.detail.strip():
+            raise ValueError("TaskBlocker.detail must be a non-empty string")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"awaiting": self.awaiting, "detail": self.detail}
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "TaskBlocker":
+        if set(value) != {"awaiting", "detail"}:
+            raise ValueError("TaskBlocker fields are invalid")
+        return cls(awaiting=value["awaiting"], detail=value["detail"])
+
+
+@dataclass(frozen=True, slots=True)
+class TaskLifecycle:
+    """Folded lifecycle projection of one Task.
+
+    Invariants: ``blocker`` is present exactly while the Task is BLOCKED and
+    ``terminal_reason`` exactly at a terminal status; a usage snapshot is
+    allowed at any status.
+    """
+
+    status: TaskStatus
+    usage: ModelUsage | None = None
+    blocker: TaskBlocker | None = None
+    terminal_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, TaskStatus):
+            raise TypeError("TaskLifecycle.status must be a TaskStatus")
+        if self.blocker is not None and not isinstance(self.blocker, TaskBlocker):
+            raise TypeError("TaskLifecycle.blocker must be a TaskBlocker or None")
+        if (self.blocker is not None) is not (self.status is TaskStatus.BLOCKED):
+            raise ValueError("blocker is present exactly while the Task is blocked")
+        if (self.terminal_reason is not None) is not self.status.terminal:
+            raise ValueError(
+                "terminal_reason is present exactly at a terminal status"
+            )
+        if self.terminal_reason is not None and (
+            not isinstance(self.terminal_reason, str)
+            or not self.terminal_reason.strip()
+        ):
+            raise ValueError("TaskLifecycle.terminal_reason must be non-empty")
+        if self.usage is not None and not isinstance(self.usage, ModelUsage):
+            raise TypeError("TaskLifecycle.usage must be a ModelUsage or None")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status.value,
+            "usage": self.usage.to_dict() if self.usage is not None else None,
+            "blocker": (
+                self.blocker.to_dict() if self.blocker is not None else None
             ),
-            resources=resources,
-            env_spec=env_spec,
-            constraints=(
-                payload.get("constraints", {})
-                if isinstance(payload.get("constraints", {}), dict)
-                else {}
+            "terminal_reason": self.terminal_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "TaskLifecycle":
+        if set(value) != {"status", "usage", "blocker", "terminal_reason"}:
+            raise ValueError("TaskLifecycle fields are invalid")
+        raw_usage = value["usage"]
+        raw_blocker = value["blocker"]
+        if raw_usage is not None and not isinstance(raw_usage, Mapping):
+            raise TypeError("TaskLifecycle.usage must be an object or None")
+        if raw_blocker is not None and not isinstance(raw_blocker, Mapping):
+            raise TypeError("TaskLifecycle.blocker must be an object or None")
+        return cls(
+            status=TaskStatus(value["status"]),
+            usage=(
+                ModelUsage.from_mapping(raw_usage) if raw_usage is not None else None
             ),
-            success_criteria=[
-                str(x)
-                for x in payload.get("success_criteria", [])
-                if isinstance(payload.get("success_criteria", []), list)
-            ],
-            budget=budget,
-            metadata=(
-                payload.get("metadata", {})
-                if isinstance(payload.get("metadata", {}), dict)
-                else {}
+            blocker=(
+                TaskBlocker.from_dict(raw_blocker)
+                if raw_blocker is not None
+                else None
             ),
+            terminal_reason=value["terminal_reason"],
         )
-        obj.validate()
-        return obj
 
 
-def _is_writable(path: Path) -> bool:
-    try:
-        if not path.exists():
-            return False
-        return os.access(path, os.W_OK)
-    except Exception:
-        return False
+@dataclass(frozen=True, slots=True)
+class Task:
+    """Immutable goal definition committed as one ``task.created`` record."""
+
+    task_id: str
+    objective: str
+    parent_task_id: str | None = None
+    success_criteria: tuple[str, ...] = ()
+    constraints: Mapping[str, str] = field(default_factory=dict)
+    references: tuple[TaskReference, ...] = ()
+    budget: TaskBudget = field(default_factory=TaskBudget)
+    created_at: str = field(default_factory=_utc_now_iso)
+    created_by_run_id: str | None = None
+    plan_assignment: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.task_id, str) or not self.task_id.strip():
+            raise ValueError("Task.task_id must be a non-empty string")
+        if not isinstance(self.objective, str) or not self.objective.strip():
+            raise ValueError("Task.objective must be a non-empty string")
+        _optional_text(self.parent_task_id, "Task.parent_task_id")
+        _optional_text(self.created_by_run_id, "Task.created_by_run_id")
+        _optional_text(self.plan_assignment, "Task.plan_assignment")
+        if not isinstance(self.success_criteria, tuple) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in self.success_criteria
+        ):
+            raise TypeError(
+                "Task.success_criteria must be a tuple of non-empty strings"
+            )
+        if not isinstance(self.constraints, Mapping) or any(
+            not isinstance(key, str) or not isinstance(item, str)
+            for key, item in self.constraints.items()
+        ):
+            raise TypeError("Task.constraints must map strings to strings")
+        object.__setattr__(
+            self, "constraints", MappingProxyType(dict(self.constraints))
+        )
+        if not isinstance(self.references, tuple) or any(
+            not isinstance(item, TaskReference) for item in self.references
+        ):
+            raise TypeError(
+                "Task.references must be a tuple of TaskReference values"
+            )
+        if not isinstance(self.budget, TaskBudget):
+            raise TypeError("Task.budget must be a TaskBudget")
+        if not isinstance(self.created_at, str) or not self.created_at.strip():
+            raise ValueError("Task.created_at must be an ISO-8601 UTC timestamp")
+        try:
+            parsed = datetime.fromisoformat(self.created_at)
+        except ValueError as exc:
+            raise ValueError(
+                "Task.created_at must be an ISO-8601 UTC timestamp"
+            ) from exc
+        if parsed.tzinfo is None:
+            raise ValueError("Task.created_at must carry a UTC offset")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "parent_task_id": self.parent_task_id,
+            "objective": self.objective,
+            "success_criteria": list(self.success_criteria),
+            "constraints": dict(self.constraints),
+            "references": [item.to_dict() for item in self.references],
+            "budget": self.budget.to_dict(),
+            "created_at": self.created_at,
+            "created_by_run_id": self.created_by_run_id,
+            "plan_assignment": self.plan_assignment,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "Task":
+        expected = {
+            "task_id",
+            "parent_task_id",
+            "objective",
+            "success_criteria",
+            "constraints",
+            "references",
+            "budget",
+            "created_at",
+            "created_by_run_id",
+            "plan_assignment",
+        }
+        if set(value) != expected:
+            raise ValueError("Task fields are invalid")
+        raw_criteria = value["success_criteria"]
+        raw_constraints = value["constraints"]
+        raw_references = value["references"]
+        raw_budget = value["budget"]
+        if not isinstance(raw_criteria, list):
+            raise TypeError("Task.success_criteria must be an array")
+        if not isinstance(raw_constraints, Mapping):
+            raise TypeError("Task.constraints must be an object")
+        if not isinstance(raw_references, list) or any(
+            not isinstance(item, Mapping) for item in raw_references
+        ):
+            raise TypeError("Task.references must be an array of objects")
+        if not isinstance(raw_budget, Mapping):
+            raise TypeError("Task.budget must be an object")
+        return cls(
+            task_id=value["task_id"],
+            parent_task_id=value["parent_task_id"],
+            objective=value["objective"],
+            success_criteria=tuple(raw_criteria),
+            constraints=dict(raw_constraints),
+            references=tuple(
+                TaskReference.from_dict(item) for item in raw_references
+            ),
+            budget=TaskBudget.from_dict(raw_budget),
+            created_at=value["created_at"],
+            created_by_run_id=value["created_by_run_id"],
+            plan_assignment=value["plan_assignment"],
+        )
+
+
+def validate_task_transition(
+    from_status: TaskStatus, to_status: TaskStatus
+) -> None:
+    """Raise ``ValueError`` when one lifecycle move is not a legal transition.
+
+    An active Task may block or terminate; a blocked Task may terminate or
+    return to active only through an explicit unblock; terminal statuses are
+    final.
+    """
+
+    if not isinstance(from_status, TaskStatus) or not isinstance(
+        to_status, TaskStatus
+    ):
+        raise TypeError("task transitions use TaskStatus values")
+    if from_status.terminal:
+        raise ValueError(f"terminal task status {from_status.value!r} is final")
+    if to_status is TaskStatus.ACTIVE:
+        if from_status is not TaskStatus.BLOCKED:
+            raise ValueError("only a blocked task can return to active")
+    elif to_status is TaskStatus.BLOCKED:
+        if from_status is not TaskStatus.ACTIVE:
+            raise ValueError("only an active task can block")
 
 
 __all__ = [
     "Task",
-    "TaskResource",
+    "TaskBlocker",
     "TaskBudget",
-    "TaskValidationIssue",
-    "TaskResourceBinding",
-    "TaskCriterionResult",
-    "TaskResult",
+    "TaskLifecycle",
+    "TaskReference",
+    "TaskStatus",
+    "validate_task_transition",
 ]

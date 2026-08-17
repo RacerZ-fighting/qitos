@@ -50,13 +50,13 @@ from ...core.message import AssistantMessage, Message, ToolCall, UserMessage
 from ...core.model_request import ModelRequest
 from ...core.model_response import ModelPricing, ModelUsage
 from ...core.runtime_input import RuntimeInput
-from ...core.task import TaskBudget
+from ...core.task import Task, TaskBudget
 from ...core.tool import ToolPermissionContext
 from ...core.tool_executor import BeforeToolCallContext, BeforeToolCallDecision
 from ...core.tool_registry import ToolExposure, ToolRegistry
 from ...core.tool_result import ToolResult
 from ..journal import JournalTurnTransaction, JsonlSessionJournal
-from ..journal.turn_recorder import encode_runtime_input_consumed
+from ..journal.turn_recorder import encode_runtime_input_consumed, encode_task_created
 
 if TYPE_CHECKING:
     from ...models.base import Model
@@ -399,6 +399,7 @@ class AgentChildEngine:
         runtime_context: Optional[Mapping[str, Any]] = None,
         journal_factory: Optional[Callable[[], SessionJournal]] = None,
         journal_metadata: Optional[Mapping[str, Any]] = None,
+        child_task: Optional[Task] = None,
     ) -> None:
         self._model = model
         self._tool_registry = tool_registry
@@ -415,6 +416,12 @@ class AgentChildEngine:
             raise TypeError("budget_ledger must be a BudgetLedger or None")
         if model_pricing is not None and not isinstance(model_pricing, ModelPricing):
             raise TypeError("model_pricing must be a ModelPricing or None")
+        if child_task is not None:
+            if not isinstance(child_task, Task):
+                raise TypeError("child_task must be a Task or None")
+            if journal_factory is None:
+                raise ValueError("a child_task requires a journal factory")
+        self._child_task = child_task
         self._budget_ledger = budget_ledger
         self._model_pricing = model_pricing
         self._extra_request_options = dict(extra_request_options or {})
@@ -495,6 +502,16 @@ class AgentChildEngine:
                 raise TypeError("journal_factory must return a SessionJournal")
             await journal.create(run_id, dict(self._journal_metadata))
             self._journal = journal
+            if self._child_task is not None:
+                # The Child Task commits before input.accepted and any model
+                # or Tool side effect of the child run.
+                await journal.append(
+                    JournalRecordType.TASK_CREATED,
+                    encode_task_created(self._child_task),
+                    record_id=(
+                        f"{run_id}:task:{self._child_task.task_id}:created"
+                    ),
+                )
             journal_transaction = JournalTurnTransaction(journal)
         transaction = _ChildTurnTransaction(
             run_id=run_id,
@@ -1040,6 +1057,14 @@ def build_agent_child_invocation_factory(
         resolved_concurrency = _tightest_int(
             max_tool_concurrency, budget.max_tool_concurrency
         )
+        child_task = Task(
+            task_id=runtime_context.handle.child_id,
+            parent_task_id=request.parent_task_id,
+            objective=request.task,
+            budget=request.budget,
+            created_by_run_id=runtime_context.parent_run_id,
+            plan_assignment=request.plan_assignment,
+        )
         engine = AgentChildEngine(
             model=resolved_model,
             tool_registry=(
@@ -1067,6 +1092,12 @@ def build_agent_child_invocation_factory(
                 "deadline_monotonic": runtime_context.deadline_monotonic,
                 "budget_ledger": runtime_context.budget_ledger,
                 "permission_context": runtime_context.parent_permission_context,
+                "task_id": runtime_context.handle.child_id,
+                **(
+                    {"plan_assignment": request.plan_assignment}
+                    if request.plan_assignment is not None
+                    else {}
+                ),
                 "max_children": _tightest_int(
                     runtime_context.launch.max_children or None,
                     budget.max_children,
@@ -1074,6 +1105,7 @@ def build_agent_child_invocation_factory(
                 or 0,
             },
             journal_factory=journal_factory,
+            child_task=child_task if journal_factory is not None else None,
             journal_metadata={
                 "parent_run_id": runtime_context.parent_run_id,
                 "child_id": runtime_context.handle.child_id,

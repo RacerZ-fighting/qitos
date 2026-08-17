@@ -249,6 +249,24 @@ class AgentTool(BaseTool):
         background = self._execution_mode == "background" or (
             self._execution_mode == "optional_background" and requested_background
         )
+        context_values = runtime_context or {}
+        task_binding: dict[str, str | None] = {}
+        for context_key in ("task_id", "plan_assignment"):
+            context_value = context_values.get(context_key)
+            if context_value is not None and (
+                not isinstance(context_value, str) or not context_value.strip()
+            ):
+                return tool_result(
+                    {
+                        "status": "error",
+                        "error": (
+                            f"runtime context {context_key} must be a "
+                            "non-empty string or None"
+                        ),
+                    },
+                    status="error",
+                )
+            task_binding[context_key] = context_value
         request = ChildLaunchRequest(
             task=prompt,
             description=description,
@@ -258,6 +276,8 @@ class AgentTool(BaseTool):
             allowed_tool_groups=self._child_allowed_tool_groups,
             working_directory=self._child_working_directory,
             budget=self._child_budget,
+            parent_task_id=task_binding["task_id"],
+            plan_assignment=task_binding["plan_assignment"],
         )
         try:
             result = await self._supervisor.launch(

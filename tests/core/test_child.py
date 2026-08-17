@@ -46,6 +46,32 @@ def test_child_launch_request_is_immutable_and_round_trips() -> None:
         request.task = "changed"  # type: ignore[misc]
 
 
+def test_child_launch_request_decodes_legacy_payload_without_task_keys() -> None:
+    payload = _request().to_dict()
+    del payload["parent_task_id"]
+    del payload["plan_assignment"]
+    restored = ChildLaunchRequest.from_dict(payload)
+    assert restored.parent_task_id is None
+    assert restored.plan_assignment is None
+    assert restored.to_dict() == _request().to_dict()
+
+
+def test_child_launch_request_round_trips_task_binding() -> None:
+    request = ChildLaunchRequest(
+        task="Enumerate the service",
+        description="enumeration child",
+        parent_task_id="root-task",
+        plan_assignment="plan-node-1",
+    )
+    assert ChildLaunchRequest.from_dict(request.to_dict()) == request
+    with pytest.raises(ValueError):
+        ChildLaunchRequest(
+            task="x",
+            description="y",
+            parent_task_id=" ",
+        )
+
+
 def test_child_result_preserves_scoped_handle_and_evidence() -> None:
     result = ChildResult(
         handle=ChildHandle(child_id="child-1", parent_run_id="parent-1"),

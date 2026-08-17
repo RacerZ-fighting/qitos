@@ -69,6 +69,8 @@ class JournalRecordType(str, Enum):
     CHILD_TERMINAL = "child.terminal"
     RUNTIME_INPUT_POSTED = "runtime_input.posted"
     RUNTIME_INPUT_CONSUMED = "runtime_input.consumed"
+    TASK_CREATED = "task.created"
+    TASK_TRANSITION = "task.transition"
     STEP_COMMITTED = "step.committed"
     RUN_INTERRUPTED = "run.interrupted"
     RUN_COMPLETED = "run.completed"
