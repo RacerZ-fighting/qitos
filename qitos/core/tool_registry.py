@@ -431,16 +431,9 @@ class ToolRegistry:
         if cleanup_error is not None:
             raise cleanup_error
 
-    def get_tool_descriptions(self, protocol: Any = None, renderer: Any = None) -> str:
+    def get_tool_descriptions(self, renderer: Any = None) -> str:
         if renderer is not None:
             return str(renderer(self))
-        if protocol is not None:
-            try:
-                from qitos.protocols import render_protocol_tool_schema
-
-                return render_protocol_tool_schema(self, protocol)
-            except Exception:
-                pass
         lines: List[str] = []
         for name in self.list_tools():
             tool = self._tools[name]
@@ -463,8 +456,8 @@ class ToolRegistry:
             lines.append("")
         return "\n".join(lines)
 
-    def render_tool_schema(self, protocol: Any = None, renderer: Any = None) -> str:
-        return self.get_tool_descriptions(protocol=protocol, renderer=renderer)
+    def render_tool_schema(self, renderer: Any = None) -> str:
+        return self.get_tool_descriptions(renderer=renderer)
 
     def get_all_specs(self) -> List[Dict[str, Any]]:
         specs = []

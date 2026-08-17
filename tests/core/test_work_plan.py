@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict
+from types import SimpleNamespace
 
 import pytest
 
-from qitos.checkpoint import Checkpoint, CheckpointId
 from qitos.core import (
-    Action,
-    StateSchema,
     ToolResult,
     WorkPlanContractError,
     WorkPlanItem,
@@ -31,34 +27,12 @@ def _plan() -> WorkPlanState:
     )
 
 
-def test_work_plan_round_trips_through_checkpoint_json() -> None:
-    @dataclass
-    class _State(StateSchema):
-        work_plan: WorkPlanState = field(default_factory=WorkPlanState)
+def test_work_plan_round_trips_through_durable_dict() -> None:
+    plan = _plan()
 
-        def to_dict(self) -> Dict[str, Any]:
-            payload = super().to_dict()
-            payload["work_plan"] = work_plan_state_to_dict(self.work_plan)
-            return payload
+    restored = work_plan_state_from_dict(work_plan_state_to_dict(plan))
 
-        @classmethod
-        def from_dict(cls, payload: Dict[str, Any], strict: bool = True) -> _State:
-            owned = dict(payload)
-            owned["work_plan"] = work_plan_state_from_dict(owned["work_plan"])
-            return super().from_dict(owned, strict=strict)
-
-    state = _State(task="authorized task", work_plan=_plan())
-    checkpoint = Checkpoint(
-        id=CheckpointId("checkpoint-1"),
-        thread_id="thread-1",
-        step=1,
-        state_data=state.to_dict(),
-    )
-
-    restored_checkpoint = Checkpoint.from_dict(checkpoint.to_dict())
-    restored_state = _State.from_dict(restored_checkpoint.state_data)
-
-    assert restored_state.work_plan == state.work_plan
+    assert restored == plan
 
 
 def test_work_plan_rejects_ambiguous_checklists() -> None:
@@ -87,10 +61,10 @@ def test_work_plan_reducer_applies_only_successful_updates_in_call_order() -> No
     reduced = reduce_work_plan(
         WorkPlanState(),
         [
-            Action(name="update_plan", args=first),
-            Action(name="update_plan", args=rejected),
-            Action(name="unrelated", args={}),
-            Action(name="update_plan", args=last),
+            SimpleNamespace(name="update_plan", args=first),
+            SimpleNamespace(name="update_plan", args=rejected),
+            SimpleNamespace(name="unrelated", args={}),
+            SimpleNamespace(name="update_plan", args=last),
         ],
         [
             ToolResult(output={}),

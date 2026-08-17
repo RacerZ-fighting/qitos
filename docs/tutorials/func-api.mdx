@@ -69,7 +69,7 @@ The available parameters are:
 
 Without `retry_policy`, a tool is invoked exactly once. Validation, approval, and
 permission checks are not repeated; all invocation attempts share `timeout_s` and the
-Engine runtime deadline.
+run deadline.
 
 ## Step 3: Type hints become ToolSpec parameters
 
@@ -192,10 +192,4 @@ Most tools are simple functions. Start with `@function_tool` and reach for `Base
 ## What's next
 
 <CardGroup cols={2}>
-  <Card title="MCP Integration" icon="plug" href="/tutorials/mcp-integration">
-    Bridge external MCP server tools into QitOS using the same FunctionTool interface.
-  </Card>
-  <Card title="Build your first agent" icon="code" href="/guides/build-your-first-agent">
-    Use your tools inside an AgentModule with a real LLM loop.
-  </Card>
 </CardGroup>

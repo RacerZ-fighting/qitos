@@ -9,18 +9,10 @@ from __future__ import annotations
 import pytest
 
 from qitos.harness import build_model_for_preset
-from qitos.protocols import (
-    get_protocol,
-    list_protocols,
-    render_protocol_contract,
-    render_protocol_prompt,
-    render_protocol_tool_schema,
-)
 from qitos.harness._types import (
     FamilyPreset,
     ToolPolicy,
     ContextPolicy,
-    build_protocol_for_preset,
 )
 
 
@@ -118,86 +110,6 @@ class TestDomesticPresetResolution:
         assert QWEN_PRESET.matches("qwen")
         assert GLM_PRESET.matches("glm")
         assert MINIMAX_PRESET.matches("minimax")
-
-
-# ---------------------------------------------------------------------------
-# Tests: Protocol building
-# ---------------------------------------------------------------------------
-
-
-class TestDomesticProtocolBuild:
-    @pytest.mark.parametrize(
-        "preset",
-        [DEEPSEEK_PRESET, QWEN_PRESET, GLM_PRESET, MINIMAX_PRESET],
-    )
-    def test_build_protocol_succeeds(self, preset):
-        protocol = build_protocol_for_preset(preset=preset)
-        assert protocol.id is not None
-        assert protocol.prompt_renderer is not None
-        assert protocol.tool_schema_renderer is not None
-
-    def test_deepseek_uses_json_decision(self):
-        protocol = build_protocol_for_preset(preset=DEEPSEEK_PRESET)
-        assert "json" in protocol.id.lower() or protocol.id == "json_decision_v1"
-
-    def test_qwen_uses_json_decision(self):
-        protocol = build_protocol_for_preset(preset=QWEN_PRESET)
-        assert protocol.id == "json_decision_v1"
-
-    def test_glm_uses_json_decision(self):
-        protocol = build_protocol_for_preset(preset=GLM_PRESET)
-        assert protocol.id == "json_decision_v1"
-
-    def test_minimax_uses_native_tool_call(self):
-        protocol = build_protocol_for_preset(preset=MINIMAX_PRESET)
-        assert protocol.id == "minimax_tool_call_v1"
-        assert protocol.supports_native_tool_call_markup is True
-
-    def test_minimax_has_fallback_chain(self):
-        protocol = build_protocol_for_preset(preset=MINIMAX_PRESET)
-        assert len(protocol.fallback_protocols) >= 2
-
-
-# ---------------------------------------------------------------------------
-# Tests: Protocol rendering
-# ---------------------------------------------------------------------------
-
-
-class TestDomesticProtocolRendering:
-    @pytest.mark.parametrize(
-        "preset",
-        [DEEPSEEK_PRESET, QWEN_PRESET, GLM_PRESET, MINIMAX_PRESET],
-    )
-    def test_render_prompt(self, preset):
-        protocol = build_protocol_for_preset(preset=preset)
-        # render_protocol_prompt(base_prompt, protocol, tool_registry)
-        prompt = render_protocol_prompt("test task", protocol, None)
-        assert len(prompt) > 0
-
-    @pytest.mark.parametrize(
-        "preset",
-        [DEEPSEEK_PRESET, QWEN_PRESET, GLM_PRESET, MINIMAX_PRESET],
-    )
-    def test_render_tool_schema(self, preset):
-        protocol = build_protocol_for_preset(preset=preset)
-        # render_protocol_tool_schema(tool_registry, protocol)
-        schema = render_protocol_tool_schema(None, protocol)
-        # tool_registry=None may produce empty schema; just verify no error
-        assert schema is not None
-
-    @pytest.mark.parametrize(
-        "preset",
-        [DEEPSEEK_PRESET, QWEN_PRESET, GLM_PRESET, MINIMAX_PRESET],
-    )
-    def test_render_contract(self, preset):
-        protocol = build_protocol_for_preset(preset=preset)
-        contract = render_protocol_contract(protocol)
-        assert len(contract) > 0
-
-
-# ---------------------------------------------------------------------------
-# Tests: Embedder ↔ Preset pairing
-# ---------------------------------------------------------------------------
 
 
 class TestEmbedderPresetPairing:

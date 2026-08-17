@@ -1,47 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-import json
-from pathlib import Path
-from typing import Any
-
-from examples._support import SequenceModel
-import qitos.core.agent_module as agent_module_module
-from qitos import AgentModule, Decision, HistoryPolicy, StateSchema, Task, ToolRegistry
 from qitos.harness import (
     build_harness_policy,
     build_model_for_preset,
     resolve_family_preset,
 )
 from qitos.models.profile_registry import infer_default_protocol, infer_model_profile
-from qitos.qita.cli import _build_run_diff
-from qitos.qita.data import _load_run_payload
-
-
-class _PresetAgent(AgentModule):
-    """Minimal engine agent exercising harness presets without product code."""
-
-    def __init__(self, *, llm, model_parser=None, model_protocol=None) -> None:
-        super().__init__(
-            tool_registry=ToolRegistry(),
-            llm=llm,
-            model_parser=model_parser,
-            model_protocol=model_protocol,
-        )
-
-    def init_state(self, task: str, **kwargs):
-        return StateSchema(task=task, max_steps=int(kwargs.get("max_steps", 2)))
-
-    def build_system_prompt(self, state):
-        return "You are a preset conformance agent."
-
-    def prepare(self, state):
-        return f"Task: {state.task}"
-
-    def reduce(self, state, observation, decision):
-        if isinstance(decision, Decision) and decision.mode == "final":
-            state.final_result = str(decision.final_answer or "")
-        return state
 
 
 def test_resolve_family_preset_for_gold_families() -> None:
@@ -72,28 +36,26 @@ def test_profile_registry_is_derived_from_presets() -> None:
 def test_build_harness_policy_keeps_glm_native_chain() -> None:
     harness = build_harness_policy(model_name="GLM-5.1-sii")
     assert harness.family_preset.id == "glm"
-    assert harness.protocol.id == "json_decision_multi_v1"
-    assert harness.protocol.fallback_protocols == (
+    assert harness.protocol_id == "json_decision_multi_v1"
+    assert harness.fallback_protocol_ids == (
         "json_decision_v1",
         "xml_decision_v1",
         "react_text_v1",
     )
     assert harness.tool_policy.primary_delivery == "api_parameter"
     assert harness.tool_policy.native_tool_call_preferred is True
-    assert harness.parser_name == "JsonDecisionParser"
 
 
 def test_build_harness_policy_keeps_minimax_native_chain() -> None:
     harness = build_harness_policy(model_name="MiniMax-M2.5")
     assert harness.family_preset.id == "minimax"
-    assert harness.protocol.id == "minimax_tool_call_v1"
-    assert harness.protocol.fallback_protocols == (
+    assert harness.protocol_id == "minimax_tool_call_v1"
+    assert harness.fallback_protocol_ids == (
         "terminus_xml_v1",
         "terminus_json_v1",
         "json_decision_v1",
     )
     assert harness.tool_policy.primary_delivery == "api_parameter"
-    assert harness.parser_name == "MiniMaxToolCallParser"
 
 
 def test_build_model_for_preset_attaches_harness_metadata() -> None:
@@ -128,223 +90,3 @@ def test_build_model_for_glm_preset_attaches_native_tool_call_metadata() -> None
     assert metadata["native_tool_call_preferred"] is True
     assert metadata["decision_lane_preference"] == "native_tool_calls"
     assert metadata["effective_tool_delivery"] == "api_parameter"
-
-
-def test_same_claude_code_agent_switches_across_gold_families(tmp_path: Path) -> None:
-    final_outputs = {
-        "qwen": '{"thought":"done","final_answer":"ok"}',
-        "kimi": '{"thought":"done","final_answer":"ok"}',
-        "gpt-oss": '{"thought":"done","final_answer":"ok"}',
-        "gemma-4": '{"thought":"done","final_answer":"ok"}',
-        "minimax": (
-            "<minimax:response>"
-            "<analysis>done</analysis>"
-            "<plan>finish</plan>"
-            "<task_complete>true</task_complete>"
-            "<final_answer>ok</final_answer>"
-            "</minimax:response>"
-        ),
-    }
-    for family_id, output in final_outputs.items():
-        harness = build_harness_policy(family_id=family_id)
-        llm = SequenceModel([output], model=f"{family_id}-model")
-        setattr(
-            llm,
-            "qitos_harness_metadata",
-            {
-                "family_preset": harness.family_preset.id,
-                "adapter_kind": harness.adapter.kind,
-                "protocol": harness.protocol.id,
-                "parser": harness.parser_name,
-                "tool_policy": harness.tool_policy.to_dict(),
-                "context_policy": harness.context_policy.to_dict(),
-            },
-        )
-        workspace = tmp_path / family_id
-        workspace.mkdir(parents=True, exist_ok=True)
-        agent = _PresetAgent(
-            llm=llm,
-            model_parser=harness.parser,
-            model_protocol=harness.protocol,
-        )
-        result = agent.run(
-            task="finish",
-            workspace=str(workspace),
-            max_steps=2,
-            render=False,
-            trace=False,
-            history_policy=HistoryPolicy(max_messages=8, max_tokens=1200),
-            return_state=True,
-        )
-        assert result.state.stop_reason == "completed"
-
-
-def test_harness_metadata_reaches_trace_manifest(tmp_path: Path) -> None:
-    harness = build_harness_policy(family_id="kimi")
-    llm = SequenceModel(
-        ['{"thought":"done","final_answer":"ok"}'], model="moonshot-v1-128k"
-    )
-    setattr(
-        llm,
-        "qitos_harness_metadata",
-        {
-            "family_preset": harness.family_preset.id,
-            "adapter_kind": harness.adapter.kind,
-            "protocol": harness.protocol.id,
-            "parser": harness.parser_name,
-            "tool_policy": harness.tool_policy.to_dict(),
-            "context_policy": harness.context_policy.to_dict(),
-        },
-    )
-    workspace = tmp_path / "kimi"
-    workspace.mkdir(parents=True, exist_ok=True)
-    agent = _PresetAgent(
-            llm=llm,
-            model_parser=harness.parser,
-            model_protocol=harness.protocol,
-        )
-    agent.run(
-        task="finish",
-        workspace=str(workspace),
-        max_steps=2,
-        render=False,
-        trace=True,
-        trace_logdir=str(tmp_path / "runs"),
-        return_state=False,
-    )
-    manifests = list((tmp_path / "runs").glob("*/manifest.json"))
-    assert manifests
-    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
-    assert manifest["model_family"] == "kimi"
-    assert manifest["prompt_protocol"] == "json_decision_v1"
-    assert manifest["run_spec"]["metadata"]["family_preset"] == "kimi"
-    assert (
-        manifest["run_spec"]["metadata"]["harness_policy"]["protocol"]
-        == "json_decision_v1"
-    )
-    assert manifest["summary"]["run_meta"]["budget"] == {
-        "max_steps": 2,
-        "max_runtime_seconds": None,
-        "max_tokens": None,
-        "max_cost_usd": None,
-        "max_tool_concurrency": 4,
-        "max_children": 4,
-        "deadline_constrained": False,
-    }
-
-
-def test_scripted_runs_produce_a_same_spec_comparison(
-    tmp_path: Path, monkeypatch: Any
-) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-
-    class _Clock:
-        current = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-        @classmethod
-        def now(cls, tz: Any = None) -> datetime:
-            if tz is None:
-                return cls.current.replace(tzinfo=None)
-            return cls.current.astimezone(tz)
-
-    monkeypatch.setattr(agent_module_module, "datetime", _Clock)
-
-    def run_once(
-        trace_root: Path,
-        *,
-        now: datetime,
-        objective: str = "finish",
-        model: str = "moonshot-v1-128k",
-        explicit_task_id: str | None = None,
-    ) -> dict[str, Any]:
-        _Clock.current = now
-        harness = build_harness_policy(family_id="kimi")
-        llm = SequenceModel(
-            ['{"thought":"done","final_answer":"ok"}'],
-            model=model,
-        )
-        setattr(
-            llm,
-            "qitos_harness_metadata",
-            {
-                "family_preset": harness.family_preset.id,
-                "adapter_kind": harness.adapter.kind,
-                "protocol": harness.protocol.id,
-                "parser": harness.parser_name,
-                "tool_policy": harness.tool_policy.to_dict(),
-                "context_policy": harness.context_policy.to_dict(),
-            },
-        )
-        agent = _PresetAgent(
-            llm=llm,
-            model_parser=harness.parser,
-            model_protocol=harness.protocol,
-        )
-        agent.run(
-            task=(
-                Task(id=explicit_task_id, objective=objective)
-                if explicit_task_id is not None
-                else objective
-            ),
-            workspace=str(workspace),
-            max_steps=2,
-            render=False,
-            trace=True,
-            trace_logdir=str(trace_root),
-            return_state=False,
-        )
-        manifests = list(trace_root.glob("*/manifest.json"))
-        assert len(manifests) == 1
-        return _load_run_payload(manifests[0].parent)
-
-    left = run_once(
-        tmp_path / "left-runs",
-        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
-    )
-    right = run_once(
-        tmp_path / "right-runs",
-        now=datetime(2026, 1, 2, tzinfo=timezone.utc),
-    )
-    changed_task = run_once(
-        tmp_path / "changed-task-runs",
-        now=datetime(2026, 1, 3, tzinfo=timezone.utc),
-        objective="finish a different task",
-    )
-    changed_config = run_once(
-        tmp_path / "changed-config-runs",
-        now=datetime(2026, 1, 4, tzinfo=timezone.utc),
-        model="moonshot-v1-32k",
-    )
-    changed_identity = run_once(
-        tmp_path / "changed-identity-runs",
-        now=datetime(2026, 1, 5, tzinfo=timezone.utc),
-        explicit_task_id="benchmark-sample-2",
-    )
-
-    left_manifest = left["manifest"]
-    right_manifest = right["manifest"]
-    changed_manifest = changed_task["manifest"]
-    changed_config_manifest = changed_config["manifest"]
-    changed_identity_manifest = changed_identity["manifest"]
-    assert left_manifest["summary"]["task_meta"]["task_id"] == right_manifest[
-        "summary"
-    ]["task_meta"]["task_id"]
-    assert left_manifest["task_hash"] == right_manifest["task_hash"]
-    assert left_manifest["task_hash"] != changed_manifest["task_hash"]
-    assert left_manifest["run_config_hash"] == changed_manifest["run_config_hash"]
-    assert left_manifest["task_hash"] == changed_config_manifest["task_hash"]
-    assert (
-        left_manifest["run_config_hash"]
-        != changed_config_manifest["run_config_hash"]
-    )
-    assert left_manifest["task_hash"] != changed_identity_manifest["task_hash"]
-
-    diff = _build_run_diff(left, right)
-
-    assert diff["comparison"] == {
-        "compatible": True,
-        "status": "same_spec",
-        "missing_fields": [],
-        "mismatch_fields": [],
-    }

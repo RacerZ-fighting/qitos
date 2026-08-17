@@ -79,6 +79,39 @@ How to update:
 
 ### Removed
 
+- **Breaking:** Removed the retired `AgentModule`/`Engine` lifecycle and its
+  exclusive surface: the whole `qitos/engine/` package (action executor,
+  journal/control/turn runtimes, handoff runtime, hooks, streaming, recovery,
+  stop criteria, interrupt), the `qitos/core` old-lifecycle modules
+  (`agent_module`, `observation`, `decision`, `action`, `state`,
+  `state_delta`, `field_reducers`, `channel`, `agent_spec`, `message_builder`,
+  `completion`), `qitos/checkpoint/`, `qitos/protocols.py` (prompt-injected
+  protocol registry), `qitos/render/` (Engine hook renderer), the Engine-era
+  kit packages (`qitos.kit.{parser,critic,planning,prompts,history}`), and
+  `qitos/prompting.py` / `qitos/core/_json_repair.py` (zero surviving
+  consumers). `qitos/core/errors.py` keeps only the model-facing error types;
+  `core/history.py` keeps only the `HistorySnapshot` closure used by
+  `core/turn.py`; `core/spec.py` (`RunSpec`/`ExperimentSpec`/
+  `BenchmarkRunResult`) stays because the engine-free benchmark core and the
+  leaderboard store consume it. The `Agent` façade over the minimal agent
+  loop is the only execution path.
+- **Breaking:** `ToolTransaction` decodes only the loop's journal schema
+  (`turn` + typed `ToolCall`); the retired Engine payload fields
+  (`step_id`/`action_index`/`action`) fail closed on decode, consistent with
+  the no-cross-path-resume rule. `ToolResult` validates its status against
+  the local `ToolResultStatus` literal set instead of the deleted
+  `ActionStatus` enum.
+- **Breaking:** `qitos.harness` no longer builds Engine parsers or
+  prompt-injected protocol objects: `HarnessPolicy` carries `protocol_id` /
+  `fallback_protocol_ids` identities instead of `protocol`/`parser`
+  instances, and `build_model_for_preset` attaches protocol identity as
+  metadata only. Family presets, adapters, `resolve_family_preset`, and
+  reasoning policies are unchanged.
+- **Breaking:** `qit` drops no further commands in this slice; `qita`, the
+  trace readers, and the leaderboard store are untouched and read existing
+  run directories and result files as before. Note the loop-side trace writer
+  is not yet reattached, so new façade runs journal but do not emit
+  engine-era trace manifests yet.
 - **Breaking:** Removed the benchmark execution layer: `qitos.recipes` is gone
   entirely (`benchmarks/`, `desktop/`, and the pattern recipes), together with
   the recipe-coupled `qitos.benchmark` adapter subpackages (`cybench`,

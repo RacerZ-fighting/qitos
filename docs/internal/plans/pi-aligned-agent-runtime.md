@@ -27,30 +27,13 @@ not compatibility requirements.
 
 ### 2.1 Freeze behavioral conformance
 
-- Express provider/message, Tool transaction, cancellation, deadline, ordering and
-  recovery tests without legacy class names.
-- Resolve the public Message, ToolCall, ToolResult, AgentEvent and failure types.
-
-Done when the suite can run against a replacement loop without importing AgentModule,
-Observation, Decision or Action.
-
-Progress on `feat/pi-aligned-agent-loop`: typed messages (`core/message.py`),
-loop events (`core/agent_events.py`), `AgentLoopResult`/rejection types, the
-minimal loop (`core/agent_loop.py`), the `Agent` façade (`core/agent.py`) and
-`ToolBatchExecutor` (`core/tool_executor.py`) landed with conformance tests in
+Done on `feat/pi-aligned-agent-loop` (commits `af8f8ef`, `306d3bc`): typed
+messages (`core/message.py`), loop events (`core/agent_events.py`),
+`AgentLoopResult`/rejection types, the minimal loop (`core/agent_loop.py`),
+the `Agent` façade (`core/agent.py`) and `ToolBatchExecutor`
+(`core/tool_executor.py`) with conformance tests in
 `tests/core/test_agent_{message,loop,facade}.py`, `test_tool_executor.py` and
-`tests/journal/test_turn_recorder.py`. Child agents now run on the façade:
-`kit/child/agent_engine.py` drives one child run per invocation through `Agent`
-with narrowed tools/budgets and a `JournalTurnTransaction` journal, supervisor
-recovery rebuilds terminal Child facts from the child's loop journal, and the
-Engine-coupled `DelegateTool`/`FanOutTool`, the kit `HandoffTool` chain,
-`core/shared_memory.py` and `kit/repl` are removed. The showcase layer is
-gone: the `qitos_zoo` submodule, `qitos.demo` and `qit demo`, the whole
-`qitos.recipes` package, the recipe-coupled `qitos.benchmark` adapters and
-`runner.py` (`qit bench` keeps the engine-free `eval`/`replay`/`export`/
-`presets`), and the Engine-era examples/tutorial course; the quickstart
-example composes the façade directly. Old-lifecycle callers remain until the
-rest of milestone 2.2.
+`tests/journal/test_turn_recorder.py`.
 
 Review-hardening dispositions recorded on the same branch:
 
@@ -74,18 +57,23 @@ Review-hardening dispositions recorded on the same branch:
 
 ### 2.2 Replace loop and façade
 
-- Introduce the minimal loop and small Agent façade as the only execution path.
-- Move all application callers in the same slices that delete the corresponding old
-  lifecycle; do not publish two runtimes.
-
-Done when application composition no longer subclasses AgentModule and old Engine is
-absent from public exports, examples and runtime tests.
+Done on `feat/pi-aligned-agent-loop`. The minimal loop and small `Agent`
+façade are the only execution path: C2 (commit `e28b23e`) moved child agents
+onto the façade and removed the delegate/fanout tools, kit handoff tool
+chain, shared memory and repl; C3 (commit `9ad277e`) removed the zoo
+submodule, demo, recipes, benchmark execution adapters and the Engine-era
+examples; C4 (this slice) deletes `qitos/engine/`, the `core` old-lifecycle
+modules, checkpoint, protocols, render, and the Engine-era kit
+parser/critic/planning/prompts/history packages. No composition subclasses
+AgentModule, and the old Engine is absent from exports, examples and tests.
 
 ### 2.3 Make Session/Harness authoritative
 
 - Separate transcript entries from operation records in one canonical storage contract.
 - Move queue, compact, recovery, resume, fork and expected rejection out of Engine.
 - Provide memory/JSONL conformance and pure recovery tests.
+- Reattach the trace writer to the loop/façade so new runs emit trace
+  artifacts (the Engine-era producer was removed with C4).
 
 Done when recovery never branches through a live Engine or guesses side effects.
 

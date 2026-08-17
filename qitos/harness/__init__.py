@@ -19,7 +19,6 @@ from ._types import (
     HarnessPolicy,
     ModelAdapter,
     ToolPolicy,
-    build_protocol_for_preset,
 )
 
 
@@ -34,26 +33,25 @@ def build_harness_policy(
     *,
     model_name: str | None = None,
     family_id: str | None = None,
-    protocol: Any = None,
+    protocol: str | None = None,
     tool_delivery: str | None = None,
     adapter_kind: str | None = None,
     resolution_source: str = "family_preset",
 ) -> HarnessPolicy:
     preset = resolve_family_preset(model_name, family_id=family_id)
     adapter = adapter_for_kind(adapter_kind or preset.adapter_kind)
-    protocol_obj = build_protocol_for_preset(
-        preset=preset,
-        protocol=protocol,
-        delivery=tool_delivery,
+    protocol_id = str(protocol or preset.default_protocol)
+    fallback_ids = (
+        () if protocol is not None else tuple(preset.fallback_protocols)
     )
-    parser = protocol_obj.parser_factory()
     return HarnessPolicy(
         family_preset=preset,
         adapter=adapter,
-        protocol=protocol_obj,
-        parser=parser,
+        protocol_id=protocol_id,
+        fallback_protocol_ids=fallback_ids,
         tool_policy=preset.tool_policy,
         context_policy=preset.context_policy,
+        tool_delivery=str(tool_delivery or preset.tool_policy.primary_delivery),
         resolution_source=resolution_source,
     )
 
@@ -64,7 +62,7 @@ def build_model_for_preset(
     family_id: str | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
-    protocol: Any = None,
+    protocol: str | None = None,
     tool_delivery: str | None = None,
     adapter_kind: str | None = None,
     temperature: float | None = 0.2,
@@ -139,16 +137,10 @@ def build_model_for_preset(
     metadata.setdefault(
         "native_tool_call_preferred", harness.tool_policy.native_tool_call_preferred
     )
-    metadata.setdefault(
-        "effective_tool_delivery", harness.protocol.tool_schema_delivery
-    )
+    metadata.setdefault("effective_tool_delivery", harness.tool_delivery)
     metadata["reasoning"] = reasoning.to_dict()
     setattr(llm, "qitos_harness_metadata", metadata)
     setattr(llm, "qitos_family_preset", harness.family_preset.id)
-    # Keep the resolved protocol object rather than only its registry id. Preset
-    # delivery overrides (for example Anthropic's native API tools on ReAct) are
-    # part of the effective turn contract and would be lost by an id round-trip.
-    setattr(llm, "qitos_protocol", harness.protocol)
     return llm
 
 

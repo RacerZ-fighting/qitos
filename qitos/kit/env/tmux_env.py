@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from qitos.core.action import Action
 from qitos.core.env import (
     Env,
     EnvObservation,
@@ -323,9 +322,11 @@ class TmuxEnv(Env):
             "backend": "tmux",
         }
 
-    def _to_action_name(self, action: Any) -> str:
-        if isinstance(action, Action):
-            return action.name
+    @staticmethod
+    def _to_action_name(action: Any) -> str:
+        name = getattr(action, "name", None)
+        if isinstance(name, str) and name:
+            return name
         if isinstance(action, dict):
             return str(action.get("name", ""))
         return ""

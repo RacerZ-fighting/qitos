@@ -3,7 +3,9 @@ title: "简介"
 description: "QitOS 是一个以研究为先、用于构建可复现和可追踪 LLM 智能体的框架。"
 ---
 
-当前 QitOS 版本通过同一套 `AgentModule + Engine` 运行时构建可复现的 LLM 智能体（agent）。无论你是在原型化 ReAct 循环、运行 GAIA 基准测试（benchmark），还是交付一个面向真实工作流的编程智能体，运行结果始终可追踪、可组合、可复现。已经确认的运行时重构会原地将这套 API 替换为 Model、最小异步 Agent loop 和可恢复 Session/Harness。
+QitOS 在一条最小异步 agent loop 上构建可复现的 LLM 智能体（agent）：`Message ->
+Model -> ToolCall -> ToolResult`，由 `Agent` façade 驱动。无论你是在原型化新的
+智能体策略，还是交付面向真实工作流的编程智能体，运行结果始终可追踪、可组合、可复现。
 
 一个长时间运行的 QitOS 编程任务不应该退化成难以理解的胶水代码。
 
@@ -13,19 +15,23 @@ description: "QitOS 是一个以研究为先、用于构建可复现和可追踪
 
 QitOS 提供两种智能体编写方式。
 
-### 研究优先（research-first）
+### façade 优先
 
-这是研究者的默认入口。
+这是默认入口：直接组合运行时。
 
-你可以手写：
+你选择：
 
+- 模型（任意兼容 OpenAI、Anthropic 或本地适配器）
 - 系统提示词（prompt）
-- 解析器（parser）——将原始模型输出解析为决策（decision）的组件
-- 模型协议（protocol）——模型输出的格式契约
-- 模型传输层（transport）——与模型 API 通信的客户端
-- 工具面（tool surface）
+- 工具面（类型化工具的 `ToolRegistry`）
+- 轮次与时间预算
 
-这是框架里最接近 PyTorch 风格的路径：直接、显式、便于实验。
+```python
+agent = Agent(model=model, tool_registry=registry, system_prompt="...", max_turns=10)
+result = await agent.prompt("检查这个项目")
+```
+
+一切都是显式的：没有隐藏规划器，没有第二个编排器。
 
 ### 预设优先（preset-first）
 
@@ -41,17 +47,17 @@ QitOS 提供两种智能体编写方式。
 
 ## QitOS 适合谁
 
-QitOS 主要面向三类实践者：
-
-- **研究者**：原型化 ReAct、PlanAct、Tree-of-Thought、Reflexion 与新的智能体方法，并获得可回放（replay）、可对比、可发表的追踪记录（trace）。
+- **研究者**：在最小、可检查的 loop 上原型化新的智能体方法，并获得可回放（replay）、可对比、可发表的追踪记录（trace）。
 - **智能体构建者**：在稳定执行循环上构建使用工具的智能体，而不是反复手写围绕裸 LLM 调用的框架胶水。
-- **评测者**：在和产品智能体相同的内核上运行 GAIA、Tau-Bench 与 CyBench，让基准测试结果真正能够迁移。
+- **评测者**：用 qita 把结构化运行产物变成可比较、可审查的证据。
 
 ## 核心能力
 
 ### 可复现的运行
 
-每次 QitOS 运行都会产出 `manifest.json`、`events.jsonl` 和 `steps.jsonl`。这些文件记录模型 ID、提示词哈希、配置哈希、随机种子、工具清单等关键信息，足以精确复现或比较两次运行。
+每次 QitOS 运行都可以持久化一份 append-only JSONL journal：模型事务、Tool
+started/terminal 记录、已提交 turn，以及恰好一个运行终态记录。journal 是回放、
+恢复与 fork 的 canonical 真源。
 
 ### 内置可观测性：qita
 
@@ -63,67 +69,43 @@ qita board --logdir runs
 
 看板默认运行在 `http://127.0.0.1:8765`，当新运行出现时会自动刷新。
 
-### 规范化的智能体模式
+### 严格准入的类型化工具
 
-QitOS 内置四种经典推理模式，对应的可运行示例位于 `examples/patterns/`：
+工具声明严格的输入 schema，并经同一条准入/执行管线运行：校验、权限、有界并发、
+超时，以及每个调用恰好一个终态 `ToolResult`——包括被拒绝、超时和被取消的调用。
+并行批次按输入顺序提交结果。
 
-| 模式 | 说明 |
-|---|---|
-| **ReAct** | 文本协议，每步至多执行一个核心动作（action） |
-| **PlanAct** | 先生成显式计划，再按步骤执行 |
-| **Tree-of-Thought** | 先分支、评分，再决定执行路径 |
-| **Reflexion** | Actor-Critic 循环，带基于证据的重试 |
+### 子智能体
 
-### 基准测试适配器
+子智能体与父级使用同一个 `Agent` 实现，只是工具与预算被收窄。Run 级 supervisor
+提供持久 handle、后台执行、父级消息、等待、中断和基于 journal 的恢复。
 
-QitOS 提供 GAIA、Tau-Bench 与 CyBench 适配器，它们都运行在与你自定义智能体相同的 `AgentModule + Engine` 内核上，不需要另一套独立评测框架。
+### MCP 集成
+
+把 Model Context Protocol（MCP）服务器桥接进 QitOS 工具注册表。支持 stdio 或 HTTP
+传输、工具过滤与异步服务器生命周期管理。
 
 ## 特色设计
 
 这些设计决定了 QitOS 不只是智能体工具集合，而是一套清晰的运行时（runtime）方法论。
 
-### 单内核架构
+### 单 loop 架构
 
-QitOS 最核心的约束只有一条：一次运行只有一个运行时内核。
+QitOS 最核心的约束只有一条：一次运行只有一条 agent loop。
 
-- `AgentModule` 定义策略
-- `Engine` 负责执行
-- 工具、解析器、评估器（critic，可批准、停止或重试当前步骤的后置评估组件）、记忆与追踪都附着在这条主链路上
+- `Agent` façade 持有 transcript、生命周期事件与 steering 队列
+- loop 负责 turn 机制：每个 turn 一份不可变的模型/工具快照
+- 工具、记忆、journal 与追踪都附着在这条主链路上，而不是另起编排器
 
-这样示例、基准测试和生产型智能体之间就能保持可比性。
-
-### 协议感知的提示词与解析器
-
-QitOS 把提示词格式与解析器选择当作一等设计契约：
-
-- ReAct 提示词搭配 `ReActTextParser`
-- JSON 提示词搭配 `JsonDecisionParser`
-- XML 提示词搭配 `XmlDecisionParser`
-- Terminus、MiniMax 工具调用解析器等结构化变体也仍然走同一条 `model response -> parser -> Decision` 路径
-
-正因为这层契约是显式的，追踪记录才不会退化成提供商特定的隐式胶水。协议和解析器的匹配关系始终可审计。
-
-### 以预设为优先的智能体编写方式
+### 以预设为优先的模型切换
 
 QitOS 提供可复用的编写模块，不需要每个智能体从零开始组装一切：
 
 - `coding_tools(...)`、`advanced_coding_tools(...)`、`web_tools()`、`task_tools(...)`
 - `WindowMemory`、`SummaryMemory`、`VectorMemory`、`MarkdownFileMemory`
-- `WindowHistory`、`TokenBudgetSummaryHistory`、`CompactHistory`
-- `NumberedPlanBuilder`、`DynamicTreeSearch`
+- 家族预设与适配层策略用于切换 provider
 
 研究者可以调整策略，而不必重搭整套基础设施。
-
-### 面向长时运行的上下文控制
-
-长时运行智能体是 QitOS 的一等公民。你可以通过这些层次控制上下文膨胀：
-
-- `HistoryPolicy` 控制消息选择
-- `TokenBudgetSummaryHistory` 做 token 预算感知的摘要
-- `CompactHistory` 做多阶段上下文压缩（compaction）
-- 记忆适配器负责语义检索与持久记忆
-
-这也是 QitOS 的研究价值所在：框架帮你研究长时运行，而不是假设上下文是免费的。
 
 ### 追踪优先的可观测性
 
@@ -137,21 +119,18 @@ QitOS 的假设是：只要一次运行重要，它就应该可检查。
 
 ### 不引入新运行时的领域专门化
 
-QitOS 一个关键的设计点是：领域智能体仍然是普通的 QitOS 智能体。
+领域智能体仍然是普通的 QitOS 智能体。领域行为体现在：
 
-Claude Code 风格智能体、基准测试运行器、代码安全审计智能体都复用了同一个运行时。领域行为体现在：
-
-- 状态设计
 - 提示词策略
 - 工具组合
-- `reduce()` 归约（reduce）语义
+- 子智能体分解
 
 专门化因此更容易理解，也更容易复现。
 
 ## 当前状态
 
 <Warning>
-QitOS 当前处于 **Beta** 阶段。运行时迁移期间继续保持 trace/qita、canonical durable records、规范化示例和 benchmark adapter 的行为；`AgentModule + Engine` 被原地替换时，公开 Agent/runtime API 会变化。用于生产环境时请固定版本并关注 Changelog，不要把当前 API 视为冻结接口。
+QitOS 当前处于 **Beta** 阶段。运行时迁移期间继续保持 trace/qita 与 canonical durable records 的行为。用于生产环境时请固定版本并关注 Changelog，不要把当前 API 视为冻结接口。
 </Warning>
 
 ## 接下来读什么
@@ -160,17 +139,14 @@ QitOS 当前处于 **Beta** 阶段。运行时迁移期间继续保持 trace/qit
   <Card title="快速开始" icon="rocket" href="/zh/quickstart">
     2 分钟内运行第一个智能体
   </Card>
-  <Card title="教程课程" icon="graduation-cap" href="/zh/tutorials">
-    通过四节课程理解 QitOS 的智能体设计方法
+  <Card title="教程" icon="graduation-cap" href="/zh/tutorials">
+    按主题学习工具、预设与可观测性
   </Card>
   <Card title="安装" icon="download" href="/zh/installation">
     安装 QitOS 及其可选组件
   </Card>
-  <Card title="核心概念" icon="book" href="/zh/concepts/agent-module">
-    理解 AgentModule、Engine、State 与 Tools
-  </Card>
   <Card title="Kit 参考" icon="toolbox" href="/zh/reference/kit">
-    浏览内置解析器、工具集、记忆、规划与历史策略
+    浏览内置工具集、记忆、环境、子智能体与模型
   </Card>
   <Card title="追踪与 qita" icon="chart-line" href="/zh/guides/observability">
     了解 QitOS 如何让每次运行都可检查、可回放、可导出

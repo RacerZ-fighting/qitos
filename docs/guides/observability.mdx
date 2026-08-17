@@ -15,7 +15,7 @@ Each run directory contains three files:
 | `events.jsonl` | One JSON object per line; each line is a `RuntimeEvent` with `step_id`, `phase`, `ts`, `ok`, `error`, and `payload` |
 | `steps.jsonl` | One JSON object per line; each line is a `StepRecord` with `step_id`, `decision` (the model's structured output), `actions` (the tool calls dispatched), `action_results`, `observation` (the environment's response), and `critic_outputs` |
 
-`manifest.json` is written on initialization and finalized when the Engine exits.
+`manifest.json` is written on initialization and finalized when the run ends.
 Runtime events are staged until their step reaches the trace boundary; the
 events are flushed before the corresponding `steps.jsonl` commit marker. This
 keeps each completed step replayable as one ordered transaction. Lifecycle
@@ -110,7 +110,7 @@ Each default step card is intentionally sparse:
 
 Input prefers the current step's `model_input.prepared_full`, then `prepared`, and falls back to the recorded step observation for older traces. Each evidence block shows its source and complete character count; expanded code views preserve every recorded character, newline, and field, wrap long lines inside the available width, and support copying the complete unmodified text.
 
-For each action call, qita prefers an explicit `action_id` when pairing results. Standard QitOS traces without IDs use the Engine's original action/result order. The call's Result view uses `observation_ready.action_results`, which is what the agent could observe, while the Inspector Raw view also preserves canonical `step.action_results`. Environment-only results are separated before pairing. Extra actions or results are shown as **Unmatched evidence** rather than assigned speculatively.
+For each action call, qita prefers an explicit `action_id` when pairing results. Standard QitOS traces without IDs use the recorded action/result order. The call's Result view uses `observation_ready.action_results`, which is what the agent could observe, while the Inspector Raw view also preserves canonical `step.action_results`. Environment-only results are separated before pairing. Extra actions or results are shown as **Unmatched evidence** rather than assigned speculatively.
 
 The run API exposes this derived view as optional `step_interactions`. It is a qita presentation model, not a new stable core trace schema; `manifest.json`, `events.jsonl`, and `steps.jsonl` remain unchanged.
 
@@ -272,18 +272,15 @@ es.addEventListener('run_end', e => {
 
 The qita run detail page includes a **live stream** button that connects to the SSE endpoint and logs events to the browser console. This is useful for debugging and understanding the event flow of a completed run.
 
-### Streaming with Engine
+### Streaming with the Agent façade
 
-For live runs, use `Engine.arun_stream()` to consume events programmatically:
+For live runs, subscribe to façade lifecycle events programmatically:
 
 ```python
-from qitos import Engine
+from qitos import Agent
+from qitos.core.agent_events import ToolExecutionEnd, TurnEnd
 
-engine = Engine(agent=agent, budget=RuntimeBudget(max_steps=10))
-
-async for event in engine.arun_stream("analyze the data"):
-    if event.event_type == "step_end":
-        print(f"Step {event.step_id} done")
-    elif event.event_type == "handoff":
-        print(f"Handoff: {event.payload}")
+agent = Agent(model=model, tool_registry=registry)
+agent.subscribe(lambda event: print(type(event).__name__))
+result = await agent.prompt("analyze the data")
 ```

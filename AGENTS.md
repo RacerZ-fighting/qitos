@@ -14,9 +14,13 @@ Model / Provider
 → application composition
 ```
 
-The target contracts are in `docs/internal/architecture/agent-runtime.md`. Migration
-order and deletion work are in `docs/internal/plans/pi-aligned-agent-runtime.md`.
-Public docs describe shipped behavior until the migration lands.
+The contracts are in `docs/internal/architecture/agent-runtime.md`. The minimal loop,
+the `Agent` façade, the journaled child path and the façade quickstart are the shipped
+mainline; the retired `AgentModule / Observation / Decision / Action` lifecycle, its
+Engine, checkpoint store, prompt-injected protocols/parsers/critics, recipes, and
+benchmark execution adapters are removed. Remaining migration work (authoritative
+Session/Harness, Task/Plan replacement) is tracked in
+`docs/internal/plans/pi-aligned-agent-runtime.md`.
 
 Hard rules:
 
@@ -25,9 +29,8 @@ Hard rules:
 - Replace old behavior in place. A replacement is complete only when callers, exports,
   tests, examples and affected docs move, and the superseded path is removed.
 - Preserve verified Tool transaction, deadline, cancellation, ordering, trace and
-  recovery behavior while replacing `AgentModule / Observation / Decision / Action`.
-- New product capability must target the Model/loop/Session contracts, not extend the
-  old Engine lifecycle.
+  recovery behavior.
+- New product capability must target the Model/loop/Session contracts.
 - Benchmark, evaluation, recipe, renderer and product/plugin policy stay outside the
   Agent loop, Task, Session and Tool executor.
 
@@ -128,10 +131,10 @@ uv run --no-project --python 3.11 \
   pytest -q
 
 uv run --no-project --python 3.11 --with-editable . \
-  --with 'flake8>=6' flake8 qitos/core qitos/engine qitos/models qitos/trace
+  --with 'flake8>=6' flake8 qitos/core qitos/models qitos/trace
 
 uv run --no-project --python 3.11 --with-editable . \
-  --with 'mypy>=1' mypy qitos/core qitos/engine qitos/models qitos/trace
+  --with 'mypy>=1' mypy qitos/core qitos/models qitos/trace
 ```
 
 Packaging/release metadata:

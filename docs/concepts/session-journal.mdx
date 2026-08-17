@@ -3,76 +3,41 @@ title: Session journal
 description: Persist complete model and tool transactions for resume and fork.
 ---
 
-QitOS can persist one append-only JSONL journal per Run. When configured, the journal
-is the canonical source for model history, tool transactions, state recovery, resume,
-and fork. Do not configure a checkpoint store on the same Engine.
+QitOS persists one append-only JSONL journal per Run. When configured, the journal
+is the canonical record of model transactions, Tool transactions, turn commits, and
+run lifecycle for the minimal agent loop.
 
 Each journal instance is one storage owner. `create()` or `open()` acquires an
-operating-system writer lease for that Run. A competing process or Engine receives
-`JournalOwnershipError` instead of opening a second writer. `Engine.arun()` and
-`Engine.aresume_from_journal()` close their journal on every terminal path. A closed
-instance rejects mutations permanently, but its isolated replay and committed-tool
-query view remain available for diagnostics.
+operating-system writer lease for that Run. A competing process receives
+`JournalOwnershipError` instead of opening a second writer. A closed instance
+rejects mutations permanently, but its isolated replay and committed-tool query
+view remain available for diagnostics.
 
-## Tool transaction order
+## Loop transaction order
 
-The Engine writes each tool transaction in this order:
+The loop's `JournalTurnTransaction` records each turn in this order:
 
-1. `model.completed`
-2. `tool.started`
+1. `model.completed` — one finalized model transaction, success or failure
+2. `tool.started` — a durable execution permit for one admitted ToolCall
 3. execute the handler
 4. finalize the canonical `ToolResult`
 5. `tool.terminal`
-6. reduce that result into working state
-7. `step.committed`
+6. `step.committed` — the turn's committed messages plus the
+   `terminal_record_ids` linking its Tool terminals
 
 `tool.started` is a durable execution permit. If it cannot be written, the handler is
-not invoked. The finalized terminal result is persisted once and is the same value used
-by History and reducers. In a multi-action batch, each terminal is reduced before the
-next result is finalized. Explicitly concurrency-safe handlers may still run concurrently.
-The Engine binds `ToolResult.call_id` from the canonical Action before finalization and
-checks that same identity during replay; older terminal records recover it from their
-adjacent Action.
+not invoked. The finalized terminal result is persisted once and is the same deeply
+immutable value delivered to the transcript. Parallel Tool batches commit results in
+input order, and every admitted call receives exactly one terminal result, including
+denied, timed-out, and cancelled calls.
 
-Finalizer or reducer failure aborts the current uncommitted transaction. Recovery uses
-the durable started/terminal boundary; it never publishes a step around a missing result.
+A run ends in exactly one terminal record: `run.completed` carries the terminal
+status (`completed`, `failed`, `max_turns`, `deadline_exceeded`) and the run's new
+messages; an aborted run appends `run.interrupted` instead. External task
+cancellation and faults terminalize started work and the run record before
+re-raising, so a run never ends without a terminal record.
 
-If recovery finds `tool.started` without `tool.terminal`, it writes an explicit error
-terminal with unknown side effects and never runs the handler again. A call that never
-received `tool.started` is closed as cancelled with no side effect. If all terminal
-results exist but `step.committed` does not, recovery only reruns pure reducers.
-
-## Shared Root/Child budget
-
-An Engine owns a `BudgetLedger` unless a product runtime passes an existing ledger to
-its constructor. Passing the Root ledger to every Child makes the complete Run tree
-consume one token and cost allowance. Each Engine's `RuntimeBudget` remains a local
-ceiling, so a Child can be more restricted but cannot receive a second copy of the Run
-allowance.
-
-After a provider transaction completes, the Engine appends one idempotent
-`budget.committed` record to the Root JSONL before advancing the in-memory ledger.
-The record includes its origin Run, model transaction, token and cost usage, and
-completeness flags. Root resume and fork rebuild the shared total from these records;
-SQLite is not involved. Older journals without budget records recover Root usage from
-`model.completed` and completed Child usage from `child.terminal`.
-
-`EngineResult.total_*` reports the shared Run total and `local_total_*` reports the
-current Engine. `ChildResult` always stores the Child-local values, so Parent code must
-not add it back into the ledger. Estimated token counts still consume the allowance but
-mark usage incomplete. Cost completeness additionally requires explicit pricing and
-usable input/output counts.
-
-Settlement is serialized, but this contract does not reserve an estimate before a
-provider request. Concurrent requests that already passed admission can finish above
-the ceiling; the next turn stops after the committed total reaches the limit.
-
-## State commits
-
-`step.committed` publishes a deterministic JSON Patch subset with before and after
-digests. Until that record is durable, the Engine exposes only the previous committed
-state. Full snapshots are written initially, at the configured interval, and at terminal
-boundaries. They accelerate replay but are not a second source of truth.
+## Durability and projections
 
 The JSONL writer waits for durable acknowledgement for every record. Darwin uses
 `F_FULLFSYNC`. Other POSIX systems prefer `fdatasync` when available.
@@ -80,64 +45,34 @@ The JSONL writer waits for durable acknowledgement for every record. Darwin uses
 Every append first converts its payload into one isolated strict JSON value. Python
 tuples become JSON arrays; non-string object keys, non-finite numbers, bytes, sets,
 cycles, and custom objects are rejected before any record is written. The same value
-therefore drives in-memory replay, stable-record-id settlement, JSONL encoding, reopened
-replay, and projection digests.
+therefore drives in-memory replay, stable-record-id settlement, JSONL encoding, and
+reopened replay.
 
 `journal.index.sqlite3` is a disposable read projection beside the canonical file.
 QitOS updates it only after the JSONL append is durable. A missing, stale, corrupt, or
 unsupported projection is rebuilt from validated JSONL records. Open and replay always
-parse canonical JSONL first; SQLite never supplies replay records. QitOS retains the
-projection only when its record digests match those canonical records. Projection
-failures do not fail or roll back a canonical append, and deleting the SQLite file loses
-no Run state. Complete JSONL records with invalid semantics raise
-`JournalCorruptionError`. Valid records using an unsupported old or new schema raise
-`JournalUnsupportedVersionError` with upgrade or migration guidance. Both fail closed;
-only an unterminated syntactically torn tail is truncated during recovery.
+parse canonical JSONL first; SQLite never supplies replay records. Complete JSONL
+records with invalid semantics raise `JournalCorruptionError`. Valid records using an
+unsupported old or new schema raise `JournalUnsupportedVersionError`. Both fail
+closed; only an unterminated syntactically torn tail is truncated during recovery.
 
 `JsonlRunCatalog` is the read-only side of this boundary. It can inspect or list Runs
 while their writer lease remains active, and it can validate ancestor and direct-child
 lineage without constructing an Agent. A catalog read uses the current complete JSONL
-prefix; SQLite remains a disposable index and never supplies canonical records. The
-catalog never takes a writer lease, repairs a torn tail, or rebuilds either artifact.
-`RunStatus.RESUMABLE` means only that no durable `run.completed` exists; it does not
-claim that an Engine process is currently active.
+prefix; SQLite remains a disposable index and never supplies canonical records.
+`RunStatus.RESUMABLE` means only that no durable `run.completed` exists.
 
-Each `RunHandle` also exposes a stable `lineage_id`, the immediate `parent_run_id`, the
-latest durable `committed_position`, a `continuation_position`, and
-`has_terminal_state`. Applications may pass `lineage_id=` to `Engine.arun()` to bind
-their own stable Session identity; the Root Run id is used when it is omitted, and
-forks inherit the same value. Legacy journals derive the root Run id from their
-inherited prefix.
-
-The continuation position is the latest committed boundary that does not encode a
-terminal turn. This normally equals the latest committed position for an active or
-interrupted Run. Terminal step commits carry an explicit marker, so once either the
-commit or terminal snapshot is durable—even if the process stopped before
-`run.completed` was appended—the handle points to the boundary before that terminal turn.
-Resuming a completed Run remains read-only and executes no Provider or Tool; continued
-work must fork the continuation position into a new resumable Run. The terminal
-`committed_position` remains available for audit and is never relabeled as a
-continuable state.
+Each `RunHandle` also exposes a stable `lineage_id`, the immediate `parent_run_id`,
+the latest durable `committed_position`, a `continuation_position`, and
+`has_terminal_state`.
 
 ```python
-from qitos import Engine
 from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
 
-journal = JsonlSessionJournal(".qitos/sessions")
-result = await Engine(agent=agent, journal=journal).arun(
-    "inspect the project",
-    lineage_id="engagement-42",
-)
-
-resumed = await Engine(
-    agent=agent,
-    journal=JsonlSessionJournal(".qitos/sessions"),
-).aresume_from_journal(result.run_id)
-
 catalog = JsonlRunCatalog(".qitos/sessions")
-handle = await catalog.inspect_run(result.run_id)
+handle = await catalog.inspect_run(run_id)
 all_runs = await catalog.list_runs()
-ancestors = await catalog.lineage(result.run_id)
+ancestors = await catalog.lineage(run_id)
 
 if handle.is_terminal and handle.continuation_position is not None:
     source = JsonlSessionJournal(".qitos/sessions")
@@ -148,19 +83,14 @@ if handle.is_terminal and handle.continuation_position is not None:
 ```
 
 Forking accepts only a committed `JournalPosition`. The child journal owns an
- independent inherited prefix and can resume without its ancestors. An inherited local
- commit is itself a valid boundary, so forked Runs may be forked again. Direct
- `SessionJournal.fork()` leaves both journals open; `Engine.afork_journal()` closes its
- source and transfers the open child to the caller. If the source cannot close after the
- child is created, QitOS closes the unreturned child before propagating the source error,
- so no hidden writer lease remains. Every returned open journal remains owned by its
- caller until an Engine consumes it or `close()` is called.
+independent inherited prefix and can resume without its ancestors. An inherited local
+commit is itself a valid boundary, so forked Runs may be forked again. Every returned
+open journal remains owned by its caller until `close()` is called.
 
 ## Committed tool lookup
 
-Every canonical action result exposes a `JournalRecordRef` after its terminal record
-is durable. Keep that lightweight origin locator in application state when the result
-must remain discoverable after history compaction:
+Every canonical Tool terminal is discoverable through a lightweight
+`JournalRecordRef` locator once its terminal record is durable:
 
 ```python
 from qitos.core.journal import JournalRecordRef
@@ -172,25 +102,24 @@ if transaction is not None:
 ```
 
 The lookup is read-only and returns a fresh typed `ToolTransaction` only after the
-terminal is named by `step.committed`. Opening a journal rebuilds this query view from
-its canonical JSONL records. A fork resolves inherited terminals by the parent's origin
-reference, so the child does not copy the result into a second store. Unknown,
-uncommitted, or child-renamed references return `None`.
+terminal is named by a `step.committed` record. Opening a journal rebuilds this query
+view from its canonical JSONL records. A fork resolves inherited terminals by the
+parent's origin reference, so the child does not copy the result into a second store.
+Unknown, uncommitted, or child-renamed references return `None`. Only the loop's
+record schema is decodable; records written by the retired Engine taxonomy fail
+closed.
 
-Run-scoped mailbox acceptance is journal-recoverable. `runtime_input.posted` precedes
-in-memory delivery, while `model.completed.runtime_input_ids` binds the exact events
-seen by that transaction. Background Child and process completion inputs are deterministic
-projections of their local `child.terminal` and `process.terminal` facts. `child.started`
-records whether the invocation is asynchronous, so a foreground Child result is never
-redelivered through the mailbox. If a process
-stops after the terminal append but before `runtime_input.posted`, resume reconstructs
-the same stable event and delivers it once unless a completed model transaction already
-consumed its id. Forks ignore inherited terminal inputs and pending parent posts.
+## Child and mailbox records
 
-Child supervision writes `child.started` before constructing an Engine and
-`child.terminal` before parent notification. Resume restores terminal results and closes
-any start without a terminal as `interrupted`; it never reattaches or replays a Child
-Engine. A terminal created during recovery is included before the resumed inbox opens.
-Forks preserve inherited facts for audit but receive no control authority over parent
-handles. Resuming a terminal Child for follow-up remains an application-owned Session
-concern.
+Child supervision writes `child.started` before constructing the child Agent and
+`child.terminal` before parent notification. Recovery rebuilds a started child from
+its own loop journal when that journal holds a durable run terminal record, and
+closes it as `interrupted` otherwise; it never reattaches or replays a child Agent.
+A terminal created during recovery is persisted before the supervisor reports
+recovered results. Forks preserve inherited facts for audit but receive no control
+authority over parent handles.
+
+Parent messages to an active child are journaled as `runtime_input.posted` before
+the message enters the child run's steering queue, so mailbox acceptance is
+journal-recoverable and the message becomes visible at the child's next turn safe
+point.

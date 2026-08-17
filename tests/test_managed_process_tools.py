@@ -11,12 +11,9 @@ from typing import Any
 import pytest
 
 from qitos.core.journal import JournalRecordType
-from qitos.core.action import Action, ActionStatus
 from qitos.core.budget import BudgetLedger
 from qitos.core.process import ProcessStatus
 from qitos.core.tool_registry import ToolRegistry
-from qitos.engine.action_executor import ActionExecutor
-from qitos.engine.states import RuntimeBudget
 from qitos.kit.env.host_env import HostCommandCapability
 from qitos.kit.env.managed_process import ManagedHostProcessRuntime
 from qitos.kit.journal import JsonlSessionJournal
@@ -395,70 +392,4 @@ async def test_process_output_is_fully_written_to_log_with_a_bounded_summary(
     assert log_path.read_text(encoding="utf-8") == content
     assert len(result["model_summary"]) <= 8_000
     assert "omitted" in result["model_summary"]
-    await tools.ateardown({})
-
-
-class _ProcessExecutorEngine:
-    def __init__(self) -> None:
-        self.active_run_id = "run-timeout"
-        self.agent = SimpleNamespace()
-        self.budget = RuntimeBudget()
-        self.budget_ledger = BudgetLedger()
-        self.events: list[Any] = []
-        self.journal = None
-
-    @property
-    def runtime_deadline_monotonic(self) -> float | None:
-        return None
-
-    def remaining_runtime_seconds(self) -> float | None:
-        return None
-
-    async def apost_runtime_event(self, event: Any, *, run_id: str) -> bool:
-        _ = event, run_id
-        return True
-
-
-@pytest.mark.asyncio
-async def test_action_timeout_preserves_the_running_process_handle(
-    tmp_path: Path,
-) -> None:
-    tools = CodingToolSet(workspace_root=str(tmp_path), profile="shell")
-    run_command = copy(tools.run_command)
-    run_command.spec = copy(tools.run_command.spec)
-    run_command.spec.timeout_s = 0.03
-    engine = _ProcessExecutorEngine()
-    result = (
-        await ActionExecutor(
-            ToolRegistry().register(run_command),
-            engine=engine,
-            auto_approve=True,
-        ).execute(
-            [
-                Action(
-                    name="run_command",
-                    args={
-                        "command": _python_command("import time; time.sleep(60)"),
-                        "yield_time_ms": 1000,
-                    },
-                )
-            ]
-        )
-    )[0]
-
-    assert result.status is ActionStatus.TIMED_OUT
-    assert result.metadata["worker_still_running"] is True
-    assert result.output["process_status"] == ProcessStatus.RUNNING.value
-    process_id = result.output["process_id"]
-    context = _runtime_context(engine.active_run_id)
-    queried = await tools.process_read.execute(
-        {"process_id": process_id},
-        runtime_context=context,
-    )
-    assert queried["process_status"] == ProcessStatus.RUNNING.value
-
-    await tools.process_terminate.execute(
-        {"process_id": process_id},
-        runtime_context=context,
-    )
     await tools.ateardown({})

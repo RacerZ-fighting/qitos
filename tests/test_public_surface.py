@@ -8,13 +8,15 @@ def test_top_level_public_core_symbols_importable() -> None:
     import qitos
 
     stable = {
-        "AgentModule",
-        "StateSchema",
-        "Decision",
-        "Action",
+        "Agent",
+        "AgentLoopResult",
+        "AgentRunStatus",
+        "Message",
+        "AssistantMessage",
+        "ToolCall",
+        "ToolResultMessage",
         "BaseTool",
         "ToolRegistry",
-        "Engine",
         "RunSpec",
         "ExperimentSpec",
         "BenchmarkRunResult",

@@ -4,16 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from examples._support import SequenceModel
-from qitos.core import HistoryMessage, TerminalCapability
+from qitos.core import TerminalCapability
 from qitos.kit import (
     SendTerminalKeys,
-    TerminusJsonParser,
-    TerminusXmlParser,
-    TokenBudgetSummaryHistory,
     TmuxEnv,
 )
-
 
 class FakeTerminal(TerminalCapability):
     def __init__(self):
@@ -140,114 +135,3 @@ def test_tmux_env_can_wrap_custom_terminal_backend(tmp_path: Path) -> None:
     assert step.done is False
     env.teardown()
     assert terminal.closed is True
-
-
-def test_terminus_json_parser_handles_actions_completion_and_feedback() -> None:
-    parser = TerminusJsonParser()
-    act = parser.parse(
-        '{"analysis":"check state","plan":"list files","commands":[{"keystrokes":"ls\\n","duration":0.1}]}'
-    )
-    assert act.mode == "act"
-    assert act.actions[0]["name"] == "send_terminal_keys"
-    assert act.meta["plan"] == "list files"
-
-    complete = parser.parse(
-        '{"analysis":"done","plan":"finish","commands":[],"task_complete":true}'
-    )
-    assert complete.mode == "wait"
-    assert complete.meta["task_complete_requested"] is True
-
-    tool_act = parser.parse(
-        '{"analysis":"inventory repo","plan":"use audit tools","tools":[{"name":"audit_inventory","args":{}},{"name":"grep","args":{"pattern":"SECRET_KEY"}}]}'
-    )
-    assert tool_act.mode == "act"
-    assert [item["name"] for item in tool_act.actions] == [
-        "audit_inventory",
-        "grep",
-    ]
-
-    wrapped = parser.parse(
-        """I found the next step:
-
-```json
-{'analysis': 'inspect files', 'plan': 'use audit inventory', 'tools': [{'name': 'audit_inventory', 'args': {}}]}
-```
-
-This should help.
-"""
-    )
-    assert wrapped.mode == "act"
-    assert wrapped.actions[0]["name"] == "audit_inventory"
-    assert wrapped.meta["parser_diagnostics"]["severity"] == "warning"
-    assert wrapped.meta["parser_diagnostics"]["salvage_applied"] is True
-    assert wrapped.meta["parser_diagnostics"]["extraction_mode"] == "python_literal"
-
-    largest = parser.parse(
-        """Context before.
-{"analysis":"small","plan":"skip","commands":[{"keystrokes":"pwd\\n","duration":0.1}]}
-More notes.
-{"analysis":"inspect files","plan":"use tools","tools":[{"name":"audit_inventory","args":{}},{"name":"grep","args":{"pattern":"SECRET_KEY","glob":"**/*"}}]}
-Context after.
-"""
-    )
-    assert largest.mode == "act"
-    assert [item["name"] for item in largest.actions] == [
-        "audit_inventory",
-        "grep",
-    ]
-    assert largest.meta["parser_diagnostics"]["extraction_mode"] == "extracted"
-
-    malformed = parser.parse('before {"analysis":"x"')
-    assert malformed.mode == "wait"
-    assert malformed.meta["parser_error"] is True
-    assert malformed.meta["parser_diagnostics"]["code"] in {
-        "invalid_json",
-        "missing_required_field",
-    }
-    assert malformed.meta["parser_diagnostics"]["extraction_mode"] in {
-        "extracted",
-        "brace_fix",
-    }
-    assert "Return valid JSON" in malformed.meta["parser_feedback"]
-
-
-def test_terminus_xml_parser_salvages_missing_response_close() -> None:
-    parser = TerminusXmlParser()
-    output = parser.parse(
-        '<response><analysis>inspect</analysis><plan>run pwd</plan><commands><keystrokes duration="0.1">pwd\n</keystrokes></commands>'
-    )
-    assert output.mode == "act"
-    assert output.actions[0]["args"]["keystrokes"].startswith("pwd")
-    assert "AUTO-CORRECTED" in output.meta.get("parser_warning", "")
-
-    tool_output = parser.parse(
-        '<response><analysis>inspect</analysis><plan>audit</plan><tools><tool name="audit_inventory"></tool><tool name="read_file"><arg name="path">app.py</arg></tool></tools></response>'
-    )
-    assert tool_output.mode == "act"
-    assert [item["name"] for item in tool_output.actions] == [
-        "audit_inventory",
-        "read_file",
-    ]
-
-
-def test_token_budget_history_summarizes_older_messages() -> None:
-    history = TokenBudgetSummaryHistory(max_tokens=30, keep_last=2, hard_window=20)
-    for idx in range(6):
-        role = "user" if idx % 2 == 0 else "assistant"
-        history.append(
-            HistoryMessage(
-                role=role,
-                content=f"message {idx} with extra context to consume tokens",
-                step_id=idx,
-            )
-        )
-    retrieved = history.retrieve(
-        query={
-            "roles": ["user", "assistant"],
-            "max_items": 6,
-            "max_tokens": 30,
-            "pending_content": "next prompt",
-        }
-    )
-    assert len(retrieved) <= 3
-    assert retrieved[0].metadata.get("summary") is True

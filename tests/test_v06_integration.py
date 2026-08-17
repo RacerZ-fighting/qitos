@@ -59,31 +59,6 @@ class TestWebBrowserEnvIntegration:
         assert "click" in parsed["allowed_actions"]
 
 
-# ---- AgentSpec fields ----
-
-class TestAgentSpecFields:
-    def test_agent_spec_model_override_field(self):
-        """AgentSpec.model_override is accessible and defaults to None."""
-        from qitos.core.agent_spec import AgentSpec, AgentRegistry, ContextStrategy
-        from qitos.core.state import StateSchema
-        from qitos.core.agent_module import AgentModule
-
-        class _TestAgent(AgentModule):
-            def init_state(self):
-                return StateSchema()
-            def reduce(self, decision, state=None):
-                return state or {}
-
-        agent = _TestAgent(llm=None)
-        spec = AgentSpec(
-            name="test_agent",
-            description="Test",
-            agent=agent,
-            model_override="gpt-4o",
-        )
-        assert spec.model_override == "gpt-4o"
-        assert spec.tools_override is None
-
 # ---- Multimodal capability fallback integration ----
 
 class TestMultimodalFallbackIntegration:

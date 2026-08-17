@@ -11,23 +11,22 @@
 QitOS is the torch-flavor framework for agent researchers.
 
 Current releases prototype methods and inspect long-horizon
-trajectories on one `AgentModule + Engine` runtime with built-in `qita`
-observability. The accepted next runtime architecture will replace that path in
-place with a provider-neutral Model, a minimal async Agent loop, and a durable
-Session/Harness; the shipped API documentation remains authoritative until that
-migration lands.
+trajectories on the provider-neutral minimal async Agent loop (`Message ->
+Model -> ToolCall -> ToolResult`) behind the `Agent` façade, with built-in
+`qita` observability. The retired `AgentModule + Engine` lifecycle, checkpoint
+store, prompt-injected parsers/critics, recipes, and benchmark execution
+adapters are removed; the changelog records the migration.
 
 
 [Quickstart](https://qitor.mintlify.app/quickstart) · [Tutorial Track](https://qitor.mintlify.app/tutorials) · [CLI Reference](https://qitor.mintlify.app/reference/cli) · [Changelog](CHANGELOG.md) · [Chinese README](README.zh.md)
 
 ## What's New
 
-- **Accepted Pi-aligned runtime architecture**: the next runtime refactor replaces
-  `AgentModule + Engine` in place with `Model -> minimal async Agent loop ->
-  Session/Harness -> application composition`; it will not add a parallel V2 path.
-  A durable, goal-bearing Task becomes the work root for Root and Child Agents,
-  while benchmark inputs, environment handles, metrics, and application plugin
-  policy stay outside that Task contract. See the
+- **Pi-aligned runtime is the mainline**: the `Agent` façade drives the minimal
+  async `Message -> Model -> ToolCall -> ToolResult` loop with typed messages,
+  one immutable model/Tool snapshot per turn, journaled transactions, and
+  façade-driven child agents. The retired `AgentModule + Engine` lifecycle is
+  removed. See the
   [target architecture](docs/internal/architecture/agent-runtime.md) and
   [migration plan](docs/internal/plans/pi-aligned-agent-runtime.md).
 - **Cache-stable long runs**: canonical model history stays append-only between explicit
@@ -466,12 +465,10 @@ Security-sensitive tools are explicit opt-in imports and are not part of `qitos`
 - Start here: [Introduction](https://qitor.mintlify.app/introduction)
 - First successful run: [Quickstart](https://qitor.mintlify.app/quickstart)
 - Install options: [Installation](https://qitor.mintlify.app/installation)
-- Build your own minimal coding agent: [First Agent](https://qitor.mintlify.app/guides/build-your-first-agent)
-- Learn the runtime: [AgentModule](https://qitor.mintlify.app/concepts/agent-module) / [Engine](https://qitor.mintlify.app/concepts/engine)
+- Compose your own agent: [Kit Reference](https://qitor.mintlify.app/reference/kit)
 - Inspect traces: [Observability](https://qitor.mintlify.app/guides/observability)
 - Follow the course: [Tutorials](https://qitor.mintlify.app/tutorials)
 - Check commands: [CLI Reference](https://qitor.mintlify.app/reference/cli)
-- Need API details: [API Reference](https://qitor.mintlify.app/reference/api)
 
 ## Preview
 
@@ -504,10 +501,8 @@ Security-sensitive tools are explicit opt-in imports and are not part of `qitos`
 
 QitOS is currently **Beta**.
 
-- Stable behavior during migration: trace/qita flow, canonical durable records,
-  benchmark adapters, and official reproducible-run contracts.
-- Accepted runtime direction: replace `AgentModule + Engine` in place with the
-  Model / minimal Agent loop / Session-Harness architecture described above.
+- Stable behavior: the minimal Agent loop and façade, canonical durable
+  journals, and the trace/qita flow.
 - Likely to evolve: public Agent/runtime APIs, higher-level convenience APIs, some
   `kit` modules, and experimental toolsets.
 - If you are evaluating adoption, start from the kernel and examples, not assumptions about frozen surface area.

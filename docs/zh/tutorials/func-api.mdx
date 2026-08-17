@@ -68,7 +68,7 @@ def search(pattern: str, max_results: int = 10) -> list[str]:
 | `concurrency_safe` | `bool` | `False` | 表示工具可安全并行执行 |
 
 未配置 `retry_policy` 时，工具只调用一次。输入校验、审批与权限检查不会重复，
-所有调用 attempt 共享 `timeout_s` 和 Engine 的运行 deadline。
+所有调用 attempt 共享 `timeout_s` 和 run 的运行 deadline。
 
 ## Step 3: 类型注解自动转换为 ToolSpec 参数
 
@@ -191,10 +191,4 @@ class GetTimeTool(BaseTool):
 ## 下一步
 
 <CardGroup cols={2}>
-  <Card title="MCP 集成" icon="plug" href="/tutorials/mcp-integration">
-    将外部 MCP 服务器工具桥接到 QitOS，复用同一 FunctionTool 接口。
-  </Card>
-  <Card title="构建你的第一个智能体" icon="code" href="/guides/build-your-first-agent">
-    在 AgentModule 中使用你的工具，运行真实的大模型循环。
-  </Card>
 </CardGroup>

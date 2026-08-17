@@ -6,7 +6,6 @@ import json
 
 from qitos.benchmark.common import write_benchmark_results
 from qitos.core.spec import BenchmarkRunResult
-from qitos.render import ClaudeStyleHook
 from qitos.trace.events import TraceEvent
 from qitos.trace.redaction import REDACTED_FIELDS, REDACTED_MARKER, redact_mapping
 from qitos.trace.writer import TraceWriter
@@ -192,34 +191,3 @@ def test_benchmark_result_writer_redacts_sensitive_metadata(tmp_path):
         payload["metadata"]["execution"]["run_spec"]["environment"]["nested"]["token"]
         == REDACTED_MARKER
     )
-
-
-def test_render_jsonl_redacts_sensitive_payload(tmp_path):
-    """Terminal render event jsonl should not persist raw run metadata secrets."""
-    path = tmp_path / "render_events.jsonl"
-    hook = ClaudeStyleHook(output_jsonl=str(path))
-
-    hook._emit(
-        "engine_event",
-        "init",
-        step_id=0,
-        payload={
-            "run_meta": {
-                "run_spec": {
-                    "environment": {
-                        "api_key": "sk-render-secret",
-                        "nested": {"token": "render-token"},
-                    }
-                }
-            }
-        },
-    )
-
-    text = path.read_text()
-    payload = json.loads(text)
-
-    assert "sk-render-secret" not in text
-    assert "render-token" not in text
-    env = payload["payload"]["run_meta"]["run_spec"]["environment"]
-    assert env["api_key"] == REDACTED_MARKER
-    assert env["nested"]["token"] == REDACTED_MARKER

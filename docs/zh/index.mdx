@@ -3,7 +3,7 @@ title: "QitOS 文档"
 description: "面向智能体研究者的类 PyTorch 风格框架，用可追踪的单一运行时构建可复现 LLM 智能体。"
 ---
 
-QitOS 是面向智能体（agent）研究者的类 PyTorch 风格框架。当前版本通过已发布的 `AgentModule + Engine` 运行时原型化方法、运行基准测试（benchmark），并用内建 `qita` 观察长时运行轨迹（trajectory）。已经确认的下一版架构会原地替换为 Model、最小异步 Agent loop 和可恢复 Session/Harness；迁移完成前，下列指南继续准确描述当前安装版本。
+QitOS 是面向智能体（agent）研究者的类 PyTorch 风格框架。当前版本在 `Agent` façade 背后的最小异步 Agent loop 上原型化方法、观察长时运行轨迹（trajectory），并内置 `qita` 可观测性。
 
 ## 两种编写方式
 
@@ -18,23 +18,17 @@ QitOS 提供两种顶层的智能体编写方式：
   <Card title="快速开始" icon="rocket" href="/zh/quickstart">
     2 分钟内跑起第一个智能体
   </Card>
-  <Card title="构建第一个智能体" icon="code" href="/zh/guides/build-your-first-agent">
-    按步骤理解状态、工具、运行和追踪记录（trace）
+  <Card title="教程" icon="graduation-cap" href="/zh/tutorials">
+    按主题学习工具、预设与可观测性
   </Card>
-  <Card title="教程课程" icon="graduation-cap" href="/zh/tutorials">
-    通过四节课程式教程学习 QitOS 的智能体设计方法
-  </Card>
-  <Card title="核心概念" icon="book" href="/zh/concepts/agent-module">
-    理解 AgentModule、Engine、State、Tools 与追踪记录
-  </Card>
-  <Card title="API 参考" icon="rectangle-terminal" href="/zh/reference/api">
-    查看公开 Python API 与 CLI
+  <Card title="Kit 参考" icon="toolbox" href="/zh/reference/kit">
+    工具、子智能体、日志、记忆、环境与模型
   </Card>
 </CardGroup>
 
 <CardGroup cols={2}>
-  <Card title="研究优先路径" icon="flask" href="/zh/guides/build-your-first-agent">
-    手写提示词、解析器、协议与工具面，直接理解内核。
+  <Card title="façade 优先路径" icon="flask" href="/zh/quickstart">
+    直接组合 Agent façade：模型、工具注册表与提示词。
   </Card>
   <Card title="预设优先路径" icon="shuffle" href="/zh/tutorials/switch-model-families">
     用家族预设在同一个示例里快速切换多个模型家族。
@@ -81,14 +75,14 @@ QitOS 提供两种顶层的智能体编写方式：
 ## 特色设计
 
 <CardGroup cols={2}>
-  <Card title="单一执行内核" icon="cpu" href="/zh/concepts/engine">
-    示例、评测与生产型智能体全都运行在同一条 canonical runtime 上
+  <Card title="最小 agent loop" icon="cpu" href="/zh/quickstart">
+    Agent façade 背后只有一条 canonical 的 Message -> Model -> ToolCall -> ToolResult 主链路
   </Card>
-  <Card title="协议感知解析" icon="brackets-curly" href="/zh/reference/kit">
-    提示词格式与解析器选择是显式设计，而不是隐藏的胶水层
+  <Card title="类型化工具" icon="brackets-curly" href="/zh/reference/kit">
+    工具声明严格的输入 schema，并经统一的准入与执行管线运行
   </Card>
-  <Card title="长时运行上下文控制" icon="clock-rotate-left" href="/zh/guides/memory-and-history">
-    HistoryPolicy、CompactHistory 与记忆适配器共同处理长时任务
+  <Card title="长时运行上下文控制" icon="clock-rotate-left" href="/zh/reference/kit">
+    记忆适配器与持久化 journal 支撑长时任务
   </Card>
   <Card title="以 qita 为核心的可追溯性" icon="chart-line" href="/zh/guides/observability">
     看板、回放与导出都建立在结构化追踪产物（artifact）之上

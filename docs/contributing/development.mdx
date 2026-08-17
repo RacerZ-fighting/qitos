@@ -54,7 +54,7 @@ python -m mypy qitos/core qitos/engine qitos/models qitos/trace
 Run coverage gate:
 
 ```bash
-pytest --cov=qitos.core --cov=qitos.engine --cov=qitos.trace --cov-report=term --cov-fail-under=80 -q
+pytest --cov=qitos.core --cov=qitos.trace --cov-report=term -q
 ```
 
 Build the package:
@@ -107,12 +107,6 @@ Security-sensitive tools must require explicit opt-in imports and must not be ex
 ### Adding A Product Agent
 
 Keep QitOS examples small, teaching-first, and focused on one framework concept at a time; product-grade agents belong in downstream product repositories.
-
-### Changing Engine Behavior
-
-1. Preserve `Decision` as the execution contract.
-2. Add or update hook/trace coverage.
-3. Verify qita and parser behavior if event payloads change.
 
 ### Removing Or Replacing APIs
 

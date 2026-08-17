@@ -66,18 +66,18 @@ Unknown counts remain `None`; QitOS does not turn missing provider facts into ze
 `to_dict()` returns the complete provider-neutral/provider-specific mapping retained
 for compatibility, cache, trace, and later cost attribution.
 
-Engine context telemetry records `usage_source` as `provider`, `estimate`, or
+Run context telemetry records `usage_source` as `provider`, `estimate`, or
 `absent`. Provider zeroes are authoritative. Cache-read, cache-write, and reasoning
 counts are observable subsets and are not added again to cumulative input/output
 totals.
 
-Completed Engine transactions also expose local monotonic timing through
+Completed model transactions also expose local monotonic timing through
 `ModelResponse.timing`. `time_to_first_event_ms` includes provider lifecycle events;
 `time_to_first_content_ms` waits for text, reasoning, or a tool-call event, and
 `total_ms` ends only after the terminal stream transaction is complete. These fields
 are retained in local trace summaries and require neither a remote telemetry exporter
 nor an additional provider request. Model caches retain the completed normalized stream,
-not historical latency: a cache hit receives fresh Engine timing for that consumption
+not historical latency: a cache hit receives fresh run timing for that consumption
 while preserving the same response, usage, native items, and business result.
 
 ## Select a family and wire independently

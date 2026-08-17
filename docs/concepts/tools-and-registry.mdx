@@ -1,10 +1,10 @@
 ---
 title: "Tools and Registry"
-description: "QitOS tools are plain Python callables marked with the @tool decorator. ToolRegistry collects them and makes them available to the Engine for execution."
+description: "QitOS tools are plain Python callables marked with the @tool decorator. ToolRegistry collects them and makes them available to the agent loop for execution."
 ---
 
-Tools are the actions your agent can take. At runtime, the Engine uses `ToolRegistry`
-for exact-name lookup, then `ActionExecutor` validates, authorizes, and executes the
+Tools are the actions your agent can take. At runtime, the agent loop uses `ToolRegistry`
+for exact-name lookup, then the Tool executor validates, authorizes, and executes the
 resolved tool.
 
 ## The `@tool` decorator
@@ -30,7 +30,7 @@ def read_file(path: str) -> str:
 
 | Parameter     | Type                        | Description                                                                  |
 | ------------- | --------------------------- | ---------------------------------------------------------------------------- |
-| `name`        | `str \| None`               | Tool name used in `Decision.actions`. Defaults to the function's `__name__`. |
+| `name`        | `str \| None`               | Tool name used in model `ToolCall`s. Defaults to the function's `__name__`. |
 | `description` | `str \| None`               | Description shown to the LLM. Falls back to the function's docstring.        |
 | `group`       | `str`                        | Application-defined exposure group. Defaults to `"default"`.                |
 | `timeout_s`   | `float \| None`             | Whole-action timeout, including admission, retries, and invocation.          |
@@ -38,14 +38,14 @@ def read_file(path: str) -> str:
 | `permissions` | `ToolPermission \| None`    | Declares which system capabilities this tool requires.                        |
 | `required_ops`| `list[str] \| None`         | Low-level operation identifiers required from the environment.               |
 
-`ActionExecutor` is the only tool retry owner. Validation, permission checks, and
+The Tool executor is the only tool retry owner. Validation, permission checks, and
 approval run once; only the admitted invocation may repeat. All attempts and backoff
-share the tool timeout and the Engine's earlier runtime deadline. Provider or HTTP
+share the tool timeout and the run's earlier runtime deadline. Provider or HTTP
 client retries must remain disabled when an explicit `RetryPolicy` is attached.
 
 ### `ToolPermission`
 
-`ToolPermission` declares what the tool is allowed to do. The Engine uses this information during preflight validation to check environment capabilities.
+`ToolPermission` declares what the tool is allowed to do. The executor uses this information during preflight validation to check environment capabilities.
 
 ```python
 from qitos.core.tool import ToolPermission
@@ -65,7 +65,7 @@ All four fields default to `False`.
 
 ## ToolRegistry
 
-`ToolRegistry` is the collection the Engine queries when dispatching actions. Pass it to your `AgentModule` via the constructor.
+`ToolRegistry` is the collection the agent loop queries when dispatching Tool calls. Pass it to the `Agent` constructor.
 
 ```python
 from qitos import ToolRegistry
@@ -151,23 +151,16 @@ lookups all use the same exact names.
 ### Freeze one turn's tool exposure
 
 Keep `ToolRegistry` as the mutable, run-owned catalog. At the start of every model
-turn, Engine calls `AgentModule.build_tool_exposure()` and receives a read-only
-`ToolExposure`. The model schema and action dispatcher use that same snapshot. A tool
+turn, the loop freezes it into a read-only `ToolExposure`. The model schema and the
+Tool dispatcher use that same snapshot. A tool
 registered while the model request is running can appear on the next turn, but it
 cannot be called through the current turn's dispatcher.
 
-The default hook freezes every registered tool. Override it when your application
-needs profile, capability, Skill, or policy-based selection:
+The default behavior freezes every registered tool. Select a subset explicitly when
+your application needs profile, capability, Skill, or policy-based selection:
 
 ```python
-class ProductAgent(AgentModule):
-    def build_tool_exposure(self, state, tool_registry):
-        selected = [
-            name
-            for name in tool_registry.list_tools()
-            if tool_registry.get(name).spec.group in state.enabled_tool_groups
-        ]
-        return tool_registry.freeze(
+exposure = tool_registry.freeze(
             selected,
             metadata={"profile": state.profile},
         )
@@ -248,8 +241,8 @@ Class-based tools have one asynchronous execution entry:
 `await execute(args, runtime_context)`. The
 registry resolves only the exact registered name and does not execute tools itself.
 There are no `run`/`call` adapters, short aliases, separator aliases, or case repair.
-Use `ActionExecutor` (normally through `Engine`) when permission, timeout, retry, and
-result handling must apply. `read_only=True` describes effects; only an explicit
+The `ToolBatchExecutor` applies permission, timeout, retry, and
+result handling uniformly. `read_only=True` describes effects; only an explicit
 `concurrency_safe=True` permits parallel execution.
 
 At turn capture, QitOS deep-copies the Tool definition while retaining the registered
@@ -289,8 +282,8 @@ The canonical statuses are `success`, `partial`, `running`, `error`, `skipped`,
 `needs_user_input`, `output_limit_exceeded`, `cancelling`, and `canceled` are rejected
 rather than normalized. Any unknown explicit status is an error, not inferred success.
 Handlers do not need to manufacture correlation identity. Before finalization, the
-Engine copies the canonical Action identity into `ToolResult.call_id`; Journal replay,
-History, reducers, and traces therefore refer to the same model ToolCall.
+executor copies the canonical ToolCall identity into `ToolResult.call_id`; journal replay
+and traces therefore refer to the same model ToolCall.
 
 Execution lifecycle and domain outcome are separate. For example, an empty search ran
 successfully even though it found nothing:
@@ -310,25 +303,23 @@ states even when the executor successfully obtained the snapshot.
 
 ### Durable long outputs
 
-Pass a file store to the Engine when tools can return output larger than the model
-budget:
+When tools can return output larger than the model budget, persist the complete
+payload in a `FileArtifactStore` and return a typed `ArtifactRef` on the
+`ToolResult`:
 
 ```python
-from qitos import Engine
 from qitos.kit import FileArtifactStore
 
 artifacts = FileArtifactStore(
     ".agent/artifacts",
     reference_root=".",
 )
-engine = Engine(agent, artifact_store=artifacts)
 ```
 
-The Engine writes the complete output before it creates a bounded model replacement.
-`ToolResult.output` remains canonical for reducers and traces. The typed
-`ToolResult.artifacts` references the durable file, while `model_output` records the
-projection used by History and model-visible events. Checkpoint resume replays that
-exact History value instead of applying the current size threshold again.
+`ToolResult.output` remains canonical for journals and traces. The typed
+`ToolResult.artifacts` references the durable file, while `model_output` records
+the bounded projection the model actually sees; resume replays that stored
+projection instead of re-applying the current size threshold.
 
 Keep the artifact directory inside the tool workspace and set `reference_root` to that
 workspace. The path shown to the model is then workspace-relative and the existing
@@ -337,31 +328,22 @@ required.
 
 ---
 
-## Passing the registry to AgentModule
+## Passing the registry to the Agent façade
 
-Pass your populated `ToolRegistry` to `AgentModule.__init__()`:
-
-```python
-from qitos import AgentModule, ToolRegistry, tool
-
-
-class SearchAgent(AgentModule[MyState, dict, Action]):
-    def __init__(self):
-        registry = ToolRegistry()
-        registry.register(web_search)
-        registry.register(read_file)
-        super().__init__(tool_registry=registry)
-```
-
-The Engine freezes `agent.tool_registry` for each turn and creates the turn's
-`ActionExecutor` from that exposure. You can also call
-`registry.get_tool_descriptions()` to inspect the complete registered catalog:
+Pass your populated `ToolRegistry` to the `Agent` constructor:
 
 ```python
-def build_system_prompt(self, state: MyState) -> str | None:
-    tools_text = self.tool_registry.get_tool_descriptions()
-    return f"You have access to these tools:\n\n{tools_text}"
+from qitos import Agent, ToolRegistry
+
+registry = ToolRegistry()
+registry.register(web_search)
+registry.register(read_file)
+agent = Agent(model=model, tool_registry=registry, system_prompt="...")
 ```
+
+The loop re-freezes the live registry at every turn boundary, so a Tool loaded
+during one turn becomes visible to the next turn's model request. You can call
+`registry.get_tool_descriptions()` to inspect the complete registered catalog.
 
 ---
 
@@ -395,45 +377,22 @@ def write_file(path: str, content: str) -> str:
 ```
 
 ```python agent.py
-from dataclasses import dataclass
-from typing import Any
+import asyncio
 
-from qitos import AgentModule, StateSchema, ToolRegistry
+from qitos import Agent, ToolRegistry
 
 from .tools import read_file, write_file
 
 
-@dataclass
-class EditorState(StateSchema):
-    files_read: list[str] = None
+async def main() -> None:
+    registry = ToolRegistry()
+    registry.register(read_file)
+    registry.register(write_file)
+    agent = Agent(model=llm, tool_registry=registry, max_turns=10)
+    result = await agent.prompt("Read notes.txt and summarize it.")
+    print(result.status, result.error)
 
-    def __post_init__(self):
-        if self.files_read is None:
-            self.files_read = []
 
-
-class EditorAgent(AgentModule[EditorState, dict[str, Any], Any]):
-    def __init__(self, llm):
-        registry = ToolRegistry()
-        registry.register(read_file)
-        registry.register(write_file)
-        super().__init__(tool_registry=registry, llm=llm)
-
-    def init_state(self, task: str, **kwargs: Any) -> EditorState:
-        return EditorState(task=task, max_steps=int(kwargs.get("max_steps", 10)))
-
-    def build_system_prompt(self, state: EditorState) -> str | None:
-        return (
-            "You are a file editor.\n\n"
-            f"Tools:\n{self.tool_registry.get_tool_descriptions()}"
-        )
-
-    def reduce(self, state: EditorState, observation: dict, decision) -> EditorState:
-        for action in decision.actions:
-            if action.name == "read_file":
-                state.files_read.append(action.args.get("path", ""))
-        if decision.final_answer:
-            state.final_result = decision.final_answer
-        return state
+asyncio.run(main())
 ```
 </CodeGroup>

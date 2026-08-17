@@ -3,7 +3,7 @@ title: "QitOS Documentation"
 description: "The torch-flavor framework for agent researchers building reproducible, traceable LLM agents."
 ---
 
-QitOS is a PyTorch-style framework for agent researchers. Current releases let you prototype methods, run benchmarks, and inspect long-horizon trajectories through the shipped `AgentModule + Engine` runtime, with built-in observability via `qita` (the trace viewer that ships with QitOS). The accepted next architecture replaces that runtime in place with a Model, minimal async Agent loop, and durable Session/Harness; the guides below continue to document the installed release until migration completes.
+QitOS is a PyTorch-style framework for agent researchers. Current releases let you prototype methods and inspect long-horizon trajectories on the minimal async Agent loop behind the `Agent` façade, with built-in observability via `qita` (the trace viewer that ships with QitOS).
 
 ## Two authoring paths
 
@@ -18,23 +18,17 @@ Both paths are first-class citizens in the framework.
   <Card title="Quick Start" icon="rocket" href="/quickstart">
     Run your first agent in under 2 minutes
   </Card>
-  <Card title="Build Your First Agent" icon="code" href="/guides/build-your-first-agent">
-    Step-by-step walkthrough to build a working agent
+  <Card title="Tutorials" icon="graduation-cap" href="/tutorials">
+    Task-focused lessons on tools, presets, and observability
   </Card>
-  <Card title="Tutorial Track" icon="graduation-cap" href="/tutorials">
-    Learn QitOS through four course-style agent builds
-  </Card>
-  <Card title="Core Concepts" icon="book" href="/concepts/agent-module">
-    Understand AgentModule, Engine, State, and Tools
-  </Card>
-  <Card title="API Reference" icon="rectangle-terminal" href="/reference/api">
-    Full reference for the public QitOS API
+  <Card title="Kit Reference" icon="toolbox" href="/reference/kit">
+    Tools, child agents, journals, memory, environments, and models
   </Card>
 </CardGroup>
 
 <CardGroup cols={2}>
-  <Card title="Research-first path" icon="flask" href="/guides/build-your-first-agent">
-    Handwrite prompt, parser, protocol, and tool surface on top of the kernel.
+  <Card title="Façade-first path" icon="flask" href="/quickstart">
+    Compose the Agent façade directly: model, tool registry, and prompt.
   </Card>
   <Card title="Preset-first path" icon="shuffle" href="/tutorials/switch-model-families">
     Use family presets to switch one example across multiple model families.
@@ -81,14 +75,14 @@ Both paths are first-class citizens in the framework.
 ## Featured designs
 
 <CardGroup cols={2}>
-  <Card title="Single kernel" icon="cpu" href="/concepts/engine">
-    One canonical runtime across examples, benchmarks, and production-style agents
+  <Card title="Minimal agent loop" icon="cpu" href="/quickstart">
+    One canonical Message -> Model -> ToolCall -> ToolResult path behind the Agent façade
   </Card>
-  <Card title="Protocol-aware parsers" icon="brackets-curly" href="/reference/kit">
-    Prompt format and parser choice are paired intentionally, not left as implicit glue code
+  <Card title="Typed tools" icon="brackets-curly" href="/reference/kit">
+    Tools declare strict input schemas and run through one admission/execution pipeline
   </Card>
-  <Card title="Long-running context control" icon="clock-rotate-left" href="/guides/memory-and-history">
-    History policy, summary history, compact history, and memory adapters for sustained runs
+  <Card title="Long-running context control" icon="clock-rotate-left" href="/reference/kit">
+    Memory adapters and durable journals for sustained runs
   </Card>
   <Card title="Traceability with qita" icon="chart-line" href="/guides/observability">
     Board, replay, and export built on top of structured trace artifacts

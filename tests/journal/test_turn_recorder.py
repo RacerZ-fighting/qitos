@@ -154,7 +154,6 @@ async def test_committed_tool_transaction_is_queryable_after_reopen(tmp_path) ->
     await reopened.close()
 
     assert view is not None
-    assert view.step_id is None and view.action_index is None
     assert view.action.id == "c1"
     assert view.action.name == "echo"
     assert view.result.status == "success"

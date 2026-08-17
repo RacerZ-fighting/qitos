@@ -28,7 +28,6 @@ from ...core.journal import (
     ToolTransaction,
     resolve_inherited_record,
 )
-from ...core.action import Action
 from ...core.message import ToolCall
 from ...core.tool_result import ToolResult
 from ._sqlite_index import (
@@ -793,54 +792,26 @@ def _tool_transaction(
     except (TypeError, ValueError) as exc:
         raise JournalCorruptionError("tool.terminal payload is invalid") from exc
 
+    # Only the minimal agent loop's schema is decodable: the typed ToolCall
+    # travels with the terminal record alongside its turn number. Retired
+    # Engine records (step_id/action_index/action) fail closed here.
     raw_call = payload.get("call")
-    if raw_call is not None:
-        # Minimal agent loop records: the typed ToolCall travels with the
-        # terminal record, and the turn number replaces step_id/action_index.
-        turn = payload.get("turn")
-        if (
-            isinstance(turn, bool)
-            or not isinstance(turn, int)
-            or turn < 0
-            or not isinstance(raw_call, Mapping)
-        ):
-            raise JournalCorruptionError("tool.terminal payload is invalid")
-        try:
-            call = ToolCall.from_dict(copy.deepcopy(dict(raw_call)))
-        except (TypeError, ValueError) as exc:
-            raise JournalCorruptionError("tool.terminal payload is invalid") from exc
-        return ToolTransaction(
-            terminal=JournalRecordRef(terminal.run_id, terminal.record_id),
-            committed_at=committed.position,
-            step_id=None,
-            action_index=None,
-            action=call,
-            result=result,
-        )
-
-    step_id = payload.get("step_id")
-    action_index = payload.get("action_index")
-    raw_action = payload.get("action")
+    turn = payload.get("turn")
     if (
-        isinstance(step_id, bool)
-        or not isinstance(step_id, int)
-        or step_id < 0
-        or isinstance(action_index, bool)
-        or not isinstance(action_index, int)
-        or action_index < 0
-        or not isinstance(raw_action, Mapping)
+        isinstance(turn, bool)
+        or not isinstance(turn, int)
+        or turn < 0
+        or not isinstance(raw_call, Mapping)
     ):
         raise JournalCorruptionError("tool.terminal payload is invalid")
     try:
-        action = Action.from_dict(copy.deepcopy(dict(raw_action)))
+        call = ToolCall.from_dict(copy.deepcopy(dict(raw_call)))
     except (TypeError, ValueError) as exc:
         raise JournalCorruptionError("tool.terminal payload is invalid") from exc
     return ToolTransaction(
         terminal=JournalRecordRef(terminal.run_id, terminal.record_id),
         committed_at=committed.position,
-        step_id=step_id,
-        action_index=action_index,
-        action=action,
+        action=call,
         result=result,
     )
 

@@ -7,12 +7,8 @@ QitOS public API surface.
 
 __version__ = "0.6.0"
 
-from .core.agent_module import AgentModule
 from .core.budget import BudgetLedger, BudgetSnapshot
-from .core.action import Action
-from .core.decision import Decision
 from .core.env import Env, EnvSpec
-from .core.errors import QitosRuntimeError, StopReason
 from .core.memory import Memory
 from .core.model_response import ModelResponse, ModelTiming
 from .core.model_request import ModelContinuation, ModelRequest
@@ -41,12 +37,9 @@ from .core.process import (
     ProcessStatus,
     ProcessTerminalNotifier,
 )
-from .core.history import History, HistoryPolicy, HistorySnapshot
-from .core.message_builder import ContextSnapshot, ContextSnapshotConflictError
-from .core.observation import Observation
+from .core.history import HistorySnapshot
 from .core.tool_result import ToolResult, ToolResultStatus
 from .core.artifact import ArtifactRef, ArtifactStore, ArtifactStoreError
-from .core.state import StateSchema
 from .core.work_plan import (
     WorkPlanContractError,
     WorkPlanItem,
@@ -75,16 +68,6 @@ from .core.tool import (
     tool,
 )
 from .core.tool_registry import ToolExposure, ToolRegistry
-from .core.agent_spec import (
-    AgentSpec,
-    AgentRegistry,
-    ContextStrategy,
-    HandoffContext,
-    StateAdapter,
-)
-from .engine.engine import Engine, EngineResult, StepSummary
-from .engine.events import EngineEvent, EngineEventType, EventStream
-from .engine.states import ContextConfig
 from .core.agent import Agent, AgentBusyError, AgentRunRejected, QueueMode
 from .core.agent_events import AgentEvent
 from .core.agent_loop import (
@@ -111,14 +94,8 @@ from .core.tool_executor import (
 )
 
 __all__ = [
-    "AgentModule",
     "BudgetLedger",
     "BudgetSnapshot",
-    "Engine",
-    "EngineEvent",
-    "EngineEventType",
-    "EventStream",
-    "EngineResult",
     "RuntimeInput",
     "DEFAULT_CHILD_MAX_STEPS",
     "AgentConclusion",
@@ -139,13 +116,10 @@ __all__ = [
     "ProcessSnapshot",
     "ProcessStatus",
     "ProcessTerminalNotifier",
-    "StepSummary",
-    "ContextConfig",
     "Task",
     "TaskResource",
     "TaskBudget",
     "TaskResult",
-    "StateSchema",
     "WorkPlanContractError",
     "WorkPlanItem",
     "WorkPlanState",
@@ -156,8 +130,6 @@ __all__ = [
     "render_work_plan_markdown",
     "work_plan_state_from_dict",
     "work_plan_state_to_dict",
-    "Decision",
-    "Action",
     "Memory",
     "ModelResponse",
     "ModelContinuation",
@@ -165,12 +137,7 @@ __all__ = [
     "ModelStreamEvent",
     "ModelStreamEventType",
     "ModelTiming",
-    "History",
-    "HistoryPolicy",
     "HistorySnapshot",
-    "ContextSnapshot",
-    "ContextSnapshotConflictError",
-    "Observation",
     "ToolResult",
     "ToolResultStatus",
     "ArtifactRef",
@@ -189,13 +156,6 @@ __all__ = [
     "ToolValidationResult",
     "ToolRegistry",
     "ToolExposure",
-    "AgentSpec",
-    "AgentRegistry",
-    "ContextStrategy",
-    "HandoffContext",
-    "StateAdapter",
-    "StopReason",
-    "QitosRuntimeError",
     "Agent",
     "AgentBusyError",
     "AgentRunRejected",

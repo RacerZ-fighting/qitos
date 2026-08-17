@@ -32,7 +32,6 @@ exclude = [
 [[tool.mypy.overrides]]
 module = [
   "qitos.kit.*",
-  "qitos.render.*",
   "qitos.benchmark.*",
 ]
 ignore_errors = true

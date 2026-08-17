@@ -7,23 +7,11 @@ description: "Shared language for runs, trajectories, actions, artifacts, replay
 
 ### Run
 
-One invocation of `AgentModule.run(...)` or an equivalent benchmark execution path that produces a trace directory.
+One `Agent.prompt(...)` invocation that produces a durable journal and, when traced, a trace directory.
 
 ### Trajectory
 
 The temporal record of one run: prompts, decisions, tool calls, observations, reductions, and stop conditions across steps.
-
-### Observation
-
-The structured data available to the agent after a step. In QitOS this usually includes action results and environment outputs.
-
-### Decision
-
-The engine-level semantic output of the agent loop. A decision may contain actions or a final answer.
-
-### Action
-
-A normalized tool invocation (normalized meaning the call is validated, typed, and expressed in a canonical format independent of the original model output) selected by the agent and executed by the runtime.
 
 ## Reproducibility terms
 
@@ -51,11 +39,9 @@ The serialized description of the tool surface exposed to the run. It is part of
 
 ### Prompt protocol
 
-The format contract between the model and the parser — it defines what structure the model output should have (e.g., ReAct text, JSON, XML, or a model-specific harness) so the parser can reliably extract a `Decision`.
-
-### Parser
-
-The component that converts raw model output into a `Decision`. The parser must match the prompt protocol.
+The API contract identity recorded for one model transaction (for example Chat
+Completions or the Responses API), derived from the model adapter's capability
+API.
 
 ### Context compaction
 
@@ -75,38 +61,6 @@ The single-run temporal playback view.
 
 The summary-level comparison view for two runs, focused on stop reason, result, step/event counts, parser diagnostics, config differences, and token/latency/cost summaries.
 
-## Quality control terms
-
-### Critic
-
-A runtime quality controller that evaluates agent behavior after each step. A critic returns a `CriticResult` with an action (continue, stop, or retry), a reason, a score, and optional patches to the agent's instructions or state.
-
-### CriticResult
-
-The structured output of a critic evaluation. Contains `action` (continue/stop/retry), `reason`, `score` (0.0–1.0), and optional `instruction_patch`, `state_patch`, or `modified_prompt` for retry actions.
-
-### instruction_patch
-
-Additional instruction text appended to the agent's system prompt on the next iteration when a critic returns a retry action.
-
-### state_patch
-
-Key-value pairs merged into the agent's state before the next iteration when a critic returns a retry action.
-
-## Runtime extensibility terms
-
-### EngineHook
-
-The base class for runtime extension points. Hooks observe the Engine loop at defined lifecycle points (step start/end, tool use, critic evaluation, etc.) without controlling execution flow.
-
-### HookContext
-
-The dataclass passed to hook callbacks, containing the current step ID, phase, state, observation, decision, and action results.
-
-### ToolHookContext
-
-An extended `HookContext` for tool-level events, adding `tool_name`, `tool_args`, `tool_result`, and `permission_decision` fields.
-
 ## Tool system terms
 
 ### @function_tool
@@ -119,16 +73,11 @@ A filter applied when bridging MCP server tools into a QitOS tool registry, cont
 
 ## Persistence terms
 
-### CheckpointStore
-
-The abstract interface for saving and loading agent run state. Implementations include `InMemoryCheckpointStore` and `SqliteCheckpointStore`.
-
 ### Fork
 
-Creating a new checkpoint branch from an existing checkpoint without overwriting the original. Supports time-travel (same thread) and true branching (new thread).
-
-Checkpoint writes are awaited at safe step boundaries. A failed write fails the
-run instead of being queued, dropped, or reported as successful.
+Creating a new Run journal from a committed position of an existing journal
+without overwriting the original. The fork owns an independent inherited prefix
+and can be forked again.
 
 ## Integration terms
 
@@ -146,10 +95,6 @@ An MCP server transport that communicates with a subprocess via stdin/stdout JSO
 
 Creating a customized copy of a built-in `FamilyPreset` using `preset.override(**kwargs)`. The original preset is never mutated; `override()` returns a new instance with the specified fields replaced.
 
-### MaxTokensCriteria
-
-A stop criterion that halts the Engine when cumulative token usage exceeds a budget. The Engine tracks `total_tokens` across all steps and passes it in `runtime_info`.
-
 ### Advisory defaults
 
 Optional fields on `FamilyPreset` (`recommended_max_steps`, `recommended_max_tokens`, `recommended_retry_budget`, `recommended_temperature`) that document tested baseline values. These are advisory only — the engine does not auto-apply them.
@@ -160,20 +105,6 @@ Optional fields on `FamilyPreset` (`recommended_max_steps`, `recommended_max_tok
 
 The canonical append-only writer for QitOS run manifests, runtime events, and completed
 step transactions. `qita` reads these artifacts for inspection, replay, and comparison.
-
-## Engine export terms
-
-### CriticTrace
-
-A structured record of a single critic evaluation within a run, captured as `EngineResult.critic_traces`. Contains `step_id`, `critic_name`, `action`, `reason`, `score`, and optional `instruction_patch`/`state_patch`.
-
-### HandoffTrace
-
-A structured record of an agent handoff within a run, captured as `EngineResult.handoff_traces`. Contains `step_id`, `from_agent`, `to_agent`, `context_strategy`, and `messages_passed`.
-
-### EngineConfig
-
-A frozen, serializable snapshot of Engine configuration produced by `Engine.export_config()`. Contains agent name, model ID, budget settings, critic names, protocol, and capability flags.
 
 ### ToolPermissionSpec
 

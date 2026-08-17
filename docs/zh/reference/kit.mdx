@@ -1,15 +1,15 @@
 ---
 title: "Kit 参考"
-description: "qitos.kit 的能力地图：解析器、记忆适配器、工具集、规划辅助、评估器与模型。"
+description: "qitos.kit 的能力地图：工具集、记忆适配器、环境、子智能体、日志与模型。"
 ---
 
-`qitos.kit` 提供可复用的智能体编写积木。所有组件都挂接在 `AgentModule + Engine` 主流水线上，不会引入第二个编排器。
+`qitos.kit` 提供可复用的智能体编写积木。组件直接组合 `Agent` façade 与最小 agent loop，不会引入第二个编排器。
 
 ```python
-from qitos.kit import ReActTextParser, WindowMemory, CodingToolSet, ...
+from qitos.kit import WindowMemory, CodingToolSet, HostEnv, ...
 ```
 
-如果你正在做 v0.4 的多模型研究，推荐优先查看 `qitos.harness`：
+如果你正在做多模型研究，推荐优先查看 `qitos.harness`：
 
 ```python
 from qitos.harness import build_harness_policy, build_model_for_preset
@@ -23,21 +23,11 @@ from qitos.harness import build_harness_policy, build_model_for_preset
 
 | 如果你在决定…… | 优先查看 |
 |---|---|
-| 模型该如何输出动作 | 解析器 |
-| 长时运行如何保住有效上下文 | 记忆与历史 / 上下文压缩 |
+| 长时运行如何保住有效上下文 | 记忆 |
 | 要暴露哪些工具 | 工具集 |
 | 从哪些现成注册表开始 | 预设构建器 |
-| 如何加规划或搜索结构 | 规划 |
 
 ## 能力总览
-
-### 解析器
-
-- `ReActTextParser`：解析 `Thought:` / `Action:` 文本协议
-- `JsonDecisionParser`：解析 JSON 决策对象
-- `XmlDecisionParser`：解析 XML 协议
-- `MiniMaxToolCallParser`：处理模型原生工具调用结构
-- `TerminusJsonParser` / `TerminusXmlParser`：处理带显式终止信号的格式
 
 ### 工具预设
 
@@ -51,82 +41,18 @@ from qitos.harness import build_harness_policy, build_model_for_preset
 
 ### 长时上下文能力
 
-- `WindowHistory`
-- `TokenBudgetSummaryHistory`
-- `CompactHistory`
 - `WindowMemory`
 - `SummaryMemory`
 - `VectorMemory`
 - `MarkdownFileMemory`
 
-### 规划与搜索
+### 规划
 
-- `UpdateWorkPlanTool` / `update_plan`：维护一份强类型、可随 checkpoint 恢复的轻量清单
-- `NumberedPlanBuilder`
-- `PlanCursor`
-- `DynamicTreeSearch`
+- `UpdateWorkPlanTool` / `update_plan`：维护一份强类型、可随 journal 恢复的轻量清单
 
 ---
 
 <Tabs>
-<Tab title="解析器">
-
-解析器负责把原始大模型输出转换成决策（智能体每步的结构化决策）。最重要的原则是：**解析器必须与提示词请求的输出格式一一对应。**
-
-<AccordionGroup>
-<Accordion title="ReActTextParser">
-
-用于解析带 `Thought:`、`Action:`、`Final Answer:` 标记的 ReAct 文本。
-
-```python
-from qitos.kit import ReActTextParser
-```
-
-当你的提示词要求模型输出文本 ReAct 协议时，就使用它。
-
-</Accordion>
-
-<Accordion title="JsonDecisionParser">
-
-用于解析 JSON 输出。适合需要更严格结构化契约的场景。
-
-```python
-from qitos.kit import JsonDecisionParser
-```
-
-</Accordion>
-
-<Accordion title="XmlDecisionParser">
-
-用于解析 XML 输出。适合需要 XML 风格结构控制的模型或协议。
-
-```python
-from qitos.kit import XmlDecisionParser
-```
-
-</Accordion>
-
-<Accordion title="Terminus 解析器">
-
-`TerminusJsonParser` 与 `TerminusXmlParser` 用于带显式终止标记的协议。适合终端控制、长时交互等更强约束场景。
-
-</Accordion>
-</AccordionGroup>
-
-</Tab>
-
-<Tab title="历史与上下文压缩">
-
-QitOS 把长时上下文管理当成一等能力，而不是隐形中间件。
-
-- `WindowHistory`：最简单的最近窗口
-- `TokenBudgetSummaryHistory`：超 token 预算时自动摘要
-- `CompactHistory`：多阶段上下文压缩，支持警告、轮次分组、摘要压缩与可观测元数据
-
-如果你在研究长时运行智能体，`CompactHistory` 往往是最值得重点理解的组件。
-
-</Tab>
-
 <Tab title="记忆">
 
 记忆适配器负责把跨步信息存起来，并在需要时重新检索：
@@ -187,17 +113,6 @@ QitOS 的工具集帮你直接组合出一个工作环境，而不是一组松�
 说明混用。应用可以在构造时传入冻结的 `available_requirements`，用 `command:nmap`、
 `tool:run_command` 等自身约定的精确标识，在完整说明进入模型上下文前拒绝缺少运行能力的
 Skill；省略该集合时 availability 明确为 `unchecked`。
-
-</Tab>
-
-<Tab title="规划">
-
-规划辅助工具帮你在不重写运行时的情况下引入显式计划与搜索结构：
-
-- `UpdateWorkPlanTool`：校验并返回完整 WorkPlan 更新，不直接修改状态
-- `NumberedPlanBuilder`：从编号列表构建计划
-- `PlanCursor`：记录计划执行进度
-- `DynamicTreeSearch`：在分支候选之间做选择与扩展
 
 </Tab>
 </Tabs>

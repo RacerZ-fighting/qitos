@@ -10,18 +10,20 @@
 
 QitOS 是面向 agent 研究者的 torch-flavor 框架。
 
-当前版本在同一个 `AgentModule + Engine` 运行时上原型化方法、运行 benchmark，并用
-内建 `qita` 检查长时轨迹。已经确认的下一版运行时架构会原地替换这条路径，收敛为
-与 Provider 无关的 Model、最小异步 Agent loop 和可恢复的 Session/Harness；迁移完成前，
-现有 API 文档仍以当前已发布行为为准。
+当前版本在 `Agent` façade 背后的 Provider 中立最小异步 Agent loop（`Message ->
+Model -> ToolCall -> ToolResult`）上原型化方法、检查长时轨迹，并内置 `qita` 可观测性。
+已退役的 `AgentModule + Engine` 生命周期、checkpoint 存储、提示词注入式解析器/评估器、
+recipe 与基准测试执行适配器均已移除；迁移过程记录于更新日志。
 
 
 [快速开始](https://qitor.mintlify.app/zh/quickstart) · [教程课程](https://qitor.mintlify.app/zh/tutorials) · [CLI 参考](https://qitor.mintlify.app/zh/reference/cli) · [更新日志](CHANGELOG.md) · [English README](README.md)
 
 ## 最新进展
 
-- **确认与 Pi 对齐的运行时架构**：下一轮重构会原地把 `AgentModule + Engine` 替换为
-  `Model -> 最小异步 Agent loop -> Session/Harness -> 应用组合`，不新建平行 V2 路径。
+- **与 Pi 对齐的运行时已成为主线**：`Agent` façade 驱动最小异步
+  `Message -> Model -> ToolCall -> ToolResult` loop，具备类型化消息、逐 turn 不可变的
+  模型/工具快照、journal 化事务与 façade 驱动的子智能体；已退役的
+  `AgentModule + Engine` 生命周期整体移除。
   可持久化、携带 goal 的 Task 会成为 Root 和 Child Agent 的工作根；benchmark 输入、
   environment handle、metrics 与应用插件策略不进入 Task 契约。详见
   [目标架构](docs/internal/architecture/agent-runtime.md)和
@@ -305,12 +307,10 @@ registry = ToolRegistry().include_toolset(
 - 第一次接触： [简介](https://qitor.mintlify.app/zh/introduction)
 - 第一条成功路径： [快速开始](https://qitor.mintlify.app/zh/quickstart)
 - 安装方式： [安装](https://qitor.mintlify.app/zh/installation)
-- 写自己的最小 coding agent： [构建第一个 Agent](https://qitor.mintlify.app/zh/guides/build-your-first-agent)
-- 理解运行时： [AgentModule](https://qitor.mintlify.app/zh/concepts/agent-module) / [Engine](https://qitor.mintlify.app/zh/concepts/engine)
+- 组合自己的 agent： [Kit 参考](https://qitor.mintlify.app/zh/reference/kit)
 - 看 trace： [可观测性](https://qitor.mintlify.app/zh/guides/observability)
 - 走完整课程： [教程](https://qitor.mintlify.app/zh/tutorials)
 - 看命令： [CLI 参考](https://qitor.mintlify.app/zh/reference/cli)
-- 看 API： [API 参考](https://qitor.mintlify.app/zh/reference/api)
 
 ## 界面预览
 

@@ -348,7 +348,6 @@ def test_anthropic_preset_builds_native_messages_model() -> None:
     assert model.qitos_harness_metadata["reasoning"]["effective_budget_tokens"] == 2_048
     assert model.qitos_harness_metadata["native_tool_call_preferred"] is True
     assert model.qitos_harness_metadata["effective_tool_delivery"] == "api_parameter"
-    assert model.qitos_protocol.tool_schema_delivery == "api_parameter"
     assert model.build_tool_schema_request_options(
         [
             {

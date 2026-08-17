@@ -1,4 +1,4 @@
-"""Canonical tool-result contract used by Engine observations."""
+"""Canonical tool-result contract for ToolCall/ToolResult transactions."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Mapping, Sequence, TypeAlias, cast
 
 from ._freeze import freeze_deep, thaw_deep
-from .action import ActionStatus
 from .artifact import ArtifactRef
 
 
@@ -23,6 +22,21 @@ ToolResultStatus: TypeAlias = Literal[
     "timed_out",
     "cancelled",
 ]
+
+_KNOWN_STATUSES = frozenset(
+    (
+        "success",
+        "partial",
+        "running",
+        "error",
+        "skipped",
+        "denied",
+        "needs_input",
+        "needs_approval",
+        "timed_out",
+        "cancelled",
+    )
+)
 
 _MESSAGE_ERROR_STATUSES = frozenset(
     {"error", "denied", "timed_out", "cancelled"}
@@ -43,9 +57,9 @@ class ToolResult:
 
     def __post_init__(self) -> None:
         raw_status = str(self.status).strip()
-        try:
-            self.status = cast(ToolResultStatus, ActionStatus(raw_status).value)
-        except ValueError:
+        if raw_status in _KNOWN_STATUSES:
+            self.status = cast(ToolResultStatus, raw_status)
+        else:
             self.status = "error"
             if self.error in (None, ""):
                 self.error = f"unknown tool result status: {raw_status}"

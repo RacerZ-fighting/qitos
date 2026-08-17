@@ -5,8 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
-from ..protocols import ModelProtocol, require_protocol
-
 
 @dataclass(frozen=True)
 class ToolPolicy:
@@ -122,38 +120,31 @@ class ModelAdapter:
 
 @dataclass(frozen=True)
 class HarnessPolicy:
-    """Resolved harness policy for one concrete model run."""
+    """Resolved harness policy for one concrete model run.
+
+    The policy carries protocol *identities* only; parser instances and
+    prompt-injected protocol objects left with the retired Engine lifecycle.
+    """
 
     family_preset: FamilyPreset
     adapter: ModelAdapter
-    protocol: ModelProtocol
-    parser: Any
-    tool_policy: ToolPolicy
-    context_policy: ContextPolicy
+    protocol_id: str
+    fallback_protocol_ids: tuple[str, ...] = ()
+    tool_policy: ToolPolicy = field(default_factory=ToolPolicy)
+    context_policy: ContextPolicy = field(default_factory=ContextPolicy)
+    tool_delivery: str = "prompt_injection"
     resolution_source: str = "family_preset"
-
-    @property
-    def parser_name(self) -> str:
-        return self.parser.__class__.__name__
-
-    def protocol_with_delivery(self, delivery: str | None = None) -> ModelProtocol:
-        effective_delivery = str(delivery or self.tool_policy.primary_delivery)
-        return replace(
-            self.protocol,
-            tool_schema_delivery=effective_delivery,
-        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "family_preset": self.family_preset.id,
             "adapter_kind": self.adapter.kind,
-            "protocol": self.protocol.id,
-            "fallback_protocols": list(self.protocol.fallback_protocols),
-            "parser": self.parser_name,
+            "protocol": self.protocol_id,
+            "fallback_protocols": list(self.fallback_protocol_ids),
             "tool_policy": self.tool_policy.to_dict(),
             "context_policy": self.context_policy.to_dict(),
             "native_tool_call_preferred": self.tool_policy.native_tool_call_preferred,
-            "effective_tool_delivery": self.protocol.tool_schema_delivery,
+            "effective_tool_delivery": self.tool_delivery,
             "decision_lane_preference": (
                 "native_tool_calls"
                 if self.tool_policy.native_tool_call_preferred
@@ -161,25 +152,6 @@ class HarnessPolicy:
             ),
             "resolution_source": self.resolution_source,
         }
-
-
-def build_protocol_for_preset(
-    *,
-    preset: FamilyPreset,
-    protocol: str | ModelProtocol | None = None,
-    delivery: str | None = None,
-) -> ModelProtocol:
-    base = require_protocol(protocol or preset.default_protocol)
-    fallback_protocols = (
-        tuple(base.fallback_protocols)
-        if protocol is not None
-        else tuple(preset.fallback_protocols or base.fallback_protocols)
-    )
-    return replace(
-        base,
-        tool_schema_delivery=str(delivery or preset.tool_policy.primary_delivery),
-        fallback_protocols=fallback_protocols,
-    )
 
 
 Resolver = Callable[[str | None], FamilyPreset]
@@ -200,7 +172,5 @@ def native_tool_calls_preferred(*, llm: Any = None, protocol: Any = None) -> boo
             and tool_policy.get("native_tool_call_preferred") is True
         ):
             return True
-    return bool(
-        protocol is not None
-        and getattr(protocol, "supports_native_tool_call_markup", False)
-    )
+    _ = protocol  # protocol objects left with the retired Engine lifecycle
+    return False

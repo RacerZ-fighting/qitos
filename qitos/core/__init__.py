@@ -1,28 +1,11 @@
 """Core modules for QitOS Framework."""
 
-from .agent_module import ActionResultContext, AgentModule, CanonicalActionResult
-from .completion import CompletionAssessment, CompletionDisposition
 from .budget import BudgetLedger, BudgetSnapshot
-from .decision import Decision
-from .action import (
-    Action,
-    ActionResult,
-    ActionStatus,
-    ActionExecutionPolicy,
-)
 from .errors import (
-    ErrorCategory,
     ModelContinuationRejected,
+    ModelRequestCancelled,
+    ModelRequestDeadlineExceeded,
     ModelTransportError,
-    StopReason,
-    RuntimeErrorInfo,
-    QitosRuntimeError,
-)
-from .state import (
-    StateSchema,
-    StateMigrationRegistry,
-    StateValidationError,
-    StateMigrationError,
 )
 from .memory import Memory, MemoryRecord
 from .model_capabilities import ModelAPI, ModelCapabilities, ReasoningCapability
@@ -64,9 +47,7 @@ from .process import (
     ProcessStatus,
     ProcessTerminalNotifier,
 )
-from .history import History, HistoryMessage, HistoryPolicy, HistorySnapshot
-from .message_builder import ContextSnapshot, ContextSnapshotConflictError
-from .observation import Observation
+from .history import HistoryMessage, HistorySnapshot
 from .journal import (
     JournalAppendCancelled,
     JournalClosedError,
@@ -136,16 +117,6 @@ from .tool import (
 )
 from .tool_schema import function_schema, type_to_json_schema, parse_docstring
 from .function_tool_decorator import function_tool
-from .channel import (
-    Append,
-    Replace,
-    Ephemeral,
-    last_value,
-    append_list,
-    dict_merge,
-    add_messages,
-)
-from .field_reducers import FieldReducerRegistry
 from .tool_registry import ToolExposure, ToolRegistry
 from .turn import TurnBudgetSnapshot, TurnRuntimeCapabilities, TurnSnapshot
 from .work_plan import (
@@ -163,13 +134,6 @@ from .work_plan import (
     render_work_plan_markdown,
     work_plan_state_from_dict,
     work_plan_state_to_dict,
-)
-from .agent_spec import (
-    AgentSpec,
-    AgentRegistry,
-    ContextStrategy,
-    HandoffContext,
-    StateAdapter,
 )
 from .cancellation import CancelMode, CancelToken
 from .message import (
@@ -237,26 +201,10 @@ from .tool_executor import (
 __all__ = [
     "BudgetLedger",
     "BudgetSnapshot",
-    "ActionResultContext",
-    "AgentModule",
-    "CanonicalActionResult",
-    "CompletionAssessment",
-    "CompletionDisposition",
-    "Decision",
-    "Action",
-    "ActionResult",
-    "ActionStatus",
-    "ActionExecutionPolicy",
-    "ErrorCategory",
     "ModelContinuationRejected",
     "ModelTransportError",
-    "StopReason",
-    "RuntimeErrorInfo",
-    "QitosRuntimeError",
-    "StateSchema",
-    "StateMigrationRegistry",
-    "StateValidationError",
-    "StateMigrationError",
+    "ModelRequestCancelled",
+    "ModelRequestDeadlineExceeded",
     "Memory",
     "MemoryRecord",
     "ModelAPI",
@@ -296,13 +244,8 @@ __all__ = [
     "ProcessSnapshot",
     "ProcessStatus",
     "ProcessTerminalNotifier",
-    "History",
     "HistoryMessage",
-    "HistoryPolicy",
     "HistorySnapshot",
-    "ContextSnapshot",
-    "ContextSnapshotConflictError",
-    "Observation",
     "JournalAppendCancelled",
     "JournalClosedError",
     "JournalCommitError",
@@ -372,14 +315,6 @@ __all__ = [
     "type_to_json_schema",
     "parse_docstring",
     "function_tool",
-    "Append",
-    "Replace",
-    "Ephemeral",
-    "last_value",
-    "append_list",
-    "dict_merge",
-    "add_messages",
-    "FieldReducerRegistry",
     "ToolRegistry",
     "ToolExposure",
     "TurnBudgetSnapshot",
@@ -399,11 +334,6 @@ __all__ = [
     "render_work_plan_markdown",
     "work_plan_state_from_dict",
     "work_plan_state_to_dict",
-    "AgentSpec",
-    "AgentRegistry",
-    "ContextStrategy",
-    "HandoffContext",
-    "StateAdapter",
     "CancelMode",
     "CancelToken",
     "AssistantMessage",

@@ -809,14 +809,12 @@ async def test_committed_tool_transaction_lookup_rebuilds_and_isolated(
     await journal.append(
         JournalRecordType.TOOL_TERMINAL,
         {
-            "step_id": 3,
-            "transaction_id": "transaction-1",
-            "action_index": 0,
-            "action": {
+            "turn": 3,
+            "call_id": "call-1",
+            "call": {
+                "id": "call-1",
                 "name": "inspect",
-                "args": {"target": "service"},
-                "action_id": "call-1",
-                "metadata": {},
+                "arguments": {"target": "service"},
             },
             "result": {
                 "status": "timed_out",
@@ -834,8 +832,8 @@ async def test_committed_tool_transaction_lookup_rebuilds_and_isolated(
     committed = await journal.append(
         JournalRecordType.STEP_COMMITTED,
         {
-            "step_id": 3,
-            "transaction_id": "transaction-1",
+            "turn": 3,
+            "messages": [],
             "terminal_record_ids": [terminal_id],
         },
         record_id="transaction-1:committed",
@@ -845,18 +843,15 @@ async def test_committed_tool_transaction_lookup_rebuilds_and_isolated(
     assert transaction is not None
     assert transaction.terminal == reference
     assert transaction.committed_at == committed
-    assert transaction.step_id == 3
-    assert transaction.action_index == 0
+    assert transaction.action.id == "call-1"
     assert transaction.action.name == "inspect"
     assert transaction.result.status == "timed_out"
     assert transaction.result.error == ""
     assert transaction.result.model_visible_output == "service is reachable"
 
-    transaction.action.args["target"] = "mutated"
-    transaction.result.metadata["evidence_id"] = "mutated"
     reread = journal.find_tool_transaction(reference)
     assert reread is not None
-    assert reread.action.args == {"target": "service"}
+    assert reread.action.arguments == {"target": "service"}
     assert reread.result.metadata == {"evidence_id": "evidence-1"}
 
     await journal.close()
@@ -878,14 +873,12 @@ async def test_fork_resolves_inherited_committed_tool_origin(
     await parent.append(
         JournalRecordType.TOOL_TERMINAL,
         {
-            "step_id": 0,
-            "transaction_id": "transaction-1",
-            "action_index": 0,
-            "action": {
+            "turn": 0,
+            "call_id": "call-1",
+            "call": {
+                "id": "call-1",
                 "name": "inspect",
-                "args": {},
-                "action_id": "call-1",
-                "metadata": {},
+                "arguments": {},
             },
             "result": {
                 "status": "success",
@@ -899,8 +892,8 @@ async def test_fork_resolves_inherited_committed_tool_origin(
     position = await parent.append(
         JournalRecordType.STEP_COMMITTED,
         {
-            "step_id": 0,
-            "transaction_id": "transaction-1",
+            "turn": 0,
+            "messages": [],
             "terminal_record_ids": [terminal_id],
         },
         record_id="transaction-1:committed",

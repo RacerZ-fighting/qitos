@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping, Protocol, runtime_checkable
 
-from .action import Action
 from .message import ToolCall
 from .tool_result import ToolResult
 
@@ -185,17 +184,14 @@ class JournalRecordRef:
 class ToolTransaction:
     """One committed canonical Tool terminal reconstructed from a Journal.
 
-    Records written by the retired Engine path carry ``step_id`` /
-    ``action_index`` / ``action`` (an ``Action``); records written by the
-    minimal agent loop carry ``turn`` / ``call`` (a ``ToolCall``) instead, so
-    ``step_id`` and ``action_index`` are ``None`` for the loop path.
+    Only the minimal agent loop's schema is decodable: records carry ``turn``
+    and ``call`` (a ``ToolCall``). Records written by the retired Engine path
+    (``step_id`` / ``action_index`` / ``action``) fail closed at decode time.
     """
 
     terminal: JournalRecordRef
     committed_at: JournalPosition
-    step_id: int | None
-    action_index: int | None
-    action: Action | ToolCall
+    action: ToolCall
     result: ToolResult
 
 

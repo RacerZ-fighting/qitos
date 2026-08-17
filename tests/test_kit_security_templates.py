@@ -1,43 +1,10 @@
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from qitos.core.memory import MemoryRecord
 from qitos.kit import MemdirMemory
-from qitos.kit.planning import PhaseEngine, PhaseSpec, TransitionRule
 from qitos.kit.tool import WorkspaceAwareMixin
-
-
-@dataclass
-class _PhaseState:
-    current_phase: str = "investigation"
-    has_findings: bool = False
-
-
-def test_phase_engine_prefers_high_priority_condition_over_force() -> None:
-    engine = PhaseEngine(
-        [
-            PhaseSpec(
-                name="investigation",
-                transitions=[
-                    TransitionRule(
-                        target="verification",
-                        condition=lambda s: bool(s.has_findings),
-                        priority=10,
-                    ),
-                    TransitionRule(target="formulation", force_at_step=9, priority=1),
-                ],
-            ),
-            PhaseSpec(name="formulation"),
-            PhaseSpec(name="verification"),
-        ]
-    )
-    state = _PhaseState(current_phase="investigation", has_findings=True)
-    assert engine.advance(state, step=9) == "verification"
-    state.has_findings = False
-    state.current_phase = "investigation"
-    assert engine.advance(state, step=9) == "formulation"
 
 
 def test_memdir_memory_roundtrip(tmp_path: Path) -> None:

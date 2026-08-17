@@ -4,7 +4,7 @@ description: "从 PyPI 或源码安装 QitOS，并按需启用模型与基准测
 ---
 
 <Warning>
-QitOS 当前处于 **Beta** 阶段。当前版本仍发布 `AgentModule + Engine`，已经确认的运行时迁移会原地替换这套 API。Trace/qita 行为和规范化示例会继续保留，但生产环境应固定版本，并在升级前检查 Changelog。
+QitOS 当前处于 **Beta** 阶段。当前版本发布最小 agent loop 与 `Agent` façade。Trace/qita 行为和规范化示例会继续保留，但生产环境应固定版本，并在升级前检查 Changelog。
 </Warning>
 
 ## 环境要求
@@ -25,11 +25,11 @@ pip install qitos
 
 核心安装包含：
 
-- 当前已发布的 `AgentModule + Engine` 运行时
+- 最小 agent loop 与 `Agent` façade 运行时
 - `qita` 可观测性工具
 - `kit` 工具箱模块
 
-它默认不包含 OpenAI 客户端，也不包含基准测试（benchmark）数据集加载器。
+它默认不包含 OpenAI 客户端。
 
 <Tip>
 如果你想马上运行最小编程智能体（coding agent）快速入门，直接安装 `pip install "qitos[models]"` 即可。
@@ -98,8 +98,5 @@ qita --help
 <CardGroup cols={2}>
   <Card title="快速开始" icon="rocket" href="/zh/quickstart">
     2 分钟内运行你的第一个智能体（agent）
-  </Card>
-  <Card title="核心概念" icon="book" href="/zh/concepts/agent-module">
-    理解 AgentModule、Engine、State 和 Tools
   </Card>
 </CardGroup>

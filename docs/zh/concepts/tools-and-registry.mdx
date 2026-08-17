@@ -3,8 +3,8 @@ title: "Tools 与 Registry"
 description: "理解 QitOS 中的工具、工具集以及 ToolRegistry 如何组合成智能体能力表面。"
 ---
 
-工具就是智能体可以执行的动作。运行时，Engine 使用 `ToolRegistry` 做精确名称
-查找，再由 `ActionExecutor` 完成校验、授权和执行。
+工具就是智能体可以执行的动作。运行时，agent loop 使用 `ToolRegistry` 做精确名称
+查找，再由 Tool 执行器完成校验、授权和执行。
 
 ## `@tool` 装饰器
 
@@ -37,13 +37,13 @@ def read_file(path: str) -> str:
 | `permissions` | `ToolPermission \| None` | 声明该工具需要的系统能力。 |
 | `required_ops` | `list[str] \| None` | 环境层面的低级操作能力标识。 |
 
-`ActionExecutor` 是工具重试的唯一责任方。输入校验、权限检查和审批只执行一次，
+Tool 执行器是工具重试的唯一责任方。输入校验、权限检查和审批只执行一次，
 只有通过预检的实际调用可以重试；所有 attempt 和 backoff 共享工具 timeout 与
-Engine 更早的运行 deadline。配置 `RetryPolicy` 时，底层 HTTP/SDK 重试必须关闭。
+run 更早的运行 deadline。配置 `RetryPolicy` 时，底层 HTTP/SDK 重试必须关闭。
 
 ### `ToolPermission`
 
-`ToolPermission` 描述工具允许做什么。Engine 可以在预检阶段利用这些信息检查环境能力。
+`ToolPermission` 描述工具允许做什么。执行器会在预检阶段利用这些信息检查环境能力。
 
 ```python
 from qitos.core.tool import ToolPermission
@@ -62,7 +62,7 @@ ToolPermission(
 
 ## ToolRegistry
 
-`ToolRegistry` 是 Engine 分发动作时查询的注册表。通常在 `AgentModule` 构造函数里创建并传入。
+`ToolRegistry` 是 agent loop 分发工具调用时查询的注册表。通常在 `Agent` 构造函数里创建并传入。
 
 ```python
 from qitos import ToolRegistry
@@ -142,26 +142,19 @@ registry.register_toolset(CodingToolSet(workspace_root="/tmp/work"), namespace="
 
 ### 冻结单个 turn 的工具 exposure
 
-`ToolRegistry` 是由 run 持有、可以变化的完整工具目录。每个模型 turn 开始时，Engine
-调用 `AgentModule.build_tool_exposure()` 取得只读 `ToolExposure`。模型 Schema 与动作
+`ToolRegistry` 是由 run 持有、可以变化的完整工具目录。每个模型 turn 开始时，loop
+会把它冻结成只读 `ToolExposure`。模型 Schema 与工具
 分发器共用这一份快照。模型请求进行期间新注册的工具可以在下一 turn 出现，但当前
 turn 的分发器不能调用它。
 
-默认 hook 会冻结全部已注册工具。产品需要按 profile、运行能力、Skill 或策略筛选时，
-可以覆写它：
+默认行为会冻结全部已注册工具。产品需要按 profile、运行能力、Skill 或策略筛选时，
+可以显式选择子集：
 
 ```python
-class ProductAgent(AgentModule):
-    def build_tool_exposure(self, state, tool_registry):
-        selected = [
-            name
-            for name in tool_registry.list_tools()
-            if tool_registry.get(name).spec.group in state.enabled_tool_groups
-        ]
-        return tool_registry.freeze(
-            selected,
-            metadata={"profile": state.profile},
-        )
+exposure = tool_registry.freeze(
+    selected,
+    metadata={"profile": profile},
+)
 ```
 
 `group` 只负责选择，不代表授权。实际参数仍应交给 `PermissionPipeline` 判断。配置
@@ -232,8 +225,8 @@ required 字段、错误类型、非法枚举值和 JSON Schema 边界都会被�
 
 类式工具只有一个异步执行入口：`await execute(args, runtime_context)`。注册表只接受精确的
 已注册名称，本身不负责执行；不存在 `run`/`call` 适配、短名称别名、分隔符别名或
-大小写修复。需要权限、超时、重试和结果归一化时，应通过 `Engine` 使用
-`ActionExecutor`。`read_only=True` 只描述副作用；只有显式
+大小写修复。权限、超时、重试和结果归一化由 `ToolBatchExecutor` 统一负责。
+`read_only=True` 只描述副作用；只有显式
 `concurrency_safe=True` 才允许并行。
 
 冻结 turn 时，QitOS 深拷贝 Tool 定义，但保留注册 handler 作为唯一生命周期 owner，因此
@@ -267,8 +260,8 @@ return ToolResult(
 `output_limit_exceeded`、`cancelling` 和 `canceled` 等旧写法会被拒绝，不会再做
 兼容归一化；任何未知的显式状态都会被视为错误，而不是猜成成功。
 
-Handler 不需要自行生成关联身份。Engine 会在 Finalizer 前把 canonical Action 的身份写入
-`ToolResult.call_id`，因此 Journal replay、History、Reducer 和 trace 始终指向同一个模型 ToolCall。
+Handler 不需要自行生成关联身份。执行器会在 Finalizer 前把 canonical ToolCall 的身份写入
+`ToolResult.call_id`，因此 journal replay 与 trace 始终指向同一个模型 ToolCall。
 
 执行生命周期和业务结果必须分开。例如搜索正常完成但没有匹配项：
 
@@ -286,23 +279,21 @@ return {
 
 ### 持久化长输出
 
-工具可能返回超过模型预算的内容时，为 Engine 配置文件 store：
+工具可能返回超过模型预算的内容时，用 `FileArtifactStore` 持久化完整载荷，
+并在 `ToolResult` 上返回类型化 `ArtifactRef`：
 
 ```python
-from qitos import Engine
 from qitos.kit import FileArtifactStore
 
 artifacts = FileArtifactStore(
     ".agent/artifacts",
     reference_root=".",
 )
-engine = Engine(agent, artifact_store=artifacts)
 ```
 
-Engine 会先保存完整输出，再生成有界模型 replacement。`ToolResult.output` 继续作为
-Reducer 与 trace 的 canonical 结果；`ToolResult.artifacts` 保存类型化文件引用，
-`model_output` 则是 History 和模型可见事件使用的投影。Checkpoint resume 会重放当时
-保存的 History，不会用当前阈值再次截断。
+`ToolResult.output` 继续作为 journal 与 trace 的 canonical 结果；
+`ToolResult.artifacts` 保存类型化文件引用，`model_output` 则是模型实际看到的有界投影；
+resume 会重放当时保存的投影，不会用当前阈值再次截断。
 
 Artifact 目录应位于工具 workspace 内，并把 `reference_root` 指向该 workspace。
 模型看到的路径将是 workspace 相对路径，现有 `read_file` 工具可以直接分页读取，
@@ -310,30 +301,21 @@ Artifact 目录应位于工具 workspace 内，并把 `reference_root` 指向该
 
 ---
 
-## 把注册表传给 AgentModule
+## 把注册表传给 Agent façade
 
-把准备好的 `ToolRegistry` 传入 `AgentModule.__init__()`：
-
-```python
-from qitos import AgentModule, ToolRegistry, tool
-
-
-class SearchAgent(AgentModule[MyState, dict, Action]):
-    def __init__(self):
-        registry = ToolRegistry()
-        registry.register(web_search)
-        registry.register(read_file)
-        super().__init__(tool_registry=registry)
-```
-
-Engine 会在每个 turn 冻结 `agent.tool_registry`，并用同一份 exposure 创建该 turn 的
-`ActionExecutor`。你也可以调用 `registry.get_tool_descriptions()` 检查完整注册目录：
+把准备好的 `ToolRegistry` 传入 `Agent` 构造函数：
 
 ```python
-def build_system_prompt(self, state: MyState) -> str | None:
-    tools_text = self.tool_registry.get_tool_descriptions()
-    return f"You have access to these tools:\n\n{tools_text}"
+from qitos import Agent, ToolRegistry
+
+registry = ToolRegistry()
+registry.register(web_search)
+registry.register(read_file)
+agent = Agent(model=model, tool_registry=registry, system_prompt="...")
 ```
+
+loop 会在每个 turn 边界重新冻结这个活跃的注册表，因此某个 turn 中加载的工具会出现在
+下一个 turn 的模型请求里。你也可以调用 `registry.get_tool_descriptions()` 检查完整注册目录：
 
 ---
 
@@ -367,45 +349,22 @@ def write_file(path: str, content: str) -> str:
 ```
 
 ```python agent.py
-from dataclasses import dataclass
-from typing import Any
+import asyncio
 
-from qitos import AgentModule, StateSchema, ToolRegistry
+from qitos import Agent, ToolRegistry
 
 from .tools import read_file, write_file
 
 
-@dataclass
-class EditorState(StateSchema):
-    files_read: list[str] = None
+async def main() -> None:
+    registry = ToolRegistry()
+    registry.register(read_file)
+    registry.register(write_file)
+    agent = Agent(model=llm, tool_registry=registry, max_turns=10)
+    result = await agent.prompt("读取 notes.txt 并总结它。")
+    print(result.status, result.error)
 
-    def __post_init__(self):
-        if self.files_read is None:
-            self.files_read = []
 
-
-class EditorAgent(AgentModule[EditorState, dict[str, Any], Any]):
-    def __init__(self, llm):
-        registry = ToolRegistry()
-        registry.register(read_file)
-        registry.register(write_file)
-        super().__init__(tool_registry=registry, llm=llm)
-
-    def init_state(self, task: str, **kwargs: Any) -> EditorState:
-        return EditorState(task=task, max_steps=int(kwargs.get("max_steps", 10)))
-
-    def build_system_prompt(self, state: EditorState) -> str | None:
-        return (
-            "You are a file editor.\n\n"
-            f"Tools:\n{self.tool_registry.get_tool_descriptions()}"
-        )
-
-    def reduce(self, state: EditorState, observation: dict, decision) -> EditorState:
-        for action in decision.actions:
-            if action.name == "read_file":
-                state.files_read.append(action.args.get("path", ""))
-        if decision.final_answer:
-            state.final_result = decision.final_answer
-        return state
+asyncio.run(main())
 ```
 </CodeGroup>

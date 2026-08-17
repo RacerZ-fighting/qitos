@@ -37,11 +37,7 @@
                 "root": "tutorials/index",
                 "pages": [
                   "tutorials/index",
-                  "tutorials/critic-system",
-                  "tutorials/hook-lifecycle",
                   "tutorials/func-api",
-                  "tutorials/mcp-integration",
-                  "tutorials/checkpoint-and-fork",
                   "tutorials/switch-model-families",
                   "tutorials/replay-and-inspect-failed-runs",
                   "tutorials/inspect-a-gui-failure-in-qita"
@@ -56,10 +52,7 @@
               {
                 "group": "Core Concepts",
                 "pages": [
-                  "concepts/agent-module",
-                  "concepts/engine",
                   "concepts/session-journal",
-                  "concepts/state-and-task",
                   "concepts/tools-and-registry",
                   "concepts/family-presets",
                   "concepts/tracing",
@@ -69,24 +62,19 @@
               {
                 "group": "Guides",
                 "pages": [
-                  "guides/build-your-first-agent",
                   "guides/computer-use-desktop",
                   "guides/multimodal-core",
                   "guides/add-a-family-preset",
                   "guides/qwen-family-best-practice",
-                  "guides/memory-and-history",
-                  "guides/critics-and-stop-criteria",
                   "guides/observability"
                 ]
               },
               {
                 "group": "Reference",
                 "pages": [
-                  "reference/api",
                   "reference/kit",
                   "reference/model-family-matrix",
-                  "reference/cli",
-                  "reference/configuration"
+                  "reference/cli"
                 ]
               },
               {
@@ -137,11 +125,7 @@
                 "root": "zh/tutorials/index",
                 "pages": [
                   "zh/tutorials/index",
-                  "zh/tutorials/critic-system",
-                  "zh/tutorials/hook-lifecycle",
                   "zh/tutorials/func-api",
-                  "zh/tutorials/mcp-integration",
-                  "zh/tutorials/checkpoint-and-fork",
                   "zh/tutorials/switch-model-families",
                   "zh/tutorials/replay-and-inspect-failed-runs",
                   "zh/tutorials/inspect-a-gui-failure-in-qita"
@@ -156,10 +140,7 @@
               {
                 "group": "核心概念",
                 "pages": [
-                  "zh/concepts/agent-module",
-                  "zh/concepts/engine",
                   "zh/concepts/session-journal",
-                  "zh/concepts/state-and-task",
                   "zh/concepts/tools-and-registry",
                   "zh/concepts/family-presets",
                   "zh/concepts/tracing",
@@ -169,24 +150,19 @@
               {
                 "group": "指南",
                 "pages": [
-                  "zh/guides/build-your-first-agent",
                   "zh/guides/computer-use-desktop",
                   "zh/guides/multimodal-core",
                   "zh/guides/add-a-family-preset",
                   "zh/guides/qwen-family-best-practice",
-                  "zh/guides/memory-and-history",
-                  "zh/guides/critics-and-stop-criteria",
                   "zh/guides/observability"
                 ]
               },
               {
                 "group": "参考",
                 "pages": [
-                  "zh/reference/api",
                   "zh/reference/kit",
                   "zh/reference/model-family-matrix",
-                  "zh/reference/cli",
-                  "zh/reference/configuration"
+                  "zh/reference/cli"
                 ]
               },
               {

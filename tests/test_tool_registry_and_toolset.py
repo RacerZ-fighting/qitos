@@ -4,9 +4,8 @@ from typing import Any
 
 import pytest
 
-from qitos import Action, AgentModule, Decision, Engine, StateSchema, ToolRegistry, tool
+from qitos import ToolRegistry, tool
 from qitos.core.tool import BaseTool, ToolMeta, ToolSpec, build_tool_spec
-from qitos.engine import RuntimeBudget
 from qitos.kit import tool as tool_pkg
 from qitos.kit.tool import (
     CodingToolSet,
@@ -33,30 +32,6 @@ from qitos.kit.toolset import report_tools as report_tools_builder
 from qitos.kit.tool.experimental.security_research import SecurityAuditToolSet
 
 
-class _ToolState(StateSchema):
-    pass
-
-
-class _Agent(AgentModule[_ToolState, dict[str, Any], Action]):
-    def __init__(self, tool_registry: ToolRegistry):
-        super().__init__(tool_registry=tool_registry)
-
-    def init_state(self, task: str, **kwargs: Any) -> _ToolState:
-        return _ToolState(task=task, max_steps=2)
-
-    def decide(
-        self, state: _ToolState, observation: dict[str, Any]
-    ) -> Decision[Action]:
-        if state.current_step == 0:
-            return Decision.act([Action(name="math.add", args={"a": 1, "b": 2})])
-        return Decision.final("done")
-
-    def reduce(
-        self, state: _ToolState, observation: dict[str, Any], decision: Decision[Action]
-    ) -> _ToolState:
-        return state
-
-
 def test_tool_registry_include_and_toolset_lifecycle(tmp_path):
     events: list[str] = []
 
@@ -79,10 +54,8 @@ def test_tool_registry_include_and_toolset_lifecycle(tmp_path):
 
     registry = ToolRegistry()
     registry.register_toolset(MathToolSet())
-    result = Engine(
-        agent=_Agent(tool_registry=registry), budget=RuntimeBudget(max_steps=2)
-    ).run("x")
-    assert result.state.stop_reason == "completed"
+    registry.setup({})
+    registry.teardown({})
     assert events == ["setup", "teardown"]
 
     editor = ToolRegistry()
@@ -525,47 +498,6 @@ def test_static_toolset_and_toolset_from_tools_register_cleanly(tmp_path):
     )
     helper_registry = ToolRegistry().include_toolset(helper)
     assert "read_file" in helper_registry.list_tools()
-
-
-def test_agent_module_can_be_initialized_with_toolset_list(tmp_path):
-    sample = tmp_path / "demo.txt"
-    sample.write_text("hello\n", encoding="utf-8")
-
-    class _ToolsetAgent(AgentModule[_ToolState, dict[str, Any], Action]):
-        def __init__(self):
-            super().__init__(
-                toolset=[
-                    ReadFile(workspace_root=str(tmp_path)),
-                    toolset_from_tools(
-                        [Glob(workspace_root=str(tmp_path))], name="glob"
-                    ),
-                ]
-            )
-
-        def init_state(self, task: str, **kwargs: Any) -> _ToolState:
-            return _ToolState(task=task, max_steps=2)
-
-        def decide(
-            self, state: _ToolState, observation: dict[str, Any]
-        ) -> Decision[Action]:
-            if state.current_step == 0:
-                return Decision.act(
-                    [Action(name="read_file", args={"path": "demo.txt"})]
-                )
-            return Decision.final("done")
-
-        def reduce(
-            self,
-            state: _ToolState,
-            observation: dict[str, Any],
-            decision: Decision[Action],
-        ) -> _ToolState:
-            _ = observation
-            _ = decision
-            return state
-
-    result = Engine(agent=_ToolsetAgent(), budget=RuntimeBudget(max_steps=2)).run("x")
-    assert result.state.stop_reason == "completed"
 
 
 def test_computer_use_toolset_atomic_tools_are_callable() -> None:

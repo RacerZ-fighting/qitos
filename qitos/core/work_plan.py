@@ -6,7 +6,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-from .action import Action
 from .tool_result import ToolResult
 
 MAX_WORK_PLAN_ITEMS = 64
@@ -161,19 +160,44 @@ def work_plan_state_from_dict(payload: Mapping[str, object]) -> WorkPlanState:
     return parse_work_plan_update({"plan": payload["items"]}).plan
 
 
+def _action_name(action: object) -> str:
+    name = getattr(action, "name", None)
+    if isinstance(name, str) and name:
+        return name
+    if isinstance(action, Mapping):
+        return str(action.get("name", ""))
+    return ""
+
+
+def _action_args(action: object) -> Mapping[str, object]:
+    for field in ("args", "arguments"):
+        value = getattr(action, field, None)
+        if isinstance(value, Mapping):
+            return value
+    if isinstance(action, Mapping):
+        raw = action.get("args") or action.get("arguments") or {}
+        if isinstance(raw, Mapping):
+            return raw
+    return {}
+
+
 def reduce_work_plan(
     current: WorkPlanState,
-    actions: Sequence[Action],
+    actions: Sequence[object],
     results: Sequence[ToolResult],
 ) -> WorkPlanState:
-    """Fold successful update_plan calls into a new WorkPlan value."""
+    """Fold successful update_plan calls into a new WorkPlan value.
+
+    Actions are read through their ``name``/``args`` (or ``arguments``)
+    attributes or mapping keys; no concrete action type is required.
+    """
     if len(actions) != len(results):
         raise ValueError("actions and results must have the same length")
     reduced = current
     for action, raw_result in zip(actions, results):
         result = ToolResult.from_value(raw_result)
-        if action.name == UPDATE_PLAN_TOOL_NAME and result.is_success:
-            reduced = parse_work_plan_update(dict(action.args or {})).plan
+        if _action_name(action) == UPDATE_PLAN_TOOL_NAME and result.is_success:
+            reduced = parse_work_plan_update(dict(_action_args(action))).plan
     return reduced
 
 

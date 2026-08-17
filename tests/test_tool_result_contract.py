@@ -1,30 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
-from qitos import tool
-from qitos.core.action import Action, ActionStatus
-from qitos.core.artifact import ArtifactRef
-from qitos.core.tool import BaseTool, ToolSpec
-from qitos.core.tool_registry import ToolRegistry
 from qitos.core.tool_result import ToolResult
-from qitos.engine.action_executor import ActionExecutor
-
-
-class _ResultTool(BaseTool):
-    def __init__(self, payload: dict[str, Any]) -> None:
-        super().__init__(ToolSpec(name="result", description="return a fixed result"))
-        self._payload = payload
-
-    async def execute(
-        self,
-        args: dict[str, Any],
-        runtime_context: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        _ = args, runtime_context
-        return dict(self._payload)
 
 
 @pytest.mark.parametrize(
@@ -132,62 +110,6 @@ def test_tool_result_restores_legacy_payload_without_call_id() -> None:
     assert restored.call_id is None
 
 
-@pytest.mark.asyncio
-async def test_action_executor_preserves_typed_artifact_projection() -> None:
-    content = "evidence"
-    artifact = ArtifactRef(
-        artifact_id="run:step:call",
-        path="artifacts/evidence.md",
-        media_type="text/markdown",
-        size_bytes=len(content.encode("utf-8")),
-        sha256="a" * 64,
-    )
-
-    @tool(name="artifact_result")
-    def artifact_result() -> ToolResult:
-        return ToolResult(
-            output=content,
-            artifacts=(artifact,),
-            model_output=artifact.path,
-        )
-
-    result = (
-        await ActionExecutor(ToolRegistry().register(artifact_result)).execute(
-            [Action(name="artifact_result")]
-        )
-    )[0]
-
-    assert result.output == content
-    assert result.artifacts == (artifact,)
-    assert result.model_output == artifact.path
-
-
-@pytest.mark.asyncio
-async def test_action_executor_preserves_typed_result_metadata() -> None:
-    @tool(name="classified_failure")
-    def classified_failure() -> ToolResult:
-        return ToolResult(
-            status="error",
-            error="classified",
-            metadata={
-                "error_category": "backend_rejected",
-                "error_code": "BACKEND_REJECTED",
-                "correlation_id": "request-1",
-            },
-        )
-
-    result = (
-        await ActionExecutor(ToolRegistry().register(classified_failure)).execute(
-            [Action(name="classified_failure")]
-        )
-    )[0]
-
-    assert result.status is ActionStatus.ERROR
-    assert result.metadata["error_category"] == "backend_rejected"
-    assert result.metadata["error_code"] == "BACKEND_REJECTED"
-    assert result.metadata["correlation_id"] == "request-1"
-
-
 def test_tool_result_rejects_a_contradictory_success_error() -> None:
     result = ToolResult.from_value(
         {"status": "success", "output": "opaque", "error": "backend failed"}
@@ -196,57 +118,3 @@ def test_tool_result_rejects_a_contradictory_success_error() -> None:
     assert result.status == "error"
     assert result.output == "opaque"
     assert result.error == "backend failed"
-
-
-@pytest.mark.parametrize(
-    ("reported", "action_status"),
-    [
-        ("success", ActionStatus.SUCCESS),
-        ("partial", ActionStatus.PARTIAL),
-        ("running", ActionStatus.RUNNING),
-        ("error", ActionStatus.ERROR),
-        ("skipped", ActionStatus.SKIPPED),
-        ("denied", ActionStatus.DENIED),
-        ("needs_input", ActionStatus.NEEDS_INPUT),
-        ("needs_approval", ActionStatus.NEEDS_APPROVAL),
-        ("timed_out", ActionStatus.TIMED_OUT),
-        ("cancelled", ActionStatus.CANCELLED),
-    ],
-)
-@pytest.mark.asyncio
-async def test_action_executor_preserves_structured_tool_lifecycle_status(
-    reported: str,
-    action_status: ActionStatus,
-) -> None:
-    tool = _ResultTool({"status": reported, "message": "result state"})
-    executor = ActionExecutor(ToolRegistry().register(tool))
-
-    result = (await executor.execute([Action(name="result")]))[0]
-
-    assert result.status is action_status
-    assert result.output == {"message": "result state"}
-    if action_status in {
-        ActionStatus.SUCCESS,
-        ActionStatus.PARTIAL,
-        ActionStatus.RUNNING,
-        ActionStatus.SKIPPED,
-        ActionStatus.NEEDS_INPUT,
-        ActionStatus.NEEDS_APPROVAL,
-    }:
-        assert result.error is None
-    else:
-        assert result.error == "result state"
-
-
-@pytest.mark.asyncio
-async def test_action_executor_unwraps_the_exact_success_envelope() -> None:
-    tool = _ResultTool({"status": "success", "output": "done"})
-
-    result = (
-        await ActionExecutor(ToolRegistry().register(tool)).execute(
-            [Action(name="result")]
-        )
-    )[0]
-
-    assert result.status is ActionStatus.SUCCESS
-    assert result.output == "done"

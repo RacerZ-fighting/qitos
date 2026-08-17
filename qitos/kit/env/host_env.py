@@ -13,7 +13,6 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from qitos.core.action import Action
 from qitos.core.env import (
     AtomicFileWrite,
     CommandCapability,
@@ -766,9 +765,8 @@ class HostEnv(Env):
         }
 
     def execute_action(self, action: Any, state: Any = None) -> Any:
-        act = action if isinstance(action, Action) else Action.from_dict(action)
-        name = act.name
-        args = act.args or {}
+        name = self._to_action_name(action)
+        args = self._to_action_args(action)
         try:
             if name == "read_file":
                 path = str(args.get("path") or args.get("filename") or "")
@@ -892,12 +890,24 @@ class HostEnv(Env):
             "count": len(out),
         }
 
-    def _to_action_name(self, action: Any) -> str:
-        if isinstance(action, Action):
-            return action.name
+    @staticmethod
+    def _to_action_name(action: Any) -> str:
+        name = getattr(action, "name", None)
+        if isinstance(name, str) and name:
+            return name
         if isinstance(action, dict):
             return str(action.get("name", ""))
         return ""
+
+    @staticmethod
+    def _to_action_args(action: Any) -> dict:
+        args = getattr(action, "args", None)
+        if isinstance(args, dict):
+            return dict(args)
+        if isinstance(action, dict):
+            raw = action.get("args") or action.get("arguments") or {}
+            return dict(raw) if isinstance(raw, dict) else {}
+        return {}
 
 
 __all__ = ["HostFSCapability", "HostCommandCapability", "HostEnv"]
