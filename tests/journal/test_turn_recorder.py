@@ -112,3 +112,50 @@ async def test_aborted_run_records_run_interrupted(tmp_path) -> None:
 
     assert records[-1].type is JournalRecordType.RUN_INTERRUPTED
     assert records[-1].payload["status"] == "aborted"
+
+
+@pytest.mark.asyncio
+async def test_committed_tool_transaction_is_queryable_after_reopen(tmp_path) -> None:
+    from qitos.core.journal import JournalRecordRef
+
+    journal = JsonlSessionJournal(tmp_path)
+    transaction = await JournalTurnTransaction.create(
+        journal, "run-journal-3", {"purpose": "test"}
+    )
+    model = ScriptedModel(
+        [tool_events([tool_call_wire("c1", "echo", {"text": "x"})]), text_events("done")]
+    )
+    context = AgentContext(
+        messages=[], tools=ToolRegistry().register(_echo).freeze()
+    )
+    config = AgentLoopConfig(
+        model=model, run_id="run-journal-3", transaction=transaction
+    )
+    result = await run_agent_loop([UserMessage(content="go")], context, config, None)
+    assert result.status is AgentRunStatus.COMPLETED
+    await journal.close()
+
+    reopened = JsonlSessionJournal(tmp_path)
+    await reopened.open("run-journal-3")
+    records = await reopened.replay()
+    committed = next(
+        record
+        for record in records
+        if record.type is JournalRecordType.STEP_COMMITTED
+    )
+    # The commit record links its Tool terminal records, so the index rebuilt
+    # from disk can serve committed Tool transaction queries again.
+    terminal_id = "run-journal-3:turn:0:tool:c1:terminal"
+    assert terminal_id in committed.payload["terminal_record_ids"]
+
+    view = reopened.find_tool_transaction(
+        JournalRecordRef("run-journal-3", terminal_id)
+    )
+    await reopened.close()
+
+    assert view is not None
+    assert view.step_id is None and view.action_index is None
+    assert view.action.id == "c1"
+    assert view.action.name == "echo"
+    assert view.result.status == "success"
+    assert view.committed_at.record_id == committed.record_id

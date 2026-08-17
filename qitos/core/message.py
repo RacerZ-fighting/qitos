@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .model_request import ModelContinuation
 from .model_response import ModelResponse, ModelUsage
+from ._freeze import freeze_deep, thaw_deep
 from .tool_result import ToolResult
 
 
@@ -45,7 +46,7 @@ class ImageContent:
     def __post_init__(self) -> None:
         if not isinstance(self.source, Mapping):
             raise TypeError("image content must be a mapping")
-        object.__setattr__(self, "source", MappingProxyType(dict(self.source)))
+        object.__setattr__(self, "source", freeze_deep(self.source))
 
 
 UserContent = Union[str, Tuple[Union[TextContent, ImageContent], ...]]
@@ -152,9 +153,13 @@ class ToolCall:
         raw_error = value.get("parse_error")
         if raw_error is not None and not isinstance(raw_error, str):
             raise ValueError("tool call parse_error must be text or null")
+        raw_id = value.get("id")
+        raw_name = value.get("name")
+        if not isinstance(raw_id, str) or not isinstance(raw_name, str):
+            raise ValueError("tool call id and name must be text")
         return cls(
-            id=str(value.get("id") or ""),
-            name=str(value.get("name") or ""),
+            id=raw_id,
+            name=raw_name,
             arguments=raw_arguments,
             parse_error=raw_error,
         )
@@ -225,7 +230,7 @@ class AssistantMessage:
             raise TypeError("continuation must be a ModelContinuation or None")
         if not isinstance(self.metadata, Mapping):
             raise TypeError("metadata must be a mapping")
-        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        object.__setattr__(self, "metadata", freeze_deep(self.metadata))
 
     @property
     def failed(self) -> bool:
@@ -257,6 +262,10 @@ class ToolResultMessage:
             raise ValueError("tool result message tool_name must be non-empty")
         if not isinstance(self.result, ToolResult):
             raise TypeError("tool result message result must be a ToolResult")
+        # Durable messages hold a deeply immutable result snapshot: listeners
+        # receive the same object, and mutation must never make the journal's
+        # tool terminal record and the committed turn payload disagree.
+        object.__setattr__(self, "result", self.result.frozen())
 
     @property
     def is_error(self) -> bool:
@@ -344,7 +353,7 @@ def message_to_wire(message: Message) -> Dict[str, Any]:
                 (
                     {"type": "text", "text": block.text}
                     if isinstance(block, TextContent)
-                    else dict(block.source)
+                    else thaw_deep(block.source)
                 )
                 for block in message.content
             ]
@@ -365,14 +374,21 @@ def message_to_wire(message: Message) -> Dict[str, Any]:
         return payload
     if isinstance(message, ToolResultMessage):
         visible = message.result.model_visible_output
-        content = visible if isinstance(visible, str) else json.dumps(
-            visible, ensure_ascii=False, default=str
-        )
+        if isinstance(visible, str):
+            content = visible
+        elif visible is not None:
+            content = json.dumps(thaw_deep(visible), ensure_ascii=False, default=str)
+        else:
+            # An erroring result may carry no output at all (e.g. truncated
+            # tool-call arguments); the error text must still reach the model
+            # instead of a JSON ``null`` (Pi keeps the error text and isError).
+            content = message.result.error or ""
         return {
             "role": "tool",
             "tool_call_id": message.tool_call_id,
             "name": message.tool_name,
             "content": content,
+            "is_error": message.is_error,
         }
     raise TypeError(f"unsupported message type: {type(message).__name__}")
 
@@ -389,7 +405,7 @@ def message_to_dict(message: Message) -> Dict[str, Any]:
                 (
                     {"type": "text", "text": block.text}
                     if isinstance(block, TextContent)
-                    else {"type": "image", "source": dict(block.source)}
+                    else {"type": "image", "source": thaw_deep(block.source)}
                 )
                 for block in message.content
             ]
@@ -419,7 +435,7 @@ def message_to_dict(message: Message) -> Dict[str, Any]:
             ),
             "model_name": message.model_name,
             "provider": message.provider,
-            "metadata": dict(message.metadata),
+            "metadata": thaw_deep(message.metadata),
             "timestamp": message.timestamp,
         }
         return payload
@@ -501,8 +517,11 @@ def message_from_dict(value: Mapping[str, Any]) -> Message:
         raw_metadata = value.get("metadata") or {}
         if not isinstance(raw_metadata, Mapping):
             raise ValueError("assistant metadata must be a mapping")
+        raw_text = value.get("text")
+        if not isinstance(raw_text, str):
+            raise ValueError("assistant text must be text")
         return AssistantMessage(
-            text=str(value.get("text") or ""),
+            text=raw_text,
             tool_calls=tuple(ToolCall.from_dict(item) for item in raw_calls),
             reasoning_content=_optional_text(value.get("reasoning_content")),
             usage=(
@@ -532,9 +551,13 @@ def message_from_dict(value: Mapping[str, Any]) -> Message:
         raw_result = value.get("result")
         if not isinstance(raw_result, Mapping):
             raise ValueError("tool result message result must be a mapping")
+        raw_call_id = value.get("tool_call_id")
+        raw_tool_name = value.get("tool_name")
+        if not isinstance(raw_call_id, str) or not isinstance(raw_tool_name, str):
+            raise ValueError("tool result message ids must be text")
         return ToolResultMessage(
-            tool_call_id=str(value.get("tool_call_id") or ""),
-            tool_name=str(value.get("tool_name") or ""),
+            tool_call_id=raw_call_id,
+            tool_name=raw_tool_name,
             result=ToolResult.from_dict(raw_result),
             timestamp=_message_timestamp(value),
         )

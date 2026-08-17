@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Mapping, Sequence, TypeAlias, cast
 
+from ._freeze import freeze_deep, thaw_deep
 from .action import ActionStatus
 from .artifact import ArtifactRef
 
@@ -64,7 +65,7 @@ class ToolResult:
         if isinstance(self.output, str):
             return self.output
         try:
-            return json.dumps(self.output, ensure_ascii=False, default=str)
+            return json.dumps(thaw_deep(self.output), ensure_ascii=False, default=str)
         except Exception:
             return str(self.output)
 
@@ -72,18 +73,38 @@ class ToolResult:
     def model_visible_output(self) -> Any:
         if self.model_output is not None:
             return self.model_output
-        if isinstance(self.output, dict):
+        if isinstance(self.output, Mapping):
             summary = self.output.get("model_summary")
             if isinstance(summary, str) and summary.strip():
                 return summary.strip()
         return self.output
 
+    def frozen(self) -> "ToolResult":
+        """Return a deeply immutable snapshot of this result.
+
+        The executor freezes every terminal result before it crosses the
+        journal, event and Message boundaries, so a listener mutating nested
+        output or metadata cannot make two durable records contradict each
+        other. Serialization helpers thaw the snapshot back to plain
+        containers, keeping the persisted shape unchanged.
+        """
+
+        return ToolResult(
+            status=self.status,
+            output=freeze_deep(self.output),
+            error=self.error,
+            metadata=freeze_deep(self.metadata),
+            artifacts=tuple(self.artifacts),
+            model_output=self.model_output,
+            call_id=self.call_id,
+        )
+
     def to_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "status": str(self.status),
-            "output": self.output,
+            "output": thaw_deep(self.output),
             "error": self.error,
-            "metadata": dict(self.metadata),
+            "metadata": thaw_deep(self.metadata),
         }
         if self.artifacts:
             payload["artifacts"] = [item.to_dict() for item in self.artifacts]
@@ -96,9 +117,9 @@ class ToolResult:
     def to_model_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "status": str(self.status),
-            "output": self.model_visible_output,
+            "output": thaw_deep(self.model_visible_output),
             "error": self.error,
-            "metadata": dict(self.metadata),
+            "metadata": thaw_deep(self.metadata),
         }
         if self.artifacts:
             payload["artifacts"] = [item.to_dict() for item in self.artifacts]

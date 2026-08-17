@@ -26,15 +26,35 @@ How to update:
   `qitos.core.agent_events`, and `qitos.core.tool_executor`
   (`ToolBatchExecutor`) implement the target `Message -> Model -> ToolCall ->
   ToolResult` path alongside the current Engine mainline. The loop freezes one
-  model/Tool exposure/deadline snapshot per turn, injects steering before each
-  model request, revives on follow-up messages, fails truncated Tool-call
-  batches without execution, and records model/Tool/turn/run barriers through
-  a `TurnTransactionBoundary`; `qitos.kit.journal.JournalTurnTransaction`
-  persists them into the canonical JSONL journal. Tool execution keeps the
-  proven invariants: serial by default with bounded parallel segments for
-  `concurrency_safe` tools, results in input order, exactly one terminal
-  `ToolResult` per admitted call, absolute downward-propagated deadlines and
-  cooperative `CancelToken` cancellation (now `qitos.core.cancellation`).
+  model/Tool exposure/deadline snapshot per turn (a live `ToolRegistry` is
+  re-frozen per turn, so Tools loaded mid-run become visible to the next
+  turn), injects steering before each model request, revives on follow-up
+  messages, fails truncated Tool-call batches without execution, and records
+  model/Tool/turn/run barriers through a `TurnTransactionBoundary`;
+  `qitos.kit.journal.JournalTurnTransaction` persists them into the canonical
+  JSONL journal, including committed-Tool-transaction query linkage.
+  Tool execution keeps the proven invariants: serial by default; in
+  `parallel` mode validation/permission/`before_tool_call` run sequentially
+  in input order (Pi's preflight) and only prepared handlers share bounded
+  concurrent segments; results in input order; exactly one terminal
+  `ToolResult` per admitted call; duplicate Tool-call ids are rejected at
+  batch admission before any side effect; terminal results are deeply
+  immutable snapshots; absolute downward-propagated deadlines; and
+  cooperative `CancelToken` cancellation (now `qitos.core.cancellation`)
+  where `immediate` interrupts in-flight work and `after_step` stops the run
+  after the current turn commits. External task cancellation and faults
+  terminalize started work and the run record before re-raising. Hook
+  contracts mirror Pi: `before_tool_call` receives validated arguments and an
+  immutable agent-context snapshot and may block or return `updated_args`
+  (re-validated against schema and permission — a QitOS strengthening over
+  Pi); `after_tool_call` applies a field-level `AfterToolCallOverride`;
+  progress reported by Tools surfaces as `ToolExecutionUpdate` events; hooks
+  and listeners are bounded by the run's cancellation and deadline so a hung
+  callback cannot block `abort()` or `wait_for_idle()`. Error `ToolResult`s
+  project their error text and an `is_error` flag into provider payloads
+  (including Anthropic `tool_result.is_error`). The façade returns typed
+  values for expected rejections only; listener/codec/persistence bugs are
+  faults that propagate after the run is terminalized.
 
 ### Changed
 

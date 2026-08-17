@@ -56,7 +56,6 @@ from .agent_loop import (
 )
 from .cancellation import CancelToken
 from .env import Env
-from .journal import JournalError
 from .message import AssistantMessage, Message, ToolResultMessage, UserMessage
 from .tool_executor import AfterToolCallHook, BeforeToolCallHook
 from .tool_registry import ToolRegistry
@@ -74,6 +73,10 @@ class QueueMode(str, Enum):
 
 class AgentBusyError(RuntimeError):
     """A state-mutating call raced an active run."""
+
+
+class AgentListenerTimeoutError(RuntimeError):
+    """A listener ignored the run's cancellation or deadline while awaited."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +118,7 @@ class _PendingMessageQueue:
 class _ActiveRun:
     task: asyncio.Task[AgentLoopResult]
     token: CancelToken
+    deadline_monotonic: Optional[float] = None
     idle: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -124,8 +128,10 @@ AgentEventListener = Callable[[AgentEvent], Union[Awaitable[None], None]]
 class Agent:
     """One model, one Tool registry, one transcript, one active run.
 
-    The façade freezes a Tool exposure, system prompt and model identity at
-    each run start; mutating them between runs affects the next run only.
+    The façade hands the live Tool registry to the loop, which re-freezes it
+    into an immutable exposure at every turn boundary; mutating the registry,
+    system prompt or model between runs affects the next run only, while a
+    Tool loaded mid-run becomes visible to the next turn.
     """
 
     def __init__(
@@ -154,7 +160,9 @@ class Agent:
         prepare_next_turn: Optional[PrepareNextTurnHook] = None,
     ) -> None:
         self._model = model
-        self._tool_registry = tool_registry or ToolRegistry()
+        self._tool_registry = (
+            tool_registry if tool_registry is not None else ToolRegistry()
+        )
         self._system_prompt = system_prompt
         self._env = env
         self._tool_execution = tool_execution
@@ -246,8 +254,11 @@ class Agent:
 
         Listeners are awaited in subscription order and are part of the run's
         settlement: the run is not idle until every ``agent_end`` listener has
-        finished. A raising listener fails the run — persistence listeners
-        must not silently lose records.
+        finished. A raising listener is an implementation fault — it
+        terminalizes the run's durable records and then propagates, since
+        persistence listeners must not silently lose records. A listener that
+        ignores the run's cancellation or deadline is cancelled and abandoned
+        with an :class:`AgentListenerTimeoutError` fault.
         """
 
         self._listeners.append(listener)
@@ -413,7 +424,9 @@ class Agent:
         context = AgentContext(
             system_prompt=self._system_prompt,
             messages=list(self._messages),
-            tools=self._tool_registry.freeze(),
+            # The live registry: the loop re-freezes it at every turn, so a
+            # Skill/MCP Tool loaded during one turn is exposed to the next.
+            tools=self._tool_registry,
             env=self._env,
         )
 
@@ -422,31 +435,31 @@ class Agent:
         self._error_message = None
 
         async def _execute() -> AgentLoopResult:
-            try:
-                if prompts is None:
-                    return await run_agent_loop_continue(
-                        context, config, self._process_event, token
-                    )
-                return await run_agent_loop(
-                    prompts, context, config, self._process_event, token
+            # Expected rejections are typed values at the prompt/continue_run
+            # boundary and model failures are FAILED results inside the loop;
+            # everything else that raises here is an implementation fault
+            # (listener, codec, persistence or loop bug) and propagates after
+            # the loop has terminalized the run's durable records.
+            if prompts is None:
+                return await run_agent_loop_continue(
+                    context, config, self._process_event, token
                 )
-            except asyncio.CancelledError:
-                raise
-            except JournalError:
-                raise
-            except Exception as exc:
-                # A loop fault still produces a complete terminal event
-                # sequence and a typed failed outcome (Pi handleRunFailure).
-                return await self._run_failure_outcome(exc, transaction)
+            return await run_agent_loop(
+                prompts, context, config, self._process_event, token
+            )
 
         task = asyncio.create_task(_execute(), name=f"qitos-agent-{run_id[:8]}")
-        active = _ActiveRun(task=task, token=token)
+        active = _ActiveRun(task=task, token=token, deadline_monotonic=deadline)
         self._active = active
 
         def _settle(_done: "asyncio.Task[AgentLoopResult]") -> None:
             self._is_streaming = False
             self._streaming_message = None
             self._pending_tool_calls = frozenset()
+            if not _done.cancelled():
+                fault = _done.exception()
+                if fault is not None:
+                    self._error_message = str(fault) or "agent run failed"
             active.idle.set()
             if self._active is active:
                 self._active = None
@@ -456,34 +469,15 @@ class Agent:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
             # Caller cancellation aborts cooperatively; the run task stays
-            # owned by this Agent and settles through the done callback.
+            # owned by this Agent and must reach its durable terminal state
+            # before the caller observes the cancellation.
             token.request_cancel("immediate")
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
             raise
-
-    async def _run_failure_outcome(
-        self,
-        exc: Exception,
-        transaction: Optional[TurnTransactionBoundary],
-    ) -> AgentLoopResult:
-        failure = AssistantMessage(
-            error=str(exc) or "agent run failed",
-            model_name=getattr(self._model, "model", None),
-            provider=getattr(self._model, "provider_name", None),
-        )
-        await self._process_event(MessageStart(message=failure))
-        await self._process_event(MessageEnd(message=failure))
-        await self._process_event(
-            TurnEnd(turn=-1, message=failure, tool_results=())
-        )
-        result = AgentLoopResult(
-            status=AgentRunStatus.FAILED,
-            messages=(failure,),
-            error=failure.error,
-        )
-        if transaction is not None:
-            await transaction.run_terminal(result)
-        await self._process_event(AgentEnd(messages=(failure,)))
-        return result
 
     async def _process_event(self, event: AgentEvent) -> None:
         if isinstance(event, (MessageStart, MessageUpdate)):
@@ -508,13 +502,70 @@ class Agent:
         for listener in list(self._listeners):
             outcome = listener(event)
             if inspect.isawaitable(outcome):
-                await outcome
+                await self._bounded_listener(listener, outcome)
+
+    async def _bounded_listener(
+        self, listener: AgentEventListener, outcome: Awaitable[None]
+    ) -> None:
+        """Await one listener bounded by the run's cancellation and deadline.
+
+        Listener exceptions propagate as faults (persistence listeners must
+        not silently lose records). A listener that ignores cancellation or
+        outlives the run deadline is cancelled and abandoned, and an
+        :class:`AgentListenerTimeoutError` fails the run loudly instead of
+        blocking ``abort()``/``wait_for_idle()`` forever.
+        """
+
+        active = self._active
+        token = active.token if active is not None else None
+        deadline = active.deadline_monotonic if active is not None else None
+        if token is None and deadline is None:
+            await outcome
+            return
+
+        async def _await_outcome() -> None:
+            await outcome
+
+        task = asyncio.create_task(_await_outcome(), name="qitos-agent-listener")
+        tasks: set[asyncio.Task[Any]] = {task}
+        watcher: Optional[asyncio.Task[bool]] = None
+        if token is not None:
+            watcher = asyncio.create_task(token.wait_cancelled())
+            tasks.add(watcher)
+        remaining = (
+            None
+            if deadline is None
+            else max(0.0, deadline - time.monotonic())
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                tasks, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+            )
+        except asyncio.CancelledError:
+            task.cancel()
+            if watcher is not None:
+                watcher.cancel()
+            raise
+        if task in done:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+            task.result()  # listener faults propagate
+            return
+        task.cancel()
+        if watcher is not None and not watcher.done():
+            watcher.cancel()
+        raise AgentListenerTimeoutError(
+            "agent listener ignored the run cancellation or deadline: "
+            f"{getattr(listener, '__name__', repr(listener))}"
+        )
 
 
 __all__ = [
     "Agent",
     "AgentBusyError",
     "AgentEventListener",
+    "AgentListenerTimeoutError",
     "AgentRunRejected",
     "AgentRunResult",
     "AgentRunStatus",

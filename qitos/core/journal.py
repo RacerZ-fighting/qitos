@@ -11,6 +11,7 @@ from enum import Enum
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 from .action import Action
+from .message import ToolCall
 from .tool_result import ToolResult
 
 
@@ -182,13 +183,19 @@ class JournalRecordRef:
 
 @dataclass(frozen=True, slots=True)
 class ToolTransaction:
-    """One committed canonical Tool terminal reconstructed from a Journal."""
+    """One committed canonical Tool terminal reconstructed from a Journal.
+
+    Records written by the retired Engine path carry ``step_id`` /
+    ``action_index`` / ``action`` (an ``Action``); records written by the
+    minimal agent loop carry ``turn`` / ``call`` (a ``ToolCall``) instead, so
+    ``step_id`` and ``action_index`` are ``None`` for the loop path.
+    """
 
     terminal: JournalRecordRef
     committed_at: JournalPosition
-    step_id: int
-    action_index: int
-    action: Action
+    step_id: int | None
+    action_index: int | None
+    action: Action | ToolCall
     result: ToolResult
 
 

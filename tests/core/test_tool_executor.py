@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import List
 
 import pytest
 
-from qitos.core.agent_events import ToolExecutionEnd, ToolExecutionStart
+from qitos.core._freeze import thaw_deep
+from qitos.core.agent_events import (
+    ToolExecutionEnd,
+    ToolExecutionStart,
+    ToolExecutionUpdate,
+)
 from qitos.core.cancellation import CancelToken
 from qitos.core.message import ToolCall
 from qitos.core.tool import RetryPolicy, tool
@@ -83,7 +89,10 @@ async def test_plain_values_and_tool_results_both_normalize() -> None:
     )
     assert results[0].status == "success"
     assert results[1].status == "partial"
-    assert results[1].output == {"rows": [1]}
+    # Terminal results are deeply immutable snapshots crossing the boundary.
+    assert thaw_deep(results[1].output) == {"rows": [1]}
+    with pytest.raises(TypeError):
+        results[1].output["rows"] = []  # type: ignore[index]
 
 
 @pytest.mark.asyncio
@@ -359,17 +368,251 @@ async def test_fail_fast_aborts_remaining_calls() -> None:
 
 @pytest.mark.asyncio
 async def test_needs_approval_tool_never_runs_in_a_parallel_segment() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    log: List[str] = []
+
+    @tool(name="safe", concurrency_safe=True)
+    async def _safe(text: str) -> str:
+        log.append("safe:start")
+        entered.set()
+        await release.wait()
+        log.append("safe:end")
+        return text
+
     @tool(name="approval", needs_approval=True, concurrency_safe=True)
     async def _approval(text: str) -> str:
+        log.append("approval:start")
+        log.append("approval:end")
         return text
 
     executor = ToolBatchExecutor(
-        _exposure(_approval, _echo), ToolExecutionConfig(mode="parallel")
+        _exposure(_safe, _approval), ToolExecutionConfig(mode="parallel")
     )
-    segments = executor._segment_calls(
+    batch = asyncio.create_task(
+        executor.execute_batch(
+            [_call("safe", {"text": "a"}, "c1"), _call("approval", {"text": "b"}, "c2")]
+        )
+    )
+    await entered.wait()
+    # An incorrectly concurrent approval would complete while safe is parked.
+    await asyncio.sleep(0)
+    release.set()
+    results = await batch
+    assert [r.status for r in results] == ["success", "success"]
+    # The approval tool is an exclusive barrier: it runs only after the safe
+    # call has fully finished.
+    assert log == ["safe:start", "safe:end", "approval:start", "approval:end"]
+
+
+@pytest.mark.asyncio
+async def test_duplicate_tool_call_ids_are_rejected_before_any_side_effect() -> None:
+    calls_run: List[str] = []
+
+    @tool(name="tracked")
+    def _tracked(text: str) -> str:
+        calls_run.append(text)
+        return text
+
+    transaction = RecordingTransaction()
+    executor = ToolBatchExecutor(
+        _exposure(_tracked, _echo),
+        ToolExecutionConfig(run_id="r"),
+        transaction=transaction,
+    )
+    results = await executor.execute_batch(
         [
-            _call("approval", {"text": "a"}, "c1"),
-            _call("echo", {"text": "b"}, "c2"),
+            _call("echo", {"text": "ok"}, "c1"),
+            _call("tracked", {"text": "a"}, "dup"),
+            _call("tracked", {"text": "b"}, "dup"),
         ]
     )
-    assert segments == [[0], [1]]
+    # No handler with a duplicated id ever executed.
+    assert calls_run == []
+    assert results[0].status == "success"
+    assert results[1].status == "error" and results[2].status == "error"
+    assert results[1].metadata["error_category"] == "duplicate_tool_call_id"
+    assert results[2].metadata["error_category"] == "duplicate_tool_call_id"
+    assert results[1].metadata["started"] is False
+    # Each duplicated id is journaled exactly once, under its first
+    # occurrence, so deterministic record ids stay unique. Batch admission
+    # records rejections before any executed call.
+    started = [r[2] for r in transaction.records if r[0] == "tool_started"]
+    terminals = [r[2] for r in transaction.records if r[0] == "tool_terminal"]
+    assert started == ["dup", "c1"]
+    assert terminals == ["dup", "c1"]
+
+
+@pytest.mark.asyncio
+async def test_parallel_preflight_is_sequential_and_precedes_execution() -> None:
+    log: List[tuple] = []
+
+    def _make(name: str):
+        @tool(name=name, concurrency_safe=True)
+        async def _safe(text: str) -> str:
+            log.append(("run", name))
+            return text
+
+        return _safe
+
+    tools = [_make("a"), _make("b"), _make("c")]
+
+    def _before(hook_context) -> None:
+        log.append(("before", hook_context.tool_call.name))
+        return None
+
+    executor = ToolBatchExecutor(
+        _exposure(*tools),
+        ToolExecutionConfig(mode="parallel", before_tool_call=_before),
+    )
+    results = await executor.execute_batch(
+        [_call(name, {"text": name}, f"c{i}") for i, name in enumerate(("a", "b", "c"))]
+    )
+    assert all(r.status == "success" for r in results)
+    befores = [entry for entry in log if entry[0] == "before"]
+    runs = [entry for entry in log if entry[0] == "run"]
+    # Permission/validation/before-hook preflight runs in input order, and no
+    # handler starts before every preflight has finished (Pi's parallel order).
+    assert befores == [("before", "a"), ("before", "b"), ("before", "c")]
+    first_run = log.index(runs[0])
+    assert all(log.index(entry) < first_run for entry in befores)
+    assert len(runs) == 3
+
+
+@pytest.mark.asyncio
+async def test_before_hook_updated_args_are_revalidated_then_executed() -> None:
+    from qitos.core.tool_executor import BeforeToolCallDecision
+
+    executor = ToolBatchExecutor(
+        _exposure(_echo),
+        ToolExecutionConfig(
+            before_tool_call=lambda ctx: BeforeToolCallDecision(
+                updated_args={"text": "changed"}
+            )
+        ),
+    )
+    results = await executor.execute_batch([_call("echo", {"text": "orig"}, "c1")])
+    assert results[0].status == "success"
+    assert results[0].output == "echo:changed"
+
+    invalid = ToolBatchExecutor(
+        _exposure(_echo),
+        ToolExecutionConfig(
+            before_tool_call=lambda ctx: BeforeToolCallDecision(
+                updated_args={"wrong": 1}
+            )
+        ),
+    )
+    results = await invalid.execute_batch([_call("echo", {"text": "orig"}, "c1")])
+    # QitOS strengthening: updated args are re-validated against the schema.
+    assert results[0].status == "error"
+    assert results[0].metadata["error_category"] == "invalid_tool_arguments"
+    assert results[0].metadata["started"] is False
+
+
+@pytest.mark.asyncio
+async def test_hung_before_hook_is_cancelled_by_token() -> None:
+    hook_started = asyncio.Event()
+
+    async def _hung(ctx) -> None:
+        hook_started.set()
+        await asyncio.Event().wait()
+        return None
+
+    token = CancelToken()
+    executor = ToolBatchExecutor(
+        _exposure(_echo),
+        ToolExecutionConfig(cancel_token=token, before_tool_call=_hung),
+    )
+    batch = asyncio.create_task(
+        executor.execute_batch([_call("echo", {"text": "x"}, "c1")])
+    )
+    await hook_started.wait()
+    token.request_cancel("immediate")
+    results = await asyncio.wait_for(batch, timeout=5)
+    # A hung hook cannot block abort: the call ends with a cancelled terminal.
+    assert results[0].status == "cancelled"
+    assert results[0].metadata["cancel_source"] == "cancel_token"
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_terminalizes_then_reraises() -> None:
+    handler_started = asyncio.Event()
+    release = asyncio.Event()  # never set
+
+    @tool(name="waiter")
+    async def _waiter(text: str) -> str:
+        handler_started.set()
+        await release.wait()
+        return text
+
+    transaction = RecordingTransaction()
+    executor = ToolBatchExecutor(
+        _exposure(_waiter, _echo),
+        ToolExecutionConfig(run_id="r"),
+        transaction=transaction,
+    )
+    batch = asyncio.create_task(
+        executor.execute_batch(
+            [_call("waiter", {"text": "a"}, "c1"), _call("echo", {"text": "b"}, "c2")]
+        )
+    )
+    await handler_started.wait()
+    batch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await batch
+    # Started work was terminalized before the cancellation propagated.
+    results = executor.last_batch_results
+    assert results is not None and len(results) == 2
+    assert results[0].status == "cancelled"
+    assert results[0].metadata["cancel_source"] == "caller_cancelled"
+    assert results[1].status == "cancelled"
+    kinds = [record[0] for record in transaction.records]
+    assert kinds == [
+        "tool_started",
+        "tool_terminal",
+        "tool_started",
+        "tool_terminal",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_progress_emits_tool_execution_update_events() -> None:
+    @tool(name="progress")
+    def _progress(text: str, runtime_context=None) -> str:
+        runtime_context["emit_progress"]({"stage": "half"})
+        return text
+
+    events = []
+    executor = ToolBatchExecutor(
+        _exposure(_progress), ToolExecutionConfig(), emit=events.append
+    )
+    results = await executor.execute_batch([_call("progress", {"text": "x"}, "c1")])
+    assert results[0].status == "success"
+    updates = [e for e in events if isinstance(e, ToolExecutionUpdate)]
+    assert len(updates) == 1
+    assert updates[0].tool_call_id == "c1"
+    assert updates[0].partial_result == {"stage": "half"}
+    # Updates arrive before the execution end event.
+    kinds = [type(e).__name__ for e in events]
+    assert kinds.index("ToolExecutionUpdate") < kinds.index("ToolExecutionEnd")
+
+
+@pytest.mark.asyncio
+async def test_after_step_cancel_does_not_interrupt_tool_execution() -> None:
+    token = CancelToken()
+
+    @tool(name="setter")
+    def _setter(text: str) -> str:
+        token.request_cancel("after_step")
+        return text
+
+    executor = ToolBatchExecutor(
+        _exposure(_setter, _echo), ToolExecutionConfig(cancel_token=token)
+    )
+    results = await executor.execute_batch(
+        [_call("setter", {"text": "a"}, "c1"), _call("echo", {"text": "b"}, "c2")]
+    )
+    # after_step never interrupts an in-flight batch; the agent loop stops
+    # the run at the turn boundary instead.
+    assert [r.status for r in results] == ["success", "success"]

@@ -73,6 +73,17 @@ class ToolExecutionStart:
 
 
 @dataclass(frozen=True, slots=True)
+class ToolExecutionUpdate:
+    """One intermediate progress payload reported by a running Tool."""
+
+    tool_call_id: str
+    tool_name: str
+    args: Mapping[str, Any]
+    partial_result: Any
+    type: str = field(default="tool_execution_update", init=False)
+
+
+@dataclass(frozen=True, slots=True)
 class ToolExecutionEnd:
     tool_call_id: str
     tool_name: str
@@ -90,6 +101,7 @@ AgentEvent = Union[
     MessageUpdate,
     MessageEnd,
     ToolExecutionStart,
+    ToolExecutionUpdate,
     ToolExecutionEnd,
 ]
 
@@ -120,6 +132,7 @@ __all__ = [
     "MessageUpdate",
     "ToolExecutionEnd",
     "ToolExecutionStart",
+    "ToolExecutionUpdate",
     "TurnEnd",
     "TurnStart",
     "emit_to",

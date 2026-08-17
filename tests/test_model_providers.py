@@ -1200,3 +1200,28 @@ async def test_ollama_uses_official_async_chat_and_projects_history(
 def test_context_registry_infers_anthropic_and_gemini_windows() -> None:
     assert infer_context_window("claude-3-5-sonnet-latest") == 200_000
     assert infer_context_window("gemini-2.5-flash") == 1_048_576
+
+
+def test_anthropic_tool_result_block_carries_is_error() -> None:
+    model = AnthropicModel(api_key="test-key", model="claude-test", max_attempts=1)
+    replay = model._anthropic_messages(
+        [
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_9",
+                "content": "permission denied",
+                "is_error": True,
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "toolu_8",
+                "content": "fine",
+                "is_error": False,
+            },
+        ]
+    )
+    # Consecutive tool results merge into one user message; the error flag
+    # rides on the failing block only (Pi keeps isError visible to the model).
+    blocks = replay[0]["content"]
+    assert blocks[0]["is_error"] is True
+    assert "is_error" not in blocks[1]

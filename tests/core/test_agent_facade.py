@@ -270,3 +270,74 @@ async def test_queue_mode_all_drains_everything() -> None:
     await agent.prompt("go")
     users = [m.content for m in agent.messages if isinstance(m, UserMessage)]
     assert users == ["go", "f1", "f2"]
+
+
+@pytest.mark.asyncio
+async def test_listener_fault_propagates_and_run_is_terminalized() -> None:
+    from qitos.core.agent_events import TurnEnd
+
+    transaction = RecordingTransaction()
+    agent = _agent(
+        ScriptedModel([text_events("ok")]),
+        transaction_factory=lambda run_id: transaction,
+    )
+
+    def _broken(event) -> None:
+        if isinstance(event, TurnEnd):
+            raise RuntimeError("listener bug")
+
+    agent.subscribe(_broken)
+    # A listener bug is an implementation fault, not a typed run failure.
+    with pytest.raises(RuntimeError, match="listener bug"):
+        await agent.prompt("go")
+    # The run still reached its durable terminal state first.
+    kinds = [record[0] for record in transaction.records]
+    assert "run_terminal" in kinds
+    assert transaction.records[-1] == ("run_terminal", "failed")
+    assert agent.error_message == "listener bug"
+    await agent.wait_for_idle()
+
+
+@pytest.mark.asyncio
+async def test_prompt_cancellation_settles_the_run_before_raising() -> None:
+    from qitos.core.agent_events import MessageUpdate
+
+    gate = asyncio.Event()  # never set: the model stream hangs mid-run
+    transaction = RecordingTransaction()
+    agent = _agent(
+        ScriptedModel([make_hanging_model(gate, first_text="w")]),
+        transaction_factory=lambda run_id: transaction,
+    )
+    streaming = asyncio.Event()
+
+    def _on_event(event) -> None:
+        if isinstance(event, MessageUpdate):
+            streaming.set()
+
+    agent.subscribe(_on_event)
+    prompt_task = asyncio.create_task(agent.prompt("go"))
+    await streaming.wait()
+    prompt_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await prompt_task
+    # The run reached its durable terminal state before the caller observed
+    # the cancellation.
+    assert transaction.records[-1] == ("run_terminal", "aborted")
+    await agent.wait_for_idle()
+
+
+@pytest.mark.asyncio
+async def test_agent_keeps_the_callers_tool_registry_instance() -> None:
+    registry = ToolRegistry()
+    agent = Agent(model=ScriptedModel([text_events("ok")]), tool_registry=registry)
+    # An explicitly passed (even empty) registry stays the Agent's registry.
+    assert agent.tool_registry is registry
+
+    @tool(name="late")
+    def _late(text: str) -> str:
+        return text
+
+    registry.register(_late)
+    result = await agent.prompt("go")
+    assert isinstance(result, AgentLoopResult)
+    assert result.status is AgentRunStatus.COMPLETED

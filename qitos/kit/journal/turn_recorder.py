@@ -14,7 +14,13 @@ from typing import Any, Mapping
 
 from ...core.agent_loop import AgentLoopResult, TurnTransactionBoundary
 from ...core.journal import JournalPosition, JournalRecordType, SessionJournal
-from ...core.message import AssistantMessage, Message, ToolCall, message_to_dict
+from ...core.message import (
+    AssistantMessage,
+    Message,
+    ToolCall,
+    ToolResultMessage,
+    message_to_dict,
+)
 from ...core.model_request import ModelRequest
 from ...core.tool_result import ToolResult
 
@@ -69,6 +75,7 @@ class JournalTurnTransaction(TurnTransactionBoundary):
             {
                 "turn": turn,
                 "call_id": call.id,
+                "call": call.to_dict(),
                 "result": result.to_dict(),
             },
             record_id=f"{self._journal.run_id}:turn:{turn}:tool:{call.id}:terminal",
@@ -77,11 +84,20 @@ class JournalTurnTransaction(TurnTransactionBoundary):
     async def turn_committed(
         self, turn: int, new_messages: tuple[Message, ...]
     ) -> JournalPosition:
+        # The JSONL index links committed Tool terminals to their commit
+        # record through terminal_record_ids; without them a committed Tool
+        # transaction of this run could not be queried back or recovered.
+        terminal_record_ids = [
+            f"{self._journal.run_id}:turn:{turn}:tool:{message.tool_call_id}:terminal"
+            for message in new_messages
+            if isinstance(message, ToolResultMessage)
+        ]
         return await self._journal.append(
             JournalRecordType.STEP_COMMITTED,
             {
                 "turn": turn,
                 "messages": [message_to_dict(message) for message in new_messages],
+                "terminal_record_ids": terminal_record_ids,
             },
             record_id=f"{self._journal.run_id}:turn:{turn}:committed",
         )

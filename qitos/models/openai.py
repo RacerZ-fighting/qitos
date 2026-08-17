@@ -552,7 +552,7 @@ def _to_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         content = message.get("content")
         payload: Dict[str, Any] = {"role": role}
         for key, value in message.items():
-            if key in {"role", "content", "native_items"}:
+            if key in {"role", "content", "native_items", "is_error"}:
                 continue
             payload[key] = value
         if isinstance(content, list):

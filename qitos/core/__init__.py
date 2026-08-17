@@ -201,6 +201,7 @@ from .agent_events import (
     MessageUpdate,
     ToolExecutionEnd,
     ToolExecutionStart,
+    ToolExecutionUpdate,
     TurnEnd,
     TurnStart,
 )
@@ -221,6 +222,7 @@ from .agent_loop import (
 from .agent import (
     Agent,
     AgentBusyError,
+    AgentListenerTimeoutError,
     AgentRunRejected,
     AgentRunResult,
     QueueMode,
@@ -228,11 +230,14 @@ from .agent import (
 from .tool_executor import (
     AfterToolCallContext,
     AfterToolCallHook,
+    AfterToolCallOverride,
+    AgentContextSnapshot,
     BeforeToolCallContext,
     BeforeToolCallDecision,
     BeforeToolCallHook,
     ToolBatchExecutor,
     ToolExecutionConfig,
+    ToolHookRuntime,
     ToolTransactionBoundary,
 )
 
@@ -432,6 +437,7 @@ __all__ = [
     "MessageUpdate",
     "ToolExecutionEnd",
     "ToolExecutionStart",
+    "ToolExecutionUpdate",
     "TurnEnd",
     "TurnStart",
     "AgentContext",
@@ -448,15 +454,19 @@ __all__ = [
     "run_agent_loop_continue",
     "Agent",
     "AgentBusyError",
+    "AgentListenerTimeoutError",
     "AgentRunRejected",
     "AgentRunResult",
     "QueueMode",
     "AfterToolCallContext",
     "AfterToolCallHook",
+    "AfterToolCallOverride",
+    "AgentContextSnapshot",
     "BeforeToolCallContext",
     "BeforeToolCallDecision",
     "BeforeToolCallHook",
     "ToolBatchExecutor",
     "ToolExecutionConfig",
+    "ToolHookRuntime",
     "ToolTransactionBoundary",
 ]

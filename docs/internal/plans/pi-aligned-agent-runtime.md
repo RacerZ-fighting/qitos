@@ -42,6 +42,26 @@ minimal loop (`core/agent_loop.py`), the `Agent` façade (`core/agent.py`) and
 `tests/journal/test_turn_recorder.py`. Old-lifecycle callers remain until the
 rest of milestone 2.2.
 
+Review-hardening dispositions recorded on the same branch:
+
+- `ToolExecutionUpdate` is implemented, wired to the Tool `emit_progress`
+  runtime callback (Pi parity); earlier notes claiming "no data source" were
+  wrong.
+- Pi's custom `AgentMessage` + `convertToLlm` extension point is explicitly
+  excluded at the QitOS canonical transcript boundary: the transcript stays a
+  closed typed set (`UserMessage`/`AssistantMessage`/`ToolResultMessage`)
+  with a fail-closed codec; application-specific projections belong in
+  journal records, events and metadata, not in LLM-bound messages.
+- `before_tool_call` may return `updated_args`; QitOS re-validates them
+  against the same input schema and permission before execution instead of
+  copying Pi's unvalidated mutation channel.
+- Cancellation closes the loop: external task cancellation and faults
+  terminalize started work plus the run record before re-raising;
+  `CancelToken` `after_step` stops at turn boundaries and never interrupts
+  in-flight streams or Tool calls; duplicate Tool-call ids are rejected at
+  batch admission; terminal `ToolResult`s are deeply immutable before they
+  cross journal, event and Message boundaries.
+
 ### 2.2 Replace loop and façade
 
 - Introduce the minimal loop and small Agent façade as the only execution path.

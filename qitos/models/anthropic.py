@@ -598,13 +598,14 @@ class AnthropicModel(Model):
                 call_id = str(message.get("tool_call_id") or "").strip()
                 if not call_id:
                     continue
-                content: List[Dict[str, Any]] = [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": call_id,
-                        "content": content_to_text(message.get("content")),
-                    }
-                ]
+                tool_result_block: Dict[str, Any] = {
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": content_to_text(message.get("content")),
+                }
+                if message.get("is_error"):
+                    tool_result_block["is_error"] = True
+                content: List[Dict[str, Any]] = [tool_result_block]
                 self._append_message(converted, "user", content)
                 continue
 
