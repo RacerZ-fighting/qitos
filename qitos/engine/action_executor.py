@@ -109,7 +109,6 @@ class ActionExecutor:
         policy: Optional[ActionExecutionPolicy] = None,
         trace_writer: Any = None,
         delegate_depth: int = 0,
-        shared_memory: Any = None,
         engine: _ActionRuntimeOwner | None = None,
         permission_pipeline: Any = None,
         read_before_write_enforcer: Any = None,
@@ -123,7 +122,6 @@ class ActionExecutor:
         self.policy = policy or ActionExecutionPolicy()
         self.trace_writer = trace_writer
         self.delegate_depth = delegate_depth
-        self.shared_memory = shared_memory
         self._engine = engine
         self._pipeline = permission_pipeline
         self._rbw_enforcer = read_before_write_enforcer
@@ -1519,7 +1517,6 @@ class ActionExecutor:
             "remaining_seconds": _remaining_seconds,
             "agent_cancelled": self._is_cancelled,
             "trace_writer": self.trace_writer,
-            "shared_memory": self.shared_memory,
             "agent": self._engine.agent if self._engine is not None else None,
         }
 

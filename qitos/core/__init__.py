@@ -171,13 +171,6 @@ from .agent_spec import (
     HandoffContext,
     StateAdapter,
 )
-from .shared_memory import (
-    SharedMemory,
-    InMemorySharedMemory,
-    FileSharedMemory,
-    SharedMemoryNamespace,
-    SharedMemoryManager,
-)
 from .cancellation import CancelMode, CancelToken
 from .message import (
     AssistantMessage,
@@ -411,11 +404,6 @@ __all__ = [
     "ContextStrategy",
     "HandoffContext",
     "StateAdapter",
-    "SharedMemory",
-    "InMemorySharedMemory",
-    "FileSharedMemory",
-    "SharedMemoryNamespace",
-    "SharedMemoryManager",
     "CancelMode",
     "CancelToken",
     "AssistantMessage",

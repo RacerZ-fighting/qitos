@@ -181,3 +181,6 @@ security_report*.md
 # Auto-generated API reference pages (built by docs hook)
 docs/reference/api_generated/
 docs/zh/reference/api_generated/
+
+# Local task scratch (logs, debug output)
+tmp/

@@ -39,8 +39,13 @@ loop events (`core/agent_events.py`), `AgentLoopResult`/rejection types, the
 minimal loop (`core/agent_loop.py`), the `Agent` façade (`core/agent.py`) and
 `ToolBatchExecutor` (`core/tool_executor.py`) landed with conformance tests in
 `tests/core/test_agent_{message,loop,facade}.py`, `test_tool_executor.py` and
-`tests/journal/test_turn_recorder.py`. Old-lifecycle callers remain until the
-rest of milestone 2.2.
+`tests/journal/test_turn_recorder.py`. Child agents now run on the façade:
+`kit/child/agent_engine.py` drives one child run per invocation through `Agent`
+with narrowed tools/budgets and a `JournalTurnTransaction` journal, supervisor
+recovery rebuilds terminal Child facts from the child's loop journal, and the
+Engine-coupled `DelegateTool`/`FanOutTool`, the kit `HandoffTool` chain,
+`core/shared_memory.py` and `kit/repl` are removed. Old-lifecycle callers
+remain until the rest of milestone 2.2.
 
 Review-hardening dispositions recorded on the same branch:
 

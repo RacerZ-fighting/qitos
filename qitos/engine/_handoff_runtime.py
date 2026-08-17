@@ -240,9 +240,6 @@ class _HandoffRuntime(Generic[StateT, ObservationT, ActionT]):
         self.engine.agent = spec.agent
         self.engine.tool_registry = spec.agent.tool_registry
 
-        # 4b. Set up SharedMemoryManager namespace for the new agent
-        self._setup_shared_memory_namespace(old_agent_name, target_name)
-
         # Rebuild via the Engine's shared builder so the execution policy,
         # permission pipeline, interceptors and cancellation token survive
         # the handoff instead of being silently dropped.
@@ -284,30 +281,6 @@ class _HandoffRuntime(Generic[StateT, ObservationT, ActionT]):
             context_strategy=strategy_str,
             messages_passed=messages_passed,
         )
-
-    def _setup_shared_memory_namespace(
-        self, old_agent_name: str, target_name: str
-    ) -> None:
-        """Ensure a SharedMemoryManager namespace exists for the target agent.
-
-        If the engine has a SharedMemoryManager (stored as
-        ``_shared_memory_manager``), creates writable namespaces for both
-        the source and target agents.  If the spec declares
-        ``shared_memory``, the target agent also gets access to the
-        source agent's namespace as read-only.
-        """
-        from ..core.shared_memory import SharedMemoryManager
-
-        mgr = getattr(self.engine, "_shared_memory_manager", None)
-        if mgr is None:
-            return
-
-        if not isinstance(mgr, SharedMemoryManager):
-            return
-
-        # Ensure both agents have their own writable namespace
-        mgr.namespace(old_agent_name)
-        mgr.namespace(target_name)
 
     def _validate_state_compatibility(self, state: Any, spec: Any) -> None:
         """Check that state is compatible with the new agent.

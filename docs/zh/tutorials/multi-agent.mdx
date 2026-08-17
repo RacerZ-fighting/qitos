@@ -4,7 +4,7 @@
 
 ## 最终效果
 
-你将得到一个协调智能体。它通过 `fanout` 工具并行启动多个探索智能体，让每个智能体检查一个目录，
+你将得到一个协调智能体。它通过子 `Agent` 工具并行启动多个探索智能体，让每个智能体检查一个目录，
 最后汇总并综合各自的结果。
 
 ## 准备工作
@@ -12,111 +12,89 @@
 - 已安装 QitOS（`pip install qitos`）
 - 已配置兼容 OpenAI 的 API key
 
-## 第一步：定义子智能体
+## 第一步：定义子智能体的工具和提示词
 
-先创建一个能够检查目录的探索智能体：
+子智能体与父级使用同一个 `Agent` 实现，只是工具和预算被收窄。先定义一个探索子智能体可用的能力：
 
 ```python
-from dataclasses import dataclass, field
-from typing import Any
-from qitos import Action, AgentModule, Decision, StateSchema, ToolRegistry
-from qitos.kit import CodingToolSet, REACT_SYSTEM_PROMPT, ReActTextParser, format_action, render_prompt
-
-@dataclass
-class ExplorerState(StateSchema):
-    scratchpad: list[str] = field(default_factory=list)
+from qitos.core.tool_registry import ToolRegistry
+from qitos.kit import CodingToolSet
 
 EXPLORER_PROMPT = """\
 You are a code explorer agent. Investigate directories and report findings.
-
-Output contract (strict):
-Thought: <reasoning>
-Action: <tool_name>(arg=value, ...)
-or
-Final Answer: <summary>
+Keep the final answer to a short factual summary.
 """
 
-class ExplorerAgent(AgentModule[ExplorerState, dict[str, Any], Action]):
+def explorer_tools(workspace_root: str) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.include(CodingToolSet(
+        workspace_root=workspace_root,
+        include_notebook=False,
+        enable_lsp=False,
+        enable_tasks=False,
+        enable_web=False,
+    ))
+    return registry
+```
+
+## 第二步：用 Agent 工具创建协调智能体
+
+协调智能体注册面向模型的 `Agent` 工具。invocation factory 为每次调用构建一个全新的子智能体，
+工具和预算只会收窄：
+
+```python
+from dataclasses import dataclass
+from typing import Any
+from qitos import Action, AgentModule, Decision, StateSchema, ToolRegistry
+from qitos.core import TaskBudget
+from qitos.kit import CodingToolSet, ReActTextParser
+from qitos.kit.child import build_agent_child_invocation_factory
+from qitos.kit.tool.agent import AgentTool
+
+@dataclass
+class CoordinatorState(StateSchema):
+    pass
+
+class CoordinatorAgent(AgentModule[CoordinatorState, dict[str, Any], Action]):
     def __init__(self, llm, workspace_root):
         registry = ToolRegistry()
-        registry.include(CodingToolSet(
-            workspace_root=workspace_root,
-            include_notebook=False,
-            enable_lsp=False,
-            enable_tasks=False,
-            enable_web=False,
-        ))
+        registry.include(CodingToolSet(workspace_root=workspace_root, ...))
+        registry.register(
+            AgentTool(
+                invocation_factory=build_agent_child_invocation_factory(
+                    model=llm,
+                    tool_registry=explorer_tools(workspace_root),
+                    system_prompt=EXPLORER_PROMPT,
+                ),
+                execution_mode="optional_background",
+                child_budget=TaskBudget(max_steps=5),
+            )
+        )
         super().__init__(tool_registry=registry, llm=llm, model_parser=ReActTextParser())
 
     def init_state(self, task, **kwargs):
-        return ExplorerState(task=task, max_steps=5)
+        return CoordinatorState(task=task, max_steps=12)
 
     def build_system_prompt(self, state):
-        return render_prompt(EXPLORER_PROMPT, {"tool_schema": self.tool_registry.get_tool_descriptions()})
+        return (
+            "You are a code analysis coordinator. Use the Agent tool once per "
+            "independent directory investigation; same-response calls run "
+            "concurrently. Synthesize their conclusions into your final answer."
+        )
 
     def prepare(self, state):
-        lines = [f"Task: {state.task}", f"Step: {state.current_step}/{state.max_steps}"]
-        if state.scratchpad:
-            lines.extend(state.scratchpad[-8:])
-        return "\n".join(lines)
+        return f"Task: {state.task}"
 
     def reduce(self, state, observation, decision):
-        action_results = observation.get("action_results", []) if isinstance(observation, dict) else []
-        if decision.rationale:
-            state.scratchpad.append(f"Thought: {decision.rationale}")
-        if decision.actions:
-            state.scratchpad.append(f"Action: {format_action(decision.actions[0])}")
-        if action_results:
-            state.scratchpad.append(f"Observation: {action_results[0]}")
-        state.scratchpad = state.scratchpad[-20:]
+        if decision.mode == "final":
+            state.final_result = str(decision.final_answer or "")
         return state
 ```
 
-## 第二步：注册智能体
-
-通过 `AgentSpec` 和 `AgentRegistry` 注册子智能体：
+## 第三步：运行
 
 ```python
-from qitos import AgentRegistry, AgentSpec, ContextStrategy
-
-llm = ...  # 模型实例
-
-explorer_spec = AgentSpec(
-    name="explorer",
-    description="Explores a directory and reports its structure",
-    agent=ExplorerAgent(llm=llm, workspace_root="./my-project"),
-    context_strategy=ContextStrategy.ISOLATED,  # 子智能体不需要父级上下文
-    max_steps_override=5,
-)
-
-registry = AgentRegistry()
-registry.register(explorer_spec)
-```
-
-## 第三步：创建协调智能体
-
-协调智能体同时拥有编码工具和 `fanout` 工具：
-
-```python
-from qitos.kit import CodingToolSet
-
-class CoordinatorAgent(AgentModule[ExplorerState, dict[str, Any], Action]):
-    def __init__(self, llm, workspace_root, agent_registry):
-        registry = ToolRegistry()
-        registry.include(CodingToolSet(workspace_root=workspace_root, ...))
-        # 注册委派和并行派发工具
-        for delegate_tool in agent_registry.get_delegate_tools():
-            registry.register(delegate_tool)
-        registry.register(agent_registry.get_fanout_tool())
-
-        super().__init__(tool_registry=registry, llm=llm, model_parser=ReActTextParser())
-    # init_state、build_system_prompt、prepare 和 reduce 与 ExplorerAgent 相同
-```
-
-## 第四步：运行
-
-```python
-coordinator = CoordinatorAgent(llm=llm, workspace_root="./my-project", agent_registry=registry)
+coordinator = CoordinatorAgent(llm=llm, workspace_root="./my-project")
 result = coordinator.run(
     task="Analyze this codebase. Investigate the auth, api, and db modules in parallel.",
     max_steps=12,
@@ -124,9 +102,9 @@ result = coordinator.run(
 print(result.state.final_result)
 ```
 
-模型将调用
-`fanout(tasks=[{"agent":"explorer","task":"Explore /auth"}, ...])`，
-并行启动三个探索智能体。
+协调智能体为每个目录发起一次 `Agent` 调用。使用 `run_in_background=true` 时，每次调用都会立即返回
+一个父级作用域内的 child handle，每个完成结果都以类型化 `agent.child.completed` 运行时事件送达；
+前台调用则直接返回子智能体结论。
 
 ## 将协作策略留在应用层
 
@@ -137,6 +115,7 @@ Manager/Worker、Planner/Executor 和评审拓扑都是应用策略，不是独�
 
 ## 后续尝试
 
-- 使用 `ContextStrategy.FULL` 向子智能体传递父级上下文
-- 使用 `DelegateTool` 完成一对一委派并返回结果
+- 注册 `ChildControlToolSet`，让协调智能体获得对存活子智能体的 `child_status`、`child_wait`、
+  `child_message` 和 `child_interrupt` 能力
+- 给 invocation factory 传入 `journal_directory`，持久化子智能体运行记录
 - 使用 `Decision.handoff()` 构建工作流式智能体链

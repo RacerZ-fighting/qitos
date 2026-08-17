@@ -272,7 +272,6 @@ class EngineConfig:
     has_trace_writer: bool = False
     protocol_id: Optional[str] = None
     delegate_depth: int = 0
-    has_shared_memory: bool = False
     has_env: bool = False
     tool_count: int = 0
 

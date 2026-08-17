@@ -639,7 +639,8 @@ class TestAgentTool:
 
     @pytest.mark.asyncio
     async def test_background_budget_stop_returns_partial_tool_evidence(self):
-        from qitos.engine.states import StepRecord
+        from qitos.core.message import AssistantMessage, ToolResultMessage
+        from qitos.core.tool_result import ToolResult
         from qitos.kit.tool.agent import AgentTool
 
         events = []
@@ -655,14 +656,15 @@ class TestAgentTool:
                 assert kwargs == {}
                 return SimpleNamespace(
                     state=SimpleNamespace(final_result="", stop_reason="budget_time"),
-                    records=[
-                        StepRecord(
-                            step_id=4,
-                            action_results=[
-                                {"status": "success", "output": "uid=33(www-data)"}
-                            ],
-                            tool_invocations=[{"tool_name": "shell"}],
-                        )
+                    messages=[
+                        AssistantMessage(text="probing"),
+                        ToolResultMessage(
+                            tool_call_id="call-1",
+                            tool_name="shell",
+                            result=ToolResult(
+                                status="success", output="uid=33(www-data)"
+                            ),
+                        ),
                     ],
                     step_count=5,
                     total_tokens=10,
@@ -707,7 +709,8 @@ class TestAgentTool:
     async def test_running_background_child_exposes_bounded_tool_evidence_snapshot(
         self,
     ):
-        from qitos.engine.states import StepRecord
+        from qitos.core.message import AssistantMessage, ToolResultMessage
+        from qitos.core.tool_result import ToolResult
         from qitos.kit.tool.agent import AgentTool
 
         started = asyncio.Event()
@@ -715,19 +718,21 @@ class TestAgentTool:
 
         class FakeEngine(_ClosableEngine):
             active_run_id = "child-run"
-            records = [
-                StepRecord(
-                    step_id=index,
-                    model_response={"reasoning": "private child reasoning"},
-                    action_results=[
-                        {
-                            "status": "success",
-                            "output": f"evidence-{index}-" + ("x" * 2_000),
-                        }
-                    ],
-                    tool_invocations=[{"tool_name": "shell"}],
-                )
+            step_count = 20
+            messages = [
+                message
                 for index in range(20)
+                for message in (
+                    AssistantMessage(text="private child reasoning"),
+                    ToolResultMessage(
+                        tool_call_id=f"call-{index}",
+                        tool_name="shell",
+                        result=ToolResult(
+                            status="success",
+                            output=f"evidence-{index}-" + ("x" * 2_000),
+                        ),
+                    ),
+                )
             ]
 
             async def arun(self, task, **kwargs):
@@ -739,8 +744,8 @@ class TestAgentTool:
                         final_result="",
                         stop_reason="cancelled_immediate",
                     ),
-                    records=self.records,
-                    step_count=len(self.records),
+                    messages=self.messages,
+                    step_count=self.step_count,
                     total_tokens=321,
                     run_id=self.active_run_id,
                 )

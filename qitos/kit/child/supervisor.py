@@ -33,12 +33,14 @@ from ...core.journal import (
     JournalRecordType,
     SessionJournal,
 )
+from ...core.message import AssistantMessage, ToolResultMessage
 from ...core.runtime_input import (
     RuntimeInput,
     child_result_payload,
     child_terminal_runtime_input,
 )
-from ...core.tool_result import ToolResult
+from ..journal import recover_run_outcome
+from .agent_engine import child_final_text, child_run_stats, child_stop_reason
 from .limits import ChildRunLimiter, _ChildRunLease
 
 _logger = logging.getLogger(__name__)
@@ -400,18 +402,7 @@ class ChildSupervisor:
         for handle, start in started.items():
             if handle in recovered:
                 continue
-            result = ChildResult(
-                handle=handle,
-                request=start.request,
-                status=ChildStatus.INTERRUPTED,
-                conclusion=AgentConclusion(
-                    failure_paths=(
-                        "The parent process exited before the child terminal record.",
-                    )
-                ),
-                child_run_id=start.child_run_id,
-                error="Child side effects may be incomplete; the Engine was not replayed.",
-            )
+            result = await self._recover_interrupted_result(handle, start)
             try:
                 await journal.append(
                     JournalRecordType.CHILD_TERMINAL,
@@ -568,7 +559,6 @@ class ChildSupervisor:
         for owned in self._children.values():
             if self._current_result(owned).ready or owned.engine is None:
                 continue
-            records = list(getattr(owned.engine, "records", []) or [])
             events.append(
                 RuntimeInput(
                     event_id=f"{owned.handle.child_id}:conclude-snapshot",
@@ -584,18 +574,18 @@ class ChildSupervisor:
                         "name": owned.request.name,
                         "description": owned.request.description,
                         "output": self._partial_result(owned.engine),
-                        "steps": len(records),
+                        "steps": int(getattr(owned.engine, "step_count", 0) or 0),
                         "total_tokens": int(
-                            getattr(owned.engine, "_token_usage", 0) or 0
+                            getattr(owned.engine, "token_usage", 0) or 0
                         ),
                         "total_cost_usd": float(
-                            getattr(owned.engine, "_cost_usage_usd", 0.0) or 0.0
+                            getattr(owned.engine, "cost_usage_usd", 0.0) or 0.0
                         ),
                         "usage_complete": bool(
-                            getattr(owned.engine, "_usage_complete", False)
+                            getattr(owned.engine, "usage_complete", False)
                         ),
                         "cost_complete": bool(
-                            getattr(owned.engine, "_cost_complete", False)
+                            getattr(owned.engine, "cost_complete", False)
                         ),
                         "run_id": self._child_run_id(owned),
                     },
@@ -1150,6 +1140,77 @@ class ChildSupervisor:
                 terminal[result.handle] = result
         return started, terminal
 
+    async def _recover_interrupted_result(
+        self,
+        handle: ChildHandle,
+        start: _RecoveredChildStart,
+    ) -> ChildResult:
+        """Rebuild one started Child's terminal fact from its own run journal.
+
+        A child that reached a durable run terminal record (loop taxonomy)
+        before the parent died is projected from that journal; a child without
+        a terminal record is closed as interrupted without replaying its Agent.
+        """
+
+        if start.child_run_id and self._child_journal_factory is not None:
+            records = await self._replay_child_journal(start.child_run_id)
+            if records is not None:
+                try:
+                    outcome = recover_run_outcome(records)
+                except ValueError as exc:
+                    raise ChildPersistenceError(
+                        "child run journal is not a recoverable loop journal"
+                    ) from exc
+                if outcome is not None:
+                    return self._result_from_outcome(
+                        handle=handle,
+                        start=start,
+                        outcome=outcome,
+                    )
+        return ChildResult(
+            handle=handle,
+            request=start.request,
+            status=ChildStatus.INTERRUPTED,
+            conclusion=AgentConclusion(
+                failure_paths=(
+                    "The parent process exited before the child terminal record.",
+                )
+            ),
+            child_run_id=start.child_run_id,
+            error="Child side effects may be incomplete; the Agent was not replayed.",
+        )
+
+    def _result_from_outcome(
+        self,
+        *,
+        handle: ChildHandle,
+        start: _RecoveredChildStart,
+        outcome: Any,
+    ) -> ChildResult:
+        stop_reason = child_stop_reason(outcome.status, outcome.error)
+        status = self._child_status(stop_reason)
+        status_detail = stop_reason or "unknown stop reason"
+        stats = child_run_stats(outcome.messages)
+        summary = child_final_text(outcome.messages) or self._partial_result(outcome)
+        return ChildResult(
+            handle=handle,
+            request=start.request,
+            status=status,
+            conclusion=AgentConclusion(
+                summary=summary,
+                failure_paths=(status_detail,) if status is ChildStatus.FAILED else (),
+                unknowns=(
+                    (status_detail,) if status is ChildStatus.BUDGET_EXHAUSTED else ()
+                ),
+            ),
+            child_run_id=start.child_run_id,
+            error=outcome.error,
+            steps=stats.steps,
+            total_tokens=stats.total_tokens,
+            usage_complete=stats.usage_complete,
+            cost_complete=False,
+        )
+
     async def _descendant_launch_ids(
         self,
         *,
@@ -1341,10 +1402,10 @@ class ChildSupervisor:
         if engine is None:
             return (0, 0.0, False, False)
         return (
-            int(getattr(engine, "_token_usage", 0) or 0),
-            float(getattr(engine, "_cost_usage_usd", 0.0) or 0.0),
-            bool(getattr(engine, "_usage_complete", False)),
-            bool(getattr(engine, "_cost_complete", False)),
+            int(getattr(engine, "token_usage", 0) or 0),
+            float(getattr(engine, "cost_usage_usd", 0.0) or 0.0),
+            bool(getattr(engine, "usage_complete", False)),
+            bool(getattr(engine, "cost_complete", False)),
         )
 
     @staticmethod
@@ -1353,27 +1414,23 @@ class ChildSupervisor:
         return str(engine.active_run_id if engine is not None else owned.child_run_id)
 
     @staticmethod
-    def _partial_result(engine_result: Any) -> str:
+    def _partial_result(source: Any) -> str:
         items: list[str] = []
-        for record in list(getattr(engine_result, "records", []) or []):
-            step_id = int(getattr(record, "step_id", 0) or 0)
-            invocations = list(getattr(record, "tool_invocations", []) or [])
-            results = list(getattr(record, "action_results", []) or [])
-            for index, raw_result in enumerate(results):
-                invocation = invocations[index] if index < len(invocations) else {}
-                tool_name = (
-                    str(invocation.get("tool_name", "") or "tool")
-                    if isinstance(invocation, dict)
-                    else "tool"
-                )
-                result = ToolResult.from_value(raw_result)
-                text = (
-                    str(result.error or "")
-                    if result.output is None and result.error
-                    else result.text
-                ).strip()
-                if text:
-                    items.append(f"[step {step_id} {tool_name}] {text}")
+        step = 0
+        for message in list(getattr(source, "messages", ()) or ()):
+            if isinstance(message, AssistantMessage):
+                step += 1
+                continue
+            if not isinstance(message, ToolResultMessage):
+                continue
+            result = message.result
+            text = (
+                str(result.error or "")
+                if result.output is None and result.error
+                else result.text
+            ).strip()
+            if text:
+                items.append(f"[step {step} {message.tool_name}] {text}")
         if not items:
             return ""
         rendered = "\n".join(items[-_PARTIAL_RESULT_MAX_ITEMS:])

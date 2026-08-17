@@ -23,7 +23,6 @@ class TestEngineConfig:
         assert config.has_trace_writer is False
         assert config.protocol_id is None
         assert config.delegate_depth == 0
-        assert config.has_shared_memory is False
         assert config.has_env is False
         assert config.tool_count == 0
 

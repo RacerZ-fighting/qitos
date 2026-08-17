@@ -1,39 +1,21 @@
 ---
 title: 多 Agent Handoff
-description: 多 Agent 协作中的上下文传递策略和 SharedMemory 共享
+description: 多 Agent Handoff 协作中的上下文传递策略
 ---
 
 # 多 Agent Handoff
 
 QitOS 支持多 Agent 协作，通过 Handoff 机制在 Agent 之间切换执行。Handoff 决定了目标 Agent 接收哪些上下文信息。
 
-## 两种触发模式
+## 触发模式
 
-### Tool 模式（委托）
-
-通过 `DelegateTool` 触发，适合临时性的子任务委托：
-
-```python
-from qitos.core.agent_spec import AgentSpec, AgentRegistry
-
-registry = AgentRegistry()
-registry.register(AgentSpec(
-    name="coder",
-    description="编码专家",
-    agent=coder_agent,
-))
-
-# Engine 自动为每个注册的 Agent 创建 DelegateTool
-delegate_tools = registry.get_delegate_tools()
-```
-
-### Decision 模式（切换）
-
-通过 `Decision.handoff()` 触发，适合 Agent 间的正式切换：
+Handoff 通过 `Decision.handoff()` 触发，适合 Agent 间的正式切换：
 
 ```python
 decision = Decision.handoff(target="researcher")
 ```
+
+需要带类型化结果的临时子任务委托时，使用 kit 参考文档中的子 Agent `Agent` 工具，而不是 Handoff。
 
 ## 上下文策略
 
@@ -78,30 +60,6 @@ spec = AgentSpec(
     agent=executor_agent,
     context_strategy=ContextStrategy.ISOLATED,
 )
-```
-
-## SharedMemory 共享
-
-多 Agent 可以通过 `SharedMemoryManager` 共享状态数据：
-
-```python
-from qitos.core.shared_memory import SharedMemoryManager, InMemorySharedMemory
-
-manager = SharedMemoryManager(InMemorySharedMemory())
-
-# 创建命名空间
-parent_ns = manager.namespace("parent")
-child_ns = manager.namespace("child")
-
-# 父 Agent 写入
-parent_ns.write("task", "分析代码")
-
-# 子 Agent 可以读取
-child_view = manager.namespace("parent", read_only=True)
-task = child_view.read("task")  # "分析代码"
-
-# 只读视图不能写入
-child_view.write("task", "修改")  # raises PermissionError
 ```
 
 ## HandoffContext 精细控制

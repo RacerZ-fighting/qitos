@@ -54,7 +54,6 @@ class AgentSpec:
     shared_env: bool = True
     state_adapter: Optional[StateAdapter] = None
     handoff_context: Optional[HandoffContext] = None
-    shared_memory: Optional[Any] = None  # SharedMemory instance
     model_override: Optional[str] = None
     tools_override: Optional[Any] = None  # ToolRegistry instance
     tool_name: Optional[str] = None
@@ -87,37 +86,3 @@ class AgentRegistry:
 
     def list_available(self) -> List[AgentSpec]:
         return list(self._specs.values())
-
-    def get_delegate_tools(self) -> List[Any]:
-        """Return a DelegateTool for each registered agent spec.
-
-        Imports DelegateTool lazily to avoid circular imports.
-        """
-        from ..kit.tool.delegate import DelegateTool
-
-        return [DelegateTool(spec=spec, agent_registry=self) for spec in self._specs.values()]
-
-    def get_fanout_tool(self, max_workers: int = 4, per_task_timeout: float = 120.0) -> Any:
-        """Return a FanOutTool backed by this registry.
-
-        Imports FanOutTool lazily to avoid circular imports.
-        """
-        from ..kit.tool.fanout import FanOutTool
-
-        return FanOutTool(agent_registry=self, max_workers=max_workers, per_task_timeout=per_task_timeout)
-
-    def get_handoff_tools(self) -> List[Any]:
-        """Return a HandoffTool for each registered agent spec.
-
-        HandoffTools enable Decision-mode agent switching in the Engine loop.
-        Imports lazily to avoid circular imports.
-        """
-        from ..kit.tool.handoff_tool import HandoffTool
-
-        return [
-            HandoffTool(
-                target_name=spec.name,
-                target_description=spec.description,
-            )
-            for spec in self._specs.values()
-        ]

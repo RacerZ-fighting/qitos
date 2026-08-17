@@ -277,7 +277,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         agent_registry: Optional[Any] = None,
         budget: Optional[RuntimeBudget] = None,
         delegate_depth: int = 0,
-        shared_memory: Any = None,
         validation_gate: Optional[StateValidationGate] = None,
         recovery_handler: Optional[RecoveryHandler] = None,
         recovery_policy: Optional[RecoveryPolicy] = None,
@@ -314,7 +313,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self.agent = agent
         self.agent_registry = agent_registry
         self._delegate_depth = delegate_depth
-        self._shared_memory = shared_memory
         self.tool_registry = agent.tool_registry
         # Ensure Engine always has a ToolRegistry — agents without tools still
         # need one for handoff/permission tools registered by the Engine itself.
@@ -483,11 +481,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._canonical_action_results: list[CanonicalActionResult] = []
         self._last_journal_position: JournalPosition | None = None
 
-        # Handoff tools: auto-register if agent declares handoff_targets
-        self._handoff_tools: List[Any] = []
-        if getattr(agent, "handoff_targets", None) and self.tool_registry is not None:
-            self._register_handoff_tools()
-
         # Runtime inbox and active task are initialized after the executor;
         # unlike cancellation, they are not construction-time dependencies.
         self._runtime_inbox = _RuntimeInbox()
@@ -539,7 +532,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             policy=policy,
             trace_writer=self.trace_writer,
             delegate_depth=self._delegate_depth,
-            shared_memory=self._shared_memory,
             engine=self,
             permission_pipeline=self._permission_pipeline,
             read_before_write_enforcer=self._rbw_enforcer,
@@ -2062,7 +2054,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
             has_trace_writer=self.trace_writer is not None,
             protocol_id=getattr(self, "_resolved_protocol_id", None),
             delegate_depth=self._delegate_depth,
-            has_shared_memory=self._shared_memory is not None,
             has_env=self.env is not None,
             tool_count=len(self.tool_registry) if self.tool_registry else 0,
         )
@@ -3323,31 +3314,6 @@ class Engine(Generic[StateT, ObservationT, ActionT]):
         self._cancel_token.clear()
 
     # -- Handoff tool helpers --
-
-    def _register_handoff_tools(self) -> None:
-        """Register HandoffTool for each declared handoff target."""
-        from ..kit.tool.handoff_tool import HandoffTool
-
-        targets = self.agent.handoff_targets or []
-        for target_name in targets:
-            # Resolve description from agent registry if available
-            description = ""
-            if self.agent_registry is not None:
-                try:
-                    spec = self.agent_registry.resolve(target_name)
-                    description = getattr(spec, "description", "") or ""
-                except Exception as exc:
-                    _logger.debug(
-                        "Failed to resolve handoff target %s: %s", target_name, exc
-                    )
-
-            tool = HandoffTool(
-                target_name=target_name,
-                target_description=description,
-            )
-            if hasattr(self.tool_registry, "register"):
-                self.tool_registry.register(tool)
-            self._handoff_tools.append(tool)
 
     def _intercept_handoff_action(self, action: Any) -> Any | None:
         """Check if an action is a handoff tool call. Return Decision.handoff() or None."""

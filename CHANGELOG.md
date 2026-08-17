@@ -55,6 +55,21 @@ How to update:
   (including Anthropic `tool_result.is_error`). The façade returns typed
   values for expected rejections only; listener/codec/persistence bugs are
   faults that propagate after the run is terminalized.
+- **Façade-driven child agents.** `qitos.kit.child.AgentChildEngine` implements
+  the `ChildEngine` contract over the new `Agent` façade, and
+  `qitos.kit.child.build_agent_child_invocation_factory` wires one child run
+  per invocation with a narrowed Tool registry (filtered to the request's
+  allowed groups), budgets tightened to the tightest of factory defaults,
+  request budget and the parent's remaining deadline, and a per-run
+  `JournalTurnTransaction` journal (`journal_directory` or an explicit
+  SessionJournal factory). Parent messages enter the child run's steering
+  queue with journaled acceptance (`runtime_input.posted`), and every abort
+  still ends in a durable `run.interrupted` record. Child recovery now
+  rebuilds a started child's terminal `ChildResult` from its own loop journal
+  when that journal holds a run terminal record
+  (`qitos.kit.journal.recover_run_outcome`), and closes it as `interrupted`
+  only when no terminal record exists; journals written by the retired Engine
+  taxonomy are rejected instead of being guessed.
 
 ### Changed
 
@@ -64,6 +79,29 @@ How to update:
 
 ### Removed
 
+- **Breaking:** Removed the Engine-coupled delegation tools
+  `qitos.kit.tool.delegate` (`DelegateTool`) and `qitos.kit.tool.fanout`
+  (`FanOutTool`) together with `AgentRegistry.get_delegate_tools()` /
+  `get_fanout_tool()` and their examples. Child agents now run through the
+  façade-driven `AgentChildEngine` (see Added); the remaining delegate/fanout
+  Engine event names leave with the Engine mainline.
+- **Breaking:** Removed the kit-side handoff tool chain:
+  `qitos.kit.tool.handoff_tool` (`HandoffTool`),
+  `AgentRegistry.get_handoff_tools()`, and the Engine's `handoff_targets`
+  auto-registration. The Engine's internal Decision-handoff policy is
+  untouched and leaves with the Engine mainline.
+- **Breaking:** Removed `qitos.core.shared_memory` (`SharedMemory`,
+  `InMemorySharedMemory`, `FileSharedMemory`, `SharedMemoryNamespace`,
+  `SharedMemoryManager`) and its wiring: the `Engine(shared_memory=...)` /
+  `ActionExecutor(shared_memory=...)` parameters, the
+  `ExecutionConfig.has_shared_memory` projection, the `shared_memory` runtime
+  context entry, `AgentSpec.shared_memory`, and the handoff namespace setup.
+  The blackboard was consumed only by the retired delegation tools and the
+  Engine multi-agent path; parent/child collaboration uses typed Child
+  results and messages instead.
+- **Breaking:** Removed the `qitos.kit.repl` package (`AgentREPL`). It drove
+  the Engine stepping API interactively and had no consumer outside the zoo
+  coder CLI, which leaves with the zoo removal slice.
 - **Breaking:** Removed the deprecated `qitos.cache` package and
   `Engine(cache_backend=...)`. The implicit wrapper mutated an Agent's model during
   Engine construction and replayed complete prior transactions with stale usage,

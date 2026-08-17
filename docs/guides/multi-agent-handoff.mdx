@@ -1,39 +1,22 @@
 ---
 title: Multi-Agent Handoff
-description: Context strategies and SharedMemory for multi-agent collaboration
+description: Context strategies for multi-agent handoff collaboration
 ---
 
 # Multi-Agent Handoff
 
 QitOS supports multi-agent collaboration through Handoff — switching execution between agents. Handoff determines what context the target agent receives.
 
-## Two Trigger Modes
+## Trigger Mode
 
-### Tool Mode (Delegation)
-
-Triggered via `DelegateTool`, suitable for temporary subtask delegation:
-
-```python
-from qitos.core.agent_spec import AgentSpec, AgentRegistry
-
-registry = AgentRegistry()
-registry.register(AgentSpec(
-    name="coder",
-    description="Coding specialist",
-    agent=coder_agent,
-))
-
-# Engine automatically creates DelegateTool for each registered agent
-delegate_tools = registry.get_delegate_tools()
-```
-
-### Decision Mode (Switch)
-
-Triggered via `Decision.handoff()`, suitable for formal agent transitions:
+Handoff is triggered via `Decision.handoff()`, suitable for formal agent transitions:
 
 ```python
 decision = Decision.handoff(target="researcher")
 ```
+
+For temporary subtask delegation with a typed result, use the child-agent `Agent` tool
+described in the kit reference instead of a handoff.
 
 ## Context Strategies
 
@@ -78,30 +61,6 @@ spec = AgentSpec(
     agent=executor_agent,
     context_strategy=ContextStrategy.ISOLATED,
 )
-```
-
-## SharedMemory
-
-Multiple agents can share state through `SharedMemoryManager`:
-
-```python
-from qitos.core.shared_memory import SharedMemoryManager, InMemorySharedMemory
-
-manager = SharedMemoryManager(InMemorySharedMemory())
-
-# Create namespaces
-parent_ns = manager.namespace("parent")
-child_ns = manager.namespace("child")
-
-# Parent writes
-parent_ns.write("task", "Analyze code")
-
-# Child reads via read-only view
-child_view = manager.namespace("parent", read_only=True)
-task = child_view.read("task")  # "Analyze code"
-
-# Read-only view cannot write
-child_view.write("task", "modified")  # raises PermissionError
 ```
 
 ## HandoffContext Fine-Grained Control

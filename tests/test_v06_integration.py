@@ -1,4 +1,4 @@
-"""Integration tests for v0.6 features: WebBrowserEnv + DelegateTool + qita visual replay."""
+"""Integration tests for v0.6 features: WebBrowserEnv + qita visual replay."""
 
 from __future__ import annotations
 
@@ -59,9 +59,9 @@ class TestWebBrowserEnvIntegration:
         assert "click" in parsed["allowed_actions"]
 
 
-# ---- DelegateTool integration with AgentSpec ----
+# ---- AgentSpec fields ----
 
-class TestDelegateToolIntegration:
+class TestAgentSpecFields:
     def test_agent_spec_model_override_field(self):
         """AgentSpec.model_override is accessible and defaults to None."""
         from qitos.core.agent_spec import AgentSpec, AgentRegistry, ContextStrategy
@@ -83,52 +83,6 @@ class TestDelegateToolIntegration:
         )
         assert spec.model_override == "gpt-4o"
         assert spec.tools_override is None
-
-    def test_agent_spec_tool_name_override_field(self):
-        """AgentSpec.tool_name customizes the model-facing delegate tool name."""
-        from qitos.core.agent_spec import AgentSpec, AgentRegistry
-        from qitos.core.state import StateSchema
-        from qitos.core.agent_module import AgentModule
-
-        class _TestAgent(AgentModule):
-            def init_state(self):
-                return StateSchema()
-            def reduce(self, decision, state=None):
-                return state or {}
-
-        agent = _TestAgent(llm=None)
-        registry = AgentRegistry()
-        registry.register(
-            AgentSpec(
-                name="worker",
-                description="A worker",
-                agent=agent,
-                tool_name="research_topic",
-            )
-        )
-        tools = registry.get_delegate_tools()
-        assert tools[0].name == "research_topic"
-
-    def test_agent_registry_get_handoff_tools(self):
-        """AgentRegistry.get_handoff_tools() returns HandoffTool instances."""
-        from qitos.core.agent_spec import AgentSpec, AgentRegistry
-        from qitos.core.state import StateSchema
-        from qitos.core.agent_module import AgentModule
-
-        class _TestAgent(AgentModule):
-            def init_state(self):
-                return StateSchema()
-            def reduce(self, decision, state=None):
-                return state or {}
-
-        agent = _TestAgent(llm=None)
-        registry = AgentRegistry()
-        registry.register(AgentSpec(name="worker", description="A worker", agent=agent))
-        tools = registry.get_handoff_tools()
-        assert len(tools) == 1
-        assert tools[0].target_name == "worker"
-        assert tools[0].spec.name == "transfer_to_worker"
-
 
 # ---- Multimodal capability fallback integration ----
 
