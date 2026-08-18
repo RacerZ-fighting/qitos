@@ -241,7 +241,9 @@ How to update:
   commits accepted replacements through the current Session journal; models cannot
   invent a Child owner. Agent Tool calls may name a ready `plan_assignment`; the
   supervisor commits the generated handle before `child.started` and durably
-  releases it if admission fails. Root and Child use this one optional contract,
+  releases it if admission fails. A Child launched for a parent Task with a durable
+  Plan must name an explicit assignment, while no-Plan Tasks may still launch an
+  unassigned Child. Root and Child use this one optional contract,
   while a dependency-free Child Plan renders as an ordinary TODO.
 - **Child product-binding and conclusion contracts.** `ChildLaunchRequest` now carries
   explicit success criteria, Task constraints/references and a frozen

@@ -33,7 +33,7 @@ from qitos.core.journal import (
     JournalRecordType,
     SessionJournal,
 )
-from qitos.core.plan import Plan, PlanNode, PlanStatus
+from qitos.core.plan import Plan, PlanContractError, PlanNode, PlanStatus
 from qitos.core.task import Task
 from qitos.kit.child import ChildRunLimiter, ChildSupervisor
 from qitos.kit.journal import JsonlSessionJournal, recover_session
@@ -1032,6 +1032,81 @@ async def test_plan_assignment_commits_before_child_started(tmp_path) -> None:
     assigned = recovered.plan.node("delegate")
     assert assigned.status is PlanStatus.IN_PROGRESS
     assert assigned.owner == result.handle
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_plan_requires_explicit_child_assignment(tmp_path) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal-missing-assignment")
+    await journal.create("parent-run", {})
+    await _seed_parent_plan(journal)
+    factory_called = False
+
+    def invocation_factory(request, _context):
+        nonlocal factory_called
+        factory_called = True
+        return _ready_invocation(engine=_CompletingEngine(), task=request.task)
+
+    supervisor = ChildSupervisor(invocation_factory=invocation_factory)
+    with pytest.raises(PlanContractError, match="requires an explicit"):
+        await supervisor.launch(
+            ChildLaunchRequest(
+                task="inspect",
+                description="inspect task",
+                parent_task_id="parent-task",
+            ),
+            _context(journal=journal),
+            background=False,
+        )
+
+    assert factory_called is False
+    assert all(
+        record.type is not JournalRecordType.CHILD_STARTED
+        for record in await journal.replay()
+    )
+
+    result = await supervisor.launch(
+        ChildLaunchRequest(
+            task="inspect",
+            description="inspect task",
+            parent_task_id="parent-task",
+            plan_assignment="delegate",
+        ),
+        _context(journal=journal),
+        background=False,
+    )
+    assert result.status is ChildStatus.COMPLETED
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_parent_task_without_plan_allows_unassigned_child(tmp_path) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal-no-parent-plan")
+    await journal.create("parent-run", {})
+    await journal.append(
+        JournalRecordType.TASK_CREATED,
+        encode_task_created(Task(task_id="parent-task", objective="Parent work")),
+        record_id="parent-run:task:parent-task:created",
+    )
+    supervisor = ChildSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=_CompletingEngine(), task=request.task
+        )
+    )
+
+    result = await supervisor.launch(
+        ChildLaunchRequest(
+            task="inspect",
+            description="inspect task",
+            parent_task_id="parent-task",
+        ),
+        _context(journal=journal),
+        background=False,
+    )
+
+    assert result.status is ChildStatus.COMPLETED
     await supervisor.aclose()
     await journal.close()
 

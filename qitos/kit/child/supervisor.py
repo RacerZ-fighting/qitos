@@ -36,12 +36,13 @@ from ...core.journal import (
 )
 from ...core.message import AssistantMessage, ToolResultMessage
 from ...core.model_response import ModelPricing
+from ...core.plan import PlanContractError
 from ...core.runtime_input import (
     RuntimeInput,
     child_result_payload,
     child_terminal_runtime_input,
 )
-from ..journal import recover_run_outcome
+from ..journal import recover_run_outcome, recover_session
 from ..plan import assign_plan_node, release_plan_node
 from .agent_engine import (
     child_budget_stop_reason,
@@ -1019,12 +1020,23 @@ class ChildSupervisor:
 
     async def _persist_plan_assignment(self, owned: _OwnedChild) -> None:
         node_id = owned.request.plan_assignment
-        if node_id is None:
-            return
         if owned.journal is None:
+            if node_id is None:
+                return
             raise ChildPersistenceError(
                 "a Child Plan assignment requires the parent Session Journal"
             )
+        if node_id is None:
+            parent_task_id = owned.request.parent_task_id
+            if parent_task_id is None:
+                return
+            recovered = recover_session(await owned.journal.replay())
+            if recovered.plans.get(parent_task_id) is not None:
+                raise PlanContractError(
+                    "a Child launched for a Task with a Plan requires an explicit "
+                    "Plan assignment"
+                )
+            return
         await assign_plan_node(
             owned.journal,
             node_id,

@@ -215,7 +215,9 @@ never merged into the parent Plan.
 Root and Child use the same Agent implementation. A Child has its own Task, Session,
 optional Plan, context and cancellation domain; authorization and budgets only narrow.
 Launch commits the accepted parent Plan assignment before Child lifecycle persistence
-and runtime construction. `ChildLaunchRequest` carries explicit success criteria,
+and runtime construction. When the parent Task already has a durable Plan, launch
+requires an explicit ready assignment; a parent Task without a Plan may still launch
+an unassigned Child. `ChildLaunchRequest` carries explicit success criteria,
 inherited Task constraints/references and the frozen parent Permission context; the
 built-in factory rejects conflicting Permission values. Independent Agent Tool calls
 may execute concurrently through the bounded, concurrency-safe Tool path while results
