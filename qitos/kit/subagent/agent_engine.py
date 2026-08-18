@@ -1,14 +1,14 @@
-"""Child engine driven by the minimal-loop Agent façade.
+"""Subagent engine driven by the minimal-loop Agent façade.
 
-A child is the same ``Agent`` implementation as its parent, constructed with
-narrowed tools and budgets. This module provides the ``ChildEngine``
-implementation a ``ChildSupervisor`` drives plus a convenience invocation
-factory that wires one child run to a ``JournalTurnTransaction`` journal.
+A subagent is the same ``Agent`` implementation as its parent, constructed with
+narrowed tools and budgets. This module provides the ``SubagentEngine``
+implementation a ``SubagentSupervisor`` drives plus a convenience invocation
+factory that wires one subagent run to a ``JournalTurnTransaction`` journal.
 
 Failure semantics: the façade returns typed ``AgentLoopResult`` values for
 expected terminal outcomes (completion, abort, model failure, budget) and
 raises only for implementation faults; ``arun`` maps the typed outcome onto
-the ``ChildRunResult`` read view and lets faults propagate to the supervisor's
+the ``SubagentRunResult`` read view and lets faults propagate to the supervisor's
 failure path. ``cancel`` is cooperative: the run always ends in a durable
 terminal journal record before the engine reports a result.
 """
@@ -19,7 +19,7 @@ import asyncio
 import inspect
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass, field as dataclass_field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple, Union
 
@@ -37,11 +37,16 @@ from ...core.agent_loop import (
     TurnHookContext,
     TurnTransactionBoundary,
 )
-from ...core.budget import BudgetLedger, BudgetSnapshot
-from ...core.child import (
-    ChildInvocation,
-    ChildLaunchRequest,
-    ChildRuntimeContext,
+from ...core.budget import (
+    BudgetLedger,
+    BudgetSnapshot,
+    StepBudgetExhaustedError,
+    StepPurpose,
+)
+from ...core.subagent import (
+    SubagentInvocation,
+    SubagentLaunchRequest,
+    SubagentRuntimeContext,
 )
 from ...core.env import Env
 from ...core.journal import (
@@ -73,7 +78,6 @@ from ...core.tool_executor import (
 )
 from ...core.tool_registry import ToolExposure, ToolRegistry
 from ...core.tool_result import ToolResult
-from ...trace import AgentTraceProducer, TraceWriter, trace_producer_metadata
 from ..journal import JournalTurnTransaction, JsonlSessionJournal
 from ..journal.turn_recorder import (
     encode_runtime_input_consumed,
@@ -85,8 +89,8 @@ if TYPE_CHECKING:
     from ...models.base import Model
 
 
-#: Stop reasons the child supervisor classifies into its stable ChildStatus
-#: vocabulary (``ChildSupervisor._child_status``).
+#: Stop reasons the subagent supervisor classifies into its stable SubagentStatus
+#: vocabulary (``SubagentSupervisor._subagent_status``).
 _STOP_REASON_BY_STATUS = {
     AgentRunStatus.COMPLETED: "completed",
     AgentRunStatus.ABORTED: "cancelled",
@@ -94,8 +98,15 @@ _STOP_REASON_BY_STATUS = {
     AgentRunStatus.DEADLINE_EXCEEDED: "budget_time",
 }
 
+_CONCLUSION_FOLLOW_UP = (
+    "Before you finish, give your parent agent a concise final answer in plain "
+    "text. Use the existing conversation context, state what you established, "
+    "what remains uncertain, and the most useful next action. Do not repeat the "
+    "work or return an empty response."
+)
 
-def child_stop_reason(status: AgentRunStatus, error: Optional[str]) -> str:
+
+def subagent_stop_reason(status: AgentRunStatus, error: Optional[str]) -> str:
     """Map one loop run status onto the supervisor's stop-reason vocabulary."""
 
     reason = _STOP_REASON_BY_STATUS.get(status)
@@ -104,19 +115,17 @@ def child_stop_reason(status: AgentRunStatus, error: Optional[str]) -> str:
     return f"failed:{error}" if error else "failed"
 
 
-def child_final_text(messages: Sequence[Message]) -> str:
-    """Return the last non-failed assistant text in one run's messages."""
+def subagent_final_text(messages: Sequence[Message]) -> str:
+    """Return text from the last non-failed assistant message in one run."""
 
     for message in reversed(messages):
         if isinstance(message, AssistantMessage) and not message.error:
-            text = message.text.strip()
-            if text:
-                return text
+            return message.text.strip()
     return ""
 
 
 @dataclass(frozen=True, slots=True)
-class ChildRunStats:
+class SubagentRunStats:
     """Usage aggregation over one run's committed messages."""
 
     steps: int
@@ -126,11 +135,11 @@ class ChildRunStats:
     cost_complete: bool
 
 
-def child_run_stats(
+def subagent_run_stats(
     messages: Sequence[Message],
     *,
     model_pricing: ModelPricing | None = None,
-) -> ChildRunStats:
+) -> SubagentRunStats:
     """Aggregate complete token and explicitly-priced cost usage."""
 
     steps = 0
@@ -152,7 +161,7 @@ def child_run_stats(
         total_cost_usd += cost
         usage_complete = usage_complete and tokens_known
         cost_complete = cost_complete and cost_known
-    return ChildRunStats(
+    return SubagentRunStats(
         steps=steps,
         total_tokens=total_tokens,
         total_cost_usd=total_cost_usd,
@@ -186,8 +195,8 @@ def _usage_values(
     return (tokens, cost, tokens_known, cost_known)
 
 
-def child_budget_stop_reason(
-    stats: ChildRunStats,
+def subagent_budget_stop_reason(
+    stats: SubagentRunStats,
     budget: TaskBudget,
     root_budget: BudgetSnapshot | None = None,
 ) -> str | None:
@@ -215,8 +224,8 @@ def child_budget_stop_reason(
     return None
 
 
-class _ChildTurnTransaction(TurnTransactionBoundary):
-    """Add Child budget accounting to the loop's durable barriers."""
+class _SubagentTurnTransaction(TurnTransactionBoundary):
+    """Add Subagent budget accounting to the loop's durable barriers."""
 
     def __init__(
         self,
@@ -259,11 +268,11 @@ class _ChildTurnTransaction(TurnTransactionBoundary):
     ) -> None:
         previous = self._model_messages.get(turn)
         if previous is not None and previous != message:
-            raise RuntimeError("Child model transaction conflicts with its turn")
+            raise RuntimeError("Subagent model transaction conflicts with its turn")
         if previous is not None:
             return
         root_budget: BudgetSnapshot | None = None
-        usage = child_run_stats((message,), model_pricing=self._model_pricing)
+        usage = subagent_run_stats((message,), model_pricing=self._model_pricing)
         if self._budget_ledger is not None:
             root_budget = await self._budget_ledger.commit(
                 origin_run_id=self._run_id,
@@ -274,8 +283,8 @@ class _ChildTurnTransaction(TurnTransactionBoundary):
                 cost_complete=usage.cost_complete,
             )
         self._model_messages[turn] = message
-        reason = child_budget_stop_reason(
-            child_run_stats(
+        reason = subagent_budget_stop_reason(
+            subagent_run_stats(
                 tuple(self._model_messages[index] for index in sorted(self._model_messages)),
                 model_pricing=self._model_pricing,
             ),
@@ -355,7 +364,7 @@ class _RuntimeEventReservation:
     )
 
 
-class _AgentChildStateView:
+class _AgentSubagentStateView:
     """Terminal state read view over one façade run outcome."""
 
     def __init__(self, *, final_result: str, stop_reason: str) -> None:
@@ -371,8 +380,8 @@ class _AgentChildStateView:
         return self._stop_reason
 
 
-class AgentChildRunResult:
-    """``ChildRunResult`` projection of one terminal façade run."""
+class AgentSubagentRunResult:
+    """``SubagentRunResult`` projection of one terminal façade run."""
 
     def __init__(
         self,
@@ -384,7 +393,7 @@ class AgentChildRunResult:
     ) -> None:
         self.run_id = run_id
         self._result = result
-        stats = child_run_stats(result.messages, model_pricing=model_pricing)
+        stats = subagent_run_stats(result.messages, model_pricing=model_pricing)
         self.step_count = stats.steps
         self.total_tokens = stats.total_tokens
         self.total_cost_usd = stats.total_cost_usd
@@ -394,13 +403,13 @@ class AgentChildRunResult:
         self.cost_complete = stats.cost_complete
         self.local_usage_complete = stats.usage_complete
         self.local_cost_complete = stats.cost_complete
-        self._state = _AgentChildStateView(
-            final_result=child_final_text(result.messages),
-            stop_reason=stop_reason or child_stop_reason(result.status, result.error),
+        self._state = _AgentSubagentStateView(
+            final_result=subagent_final_text(result.messages),
+            stop_reason=stop_reason or subagent_stop_reason(result.status, result.error),
         )
 
     @property
-    def state(self) -> _AgentChildStateView:
+    def state(self) -> _AgentSubagentStateView:
         return self._state
 
     @property
@@ -414,8 +423,8 @@ class AgentChildRunResult:
         return ()
 
 
-class AgentChildEngine:
-    """One-shot ``ChildEngine`` running a child through the Agent façade.
+class AgentSubagentEngine:
+    """One-shot ``SubagentEngine`` running a subagent through the Agent façade.
 
     The engine owns its run journal: ``arun`` creates the journal under the
     supervisor-assigned Run id before the first model side effect and every
@@ -448,8 +457,7 @@ class AgentChildEngine:
         run_finalizer: RunFinalizer | None = None,
         journal_factory: Optional[Callable[[], SessionJournal]] = None,
         journal_metadata: Optional[Mapping[str, Any]] = None,
-        child_task: Optional[Task] = None,
-        trace_directory: Union[str, Path, None] = None,
+        subagent_task: Optional[Task] = None,
     ) -> None:
         self._model = model
         self._tool_registry = tool_registry
@@ -466,15 +474,15 @@ class AgentChildEngine:
             raise TypeError("budget_ledger must be a BudgetLedger or None")
         if model_pricing is not None and not isinstance(model_pricing, ModelPricing):
             raise TypeError("model_pricing must be a ModelPricing or None")
-        if child_task is not None:
-            if not isinstance(child_task, Task):
-                raise TypeError("child_task must be a Task or None")
+        if subagent_task is not None:
+            if not isinstance(subagent_task, Task):
+                raise TypeError("subagent_task must be a Task or None")
             if journal_factory is None:
-                raise ValueError("a child_task requires a journal factory")
-        self._child_task = child_task
+                raise ValueError("a subagent_task requires a journal factory")
+        self._subagent_task = subagent_task
         self._task_lifecycle = (
             TaskLifecycle(status=TaskStatus.ACTIVE)
-            if child_task is not None
+            if subagent_task is not None
             else None
         )
         self._task_lock = asyncio.Lock()
@@ -493,15 +501,9 @@ class AgentChildEngine:
         self._run_finalizer = run_finalizer
         self._journal_factory = journal_factory
         self._journal_metadata = dict(journal_metadata or {})
-        self._trace_directory = (
-            Path(trace_directory).expanduser().resolve()
-            if trace_directory is not None
-            else None
-        )
 
         self._agent: Optional[Agent] = None
         self._journal: Optional[SessionJournal] = None
-        self._trace_producer: AgentTraceProducer | None = None
         self._run_id = ""
         self._cancel_requested = False
         self._runtime_started = asyncio.Event()
@@ -510,6 +512,11 @@ class AgentChildEngine:
         self._runtime_input_messages: dict[int, str] = {}
         self._runtime_input_injected: list[str] = []
         self._runtime_input_consumed: set[str] = set()
+        self._conclusion_retry_requested = False
+        self._conclusion_missing = False
+        self._conclusion_turn: int | None = None
+        self._conclusion_stop_reason: str | None = None
+        self._conclusion_budget_limited = False
         self._closed = False
         self._result: Optional[AgentLoopResult] = None
 
@@ -548,7 +555,7 @@ class AgentChildEngine:
 
     @property
     def task_lifecycle(self) -> TaskLifecycle | None:
-        """Return the in-process projection of the durable Child Task state."""
+        """Return the in-process projection of the durable Subagent Task state."""
 
         return self._task_lifecycle
 
@@ -557,48 +564,48 @@ class AgentChildEngine:
 
         agent = self._agent
         if agent is None or self._result is not None:
-            raise RuntimeError("child run is not accepting follow-up input")
+            raise RuntimeError("subagent run is not accepting follow-up input")
         agent.follow_up(message)
 
     async def complete_task(self, reason: str) -> TaskLifecycle:
-        """Commit the Child Task's completed terminal transition."""
+        """Commit the Subagent Task's completed terminal transition."""
 
         return await self._transition_task(TaskStatus.COMPLETED, reason=reason)
 
     async def fail_task(self, reason: str) -> TaskLifecycle:
-        """Commit the Child Task's failed terminal transition."""
+        """Commit the Subagent Task's failed terminal transition."""
 
         return await self._transition_task(TaskStatus.FAILED, reason=reason)
 
     async def cancel_task(self, reason: str) -> TaskLifecycle:
-        """Commit the Child Task's cancelled terminal transition."""
+        """Commit the Subagent Task's cancelled terminal transition."""
 
         return await self._transition_task(TaskStatus.CANCELLED, reason=reason)
 
     async def block_task(self, blocker: TaskBlocker) -> TaskLifecycle:
-        """Commit a resumable blocker before the Child run settles."""
+        """Commit a resumable blocker before the Subagent run settles."""
 
         if not isinstance(blocker, TaskBlocker):
             raise TypeError("blocker must be a TaskBlocker")
         return await self._transition_task(TaskStatus.BLOCKED, blocker=blocker)
 
-    def _stats(self) -> ChildRunStats:
-        return child_run_stats(self.messages, model_pricing=self._model_pricing)
+    def _stats(self) -> SubagentRunStats:
+        return subagent_run_stats(self.messages, model_pricing=self._model_pricing)
 
-    async def arun(self, task: str, **kwargs: Any) -> AgentChildRunResult:
-        """Run the child task once under the supervisor-assigned Run id."""
+    async def arun(self, task: str, **kwargs: Any) -> AgentSubagentRunResult:
+        """Run the subagent task once under the supervisor-assigned Run id."""
 
         run_id = kwargs.pop("run_id", None)
         if kwargs:
-            raise ValueError(f"unsupported child run arguments: {sorted(kwargs)}")
+            raise ValueError(f"unsupported subagent run arguments: {sorted(kwargs)}")
         if not isinstance(run_id, str) or not run_id.strip():
             raise ValueError("arun requires the supervisor-assigned run_id")
         if not isinstance(task, str) or not task.strip():
             raise ValueError("arun requires a non-empty task")
         if self._closed:
-            raise RuntimeError("child engine is closed")
+            raise RuntimeError("subagent engine is closed")
         if self._agent is not None:
-            raise RuntimeError("a child engine runs at most once")
+            raise RuntimeError("a subagent engine runs at most once")
         run_id = run_id.strip()
         self._run_id = run_id
 
@@ -609,18 +616,18 @@ class AgentChildEngine:
                 raise TypeError("journal_factory must return a SessionJournal")
             await journal.create(run_id, dict(self._journal_metadata))
             self._journal = journal
-            if self._child_task is not None:
-                # The Child Task commits before input.accepted and any model
-                # or Tool side effect of the child run.
+            if self._subagent_task is not None:
+                # The Subagent Task commits before input.accepted and any model
+                # or Tool side effect of the subagent run.
                 await journal.append(
                     JournalRecordType.TASK_CREATED,
-                    encode_task_created(self._child_task),
+                    encode_task_created(self._subagent_task),
                     record_id=(
-                        f"{run_id}:task:{self._child_task.task_id}:created"
+                        f"{run_id}:task:{self._subagent_task.task_id}:created"
                     ),
                 )
             journal_transaction = JournalTurnTransaction(journal)
-        transaction = _ChildTurnTransaction(
+        transaction = _SubagentTurnTransaction(
             run_id=run_id,
             delegate=journal_transaction,
             budget=self._budget,
@@ -628,9 +635,76 @@ class AgentChildEngine:
             model_pricing=self._model_pricing,
             settle_runtime_events=self._reject_runtime_event_admissions,
             before_run_terminal=(
-                self._settle_child_task if self._child_task is not None else None
+                self._settle_subagent_task if self._subagent_task is not None else None
             ),
         )
+
+        leased_turns: set[int] = set()
+        conclusion_claimed = False
+
+        async def _lease_turn(turn: int, purpose: StepPurpose) -> None:
+            if self._budget_ledger is None:
+                return
+            await self._budget_ledger.lease_step(
+                origin_run_id=run_id,
+                transaction_id=f"{run_id}:turn:{turn}:step",
+                purpose=purpose,
+            )
+            leased_turns.add(turn)
+
+        async def _release_budget_holds() -> None:
+            if self._budget_ledger is None:
+                return
+            for turn in tuple(leased_turns):
+                await self._budget_ledger.release_step_lease(
+                    origin_run_id=run_id,
+                    transaction_id=f"{run_id}:turn:{turn}:step",
+                )
+            if conclusion_claimed:
+                await self._budget_ledger.release_conclusion_step(
+                    origin_run_id=run_id
+                )
+
+        try:
+            if self._budget_ledger is not None:
+                try:
+                    await self._budget_ledger.claim_conclusion_step(
+                        origin_run_id=run_id
+                    )
+                except StepBudgetExhaustedError as exc:
+                    outcome = AgentLoopResult(
+                        status=AgentRunStatus.MAX_TURNS,
+                        messages=(),
+                        error=str(exc),
+                    )
+                    await transaction.run_terminal(outcome)
+                    self._result = outcome
+                    return AgentSubagentRunResult(
+                        run_id=run_id,
+                        result=outcome,
+                        model_pricing=self._model_pricing,
+                        stop_reason="max_steps",
+                    )
+                conclusion_claimed = True
+
+            initial_conclusion = self._max_turns is not None and self._max_turns <= 1
+            self._conclusion_budget_limited = initial_conclusion
+            if self._budget_ledger is not None:
+                if initial_conclusion:
+                    await _lease_turn(0, StepPurpose.CONCLUSION)
+                else:
+                    try:
+                        await _lease_turn(0, StepPurpose.WORK)
+                    except StepBudgetExhaustedError:
+                        initial_conclusion = True
+                        self._conclusion_budget_limited = True
+                        await _lease_turn(0, StepPurpose.CONCLUSION)
+        except BaseException:
+            await _release_budget_holds()
+            raise
+        if initial_conclusion:
+            self._conclusion_turn = 0
+            self._conclusion_retry_requested = True
 
         runtime_context = dict(self._runtime_context)
         if self._journal is not None:
@@ -639,11 +713,12 @@ class AgentChildEngine:
         async def _post_descendant_event(event: RuntimeInput) -> bool:
             return await self.apost_runtime_event(event, run_id=run_id)
 
-        # A recursively launched background Child reports to this Child's
+        # A recursively launched background Subagent reports to this Subagent's
         # active mailbox, not directly to the Root. Products may provide a
         # stricter durable callback explicitly; otherwise the façade engine is
         # the natural parent-run endpoint.
         runtime_context.setdefault("post_runtime_event", _post_descendant_event)
+        conclusion_retry_defer_turn: int | None = None
 
         async def _block_tools_after_budget(
             context: BeforeToolCallContext,
@@ -658,11 +733,15 @@ class AgentChildEngine:
                 return value
             return BeforeToolCallDecision(
                 block=True,
-                reason="Child budget was exhausted by the model transaction.",
+                reason="Subagent budget was exhausted by the model transaction.",
                 terminate=True,
             )
 
         async def _stop_after_budget(context: TurnHookContext) -> bool:
+            if self._conclusion_turn == context.turn:
+                return True
+            if conclusion_retry_defer_turn == context.turn:
+                return False
             if transaction.budget_stop_reason is not None:
                 return True
             hook = self._should_stop_after_turn
@@ -673,9 +752,10 @@ class AgentChildEngine:
                 value = await value
             return bool(value)
 
-        async def _prepare_child_next_turn(
+        async def _prepare_subagent_next_turn(
             context: TurnHookContext,
         ) -> NextTurnUpdate | None:
+            nonlocal conclusion_retry_defer_turn
             update: NextTurnUpdate | None = None
             hook = self._prepare_next_turn
             if hook is not None:
@@ -683,13 +763,107 @@ class AgentChildEngine:
                 if inspect.isawaitable(value):
                     value = await value
                 update = value
+            terminal_candidate = not context.message.tool_calls or (
+                bool(context.tool_results)
+                and all(
+                    result.result.metadata.get("terminate") is True
+                    for result in context.tool_results
+                )
+            )
+            # Text accompanying a ToolCall is not yet a final answer. In
+            # particular, a token/cost crossing can deny that ToolCall after
+            # the model transaction; returning its incidental text would
+            # waste the held conclusion turn and hide that no action ran.
+            has_final_text = (
+                terminal_candidate
+                and not context.message.tool_calls
+                and bool(context.message.text.strip())
+            )
+            if self._conclusion_turn == context.turn:
+                self._conclusion_missing = not bool(context.message.text.strip())
+                if self._conclusion_missing and self._conclusion_budget_limited:
+                    self._conclusion_stop_reason = "max_steps"
+                await self._settle_runtime_event_admissions(
+                    accept=False,
+                    agent=agent,
+                )
+                return update
+
+            has_parent_input = bool(self._runtime_event_reservations)
+            remaining_local = (
+                None
+                if self._max_turns is None
+                else self._max_turns - (context.turn + 1)
+            )
+            parent_can_continue = (
+                has_parent_input
+                and not self._cancel_requested
+                and transaction.budget_stop_reason is None
+                and (remaining_local is None or remaining_local > 1)
+            )
+            if parent_can_continue:
+                try:
+                    await _lease_turn(context.turn + 1, StepPurpose.WORK)
+                except StepBudgetExhaustedError:
+                    parent_can_continue = False
+                else:
+                    await self._settle_runtime_event_admissions(
+                        accept=True,
+                        agent=agent,
+                    )
+                    return update
+
+            if has_final_text:
+                self._conclusion_missing = False
+                await self._settle_runtime_event_admissions(
+                    accept=False,
+                    agent=agent,
+                )
+                return update
+
+            force_conclusion = transaction.budget_stop_reason is not None
+            if remaining_local is not None and remaining_local <= 1:
+                force_conclusion = True
+                self._conclusion_budget_limited = True
+                self._conclusion_stop_reason = "max_steps"
+            if terminal_candidate and not context.message.text.strip():
+                force_conclusion = True
+
+            next_turn = context.turn + 1
+            if not force_conclusion and not self._cancel_requested:
+                try:
+                    await _lease_turn(next_turn, StepPurpose.WORK)
+                except StepBudgetExhaustedError:
+                    force_conclusion = True
+                    self._conclusion_budget_limited = True
+                    self._conclusion_stop_reason = "max_steps"
+
+            if force_conclusion and not self._cancel_requested:
+                if remaining_local is not None and remaining_local <= 0:
+                    self._conclusion_missing = True
+                elif not self._conclusion_retry_requested:
+                    try:
+                        await _lease_turn(next_turn, StepPurpose.CONCLUSION)
+                    except StepBudgetExhaustedError:
+                        self._conclusion_missing = True
+                    else:
+                        agent.steer(UserMessage(content=_CONCLUSION_FOLLOW_UP))
+                        self._conclusion_retry_requested = True
+                        self._conclusion_turn = next_turn
+                        conclusion_retry_defer_turn = context.turn
+                        update = replace(
+                            update or NextTurnUpdate(),
+                            tools=ToolRegistry(),
+                        )
+
             can_continue = (
                 not self._cancel_requested
-                and transaction.budget_stop_reason is None
                 and (
-                    self._max_turns is None
-                    or context.turn + 1 < self._max_turns
+                    self._conclusion_turn == next_turn
+                    or next_turn in leased_turns
+                    or self._budget_ledger is None
                 )
+                and not self._conclusion_missing
             )
             await self._settle_runtime_event_admissions(
                 accept=can_continue,
@@ -699,7 +873,7 @@ class AgentChildEngine:
 
         agent = Agent(
             model=self._model,
-            tool_registry=self._tool_registry,
+            tool_registry=(ToolRegistry() if initial_conclusion else self._tool_registry),
             system_prompt=self._system_prompt,
             env=self._env,
             tool_execution=self._tool_execution,
@@ -714,11 +888,10 @@ class AgentChildEngine:
             before_tool_call=_block_tools_after_budget,
             after_tool_call=self._after_tool_call,
             should_stop_after_turn=_stop_after_budget,
-            prepare_next_turn=_prepare_child_next_turn,
+            prepare_next_turn=_prepare_subagent_next_turn,
             run_finalizer=self._run_finalizer,
         )
         self._agent = agent
-        self._trace_producer = self._attach_trace(agent, run_id)
 
         async def _observe_run(event: Any) -> None:
             if isinstance(event, TurnStart):
@@ -751,62 +924,38 @@ class AgentChildEngine:
 
         unsubscribe_observer = agent.subscribe(_observe_run)
         try:
-            outcome = await agent.prompt(task)
+            initial_task = task
+            if initial_conclusion:
+                initial_task = f"{task}\n\n{_CONCLUSION_FOLLOW_UP}"
+            outcome = await agent.prompt(initial_task)
         finally:
             await self._reject_runtime_event_admissions()
             self._runtime_started.set()
             unsubscribe_observer()
+            await _release_budget_holds()
         if isinstance(outcome, AgentRunRejected):
             raise RuntimeError(
-                f"a fresh child Agent rejected its only run: {outcome.reason}"
+                f"a fresh Subagent rejected its only run: {outcome.reason}"
             )
         self._result = outcome
-        producer = self._trace_producer
-        if producer is not None:
-            producer.finalize(outcome)
-        return AgentChildRunResult(
+        return AgentSubagentRunResult(
             run_id=run_id,
             result=outcome,
             model_pricing=self._model_pricing,
             stop_reason=(
-                transaction.budget_stop_reason or transaction.task_stop_reason
+                transaction.budget_stop_reason
+                or self._conclusion_stop_reason
+                or transaction.task_stop_reason
+                or ("missing_conclusion" if self._conclusion_missing else None)
             ),
         )
 
-    def _attach_trace(
-        self,
-        agent: Agent,
-        run_id: str,
-    ) -> AgentTraceProducer | None:
-        directory = self._trace_directory
-        if directory is None:
-            return None
-        metadata = trace_producer_metadata(self._model)
-        metadata["agent_name"] = "qitos.child"
-        task = self._child_task
-        parent_run_id = (
-            task.created_by_run_id
-            if task is not None
-            else self._journal_metadata.get("parent_run_id")
-        )
-        if isinstance(parent_run_id, str) and parent_run_id:
-            metadata["parent_run_id"] = parent_run_id
-        if task is not None:
-            provenance = dict(metadata.get("provenance") or {})
-            provenance["task_id"] = task.task_id
-            metadata["provenance"] = provenance
-        producer = AgentTraceProducer(
-            TraceWriter(str(directory), run_id, metadata=metadata)
-        )
-        producer.attach(agent)
-        return producer
-
-    async def _settle_child_task(
+    async def _settle_subagent_task(
         self,
         result: AgentLoopResult,
         budget_stop_reason: str | None,
     ) -> str | None:
-        """Terminalize an active Child Task before the Run terminal record."""
+        """Terminalize an active Subagent Task before the Run terminal record."""
 
         lifecycle = self._task_lifecycle
         if lifecycle is None:
@@ -815,16 +964,22 @@ class AgentChildEngine:
             return lifecycle.status.value
         if result.status is AgentRunStatus.ABORTED:
             target = TaskStatus.CANCELLED
-            reason = result.error or "Child run was cancelled"
-        elif budget_stop_reason is not None:
+            reason = result.error or "Subagent run was cancelled"
+        elif budget_stop_reason is not None or self._conclusion_stop_reason is not None:
             target = TaskStatus.FAILED
-            reason = f"Child budget ended the run: {budget_stop_reason}"
+            reason = (
+                "Subagent budget ended the run: "
+                f"{budget_stop_reason or self._conclusion_stop_reason}"
+            )
+        elif self._conclusion_missing:
+            target = TaskStatus.FAILED
+            reason = "Subagent ended without a final answer"
         elif result.status is AgentRunStatus.COMPLETED:
             target = TaskStatus.COMPLETED
-            reason = "Child run completed"
+            reason = "Subagent run completed"
         else:
             target = TaskStatus.FAILED
-            reason = result.error or f"Child run ended with {result.status.value}"
+            reason = result.error or f"Subagent run ended with {result.status.value}"
         await self._transition_task(target, reason=reason)
         # Preserve the loop/budget stop vocabulary unless product policy had
         # already committed a more specific Task outcome in a turn hook.
@@ -837,12 +992,12 @@ class AgentChildEngine:
         reason: str | None = None,
         blocker: TaskBlocker | None = None,
     ) -> TaskLifecycle:
-        task = self._child_task
+        task = self._subagent_task
         journal = self._journal
         if task is None or self._task_lifecycle is None:
-            raise RuntimeError("child engine has no goal-bearing Task")
+            raise RuntimeError("subagent engine has no goal-bearing Task")
         if journal is None or not self._run_id:
-            raise RuntimeError("child Task cannot transition before its Run starts")
+            raise RuntimeError("subagent Task cannot transition before its Run starts")
         async with self._task_lock:
             current = self._task_lifecycle
             validate_task_transition(current.status, to_status)
@@ -892,13 +1047,13 @@ class AgentChildEngine:
         *,
         run_id: Optional[str] = None,
     ) -> bool:
-        """Accept one parent message into the child run's steering queue.
+        """Accept one parent message into the subagent run's steering queue.
 
         Acceptance is durable when the engine keeps a journal and means the
         message was queued for the next turn safe point. Starting, between-turn
         and terminal-settlement windows reject. A post made during an open turn
         first reserves ordered admission; the existing prepare-next-turn hook
-        accepts it only when the one-shot Child can continue, and settles the
+        accepts it only when the one-shot Subagent can continue, and settles the
         journal plus steering queue before the loop drains that queue. Terminal
         turns reject without writing a runtime-input record. Once the steered
         message enters the committed transcript (its ``MessageEnd`` followed by
@@ -1128,9 +1283,9 @@ class AgentChildEngine:
             if error.commit_state is JournalCommitState.COMMITTED:
                 self._commit_runtime_event(reservation, agent)
             elif error.commit_state is JournalCommitState.NOT_COMMITTED:
-                AgentChildEngine._reject_runtime_event(reservation)
+                AgentSubagentEngine._reject_runtime_event(reservation)
             else:
-                AgentChildEngine._fail_runtime_event_unknown(reservation, error)
+                AgentSubagentEngine._fail_runtime_event_unknown(reservation, error)
             return
         self._settle_runtime_event_commit_error(
             reservation,
@@ -1159,7 +1314,7 @@ class AgentChildEngine:
         if error.commit_state is JournalCommitState.COMMITTED:
             self._commit_runtime_event(reservation, agent)
         elif error.commit_state is JournalCommitState.NOT_COMMITTED:
-            AgentChildEngine._reject_runtime_event(reservation)
+            AgentSubagentEngine._reject_runtime_event(reservation)
         else:
             reservation.phase = "unknown"
             if not reservation.result.done():
@@ -1178,22 +1333,8 @@ class AgentChildEngine:
             agent.abort()
             await self._reject_runtime_event_admissions()
             await agent.wait_for_idle()
-        trace_error: BaseException | None = None
-        producer = self._trace_producer
-        if producer is not None and not producer.finalized:
-            try:
-                producer.finalize(self._result)
-            except BaseException as exc:
-                trace_error = exc
-        try:
-            if self._journal is not None:
-                await self._journal.close()
-        except BaseException as exc:
-            if trace_error is not None:
-                raise exc from trace_error
-            raise
-        if trace_error is not None:
-            raise trace_error
+        if self._journal is not None:
+            await self._journal.close()
 
 
 def _narrow_tool_registry(
@@ -1201,7 +1342,7 @@ def _narrow_tool_registry(
     allowed_groups: Tuple[str, ...],
     parent_authority: ToolExposure | None,
 ) -> ToolRegistry:
-    """Intersect the configured Child pool with one frozen parent exposure."""
+    """Intersect the configured Subagent pool with one frozen parent exposure."""
 
     registry = ToolRegistry()
     if parent_authority is None:
@@ -1226,7 +1367,7 @@ def _narrow_tool_registry(
     return registry
 
 
-def build_agent_child_invocation_factory(
+def build_agent_subagent_invocation_factory(
     *,
     model: Union["Model", Callable[[], "Model"]],
     tool_registry: Optional[ToolRegistry] = None,
@@ -1240,19 +1381,16 @@ def build_agent_child_invocation_factory(
     extra_request_options: Optional[Mapping[str, Any]] = None,
     journal_directory: Union[str, Path, None] = None,
     journal_factory: Optional[Callable[[], SessionJournal]] = None,
-    trace_directory: Union[str, Path, None] = None,
     run_finalizer: RunFinalizer | None = None,
-) -> Callable[[ChildLaunchRequest, ChildRuntimeContext], Awaitable[ChildInvocation]]:
-    """Build a ``ChildInvocationFactory`` driving children through ``Agent``.
+) -> Callable[[SubagentLaunchRequest, SubagentRuntimeContext], Awaitable[SubagentInvocation]]:
+    """Build a ``SubagentInvocationFactory`` driving subagents through ``Agent``.
 
-    Every invocation constructs a fresh ``AgentChildEngine`` whose authority
+    Every invocation constructs a fresh ``AgentSubagentEngine`` whose authority
     only narrows the parent's: the Tool registry is copied and filtered to the
     request's allowed groups, and turn/runtime budgets are the tightest of the
     factory defaults, the request budget and the parent's remaining deadline.
     ``journal_directory`` (or an explicit ``journal_factory``) gives each
-    child run its own ``JournalTurnTransaction`` journal. ``trace_directory``
-    writes a separate trace directory for every Child Run and links it to the
-    immediate parent through manifest metadata.
+    subagent run its own ``JournalTurnTransaction`` journal.
     """
 
     if journal_directory is not None and journal_factory is not None:
@@ -1266,17 +1404,17 @@ def build_agent_child_invocation_factory(
             return JsonlSessionJournal(journal_root)
 
     async def _factory(
-        request: ChildLaunchRequest,
-        runtime_context: ChildRuntimeContext,
-    ) -> ChildInvocation:
+        request: SubagentLaunchRequest,
+        runtime_context: SubagentRuntimeContext,
+    ) -> SubagentInvocation:
         if request.profile != "default":
             raise ValueError(
-                "build_agent_child_invocation_factory has no profile resolver; "
-                f"unsupported Child profile: {request.profile}"
+                "build_agent_subagent_invocation_factory has no profile resolver; "
+                f"unsupported Subagent profile: {request.profile}"
             )
         if request.working_directory is not None:
             raise ValueError(
-                "build_agent_child_invocation_factory has no working-directory "
+                "build_agent_subagent_invocation_factory has no working-directory "
                 "resolver"
             )
         parent_permission = runtime_context.parent_permission_context
@@ -1287,7 +1425,7 @@ def build_agent_child_invocation_factory(
             and requested_permission != parent_permission
         ):
             raise ValueError(
-                "Child permission policy differs from the frozen parent policy; "
+                "Subagent permission policy differs from the frozen parent policy; "
                 "the built-in factory cannot prove that it only narrows authority"
             )
         effective_permission = requested_permission or parent_permission
@@ -1298,7 +1436,7 @@ def build_agent_child_invocation_factory(
             env_permission, ToolPermissionContext
         ):
             raise TypeError(
-                "Child Env tool_permission_context must be a "
+                "Subagent Env tool_permission_context must be a "
                 "ToolPermissionContext, mapping, or None"
             )
         if (
@@ -1307,7 +1445,7 @@ def build_agent_child_invocation_factory(
             and env_permission != effective_permission
         ):
             raise ValueError(
-                "Child Env permission policy differs from the frozen parent policy; "
+                "Subagent Env permission policy differs from the frozen parent policy; "
                 "the built-in factory cannot prove that it only narrows authority"
             )
         root_budget = (
@@ -1319,7 +1457,7 @@ def build_agent_child_invocation_factory(
             root_budget is not None and root_budget.max_cost_usd is not None
         )
         if cost_limit and model_pricing is None:
-            raise ValueError("a Child cost budget requires explicit model_pricing")
+            raise ValueError("a Subagent cost budget requires explicit model_pricing")
         resolved_model = model() if callable(model) else model
         budget = request.budget
         resolved_max_turns = _tightest_int(max_turns, budget.max_steps)
@@ -1334,8 +1472,8 @@ def build_agent_child_invocation_factory(
         resolved_concurrency = _tightest_int(
             max_tool_concurrency, budget.max_tool_concurrency
         )
-        child_task = Task(
-            task_id=runtime_context.handle.child_id,
+        subagent_task = Task(
+            task_id=runtime_context.handle.subagent_id,
             parent_task_id=request.parent_task_id,
             objective=request.task,
             success_criteria=request.success_criteria,
@@ -1345,7 +1483,7 @@ def build_agent_child_invocation_factory(
             created_by_run_id=runtime_context.parent_run_id,
             plan_assignment=request.plan_assignment,
         )
-        engine = AgentChildEngine(
+        engine = AgentSubagentEngine(
             model=resolved_model,
             tool_registry=(
                 _narrow_tool_registry(
@@ -1368,30 +1506,29 @@ def build_agent_child_invocation_factory(
             extra_request_options=extra_request_options,
             run_finalizer=run_finalizer,
             runtime_context={
-                "parent_run_id": runtime_context.child_run_id,
+                "parent_run_id": runtime_context.subagent_run_id,
                 "delegate_depth": runtime_context.delegate_depth + 1,
                 "deadline_monotonic": runtime_context.deadline_monotonic,
                 "budget_ledger": runtime_context.budget_ledger,
                 "permission_context": effective_permission,
-                "task_id": runtime_context.handle.child_id,
-                "task": child_task,
+                "task_id": runtime_context.handle.subagent_id,
+                "task": subagent_task,
                 **(
                     {"plan_assignment": request.plan_assignment}
                     if request.plan_assignment is not None
                     else {}
                 ),
-                "max_children": _tightest_int(
-                    runtime_context.launch.max_children or None,
-                    budget.max_children,
+                "max_subagents": _tightest_int(
+                    runtime_context.launch.max_subagents or None,
+                    budget.max_subagents,
                 )
                 or 0,
             },
             journal_factory=journal_factory,
-            child_task=child_task if journal_factory is not None else None,
-            trace_directory=trace_directory,
+            subagent_task=subagent_task if journal_factory is not None else None,
             journal_metadata={
                 "parent_run_id": runtime_context.parent_run_id,
-                "child_id": runtime_context.handle.child_id,
+                "subagent_id": runtime_context.handle.subagent_id,
                 "agent_type": request.agent_type,
                 "description": request.description,
                 "model_pricing": (
@@ -1413,7 +1550,7 @@ def build_agent_child_invocation_factory(
         task = request.task
         if request.context.strip():
             task = f"{request.task}\n\nContext:\n{request.context.strip()}"
-        return ChildInvocation(engine=engine, task=task)
+        return SubagentInvocation(engine=engine, task=task)
 
     return _factory
 
@@ -1429,12 +1566,12 @@ def _tightest_float(*values: Optional[float]) -> Optional[float]:
 
 
 __all__ = [
-    "AgentChildEngine",
-    "AgentChildRunResult",
-    "build_agent_child_invocation_factory",
-    "child_final_text",
-    "child_budget_stop_reason",
-    "child_run_stats",
-    "child_stop_reason",
-    "ChildRunStats",
+    "AgentSubagentEngine",
+    "AgentSubagentRunResult",
+    "build_agent_subagent_invocation_factory",
+    "subagent_final_text",
+    "subagent_budget_stop_reason",
+    "subagent_run_stats",
+    "subagent_stop_reason",
+    "SubagentRunStats",
 ]

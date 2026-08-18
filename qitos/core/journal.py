@@ -66,8 +66,8 @@ class JournalRecordType(str, Enum):
     TOOL_TERMINAL = "tool.terminal"
     PROCESS_STARTED = "process.started"
     PROCESS_TERMINAL = "process.terminal"
-    CHILD_STARTED = "child.started"
-    CHILD_TERMINAL = "child.terminal"
+    SUBAGENT_STARTED = "subagent.started"
+    SUBAGENT_TERMINAL = "subagent.terminal"
     RUNTIME_INPUT_POSTED = "runtime_input.posted"
     RUNTIME_INPUT_CONSUMED = "runtime_input.consumed"
     TASK_CREATED = "task.created"
@@ -280,8 +280,13 @@ class JournalRecord:
             raise JournalCorruptionError("journal timestamp is invalid")
         if not isinstance(payload, dict):
             raise JournalCorruptionError("journal payload is invalid")
+        raw_record_type = str(value["type"])
+        if raw_record_type == "child.started":
+            raw_record_type = JournalRecordType.SUBAGENT_STARTED.value
+        elif raw_record_type == "child.terminal":
+            raw_record_type = JournalRecordType.SUBAGENT_TERMINAL.value
         try:
-            record_type = JournalRecordType(str(value["type"]))
+            record_type = JournalRecordType(raw_record_type)
         except ValueError as exc:
             raise JournalCorruptionError("journal record type is unsupported") from exc
         try:

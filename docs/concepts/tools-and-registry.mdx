@@ -251,7 +251,7 @@ concurrency metadata stable for the turn without duplicating stateful handler co
 background tasks, clients, or cleanup responsibility.
 
 Synchronous decorated callables remain compatible and run outside the event loop.
-Prefer `async def` for network, subprocess, Mailbox, MCP, Child, and other waiting work.
+Prefer `async def` for network, subprocess, Mailbox, MCP, Subagent, and other waiting work.
 If cancellation reaches a synchronous compatibility call, QitOS waits for it to finish
 before declaring the side effect terminal.
 
@@ -303,7 +303,7 @@ states even when the executor successfully obtained the snapshot.
 
 Accounting and Tool activation are typed facts, not untyped output payload:
 `ToolResult.usage` carries the `ModelUsage` token/cost accounting of the work the
-Tool itself performed (for example a child Agent run), and `added_tool_names` lists
+Tool itself performed (for example a Subagent run), and `added_tool_names` lists
 the names of Tools this result activated, available from this transcript point
 onward. Both are validated, deeply immutable and persisted through the canonical
 codec; they are not provider wire data and never enter the model projection.

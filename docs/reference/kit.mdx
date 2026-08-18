@@ -1,6 +1,6 @@
 ---
 title: "Kit Reference"
-description: "Reference for qitos.kit — reusable tools, memory adapters, environments, child agents, journals, and models."
+description: "Reference for qitos.kit — reusable tools, memory adapters, environments, subagents, journals, and models."
 ---
 
 `qitos.kit` provides concrete, reusable building blocks for common agent authoring patterns. Components compose the `Agent` façade and the minimal agent loop; they do not introduce a second orchestrator.
@@ -63,13 +63,13 @@ Use this page as a capability map for QitOS authoring.
 
 - `UpdatePlanTool` / `update_plan` commits a complete dependency-aware Plan to the
   current Session journal. Nodes have stable ids, dependencies, explicit durable
-  states, and optional Child owners. Readiness is derived from completed dependencies.
+  states, and optional Subagent owners. Readiness is derived from completed dependencies.
   An empty Plan has no TODO projection; a Plan without dependencies or owners renders
   as a plain TODO list.
 
-Child ownership is not model-authored. Pass a ready node id as the Agent Tool's
-`plan_assignment`; the Child supervisor commits the generated handle to the Plan before
-it writes `child.started`.
+Subagent ownership is not model-authored. Pass a ready node id as the `subagent` Tool's
+`plan_assignment`; the Subagent supervisor commits the generated handle to the Plan before
+it writes `subagent.started`.
 
 ---
 
@@ -471,117 +471,127 @@ Stand-alone tool objects you can register directly.
 
 <AccordionGroup>
 
-<Accordion title="AgentTool">
+<Accordion title="SubagentTool">
 
-Launch a fresh child-agent run from a normal tool call. Children run on the same
-minimal-loop `Agent` as the parent; `qitos.kit.child.build_agent_child_invocation_factory`
-wires one child run per invocation with narrowed tools, budgets and its own journal.
+Launch a fresh subagent run from a normal tool call. Subagents run on the same
+minimal-loop `Agent` as the parent; `qitos.kit.subagent.build_agent_subagent_invocation_factory`
+wires one Subagent run per invocation with narrowed tools, budgets and its own journal.
 
 ```python
 from qitos.core import TaskBudget
-from qitos.kit.child import build_agent_child_invocation_factory
-from qitos.kit.tool.agent import AgentTool, ChildControlToolSet
+from qitos.kit.subagent import build_agent_subagent_invocation_factory
+from qitos.kit.tool.subagent import SubagentTool, SubagentControlToolSet
 
-tool = AgentTool(
-    invocation_factory=build_agent_child_invocation_factory(
+tool = SubagentTool(
+    invocation_factory=build_agent_subagent_invocation_factory(
         model=model,
         tool_registry=registry,
-        journal_directory=journal_root / "children",
+        journal_directory=journal_root / "subagents",
     ),
     execution_scope=acquire_run_scoped_slot,
     execution_mode="background",
     max_delegate_depth=1,
-    child_budget=TaskBudget(max_steps=200),
-    child_allowed_tool_groups=("filesystem.read", "network"),
+    subagent_budget=TaskBudget(max_steps=200),
+    subagent_allowed_tool_groups=("filesystem.read", "network"),
 )
 registry.register(tool)
-registry.register_toolset(ChildControlToolSet(tool.supervisor), namespace="")
+registry.register_toolset(SubagentControlToolSet(tool.supervisor), namespace="")
 ```
 
-The model-facing arguments are `description`, `prompt`, optional `name`, and optional
-`subagent_type`. The supervisor awaits the invocation factory, so construction can
+The model-facing arguments are `description`, `prompt`, `success_criteria`, optional
+`name`, optional `subagent_type`, and optional `plan_assignment`. The supervisor awaits
+the invocation factory, so construction can
 acquire run-scoped resources without blocking the event loop. Each factory call must
 resolve to an independent Agent; sharing a mutable history or model client between
-concurrent children is unsupported.
+concurrent Subagents is unsupported.
 `execution_scope` can enforce an application-owned concurrency or lifecycle boundary.
 The result payload reports output, steps, elapsed time, stop reason, run id and the
-`usage_complete` / `cost_complete` completeness flags; a terminal child's token and
+`usage_complete` / `cost_complete` completeness flags; a terminal Subagent's token and
 cost accounting rides the typed `ToolResult.usage` carrier instead of the payload.
-`child_budget` is an immutable `TaskBudget` and defaults to 200 steps. Invocation
-factories receive it on `ChildLaunchRequest.budget`, together with the task, profile,
+`subagent_budget` is an immutable `TaskBudget` and defaults to 200 steps. Invocation
+factories receive it on `SubagentLaunchRequest.budget`, together with the task, profile,
 allowed tool groups, and working-directory fields needed by a product composition. The
 built-in factory accepts only `profile="default"` and `working_directory=None`; it
 rejects any other profile or working-directory request before model construction.
 Products that resolve those policies must do so in their own invocation factory.
 The built-in factory also carries the frozen parent Tool permission/scope policy into
-the Child. A configured Child Env with a different policy is rejected because equality
-alone is the only narrowing relation this generic factory can prove.
-The async factory returns a `ChildInvocation`; live Agent objects never enter persisted child
-requests or results. If the invocation creates a model client, trace, or other live
+the Subagent. A configured Subagent Env with a different policy is rejected because
+equality alone is the only narrowing relation this generic factory can prove.
+The async factory returns a `SubagentInvocation`; live Agent objects never enter
+persisted Subagent requests or results. If the invocation creates a model client, trace, or other live
 resource, set its async `cleanup` callback. The supervisor awaits cleanup after success,
 failure, or cancellation before publishing the terminal result. If construction itself
-fails or is cancelled before returning a `ChildInvocation`, the factory still owns and
+fails or is cancelled before returning a `SubagentInvocation`, the factory still owns and
 must close every partially created resource before propagating the error.
 
 `execution_mode` accepts `"foreground"`, `"optional_background"`, or `"background"`.
 The optional mode exposes `run_in_background` to the model. The background mode omits
-that argument, always returns a running receipt with a parent-scoped `ChildHandle`, and
-attempts an `agent.child.completed` `RuntimeInput` to the exact parent run when a
-parent mailbox callback is available. `AgentTool` retains an explicitly supplied
+that argument, always returns a running receipt with a parent-scoped `SubagentHandle`, and
+attempts an `agent.subagent.completed` `RuntimeInput` to the exact parent run when a
+parent mailbox callback is available. `SubagentTool` retains an explicitly supplied
 parent-history or snapshot value at launch; the minimal façade does not implicitly copy
-its full transcript into every Child. It then delegates lifecycle ownership to a
-Run-scoped `ChildSupervisor`. The supervisor does not call the invocation factory until
+its full transcript into every Subagent. It then delegates lifecycle ownership to a
+Run-scoped `SubagentSupervisor`. The supervisor does not call the invocation factory until
 `execution_scope` admits the task. Queued work therefore retains
-its launch context without allocating a model, Agent, or trace before it can run. If a
-child has no final answer, the completion payload contains a bounded projection of its
-recent tool evidence instead of silently dropping useful work.
+its launch context without allocating a model, Agent, or trace before it can run.
+
+Every active Subagent claims one slot from the shared lineage step budget for a final
+answer. Ordinary work cannot consume another Subagent's claim. At a local/shared step
+boundary, or after settled usage crosses a token/cost limit, the same conversation gets
+one final turn with no exposed Tools. If the Subagent already returned useful final text,
+the unused claim is released. The final assistant text is the canonical summary; an
+optional `conclusion_factory` may attach typed evidence, resource, failure, unknown and
+next-step references but cannot replace that text. If the final turn is still empty, the
+result reports a missing conclusion. The Supervisor never writes an answer from Tool,
+Plan, or Journal facts. Explicit cancellation and an expired absolute deadline remain
+hard boundaries.
 
 The parent runtime supplies the async callback through
-`ChildLaunchContext.post_runtime_event` and owns durable mailbox acceptance. Child
+`SubagentLaunchContext.post_runtime_event` and owns durable mailbox acceptance. Subagent
 supervision stores its terminal result before awaiting that callback.
-It also appends `child.started` before constructing the child Agent and
-`child.terminal` before delivery. Resume rebuilds a started child from its own loop
+It also appends `subagent.started` before constructing the Subagent and
+`subagent.terminal` before delivery. Resume rebuilds a started Subagent from its own loop
 journal when that journal holds a durable run terminal record, and otherwise closes it
 as `interrupted` without replaying the Agent. Fork recovery ignores inherited
-parent lifecycle records, so a fork cannot query or interrupt the parent's live Child.
-If mailbox acceptance fails after `child.terminal`, the terminal result remains
+parent lifecycle records, so a fork cannot query or interrupt the parent's live Subagent.
+If mailbox acceptance fails after `subagent.terminal`, the terminal result remains
 queryable through the control tools. Re-projecting unconsumed background completion
 inputs is owned by `qitos.kit.session.SessionHarness`: it re-projects them exactly
 once from the recovered journal's own records while inherited fork facts are never
 redelivered. Foreground results are
 returned only through the original Agent ToolResult.
 
-`active_background_count`, `child_result(handle)`, `wait_child(handle)`,
-`interrupt_child(handle)`, `cancel_child(handle)`,
+`active_background_count`, `subagent_result(handle)`, `wait_subagent(handle)`,
+`interrupt_subagent(handle)`, `cancel_subagent(handle)`,
 `snapshot_background_events()`, and `aclose()` expose lifecycle control to the owning
-application. `ChildResult` uses one stable status vocabulary for running, completion,
+application. `SubagentResult` uses one stable status vocabulary for running, completion,
 blocking, budget exhaustion, failure, cancellation, interruption, and unknown handles.
-Tool payloads keep that value in `child_status`; their top-level `status` remains the
+Tool payloads keep that value in `subagent_status`; their top-level `status` remains the
 canonical Tool execution status (`success`, `partial`, `running`, `error`, or
 `cancelled`).
-A snapshot projects only the active children's bounded, completed tool
-results into `agent.child.snapshot` runtime events; it does not expose model responses or
+A snapshot projects only the active Subagents' bounded, completed tool
+results into `agent.subagent.snapshot` runtime events; it does not expose model responses or
 reasoning. This lets an owner preserve evidence immediately before a forced conclusion.
-`aclose()` cooperatively cancels outstanding child Agents; applications with run-scoped
+`aclose()` cooperatively cancels outstanding Subagents; applications with run-scoped
 resources should call it before those resources leave scope. It returns the number of
 tasks still winding down after the requested bounded wait, and a later call can wait
-again after an earlier non-blocking cancellation request. Background children and parent
+again after an earlier non-blocking cancellation request. Background Subagents and parent
 completion delivery remain supervisor-owned asyncio tasks until both paths settle.
 Terminal result state is stored before QitOS attempts to wake the parent. An
 `execution_scope` that waits for an application slot should observe the
-typed `ChildRuntimeContext.cancellation_requested` callback so teardown can wake a
-child that has not entered its Agent yet.
+typed `SubagentRuntimeContext.cancellation_requested` callback so teardown can wake a
+Subagent that has not entered its Agent yet.
 
-`ChildControlToolSet` exposes exact `child_status`, `child_wait`, `child_message`, and
-`child_interrupt` tools over that same supervisor. Wait timeout never cancels the Child.
-Message acceptance is journaled when the child keeps a journal, and the message enters
-the child run's steering queue, becoming visible at a
+`SubagentControlToolSet` exposes exact `subagent_status`, `subagent_wait`, `subagent_message`, and
+`subagent_interrupt` tools over that same supervisor. Wait timeout never cancels the Subagent.
+Message acceptance is journaled when the Subagent keeps a journal, and the message enters
+the Subagent run's steering queue, becoming visible at a
 turn safe point. Unknown or foreign handles return stable `unknown` state. A terminal
-Child rejects messages explicitly; continuing a terminal Session requires a product
-resume factory rather than silently creating a different Child.
+Subagent rejects messages explicitly; continuing a terminal Session requires a product
+resume factory rather than silently creating a different Subagent.
 
-Delegation depth is checked before the factory runs. Multiple Agent calls execute in
-parallel only when the parent's Tool execution policy allows `Agent` and the
+Delegation depth is checked before the factory runs. Multiple Subagent calls execute in
+parallel only when the parent's Tool execution policy allows the `subagent` Tool and the
 tool remains marked concurrency-safe. The model-facing tool description recommends one
 same-response call per independent multi-step task, while dependent steps stay in the
 parent and cheap mechanical variants use ordinary tools in a bounded batch. The parent

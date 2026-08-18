@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..core.child import ChildHandle
+from ..core.subagent import SubagentHandle
 from ..core.journal import JournalPosition, JournalRecordType, SessionJournal
 from ..core.plan import (
     Plan,
@@ -47,7 +47,7 @@ async def _commit_plan(
 
 
 def _validate_model_owner_changes(current: Plan | None, proposed: Plan) -> None:
-    """Keep creation of Child owners inside the durable launch boundary."""
+    """Keep creation of Subagent owners inside the durable launch boundary."""
 
     previous = (
         {} if current is None else {node.node_id: node for node in current.nodes}
@@ -56,8 +56,8 @@ def _validate_model_owner_changes(current: Plan | None, proposed: Plan) -> None:
         old = previous.get(node.node_id)
         if node.owner is not None and (old is None or node.owner != old.owner):
             raise PlanContractError(
-                "update_plan cannot create or change a Child owner; "
-                "launch the Child with this node as its assignment"
+                "update_plan cannot create or change a Subagent owner; "
+                "launch the Subagent with this node as its assignment"
             )
 
 
@@ -80,17 +80,17 @@ async def commit_model_plan_update(
 async def assign_plan_node(
     journal: SessionJournal,
     node_id: str,
-    owner: ChildHandle,
+    owner: SubagentHandle,
     *,
     parent_task_id: str | None,
     record_id: str,
 ) -> Plan:
-    """Reserve one ready node for a Child before child.started is written."""
+    """Reserve one ready node before ``subagent.started`` is written."""
 
-    if not isinstance(owner, ChildHandle):
-        raise TypeError("owner must be a ChildHandle")
+    if not isinstance(owner, SubagentHandle):
+        raise TypeError("owner must be a SubagentHandle")
     if parent_task_id is None:
-        raise PlanContractError("Child Plan assignment requires a parent Task")
+        raise PlanContractError("Subagent Plan assignment requires a parent Task")
     recovered = recover_session(await journal.replay())
     parent_task = recovered.unfinished_root
     if (
@@ -98,11 +98,11 @@ async def assign_plan_node(
         or parent_task.definition.task_id != parent_task_id
     ):
         raise PlanContractError(
-            "Child Plan assignment does not match the unfinished parent Task"
+            "Subagent Plan assignment does not match the unfinished parent Task"
         )
     current = recovered.plans.get(parent_task_id)
     if current is None:
-        raise PlanContractError("Child Plan assignment requires a current Plan")
+        raise PlanContractError("Subagent Plan assignment requires a current Plan")
     node = current.node(node_id)
     if node.status is not PlanStatus.PENDING or not current.is_ready(node_id):
         raise PlanContractError(
@@ -127,18 +127,18 @@ async def release_plan_node(
     journal: SessionJournal,
     task_id: str,
     node_id: str,
-    owner: ChildHandle,
+    owner: SubagentHandle,
     *,
     record_id: str,
 ) -> Plan:
-    """Durably release an assignment whose child.started did not commit."""
+    """Durably release an assignment whose ``subagent.started`` did not commit."""
 
     current = await load_plan(journal, task_id)
     if current is None:
         raise PlanContractError("Cannot release an assignment without a Plan")
     node = current.node(node_id)
     if node.status is not PlanStatus.IN_PROGRESS or node.owner != owner:
-        raise PlanContractError("Plan assignment no longer belongs to this Child")
+        raise PlanContractError("Plan assignment no longer belongs to this Subagent")
     proposed = current.transition_node(
         node_id,
         status=PlanStatus.PENDING,

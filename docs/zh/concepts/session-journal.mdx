@@ -178,15 +178,16 @@ if transaction is not None:
 子级改名的引用返回 `None`。只有 loop 的记录 schema 可以解码；旧 Engine taxonomy 写入的
 记录会 fail closed。
 
-## Child 与 mailbox 记录
+## Subagent 与 mailbox 记录
 
-Child 监督在构造子 Agent 之前写入 `child.started`，在通知父级之前写入 `child.terminal`。
-恢复时，如果子级自己的 loop journal 中存在持久化运行终态记录，就从该 journal 重建子级
-终态结果，否则将其关闭为 `interrupted`；恢复永远不会重新挂载或重放子 Agent。恢复期间
+Subagent 监督在构造 Subagent 之前写入 `subagent.started`，在通知父级之前写入
+`subagent.terminal`。恢复时，如果 Subagent 自己的 loop journal 中存在持久化运行终态记录，
+就从该 journal 重建终态结果，否则将其关闭为 `interrupted`；恢复永远不会重新挂载或重放
+Subagent。恢复期间
 创建的终态记录会在 supervisor 报告恢复结果之前持久化。fork 保留继承的事实用于审计，
 但不会获得对父级 handle 的控制权。
 
-发给活跃子级的父级消息会先作为 `runtime_input.posted` 写入 journal，再进入子级运行的
-steering 队列，因此 mailbox 接收可以从 journal 恢复，消息会在子级下一个 turn 安全点可见。
-当被 steering 的消息进入已提交的 transcript 后，子级引擎会追加幂等的
+发给活跃 Subagent 的父级消息会先作为 `runtime_input.posted` 写入 journal，再进入其运行的
+steering 队列，因此 mailbox 接收可以从 journal 恢复，消息会在 Subagent 下一个 turn 安全点
+可见。当被 steering 的消息进入已提交的 transcript 后，Subagent 引擎会追加幂等的
 `runtime_input.consumed` 记录；如果运行结束时消息尚未注入，则不产生任何消费记录。

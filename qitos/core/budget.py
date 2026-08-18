@@ -1,4 +1,4 @@
-"""Shared Root/Child model-step admission and usage accounting."""
+"""Shared Root/Subagent model-step admission and usage accounting."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import hashlib
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 
 from .journal import (
     JournalAppendCancelled,
@@ -197,6 +198,13 @@ class StepBudgetExhaustedError(RuntimeError):
         super().__init__(f"lineage reached the max step budget ({max_steps})")
 
 
+class StepPurpose(str, Enum):
+    """Purpose of one pending model-step lease."""
+
+    WORK = "work"
+    CONCLUSION = "conclusion"
+
+
 class BudgetLedger:
     """One async-safe usage owner shared by a Root Run and its descendants.
 
@@ -238,6 +246,11 @@ class BudgetLedger:
         )
         self._commits: dict[tuple[str, str], _BudgetCommit] = {}
         self._step_reservations: set[tuple[str, str]] = set()
+        # These holds are deliberately process-local. They protect capacity
+        # only for live Agents; after a crash those Agents are interrupted and
+        # recovery rebuilds actual usage solely from durable step reservations.
+        self._step_leases: dict[tuple[str, str], StepPurpose] = {}
+        self._conclusion_claims: dict[str, tuple[str, str] | None] = {}
         self._total_steps = 0
         self._total_tokens = 0
         self._total_cost_usd = 0.0
@@ -293,7 +306,12 @@ class BudgetLedger:
     ) -> None:
         """Set Root limits before the first transaction is committed."""
 
-        if self._commits or self._step_reservations:
+        if (
+            self._commits
+            or self._step_reservations
+            or self._step_leases
+            or self._conclusion_claims
+        ):
             raise RuntimeError("BudgetLedger limits cannot change after usage")
         replacement = BudgetLedger(
             max_steps=max_steps,
@@ -319,7 +337,7 @@ class BudgetLedger:
     def snapshot_after_origin(self, origin_run_id: str) -> BudgetSnapshot | None:
         """Return the aggregate as of one origin's latest exact commit.
 
-        Recovery uses this to attribute a Root budget crossing to the Child
+        Recovery uses this to attribute a Root budget crossing to the Subagent
         that observed it, without applying later sibling usage retroactively.
         """
 
@@ -383,7 +401,7 @@ class BudgetLedger:
 
         Reservations use deterministic transaction ids, so recovery may retry
         the same turn admission without consuming a second step. Concurrent
-        Root and Child admissions serialize through the ledger lock; once the
+        Root and Subagent admissions serialize through the ledger lock; once the
         shared limit is reached, no further provider request is admitted.
         """
 
@@ -394,7 +412,20 @@ class BudgetLedger:
         async with self._lock:
             if reservation.key in self._step_reservations:
                 return self.snapshot()
-            if self._max_steps is not None and self._total_steps >= self._max_steps:
+            purpose = self._step_leases.get(reservation.key)
+            if purpose is StepPurpose.CONCLUSION:
+                if (
+                    self._conclusion_claims.get(reservation.origin_run_id)
+                    != reservation.key
+                ):
+                    raise RuntimeError(
+                        "conclusion step lease has no matching lineage claim"
+                    )
+            elif (
+                purpose is None
+                and self._max_steps is not None
+                and self._held_step_count() >= self._max_steps
+            ):
                 raise StepBudgetExhaustedError(self._max_steps)
             if self._journal is not None:
                 digest = hashlib.sha256(
@@ -412,13 +443,125 @@ class BudgetLedger:
                 except JournalAppendCancelled as cancellation:
                     if cancellation.commit_state is JournalCommitState.COMMITTED:
                         self._apply_step(reservation)
+                        self._settle_step_lease(reservation.key, purpose)
                     raise
             self._apply_step(reservation)
+            self._settle_step_lease(reservation.key, purpose)
             return self.snapshot()
+
+    async def claim_conclusion_step(self, *, origin_run_id: str) -> BudgetSnapshot:
+        """Hold one shared step for a live Agent's final natural-language answer.
+
+        The claim does not count as consumed usage and is not journaled. Normal
+        admissions nevertheless cannot use its capacity. The owner either
+        converts it to one durable conclusion step or releases it when a useful
+        answer was produced earlier.
+        """
+
+        normalized = str(origin_run_id or "").strip()
+        if not normalized:
+            raise ValueError("origin_run_id must be a non-empty string")
+        async with self._lock:
+            if normalized in self._conclusion_claims:
+                return self.snapshot()
+            if self._max_steps is not None and self._held_step_count() >= self._max_steps:
+                raise StepBudgetExhaustedError(self._max_steps)
+            self._conclusion_claims[normalized] = None
+            return self.snapshot()
+
+    async def lease_step(
+        self,
+        *,
+        origin_run_id: str,
+        transaction_id: str,
+        purpose: StepPurpose,
+    ) -> BudgetSnapshot:
+        """Atomically hold the next model step until ``turn_frozen`` commits it."""
+
+        if not isinstance(purpose, StepPurpose):
+            raise TypeError("purpose must be a StepPurpose")
+        reservation = _StepReservation.create(
+            origin_run_id=origin_run_id,
+            transaction_id=transaction_id,
+        )
+        async with self._lock:
+            if reservation.key in self._step_reservations:
+                return self.snapshot()
+            existing = self._step_leases.get(reservation.key)
+            if existing is not None:
+                if existing is not purpose:
+                    raise ValueError("step lease purpose conflicts with its first use")
+                return self.snapshot()
+            if purpose is StepPurpose.CONCLUSION:
+                claim = self._conclusion_claims.get(reservation.origin_run_id)
+                if claim is not None:
+                    raise RuntimeError(
+                        "conclusion claim is already leased to another transaction"
+                    )
+                if reservation.origin_run_id not in self._conclusion_claims:
+                    raise RuntimeError("conclusion step requires a lineage claim")
+                self._conclusion_claims[reservation.origin_run_id] = reservation.key
+            else:
+                if (
+                    self._max_steps is not None
+                    and self._held_step_count() >= self._max_steps
+                ):
+                    raise StepBudgetExhaustedError(self._max_steps)
+            self._step_leases[reservation.key] = purpose
+            return self.snapshot()
+
+    async def release_step_lease(
+        self,
+        *,
+        origin_run_id: str,
+        transaction_id: str,
+    ) -> None:
+        """Release an uncommitted next-turn lease without consuming a step."""
+
+        reservation = _StepReservation.create(
+            origin_run_id=origin_run_id,
+            transaction_id=transaction_id,
+        )
+        async with self._lock:
+            purpose = self._step_leases.pop(reservation.key, None)
+            if (
+                purpose is StepPurpose.CONCLUSION
+                and self._conclusion_claims.get(reservation.origin_run_id)
+                == reservation.key
+            ):
+                self._conclusion_claims[reservation.origin_run_id] = None
+
+    async def release_conclusion_step(self, *, origin_run_id: str) -> None:
+        """Release one live Agent's unused conclusion capacity claim."""
+
+        normalized = str(origin_run_id or "").strip()
+        if not normalized:
+            raise ValueError("origin_run_id must be a non-empty string")
+        async with self._lock:
+            leased = self._conclusion_claims.pop(normalized, None)
+            if leased is not None:
+                self._step_leases.pop(leased, None)
+
+    def _held_step_count(self) -> int:
+        work_leases = sum(
+            purpose is StepPurpose.WORK for purpose in self._step_leases.values()
+        )
+        return self._total_steps + len(self._conclusion_claims) + work_leases
+
+    def _settle_step_lease(
+        self,
+        key: tuple[str, str],
+        purpose: StepPurpose | None,
+    ) -> None:
+        self._step_leases.pop(key, None)
+        if purpose is StepPurpose.CONCLUSION:
+            self._conclusion_claims.pop(key[0], None)
 
     def _reset_projection(self) -> None:
         self._commits.clear()
         self._step_reservations.clear()
+        self._step_leases.clear()
+        self._conclusion_claims.clear()
         self._total_steps = 0
         self._total_tokens = 0
         self._total_cost_usd = 0.0
@@ -459,4 +602,9 @@ class BudgetLedger:
             self._ordered_attribution_complete = False
 
 
-__all__ = ["BudgetLedger", "BudgetSnapshot", "StepBudgetExhaustedError"]
+__all__ = [
+    "BudgetLedger",
+    "BudgetSnapshot",
+    "StepBudgetExhaustedError",
+    "StepPurpose",
+]

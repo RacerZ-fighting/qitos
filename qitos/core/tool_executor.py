@@ -1317,7 +1317,7 @@ class ToolBatchExecutor:
             artifacts.append(dict(payload))
 
         # Product context may add domain values (for example
-        # ``permission_context`` or Child lineage), but it must never replace
+        # ``permission_context`` or Subagent lineage), but it must never replace
         # the executor-owned authority, deadline, cancellation or callback
         # capabilities for this frozen turn.
         context: Dict[str, Any] = dict(self._config.extra_runtime_context)

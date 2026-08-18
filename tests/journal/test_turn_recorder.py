@@ -514,7 +514,7 @@ async def test_recorder_commits_budget_per_model_terminal(tmp_path) -> None:
     ]
     assert len(budget_records) == 1
     payload = budget_records[0].payload
-    # Same idempotency-key scheme the Child boundary uses, keyed by this run.
+    # Same idempotency-key scheme the Subagent boundary uses, keyed by this run.
     assert payload["transaction_id"] == "run-budget:turn:0:model"
     assert payload["origin_run_id"] == "run-budget"
     assert payload["tokens"] == 7

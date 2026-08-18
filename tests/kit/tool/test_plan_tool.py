@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from qitos.core import ChildHandle, PlanContractError, PlanStatus
+from qitos.core import SubagentHandle, PlanContractError, PlanStatus
 from qitos.core.journal import JournalRecordType
 from qitos.core.task import Task
 from qitos.core.tool_registry import ToolRegistry
@@ -176,9 +176,9 @@ async def test_update_plan_tool_rejects_history_rewrite() -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_plan_tool_cannot_invent_a_child_owner() -> None:
+async def test_update_plan_tool_cannot_invent_a_subagent_owner() -> None:
     journal = await _journal()
-    owner = ChildHandle("child-a", "run-plan-tool")
+    owner = SubagentHandle("child-a", "run-plan-tool")
 
     with pytest.raises(PlanContractError):
         await UpdatePlanTool().execute(

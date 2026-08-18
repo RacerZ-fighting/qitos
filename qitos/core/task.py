@@ -1,6 +1,6 @@
 """Goal-bearing Task contract for QitOS Sessions.
 
-A Task is the durable goal of one Root or Child execution. The immutable
+A Task is the durable goal of one Root or Subagent execution. The immutable
 definition carries the objective, success criteria, constraints, stable
 resource/context references, budget and creation provenance; the durable
 lifecycle (``active | blocked | completed | failed | cancelled``, usage,
@@ -51,8 +51,12 @@ _TASK_BUDGET_FIELDS = {
     "max_tokens",
     "max_cost_usd",
     "max_tool_concurrency",
-    "max_children",
+    "max_subagents",
 }
+
+_LEGACY_TASK_BUDGET_FIELDS = (
+    _TASK_BUDGET_FIELDS.difference({"max_subagents"}) | {"max_children"}
+)
 
 
 def _utc_now_iso() -> str:
@@ -109,14 +113,14 @@ class TaskBudget:
     max_tokens: Optional[int] = None
     max_cost_usd: Optional[float] = None
     max_tool_concurrency: Optional[int] = None
-    max_children: Optional[int] = None
+    max_subagents: Optional[int] = None
 
     def __post_init__(self) -> None:
         for name in (
             "max_steps",
             "max_tokens",
             "max_tool_concurrency",
-            "max_children",
+            "max_subagents",
         ):
             value = getattr(self, name)
             if value is None:
@@ -141,14 +145,19 @@ class TaskBudget:
             "max_tokens": self.max_tokens,
             "max_cost_usd": self.max_cost_usd,
             "max_tool_concurrency": self.max_tool_concurrency,
-            "max_children": self.max_children,
+            "max_subagents": self.max_subagents,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "TaskBudget":
-        if set(value) != _TASK_BUDGET_FIELDS:
+        fields = set(value)
+        if fields == _TASK_BUDGET_FIELDS:
+            return cls(**dict(value))
+        if fields != _LEGACY_TASK_BUDGET_FIELDS:
             raise ValueError("TaskBudget fields are invalid")
-        return cls(**dict(value))
+        migrated = dict(value)
+        migrated["max_subagents"] = migrated.pop("max_children")
+        return cls(**migrated)
 
 
 @dataclass(frozen=True, slots=True)

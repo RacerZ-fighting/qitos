@@ -463,7 +463,7 @@ async def test_unconsumed_inputs_fold_own_records_only() -> None:
     await run.commit(0)
     first = RuntimeInput(
         event_id="evt-1",
-        kind="agent.child.completed",
+        kind="agent.subagent.completed",
         correlation_id="child-1",
         source="qitos.agent",
         payload={"content": "done"},
@@ -497,7 +497,7 @@ async def test_inherited_runtime_inputs_are_never_redelivered() -> None:
     await parent.commit(0)
     inherited_input = RuntimeInput(
         event_id="evt-parent",
-        kind="agent.child.completed",
+        kind="agent.subagent.completed",
         correlation_id="child-1",
         source="qitos.agent",
         payload={"content": "done"},

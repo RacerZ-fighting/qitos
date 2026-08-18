@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .child import ChildResult
+    from .subagent import SubagentResult
     from .process import ProcessSnapshot
 
 
@@ -77,34 +77,67 @@ class RuntimeInput:
         payload = value["payload"]
         if not isinstance(payload, Mapping):
             raise TypeError("RuntimeInput.payload must be a mapping")
+        kind = value["kind"]
+        migrated_payload = dict(payload)
+        if isinstance(kind, str) and kind in {
+            "agent.child.completed",
+            "agent.child.snapshot",
+        }:
+            kind = kind.replace("agent.child.", "agent.subagent.", 1)
+            _migrate_legacy_subagent_payload(migrated_payload)
         return cls(
             event_id=value["event_id"],
-            kind=value["kind"],
+            kind=kind,
             correlation_id=value["correlation_id"],
             source=value["source"],
-            payload=dict(payload),
+            payload=migrated_payload,
         )
 
 
-def child_result_payload(result: ChildResult) -> dict[str, Any]:
-    """Return the stable model-facing projection of one child result.
+def _migrate_legacy_subagent_payload(payload: dict[str, Any]) -> None:
+    for old, new in (
+        ("child_status", "subagent_status"),
+        ("child_id", "subagent_id"),
+        ("run_id", "subagent_run_id"),
+    ):
+        if old not in payload:
+            continue
+        if new in payload and payload[new] != payload[old]:
+            raise ValueError(f"legacy {old} conflicts with {new}")
+        payload[new] = payload.pop(old)
+    handle = payload.get("handle")
+    if not isinstance(handle, Mapping):
+        return
+    migrated_handle = dict(handle)
+    if "child_id" in migrated_handle:
+        if (
+            "subagent_id" in migrated_handle
+            and migrated_handle["subagent_id"] != migrated_handle["child_id"]
+        ):
+            raise ValueError("legacy handle child_id conflicts with subagent_id")
+        migrated_handle["subagent_id"] = migrated_handle.pop("child_id")
+    payload["handle"] = migrated_handle
+
+
+def subagent_result_payload(result: SubagentResult) -> dict[str, Any]:
+    """Return the stable model-facing projection of one Subagent result.
 
     Token and cost accounting is not part of this untyped projection: at
     the Tool boundary it rides the typed ``ToolResult.usage`` carrier, and
-    the durable ``child.terminal`` journal record keeps the full
-    ``ChildResult`` facts. Completeness flags stay here so the model can
+    the durable ``subagent.terminal`` journal record keeps the full
+    ``SubagentResult`` facts. Completeness flags stay here so the model can
     tell whether the accounting it cannot see is known to be partial.
     """
 
-    from .child import ChildResult, ChildStatus
+    from .subagent import SubagentResult, SubagentStatus
 
-    if not isinstance(result, ChildResult):
-        raise TypeError("result must be a ChildResult")
-    if result.status is ChildStatus.COMPLETED:
+    if not isinstance(result, SubagentResult):
+        raise TypeError("result must be a SubagentResult")
+    if result.status is SubagentStatus.COMPLETED:
         execution_status = "success"
-    elif result.status in {ChildStatus.PENDING, ChildStatus.RUNNING}:
+    elif result.status in {SubagentStatus.PENDING, SubagentStatus.RUNNING}:
         execution_status = "running"
-    elif result.status in {ChildStatus.CANCELLED, ChildStatus.INTERRUPTED}:
+    elif result.status in {SubagentStatus.CANCELLED, SubagentStatus.INTERRUPTED}:
         execution_status = "cancelled"
     elif result.conclusion.summary:
         execution_status = "partial"
@@ -112,10 +145,10 @@ def child_result_payload(result: ChildResult) -> dict[str, Any]:
         execution_status = "error"
     return {
         "status": execution_status,
-        "child_status": result.status.value,
+        "subagent_status": result.status.value,
         "ready": result.ready,
         "handle": result.handle.to_dict(),
-        "child_id": result.handle.child_id,
+        "subagent_id": result.handle.subagent_id,
         "agent_type": result.request.agent_type,
         "name": result.request.name,
         "description": result.request.description,
@@ -127,21 +160,21 @@ def child_result_payload(result: ChildResult) -> dict[str, Any]:
         "cost_complete": result.cost_complete,
         "elapsed_seconds": result.elapsed_seconds,
         "stop_reason": result.status.value,
-        "run_id": result.child_run_id,
+        "subagent_run_id": result.subagent_run_id,
     }
 
 
-def child_terminal_runtime_input(result: ChildResult) -> RuntimeInput:
-    """Derive the idempotent parent input for one canonical child terminal."""
+def subagent_terminal_runtime_input(result: SubagentResult) -> RuntimeInput:
+    """Derive the idempotent parent input for one canonical Subagent terminal."""
 
-    payload = child_result_payload(result)
+    payload = subagent_result_payload(result)
     if not result.ready:
-        raise ValueError("child result must be terminal")
-    child_id = result.handle.child_id
+        raise ValueError("Subagent result must be terminal")
+    subagent_id = result.handle.subagent_id
     return RuntimeInput(
-        event_id=f"{child_id}:terminal",
-        kind="agent.child.completed",
-        correlation_id=child_id,
+        event_id=f"{subagent_id}:terminal",
+        kind="agent.subagent.completed",
+        correlation_id=subagent_id,
         source="qitos.agent",
         payload=payload,
     )
@@ -199,8 +232,8 @@ def process_terminal_runtime_input(snapshot: ProcessSnapshot) -> RuntimeInput:
 
 __all__ = [
     "RuntimeInput",
-    "child_result_payload",
-    "child_terminal_runtime_input",
+    "subagent_result_payload",
+    "subagent_terminal_runtime_input",
     "process_terminal_payload",
     "process_terminal_runtime_input",
 ]

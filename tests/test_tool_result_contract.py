@@ -191,7 +191,7 @@ def _usage() -> ModelUsage:
 
 def test_tool_result_usage_and_added_names_round_trip() -> None:
     result = ToolResult(
-        output={"child_status": "completed"},
+        output={"subagent_status": "completed"},
         usage=_usage(),
         added_tool_names=("skill_tool", "mcp_tool"),
     )

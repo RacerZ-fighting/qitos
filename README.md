@@ -25,7 +25,7 @@ execution adapters are removed; the changelog records the migration.
 - **Pi-aligned runtime is the mainline**: the `Agent` façade drives the minimal
   async `Message -> Model -> ToolCall -> ToolResult` loop with typed messages,
   one immutable model/Tool snapshot per turn, journaled transactions, and
-  façade-driven child agents. The retired `AgentModule + Engine` lifecycle is
+  façade-driven subagents. The retired `AgentModule + Engine` lifecycle is
   removed. See the
   [target architecture](docs/internal/architecture/agent-runtime.md) and
   [migration plan](docs/internal/plans/pi-aligned-agent-runtime.md).
@@ -35,9 +35,15 @@ execution adapters are removed; the changelog records the migration.
   stream. Tool execution is serial by default, preserves input order under
   bounded parallelism, and produces one terminal `ToolResult` for every call.
 - **Explicit persistence boundary**: loop transactions can be written to the
-  Session Journal. Making Session/Harness authoritative for compact, resume,
-  fork, and recovery is still active migration work. Trace artifacts and
-  `qita` are observational, not recovery truth.
+  canonical Session Journal. Session/Harness owns compact, resume, fork, and
+  pure recovery; trace artifacts and `qita` remain observational rather than
+  recovery truth.
+- **Subagents finish with their own words**: every active Subagent reserves one
+  shared step for a tool-free final answer. Step, token, or cost exhaustion can
+  trigger that same-context conclusion turn; a useful earlier answer releases
+  the reservation. The Supervisor transports the model's final text and never
+  synthesizes prose from Tool, Plan, or Journal facts. Explicit cancellation
+  and expired absolute deadlines remain hard boundaries.
 
 ## Historical pre-migration highlights
 
@@ -82,10 +88,10 @@ critic, checkpoint, and recipe are not current execution APIs.
   and EPUB reading now use the required Beautiful Soup parser through one shared
   policy. Optional-dependency branches and regex HTML fallbacks are gone, and search
   result links are selected from the parsed DOM.
-- **One general Child-Agent lifecycle**: the fixed `qitos.kit.patterns`
+- **One general Subagent lifecycle**: the fixed `qitos.kit.patterns`
   Manager/Worker, Planner/Executor, Proposer/Verifier, Debate, MoA, and DAG workflow
   templates are gone. Applications now compose coordination policy from the typed,
-  async `AgentTool` and `ChildControlToolSet` lifecycle or keep it in explicit
+  async `SubagentTool` and `SubagentControlToolSet` lifecycle or keep it in explicit
   application-owned recipes instead of entering a second orchestration runtime.
 - **One Skill path and one HTTP client**: QitOS now keeps only progressive, read-only
   bundled `SKILL.md` disclosure in the Agent runtime. The old SkillHub installer,
@@ -130,14 +136,14 @@ critic, checkpoint, and recipe are not current execution APIs.
   official MCP protocol models retain their Pydantic validation. ToolCalls from
   incomplete or failed model terminals are retained only as diagnostics and never
   execute.
-- **Deterministic completion projections**: Background Child and managed-process completion
+- **Deterministic completion projections**: Background Subagent and managed-process completion
   inputs are deterministic projections of canonical Journal terminals. The retired
   Engine recovery path that re-projected unconsumed inputs has been removed; closing
   the terminal-to-mailbox crash window now remains an explicit authoritative
   Session/Harness migration gate. Canonical
-  `ToolResult` values also carry their model `call_id`, and Child factories may finish
-  async resource construction safely. Foreground Child-local cancellation returns a
-  terminal Child result without being misclassified as parent Task cancellation.
+  `ToolResult` values also carry their model `call_id`, and Subagent factories may finish
+  async resource construction safely. Foreground Subagent-local cancellation returns a
+  terminal Subagent result without being misclassified as parent Task cancellation.
 - **Lease-free Run discovery and lineage**: `JsonlRunCatalog` now returns immutable
   typed summaries, deterministic listings, validated ancestors, and direct children
   while an Engine still owns the writer lease. Reads never repair canonical JSONL or
@@ -178,22 +184,24 @@ critic, checkpoint, and recipe are not current execution APIs.
   protocol, complete History, Tool exposure, capability, deadline, pricing, and budget
   view. Full runs and interactive steps share this one transaction; parser and optional
   critic/handoff policies compose around it instead of adding another loop. Engine,
-  Tool, Mailbox, MCP, and Child calls stay on the caller's event loop; cancellation
+  Tool, Mailbox, MCP, and Subagent calls stay on the caller's event loop; cancellation
   drains started handlers and journals one ordered terminal result per call before it
   propagates. Model changes re-resolve inferred protocol only for the next turn.
 - **Product-owned completion and bounded Runs**: `AgentModule.assess_completion()` can
   accept a final answer, request another evidence-gathering turn, or classify a concrete
   blocker. Runtime and Task budgets now cover steps, time, tokens, cost, Tool
-  concurrency, and Child count, with shared step/token/cost usage restored on Journal
+  concurrency, and Subagent count, with shared step/token/cost usage restored on Journal
   resume.
-- **One Root/Child budget ledger**: product runtimes can pass one `BudgetLedger` to
+- **One Root/Subagent budget ledger**: product runtimes can pass one `BudgetLedger` to
   descendant Engines. Every model request first reserves one step in the Root JSONL;
   every completed model transaction then settles token and cost exactly once. The
-  reservation is atomic across concurrent Children, so the lineage cannot issue more
-  provider requests than its shared step limit. Child budgets remain local caps inside
-  that allowance. Results expose both shared and local totals plus completeness. Token
-  and cost enforcement still settles after a response; it does not pre-reserve unknown
-  usage for concurrent requests.
+  reservation is atomic across concurrent Subagents, so the lineage cannot issue more
+  provider requests than its shared step limit. Subagent budgets remain local caps inside
+  that allowance. Each live Subagent also holds one step for its final natural-language
+  answer, so ordinary Root or sibling work cannot consume the last chance to report its
+  result. Results expose both shared and local totals plus completeness. Token and cost
+  enforcement still settles after a response; unknown usage is not pre-reserved, but a
+  crossing may use the held tool-free conclusion turn.
 - **Single-owner Session journals**: each Run now has one process-safe JSONL writer
   lease and an explicit terminal lifecycle. Replay always validates canonical JSONL;
   the disposable SQLite read projection is retained only when it matches JSONL and
@@ -351,14 +359,14 @@ critic, checkpoint, and recipe are not current execution APIs.
   typed calls now bypass text interpreters and parsers, API requests omit the duplicate
   framework action contract, and every accepted, rejected, or malformed call commits one
   ordered result with the original call id. Malformed arguments never execute a tool.
-- **Typed child-agent lifecycle**: immutable launch, handle, status, result, budget, and
-  conclusion contracts separate persisted Child identity from live Engines. A Run-owned
+- **Typed Subagent lifecycle**: immutable launch, handle, status, result, budget, and
+  conclusion contracts separate persisted Subagent identity from live Engines. A Run-owned
   async supervisor handles admission, wait, interrupt, terminal state, parent delivery,
-  and teardown; durable started/terminal records prevent recovery from replaying a Child,
+  and teardown; durable started/terminal records prevent recovery from replaying a Subagent,
   and forks cannot control inherited handles. Launch policy carries narrowed profile,
   Tool groups, workspace, and budget, while invocation cleanup owns fresh model
   resources. Shared status, wait, message, and interrupt tools use the same supervisor;
-  `AgentTool` is now a thin launch projection.
+  `SubagentTool` is now a thin launch projection.
 - **Environment-backed coding tools**: named Env capability groups now let the same
   bounded workspace tools run against host, container, or remote providers. The compact
   workspace profile exposes one lowercase surface (`read_file`, `write_file`,
@@ -403,7 +411,7 @@ critic, checkpoint, and recipe are not current execution APIs.
 - **Native response extraction hardening**: null-content OpenAI-compatible messages no longer surface SDK repr strings as final answers.
 - **OpenAI-compatible request hardening**: forced tool-call requests now avoid provider thinking-mode conflicts, and JSON/tool-call parsing repairs bare control characters inside string values.
 - **More robust JSON salvage**: JSON-like parser recovery now ignores apostrophes in surrounding prose, so contractions before a valid payload no longer hide the object.
-- **Cleaner delegate tools**: `AgentSpec.tool_name` lets multi-agent systems expose task-oriented tool names, and `DelegateTool` now delivers structured `context` payloads into child agents.
+- **Cleaner delegate tools**: `AgentSpec.tool_name` lets multi-agent systems expose task-oriented tool names, and `DelegateTool` now delivers structured `context` payloads into subagents.
 - **CyberGym integration hardening**: v0.6 integration runs now preserve valid OpenAI-compatible tool schemas, redact persisted secrets across traces/results/render artifacts, and keep CyberGym PoC-generation shell commands out of the interactive review path while preserving the default coding-tool guard.
 - **Lighter-weight CyberGym bootstrap guidance**: the CyberGym PoC agent now derives a compact task-spec summary, ranks likely parser/harness/sample paths more aggressively, tracks richer candidate provenance, and records a lightweight internal failure taxonomy without changing the single-agent runtime.
 

@@ -1,10 +1,10 @@
-"""Model-facing contract tests for the generic child Agent tool."""
+"""Model-facing contract tests for the generic Subagent tool."""
 
-from qitos.kit.tool.agent import AgentTool
+from qitos.kit.tool.subagent import SubagentTool
 
 
 def test_description_explains_parallel_delegation_boundary() -> None:
-    tool = AgentTool(
+    tool = SubagentTool(
         invocation_factory=lambda request, _context: None,
         execution_mode="foreground",
     )

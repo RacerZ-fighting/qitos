@@ -747,7 +747,7 @@ class JournalTurnTransaction(TurnTransactionBoundary):
         self._require_turn(turn)
         message_record_id = await self._append_transcript(message)
         if self._budget_ledger is not None:
-            # Root runs commit durable usage the same way the child boundary
+            # Root runs commit durable usage the same way the Subagent boundary
             # does: per model terminal, keyed by the run's own deterministic
             # model-transaction id, before the model record itself.
             tokens, cost, usage_complete, cost_complete = _usage_accounting(
@@ -915,7 +915,7 @@ def _usage_accounting(
     *,
     model_pricing: ModelPricing | None,
 ) -> tuple[int, float, bool, bool]:
-    """Token/cost accounting of one model terminal (child-boundary parity)."""
+    """Token/cost accounting of one model terminal (Subagent-boundary parity)."""
 
     usage = message.usage
     if usage is None:

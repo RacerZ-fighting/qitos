@@ -1,4 +1,4 @@
-"""Behavior tests for one root Run's recursive Child admission limits."""
+"""Behavior tests for one root Run's recursive Subagent admission limits."""
 
 from __future__ import annotations
 
@@ -9,47 +9,47 @@ from typing import Any
 
 import pytest
 
-from qitos.core.child import (
-    ChildHandle,
-    ChildInvocation,
-    ChildLaunchContext,
-    ChildLaunchRequest,
-    ChildPostRuntimeEvent,
-    ChildPersistenceError,
-    ChildResult,
-    ChildRunLimitError,
-    ChildRuntimeContext,
-    ChildStatus,
+from qitos.core.subagent import (
+    SubagentHandle,
+    SubagentInvocation,
+    SubagentLaunchContext,
+    SubagentLaunchRequest,
+    SubagentPostRuntimeEvent,
+    SubagentPersistenceError,
+    SubagentResult,
+    SubagentRunLimitError,
+    SubagentRuntimeContext,
+    SubagentStatus,
 )
 from qitos.core.journal import JournalRecordType, SessionJournal
-from qitos.kit.child import ChildRunLimiter, ChildSupervisor
+from qitos.kit.subagent import SubagentRunLimiter, SubagentSupervisor
 from qitos.kit.journal import JsonlSessionJournal
-from qitos.kit.tool.agent import AgentTool
+from qitos.kit.tool.subagent import SubagentTool
 
 
-def _request(task: str) -> ChildLaunchRequest:
-    return ChildLaunchRequest(task=task, description=f"Run {task}")
+def _request(task: str) -> SubagentLaunchRequest:
+    return SubagentLaunchRequest(task=task, description=f"Run {task}")
 
 
 def _context(
     parent_run_id: str,
     *,
     journal: SessionJournal | None = None,
-    post_runtime_event: ChildPostRuntimeEvent | None = None,
-) -> ChildLaunchContext:
-    return ChildLaunchContext(
+    post_runtime_event: SubagentPostRuntimeEvent | None = None,
+) -> SubagentLaunchContext:
+    return SubagentLaunchContext(
         parent_run_id=parent_run_id,
         journal=journal,
         post_runtime_event=post_runtime_event,
     )
 
 
-async def _ready_invocation(**kwargs: Any) -> ChildInvocation:
-    return ChildInvocation(**kwargs)
+async def _ready_invocation(**kwargs: Any) -> SubagentInvocation:
+    return SubagentInvocation(**kwargs)
 
 
 class _Engine:
-    active_run_id = "child-run"
+    active_run_id = "subagent-run"
 
     def __init__(
         self,
@@ -89,21 +89,21 @@ class _Engine:
 
 
 def _supervisor(
-    limiter: ChildRunLimiter,
+    limiter: SubagentRunLimiter,
     engine_factory: Any,
-) -> ChildSupervisor:
+) -> SubagentSupervisor:
     async def build(
-        request: ChildLaunchRequest,
-        _context: ChildRuntimeContext,
-    ) -> ChildInvocation:
-        return ChildInvocation(engine=engine_factory(), task=request.task)
+        request: SubagentLaunchRequest,
+        _context: SubagentRuntimeContext,
+    ) -> SubagentInvocation:
+        return SubagentInvocation(engine=engine_factory(), task=request.task)
 
-    return ChildSupervisor(invocation_factory=build, run_limiter=limiter)
+    return SubagentSupervisor(invocation_factory=build, run_limiter=limiter)
 
 
 @pytest.mark.asyncio
-async def test_recursive_supervisors_share_cumulative_child_budget() -> None:
-    limiter = ChildRunLimiter(max_active_children=2, max_children=2)
+async def test_recursive_supervisors_share_cumulative_subagent_budget() -> None:
+    limiter = SubagentRunLimiter(max_active_subagents=2, max_subagents=2)
     first = _supervisor(limiter, _Engine)
     nested = _supervisor(limiter, _Engine)
 
@@ -114,15 +114,15 @@ async def test_recursive_supervisors_share_cumulative_child_budget() -> None:
     )
     two = await nested.launch(
         _request("two"),
-        _context("child-run"),
+        _context("subagent-run"),
         background=False,
     )
 
-    assert one.status is ChildStatus.COMPLETED
-    assert two.status is ChildStatus.COMPLETED
-    assert limiter.children_started == 2
-    assert limiter.active_children == 0
-    with pytest.raises(ChildRunLimitError, match="max_children=2"):
+    assert one.status is SubagentStatus.COMPLETED
+    assert two.status is SubagentStatus.COMPLETED
+    assert limiter.subagents_started == 2
+    assert limiter.active_subagents == 0
+    with pytest.raises(SubagentRunLimitError, match="max_subagents=2"):
         await first.launch(
             _request("three"),
             _context("root-run"),
@@ -135,7 +135,7 @@ async def test_recursive_supervisors_share_cumulative_child_budget() -> None:
 
 @pytest.mark.asyncio
 async def test_nested_supervisor_setup_does_not_reset_shared_run_budget() -> None:
-    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
+    limiter = SubagentRunLimiter(max_active_subagents=1, max_subagents=1)
     root = _supervisor(limiter, _Engine)
     nested = _supervisor(limiter, _Engine)
 
@@ -146,12 +146,12 @@ async def test_nested_supervisor_setup_does_not_reset_shared_run_budget() -> Non
     )
     nested.setup()
 
-    assert first.status is ChildStatus.COMPLETED
-    assert limiter.children_started == 1
-    with pytest.raises(ChildRunLimitError, match="max_children=1"):
+    assert first.status is SubagentStatus.COMPLETED
+    assert limiter.subagents_started == 1
+    with pytest.raises(SubagentRunLimitError, match="max_subagents=1"):
         await nested.launch(
             _request("nested"),
-            _context("child-run"),
+            _context("subagent-run"),
             background=False,
         )
 
@@ -160,16 +160,16 @@ async def test_nested_supervisor_setup_does_not_reset_shared_run_budget() -> Non
 
 
 @pytest.mark.asyncio
-async def test_agent_tool_setup_starts_fresh_root_run_limit_generation() -> None:
-    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
+async def test_subagent_tool_setup_starts_fresh_root_run_limit_generation() -> None:
+    limiter = SubagentRunLimiter(max_active_subagents=1, max_subagents=1)
 
     async def build(
-        request: ChildLaunchRequest,
-        _context: ChildRuntimeContext,
-    ) -> ChildInvocation:
-        return ChildInvocation(engine=_Engine(), task=request.task)
+        request: SubagentLaunchRequest,
+        _context: SubagentRuntimeContext,
+    ) -> SubagentInvocation:
+        return SubagentInvocation(engine=_Engine(), task=request.task)
 
-    tool = AgentTool(invocation_factory=build, run_limiter=limiter)
+    tool = SubagentTool(invocation_factory=build, run_limiter=limiter)
     first = await tool.execute(
         {
             "description": "first",
@@ -190,32 +190,32 @@ async def test_agent_tool_setup_starts_fresh_root_run_limit_generation() -> None
         runtime_context={"run_id": "root-two"},
     )
 
-    assert first.output["child_status"] == ChildStatus.COMPLETED.value
-    assert second.output["child_status"] == ChildStatus.COMPLETED.value
-    assert limiter.children_started == 1
+    assert first.output["subagent_status"] == SubagentStatus.COMPLETED.value
+    assert second.output["subagent_status"] == SubagentStatus.COMPLETED.value
+    assert limiter.subagents_started == 1
     await tool.aclose()
 
 
 @pytest.mark.asyncio
-async def test_nested_agent_tool_setup_preserves_active_shared_run_limit() -> None:
-    limiter = ChildRunLimiter(max_active_children=2, max_children=2)
+async def test_nested_subagent_tool_setup_preserves_active_shared_run_limit() -> None:
+    limiter = SubagentRunLimiter(max_active_subagents=2, max_subagents=2)
     lease = await limiter.reserve()
 
     async def build(
-        request: ChildLaunchRequest,
-        _context: ChildRuntimeContext,
-    ) -> ChildInvocation:
-        return ChildInvocation(engine=_Engine(), task=request.task)
+        request: SubagentLaunchRequest,
+        _context: SubagentRuntimeContext,
+    ) -> SubagentInvocation:
+        return SubagentInvocation(engine=_Engine(), task=request.task)
 
-    nested = AgentTool(
+    nested = SubagentTool(
         invocation_factory=build,
         run_limiter=limiter,
         owns_run_limiter=False,
     )
     nested.setup()
 
-    assert limiter.active_children == 1
-    assert limiter.children_started == 1
+    assert limiter.active_subagents == 1
+    assert limiter.subagents_started == 1
     await lease.rollback()
     await nested.aclose()
 
@@ -224,7 +224,7 @@ async def test_nested_agent_tool_setup_preserves_active_shared_run_limit() -> No
 async def test_active_limit_rejects_without_consuming_cumulative_budget() -> None:
     started = asyncio.Event()
     release = asyncio.Event()
-    limiter = ChildRunLimiter(max_active_children=1, max_children=3)
+    limiter = SubagentRunLimiter(max_active_subagents=1, max_subagents=3)
     first = _supervisor(
         limiter,
         lambda: _Engine(started=started, release=release),
@@ -237,38 +237,38 @@ async def test_active_limit_rejects_without_consuming_cumulative_budget() -> Non
     )
     await asyncio.wait_for(started.wait(), timeout=1)
 
-    with pytest.raises(ChildRunLimitError, match="max_active_children=1"):
+    with pytest.raises(SubagentRunLimitError, match="max_active_subagents=1"):
         await nested.launch(
             _request("nested"),
-            _context("child-run"),
+            _context("subagent-run"),
             background=False,
         )
-    assert limiter.children_started == 1
-    assert limiter.active_children == 1
+    assert limiter.subagents_started == 1
+    assert limiter.active_subagents == 1
 
     release.set()
     terminal = await first.wait(running.handle, timeout_seconds=1)
-    assert terminal is not None and terminal.status is ChildStatus.COMPLETED
-    assert limiter.active_children == 0
+    assert terminal is not None and terminal.status is SubagentStatus.COMPLETED
+    assert limiter.active_subagents == 0
 
     admitted = await nested.launch(
         _request("nested"),
-        _context("child-run"),
+        _context("subagent-run"),
         background=False,
     )
-    assert admitted.status is ChildStatus.COMPLETED
-    assert limiter.children_started == 2
-    assert limiter.active_children == 0
+    assert admitted.status is SubagentStatus.COMPLETED
+    assert limiter.subagents_started == 2
+    assert limiter.active_subagents == 0
 
     await first.aclose()
     await nested.aclose()
 
 
 @pytest.mark.asyncio
-async def test_terminal_child_releases_active_slot_before_parent_delivery() -> None:
+async def test_terminal_subagent_releases_active_slot_before_parent_delivery() -> None:
     delivery_started = asyncio.Event()
     release_delivery = asyncio.Event()
-    limiter = ChildRunLimiter(max_active_children=1, max_children=2)
+    limiter = SubagentRunLimiter(max_active_subagents=1, max_subagents=2)
     supervisor = _supervisor(limiter, _Engine)
 
     async def post_runtime_event(_event: object) -> bool:
@@ -285,17 +285,17 @@ async def test_terminal_child_releases_active_slot_before_parent_delivery() -> N
 
     first_result = supervisor.result(first.handle)
     assert first_result is not None
-    assert first_result.status is ChildStatus.COMPLETED
-    assert limiter.active_children == 0
+    assert first_result.status is SubagentStatus.COMPLETED
+    assert limiter.active_subagents == 0
 
     second = await supervisor.launch(
         _request("second"),
         _context("root-run"),
         background=False,
     )
-    assert second.status is ChildStatus.COMPLETED
-    assert limiter.children_started == 2
-    assert limiter.active_children == 0
+    assert second.status is SubagentStatus.COMPLETED
+    assert limiter.subagents_started == 2
+    assert limiter.active_subagents == 0
 
     release_delivery.set()
     await supervisor.aclose()
@@ -303,22 +303,22 @@ async def test_terminal_child_releases_active_slot_before_parent_delivery() -> N
 
 @pytest.mark.asyncio
 async def test_provisional_admission_can_be_rolled_back() -> None:
-    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
+    limiter = SubagentRunLimiter(max_active_subagents=1, max_subagents=1)
     lease = await limiter.reserve()
 
-    assert limiter.active_children == 1
-    assert limiter.children_started == 1
-    with pytest.raises(RuntimeError, match="active children"):
+    assert limiter.active_subagents == 1
+    assert limiter.subagents_started == 1
+    with pytest.raises(RuntimeError, match="active subagents"):
         limiter.reset_for_new_run()
     await lease.rollback()
     await lease.rollback()
 
-    assert limiter.active_children == 0
-    assert limiter.children_started == 0
+    assert limiter.active_subagents == 0
+    assert limiter.subagents_started == 0
     replacement = await limiter.reserve()
     replacement.commit()
     await replacement.release()
-    assert limiter.children_started == 1
+    assert limiter.subagents_started == 1
 
 
 @pytest.mark.asyncio
@@ -327,7 +327,7 @@ async def test_recovery_restores_durable_launches_into_shared_budget(
 ) -> None:
     journal = JsonlSessionJournal(tmp_path / "journal")
     await journal.create("root-run", {})
-    original = ChildSupervisor(
+    original = SubagentSupervisor(
         invocation_factory=(
             lambda request, _context: _ready_invocation(
                 engine=_Engine(),
@@ -342,13 +342,13 @@ async def test_recovery_restores_durable_launches_into_shared_budget(
     )
     await original.aclose()
 
-    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
+    limiter = SubagentRunLimiter(max_active_subagents=1, max_subagents=1)
     recovered = _supervisor(limiter, _Engine)
     results = await recovered.recover(parent_run_id="root-run", journal=journal)
 
     assert len(results) == 1
-    assert limiter.children_started == 1
-    with pytest.raises(ChildRunLimitError, match="max_children=1"):
+    assert limiter.subagents_started == 1
+    with pytest.raises(SubagentRunLimitError, match="max_subagents=1"):
         await recovered.launch(
             _request("over-budget"),
             _context("root-run", journal=journal),
@@ -368,16 +368,16 @@ async def test_launch_persists_run_id_before_invocation_factory(
     observed_run_ids: list[str] = []
 
     async def build(
-        request: ChildLaunchRequest,
-        context: ChildRuntimeContext,
-    ) -> ChildInvocation:
-        child_run_id = context.child_run_id
-        observed_run_ids.append(child_run_id)
+        request: SubagentLaunchRequest,
+        context: SubagentRuntimeContext,
+    ) -> SubagentInvocation:
+        subagent_run_id = context.subagent_run_id
+        observed_run_ids.append(subagent_run_id)
         engine = _Engine()
-        engine.active_run_id = child_run_id
-        return ChildInvocation(engine=engine, task=request.task)
+        engine.active_run_id = subagent_run_id
+        return SubagentInvocation(engine=engine, task=request.task)
 
-    supervisor = ChildSupervisor(invocation_factory=build)
+    supervisor = SubagentSupervisor(invocation_factory=build)
     result = await supervisor.launch(
         _request("persist locator"),
         _context("root-run", journal=journal),
@@ -387,10 +387,10 @@ async def test_launch_persists_run_id_before_invocation_factory(
     started = next(
         record
         for record in await journal.replay()
-        if record.type is JournalRecordType.CHILD_STARTED
+        if record.type is JournalRecordType.SUBAGENT_STARTED
     )
-    assert observed_run_ids == [started.payload["child_run_id"]]
-    assert result.child_run_id == started.payload["child_run_id"]
+    assert observed_run_ids == [started.payload["subagent_run_id"]]
+    assert result.subagent_run_id == started.payload["subagent_run_id"]
 
     await supervisor.aclose()
     await journal.close()
@@ -403,74 +403,74 @@ async def test_recovery_restores_nested_journal_launches_into_root_budget(
     journal_root = tmp_path / "journal"
     root_journal = JsonlSessionJournal(journal_root)
     await root_journal.create("root-run", {})
-    child_request = _request("child")
-    child_handle = ChildHandle(
-        child_id="child-direct",
+    subagent_request = _request("subagent")
+    subagent_handle = SubagentHandle(
+        subagent_id="subagent-direct",
         parent_run_id="root-run",
     )
     await root_journal.append(
-        JournalRecordType.CHILD_STARTED,
+        JournalRecordType.SUBAGENT_STARTED,
         {
-            "handle": child_handle.to_dict(),
-            "request": child_request.to_dict(),
-            "child_run_id": "child-run",
+            "handle": subagent_handle.to_dict(),
+            "request": subagent_request.to_dict(),
+            "subagent_run_id": "subagent-run",
         },
-        record_id="root-run:child:child-direct:started",
+        record_id="root-run:subagent:subagent-direct:started",
     )
     await root_journal.append(
-        JournalRecordType.CHILD_TERMINAL,
-        ChildResult(
-            handle=child_handle,
-            request=child_request,
-            status=ChildStatus.COMPLETED,
-            child_run_id="child-run",
+        JournalRecordType.SUBAGENT_TERMINAL,
+        SubagentResult(
+            handle=subagent_handle,
+            request=subagent_request,
+            status=SubagentStatus.COMPLETED,
+            subagent_run_id="subagent-run",
         ).to_dict(),
-        record_id="root-run:child:child-direct:terminal",
+        record_id="root-run:subagent:subagent-direct:terminal",
     )
 
-    child_journal = JsonlSessionJournal(journal_root)
-    await child_journal.create("child-run", {})
-    grandchild_request = _request("grandchild")
-    grandchild_handle = ChildHandle(
-        child_id="child-nested",
-        parent_run_id="child-run",
+    subagent_journal = JsonlSessionJournal(journal_root)
+    await subagent_journal.create("subagent-run", {})
+    grandsubagent_request = _request("grandsubagent")
+    grandsubagent_handle = SubagentHandle(
+        subagent_id="subagent-nested",
+        parent_run_id="subagent-run",
     )
-    await child_journal.append(
-        JournalRecordType.CHILD_STARTED,
+    await subagent_journal.append(
+        JournalRecordType.SUBAGENT_STARTED,
         {
-            "handle": grandchild_handle.to_dict(),
-            "request": grandchild_request.to_dict(),
-            "child_run_id": "grandchild-run",
+            "handle": grandsubagent_handle.to_dict(),
+            "request": grandsubagent_request.to_dict(),
+            "subagent_run_id": "grandsubagent-run",
         },
-        record_id="child-run:child:child-nested:started",
+        record_id="subagent-run:subagent:subagent-nested:started",
     )
-    await child_journal.append(
-        JournalRecordType.CHILD_TERMINAL,
-        ChildResult(
-            handle=grandchild_handle,
-            request=grandchild_request,
-            status=ChildStatus.COMPLETED,
-            child_run_id="grandchild-run",
+    await subagent_journal.append(
+        JournalRecordType.SUBAGENT_TERMINAL,
+        SubagentResult(
+            handle=grandsubagent_handle,
+            request=grandsubagent_request,
+            status=SubagentStatus.COMPLETED,
+            subagent_run_id="grandsubagent-run",
         ).to_dict(),
-        record_id="child-run:child:child-nested:terminal",
+        record_id="subagent-run:subagent:subagent-nested:terminal",
     )
-    await child_journal.close()
+    await subagent_journal.close()
 
-    limiter = ChildRunLimiter(max_active_children=2, max_children=2)
-    recovered = ChildSupervisor(
+    limiter = SubagentRunLimiter(max_active_subagents=2, max_subagents=2)
+    recovered = SubagentSupervisor(
         invocation_factory=lambda request, _context: _ready_invocation(
             engine=_Engine(),
             task=request.task,
         ),
         run_limiter=limiter,
-        child_journal_factory=lambda: JsonlSessionJournal(journal_root),
+        subagent_journal_factory=lambda: JsonlSessionJournal(journal_root),
     )
 
     await recovered.recover(parent_run_id="root-run", journal=root_journal)
 
-    assert limiter.children_started == 2
-    assert limiter.active_children == 0
-    with pytest.raises(ChildRunLimitError, match="max_children=2"):
+    assert limiter.subagents_started == 2
+    assert limiter.active_subagents == 0
+    with pytest.raises(SubagentRunLimitError, match="max_subagents=2"):
         await recovered.launch(
             _request("over budget after resume"),
             _context("root-run", journal=root_journal),
@@ -489,30 +489,30 @@ async def test_recovery_rejects_duplicate_descendant_run_identity(
     root_journal = JsonlSessionJournal(journal_root)
     await root_journal.create("root-run", {})
     for index in range(2):
-        request = _request(f"child-{index}")
-        handle = ChildHandle(
-            child_id=f"child-{index}",
+        request = _request(f"subagent-{index}")
+        handle = SubagentHandle(
+            subagent_id=f"subagent-{index}",
             parent_run_id="root-run",
         )
         await root_journal.append(
-            JournalRecordType.CHILD_STARTED,
+            JournalRecordType.SUBAGENT_STARTED,
             {
                 "handle": handle.to_dict(),
                 "request": request.to_dict(),
-                "child_run_id": "shared-child-run",
+                "subagent_run_id": "shared-subagent-run",
             },
-            record_id=f"root-run:child:child-{index}:started",
+            record_id=f"root-run:subagent:subagent-{index}:started",
         )
 
-    supervisor = ChildSupervisor(
+    supervisor = SubagentSupervisor(
         invocation_factory=lambda request, _context: _ready_invocation(
             engine=_Engine(),
             task=request.task,
         ),
-        child_journal_factory=lambda: JsonlSessionJournal(journal_root),
+        subagent_journal_factory=lambda: JsonlSessionJournal(journal_root),
     )
 
-    with pytest.raises(ChildPersistenceError, match="cycle or duplicate Run"):
+    with pytest.raises(SubagentPersistenceError, match="cycle or duplicate Run"):
         await supervisor.recover(
             parent_run_id="root-run",
             journal=root_journal,
@@ -524,25 +524,25 @@ async def test_recovery_rejects_duplicate_descendant_run_identity(
 
 
 @pytest.mark.asyncio
-async def test_recovery_rejects_history_over_configured_child_limit(
+async def test_recovery_rejects_history_over_configured_subagent_limit(
     tmp_path: Path,
 ) -> None:
     root_journal = JsonlSessionJournal(tmp_path / "journal")
     await root_journal.create("root-run", {})
     for index in range(2):
-        request = _request(f"child-{index}")
-        handle = ChildHandle(
-            child_id=f"child-{index}",
+        request = _request(f"subagent-{index}")
+        handle = SubagentHandle(
+            subagent_id=f"subagent-{index}",
             parent_run_id="root-run",
         )
         await root_journal.append(
-            JournalRecordType.CHILD_STARTED,
+            JournalRecordType.SUBAGENT_STARTED,
             {"handle": handle.to_dict(), "request": request.to_dict()},
-            record_id=f"root-run:child:child-{index}:started",
+            record_id=f"root-run:subagent:subagent-{index}:started",
         )
 
-    limiter = ChildRunLimiter(max_active_children=1, max_children=1)
-    supervisor = ChildSupervisor(
+    limiter = SubagentRunLimiter(max_active_subagents=1, max_subagents=1)
+    supervisor = SubagentSupervisor(
         invocation_factory=lambda request, _context: _ready_invocation(
             engine=_Engine(),
             task=request.task,
@@ -550,13 +550,13 @@ async def test_recovery_rejects_history_over_configured_child_limit(
         run_limiter=limiter,
     )
 
-    with pytest.raises(ChildPersistenceError, match="configured Run limit"):
+    with pytest.raises(SubagentPersistenceError, match="configured Run limit"):
         await supervisor.recover(
             parent_run_id="root-run",
             journal=root_journal,
         )
 
-    assert limiter.children_started == 0
+    assert limiter.subagents_started == 0
     assert supervisor.active_count == 0
     await supervisor.aclose()
     await root_journal.close()

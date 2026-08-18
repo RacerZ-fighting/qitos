@@ -25,7 +25,7 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
   `Message -> Model -> ToolCall -> ToolResult` loop，具备类型化消息、逐 turn 不可变的
   模型/工具快照、journal 化事务与 façade 驱动的子智能体；已退役的
   `AgentModule + Engine` 生命周期整体移除。
-  可持久化、携带 goal 的 Task 会成为 Root 和 Child Agent 的工作根；benchmark 输入、
+  可持久化、携带 goal 的 Task 会成为 Root 和 Subagent 的工作根；benchmark 输入、
   environment handle、metrics 与应用插件策略不进入 Task 契约。详见
   [目标架构](docs/internal/architecture/agent-runtime.md)和
   [迁移计划](docs/internal/plans/pi-aligned-agent-runtime.md)。
@@ -34,8 +34,12 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
   Chat Completions 进入同一套 Provider 中立 Message 流。Tool 默认串行执行；有界并行
   仍按输入顺序提交，并保证每个调用都有唯一 terminal `ToolResult`。
 - **明确的持久化边界**：loop 事务可以写入 Session Journal。让 Session/Harness 成为
-  compact、resume、fork 与 recovery 的权威 owner 仍是迁移中的工作；trace artifact 与
-  `qita` 只用于观察，不是恢复真源。
+  compact、resume、fork 与纯恢复的权威 owner；trace artifact 与 `qita` 只用于观察，
+  不是恢复真源。
+- **Subagent 用自己的话交付结果**：每个活跃 Subagent 都会从共享预算中保留一次无 Tool 的
+  最终交互。step 边界或 token/cost 越界后，可以沿用原上下文完成结论；若此前已经给出有效
+  结论，则立即释放保留额度。Supervisor 只运输模型最终文本，不会根据 Tool、Plan 或 Journal
+  代写。显式取消和已经到达的绝对 deadline 仍是硬边界。
 
 ## 迁移前版本历史
 
@@ -64,9 +68,9 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
 - **HTML 只保留一套成熟 parser**：Text Web、coding Web fetch、独立 HTML 提取和
   EPUB 阅读现在通过同一策略直接使用必装的 Beautiful Soup。无效的可选依赖分支和正则
   HTML fallback 已删除，搜索结果链接也改为从解析后的 DOM 中选择。
-- **Child Agent 只保留一套通用生命周期**：固定的 `qitos.kit.patterns`
+- **Subagent 只保留一套通用生命周期**：固定的 `qitos.kit.patterns`
   Manager/Worker、Planner/Executor、Proposer/Verifier、Debate、MoA 与 DAG workflow
-  模板已删除。应用直接组合类型化、异步的 `AgentTool` 和 `ChildControlToolSet`，或把具体
+  模板已删除。应用直接组合类型化、异步的 `SubagentTool` 和 `SubagentControlToolSet`，或把具体
   协作策略留在显式的应用 recipe 中，不再进入第二套编排 runtime。
 - **Skill 单主线，HTTP 单 client**：Agent runtime 只保留渐进披露、只读的 bundled
   `SKILL.md`。旧 SkillHub installer、可变 registry、自安装 Tool 和孤立 search adapter
@@ -96,14 +100,14 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
   SDK context 由一个专用 task 持有到关闭，QitOS 继续负责有界目录发布和稳定
   ToolResult 错误。PTY 改由 `ptyprocess` 建立，官方 MCP 协议模型继续使用 Pydantic
   校验。来自 incomplete 或 failed 模型终态的 ToolCall 只保留诊断，不会执行。
-- **确定性的完成通知投影**：后台 Child 与受管进程的完成输入都是 canonical Journal
+- **确定性的完成通知投影**：后台 Subagent 与受管进程的完成输入都是 canonical Journal
   terminal 的确定性投影。旧 Engine 中负责恢复未消费输入的路径已经删除；补上 terminal 到
   Mailbox 之间的崩溃窗口仍是 authoritative Session/Harness 迁移的明确合入门槛。canonical `ToolResult` 同时保存
-  模型 `call_id`，Child factory 可以安全完成异步资源构造。前台 Child 自身取消会返回 terminal
-  Child 结果，不再被误判为 Parent Task 取消。
+  模型 `call_id`，Subagent factory 可以安全完成异步资源构造。前台 Subagent 自身取消会返回 terminal
+  Subagent 结果，不再被误判为 Parent Task 取消。
 - **无 writer lease 的 Run 查询与 lineage**：`JsonlRunCatalog` 现在可以在 Engine
   仍持有 writer lease 时返回不可变、类型化的 Run 摘要、确定性列表、已校验祖先和直接
-  Child。读取不会修复 canonical JSONL，也不会重建可丢弃的 SQLite 投影。继承到本地的
+  子 Run。读取不会修复 canonical JSONL，也不会重建可丢弃的 SQLite 投影。继承到本地的
   committed boundary 可继续 fork；嵌套 fork 的 Engine 恢复不依赖祖先文件，也不会重放
   已完成工具。稳定 lineage id 会跨 fork 保留；terminal handle 还会给出最后一个非终态
   continuation boundary，让显式 follow-up fork 成为 resumable Run，而不是继承完成态。
@@ -129,12 +133,13 @@ recipe 与基准测试执行适配器均已移除；迁移过程记录于更新�
   恢复出的 step 也会保留与之匹配的 continuation。
 - **同一个异步 turn 事务**：完整 Run 与交互式 step 现在共用一份不可变 turn
   事务。Parser、Critic 与 handoff 作为组合策略接入，不再各自占据或复制 Agent loop；
-  Tool、Mailbox、MCP 与 Child 始终运行在调用方 event loop，取消会先等待已启动 handler
+  Tool、Mailbox、MCP 与 Subagent 始终运行在调用方 event loop，取消会先等待已启动 handler
   清理并按输入顺序写完 terminal 结果。模型变化只会让下一 turn 重新解析推断协议。
-- **Root/Child 共用一份 usage 总账**：产品运行时可把同一个 `BudgetLedger` 传给所有
-  后代 Engine。每个完成的模型事务只向 Root JSONL 结算一次 token 与 cost；Child 预算
+- **Root/Subagent 共用一份 usage 总账**：产品运行时可把同一个 `BudgetLedger` 传给所有
+  后代 Engine。每个完成的模型事务只向 Root JSONL 结算一次 token 与 cost；Subagent 预算
   只会进一步收紧共享余额，不会复制一份全局额度。结果同时保留共享总量、本地用量和
-  完整性。首版在结算后阻止下一 turn，不为已经并发发出的请求预留 token。
+  完整性。每个活跃 Subagent 还会保留一个最终结论 step，Root 或 sibling 的普通工作不能
+  抢占。token/cost 仍在模型返回后结算，越界时可使用这个保留 step 进行无 Tool 总结。
 - **Session Journal 只有一个 owner**：每个 Run 现在使用进程安全的 JSONL writer lease
   和明确的终止生命周期。replay 始终先验证 canonical JSONL；可丢弃的 SQLite 读取投影只有
   在与 JSONL 一致时才会保留，并会在过期或损坏后重建。payload 在 append 前先通过唯一的
