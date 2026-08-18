@@ -15,7 +15,7 @@ Model / Provider
 ```
 
 The contracts are in `docs/internal/architecture/agent-runtime.md`. The minimal loop,
-the `Agent` façade, the journaled child path, the façade quickstart and the
+the `Agent` façade, the journaled Subagent path, the façade quickstart and the
 authoritative Session/Harness (`qitos.kit.session`) are the shipped
 mainline; the retired `AgentModule / Observation / Decision / Action` lifecycle, its
 Engine, checkpoint store, prompt-injected protocols/parsers/critics, recipes, and
@@ -43,7 +43,7 @@ Hard rules:
 - Agent loop: model/Tool turn mechanics and transaction barriers only.
 - Session/Harness: queue, compact, resume, fork, abort, idle and pure recovery.
 - `qitos.kit`: concrete reusable Runtime, storage, Tool, Skill, MCP, Artifact, Plan and
-  Child implementations.
+  Subagent implementations.
 - `examples`: runnable product-surface examples, not alternate framework layers.
 - `docs`: public shipped behavior or explicitly labelled internal target architecture.
 
@@ -72,7 +72,7 @@ Small isolated fixes and docs-only edits do not require a new plan document.
 - Async is native below the outermost application/CLI boundary. Do not call
   `asyncio.run()` or create a temporary loop inside running async code.
 - Re-raise `asyncio.CancelledError` after durable terminalization and cleanup.
-- Propagate absolute deadlines; child calls receive only remaining time.
+- Propagate absolute deadlines; Subagent calls receive only remaining time.
 - Use structured concurrency for bounded parallel work. No detached unowned tasks.
 - Every ToolCall receives exactly one terminal ToolResult, including invalid, denied,
   timeout, cancelled and failed calls. Parallel results commit in input order.
@@ -91,7 +91,7 @@ Task rules:
   Task identity; terminal follow-up creates a new Task explicitly.
 - Blocked is resumable only after explicit caller input or observed external-state
   change. Completed, failed and cancelled are terminal once.
-- Child launch creates a narrowed Task linked to parent Task and Plan assignment before
+- Subagent launch creates a narrowed Task linked to parent Task and Plan assignment before
   runtime construction.
 - Benchmark resources, environment probing, metrics and free-form metadata do not enter
   canonical Task.

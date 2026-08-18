@@ -1,4 +1,4 @@
-"""Model-facing tool projection for child Agent supervision."""
+"""Model-facing Tool projection for Subagent supervision."""
 
 from __future__ import annotations
 
@@ -6,12 +6,12 @@ from collections.abc import Mapping
 from typing import Any, Literal, cast
 
 from ....core.budget import BudgetLedger
-from ....core.child import (
-    DEFAULT_CHILD_MAX_STEPS,
-    ChildHandle,
-    ChildLaunchContext,
-    ChildLaunchRequest,
-    ChildResult,
+from ....core.subagent import (
+    DEFAULT_SUBAGENT_MAX_STEPS,
+    SubagentHandle,
+    SubagentLaunchContext,
+    SubagentLaunchRequest,
+    SubagentResult,
 )
 from ....core.model_response import ModelUsage
 from ....core.runtime_input import RuntimeInput
@@ -24,22 +24,22 @@ from ....core.tool import (
 )
 from ....core.tool_registry import ToolExposure
 from ....core.tool_result import ToolResult, ToolResultStatus
-from ...child import (
-    ChildExecutionScope,
-    ChildInvocationFactory,
-    ChildJournalFactory,
-    ChildRunLimiter,
-    ChildSupervisor,
+from ...subagent import (
+    SubagentExecutionScope,
+    SubagentInvocationFactory,
+    SubagentJournalFactory,
+    SubagentRunLimiter,
+    SubagentSupervisor,
 )
 from ..internal.results import tool_result
 
-AgentExecutionMode = Literal["foreground", "optional_background", "background"]
+SubagentExecutionMode = Literal["foreground", "optional_background", "background"]
 
 
-def _child_result_usage(result: ChildResult) -> ModelUsage | None:
-    """Project one terminal Child's accounting into typed Tool usage.
+def _subagent_result_usage(result: SubagentResult) -> ModelUsage | None:
+    """Project one terminal Subagent's accounting into typed Tool usage.
 
-    ``ChildResult`` tracks cumulative totals only, so ``total_tokens`` is the
+    ``SubagentResult`` tracks cumulative totals only, so ``total_tokens`` is the
     available token fact and ``cost_usd`` rides as a lossless detail key.
     A non-terminal (background launch) result has no finished accounting
     yet and carries no usage; completeness flags stay in the output
@@ -56,87 +56,93 @@ def _child_result_usage(result: ChildResult) -> ModelUsage | None:
     )
 
 
-class AgentTool(BaseTool):
-    """Launch a fresh child Agent through one Run-owned async supervisor."""
+class SubagentTool(BaseTool):
+    """Launch a fresh Subagent through one Run-owned async supervisor."""
 
     def __init__(
         self,
         *,
-        invocation_factory: ChildInvocationFactory | None = None,
-        execution_scope: ChildExecutionScope | None = None,
-        execution_mode: AgentExecutionMode = "foreground",
+        invocation_factory: SubagentInvocationFactory | None = None,
+        execution_scope: SubagentExecutionScope | None = None,
+        execution_mode: SubagentExecutionMode = "foreground",
         max_background_workers: int = 4,
-        run_limiter: ChildRunLimiter | None = None,
+        run_limiter: SubagentRunLimiter | None = None,
         owns_run_limiter: bool = True,
-        child_journal_factory: ChildJournalFactory | None = None,
+        subagent_journal_factory: SubagentJournalFactory | None = None,
         max_delegate_depth: int = 1,
-        child_budget: TaskBudget | None = None,
-        child_profile: str = "default",
-        child_allowed_tool_groups: tuple[str, ...] = (),
-        child_working_directory: str | None = None,
-        supervisor: ChildSupervisor | None = None,
+        subagent_budget: TaskBudget | None = None,
+        subagent_profile: str = "default",
+        subagent_allowed_tool_groups: tuple[str, ...] = (),
+        subagent_working_directory: str | None = None,
+        supervisor: SubagentSupervisor | None = None,
     ) -> None:
         if max_delegate_depth <= 0:
             raise ValueError("max_delegate_depth must be positive")
         if not isinstance(owns_run_limiter, bool):
             raise TypeError("owns_run_limiter must be a boolean")
-        resolved_budget = child_budget or TaskBudget(max_steps=DEFAULT_CHILD_MAX_STEPS)
+        resolved_budget = subagent_budget or TaskBudget(
+            max_steps=DEFAULT_SUBAGENT_MAX_STEPS
+        )
         if not isinstance(resolved_budget, TaskBudget):
-            raise TypeError("child_budget must be a TaskBudget")
-        if not isinstance(child_profile, str) or not child_profile.strip():
-            raise ValueError("child_profile must be a non-empty string")
-        if not isinstance(child_allowed_tool_groups, tuple) or any(
+            raise TypeError("subagent_budget must be a TaskBudget")
+        if not isinstance(subagent_profile, str) or not subagent_profile.strip():
+            raise ValueError("subagent_profile must be a non-empty string")
+        if not isinstance(subagent_allowed_tool_groups, tuple) or any(
             not isinstance(group, str) or not group.strip()
-            for group in child_allowed_tool_groups
+            for group in subagent_allowed_tool_groups
         ):
-            raise TypeError("child_allowed_tool_groups must contain non-empty strings")
-        if child_working_directory is not None and (
-            not isinstance(child_working_directory, str)
-            or not child_working_directory.strip()
+            raise TypeError(
+                "subagent_allowed_tool_groups must contain non-empty strings"
+            )
+        if subagent_working_directory is not None and (
+            not isinstance(subagent_working_directory, str)
+            or not subagent_working_directory.strip()
         ):
             raise ValueError(
-                "child_working_directory must be a non-empty string or None"
+                "subagent_working_directory must be a non-empty string or None"
             )
         if execution_mode not in {
             "foreground",
             "optional_background",
             "background",
         }:
-            raise ValueError(f"unsupported Agent execution_mode: {execution_mode}")
+            raise ValueError(
+                f"unsupported Subagent execution_mode: {execution_mode}"
+            )
         if supervisor is not None and (
             invocation_factory is not None
             or execution_scope is not None
             or run_limiter is not None
-            or child_journal_factory is not None
+            or subagent_journal_factory is not None
             or max_background_workers != 4
         ):
             raise ValueError(
                 "invocation_factory, execution_scope, run_limiter, "
-                "child_journal_factory, and max_background_workers "
+                "subagent_journal_factory, and max_background_workers "
                 "belong to the supplied supervisor"
             )
         if supervisor is None:
             if invocation_factory is None:
                 raise TypeError("invocation_factory is required without a supervisor")
-            supervisor = ChildSupervisor(
+            supervisor = SubagentSupervisor(
                 invocation_factory=invocation_factory,
                 execution_scope=execution_scope,
                 max_concurrency=max_background_workers,
                 run_limiter=run_limiter,
-                child_journal_factory=child_journal_factory,
+                subagent_journal_factory=subagent_journal_factory,
             )
         self._supervisor = supervisor
         self._owns_run_limiter = owns_run_limiter
         self._execution_mode = execution_mode
         self._max_delegate_depth = max_delegate_depth
-        self._child_budget = resolved_budget
-        self._child_profile = child_profile.strip()
-        self._child_allowed_tool_groups = tuple(
-            dict.fromkeys(group.strip() for group in child_allowed_tool_groups)
+        self._subagent_budget = resolved_budget
+        self._subagent_profile = subagent_profile.strip()
+        self._subagent_allowed_tool_groups = tuple(
+            dict.fromkeys(group.strip() for group in subagent_allowed_tool_groups)
         )
-        self._child_working_directory = (
-            child_working_directory.strip()
-            if child_working_directory is not None
+        self._subagent_working_directory = (
+            subagent_working_directory.strip()
+            if subagent_working_directory is not None
             else None
         )
 
@@ -147,56 +153,56 @@ class AgentTool(BaseTool):
             },
             "prompt": {
                 "type": "string",
-                "description": "The task for the child agent to perform.",
+                "description": "The task for the Subagent to perform.",
             },
             "success_criteria": {
                 "type": "array",
                 "items": {"type": "string"},
                 "minItems": 1,
                 "description": (
-                    "Concrete conditions the child must satisfy before it can "
+                    "Concrete conditions the subagent must satisfy before it can "
                     "report completion."
                 ),
             },
             "name": {
                 "type": "string",
-                "description": "Optional short name used to identify this child run.",
+                "description": "Optional short name used to identify this subagent run.",
             },
             "subagent_type": {
                 "type": "string",
                 "description": (
                     "Optional specialized agent type. Omit it to use the runtime's "
-                    "general-purpose child."
+                    "general-purpose subagent."
                 ),
             },
             "plan_assignment": {
                 "type": "string",
                 "description": (
-                    "Optional ready parent Plan node id assigned to this child. "
-                    "The runtime durably reserves it before the child starts."
+                    "Optional ready parent Plan node id assigned to this subagent. "
+                    "The runtime durably reserves it before the subagent starts."
                 ),
             },
         }
         if execution_mode == "optional_background":
             parameters["run_in_background"] = {
                 "type": "boolean",
-                "description": "Run asynchronously and return a child handle.",
+                "description": "Run asynchronously and return a subagent handle.",
             }
         execution_description = {
-            "foreground": "This runtime waits for the child result before continuing. ",
+            "foreground": "This runtime waits for the subagent result before continuing. ",
             "optional_background": (
-                "Set run_in_background=true for an asynchronous child; its completion "
-                "is delivered as a later runtime event with a stable child handle. "
+                "Set run_in_background=true for an asynchronous subagent; its completion "
+                "is delivered as a later runtime event with a stable subagent handle. "
             ),
             "background": (
-                "This runtime always starts the child asynchronously and immediately "
-                "returns a child handle. Completion is delivered as a later runtime "
+                "This runtime always starts the subagent asynchronously and immediately "
+                "returns a subagent handle. Completion is delivered as a later runtime "
                 "event. "
             ),
         }[execution_mode]
         description = execution_description + (
-            "Launch an independent child agent for one clearly scoped multi-step task. "
-            "For two or more independent multi-step tasks, make one Agent call per task "
+            "Launch an independent Subagent for one clearly scoped multi-step task. "
+            "For two or more independent multi-step tasks, make one subagent call per task "
             "in the same response; same-response calls run concurrently under the "
             "concurrent action policy. Do not repeat delegated work in the parent. Keep "
             "dependent steps in the parent until their prerequisites are available. Use "
@@ -205,13 +211,14 @@ class AgentTool(BaseTool):
         )
         super().__init__(
             spec=ToolSpec(
-                name="Agent",
+                name="subagent",
                 description=description,
                 parameters=parameters,
                 required=["description", "prompt", "success_criteria"],
                 permissions=ToolPermission(),
                 concurrency_safe=True,
                 supports_background=execution_mode != "foreground",
+                group="subagent",
             )
         )
         self.spec.description = description
@@ -221,7 +228,7 @@ class AgentTool(BaseTool):
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | ToolResult:
-        """Launch one child and project its typed lifecycle as a Tool result."""
+        """Launch one subagent and project its typed lifecycle as a Tool result."""
 
         prompt = str(args.get("prompt", "")).strip()
         if not prompt:
@@ -268,7 +275,7 @@ class AgentTool(BaseTool):
             payload = {
                 "status": "error",
                 "error": (
-                    "Child agents cannot launch another Agent; maximum delegation "
+                    "Subagents cannot launch another Subagent; maximum delegation "
                     f"depth is {self._max_delegate_depth}."
                 ),
             }
@@ -278,7 +285,7 @@ class AgentTool(BaseTool):
         if requested_background and self._execution_mode == "foreground":
             payload = {
                 "status": "error",
-                "error": "Background child agents are disabled in this runtime.",
+                "error": "Background Subagents are disabled in this runtime.",
             }
             return tool_result(payload, status="error")
         background = self._execution_mode == "background" or (
@@ -330,7 +337,7 @@ class AgentTool(BaseTool):
                 },
                 status="error",
             )
-        request = ChildLaunchRequest(
+        request = SubagentLaunchRequest(
             task=prompt,
             description=description,
             name=str(args.get("name", "")).strip(),
@@ -339,10 +346,10 @@ class AgentTool(BaseTool):
             constraints=(parent_task.constraints if parent_task is not None else {}),
             references=(parent_task.references if parent_task is not None else ()),
             permission_context=context.parent_permission_context,
-            profile=self._child_profile,
-            allowed_tool_groups=self._child_allowed_tool_groups,
-            working_directory=self._child_working_directory,
-            budget=self._child_budget,
+            profile=self._subagent_profile,
+            allowed_tool_groups=self._subagent_allowed_tool_groups,
+            working_directory=self._subagent_working_directory,
+            budget=self._subagent_budget,
             parent_task_id=parent_task_id,
             plan_assignment=(
                 raw_assignment.strip()
@@ -361,7 +368,7 @@ class AgentTool(BaseTool):
                 {"status": "error", "error": str(exc)}, status="error"
             )
         payload = self._supervisor.result_payload(result)
-        usage = _child_result_usage(result)
+        usage = _subagent_result_usage(result)
         lifecycle = str(payload.get("status") or "success")
         if lifecycle in {"error", "cancelled", "partial"}:
             return tool_result(
@@ -369,39 +376,39 @@ class AgentTool(BaseTool):
                 status=cast(ToolResultStatus, lifecycle),
                 usage=usage,
             )
-        # A background Child's ``running`` value describes the Child domain;
+        # A background Subagent's ``running`` value describes the Subagent domain;
         # launching it was a successful, terminal Tool call.
         return tool_result(payload, status="success", usage=usage)
 
-    def child_result(self, handle: ChildHandle) -> ChildResult | None:
-        """Return one owned child's current immutable result."""
+    def subagent_result(self, handle: SubagentHandle) -> SubagentResult | None:
+        """Return one owned subagent's current immutable result."""
 
         return self._supervisor.result(handle)
 
-    async def wait_child(
+    async def wait_subagent(
         self,
-        handle: ChildHandle,
+        handle: SubagentHandle,
         *,
         timeout_seconds: float | None = None,
-    ) -> ChildResult | None:
-        """Wait for one child without cancelling it when the wait times out."""
+    ) -> SubagentResult | None:
+        """Wait for one subagent without cancelling it when the wait times out."""
 
         return await self._supervisor.wait(
             handle,
             timeout_seconds=timeout_seconds,
         )
 
-    async def interrupt_child(
+    async def interrupt_subagent(
         self,
-        handle: ChildHandle,
+        handle: SubagentHandle,
         *,
         wait_seconds: float = 5.0,
-    ) -> ChildResult | None:
-        """Cancel one child and wait a bounded time for terminal cleanup."""
+    ) -> SubagentResult | None:
+        """Cancel one subagent and wait a bounded time for terminal cleanup."""
 
         return await self._supervisor.interrupt(handle, wait_seconds=wait_seconds)
 
-    def cancel_child(self, handle: ChildHandle) -> bool:
+    def cancel_subagent(self, handle: SubagentHandle) -> bool:
         """Signal cancellation without blocking the current Tool call."""
 
         return self._supervisor.request_interrupt(handle)
@@ -411,7 +418,7 @@ class AgentTool(BaseTool):
         return self._supervisor.active_count
 
     @property
-    def supervisor(self) -> ChildSupervisor:
+    def supervisor(self) -> SubagentSupervisor:
         """Return the shared Run-owned lifecycle capability for control tools."""
 
         return self._supervisor
@@ -443,7 +450,7 @@ class AgentTool(BaseTool):
         runtime_context: dict[str, Any] | None,
         *,
         agent_type: str,
-    ) -> ChildLaunchContext:
+    ) -> SubagentLaunchContext:
         context = runtime_context or {}
         parent_agent = context.get("agent")
         parent_history = getattr(parent_agent, "history", None)
@@ -475,12 +482,12 @@ class AgentTool(BaseTool):
             raise TypeError(
                 "permission_context must be a ToolPermissionContext, mapping, or None"
             )
-        return ChildLaunchContext(
+        return SubagentLaunchContext(
             parent_run_id=str(
                 context.get("run_id") or context.get("parent_run_id") or ""
             ).strip(),
             delegate_depth=context.get("delegate_depth", 0),
-            max_children=context.get("max_children", 0) or 0,
+            max_subagents=context.get("max_subagents", 0) or 0,
             deadline_monotonic=context.get("deadline_monotonic"),
             budget_ledger=budget_ledger,
             journal=context.get("journal"),

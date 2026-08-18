@@ -991,7 +991,7 @@ class SessionRun:
         if self._task_state is not None:
             # Publish the current Root Task identity for Tools that bind
             # their work to it (the Agent Tool reads these keys for its
-            # Child launch request).
+            # Subagent launch request).
             runtime_context["task_id"] = self._task_state.definition.task_id
             if self._task_state.definition.plan_assignment is not None:
                 runtime_context["plan_assignment"] = (

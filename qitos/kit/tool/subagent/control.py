@@ -1,45 +1,45 @@
-"""Model-facing control tools for one Run-owned ChildSupervisor."""
+"""Model-facing control tools for one Run-owned SubagentSupervisor."""
 
 from __future__ import annotations
 
 import math
 from typing import Any
 
-from ....core.child import ChildHandle, ChildResult, ChildStatus
+from ....core.subagent import SubagentHandle, SubagentResult, SubagentStatus
 from ....core.tool import BaseTool, ToolPermission, ToolSpec
 from ....core.tool_result import ToolResult
-from ...child import ChildSupervisor
+from ...subagent import SubagentSupervisor
 from ..internal.results import tool_result
 
 
-class _ChildControlTool(BaseTool):
+class _SubagentControlTool(BaseTool):
     def __init__(
         self,
         *,
-        supervisor: ChildSupervisor,
+        supervisor: SubagentSupervisor,
         name: str,
         description: str,
         parameters: dict[str, dict[str, Any]],
         required: list[str],
     ) -> None:
-        if not isinstance(supervisor, ChildSupervisor):
-            raise TypeError("supervisor must be a ChildSupervisor")
+        if not isinstance(supervisor, SubagentSupervisor):
+            raise TypeError("supervisor must be a SubagentSupervisor")
         self._supervisor = supervisor
         super().__init__(
             ToolSpec(
                 name=name,
                 description=description,
                 parameters={
-                    "child_id": {
+                    "subagent_id": {
                         "type": "string",
-                        "description": "The child id returned by Agent.",
+                        "description": "The subagent id returned by `subagent`.",
                     },
                     **parameters,
                 },
-                required=["child_id", *required],
+                required=["subagent_id", *required],
                 permissions=ToolPermission(),
                 concurrency_safe=True,
-                group="agent",
+                group="subagent",
             )
         )
         self.spec.description = description
@@ -48,10 +48,10 @@ class _ChildControlTool(BaseTool):
     def _handle(
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None,
-    ) -> ChildHandle:
-        child_id = str(args.get("child_id") or "").strip()
-        if not child_id:
-            raise ValueError("child_id is required")
+    ) -> SubagentHandle:
+        subagent_id = str(args.get("subagent_id") or "").strip()
+        if not subagent_id:
+            raise ValueError("subagent_id is required")
         context = runtime_context or {}
         # ToolBatchExecutor owns ``run_id`` for the frozen turn. Keep the
         # explicit parent id for direct application callers, but never let it
@@ -60,8 +60,8 @@ class _ChildControlTool(BaseTool):
             context.get("run_id") or context.get("parent_run_id") or ""
         ).strip()
         if not parent_run_id:
-            raise ValueError("parent_run_id is required for child ownership")
-        return ChildHandle(child_id=child_id, parent_run_id=parent_run_id)
+            raise ValueError("parent_run_id is required for subagent ownership")
+        return SubagentHandle(subagent_id=subagent_id, parent_run_id=parent_run_id)
 
     @staticmethod
     def _timeout(
@@ -84,31 +84,31 @@ class _ChildControlTool(BaseTool):
         return timeout
 
     @staticmethod
-    def _projection(result: ChildResult) -> dict[str, Any]:
-        payload = ChildSupervisor.result_payload(result)
+    def _projection(result: SubagentResult) -> dict[str, Any]:
+        payload = SubagentSupervisor.result_payload(result)
         payload["status"] = "success"
         return payload
 
     @staticmethod
-    def _unknown(handle: ChildHandle) -> dict[str, Any]:
+    def _unknown(handle: SubagentHandle) -> dict[str, Any]:
         return {
             "status": "success",
-            "child_status": ChildStatus.UNKNOWN.value,
+            "subagent_status": SubagentStatus.UNKNOWN.value,
             "ready": True,
             "handle": handle.to_dict(),
-            "child_id": handle.child_id,
-            "output": "No child with this handle belongs to the current Run.",
+            "subagent_id": handle.subagent_id,
+            "output": "No subagent with this handle belongs to the current Run.",
         }
 
 
-class ChildStatusTool(_ChildControlTool):
-    """Query one Child without changing its lifecycle."""
+class SubagentStatusTool(_SubagentControlTool):
+    """Query one Subagent without changing its lifecycle."""
 
-    def __init__(self, supervisor: ChildSupervisor) -> None:
+    def __init__(self, supervisor: SubagentSupervisor) -> None:
         super().__init__(
             supervisor=supervisor,
-            name="child_status",
-            description="Return the current typed status and conclusion of one Child.",
+            name="subagent_status",
+            description="Return the current typed status and conclusion of one Subagent.",
             parameters={},
             required=[],
         )
@@ -128,16 +128,16 @@ class ChildStatusTool(_ChildControlTool):
         return self._unknown(handle) if result is None else self._projection(result)
 
 
-class ChildWaitTool(_ChildControlTool):
-    """Wait a bounded time for one Child without cancelling it on timeout."""
+class SubagentWaitTool(_SubagentControlTool):
+    """Wait a bounded time for one Subagent without cancelling it on timeout."""
 
-    def __init__(self, supervisor: ChildSupervisor) -> None:
+    def __init__(self, supervisor: SubagentSupervisor) -> None:
         super().__init__(
             supervisor=supervisor,
-            name="child_wait",
+            name="subagent_wait",
             description=(
-                "Wait for one Child to reach terminal state. A wait timeout leaves the "
-                "Child running and returns its current status."
+                "Wait for one Subagent to reach terminal state. A wait timeout leaves the "
+                "Subagent running and returns its current status."
             ),
             parameters={
                 "timeout_seconds": {
@@ -172,21 +172,21 @@ class ChildWaitTool(_ChildControlTool):
         return self._unknown(handle) if result is None else self._projection(result)
 
 
-class ChildMessageTool(_ChildControlTool):
-    """Deliver a parent message through an active Child Engine mailbox."""
+class SubagentMessageTool(_SubagentControlTool):
+    """Deliver a parent message through an active Subagent Engine mailbox."""
 
-    def __init__(self, supervisor: ChildSupervisor) -> None:
+    def __init__(self, supervisor: SubagentSupervisor) -> None:
         super().__init__(
             supervisor=supervisor,
-            name="child_message",
+            name="subagent_message",
             description=(
-                "Send context or follow-up instructions to an active Child. The Child "
+                "Send context or follow-up instructions to an active Subagent. The Subagent "
                 "accepts the message at its next turn safe point."
             ),
             parameters={
                 "content": {
                     "type": "string",
-                    "description": "The new context or instruction for the Child.",
+                    "description": "The new context or instruction for the Subagent.",
                 },
                 "timeout_seconds": {
                     "type": "number",
@@ -225,21 +225,21 @@ class ChildMessageTool(_ChildControlTool):
         payload["accepted"] = accepted
         if not accepted and result is not None and result.ready:
             payload["message"] = (
-                "Terminal children cannot accept messages; launch a new Child for "
+                "Terminal subagents cannot accept messages; launch a new Subagent for "
                 "follow-up work."
             )
         return payload
 
 
-class ChildInterruptTool(_ChildControlTool):
-    """Interrupt one Child and wait for bounded terminal cleanup."""
+class SubagentInterruptTool(_SubagentControlTool):
+    """Interrupt one Subagent and wait for bounded terminal cleanup."""
 
-    def __init__(self, supervisor: ChildSupervisor) -> None:
+    def __init__(self, supervisor: SubagentSupervisor) -> None:
         super().__init__(
             supervisor=supervisor,
-            name="child_interrupt",
+            name="subagent_interrupt",
             description=(
-                "Request immediate cancellation of one active Child and wait for its "
+                "Request immediate cancellation of one active Subagent and wait for its "
                 "cleanup. Terminal and unknown handles are stable no-ops."
             ),
             parameters={
@@ -275,18 +275,18 @@ class ChildInterruptTool(_ChildControlTool):
         return self._unknown(handle) if result is None else self._projection(result)
 
 
-class ChildControlToolSet:
-    """Expose status, wait, message, and interrupt over one ChildSupervisor."""
+class SubagentControlToolSet:
+    """Expose status, wait, message, and interrupt over one SubagentSupervisor."""
 
-    name = "child"
+    name = "subagent"
     version = "1"
 
-    def __init__(self, supervisor: ChildSupervisor) -> None:
+    def __init__(self, supervisor: SubagentSupervisor) -> None:
         self._tools = [
-            ChildStatusTool(supervisor),
-            ChildWaitTool(supervisor),
-            ChildMessageTool(supervisor),
-            ChildInterruptTool(supervisor),
+            SubagentStatusTool(supervisor),
+            SubagentWaitTool(supervisor),
+            SubagentMessageTool(supervisor),
+            SubagentInterruptTool(supervisor),
         ]
 
     def tools(self) -> list[BaseTool]:
@@ -294,9 +294,9 @@ class ChildControlToolSet:
 
 
 __all__ = [
-    "ChildControlToolSet",
-    "ChildInterruptTool",
-    "ChildMessageTool",
-    "ChildStatusTool",
-    "ChildWaitTool",
+    "SubagentControlToolSet",
+    "SubagentInterruptTool",
+    "SubagentMessageTool",
+    "SubagentStatusTool",
+    "SubagentWaitTool",
 ]

@@ -8,7 +8,7 @@ façade, retired-runtime deletion slices, S1 parity items, the authoritative
 Session/Harness (S2), goal-bearing Task (S3a), and dependency-aware Plan (S3b) are
 implemented on the migration branch. The branch has passed its independent pytest,
 flake8 and mypy gates for S1-S3. Cross-repository integration hardening has since added
-Child product hooks, authorization/task binding, committed transaction queries and a
+Subagent product hooks, authorization/task binding, committed transaction queries and a
 trace serialization fix; the branch has passed a fresh full pytest, flake8 and mypy gate
 and now awaits review and merge.
 
@@ -77,7 +77,7 @@ S1 closes the remaining parity items:
   nearest-up-then-down clamping, and a per-turn `NextTurnUpdate` override;
 - typed `ToolResult.usage` (`ModelUsage`) and `ToolResult.added_tool_names`,
   carried onto `ToolResultMessage` and through the durable codecs; the Agent
-  (Child) Tool moves its Child token/cost accounting out of the untyped output
+  (Subagent) Tool moves its Subagent token/cost accounting out of the untyped output
   payload into these fields;
 - restore of initial façade messages and Tool activation is part of S2, where
   the authoritative Session/Harness path exists.
@@ -85,7 +85,7 @@ S1 closes the remaining parity items:
 ### 2.2 Replace loop and façade
 
 Done on `feat/pi-aligned-agent-loop`. The minimal loop and small `Agent`
-façade are the only execution path: C2 (commit `e28b23e`) moved child agents
+façade are the only execution path: C2 (commit `e28b23e`) moved subagents
 onto the façade and removed the delegate/fanout tools, kit handoff tool
 chain, shared memory and repl; C3 (commit `9ad277e`) removed the zoo
 submodule, demo, recipes, benchmark execution adapters and the Engine-era
@@ -129,9 +129,9 @@ concretely:
   `qitos.kit.session.compaction`, and the context swap seals Provider
   continuation through `Agent.set_transcript` plus the loop's
   `continuation_floor`.
-- (done in S2b) Unconsumed background Child completion inputs re-project
+- (done in S2b) Unconsumed background Subagent completion inputs re-project
   from own-run posted facts exactly once (the default root
-  `post_runtime_event` and `AgentChildEngine` both append
+  `post_runtime_event` and `AgentSubagentEngine` both append
   `runtime_input.consumed` once the steered message is covered by a
   `step.committed`); inherited fork facts and foreground results are never
   redelivered.
@@ -165,32 +165,32 @@ S3a (Task), done on `feat/pi-aligned-agent-loop`:
   (`resolve_resources`, `validate_structured`) and free-form metadata from
   the canonical Task; migrated `RepoEnv` (Task coupling and
   `required_missing` probing removed), the evaluation context/DSL exposure
-  (new `task.to_dict()` shape) and the Child budget consumers.
+  (new `task.to_dict()` shape) and the Subagent budget consumers.
 - (done) Root Task commits before `input.accepted`; one unfinished Root Task
   per Session lineage; blocked/terminal semantics per architecture §5
   (`unblock_task` is the only blocked → active path; run termination never
   auto-transitions the Task; `start_follow_up` starts a new Task explicitly
-  on a terminal-task lineage); Child launch commits the narrowed Child Task
-  into the child journal before its `input.accepted`. Remainder for S3b:
+  on a terminal-task lineage); Subagent launch commits the narrowed Subagent Task
+  into the Subagent journal before its `input.accepted`. Remainder for S3b:
   binding `plan_assignment` to a real parent Plan node and parent-side
-  narrowing enforcement of the Child Task.
+  narrowing enforcement of the Subagent Task.
 
 S3b (Plan), done on `feat/pi-aligned-agent-loop`:
 
 - (done) Replaced `core/work_plan.py` in place with the dependency-aware graph:
   stable node ids, dependencies, owners, explicit state, derived readiness,
   per-owner in-progress limits, cycle/reference/transition validation.
-- (done) Kept one optional Plan contract for Root and Child: Root normally uses the full
-  dependency/owner graph; a simple Child may have no Plan or a flat graph whose
-  deterministic projection is a TODO. Parent and Child Plans never merge.
+- (done) Kept one optional Plan contract for Root and Subagent: Root normally uses the full
+  dependency/owner graph; a simple Subagent may have no Plan or a flat graph whose
+  deterministic projection is a TODO. Parent and Subagent Plans never merge.
 - (done) Every accepted update commits one Task-bound `plan.updated` record; recovery
   replays each Task's latest committed update through the lineage, so terminal
   follow-up starts without the previous Task's Plan; TODO Markdown is the deterministic
   topological projection.
-- (done) Reworked the `update_plan` tool onto the graph contract and bound Child launch
+- (done) Reworked the `update_plan` tool onto the graph contract and bound Subagent launch
   to a parent Plan assignment.
 
-Done when Task, Session, Run, Plan and Child identities stay distinct across
+Done when Task, Session, Run, Plan and Subagent identities stay distinct across
 recovery, and no TaskV2/Goal mirror or compatibility Plan remains.
 
 ### 2.5 Harden application composition boundary
@@ -199,9 +199,9 @@ Done on the two feature branches, pending final gates and cross-repository landi
 
 - PentestAgent composes the façade directly and keeps Engagement, Scope, investigation
   state, plugin system and completion policy outside QitOS.
-- Root and Child use the same Agent implementation and product hooks. Child launch
+- Root and Subagent use the same Agent implementation and product hooks. Subagent launch
   carries explicit success criteria, inherited Task constraints/references and frozen
-  Permission; the built-in factory persists them on the Child Task before model work.
+  Permission; the built-in factory persists them on the Subagent Task before model work.
 - A typed conclusion factory runs before invocation cleanup, allowing the application to
   project committed evidence, resource, failure, unknown and next-step facts without
   copying a transcript.
@@ -228,7 +228,7 @@ Delete final callers, packages, exports, dependencies, tests, examples and docs 
 - checkpoint as a second persistence owner;
 - the Engine-internal handoff policy and its event names;
 - Engine critic, search, branch selector, text parser and prompt-injected protocol;
-- planning/workflow runtimes that compete with Task + Plan + Child;
+- planning/workflow runtimes that compete with Task + Plan + Subagent;
 - unconsumed environment, memory, parser, ToolSet, renderer and demo surfaces;
 - sync bridges below the outermost application/CLI boundary.
 
@@ -274,7 +274,7 @@ primary reference; where QitOS deliberately deviates, the reason is stated.
   current Run (never `journal.inherited` facts) and treats an input as
   consumed only when a `runtime_input.consumed` record exists; consumption
   commits when the steered message enters the committed transcript.
-  Foreground Child results are delivered by their ToolResult and are never
+  Foreground Subagent results are delivered by their ToolResult and are never
   re-projected.
 - D8 — Engine-era payload readers are deleted, not tolerated: the run
   catalog, the budget ledger and the transaction decoders fail closed on old
@@ -291,7 +291,7 @@ primary reference; where QitOS deliberately deviates, the reason is stated.
 Each slice needs focused behavior tests, followed by QitOS's independent pytest,
 flake8 and mypy checks. The final matrix covers terminal ToolResult pairing,
 cancellation, absolute deadline, ordered concurrency, queue safe points, Task/Plan
-transitions, compact/resume/fork, corruption, Child cleanup and no leaked tasks.
+transitions, compact/resume/fork, corruption, Subagent cleanup and no leaked tasks.
 
 README, public shipped-behavior docs and Changelog change in the same slice. A
 PentestAgent quality gate does not validate QitOS.

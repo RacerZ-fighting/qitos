@@ -224,19 +224,19 @@ Unknown, uncommitted, or child-renamed references return `None`. Only the loop's
 record schema is decodable; records written by the retired Engine taxonomy fail
 closed.
 
-## Child and mailbox records
+## Subagent and mailbox records
 
-Child supervision writes `child.started` before constructing the child Agent and
-`child.terminal` before parent notification. Recovery rebuilds a started child from
+Subagent supervision writes `subagent.started` before constructing the Subagent and
+`subagent.terminal` before parent notification. Recovery rebuilds a started Subagent from
 its own loop journal when that journal holds a durable run terminal record, and
-closes it as `interrupted` otherwise; it never reattaches or replays a child Agent.
+closes it as `interrupted` otherwise; it never reattaches or replays a Subagent.
 A terminal created during recovery is persisted before the supervisor reports
 recovered results. Forks preserve inherited facts for audit but receive no control
 authority over parent handles.
 
-Parent messages to an active child are journaled as `runtime_input.posted` before
-the message enters the child run's steering queue, so mailbox acceptance is
-journal-recoverable and the message becomes visible at the child's next turn safe
-point. Once the steered message enters the committed transcript, the child engine
+Parent messages to an active Subagent are journaled as `runtime_input.posted` before
+the message enters the Subagent run's steering queue, so mailbox acceptance is
+journal-recoverable and the message becomes visible at the Subagent's next turn safe
+point. Once the steered message enters the committed transcript, the Subagent engine
 appends the idempotent `runtime_input.consumed` record; a run that ends without
 injecting the message consumes nothing.

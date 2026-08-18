@@ -13,7 +13,7 @@ from qitos.core.message import ToolCall
 from qitos.core.tool import tool
 from qitos.core.tool_executor import ToolBatchExecutor, ToolExecutionConfig
 from qitos.core.tool_registry import ToolRegistry
-from qitos.kit.tool.agent import AgentTool
+from qitos.kit.tool.subagent import SubagentTool
 from qitos.kit.tool.internal.coding_impl import CodingToolSet
 from qitos.kit.tool.internal.delegating import DelegatingTool
 from qitos.kit.tool.notebook import InsertNotebookCell
@@ -74,14 +74,14 @@ async def test_plain_mapping_status_remains_success_through_delegating_tool() ->
     assert end.is_error is False
 
 
-def _unexpected_child_factory(*args: object, **kwargs: object) -> None:
+def _unexpected_subagent_factory(*args: object, **kwargs: object) -> None:
     _ = args, kwargs
-    raise AssertionError("invalid Agent input must not launch a Child")
+    raise AssertionError("invalid Agent input must not launch a Subagent")
 
 
 @pytest.mark.asyncio
 async def test_agent_expected_rejection_is_typed_error_and_error_event() -> None:
-    agent = AgentTool(invocation_factory=_unexpected_child_factory)
+    agent = SubagentTool(invocation_factory=_unexpected_subagent_factory)
 
     result, end = await _execute(
         agent,

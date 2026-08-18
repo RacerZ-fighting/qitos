@@ -1,4 +1,4 @@
-"""Structured async supervision for independently stateful child Agent runs."""
+"""Structured async supervision for independently stateful Subagent runs."""
 
 from __future__ import annotations
 
@@ -12,19 +12,19 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from ...core.budget import BudgetLedger, BudgetSnapshot
-from ...core.child import (
+from ...core.subagent import (
     AgentConclusion,
-    ChildEngine,
-    ChildHandle,
-    ChildInvocation,
-    ChildInvocationCancelled,
-    ChildLaunchContext,
-    ChildLaunchRequest,
-    ChildPersistenceError,
-    ChildResult,
-    ChildRunLimitError,
-    ChildRuntimeContext,
-    ChildStatus,
+    SubagentEngine,
+    SubagentHandle,
+    SubagentInvocation,
+    SubagentInvocationCancelled,
+    SubagentLaunchContext,
+    SubagentLaunchRequest,
+    SubagentPersistenceError,
+    SubagentResult,
+    SubagentRunLimitError,
+    SubagentRuntimeContext,
+    SubagentStatus,
 )
 from ...core.journal import (
     JournalAppendCancelled,
@@ -39,32 +39,37 @@ from ...core.model_response import ModelPricing
 from ...core.plan import PlanContractError
 from ...core.runtime_input import (
     RuntimeInput,
-    child_result_payload,
-    child_terminal_runtime_input,
+    subagent_result_payload,
+    subagent_terminal_runtime_input,
 )
 from ..journal import recover_run_outcome, recover_session
 from ..plan import assign_plan_node, release_plan_node
 from .agent_engine import (
-    child_budget_stop_reason,
-    child_final_text,
-    child_run_stats,
-    child_stop_reason,
+    subagent_budget_stop_reason,
+    subagent_final_text,
+    subagent_run_stats,
+    subagent_stop_reason,
 )
-from .limits import ChildRunLimiter, _ChildRunLease
+from .limits import SubagentRunLimiter, _SubagentRunLease
 
 _logger = logging.getLogger(__name__)
 
-ChildInvocationFactory = Callable[
-    [ChildLaunchRequest, ChildRuntimeContext], Awaitable[ChildInvocation]
+SubagentInvocationFactory = Callable[
+    [SubagentLaunchRequest, SubagentRuntimeContext], Awaitable[SubagentInvocation]
 ]
-ChildExecutionScope = Callable[
-    [ChildRuntimeContext],
+SubagentExecutionScope = Callable[
+    [SubagentRuntimeContext],
     AbstractContextManager[Any] | AbstractAsyncContextManager[Any],
 ]
-ChildJournalFactory = Callable[[], SessionJournal]
+SubagentJournalFactory = Callable[[], SessionJournal]
 
-_PARTIAL_RESULT_MAX_ITEMS = 12
-_PARTIAL_RESULT_MAX_CHARS = 16_000
+_TOOL_RESULT_PREVIEW_MAX_ITEMS = 12
+_TOOL_RESULT_PREVIEW_MAX_CHARS = 16_000
+
+_MISSING_CONCLUSION_ERROR = (
+    "Subagent ended without a final answer; its single same-context conclusion "
+    "follow-up was exhausted or unavailable within the existing limits."
+)
 
 
 def _caused_by_file_not_found(error: BaseException) -> bool:
@@ -79,73 +84,73 @@ def _caused_by_file_not_found(error: BaseException) -> bool:
 
 
 @dataclass(slots=True)
-class _OwnedChild:
-    handle: ChildHandle
-    child_run_id: str
-    request: ChildLaunchRequest
+class _OwnedSubagent:
+    handle: SubagentHandle
+    subagent_run_id: str
+    request: SubagentLaunchRequest
     background: bool
-    launch_context: ChildLaunchContext | None
+    launch_context: SubagentLaunchContext | None
     cancel_event: asyncio.Event
     terminal_event: asyncio.Event
     engine_ready: asyncio.Event
     journal: SessionJournal | None = None
-    task: asyncio.Task[ChildResult] | None = None
-    engine: ChildEngine | None = None
-    result: ChildResult | None = None
-    run_lease: _ChildRunLease | None = None
+    task: asyncio.Task[SubagentResult] | None = None
+    engine: SubagentEngine | None = None
+    result: SubagentResult | None = None
+    run_lease: _SubagentRunLease | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class _RecoveredChildStart:
-    request: ChildLaunchRequest
-    child_run_id: str
+class _RecoveredSubagentStart:
+    request: SubagentLaunchRequest
+    subagent_run_id: str
     background: bool
 
 
-class ChildSupervisor:
-    """Own child Engines, Tasks, terminal results, and parent delivery for one Run."""
+class SubagentSupervisor:
+    """Own subagent Engines, Tasks, terminal results, and parent delivery for one Run."""
 
     def __init__(
         self,
         *,
-        invocation_factory: ChildInvocationFactory,
-        execution_scope: ChildExecutionScope | None = None,
+        invocation_factory: SubagentInvocationFactory,
+        execution_scope: SubagentExecutionScope | None = None,
         max_concurrency: int = 4,
-        run_limiter: ChildRunLimiter | None = None,
-        child_journal_factory: ChildJournalFactory | None = None,
+        run_limiter: SubagentRunLimiter | None = None,
+        subagent_journal_factory: SubagentJournalFactory | None = None,
     ) -> None:
         if max_concurrency <= 0:
             raise ValueError("max_concurrency must be positive")
         self._invocation_factory = invocation_factory
         self._execution_scope = execution_scope
         self._max_concurrency = max_concurrency
-        if run_limiter is not None and not isinstance(run_limiter, ChildRunLimiter):
-            raise TypeError("run_limiter must be a ChildRunLimiter or None")
+        if run_limiter is not None and not isinstance(run_limiter, SubagentRunLimiter):
+            raise TypeError("run_limiter must be a SubagentRunLimiter or None")
         self._run_limiter = run_limiter
-        if child_journal_factory is not None and not callable(child_journal_factory):
-            raise TypeError("child_journal_factory must be callable or None")
-        self._child_journal_factory = child_journal_factory
+        if subagent_journal_factory is not None and not callable(subagent_journal_factory):
+            raise TypeError("subagent_journal_factory must be callable or None")
+        self._subagent_journal_factory = subagent_journal_factory
         self._limit = asyncio.Semaphore(max_concurrency)
         self._admission_lock = asyncio.Lock()
-        self._children_started = 0
+        self._subagents_started = 0
         self._closed = False
-        self._children: dict[ChildHandle, _OwnedChild] = {}
+        self._subagents: dict[SubagentHandle, _OwnedSubagent] = {}
         self._recovered_runs: set[str] = set()
         self._lifecycle_locks: dict[str, asyncio.Lock] = {}
 
     async def launch(
         self,
-        request: ChildLaunchRequest,
-        context: ChildLaunchContext,
+        request: SubagentLaunchRequest,
+        context: SubagentLaunchContext,
         *,
         background: bool,
-    ) -> ChildResult:
-        """Launch one fresh child, returning a running or terminal projection."""
+    ) -> SubagentResult:
+        """Launch one fresh subagent, returning a running or terminal projection."""
 
-        if not isinstance(request, ChildLaunchRequest):
-            raise TypeError("request must be a ChildLaunchRequest")
-        if not isinstance(context, ChildLaunchContext):
-            raise TypeError("context must be a ChildLaunchContext")
+        if not isinstance(request, SubagentLaunchRequest):
+            raise TypeError("request must be a SubagentLaunchRequest")
+        if not isinstance(context, SubagentLaunchContext):
+            raise TypeError("context must be a SubagentLaunchContext")
         normalized_parent = context.parent_run_id
         journal = context.journal
         lifecycle_lock = await self._lifecycle_lock(normalized_parent)
@@ -158,23 +163,23 @@ class ChildSupervisor:
             try:
                 async with self._admission_lock:
                     if self._closed:
-                        raise RuntimeError("child supervisor is closed")
+                        raise RuntimeError("subagent supervisor is closed")
                     if (
-                        context.max_children > 0
-                        and self._children_started >= context.max_children
+                        context.max_subagents > 0
+                        and self._subagents_started >= context.max_subagents
                     ):
                         raise RuntimeError(
-                            "Run child-agent budget exhausted: "
-                            f"max_children={context.max_children}."
+                            "Run Subagent budget exhausted: "
+                            f"max_subagents={context.max_subagents}."
                         )
-                    self._children_started += 1
-                    handle = ChildHandle(
-                        child_id=f"child-{uuid.uuid4().hex[:12]}",
+                    self._subagents_started += 1
+                    handle = SubagentHandle(
+                        subagent_id=f"subagent-{uuid.uuid4().hex[:12]}",
                         parent_run_id=normalized_parent,
                     )
-                    owned = _OwnedChild(
+                    owned = _OwnedSubagent(
                         handle=handle,
-                        child_run_id=f"run_{uuid.uuid4().hex[:12]}",
+                        subagent_run_id=f"run_{uuid.uuid4().hex[:12]}",
                         request=request,
                         background=background,
                         launch_context=context,
@@ -184,7 +189,7 @@ class ChildSupervisor:
                         journal=journal,
                         run_lease=run_lease,
                     )
-                    self._children[handle] = owned
+                    self._subagents[handle] = owned
                     owned.task = asyncio.current_task()
             except BaseException:
                 if run_lease is not None:
@@ -208,9 +213,9 @@ class ChildSupervisor:
                         commit_error.commit_state is JournalCommitState.COMMITTED
                     ),
                 )
-                raise ChildPersistenceError(
+                raise SubagentPersistenceError(
                     "failed to persist the parent Plan assignment; "
-                    "child was not admitted"
+                    "subagent was not admitted"
                 ) from commit_error
             except BaseException:
                 await self._discard_unstarted(owned, release_assignment=False)
@@ -231,7 +236,7 @@ class ChildSupervisor:
                         run_lease.commit()
                     cancelled_result = self._cancelled_result(
                         owned,
-                        error="Child launch was cancelled after durable admission.",
+                        error="Subagent launch was cancelled after durable admission.",
                     )
                     try:
                         await self._store_terminal(owned, cancelled_result)
@@ -260,8 +265,8 @@ class ChildSupervisor:
                         owned,
                         cause=commit_error,
                     )
-                raise ChildPersistenceError(
-                    "failed to persist child.started; child was not executed"
+                raise SubagentPersistenceError(
+                    "failed to persist subagent.started; subagent was not executed"
                 ) from commit_error
             except BaseException:
                 await self._discard_unstarted(
@@ -278,7 +283,7 @@ class ChildSupervisor:
                 elif background:
                     owned.task = asyncio.create_task(
                         self._supervise_background(owned),
-                        name=f"qitos-{handle.child_id}",
+                        name=f"qitos-{handle.subagent_id}",
                     )
                     return self._current_result(owned)
                 else:
@@ -286,7 +291,7 @@ class ChildSupervisor:
             if cancelled:
                 result = self._cancelled_result(
                     owned,
-                    error="Child supervisor closed before child start.",
+                    error="Subagent supervisor closed before subagent start.",
                 )
                 await self._store_terminal(owned, result)
                 owned.task = None
@@ -309,19 +314,19 @@ class ChildSupervisor:
             owned.launch_context = None
             await self._release_run_lease(owned)
 
-    def result(self, handle: ChildHandle) -> ChildResult | None:
-        """Return one owned child's immutable current state."""
+    def result(self, handle: SubagentHandle) -> SubagentResult | None:
+        """Return one owned subagent's immutable current state."""
 
         owned = self._owned(handle)
         return None if owned is None else self._current_result(owned)
 
     async def wait(
         self,
-        handle: ChildHandle,
+        handle: SubagentHandle,
         *,
         timeout_seconds: float | None = None,
-    ) -> ChildResult | None:
-        """Wait for terminal state without cancelling the child on timeout."""
+    ) -> SubagentResult | None:
+        """Wait for terminal state without cancelling the subagent on timeout."""
 
         owned = self._owned(handle)
         if owned is None:
@@ -349,8 +354,8 @@ class ChildSupervisor:
         parent_run_id: str,
         journal: SessionJournal,
         budget_ledger: BudgetLedger | None = None,
-    ) -> tuple[ChildResult, ...]:
-        """Recover terminal facts and close interrupted children without replay."""
+    ) -> tuple[SubagentResult, ...]:
+        """Recover terminal facts and close interrupted subagents without replay."""
 
         normalized_parent = str(parent_run_id or "").strip()
         if not normalized_parent:
@@ -368,10 +373,10 @@ class ChildSupervisor:
                     owned.handle.parent_run_id == normalized_parent
                     and owned.task is not None
                     and not owned.task.done()
-                    for owned in self._children.values()
+                    for owned in self._subagents.values()
                 ):
                     raise RuntimeError(
-                        "cannot recover Child state while owned tasks are active"
+                        "cannot recover Subagent state while owned tasks are active"
                     )
             return await self._recover_once(
                 parent_run_id=normalized_parent,
@@ -385,7 +390,7 @@ class ChildSupervisor:
         parent_run_id: str,
         journal: SessionJournal,
         budget_ledger: BudgetLedger | None,
-    ) -> tuple[ChildResult, ...]:
+    ) -> tuple[SubagentResult, ...]:
         """Recover one parent while its lifecycle admission is serialized."""
 
         records = await journal.replay()
@@ -395,43 +400,43 @@ class ChildSupervisor:
                 parent_run_id=parent_run_id,
             )
         except (TypeError, ValueError) as exc:
-            raise ChildPersistenceError(
-                "child lifecycle journal records are invalid"
+            raise SubagentPersistenceError(
+                "subagent lifecycle journal records are invalid"
             ) from exc
 
-        launch_ids = {f"{handle.parent_run_id}:{handle.child_id}" for handle in started}
-        if self._child_journal_factory is not None:
-            child_run_ids: list[str] = []
+        launch_ids = {f"{handle.parent_run_id}:{handle.subagent_id}" for handle in started}
+        if self._subagent_journal_factory is not None:
+            subagent_run_ids: list[str] = []
             for handle, start in started.items():
                 terminal_result = terminal.get(handle)
                 resolved_run_id = (
-                    terminal_result.child_run_id
-                    if terminal_result is not None and terminal_result.child_run_id
-                    else start.child_run_id
+                    terminal_result.subagent_run_id
+                    if terminal_result is not None and terminal_result.subagent_run_id
+                    else start.subagent_run_id
                 )
                 if resolved_run_id:
-                    child_run_ids.append(resolved_run_id)
+                    subagent_run_ids.append(resolved_run_id)
             try:
                 launch_ids.update(
                     await self._descendant_launch_ids(
                         parent_run_id=parent_run_id,
-                        child_run_ids=tuple(child_run_ids),
+                        subagent_run_ids=tuple(subagent_run_ids),
                     )
                 )
             except asyncio.CancelledError:
                 raise
-            except ChildPersistenceError:
+            except SubagentPersistenceError:
                 raise
             except Exception as exc:
-                raise ChildPersistenceError(
-                    "failed to restore descendant Child launch history"
+                raise SubagentPersistenceError(
+                    "failed to restore descendant Subagent launch history"
                 ) from exc
 
         recovered = {
             handle: (
                 result
-                if result.child_run_id
-                else replace(result, child_run_id=started[handle].child_run_id)
+                if result.subagent_run_id
+                else replace(result, subagent_run_id=started[handle].subagent_run_id)
             )
             for handle, result in terminal.items()
         }
@@ -442,40 +447,40 @@ class ChildSupervisor:
                 handle,
                 start,
                 root_budget=(
-                    budget_ledger.snapshot_after_origin(start.child_run_id)
-                    if budget_ledger is not None and start.child_run_id
+                    budget_ledger.snapshot_after_origin(start.subagent_run_id)
+                    if budget_ledger is not None and start.subagent_run_id
                     else None
                 ),
             )
             try:
                 await journal.append(
-                    JournalRecordType.CHILD_TERMINAL,
+                    JournalRecordType.SUBAGENT_TERMINAL,
                     result.to_dict(),
                     record_id=self._terminal_record_id(handle),
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                raise ChildPersistenceError(
-                    "failed to persist interrupted child terminal record"
+                raise SubagentPersistenceError(
+                    "failed to persist interrupted subagent terminal record"
                 ) from exc
             recovered[handle] = result
         if self._run_limiter is not None:
             try:
                 await self._run_limiter.restore_started(launch_ids)
-            except ChildRunLimitError as exc:
-                raise ChildPersistenceError(
-                    "restored Child launch history exceeds the configured Run limit"
+            except SubagentRunLimitError as exc:
+                raise SubagentPersistenceError(
+                    "restored Subagent launch history exceeds the configured Run limit"
                 ) from exc
 
         async with self._admission_lock:
             for handle, result in recovered.items():
-                owned = self._children.get(handle)
+                owned = self._subagents.get(handle)
                 if owned is None:
                     start = started[handle]
-                    owned = _OwnedChild(
+                    owned = _OwnedSubagent(
                         handle=handle,
-                        child_run_id=result.child_run_id or start.child_run_id,
+                        subagent_run_id=result.subagent_run_id or start.subagent_run_id,
                         request=result.request,
                         background=start.background,
                         launch_context=None,
@@ -483,19 +488,19 @@ class ChildSupervisor:
                         terminal_event=asyncio.Event(),
                         engine_ready=asyncio.Event(),
                     )
-                    self._children[handle] = owned
+                    self._subagents[handle] = owned
                 self._set_terminal(owned, result)
-            self._children_started = max(self._children_started, len(started))
+            self._subagents_started = max(self._subagents_started, len(started))
             self._recovered_runs.add(parent_run_id)
         return self._results_for_parent(parent_run_id)
 
     async def interrupt(
         self,
-        handle: ChildHandle,
+        handle: SubagentHandle,
         *,
         wait_seconds: float = 5.0,
-    ) -> ChildResult | None:
-        """Cancel one active child and wait a bounded time for its cleanup."""
+    ) -> SubagentResult | None:
+        """Cancel one active subagent and wait a bounded time for its cleanup."""
 
         if wait_seconds < 0:
             raise ValueError("wait_seconds must be non-negative")
@@ -522,12 +527,12 @@ class ChildSupervisor:
 
     async def message(
         self,
-        handle: ChildHandle,
+        handle: SubagentHandle,
         content: str,
         *,
         timeout_seconds: float | None = None,
-    ) -> tuple[bool, ChildResult | None]:
-        """Post one parent message to an active Child's durable mailbox."""
+    ) -> tuple[bool, SubagentResult | None]:
+        """Post one parent message to an active Subagent's durable mailbox."""
 
         text = str(content or "").strip()
         if not text:
@@ -561,18 +566,18 @@ class ChildSupervisor:
             return False, current
         post_runtime_event = getattr(owned.engine, "apost_runtime_event", None)
         if not callable(post_runtime_event):
-            raise RuntimeError("child Engine does not expose an async runtime mailbox")
-        child_run_id = self._child_run_id(owned)
-        if not child_run_id:
+            raise RuntimeError("subagent Engine does not expose an async runtime mailbox")
+        subagent_run_id = self._subagent_run_id(owned)
+        if not subagent_run_id:
             return False, current
         event = RuntimeInput(
-            event_id=f"{owned.handle.child_id}:parent:{uuid.uuid4().hex}",
+            event_id=f"{owned.handle.subagent_id}:parent:{uuid.uuid4().hex}",
             kind="agent.parent.message",
-            correlation_id=owned.handle.child_id,
+            correlation_id=owned.handle.subagent_id,
             source="qitos.parent",
             payload={"content": text},
         )
-        post = post_runtime_event(event, run_id=child_run_id)
+        post = post_runtime_event(event, run_id=subagent_run_id)
         try:
             if deadline is None:
                 accepted = await post
@@ -585,19 +590,19 @@ class ChildSupervisor:
             return False, self._current_result(owned)
         return bool(accepted), self._current_result(owned)
 
-    def request_interrupt(self, handle: ChildHandle) -> bool:
-        """Signal one active child without waiting for terminal cleanup."""
+    def request_interrupt(self, handle: SubagentHandle) -> bool:
+        """Signal one active subagent without waiting for terminal cleanup."""
 
         owned = self._owned(handle)
         if owned is None or self._current_result(owned).ready:
             return False
         if owned.cancel_event.is_set():
             return True
-        owned.result = ChildResult(
+        owned.result = SubagentResult(
             handle=owned.handle,
             request=owned.request,
-            status=ChildStatus.CANCEL_REQUESTED,
-            child_run_id=self._child_run_id(owned),
+            status=SubagentStatus.CANCEL_REQUESTED,
+            subagent_run_id=self._subagent_run_id(owned),
         )
         owned.cancel_event.set()
         self._cancel_engine(owned)
@@ -607,36 +612,36 @@ class ChildSupervisor:
 
     @property
     def active_count(self) -> int:
-        """Return children whose execution has not reached terminal state."""
+        """Return subagents whose execution has not reached terminal state."""
 
         return sum(
             1
-            for owned in self._children.values()
+            for owned in self._subagents.values()
             if not self._current_result(owned).ready
         )
 
     def snapshot_events(self) -> list[RuntimeInput]:
-        """Project bounded completed Tool evidence from active child Engines."""
+        """Project bounded completed Tool evidence from active subagent Engines."""
 
         events: list[RuntimeInput] = []
-        for owned in self._children.values():
+        for owned in self._subagents.values():
             if self._current_result(owned).ready or owned.engine is None:
                 continue
             events.append(
                 RuntimeInput(
-                    event_id=f"{owned.handle.child_id}:conclude-snapshot",
-                    kind="agent.child.snapshot",
-                    correlation_id=owned.handle.child_id,
+                    event_id=f"{owned.handle.subagent_id}:conclude-snapshot",
+                    kind="agent.subagent.snapshot",
+                    correlation_id=owned.handle.subagent_id,
                     source="qitos.agent",
                     payload={
                         "handle": owned.handle.to_dict(),
-                        "child_id": owned.handle.child_id,
+                        "subagent_id": owned.handle.subagent_id,
                         "status": "running",
-                        "child_status": ChildStatus.RUNNING.value,
+                        "subagent_status": SubagentStatus.RUNNING.value,
                         "agent_type": owned.request.agent_type,
                         "name": owned.request.name,
                         "description": owned.request.description,
-                        "output": self._partial_result(owned.engine),
+                        "output": self._tool_result_preview(owned.engine),
                         "steps": int(getattr(owned.engine, "step_count", 0) or 0),
                         "total_tokens": int(
                             getattr(owned.engine, "token_usage", 0) or 0
@@ -650,7 +655,7 @@ class ChildSupervisor:
                         "cost_complete": bool(
                             getattr(owned.engine, "cost_complete", False)
                         ),
-                        "run_id": self._child_run_id(owned),
+                        "run_id": self._subagent_run_id(owned),
                     },
                 )
             )
@@ -659,23 +664,23 @@ class ChildSupervisor:
     def setup(self, *, reset_run_limiter: bool = False) -> None:
         """Open this supervisor for a fresh owner Run.
 
-        A shared recursive ``ChildRunLimiter`` has one root lifecycle owner.
+        A shared recursive ``SubagentRunLimiter`` has one root lifecycle owner.
         Nested supervisors therefore leave its cumulative Run-tree accounting
         intact unless their composition owner explicitly starts a new root Run.
         """
 
         if any(
             owned.task is not None and not owned.task.done()
-            for owned in self._children.values()
+            for owned in self._subagents.values()
         ):
-            raise RuntimeError("cannot reopen a child supervisor with owned tasks")
+            raise RuntimeError("cannot reopen a subagent supervisor with owned tasks")
         if reset_run_limiter and self._run_limiter is not None:
             self._run_limiter.reset_for_new_run()
         self._limit = asyncio.Semaphore(self._max_concurrency)
         self._admission_lock = asyncio.Lock()
-        self._children_started = 0
+        self._subagents_started = 0
         self._closed = False
-        self._children.clear()
+        self._subagents.clear()
         self._recovered_runs.clear()
         self._lifecycle_locks.clear()
 
@@ -688,14 +693,14 @@ class ChildSupervisor:
             self._closed = True
             owned_tasks = [
                 owned
-                for owned in self._children.values()
+                for owned in self._subagents.values()
                 if owned.task is not None and not owned.task.done()
             ]
         for owned in owned_tasks:
             requested = self.request_interrupt(owned.handle)
             if not requested and owned.task is not None and not owned.task.done():
                 # A terminal result may still own bounded parent delivery.
-                # Cancelling that delivery cannot interrupt Child cleanup,
+                # Cancelling that delivery cannot interrupt Subagent cleanup,
                 # which has already completed before terminal publication.
                 owned.task.cancel()
 
@@ -705,7 +710,7 @@ class ChildSupervisor:
             if done:
                 await asyncio.gather(*done, return_exceptions=True)
             if pending:
-                # A second Task.cancel() can interrupt the ChildInvocation's
+                # A second Task.cancel() can interrupt the SubagentInvocation's
                 # own async cleanup. Keep the Tasks registered so a later
                 # close/wait can drain them without losing ownership.
                 await asyncio.sleep(0)
@@ -715,7 +720,7 @@ class ChildSupervisor:
                 await self._terminalize_cancelled_task(owned, task)
         return sum(1 for task in tasks if not task.done())
 
-    async def _supervise_background(self, owned: _OwnedChild) -> ChildResult:
+    async def _supervise_background(self, owned: _OwnedSubagent) -> SubagentResult:
         try:
             result = await self._run_request_with_limit(owned)
         except asyncio.CancelledError:
@@ -727,7 +732,7 @@ class ChildSupervisor:
             result = self._current_result(owned)
             # A durable terminal result no longer consumes execution capacity.
             # Parent mailbox delivery remains owned, but it must not block a
-            # later Child from entering the root Run's active limit.
+            # later Subagent from entering the root Run's active limit.
             await self._release_run_lease(owned)
             if persisted:
                 await self._post_completion_event(owned, result)
@@ -741,27 +746,27 @@ class ChildSupervisor:
             await self._release_run_lease(owned)
         return result
 
-    async def _run_request_with_limit(self, owned: _OwnedChild) -> ChildResult:
+    async def _run_request_with_limit(self, owned: _OwnedSubagent) -> SubagentResult:
         """Apply concurrency and the parent's absolute deadline to all run work."""
 
         launch_context = owned.launch_context
         if launch_context is None:
-            raise RuntimeError("Child launch context was released before execution")
+            raise RuntimeError("Subagent launch context was released before execution")
         deadline = launch_context.deadline_monotonic
         started = time.monotonic()
         if deadline is not None and started >= deadline:
             return self._budget_exhausted_result(
                 owned,
-                error="Child deadline expired before execution admission.",
+                error="Subagent deadline expired before execution admission.",
                 elapsed_seconds=0.0,
             )
 
-        async def _run_admitted() -> ChildResult:
+        async def _run_admitted() -> SubagentResult:
             async with self._limit:
                 if deadline is not None and time.monotonic() >= deadline:
                     return self._budget_exhausted_result(
                         owned,
-                        error="Child deadline expired before execution.",
+                        error="Subagent deadline expired before execution.",
                         elapsed_seconds=max(0.0, time.monotonic() - started),
                     )
                 return await self._run_request(owned)
@@ -774,11 +779,11 @@ class ChildSupervisor:
 
         request_task = asyncio.create_task(
             _run_admitted(),
-            name=f"qitos-{owned.handle.child_id}-deadline-request",
+            name=f"qitos-{owned.handle.subagent_id}-deadline-request",
         )
         deadline_task = asyncio.create_task(
             _wait_for_deadline(),
-            name=f"qitos-{owned.handle.child_id}-deadline-timer",
+            name=f"qitos-{owned.handle.subagent_id}-deadline-timer",
         )
         try:
             completed, _pending = await asyncio.wait(
@@ -805,7 +810,7 @@ class ChildSupervisor:
             raise asyncio.CancelledError
         return self._budget_exhausted_result(
             owned,
-            error="Child deadline expired.",
+            error="Subagent deadline expired.",
             elapsed_seconds=max(0.0, time.monotonic() - started),
         )
 
@@ -826,15 +831,15 @@ class ChildSupervisor:
         waiter.result()
         return caller_cancelled
 
-    async def _run_request(self, owned: _OwnedChild) -> ChildResult:
+    async def _run_request(self, owned: _OwnedSubagent) -> SubagentResult:
         started = time.monotonic()
         launch_context = owned.launch_context
         if launch_context is None:
-            raise RuntimeError("Child launch context was released before execution")
-        scoped_context = ChildRuntimeContext(
+            raise RuntimeError("Subagent launch context was released before execution")
+        scoped_context = SubagentRuntimeContext(
             launch=launch_context,
             handle=owned.handle,
-            child_run_id=owned.child_run_id,
+            subagent_run_id=owned.subagent_run_id,
             cancellation_requested=owned.cancel_event.is_set,
         )
         scope = (
@@ -843,9 +848,9 @@ class ChildSupervisor:
             else nullcontext()
         )
 
-        async def _run_in_scope() -> ChildResult:
+        async def _run_in_scope() -> SubagentResult:
             if owned.cancel_event.is_set():
-                raise RuntimeError("Child agent was cancelled before it started")
+                raise RuntimeError("Subagent was cancelled before it started")
             budget_error = self._budget_admission_error(launch_context)
             if budget_error is not None:
                 return self._budget_exhausted_result(owned, error=budget_error)
@@ -858,7 +863,7 @@ class ChildSupervisor:
             else:
                 with scope:
                     result = await _run_in_scope()
-        except ChildInvocationCancelled as exc:
+        except SubagentInvocationCancelled as exc:
             result = self._cancelled_result(owned, error=str(exc))
         except asyncio.CancelledError:
             raise
@@ -874,26 +879,26 @@ class ChildSupervisor:
 
     async def _run_invocation(
         self,
-        owned: _OwnedChild,
-        runtime_context: ChildRuntimeContext,
-    ) -> ChildResult:
+        owned: _OwnedSubagent,
+        runtime_context: SubagentRuntimeContext,
+    ) -> SubagentResult:
         invocation = await self._invocation_factory(owned.request, runtime_context)
-        if not isinstance(invocation, ChildInvocation):
-            raise TypeError("invocation_factory must resolve to ChildInvocation")
+        if not isinstance(invocation, SubagentInvocation):
+            raise TypeError("invocation_factory must resolve to SubagentInvocation")
         owned.engine = invocation.engine
         conclusion: AgentConclusion | None = None
         try:
             if self._closed or owned.cancel_event.is_set():
                 invocation.engine.cancel("immediate")
-                raise RuntimeError("child supervisor closed before child start")
+                raise RuntimeError("subagent supervisor closed before subagent start")
             owned.engine_ready.set()
             run_kwargs = dict(invocation.run_kwargs)
             requested_run_id = run_kwargs.get("run_id")
-            if requested_run_id is not None and requested_run_id != owned.child_run_id:
+            if requested_run_id is not None and requested_run_id != owned.subagent_run_id:
                 raise ValueError(
-                    "Child invocation Run id conflicts with its durable launch"
+                    "Subagent invocation Run id conflicts with its durable launch"
                 )
-            run_kwargs["run_id"] = owned.child_run_id
+            run_kwargs["run_id"] = owned.subagent_run_id
             engine_result = await invocation.engine.arun(
                 invocation.task,
                 **run_kwargs,
@@ -902,17 +907,30 @@ class ChildSupervisor:
                 conclusion = await invocation.conclusion_factory(engine_result)
                 if not isinstance(conclusion, AgentConclusion):
                     raise TypeError(
-                        "Child conclusion_factory must return AgentConclusion"
+                        "Subagent conclusion_factory must return AgentConclusion"
                     )
         finally:
             await self._cleanup_invocation(invocation)
         state = engine_result.state
         raw_stop_reason = state.stop_reason or ""
         stop_reason = str(getattr(raw_stop_reason, "value", raw_stop_reason))
-        summary = str(state.final_result or "") or self._partial_result(engine_result)
-        status = self._child_status(stop_reason)
+        summary = str(state.final_result or "").strip()
+        status = self._subagent_status(stop_reason)
         status_detail = stop_reason or "unknown stop reason"
-        return ChildResult(
+        # The model's final natural-language answer is canonical. A product
+        # conclusion factory may attach stable evidence/resource references
+        # and other typed transport fields, but it must never author or
+        # replace what the Subagent told its parent.
+        if conclusion is not None:
+            conclusion = replace(conclusion, summary=summary)
+        error: str | None = None
+        if status_detail == "missing_conclusion":
+            error = _MISSING_CONCLUSION_ERROR
+        elif status is SubagentStatus.COMPLETED and not summary:
+            status = SubagentStatus.FAILED
+            status_detail = "missing_conclusion"
+            error = _MISSING_CONCLUSION_ERROR
+        return SubagentResult(
             handle=owned.handle,
             request=owned.request,
             status=status,
@@ -922,16 +940,17 @@ class ChildSupervisor:
                 else AgentConclusion(
                     summary=summary,
                     failure_paths=(
-                        (status_detail,) if status is ChildStatus.FAILED else ()
+                        (status_detail,) if status is SubagentStatus.FAILED else ()
                     ),
                     unknowns=(
                         (status_detail,)
-                        if status is ChildStatus.BUDGET_EXHAUSTED
+                        if status is SubagentStatus.BUDGET_EXHAUSTED
                         else ()
                     ),
                 )
             ),
-            child_run_id=owned.child_run_id,
+            subagent_run_id=owned.subagent_run_id,
+            error=error,
             steps=int(engine_result.step_count or 0),
             total_tokens=int(
                 getattr(
@@ -953,11 +972,11 @@ class ChildSupervisor:
             cost_complete=bool(getattr(engine_result, "local_cost_complete", False)),
         )
 
-    def _set_terminal(self, owned: _OwnedChild, result: ChildResult) -> None:
+    def _set_terminal(self, owned: _OwnedSubagent, result: SubagentResult) -> None:
         if owned.terminal_event.is_set():
             if owned.result != result:
-                raise ChildPersistenceError(
-                    "child terminal result conflicts with its existing terminal state"
+                raise SubagentPersistenceError(
+                    "subagent terminal result conflicts with its existing terminal state"
                 )
             return
         owned.result = result
@@ -965,17 +984,17 @@ class ChildSupervisor:
 
     @staticmethod
     async def _wait_until_ready_or_terminal(
-        owned: _OwnedChild,
+        owned: _OwnedSubagent,
         *,
         timeout_seconds: float | None,
     ) -> None:
         engine_wait = asyncio.create_task(
             owned.engine_ready.wait(),
-            name=f"qitos-{owned.handle.child_id}-engine-ready",
+            name=f"qitos-{owned.handle.subagent_id}-engine-ready",
         )
         terminal_wait = asyncio.create_task(
             owned.terminal_event.wait(),
-            name=f"qitos-{owned.handle.child_id}-terminal-wait",
+            name=f"qitos-{owned.handle.subagent_id}-terminal-wait",
         )
         waits = (engine_wait, terminal_wait)
         try:
@@ -985,28 +1004,28 @@ class ChildSupervisor:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not completed:
-                raise TimeoutError("Child did not become ready before its deadline")
+                raise TimeoutError("Subagent did not become ready before its deadline")
         finally:
             for task in waits:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*waits, return_exceptions=True)
 
-    async def _persist_started(self, owned: _OwnedChild) -> None:
+    async def _persist_started(self, owned: _OwnedSubagent) -> None:
         if owned.journal is None:
             return
         try:
             await owned.journal.append(
-                JournalRecordType.CHILD_STARTED,
+                JournalRecordType.SUBAGENT_STARTED,
                 {
                     "handle": owned.handle.to_dict(),
                     "request": owned.request.to_dict(),
                     "background": owned.background,
-                    "child_run_id": owned.child_run_id,
+                    "subagent_run_id": owned.subagent_run_id,
                 },
                 record_id=(
-                    f"{owned.handle.parent_run_id}:child:"
-                    f"{owned.handle.child_id}:started"
+                    f"{owned.handle.parent_run_id}:subagent:"
+                    f"{owned.handle.subagent_id}:started"
                 ),
             )
         except asyncio.CancelledError:
@@ -1014,17 +1033,17 @@ class ChildSupervisor:
         except JournalCommitError:
             raise
         except Exception as exc:
-            raise ChildPersistenceError(
-                "failed to persist child.started; child was not executed"
+            raise SubagentPersistenceError(
+                "failed to persist subagent.started; subagent was not executed"
             ) from exc
 
-    async def _persist_plan_assignment(self, owned: _OwnedChild) -> None:
+    async def _persist_plan_assignment(self, owned: _OwnedSubagent) -> None:
         node_id = owned.request.plan_assignment
         if owned.journal is None:
             if node_id is None:
                 return
-            raise ChildPersistenceError(
-                "a Child Plan assignment requires the parent Session Journal"
+            raise SubagentPersistenceError(
+                "a Subagent Plan assignment requires the parent Session Journal"
             )
         if node_id is None:
             parent_task_id = owned.request.parent_task_id
@@ -1033,7 +1052,7 @@ class ChildSupervisor:
             recovered = recover_session(await owned.journal.replay())
             if recovered.plans.get(parent_task_id) is not None:
                 raise PlanContractError(
-                    "a Child launched for a Task with a Plan requires an explicit "
+                    "a Subagent launched for a Task with a Plan requires an explicit "
                     "Plan assignment"
                 )
             return
@@ -1044,13 +1063,13 @@ class ChildSupervisor:
             parent_task_id=owned.request.parent_task_id,
             record_id=(
                 f"{owned.handle.parent_run_id}:plan:assign:"
-                f"{owned.handle.child_id}"
+                f"{owned.handle.subagent_id}"
             ),
         )
 
     async def _discard_unstarted(
         self,
-        owned: _OwnedChild,
+        owned: _OwnedSubagent,
         *,
         release_assignment: bool,
     ) -> None:
@@ -1070,31 +1089,31 @@ class ChildSupervisor:
                     owned.handle,
                     record_id=(
                         f"{owned.handle.parent_run_id}:plan:release:"
-                        f"{owned.handle.child_id}"
+                        f"{owned.handle.subagent_id}"
                     ),
                 )
         except BaseException as exc:
             release_error = exc
         finally:
             async with self._admission_lock:
-                self._children.pop(owned.handle, None)
-                self._children_started -= 1
+                self._subagents.pop(owned.handle, None)
+                self._subagents_started -= 1
             if owned.run_lease is not None:
                 await owned.run_lease.rollback()
         if release_error is not None:
-            raise ChildPersistenceError(
-                "failed to release a Plan assignment after child admission failed"
+            raise SubagentPersistenceError(
+                "failed to release a Plan assignment after subagent admission failed"
             ) from release_error
 
     async def _store_terminal(
         self,
-        owned: _OwnedChild,
-        result: ChildResult,
+        owned: _OwnedSubagent,
+        result: SubagentResult,
     ) -> bool:
         if owned.journal is not None:
             try:
                 await owned.journal.append(
-                    JournalRecordType.CHILD_TERMINAL,
+                    JournalRecordType.SUBAGENT_TERMINAL,
                     result.to_dict(),
                     record_id=self._terminal_record_id(owned.handle),
                 )
@@ -1150,7 +1169,7 @@ class ChildSupervisor:
 
     async def _retain_failed_admission(
         self,
-        owned: _OwnedChild,
+        owned: _OwnedSubagent,
         *,
         cause: BaseException | None,
     ) -> None:
@@ -1159,7 +1178,7 @@ class ChildSupervisor:
         result = self._cancelled_result(
             owned,
             error=(
-                "Child launch was not executed because its durable admission "
+                "Subagent launch was not executed because its durable admission "
                 "could not be confirmed."
             ),
         )
@@ -1173,8 +1192,8 @@ class ChildSupervisor:
 
     async def _terminalize_cancelled_task(
         self,
-        owned: _OwnedChild,
-        task: asyncio.Task[ChildResult],
+        owned: _OwnedSubagent,
+        task: asyncio.Task[SubagentResult],
     ) -> None:
         """Persist cancellation for a Task that never entered its supervisor."""
 
@@ -1187,7 +1206,7 @@ class ChildSupervisor:
         owned.launch_context = None
 
     @staticmethod
-    async def _cleanup_invocation(invocation: ChildInvocation) -> None:
+    async def _cleanup_invocation(invocation: SubagentInvocation) -> None:
         errors: list[BaseException] = []
         cancellation: asyncio.CancelledError | None = None
         first_close_error: BaseException | None = None
@@ -1226,48 +1245,48 @@ class ChildSupervisor:
             raise errors[0]
 
     @staticmethod
-    async def _release_run_lease(owned: _OwnedChild) -> None:
+    async def _release_run_lease(owned: _OwnedSubagent) -> None:
         lease = owned.run_lease
         if lease is None:
             return
         await lease.release()
         owned.run_lease = None
 
-    def _current_result(self, owned: _OwnedChild) -> ChildResult:
+    def _current_result(self, owned: _OwnedSubagent) -> SubagentResult:
         if owned.result is not None:
             return owned.result
-        return ChildResult(
+        return SubagentResult(
             handle=owned.handle,
             request=owned.request,
             status=(
-                ChildStatus.CANCEL_REQUESTED
+                SubagentStatus.CANCEL_REQUESTED
                 if owned.cancel_event.is_set()
                 else (
-                    ChildStatus.RUNNING
+                    SubagentStatus.RUNNING
                     if owned.task is not None
-                    else ChildStatus.PENDING
+                    else SubagentStatus.PENDING
                 )
             ),
-            child_run_id=owned.child_run_id,
+            subagent_run_id=owned.subagent_run_id,
         )
 
     @staticmethod
-    def result_payload(result: ChildResult) -> dict[str, Any]:
-        """Project typed child state without overloading Tool execution status."""
+    def result_payload(result: SubagentResult) -> dict[str, Any]:
+        """Project typed subagent state without overloading Tool execution status."""
 
-        return child_result_payload(result)
+        return subagent_result_payload(result)
 
     async def _post_completion_event(
         self,
-        owned: _OwnedChild,
-        result: ChildResult,
+        owned: _OwnedSubagent,
+        result: SubagentResult,
     ) -> None:
         launch_context = owned.launch_context
         if launch_context is None or launch_context.post_runtime_event is None:
             return
         try:
             await launch_context.post_runtime_event(
-                child_terminal_runtime_input(result)
+                subagent_terminal_runtime_input(result)
             )
         except asyncio.CancelledError:
             raise
@@ -1276,15 +1295,15 @@ class ChildSupervisor:
             # durable mailbox acceptance fails.
             return
 
-    def _owned(self, handle: ChildHandle) -> _OwnedChild | None:
-        if not isinstance(handle, ChildHandle):
-            raise TypeError("handle must be a ChildHandle")
-        return self._children.get(handle)
+    def _owned(self, handle: SubagentHandle) -> _OwnedSubagent | None:
+        if not isinstance(handle, SubagentHandle):
+            raise TypeError("handle must be a SubagentHandle")
+        return self._subagents.get(handle)
 
-    def _results_for_parent(self, parent_run_id: str) -> tuple[ChildResult, ...]:
+    def _results_for_parent(self, parent_run_id: str) -> tuple[SubagentResult, ...]:
         return tuple(
             self._current_result(owned)
-            for owned in self._children.values()
+            for owned in self._subagents.values()
             if owned.handle.parent_run_id == parent_run_id
         )
 
@@ -1294,99 +1313,106 @@ class ChildSupervisor:
         *,
         parent_run_id: str,
     ) -> tuple[
-        dict[ChildHandle, _RecoveredChildStart],
-        dict[ChildHandle, ChildResult],
+        dict[SubagentHandle, _RecoveredSubagentStart],
+        dict[SubagentHandle, SubagentResult],
     ]:
-        started: dict[ChildHandle, _RecoveredChildStart] = {}
-        terminal: dict[ChildHandle, ChildResult] = {}
+        started: dict[SubagentHandle, _RecoveredSubagentStart] = {}
+        terminal: dict[SubagentHandle, SubagentResult] = {}
         for record in records:
             if not isinstance(record, JournalRecord):
                 raise TypeError("journal replay must contain JournalRecord values")
             if record.run_id != parent_run_id:
                 continue
-            if record.type is JournalRecordType.CHILD_STARTED:
-                if set(record.payload) not in (
+            if record.type is JournalRecordType.SUBAGENT_STARTED:
+                payload = dict(record.payload)
+                if "child_run_id" in payload:
+                    if "subagent_run_id" in payload:
+                        raise ValueError(
+                            "subagent.started contains conflicting Run id fields"
+                        )
+                    payload["subagent_run_id"] = payload.pop("child_run_id")
+                if set(payload) not in (
                     {"handle", "request"},
-                    {"handle", "request", "child_run_id"},
+                    {"handle", "request", "subagent_run_id"},
                     {"handle", "request", "background"},
-                    {"handle", "request", "background", "child_run_id"},
+                    {"handle", "request", "background", "subagent_run_id"},
                 ):
-                    raise ValueError("child.started fields are invalid")
-                raw_handle = record.payload.get("handle")
-                raw_request = record.payload.get("request")
-                raw_child_run_id = record.payload.get("child_run_id", "")
-                raw_background = record.payload.get("background", False)
+                    raise ValueError("subagent.started fields are invalid")
+                raw_handle = payload.get("handle")
+                raw_request = payload.get("request")
+                raw_subagent_run_id = payload.get("subagent_run_id", "")
+                raw_background = payload.get("background", False)
                 if not isinstance(raw_handle, Mapping) or not isinstance(
                     raw_request, Mapping
                 ):
-                    raise ValueError("child.started payload is invalid")
-                if not isinstance(raw_child_run_id, str) or (
-                    raw_child_run_id and raw_child_run_id != raw_child_run_id.strip()
+                    raise ValueError("subagent.started payload is invalid")
+                if not isinstance(raw_subagent_run_id, str) or (
+                    raw_subagent_run_id and raw_subagent_run_id != raw_subagent_run_id.strip()
                 ):
-                    raise ValueError("child.started child_run_id is invalid")
+                    raise ValueError("subagent.started subagent_run_id is invalid")
                 if not isinstance(raw_background, bool):
-                    raise ValueError("child.started background flag is invalid")
-                handle = ChildHandle.from_dict(raw_handle)
-                request = ChildLaunchRequest.from_dict(raw_request)
+                    raise ValueError("subagent.started background flag is invalid")
+                handle = SubagentHandle.from_dict(raw_handle)
+                request = SubagentLaunchRequest.from_dict(raw_request)
                 if handle.parent_run_id != parent_run_id:
-                    raise ValueError("child.started parent is inconsistent")
+                    raise ValueError("subagent.started parent is inconsistent")
                 if handle in terminal:
-                    raise ValueError("child.started occurs after child.terminal")
-                recovered_start = _RecoveredChildStart(
+                    raise ValueError("subagent.started occurs after subagent.terminal")
+                recovered_start = _RecoveredSubagentStart(
                     request=request,
-                    child_run_id=raw_child_run_id,
+                    subagent_run_id=raw_subagent_run_id,
                     background=raw_background,
                 )
                 previous_start = started.get(handle)
                 if previous_start is not None and previous_start != recovered_start:
-                    raise ValueError("child.started conflicts with an earlier record")
+                    raise ValueError("subagent.started conflicts with an earlier record")
                 started[handle] = recovered_start
-            elif record.type is JournalRecordType.CHILD_TERMINAL:
-                result = ChildResult.from_dict(record.payload)
+            elif record.type is JournalRecordType.SUBAGENT_TERMINAL:
+                result = SubagentResult.from_dict(record.payload)
                 if result.handle.parent_run_id != parent_run_id:
-                    raise ValueError("child.terminal parent is inconsistent")
+                    raise ValueError("subagent.terminal parent is inconsistent")
                 if not result.ready:
-                    raise ValueError("child.terminal contains a live status")
+                    raise ValueError("subagent.terminal contains a live status")
                 recovered_start = started.get(result.handle)
                 if recovered_start is None:
-                    raise ValueError("child.terminal has no child.started record")
+                    raise ValueError("subagent.terminal has no subagent.started record")
                 if result.request != recovered_start.request:
-                    raise ValueError("child.terminal request is inconsistent")
-                started_run_id = recovered_start.child_run_id
+                    raise ValueError("subagent.terminal request is inconsistent")
+                started_run_id = recovered_start.subagent_run_id
                 if (
                     started_run_id
-                    and result.child_run_id
-                    and result.child_run_id != started_run_id
+                    and result.subagent_run_id
+                    and result.subagent_run_id != started_run_id
                 ):
-                    raise ValueError("child.terminal Run id is inconsistent")
+                    raise ValueError("subagent.terminal Run id is inconsistent")
                 previous_result = terminal.get(result.handle)
                 if previous_result is not None and previous_result != result:
-                    raise ValueError("child.terminal conflicts with an earlier record")
+                    raise ValueError("subagent.terminal conflicts with an earlier record")
                 terminal[result.handle] = result
         return started, terminal
 
     async def _recover_interrupted_result(
         self,
-        handle: ChildHandle,
-        start: _RecoveredChildStart,
+        handle: SubagentHandle,
+        start: _RecoveredSubagentStart,
         *,
         root_budget: BudgetSnapshot | None,
-    ) -> ChildResult:
-        """Rebuild one started Child's terminal fact from its own run journal.
+    ) -> SubagentResult:
+        """Rebuild one started Subagent's terminal fact from its own run journal.
 
-        A child that reached a durable run terminal record (loop taxonomy)
-        before the parent died is projected from that journal; a child without
+        A subagent that reached a durable run terminal record (loop taxonomy)
+        before the parent died is projected from that journal; a subagent without
         a terminal record is closed as interrupted without replaying its Agent.
         """
 
-        if start.child_run_id and self._child_journal_factory is not None:
-            records = await self._replay_child_journal(start.child_run_id)
+        if start.subagent_run_id and self._subagent_journal_factory is not None:
+            records = await self._replay_subagent_journal(start.subagent_run_id)
             if records is not None:
                 try:
                     outcome = recover_run_outcome(records)
                 except ValueError as exc:
-                    raise ChildPersistenceError(
-                        "child run journal is not a recoverable loop journal"
+                    raise SubagentPersistenceError(
+                        "subagent run journal is not a recoverable loop journal"
                     ) from exc
                 if outcome is not None:
                     return self._result_from_outcome(
@@ -1396,58 +1422,63 @@ class ChildSupervisor:
                         records=records,
                         root_budget=root_budget,
                     )
-        return ChildResult(
+        return SubagentResult(
             handle=handle,
             request=start.request,
-            status=ChildStatus.INTERRUPTED,
+            status=SubagentStatus.INTERRUPTED,
             conclusion=AgentConclusion(
                 failure_paths=(
-                    "The parent process exited before the child terminal record.",
+                    "The parent process exited before the subagent terminal record.",
                 )
             ),
-            child_run_id=start.child_run_id,
-            error="Child side effects may be incomplete; the Agent was not replayed.",
+            subagent_run_id=start.subagent_run_id,
+            error="Subagent side effects may be incomplete; the Agent was not replayed.",
         )
 
     def _result_from_outcome(
         self,
         *,
-        handle: ChildHandle,
-        start: _RecoveredChildStart,
+        handle: SubagentHandle,
+        start: _RecoveredSubagentStart,
         outcome: Any,
         records: Sequence[JournalRecord],
         root_budget: BudgetSnapshot | None,
-    ) -> ChildResult:
+    ) -> SubagentResult:
         model_pricing = self._model_pricing(records)
-        stats = child_run_stats(
+        stats = subagent_run_stats(
             outcome.messages,
             model_pricing=model_pricing,
         )
         budget_reason = (
-            child_budget_stop_reason(stats, start.request.budget, root_budget)
+            subagent_budget_stop_reason(stats, start.request.budget, root_budget)
             if outcome.status.value == "completed"
             else None
         )
-        stop_reason = budget_reason or child_stop_reason(
+        stop_reason = budget_reason or subagent_stop_reason(
             outcome.status,
             outcome.error,
         )
-        status = self._child_status(stop_reason)
+        status = self._subagent_status(stop_reason)
         status_detail = stop_reason or "unknown stop reason"
-        summary = child_final_text(outcome.messages) or self._partial_result(outcome)
-        return ChildResult(
+        summary = subagent_final_text(outcome.messages)
+        error = outcome.error
+        if status is SubagentStatus.COMPLETED and not summary:
+            status = SubagentStatus.FAILED
+            status_detail = "missing_conclusion"
+            error = _MISSING_CONCLUSION_ERROR
+        return SubagentResult(
             handle=handle,
             request=start.request,
             status=status,
             conclusion=AgentConclusion(
                 summary=summary,
-                failure_paths=(status_detail,) if status is ChildStatus.FAILED else (),
+                failure_paths=(status_detail,) if status is SubagentStatus.FAILED else (),
                 unknowns=(
-                    (status_detail,) if status is ChildStatus.BUDGET_EXHAUSTED else ()
+                    (status_detail,) if status is SubagentStatus.BUDGET_EXHAUSTED else ()
                 ),
             ),
-            child_run_id=start.child_run_id,
-            error=outcome.error,
+            subagent_run_id=start.subagent_run_id,
+            error=error,
             steps=stats.steps,
             total_tokens=stats.total_tokens,
             total_cost_usd=stats.total_cost_usd,
@@ -1473,33 +1504,33 @@ class ChildSupervisor:
             "cache_read_usd_per_million",
             "cache_write_usd_per_million",
         }:
-            raise ChildPersistenceError("child model pricing metadata is invalid")
+            raise SubagentPersistenceError("subagent model pricing metadata is invalid")
         try:
             return ModelPricing(**dict(raw))
         except (TypeError, ValueError) as exc:
-            raise ChildPersistenceError(
-                "child model pricing metadata is invalid"
+            raise SubagentPersistenceError(
+                "subagent model pricing metadata is invalid"
             ) from exc
 
     async def _descendant_launch_ids(
         self,
         *,
         parent_run_id: str,
-        child_run_ids: tuple[str, ...],
+        subagent_run_ids: tuple[str, ...],
     ) -> set[str]:
         # Do not deduplicate here: two lifecycle records claiming the same
         # descendant Run are corrupt lineage and must be rejected explicitly.
-        pending = list(child_run_ids)
+        pending = list(subagent_run_ids)
         visited = {parent_run_id}
         launch_ids: set[str] = set()
         while pending:
             run_id = pending.pop(0)
             if run_id in visited:
-                raise ChildPersistenceError(
-                    "child journal lineage contains a cycle or duplicate Run"
+                raise SubagentPersistenceError(
+                    "subagent journal lineage contains a cycle or duplicate Run"
                 )
             visited.add(run_id)
-            records = await self._replay_child_journal(run_id)
+            records = await self._replay_subagent_journal(run_id)
             if records is None:
                 # A durable launch may fail before its Engine creates a journal.
                 continue
@@ -1509,31 +1540,31 @@ class ChildSupervisor:
                     parent_run_id=run_id,
                 )
             except (TypeError, ValueError) as exc:
-                raise ChildPersistenceError(
-                    "descendant child lifecycle journal records are invalid"
+                raise SubagentPersistenceError(
+                    "descendant subagent lifecycle journal records are invalid"
                 ) from exc
             for handle, start in started.items():
-                launch_ids.add(f"{handle.parent_run_id}:{handle.child_id}")
+                launch_ids.add(f"{handle.parent_run_id}:{handle.subagent_id}")
                 terminal_result = terminal.get(handle)
                 resolved_run_id = (
-                    terminal_result.child_run_id
-                    if terminal_result is not None and terminal_result.child_run_id
-                    else start.child_run_id
+                    terminal_result.subagent_run_id
+                    if terminal_result is not None and terminal_result.subagent_run_id
+                    else start.subagent_run_id
                 )
                 if resolved_run_id:
                     pending.append(resolved_run_id)
         return launch_ids
 
-    async def _replay_child_journal(
+    async def _replay_subagent_journal(
         self,
         run_id: str,
     ) -> tuple[JournalRecord, ...] | None:
-        factory = self._child_journal_factory
+        factory = self._subagent_journal_factory
         if factory is None:
             return None
         journal = factory()
         if not isinstance(journal, SessionJournal):
-            raise TypeError("child_journal_factory must return a SessionJournal")
+            raise TypeError("subagent_journal_factory must return a SessionJournal")
 
         records: tuple[JournalRecord, ...] | None = None
         missing = False
@@ -1557,7 +1588,7 @@ class ChildSupervisor:
                 failure = exc
             else:
                 _logger.warning(
-                    "Child journal cleanup also failed for Run %s",
+                    "Subagent journal cleanup also failed for Run %s",
                     run_id,
                     exc_info=exc,
                 )
@@ -1566,7 +1597,7 @@ class ChildSupervisor:
         if missing:
             return None
         if records is None:
-            raise RuntimeError("child journal replay returned no records")
+            raise RuntimeError("subagent journal replay returned no records")
         return records
 
     async def _lifecycle_lock(self, parent_run_id: str) -> asyncio.Lock:
@@ -1578,23 +1609,23 @@ class ChildSupervisor:
             return lifecycle_lock
 
     @staticmethod
-    def _terminal_record_id(handle: ChildHandle) -> str:
-        return f"{handle.parent_run_id}:child:{handle.child_id}:terminal"
+    def _terminal_record_id(handle: SubagentHandle) -> str:
+        return f"{handle.parent_run_id}:subagent:{handle.subagent_id}:terminal"
 
     @staticmethod
     def _persistence_failed_result(
-        result: ChildResult,
+        result: SubagentResult,
         *,
         cause: BaseException | None = None,
-    ) -> ChildResult:
+    ) -> SubagentResult:
         error = (
-            "Child reached terminal state but its terminal record was not persisted."
+            "Subagent reached terminal state but its terminal record was not persisted."
         )
         if cause is not None and str(cause):
             error = f"{error} {cause}"
         return replace(
             result,
-            status=ChildStatus.FAILED,
+            status=SubagentStatus.FAILED,
             conclusion=replace(
                 result.conclusion,
                 failure_paths=result.conclusion.failure_paths + (error,),
@@ -1604,19 +1635,19 @@ class ChildSupervisor:
 
     @staticmethod
     def _persistence_unknown_result(
-        result: ChildResult,
+        result: SubagentResult,
         *,
         cause: BaseException | None = None,
-    ) -> ChildResult:
+    ) -> SubagentResult:
         error = (
-            "Child reached terminal state but its durable terminal outcome is "
+            "Subagent reached terminal state but its durable terminal outcome is "
             "unknown; close and reopen the Journal before continuing."
         )
         if cause is not None and str(cause):
             error = f"{error} {cause}"
         return replace(
             result,
-            status=ChildStatus.UNKNOWN,
+            status=SubagentStatus.UNKNOWN,
             conclusion=replace(
                 result.conclusion,
                 unknowns=result.conclusion.unknowns + (error,),
@@ -1625,24 +1656,24 @@ class ChildSupervisor:
         )
 
     @staticmethod
-    def _cancel_engine(owned: _OwnedChild) -> None:
+    def _cancel_engine(owned: _OwnedSubagent) -> None:
         if owned.engine is not None:
             owned.engine.cancel("immediate")
 
     def _cancelled_result(
         self,
-        owned: _OwnedChild,
+        owned: _OwnedSubagent,
         *,
-        error: str = "Child agent was cancelled.",
-    ) -> ChildResult:
-        error = error or "Child agent was cancelled."
+        error: str = "Subagent was cancelled.",
+    ) -> SubagentResult:
+        error = error or "Subagent was cancelled."
         tokens, cost, usage_complete, cost_complete = self._engine_usage(owned)
-        return ChildResult(
+        return SubagentResult(
             handle=owned.handle,
             request=owned.request,
-            status=ChildStatus.CANCELLED,
+            status=SubagentStatus.CANCELLED,
             conclusion=AgentConclusion(failure_paths=(error,)),
-            child_run_id=self._child_run_id(owned),
+            subagent_run_id=self._subagent_run_id(owned),
             error=error,
             total_tokens=tokens,
             total_cost_usd=cost,
@@ -1652,18 +1683,18 @@ class ChildSupervisor:
 
     def _budget_exhausted_result(
         self,
-        owned: _OwnedChild,
+        owned: _OwnedSubagent,
         *,
         error: str,
         elapsed_seconds: float = 0.0,
-    ) -> ChildResult:
+    ) -> SubagentResult:
         tokens, cost, usage_complete, cost_complete = self._engine_usage(owned)
-        return ChildResult(
+        return SubagentResult(
             handle=owned.handle,
             request=owned.request,
-            status=ChildStatus.BUDGET_EXHAUSTED,
+            status=SubagentStatus.BUDGET_EXHAUSTED,
             conclusion=AgentConclusion(unknowns=(error,)),
-            child_run_id=self._child_run_id(owned),
+            subagent_run_id=self._subagent_run_id(owned),
             error=error,
             total_tokens=tokens,
             total_cost_usd=cost,
@@ -1673,7 +1704,7 @@ class ChildSupervisor:
         )
 
     @staticmethod
-    def _budget_admission_error(context: ChildLaunchContext) -> str | None:
+    def _budget_admission_error(context: SubagentLaunchContext) -> str | None:
         ledger = context.budget_ledger
         if ledger is None:
             return None
@@ -1682,25 +1713,25 @@ class ChildSupervisor:
             return "Root step budget is exhausted."
         if snapshot.max_tokens is not None:
             if not snapshot.usage_complete:
-                return "Root token usage is incomplete; Child admission is closed."
+                return "Root token usage is incomplete; Subagent admission is closed."
             if snapshot.tokens_exhausted:
                 return "Root token budget is exhausted."
         if snapshot.max_cost_usd is not None:
             if not snapshot.cost_complete:
-                return "Root cost usage is incomplete; Child admission is closed."
+                return "Root cost usage is incomplete; Subagent admission is closed."
             if snapshot.cost_exhausted:
                 return "Root cost budget is exhausted."
         return None
 
-    def _failed_result(self, owned: _OwnedChild, exc: Exception) -> ChildResult:
+    def _failed_result(self, owned: _OwnedSubagent, exc: Exception) -> SubagentResult:
         error = str(exc) or type(exc).__name__
         tokens, cost, usage_complete, cost_complete = self._engine_usage(owned)
-        return ChildResult(
+        return SubagentResult(
             handle=owned.handle,
             request=owned.request,
-            status=ChildStatus.FAILED,
+            status=SubagentStatus.FAILED,
             conclusion=AgentConclusion(failure_paths=(error,)),
-            child_run_id=self._child_run_id(owned),
+            subagent_run_id=self._subagent_run_id(owned),
             error=error,
             total_tokens=tokens,
             total_cost_usd=cost,
@@ -1709,7 +1740,7 @@ class ChildSupervisor:
         )
 
     @staticmethod
-    def _engine_usage(owned: _OwnedChild) -> tuple[int, float, bool, bool]:
+    def _engine_usage(owned: _OwnedSubagent) -> tuple[int, float, bool, bool]:
         engine = owned.engine
         if engine is None:
             return (0, 0.0, False, False)
@@ -1721,12 +1752,12 @@ class ChildSupervisor:
         )
 
     @staticmethod
-    def _child_run_id(owned: _OwnedChild) -> str:
+    def _subagent_run_id(owned: _OwnedSubagent) -> str:
         engine = owned.engine
-        return str(engine.active_run_id if engine is not None else owned.child_run_id)
+        return str(engine.active_run_id if engine is not None else owned.subagent_run_id)
 
     @staticmethod
-    def _partial_result(source: Any) -> str:
+    def _tool_result_preview(source: Any) -> str:
         items: list[str] = []
         step = 0
         for message in list(getattr(source, "messages", ()) or ()):
@@ -1745,25 +1776,25 @@ class ChildSupervisor:
                 items.append(f"[step {step} {message.tool_name}] {text}")
         if not items:
             return ""
-        rendered = "\n".join(items[-_PARTIAL_RESULT_MAX_ITEMS:])
-        if len(rendered) <= _PARTIAL_RESULT_MAX_CHARS:
+        rendered = "\n".join(items[-_TOOL_RESULT_PREVIEW_MAX_ITEMS:])
+        if len(rendered) <= _TOOL_RESULT_PREVIEW_MAX_CHARS:
             return rendered
-        marker = "\n...[earlier child evidence clipped]...\n"
-        tail_size = _PARTIAL_RESULT_MAX_CHARS - len(marker)
+        marker = "\n...[earlier subagent evidence clipped]...\n"
+        tail_size = _TOOL_RESULT_PREVIEW_MAX_CHARS - len(marker)
         return marker + rendered[-tail_size:]
 
     @staticmethod
-    def _child_status(stop_reason: str) -> ChildStatus:
+    def _subagent_status(stop_reason: str) -> SubagentStatus:
         if stop_reason in {"completed", "final", "success"}:
-            return ChildStatus.COMPLETED
+            return SubagentStatus.COMPLETED
         if stop_reason == "blocked":
-            return ChildStatus.BLOCKED
+            return SubagentStatus.BLOCKED
         if stop_reason == "max_steps" or stop_reason == "context_overflow":
-            return ChildStatus.BUDGET_EXHAUSTED
+            return SubagentStatus.BUDGET_EXHAUSTED
         if stop_reason.startswith("budget_"):
-            return ChildStatus.BUDGET_EXHAUSTED
+            return SubagentStatus.BUDGET_EXHAUSTED
         if stop_reason.startswith("cancelled"):
-            return ChildStatus.CANCELLED
+            return SubagentStatus.CANCELLED
         if stop_reason.startswith("interrupt"):
-            return ChildStatus.INTERRUPTED
-        return ChildStatus.FAILED
+            return SubagentStatus.INTERRUPTED
+        return SubagentStatus.FAILED

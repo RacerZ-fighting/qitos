@@ -1,4 +1,4 @@
-"""Dependency-aware execution Plan shared by Root and Child Agents."""
+"""Dependency-aware execution Plan shared by Root and Subagents."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-from .child import ChildHandle
+from .subagent import SubagentHandle
 from .tool_result import ToolResult
 
 MAX_PLAN_NODES = 64
@@ -60,7 +60,7 @@ class PlanNode:
     description: str
     status: PlanStatus = PlanStatus.PENDING
     dependencies: tuple[str, ...] = ()
-    owner: ChildHandle | None = None
+    owner: SubagentHandle | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -96,8 +96,8 @@ class PlanNode:
         if len(normalized_dependencies) != len(set(normalized_dependencies)):
             raise PlanContractError("Plan dependencies must be unique")
         object.__setattr__(self, "dependencies", normalized_dependencies)
-        if self.owner is not None and not isinstance(self.owner, ChildHandle):
-            raise PlanContractError("Plan owner must be a ChildHandle or None")
+        if self.owner is not None and not isinstance(self.owner, SubagentHandle):
+            raise PlanContractError("Plan owner must be a SubagentHandle or None")
         if self.owner is not None and self.status is not PlanStatus.IN_PROGRESS:
             raise PlanContractError("Only an in-progress Plan node may have an owner")
 
@@ -132,7 +132,7 @@ class Plan:
         ordered = _topological_nodes(self.nodes, by_id)
         if len(ordered) != len(self.nodes):
             raise PlanContractError("Plan dependencies contain a cycle")
-        active_owners: set[ChildHandle | None] = set()
+        active_owners: set[SubagentHandle | None] = set()
         for node in self.nodes:
             if node.status in {
                 PlanStatus.IN_PROGRESS,
@@ -196,7 +196,7 @@ class Plan:
         node_id: str,
         *,
         status: PlanStatus,
-        owner: ChildHandle | None,
+        owner: SubagentHandle | None,
     ) -> "Plan":
         """Return a complete Plan value with one node's lifecycle replaced."""
 
@@ -259,15 +259,15 @@ class PlanUpdate:
             )
 
 
-def _parse_owner(value: object) -> ChildHandle | None:
+def _parse_owner(value: object) -> SubagentHandle | None:
     if value is None:
         return None
     if not isinstance(value, Mapping):
         raise PlanContractError("Plan owner must be an object or null")
     try:
-        return ChildHandle.from_dict(value)
+        return SubagentHandle.from_dict(value)
     except (TypeError, ValueError) as exc:
-        raise PlanContractError("Plan owner is not a valid ChildHandle") from exc
+        raise PlanContractError("Plan owner is not a valid SubagentHandle") from exc
 
 
 def parse_plan_update(arguments: Mapping[str, object]) -> PlanUpdate:
@@ -508,7 +508,7 @@ def render_plan_markdown(plan: Plan) -> str | None:
         if node.dependencies:
             details.append(f"depends on: {', '.join(node.dependencies)}")
         if node.owner is not None:
-            details.append(f"owner: {node.owner.child_id}")
+            details.append(f"owner: {node.owner.subagent_id}")
         suffix = f" ({'; '.join(details)})" if details else ""
         lines.append(f"- {_MARKERS[node.status]} {label}{suffix}")
     return "\n".join(lines)

@@ -4,7 +4,11 @@ import asyncio
 
 import pytest
 
-from qitos.core.budget import BudgetLedger, StepBudgetExhaustedError
+from qitos.core.budget import (
+    BudgetLedger,
+    StepBudgetExhaustedError,
+    StepPurpose,
+)
 from qitos.core.journal import (
     JournalAppendCancelled,
     JournalCommitState,
@@ -79,6 +83,64 @@ async def test_budget_ledger_serializes_concurrent_step_reservations() -> None:
         transaction_id=f"turn-{admitted_index}",
     )
     assert repeated.total_steps == 3
+
+
+@pytest.mark.asyncio
+async def test_conclusion_claims_protect_shared_capacity_until_used_or_released() -> None:
+    ledger = BudgetLedger(max_steps=3)
+    await ledger.claim_conclusion_step(origin_run_id="subagent-a")
+    await ledger.claim_conclusion_step(origin_run_id="subagent-b")
+
+    await ledger.lease_step(
+        origin_run_id="root",
+        transaction_id="root:turn:0:step",
+        purpose=StepPurpose.WORK,
+    )
+    await ledger.reserve_step(
+        origin_run_id="root",
+        transaction_id="root:turn:0:step",
+    )
+    with pytest.raises(StepBudgetExhaustedError):
+        await ledger.reserve_step(
+            origin_run_id="root",
+            transaction_id="root:turn:1:step",
+        )
+
+    await ledger.lease_step(
+        origin_run_id="subagent-a",
+        transaction_id="subagent-a:turn:0:step",
+        purpose=StepPurpose.CONCLUSION,
+    )
+    await ledger.reserve_step(
+        origin_run_id="subagent-a",
+        transaction_id="subagent-a:turn:0:step",
+    )
+    await ledger.release_conclusion_step(origin_run_id="subagent-b")
+    await ledger.reserve_step(
+        origin_run_id="root",
+        transaction_id="root:turn:1:step",
+    )
+
+    assert ledger.snapshot().total_steps == 3
+
+
+@pytest.mark.asyncio
+async def test_releasing_unused_conclusion_claim_restores_normal_capacity() -> None:
+    ledger = BudgetLedger(max_steps=1)
+    await ledger.claim_conclusion_step(origin_run_id="subagent")
+
+    with pytest.raises(StepBudgetExhaustedError):
+        await ledger.reserve_step(
+            origin_run_id="root",
+            transaction_id="root:turn:0:step",
+        )
+
+    await ledger.release_conclusion_step(origin_run_id="subagent")
+    await ledger.reserve_step(
+        origin_run_id="root",
+        transaction_id="root:turn:0:step",
+    )
+    assert ledger.snapshot().total_steps == 1
 
 
 @pytest.mark.asyncio

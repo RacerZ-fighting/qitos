@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from qitos.core import (
-    ChildHandle,
+    SubagentHandle,
     Plan,
     PlanContractError,
     PlanNode,
@@ -20,8 +20,11 @@ from qitos.core import (
 )
 
 
-def _handle(child_id: str) -> ChildHandle:
-    return ChildHandle(child_id=child_id, parent_run_id="parent-run")
+def _handle(subagent_id: str) -> SubagentHandle:
+    return SubagentHandle(
+        subagent_id=subagent_id,
+        parent_run_id="parent-run",
+    )
 
 
 def _graph() -> Plan:

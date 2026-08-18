@@ -370,7 +370,7 @@ def test_assistant_metadata_is_deeply_immutable() -> None:
 def test_tool_result_message_usage_and_added_names_round_trip() -> None:
     usage = ModelUsage.from_mapping({"total_tokens": 9, "cost_usd": 0.001})
     result = ToolResult(
-        output={"child_status": "completed"},
+        output={"subagent_status": "completed"},
         usage=usage,
         added_tool_names=("skill_tool",),
     )

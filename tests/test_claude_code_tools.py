@@ -8,13 +8,13 @@ from types import SimpleNamespace
 from typing import Any, Protocol
 
 import pytest
-from qitos.core.child import (
-    ChildHandle,
-    ChildInvocation,
-    ChildLaunchRequest,
-    ChildResult,
-    ChildRuntimeContext,
-    ChildStatus,
+from qitos.core.subagent import (
+    SubagentHandle,
+    SubagentInvocation,
+    SubagentLaunchRequest,
+    SubagentResult,
+    SubagentRuntimeContext,
+    SubagentStatus,
 )
 from qitos.core.tool_result import ToolResult
 
@@ -26,21 +26,21 @@ from qitos.kit.tool.internal.coding_utils import (
 )
 
 
-async def _ready_invocation(**kwargs: Any) -> ChildInvocation:
-    return ChildInvocation(**kwargs)
+async def _ready_invocation(**kwargs: Any) -> SubagentInvocation:
+    return SubagentInvocation(**kwargs)
 
 
-class _ChildResultReader(Protocol):
-    def child_result(self, handle: ChildHandle) -> ChildResult | None:
+class _SubagentResultReader(Protocol):
+    def subagent_result(self, handle: SubagentHandle) -> SubagentResult | None:
         ...
 
 
-async def _wait_for_child_result(
-    tool: _ChildResultReader,
-    handle: ChildHandle,
-) -> ChildResult:
+async def _wait_for_subagent_result(
+    tool: _SubagentResultReader,
+    handle: SubagentHandle,
+) -> SubagentResult:
     while True:
-        result = tool.child_result(handle)
+        result = tool.subagent_result(handle)
         if result is not None and result.ready:
             return result
         await asyncio.sleep(0)
@@ -252,20 +252,20 @@ class TestCronTools:
             assert result["count"] == 2
 
 
-# ── AgentTool ─────────────────────────────────────────────────────────────────
+# ── SubagentTool ─────────────────────────────────────────────────────────────────
 
 
-class TestAgentTool:
+class TestSubagentTool:
     def test_import(self):
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
-        assert AgentTool is not None
+        assert SubagentTool is not None
 
     @pytest.mark.asyncio
     async def test_call_without_prompt(self):
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
-        tool = AgentTool(invocation_factory=lambda request, _context: None)
+        tool = SubagentTool(invocation_factory=lambda request, _context: None)
         result = await tool.execute({"description": "missing task"})
         assert isinstance(result, ToolResult)
         assert result.status == "error"
@@ -278,7 +278,7 @@ class TestAgentTool:
 
         from qitos.core.budget import BudgetLedger
         from qitos.core.tool_result import ToolResult
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
         engines = []
         run_ids = []
@@ -286,7 +286,7 @@ class TestAgentTool:
         budget_ledger = BudgetLedger()
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 assert task.startswith("seeded:")
@@ -296,7 +296,7 @@ class TestAgentTool:
                 assert kwargs == {}
                 return SimpleNamespace(
                     state=SimpleNamespace(
-                        final_result="child result",
+                        final_result="subagent result",
                         stop_reason="final",
                     ),
                     step_count=3,
@@ -304,8 +304,8 @@ class TestAgentTool:
                 )
 
         def build_invocation(
-            request: ChildLaunchRequest,
-            runtime_context: ChildRuntimeContext,
+            request: SubagentLaunchRequest,
+            runtime_context: SubagentRuntimeContext,
         ):
             assert runtime_context.delegate_depth == 0
             assert runtime_context.budget_ledger is budget_ledger
@@ -318,7 +318,7 @@ class TestAgentTool:
             return _ready_invocation(engine=engine, task=f"seeded:{request.task}")
 
         @contextmanager
-        def execution_scope(runtime_context: ChildRuntimeContext):
+        def execution_scope(runtime_context: SubagentRuntimeContext):
             assert runtime_context.delegate_depth == 0
             scopes.append("enter")
             try:
@@ -326,13 +326,13 @@ class TestAgentTool:
             finally:
                 scopes.append("exit")
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=build_invocation,
             execution_scope=execution_scope,
             execution_mode="foreground",
-            child_profile="restricted",
-            child_allowed_tool_groups=("files", "network"),
-            child_working_directory="workspace",
+            subagent_profile="restricted",
+            subagent_allowed_tool_groups=("files", "network"),
+            subagent_working_directory="workspace",
         )
         first = await tool.execute(
             _agent_args("first task", "one"),
@@ -353,15 +353,15 @@ class TestAgentTool:
 
         assert isinstance(first, ToolResult)
         assert first.output["status"] == "success"
-        assert first.output["child_status"] == "completed"
+        assert first.output["subagent_status"] == "completed"
         assert first.is_success
         assert first.output["steps"] == 3
-        # Child token accounting moved to the typed usage carrier.
+        # Subagent token accounting moved to the typed usage carrier.
         assert "total_tokens" not in first.output
         assert first.usage is not None
         assert first.usage.total_tokens == 42
         assert second.output["status"] == "success"
-        assert second.output["child_status"] == "completed"
+        assert second.output["subagent_status"] == "completed"
         assert len(engines) == 2
         assert engines[0] is not engines[1]
         assert len(set(run_ids)) == 2
@@ -370,18 +370,18 @@ class TestAgentTool:
         assert "run_in_background" not in tool.spec.parameters
 
     @pytest.mark.asyncio
-    async def test_child_accounting_rides_the_typed_usage_carrier(self):
+    async def test_subagent_accounting_rides_the_typed_usage_carrier(self):
         from qitos.core.tool_result import ToolResult
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 _ = task, kwargs
                 return SimpleNamespace(
                     state=SimpleNamespace(
-                        final_result="child result",
+                        final_result="subagent result",
                         stop_reason="final",
                     ),
                     records=[],
@@ -394,7 +394,7 @@ class TestAgentTool:
                     local_cost_complete=True,
                 )
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, _context: _ready_invocation(
                 engine=FakeEngine(),
                 task=request.task,
@@ -416,7 +416,7 @@ class TestAgentTool:
         assert "total_cost_usd" not in result.output
         # Domain conclusion facts, including completeness flags, stay in output.
         assert result.output["status"] == "success"
-        assert result.output["child_status"] == "completed"
+        assert result.output["subagent_status"] == "completed"
         assert result.output["steps"] == 3
         assert result.output["usage_complete"] is True
         assert result.output["cost_complete"] is True
@@ -425,13 +425,13 @@ class TestAgentTool:
     @pytest.mark.asyncio
     async def test_background_launch_receipt_carries_no_finished_usage(self):
         from qitos.core.tool_result import ToolResult
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
         started = asyncio.Event()
         release = asyncio.Event()
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 _ = task, kwargs
@@ -448,7 +448,7 @@ class TestAgentTool:
                 _ = mode
                 release.set()
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, _context: _ready_invocation(
                 engine=FakeEngine(),
                 task=request.task,
@@ -463,7 +463,7 @@ class TestAgentTool:
         assert isinstance(result, ToolResult)
         assert result.is_success
         assert result.output["status"] == "running"
-        # A launch receipt has no finished Child accounting yet.
+        # A launch receipt has no finished Subagent accounting yet.
         assert result.usage is None
         await asyncio.wait_for(started.wait(), timeout=1)
         release.set()
@@ -471,9 +471,9 @@ class TestAgentTool:
 
     @pytest.mark.asyncio
     async def test_run_scoped_factory_rejects_recursive_agent(self):
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, context: None,
             execution_mode="foreground",
         )
@@ -485,14 +485,14 @@ class TestAgentTool:
         assert isinstance(result, ToolResult)
         assert result.status == "error"
         assert result.error is not None
-        assert "cannot launch another Agent" in result.error
+        assert "cannot launch another Subagent" in result.error
 
     @pytest.mark.asyncio
-    async def test_run_child_budget_rejects_calls_beyond_limit(self):
-        from qitos.kit.tool.agent import AgentTool
+    async def test_run_subagent_budget_rejects_calls_beyond_limit(self):
+        from qitos.kit.tool.subagent import SubagentTool
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 _ = task, kwargs
@@ -506,7 +506,7 @@ class TestAgentTool:
                     total_tokens=1,
                 )
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, _context: _ready_invocation(
                 engine=FakeEngine(),
                 task=request.task,
@@ -516,7 +516,7 @@ class TestAgentTool:
         context = {
             "delegate_depth": 0,
             "parent_run_id": "parent-run",
-            "max_children": 1,
+            "max_subagents": 1,
         }
 
         first = await tool.execute(
@@ -529,18 +529,18 @@ class TestAgentTool:
         )
 
         assert first.output["status"] == "success"
-        assert first.output["child_status"] == "completed"
+        assert first.output["subagent_status"] == "completed"
         assert isinstance(second, ToolResult)
         assert second.status == "error"
         assert second.error is not None
-        assert "max_children=1" in second.error
+        assert "max_subagents=1" in second.error
 
     @pytest.mark.asyncio
-    async def test_forced_background_children_launch_concurrently_and_notify_parent(
+    async def test_forced_background_subagents_launch_concurrently_and_notify_parent(
         self,
     ):
         from qitos.core.runtime_input import RuntimeInput
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
         both_started = asyncio.Event()
         release = asyncio.Event()
@@ -550,7 +550,7 @@ class TestAgentTool:
         events = []
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 nonlocal active, peak
@@ -577,7 +577,7 @@ class TestAgentTool:
                 assert mode == "immediate"
                 release.set()
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, _context: _ready_invocation(
                 engine=FakeEngine(),
                 task=request.task,
@@ -620,7 +620,7 @@ class TestAgentTool:
 
         assert len(events) == 2
         assert all(isinstance(event, RuntimeInput) for event in events)
-        assert {event.kind for event in events} == {"agent.child.completed"}
+        assert {event.kind for event in events} == {"agent.subagent.completed"}
         assert {event.payload["output"] for event in events} == {
             "validated:one",
             "validated:two",
@@ -632,7 +632,7 @@ class TestAgentTool:
     async def test_background_invocation_is_created_after_execution_slot_opens(self):
         from contextlib import asynccontextmanager
 
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
         waiting = asyncio.Event()
         open_slot = asyncio.Event()
@@ -649,7 +649,7 @@ class TestAgentTool:
             yield
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 _ = kwargs
@@ -664,8 +664,8 @@ class TestAgentTool:
                 _ = mode
 
         def invocation_factory(
-            request: ChildLaunchRequest,
-            runtime_context: ChildRuntimeContext,
+            request: SubagentLaunchRequest,
+            runtime_context: SubagentRuntimeContext,
         ):
             nonlocal received_parent_history, received_parent_snapshot
             factory_called.set()
@@ -673,7 +673,7 @@ class TestAgentTool:
             received_parent_snapshot = runtime_context.parent_history_snapshot
             return _ready_invocation(engine=FakeEngine(), task=request.task)
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=invocation_factory,
             execution_scope=execution_scope,
             execution_mode="background",
@@ -697,26 +697,26 @@ class TestAgentTool:
         assert not factory_called.is_set()
         parent_messages.append(object())
         open_slot.set()
-        handle = ChildHandle.from_dict(launched.output["handle"])
+        handle = SubagentHandle.from_dict(launched.output["handle"])
         result = await asyncio.wait_for(
-            _wait_for_child_result(tool, handle),
+            _wait_for_subagent_result(tool, handle),
             timeout=1,
         )
 
         assert factory_called.is_set()
         assert received_parent_history == (before_launch,)
         assert received_parent_snapshot == (before_launch,)
-        assert result is not None and result.status is ChildStatus.COMPLETED
+        assert result is not None and result.status is SubagentStatus.COMPLETED
         assert await tool.aclose(wait_seconds=0) == 0
 
     @pytest.mark.asyncio
-    async def test_background_child_becomes_terminal_before_event_delivery(self):
-        from qitos.kit.tool.agent import AgentTool
+    async def test_background_subagent_becomes_terminal_before_event_delivery(self):
+        from qitos.kit.tool.subagent import SubagentTool
 
         delivery_started = asyncio.Event()
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 _ = kwargs
@@ -735,7 +735,7 @@ class TestAgentTool:
             delivery_started.set()
             return True
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, _context: _ready_invocation(
                 engine=FakeEngine(),
                 task=request.task,
@@ -754,23 +754,23 @@ class TestAgentTool:
         assert launched.output["status"] == "running"
         await asyncio.wait_for(delivery_started.wait(), timeout=1)
         assert tool.active_background_count == 0
-        handle = ChildHandle.from_dict(launched.output["handle"])
-        terminal = tool.child_result(handle)
-        assert terminal is not None and terminal.status is ChildStatus.COMPLETED
-        assert tool.cancel_child(handle) is False
+        handle = SubagentHandle.from_dict(launched.output["handle"])
+        terminal = tool.subagent_result(handle)
+        assert terminal is not None and terminal.status is SubagentStatus.COMPLETED
+        assert tool.cancel_subagent(handle) is False
         assert await tool.aclose(wait_seconds=1) == 0
 
     @pytest.mark.asyncio
-    async def test_background_budget_stop_returns_partial_tool_evidence(self):
+    async def test_background_budget_stop_does_not_fabricate_a_conclusion(self):
         from qitos.core.message import AssistantMessage, ToolResultMessage
         from qitos.core.tool_result import ToolResult
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
         events = []
         completed = asyncio.Event()
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 assert task == "validate"
@@ -796,7 +796,7 @@ class TestAgentTool:
             def cancel(self, mode):
                 _ = mode
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, _context: _ready_invocation(
                 engine=FakeEngine(),
                 task=request.task,
@@ -822,31 +822,32 @@ class TestAgentTool:
 
         assert launched.output["status"] == "running"
         assert len(events) == 1
-        assert events[0].payload["status"] == "partial"
-        assert events[0].payload["child_status"] == "budget_exhausted"
+        assert events[0].payload["status"] == "error"
+        assert events[0].payload["subagent_status"] == "budget_exhausted"
         assert events[0].payload["stop_reason"] == "budget_exhausted"
-        assert "uid=33(www-data)" in events[0].payload["output"]
+        assert events[0].payload["output"] == ""
+        assert events[0].payload["conclusion"]["summary"] == ""
         assert await tool.aclose(wait_seconds=0) == 0
 
     @pytest.mark.asyncio
-    async def test_running_background_child_exposes_bounded_tool_evidence_snapshot(
+    async def test_running_background_subagent_exposes_bounded_tool_evidence_snapshot(
         self,
     ):
         from qitos.core.message import AssistantMessage, ToolResultMessage
         from qitos.core.tool_result import ToolResult
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
         started = asyncio.Event()
         cancelled = asyncio.Event()
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
             step_count = 20
             messages = [
                 message
                 for index in range(20)
                 for message in (
-                    AssistantMessage(text="private child reasoning"),
+                    AssistantMessage(text="private subagent reasoning"),
                     ToolResultMessage(
                         tool_call_id=f"call-{index}",
                         tool_name="shell",
@@ -877,7 +878,7 @@ class TestAgentTool:
                 assert mode == "immediate"
                 cancelled.set()
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, _context: _ready_invocation(
                 engine=FakeEngine(),
                 task=request.task,
@@ -900,27 +901,27 @@ class TestAgentTool:
 
         assert len(snapshots) == 1
         snapshot = snapshots[0]
-        assert snapshot.kind == "agent.child.snapshot"
-        assert snapshot.event_id == f"{launched.output['child_id']}:conclude-snapshot"
-        assert snapshot.payload["child_id"] == launched.output["child_id"]
+        assert snapshot.kind == "agent.subagent.snapshot"
+        assert snapshot.event_id == f"{launched.output['subagent_id']}:conclude-snapshot"
+        assert snapshot.payload["subagent_id"] == launched.output["subagent_id"]
         assert snapshot.payload["handle"] == launched.output["handle"]
         assert snapshot.payload["status"] == "running"
         assert snapshot.payload["name"] == "extension-bypass"
         assert snapshot.payload["description"] == "validate extension bypass"
         assert snapshot.payload["steps"] == 20
-        assert snapshot.payload["run_id"] == "child-run"
+        assert snapshot.payload["run_id"] == "subagent-run"
         assert "evidence-19" in snapshot.payload["output"]
         assert "evidence-0" not in snapshot.payload["output"]
-        assert "private child reasoning" not in snapshot.payload["output"]
+        assert "private subagent reasoning" not in snapshot.payload["output"]
         assert len(snapshot.payload["output"]) <= 16_000
         assert await tool.aclose(wait_seconds=1) == 0
 
     @pytest.mark.asyncio
-    async def test_completed_background_child_is_not_repeated_in_snapshot(self):
-        from qitos.kit.tool.agent import AgentTool
+    async def test_completed_background_subagent_is_not_repeated_in_snapshot(self):
+        from qitos.kit.tool.subagent import SubagentTool
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 _ = task, kwargs
@@ -935,7 +936,7 @@ class TestAgentTool:
             def cancel(self, mode):
                 _ = mode
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, _context: _ready_invocation(
                 engine=FakeEngine(),
                 task=request.task,
@@ -947,9 +948,9 @@ class TestAgentTool:
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
-        handle = ChildHandle.from_dict(launched.output["handle"])
+        handle = SubagentHandle.from_dict(launched.output["handle"])
         await asyncio.wait_for(
-            _wait_for_child_result(tool, handle),
+            _wait_for_subagent_result(tool, handle),
             timeout=1,
         )
 
@@ -957,14 +958,14 @@ class TestAgentTool:
         assert await tool.aclose(wait_seconds=0) == 0
 
     @pytest.mark.asyncio
-    async def test_close_cancels_a_running_background_child(self):
-        from qitos.kit.tool.agent import AgentTool
+    async def test_close_cancels_a_running_background_subagent(self):
+        from qitos.kit.tool.subagent import SubagentTool
 
         started = asyncio.Event()
         cancelled = asyncio.Event()
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 _ = task, kwargs
@@ -984,7 +985,7 @@ class TestAgentTool:
                 assert mode == "immediate"
                 cancelled.set()
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, _context: _ready_invocation(
                 engine=FakeEngine(),
                 task=request.task,
@@ -1002,14 +1003,14 @@ class TestAgentTool:
         assert cancelled.is_set()
 
     @pytest.mark.asyncio
-    async def test_close_drains_an_already_cancelled_child(self):
-        from qitos.kit.tool.agent import AgentTool
+    async def test_close_drains_an_already_cancelled_subagent(self):
+        from qitos.kit.tool.subagent import SubagentTool
 
         started = asyncio.Event()
         cancelled = asyncio.Event()
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 _ = task, kwargs
@@ -1029,7 +1030,7 @@ class TestAgentTool:
                 assert mode == "immediate"
                 cancelled.set()
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=lambda request, _context: _ready_invocation(
                 engine=FakeEngine(),
                 task=request.task,
@@ -1046,31 +1047,31 @@ class TestAgentTool:
         assert await tool.aclose(wait_seconds=0) == 0
 
     @pytest.mark.asyncio
-    async def test_close_wakes_a_child_waiting_for_an_execution_slot(self):
+    async def test_close_wakes_a_subagent_waiting_for_an_execution_slot(self):
         from contextlib import asynccontextmanager
 
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
         waiting = asyncio.Event()
-        child_started = asyncio.Event()
+        subagent_started = asyncio.Event()
         factory_called = asyncio.Event()
 
         @asynccontextmanager
-        async def blocked_scope(runtime_context: ChildRuntimeContext):
+        async def blocked_scope(runtime_context: SubagentRuntimeContext):
             waiting.set()
             cancelled = runtime_context.cancellation_requested
             while not cancelled():
                 await asyncio.sleep(0)
-            raise RuntimeError("cancelled before child slot opened")
+            raise RuntimeError("cancelled before subagent slot opened")
             yield  # pragma: no cover
 
         class FakeEngine(_ClosableEngine):
-            active_run_id = "child-run"
+            active_run_id = "subagent-run"
 
             async def arun(self, task, **kwargs):
                 _ = task, kwargs
-                child_started.set()
-                raise AssertionError("cancelled child unexpectedly started")
+                subagent_started.set()
+                raise AssertionError("cancelled subagent unexpectedly started")
 
             def cancel(self, mode):
                 _ = mode
@@ -1079,7 +1080,7 @@ class TestAgentTool:
             factory_called.set()
             return _ready_invocation(engine=FakeEngine(), task=request.task)
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=invocation_factory,
             execution_scope=blocked_scope,
             execution_mode="background",
@@ -1092,18 +1093,18 @@ class TestAgentTool:
         assert result.output["status"] == "running"
         await asyncio.wait_for(waiting.wait(), timeout=1)
         assert await tool.aclose(wait_seconds=1) == 0
-        handle = ChildHandle.from_dict(result.output["handle"])
-        terminal = tool.child_result(handle)
+        handle = SubagentHandle.from_dict(result.output["handle"])
+        terminal = tool.subagent_result(handle)
         assert terminal is not None
-        assert terminal.status is ChildStatus.CANCELLED
+        assert terminal.status is SubagentStatus.CANCELLED
         assert not factory_called.is_set()
-        assert not child_started.is_set()
+        assert not subagent_started.is_set()
 
     @pytest.mark.asyncio
-    async def test_background_child_deadline_expires_before_execution_slot_opens(self):
+    async def test_background_subagent_deadline_expires_before_execution_slot_opens(self):
         from contextlib import asynccontextmanager
 
-        from qitos.kit.tool.agent import AgentTool
+        from qitos.kit.tool.subagent import SubagentTool
 
         factory_called = asyncio.Event()
         never = asyncio.Event()
@@ -1117,7 +1118,7 @@ class TestAgentTool:
             factory_called.set()
             return _ready_invocation(engine=object(), task=request.task)
 
-        tool = AgentTool(
+        tool = SubagentTool(
             invocation_factory=invocation_factory,
             execution_scope=expired_scope,
             execution_mode="background",
@@ -1131,14 +1132,14 @@ class TestAgentTool:
             },
         )
 
-        handle = ChildHandle.from_dict(launched.output["handle"])
+        handle = SubagentHandle.from_dict(launched.output["handle"])
         terminal = await asyncio.wait_for(
-            _wait_for_child_result(tool, handle),
+            _wait_for_subagent_result(tool, handle),
             timeout=1,
         )
 
         assert terminal is not None
-        assert terminal.status is ChildStatus.BUDGET_EXHAUSTED
+        assert terminal.status is SubagentStatus.BUDGET_EXHAUSTED
         assert not factory_called.is_set()
         assert tool.active_background_count == 0
         assert await tool.aclose(wait_seconds=0) == 0

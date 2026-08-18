@@ -1,20 +1,20 @@
-"""Child Task binding: launch commits the narrowed Child Task durably."""
+"""Subagent Task binding: launch commits the narrowed Subagent Task durably."""
 
 from __future__ import annotations
 
 import pytest
 
-from qitos.core.child import (
-    ChildLaunchContext,
-    ChildLaunchRequest,
-    ChildStatus,
+from qitos.core.subagent import (
+    SubagentLaunchContext,
+    SubagentLaunchRequest,
+    SubagentStatus,
 )
 from qitos.core.journal import JournalRecordType
 from qitos.core.plan import Plan, PlanNode
 from qitos.core.task import Task, TaskBudget, TaskReference
-from qitos.kit.child import (
-    ChildSupervisor,
-    build_agent_child_invocation_factory,
+from qitos.kit.subagent import (
+    SubagentSupervisor,
+    build_agent_subagent_invocation_factory,
 )
 from qitos.kit.journal import JsonlSessionJournal, recover_session
 from qitos.kit.journal.turn_recorder import (
@@ -26,8 +26,8 @@ from qitos.kit.journal.turn_recorder import (
 from tests.core.agent_fakes import ScriptedModel, text_events
 
 
-def _children_root(tmp_path):
-    return tmp_path / "children"
+def _subagents_root(tmp_path):
+    return tmp_path / "subagents"
 
 
 async def _read_records(root, run_id: str):
@@ -40,15 +40,15 @@ async def _read_records(root, run_id: str):
 
 
 @pytest.mark.asyncio
-async def test_child_journal_commits_narrowed_task_before_input(tmp_path) -> None:
-    model = ScriptedModel([text_events("child answer", usage={"total_tokens": 7})])
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+async def test_subagent_journal_commits_narrowed_task_before_input(tmp_path) -> None:
+    model = ScriptedModel([text_events("subagent answer", usage={"total_tokens": 7})])
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         ),
-        child_journal_factory=lambda: JsonlSessionJournal(
-            _children_root(tmp_path)
+        subagent_journal_factory=lambda: JsonlSessionJournal(
+            _subagents_root(tmp_path)
         ),
     )
     parent_journal = JsonlSessionJournal(tmp_path / "parent")
@@ -67,9 +67,9 @@ async def test_child_journal_commits_narrowed_task_before_input(tmp_path) -> Non
         record_id="parent-run:plan:initial",
     )
 
-    request = ChildLaunchRequest(
+    request = SubagentLaunchRequest(
         task="enumerate the target",
-        description="enumeration child",
+        description="enumeration subagent",
         success_criteria=("Return verified service evidence",),
         constraints={"scope": "primary"},
         references=(
@@ -81,22 +81,22 @@ async def test_child_journal_commits_narrowed_task_before_input(tmp_path) -> Non
     )
     result = await supervisor.launch(
         request,
-        ChildLaunchContext(parent_run_id="parent-run", journal=parent_journal),
+        SubagentLaunchContext(parent_run_id="parent-run", journal=parent_journal),
         background=False,
     )
-    assert result.status is ChildStatus.COMPLETED
+    assert result.status is SubagentStatus.COMPLETED
 
     started = [
         record
         for record in await parent_journal.replay()
-        if record.type is JournalRecordType.CHILD_STARTED
+        if record.type is JournalRecordType.SUBAGENT_STARTED
     ]
     assert len(started) == 1
     embedded = started[0].payload["request"]
     assert embedded["parent_task_id"] == "root-task"
     assert embedded["plan_assignment"] == "plan-node-1"
 
-    records = await _read_records(_children_root(tmp_path), result.child_run_id)
+    records = await _read_records(_subagents_root(tmp_path), result.subagent_run_id)
     ordering = [record.type for record in records]
     assert ordering.index(JournalRecordType.TASK_CREATED) < ordering.index(
         JournalRecordType.INPUT_ACCEPTED
@@ -107,7 +107,7 @@ async def test_child_journal_commits_narrowed_task_before_input(tmp_path) -> Non
         if record.type is JournalRecordType.TASK_CREATED
     )
     definition = decode_task_created(created.payload)
-    assert definition.task_id == result.handle.child_id
+    assert definition.task_id == result.handle.subagent_id
     assert definition.parent_task_id == "root-task"
     assert definition.objective == "enumerate the target"
     assert definition.success_criteria == ("Return verified service evidence",)
@@ -120,10 +120,10 @@ async def test_child_journal_commits_narrowed_task_before_input(tmp_path) -> Non
     assert definition.plan_assignment == "plan-node-1"
 
     recovered = recover_session(records)
-    projected = recovered.tasks[result.handle.child_id]
+    projected = recovered.tasks[result.handle.subagent_id]
     assert projected.definition == definition
     assert projected.lifecycle.status.value == "completed"
-    # A Child Task is not a Root Task of its own lineage.
+    # A Subagent Task is not a Root Task of its own lineage.
     assert recovered.unfinished_root is None
 
     await supervisor.aclose()
@@ -131,28 +131,28 @@ async def test_child_journal_commits_narrowed_task_before_input(tmp_path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_child_launch_defaults_keep_task_binding_empty(tmp_path) -> None:
-    model = ScriptedModel([text_events("child answer")])
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+async def test_subagent_launch_defaults_keep_task_binding_empty(tmp_path) -> None:
+    model = ScriptedModel([text_events("subagent answer")])
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         ),
     )
     result = await supervisor.launch(
-        ChildLaunchRequest(task="inspect", description="inspect child"),
-        ChildLaunchContext(parent_run_id="parent-run"),
+        SubagentLaunchRequest(task="inspect", description="inspect subagent"),
+        SubagentLaunchContext(parent_run_id="parent-run"),
         background=False,
     )
-    assert result.status is ChildStatus.COMPLETED
-    records = await _read_records(_children_root(tmp_path), result.child_run_id)
+    assert result.status is SubagentStatus.COMPLETED
+    records = await _read_records(_subagents_root(tmp_path), result.subagent_run_id)
     created = next(
         record
         for record in records
         if record.type is JournalRecordType.TASK_CREATED
     )
     definition = decode_task_created(created.payload)
-    assert definition.task_id == result.handle.child_id
+    assert definition.task_id == result.handle.subagent_id
     assert definition.parent_task_id is None
     assert definition.plan_assignment is None
     await supervisor.aclose()

@@ -26,7 +26,7 @@ Agent façade / Session Harness
 ├── prompt / steer / follow-up / abort / idle
 ├── goal-bearing Task + transcript + operation records
 ├── compact / resume / fork / pure recovery
-└── Tool / Runtime / Skill / MCP / Plan / Child primitives
+└── Tool / Runtime / Skill / MCP / Plan / Subagent primitives
         │
         ▼
 application composition
@@ -112,7 +112,7 @@ The log carries two typed record families in one sequence:
   diagnostic), `model.change` / `thinking.change` / `tools.change`
   (per-turn configuration freeze diffs), `budget.step_reserved` (atomic
   Root-lineage model admission), `budget.committed` (settled token/cost usage),
-  `process.*`, `child.*`, `runtime_input.posted` / `runtime_input.consumed`,
+  `process.*`, `subagent.*`, `runtime_input.posted` / `runtime_input.consumed`,
   `task.*`, `plan.updated`, `run.forked` and `journal.inherited`.
 
 Records that carry references resolve fail closed through `journal.inherited`
@@ -194,7 +194,7 @@ not belong to Task. They remain at recipe/application boundaries and reference T
 id. The existing Task schema is replaced in place; there is no Goal alias, TaskV2 or
 compatibility mirror.
 
-## 6. Plan and Child
+## 6. Plan and Subagent
 
 Plan is a dependency-aware graph with stable node identity, owner and explicit state.
 `ready` is a derived view of a pending node whose dependencies are completed, not a
@@ -207,30 +207,44 @@ does not inherit the previous Task's strategy. TODO
 Markdown is a deterministic projection of the committed Plan, never an editable
 second truth.
 
-Plan is optional and uses one contract for Root and Child. Root normally uses a graph
-with dependencies and Child owners. A simple Child may have no Plan, or use the same
-graph with no dependencies or owners as a linear TODO. Parent and Child Plans remain
-independent; a Child conclusion drives the parent assignment node but the Child Plan is
+Plan is optional and uses one contract for Root and Subagent. Root normally uses a graph
+with dependencies and Subagent owners. A simple Subagent may have no Plan, or use the same
+graph with no dependencies or owners as a linear TODO. Parent and Subagent Plans remain
+independent; a Subagent conclusion drives the parent assignment node but the Subagent Plan is
 never merged into the parent Plan.
 
-Root and Child use the same Agent implementation. A Child has its own Task, Session,
+Root and Subagent use the same Agent implementation. A Subagent has its own Task, Session,
 optional Plan, context and cancellation domain; authorization and budgets only narrow.
 Root and every descendant reserve each model step through one durable, async-safe
-lineage ledger before the provider request. A Child's `max_steps` is only a local cap
+lineage ledger before the provider request. A Subagent's `max_steps` is only a local cap
 within the shared remaining total. Concurrent admission is serialized, and deterministic
 reservation ids make resume/fork replay idempotent without resetting or double-charging
 the lineage.
-Launch commits the accepted parent Plan assignment before Child lifecycle persistence
+
+Each active Subagent also owns one process-local claim on a shared step for its final
+natural-language answer. Work-step admission counts all live claims, so concurrent
+Subagents cannot consume one another's conclusion capacity. At the local/shared step
+boundary, or after settled usage crosses a token/cost limit, the Subagent receives one
+same-context follow-up turn with an empty Tool exposure. If it already returned useful
+final text, its unused claim is released immediately. The model's final assistant text
+is the canonical conclusion: a typed conclusion projector may attach stable evidence,
+resource, failure, unknown and next-step references, but cannot author or replace the
+summary. An empty final turn remains an explicit missing conclusion; the Supervisor
+does not synthesize prose from Tool results, Plan state or Journal records. Claims are
+not persisted because a crash interrupts the live Agent; only provider admissions and
+settled usage remain durable. Explicit cancellation and an expired absolute deadline
+remain hard boundaries.
+Launch commits the accepted parent Plan assignment before Subagent lifecycle persistence
 and runtime construction. When the parent Task already has a durable Plan, launch
 requires an explicit ready assignment; a parent Task without a Plan may still launch
-an unassigned Child. `ChildLaunchRequest` carries explicit success criteria,
+an unassigned Subagent. `SubagentLaunchRequest` carries explicit success criteria,
 inherited Task constraints/references and the frozen parent Permission context; the
 built-in factory rejects conflicting Permission values. Independent Agent Tool calls
 may execute concurrently through the bounded, concurrency-safe Tool path while results
-remain in input order. A typed conclusion factory runs before Child cleanup and can
+remain in input order. A typed conclusion factory runs before Subagent cleanup and can
 project committed application facts into evidence/resource refs, failure paths,
-unknowns and next steps. Parent control uses stable handles and bounded conclusions,
-never live Agents or Child transcripts.
+unknowns and next steps while preserving the model-authored summary. Parent control uses
+stable handles and bounded conclusions, never live Agents or Subagent transcripts.
 
 ## 7. Tool, Runtime and extension boundary
 
@@ -240,7 +254,7 @@ without requiring a class for each one. One frozen exposure drives both model sc
 and dispatch for a turn.
 
 QitOS owns reusable file, Shell/PTY, managed process, Artifact, Skill, MCP, Permission,
-Plan and Child primitives. Product-specific drivers, pentest semantics and product
+Plan and Subagent primitives. Product-specific drivers, pentest semantics and product
 plugin systems stay in applications. QitOS does not provide a general product plugin
 loader or arbitrary loop/Session hooks.
 
@@ -257,7 +271,7 @@ loader or arbitrary loop/Session hooks.
 - Cancellation is re-raised after started work reaches durable terminal records when
   canonical appends settle; an append failure or unknown outcome instead requires
   close-and-replay recovery and never permits a Run terminal across an open Tool call.
-- Runtime and Child concurrency are bounded and leave no detached tasks.
-- Concurrent Root/Child model requests cannot oversubscribe the durable lineage step
+- Runtime and Subagent concurrency are bounded and leave no detached tasks.
+- Concurrent Root/Subagent model requests cannot oversubscribe the durable lineage step
   budget; token/cost totals settle exactly once after each model terminal.
 - The outermost CLI/application is the only sync-to-async boundary.

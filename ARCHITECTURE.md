@@ -29,7 +29,7 @@ Agent façade / Session Harness
 ├── prompt / steer / follow-up / abort / idle
 ├── goal-bearing Task + transcript + operation records
 ├── compact / resume / fork / pure recovery
-└── Tool / Runtime / Skill / MCP / Plan / Child primitives
+└── Tool / Runtime / Skill / MCP / Plan / Subagent primitives
         │
         ▼
 application composition
@@ -70,7 +70,7 @@ migration gate. Trace and UI projections are never recovery truth.
 ### Reusable concrete capabilities
 
 `qitos.kit` owns reusable storage, Runtime, file/Shell/managed-process Tools, Skill,
-MCP, Artifact, Permission, Plan and Child implementations. Concrete capability does not
+MCP, Artifact, Permission, Plan and Subagent implementations. Concrete capability does not
 automatically become a stable core interface.
 
 ### Applications and benchmarks
@@ -81,19 +81,24 @@ result-file evaluation and application-owned benchmark integration stay outside 
 Agent loop, Task, Session and Tool executor. Product-grade agents live outside the
 QitOS kernel repository.
 
-## Target Task, Plan and Child
+## Task, Plan and Subagent
 
 The remaining Task/Plan migration will make every Root execution commit one
 goal-bearing Task before external side effects. Task owns objective, success criteria,
 constraints, budget and lifecycle. Plan is a revisable dependency graph, never a second
 Task/Goal truth.
 
-Root and Child use the same Agent implementation. A Child has an independent Task,
+Root and Subagent use the same Agent implementation. A Subagent has an independent Task,
 Session, Plan and cancellation domain while authorization and budget only narrow. The
 parent stores a stable handle and bounded conclusion, not a live Agent or transcript.
-Every descendant reserves model steps from one Root-lineage ledger before provider
-admission; a Child's local step budget is a cap within that shared total, not an
-additional allowance.
+Every active Subagent holds one shared model-step slot for its final natural-language
+answer. Ordinary work cannot consume that slot; on a step boundary or a token/cost
+crossing, the same conversation gets one tool-free conclusion turn. A useful answer
+produced earlier releases the hold. The Supervisor never composes an answer from Tool,
+Plan, or journal facts, and hard cancellation or an expired absolute deadline is not
+bypassed. All model steps still reserve durably from one Root-lineage ledger before
+provider admission, and a Subagent's local step budget remains a cap within that shared
+total rather than an additional allowance.
 
 ## Repository invariants
 

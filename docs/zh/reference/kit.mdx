@@ -49,11 +49,13 @@ from qitos.harness import build_harness_policy, build_model_for_preset
 ### 规划
 
 - `UpdatePlanTool` / `update_plan`：把完整的依赖图 Plan 提交到当前 Session journal。Node
-  使用稳定 id、dependencies、显式持久状态和可选 Child owner；readiness 由已完成依赖派生。
+  使用稳定 id、dependencies、显式持久状态和可选 Subagent owner；readiness 由已完成依赖派生。
   空 Plan 不产生 TODO 投影，无依赖、无 owner 的 Plan 投影为普通 TODO。
 
-模型不能自行写入 Child owner。调用 Agent Tool 时把 ready node id 作为 `plan_assignment`；Child
-supervisor 会先把生成的稳定 handle 提交到 Plan，再写入 `child.started`。
+模型不能自行写入 Subagent owner。调用 `subagent` Tool 时把 ready node id 作为
+`plan_assignment`；Subagent supervisor 会先把生成的稳定 handle 提交到 Plan，再写入
+`subagent.started`。每个活跃 Subagent 会从共享 step 预算中保留一次无 Tool 的结论交互；模型
+最终写出的自然语言是唯一结论，Supervisor 不会用 Tool、Plan 或 Journal 内容代写。
 
 ---
 

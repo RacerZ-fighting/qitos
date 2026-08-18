@@ -85,11 +85,13 @@ pipeline: validation, permission, bounded concurrency, timeout, and exactly one
 terminal `ToolResult` per call — including denied, timed-out, and cancelled
 calls. Parallel batches commit results in input order.
 
-### Child agents
+### Subagents
 
-Children run on the same `Agent` implementation as the parent with narrowed
+Subagents run on the same `Agent` implementation as the parent with narrowed
 tools and budgets. A Run-owned supervisor provides durable handles, background
-execution, parent messages, waits, interrupts, and journal-backed recovery.
+execution, parent messages, waits, interrupts, and journal-backed recovery. Each
+active Subagent keeps one shared step for a tool-free final answer; the Supervisor
+delivers that model-authored text without synthesizing a replacement.
 
 ### MCP integration
 
@@ -129,7 +131,7 @@ Domain agents are still ordinary QitOS agents — they do not need a separate ru
 
 - prompt policy
 - tool composition
-- child-agent decomposition
+- subagent decomposition
 
 This makes specialization easier to reason about and easier to reproduce.
 
@@ -152,7 +154,7 @@ QitOS is currently **Beta**. Trace/qita behavior and canonical durable records r
     Install QitOS and its optional extras
   </Card>
   <Card title="Kit reference" icon="toolbox" href="/reference/kit">
-    Explore pre-built tools, memory, environments, child agents, and models
+    Explore pre-built tools, memory, environments, subagents, and models
   </Card>
   <Card title="Tracing & qita" icon="chart-line" href="/guides/observability">
     Learn how QitOS makes every run inspectable, replayable, and exportable

@@ -26,10 +26,10 @@ class UpdatePlanTool(BaseTool):
         owner_schema = {
             "type": "object",
             "properties": {
-                "child_id": {"type": "string"},
+                "subagent_id": {"type": "string"},
                 "parent_run_id": {"type": "string"},
             },
-            "required": ["child_id", "parent_run_id"],
+            "required": ["subagent_id", "parent_run_id"],
             "additionalProperties": False,
         }
         super().__init__(
@@ -38,7 +38,7 @@ class UpdatePlanTool(BaseTool):
                 description=(
                     "Replace the current dependency-aware execution Plan. Keep "
                     "existing nodes when revising work; readiness is derived from "
-                    "completed dependencies. Child owners are assigned by the Agent "
+                    "completed dependencies. Subagent owners are assigned by the Agent "
                     "launch boundary, not invented here."
                 ),
                 input_schema={

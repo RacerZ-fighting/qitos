@@ -7,7 +7,12 @@ QitOS public API surface.
 
 __version__ = "0.6.0"
 
-from .core.budget import BudgetLedger, BudgetSnapshot, StepBudgetExhaustedError
+from .core.budget import (
+    BudgetLedger,
+    BudgetSnapshot,
+    StepBudgetExhaustedError,
+    StepPurpose,
+)
 from .core.env import Env, EnvSpec
 from .core.memory import Memory
 from .core.model_response import ModelResponse, ModelTiming
@@ -15,18 +20,18 @@ from .core.model_request import ModelContinuation, ModelRequest
 from .core.model_stream import ModelStreamEvent, ModelStreamEventType
 from .core.thinking import ThinkingLevel, clamp_thinking_level
 from .core.runtime_input import RuntimeInput
-from .core.child import (
-    DEFAULT_CHILD_MAX_STEPS,
+from .core.subagent import (
+    DEFAULT_SUBAGENT_MAX_STEPS,
     AgentConclusion,
-    ChildHandle,
-    ChildInvocationCancelled,
-    ChildLaunchContext,
-    ChildLaunchRequest,
-    ChildPersistenceError,
-    ChildRunLimitError,
-    ChildResult,
-    ChildRuntimeContext,
-    ChildStatus,
+    SubagentHandle,
+    SubagentInvocationCancelled,
+    SubagentLaunchContext,
+    SubagentLaunchRequest,
+    SubagentPersistenceError,
+    SubagentRunLimitError,
+    SubagentResult,
+    SubagentRuntimeContext,
+    SubagentStatus,
 )
 from .core.process import (
     ProcessError,
@@ -103,18 +108,19 @@ __all__ = [
     "BudgetLedger",
     "BudgetSnapshot",
     "StepBudgetExhaustedError",
+    "StepPurpose",
     "RuntimeInput",
-    "DEFAULT_CHILD_MAX_STEPS",
+    "DEFAULT_SUBAGENT_MAX_STEPS",
     "AgentConclusion",
-    "ChildHandle",
-    "ChildInvocationCancelled",
-    "ChildLaunchContext",
-    "ChildLaunchRequest",
-    "ChildPersistenceError",
-    "ChildRunLimitError",
-    "ChildResult",
-    "ChildRuntimeContext",
-    "ChildStatus",
+    "SubagentHandle",
+    "SubagentInvocationCancelled",
+    "SubagentLaunchContext",
+    "SubagentLaunchRequest",
+    "SubagentPersistenceError",
+    "SubagentRunLimitError",
+    "SubagentResult",
+    "SubagentRuntimeContext",
+    "SubagentStatus",
     "ProcessError",
     "ProcessHandle",
     "ProcessNotFoundError",

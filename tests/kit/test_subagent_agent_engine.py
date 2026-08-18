@@ -1,4 +1,4 @@
-"""Façade-driven child agents: launch, interrupt, mailbox and journal recovery."""
+"""Façade-driven Subagents: launch, interrupt, mailbox and journal recovery."""
 
 from __future__ import annotations
 
@@ -9,12 +9,12 @@ import pytest
 
 from qitos.core.budget import BudgetLedger
 from qitos.core.agent_loop import NextTurnUpdate
-from qitos.core.child import (
-    ChildHandle,
-    ChildLaunchContext,
-    ChildLaunchRequest,
-    ChildPersistenceError,
-    ChildStatus,
+from qitos.core.subagent import (
+    SubagentHandle,
+    SubagentLaunchContext,
+    SubagentLaunchRequest,
+    SubagentPersistenceError,
+    SubagentStatus,
 )
 from qitos.core.journal import (
     JournalAppendCancelled,
@@ -32,14 +32,14 @@ from qitos.core.tool import ToolPermissionContext, ToolPermissionRule, tool
 from qitos.core.tool_executor import AfterToolCallOverride
 from qitos.core.tool_registry import ToolRegistry
 from qitos.core.runtime_input import RuntimeInput
-from qitos.kit.child import (
-    AgentChildEngine,
-    ChildSupervisor,
-    build_agent_child_invocation_factory,
+from qitos.kit.subagent import (
+    AgentSubagentEngine,
+    SubagentSupervisor,
+    build_agent_subagent_invocation_factory,
 )
 from qitos.kit.journal import JsonlSessionJournal, recover_session
 from qitos.kit.journal.turn_recorder import encode_plan_updated, encode_task_created
-from qitos.kit.tool.agent import AgentTool
+from qitos.kit.tool.subagent import SubagentTool
 
 from tests.core.agent_fakes import (
     ScriptedModel,
@@ -54,12 +54,12 @@ def _echo(text: str) -> str:
     return f"echo:{text}"
 
 
-def _request(task: str, **kwargs: object) -> ChildLaunchRequest:
-    return ChildLaunchRequest(task=task, description=f"{task} task", **kwargs)
+def _request(task: str, **kwargs: object) -> SubagentLaunchRequest:
+    return SubagentLaunchRequest(task=task, description=f"{task} task", **kwargs)
 
 
-def _context(**kwargs: object) -> ChildLaunchContext:
-    return ChildLaunchContext(parent_run_id="parent-run", **kwargs)
+def _context(**kwargs: object) -> SubagentLaunchContext:
+    return SubagentLaunchContext(parent_run_id="parent-run", **kwargs)
 
 
 def _terminal_result_payload(records, terminal):
@@ -75,16 +75,16 @@ def _terminal_result_payload(records, terminal):
     return entry.payload["message"]["result"]
 
 
-def _children_root(tmp_path):
-    return tmp_path / "children"
+def _subagents_root(tmp_path):
+    return tmp_path / "subagents"
 
 
-def _child_journal_factory(tmp_path):
-    return lambda: JsonlSessionJournal(_children_root(tmp_path))
+def _subagent_journal_factory(tmp_path):
+    return lambda: JsonlSessionJournal(_subagents_root(tmp_path))
 
 
-async def _read_child_records(tmp_path, run_id: str):
-    journal = JsonlSessionJournal(_children_root(tmp_path))
+async def _read_subagent_records(tmp_path, run_id: str):
+    journal = JsonlSessionJournal(_subagents_root(tmp_path))
     await journal.open(run_id)
     try:
         return await journal.replay()
@@ -93,22 +93,22 @@ async def _read_child_records(tmp_path, run_id: str):
 
 
 @pytest.mark.asyncio
-async def test_foreground_child_completes_and_journals_turns(tmp_path) -> None:
+async def test_foreground_subagent_completes_and_journals_turns(tmp_path) -> None:
     model = ScriptedModel(
-        [text_events("child answer", usage={"total_tokens": 7})]
+        [text_events("subagent answer", usage={"total_tokens": 7})]
     )
     finalized_run_ids: list[str] = []
 
     async def _finalize(run_id: str) -> None:
         finalized_run_ids.append(run_id)
 
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
             run_finalizer=_finalize,
         ),
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
     parent_journal = JsonlSessionJournal(tmp_path / "parent")
     await parent_journal.create("parent-run", {})
@@ -119,45 +119,45 @@ async def test_foreground_child_completes_and_journals_turns(tmp_path) -> None:
         background=False,
     )
 
-    assert result.status is ChildStatus.COMPLETED
-    assert result.conclusion.summary == "child answer"
+    assert result.status is SubagentStatus.COMPLETED
+    assert result.conclusion.summary == "subagent answer"
     assert result.steps == 1
     assert result.total_tokens == 7
     assert result.usage_complete is True
     assert result.cost_complete is False
-    assert result.child_run_id
-    assert finalized_run_ids == [result.child_run_id]
+    assert result.subagent_run_id
+    assert finalized_run_ids == [result.subagent_run_id]
 
     parent_records = await parent_journal.replay()
-    child_started = [
+    subagent_started = [
         record
         for record in parent_records
-        if record.type is JournalRecordType.CHILD_STARTED
+        if record.type is JournalRecordType.SUBAGENT_STARTED
     ]
-    child_terminal = [
+    subagent_terminal = [
         record
         for record in parent_records
-        if record.type is JournalRecordType.CHILD_TERMINAL
+        if record.type is JournalRecordType.SUBAGENT_TERMINAL
     ]
-    assert len(child_started) == len(child_terminal) == 1
-    assert child_terminal[0].payload["status"] == ChildStatus.COMPLETED.value
+    assert len(subagent_started) == len(subagent_terminal) == 1
+    assert subagent_terminal[0].payload["status"] == SubagentStatus.COMPLETED.value
 
-    child_records = await _read_child_records(tmp_path, result.child_run_id)
-    child_types = [record.type for record in child_records]
-    assert child_types[0] is JournalRecordType.RUN_STARTED
-    assert child_types.index(JournalRecordType.TASK_CREATED) < child_types.index(
+    subagent_records = await _read_subagent_records(tmp_path, result.subagent_run_id)
+    subagent_types = [record.type for record in subagent_records]
+    assert subagent_types[0] is JournalRecordType.RUN_STARTED
+    assert subagent_types.index(JournalRecordType.TASK_CREATED) < subagent_types.index(
         JournalRecordType.INPUT_ACCEPTED
     )
-    assert JournalRecordType.MODEL_COMPLETED in child_types
-    assert JournalRecordType.STEP_COMMITTED in child_types
-    assert child_types.index(JournalRecordType.TASK_TRANSITION) < child_types.index(
+    assert JournalRecordType.MODEL_COMPLETED in subagent_types
+    assert JournalRecordType.STEP_COMMITTED in subagent_types
+    assert subagent_types.index(JournalRecordType.TASK_TRANSITION) < subagent_types.index(
         JournalRecordType.RUN_COMPLETED
     )
-    assert child_types[-1] is JournalRecordType.RUN_COMPLETED
-    terminal = child_records[-1]
-    assert terminal.record_id == f"{result.child_run_id}:run:terminal"
+    assert subagent_types[-1] is JournalRecordType.RUN_COMPLETED
+    terminal = subagent_records[-1]
+    assert terminal.record_id == f"{result.subagent_run_id}:run:terminal"
     assert terminal.payload["status"] == "completed"
-    recovered = recover_session(child_records)
+    recovered = recover_session(subagent_records)
     task = next(iter(recovered.tasks.values()))
     assert task.lifecycle.status is TaskStatus.COMPLETED
     assert task.lifecycle.usage is not None
@@ -167,7 +167,75 @@ async def test_foreground_child_completes_and_journals_turns(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
+async def test_empty_subagent_answer_gets_one_same_context_conclusion_follow_up(
+    tmp_path,
+) -> None:
+    model = ScriptedModel([text_events(""), text_events("final conclusion")])
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=model,
+            journal_directory=_subagents_root(tmp_path),
+            max_turns=3,
+        )
+    )
+
+    result = await supervisor.launch(
+        _request("inspect"),
+        _context(),
+        background=False,
+    )
+
+    assert result.status is SubagentStatus.COMPLETED
+    assert result.conclusion.summary == "final conclusion"
+    assert result.steps == 2
+    assert len(model.requests) == 2
+    follow_up_messages = [
+        message
+        for message in model.requests[1].message_dicts()
+        if message.get("role") == "user"
+    ]
+    assert len(follow_up_messages) == 2
+    assert str(follow_up_messages[-1]["content"]).strip()
+    assert follow_up_messages[-1]["content"] != follow_up_messages[0]["content"]
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_empty_conclusion_retry_fails_without_fabricating_tool_output(
+    tmp_path,
+) -> None:
+    model = ScriptedModel(
+        [
+            tool_events([tool_call_wire("c1", "echo", {"text": "evidence"})]),
+            text_events(""),
+            text_events(""),
+        ]
+    )
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=model,
+            tool_registry=ToolRegistry().register(_echo),
+            journal_directory=_subagents_root(tmp_path),
+            max_turns=4,
+        )
+    )
+
+    result = await supervisor.launch(
+        _request("inspect"),
+        _context(),
+        background=False,
+    )
+
+    assert result.status is SubagentStatus.FAILED
+    assert result.conclusion.summary == ""
+    assert result.error is not None
+    assert "final answer" in result.error
+    assert len(model.requests) == 3
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
     parent_journal = JsonlSessionJournal(tmp_path / "parent-plan")
     await parent_journal.create("parent-run", {})
     parent_task = Task(
@@ -191,10 +259,10 @@ async def test_agent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
         ),
         record_id="parent-run:plan:initial",
     )
-    agent_tool = AgentTool(
-        invocation_factory=build_agent_child_invocation_factory(
-            model=ScriptedModel([text_events("child answer")]),
-            journal_directory=_children_root(tmp_path),
+    subagent_tool = SubagentTool(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=ScriptedModel([text_events("subagent answer")]),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
     permission = ToolPermissionContext(
@@ -204,7 +272,7 @@ async def test_agent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
         ),
     )
 
-    result = await agent_tool.execute(
+    result = await subagent_tool.execute(
         {
             "description": "inspect",
             "prompt": "inspect",
@@ -222,24 +290,27 @@ async def test_agent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
     started = next(
         record
         for record in await parent_journal.replay()
-        if record.type is JournalRecordType.CHILD_STARTED
+        if record.type is JournalRecordType.SUBAGENT_STARTED
     )
 
-    assert result.output["child_status"] == ChildStatus.COMPLETED.value
+    assert result.output["subagent_status"] == SubagentStatus.COMPLETED.value
     assert started.payload["request"]["parent_task_id"] == "parent-task"
     assert started.payload["request"]["plan_assignment"] == "delegate"
-    child_records = await _read_child_records(tmp_path, result.output["run_id"])
-    child_task = next(iter(recover_session(child_records).tasks.values())).definition
-    assert child_task.success_criteria == ("Return the inspection result",)
-    assert child_task.constraints == parent_task.constraints
-    assert child_task.references == parent_task.references
+    subagent_records = await _read_subagent_records(
+        tmp_path,
+        result.output["subagent_run_id"],
+    )
+    subagent_task = next(iter(recover_session(subagent_records).tasks.values())).definition
+    assert subagent_task.success_criteria == ("Return the inspection result",)
+    assert subagent_task.constraints == parent_task.constraints
+    assert subagent_task.references == parent_task.references
     assert started.payload["request"]["permission_context"] == permission.to_dict()
-    await agent_tool.aclose()
+    await subagent_tool.aclose()
     await parent_journal.close()
 
 
 @pytest.mark.asyncio
-async def test_child_tool_evidence_commits_in_order(tmp_path) -> None:
+async def test_subagent_tool_evidence_commits_in_order(tmp_path) -> None:
     registry = ToolRegistry().register(_echo)
     model = ScriptedModel(
         [
@@ -247,13 +318,13 @@ async def test_child_tool_evidence_commits_in_order(tmp_path) -> None:
             text_events("done with echo:ping"),
         ]
     )
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         ),
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
 
     result = await supervisor.launch(
@@ -262,28 +333,28 @@ async def test_child_tool_evidence_commits_in_order(tmp_path) -> None:
         background=False,
     )
 
-    assert result.status is ChildStatus.COMPLETED
+    assert result.status is SubagentStatus.COMPLETED
     assert result.steps == 2
     assert result.conclusion.summary == "done with echo:ping"
-    child_records = await _read_child_records(tmp_path, result.child_run_id)
+    subagent_records = await _read_subagent_records(tmp_path, result.subagent_run_id)
     tool_terminal = [
         record
-        for record in child_records
+        for record in subagent_records
         if record.type is JournalRecordType.TOOL_TERMINAL
     ]
     assert len(tool_terminal) == 1
     assert (
         tool_terminal[0].record_id
-        == f"{result.child_run_id}:turn:0:tool:c1:terminal"
+        == f"{result.subagent_run_id}:turn:0:tool:c1:terminal"
     )
-    assert _terminal_result_payload(child_records, tool_terminal[0])["output"] == (
+    assert _terminal_result_payload(subagent_records, tool_terminal[0])["output"] == (
         "echo:ping"
     )
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_child_engine_composes_product_turn_hooks(tmp_path) -> None:
+async def test_subagent_engine_composes_product_turn_hooks(tmp_path) -> None:
     model = ScriptedModel(
         [
             tool_events([tool_call_wire("c1", "echo", {"text": "ping"})]),
@@ -293,7 +364,7 @@ async def test_child_engine_composes_product_turn_hooks(tmp_path) -> None:
     observed: list[str] = []
 
     def transform(messages):
-        return [*messages, UserMessage(content="projected child state")]
+        return [*messages, UserMessage(content="projected subagent state")]
 
     def before(context):
         observed.append(f"before:{context.tool_call.name}")
@@ -301,41 +372,41 @@ async def test_child_engine_composes_product_turn_hooks(tmp_path) -> None:
 
     def after(context):
         observed.append(f"after:{context.tool_call.name}")
-        return AfterToolCallOverride(output="rewritten child result")
+        return AfterToolCallOverride(output="rewritten subagent result")
 
     def prepare(context):
         observed.append(f"prepare:{context.turn}")
-        return NextTurnUpdate(system_prompt="updated child instructions")
+        return NextTurnUpdate(system_prompt="updated subagent instructions")
 
     def should_stop(context):
         observed.append(f"stop:{context.turn}")
         return context.turn == 1
 
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=model,
         tool_registry=ToolRegistry().register(_echo),
-        system_prompt="initial child instructions",
+        system_prompt="initial subagent instructions",
         transform_context=transform,
         before_tool_call=before,
         after_tool_call=after,
         prepare_next_turn=prepare,
         should_stop_after_turn=should_stop,
-        journal_factory=_child_journal_factory(tmp_path),
+        journal_factory=_subagent_journal_factory(tmp_path),
     )
 
-    result = await engine.arun("inspect", run_id="run_child_hooks")
+    result = await engine.arun("inspect", run_id="run_subagent_hooks")
 
     assert result.state.stop_reason == "completed"
-    assert "projected child state" in {
+    assert "projected subagent state" in {
         message.get("content") for message in model.requests[0].messages
     }
     assert model.requests[1].messages[0] == {
         "role": "system",
-        "content": "updated child instructions",
+        "content": "updated subagent instructions",
     }
     assert any(
         message.get("role") == "tool"
-        and "rewritten child result" in str(message.get("content"))
+        and "rewritten subagent result" in str(message.get("content"))
         for message in model.requests[1].messages
     )
     assert observed == [
@@ -350,11 +421,11 @@ async def test_child_engine_composes_product_turn_hooks(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_policy_can_follow_up_and_terminalize_its_task(tmp_path) -> None:
+async def test_subagent_policy_can_follow_up_and_terminalize_its_task(tmp_path) -> None:
     model = ScriptedModel(
         [text_events("premature answer"), text_events("finished answer")]
     )
-    engine: AgentChildEngine
+    engine: AgentSubagentEngine
 
     def prepare(context):
         if context.turn == 0:
@@ -363,22 +434,22 @@ async def test_child_policy_can_follow_up_and_terminalize_its_task(tmp_path) -> 
     async def should_stop(context):
         if context.turn != 1:
             return False
-        await engine.complete_task("child completion policy passed")
+        await engine.complete_task("subagent completion policy passed")
         return True
 
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=model,
         prepare_next_turn=prepare,
         should_stop_after_turn=should_stop,
-        journal_factory=_child_journal_factory(tmp_path),
-        child_task=Task(
-            task_id="child-policy",
+        journal_factory=_subagent_journal_factory(tmp_path),
+        subagent_task=Task(
+            task_id="subagent-policy",
             parent_task_id="parent-task",
             objective="finish committed work",
         ),
     )
 
-    result = await engine.arun("inspect", run_id="run_child_policy")
+    result = await engine.arun("inspect", run_id="run_subagent_policy")
 
     assert result.step_count == 2
     assert any(
@@ -387,18 +458,18 @@ async def test_child_policy_can_follow_up_and_terminalize_its_task(tmp_path) -> 
         for message in model.requests[1].messages
     )
     await engine.aclose()
-    records = await _read_child_records(tmp_path, "run_child_policy")
+    records = await _read_subagent_records(tmp_path, "run_subagent_policy")
     types = [record.type for record in records]
     assert types.count(JournalRecordType.TASK_TRANSITION) == 1
     assert types.index(JournalRecordType.TASK_TRANSITION) < types.index(
         JournalRecordType.RUN_COMPLETED
     )
     recovered = recover_session(records)
-    assert recovered.tasks["child-policy"].lifecycle.status is TaskStatus.COMPLETED
+    assert recovered.tasks["subagent-policy"].lifecycle.status is TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio
-async def test_interrupt_running_child_terminalizes_journal(tmp_path) -> None:
+async def test_interrupt_running_subagent_terminalizes_journal(tmp_path) -> None:
     started = asyncio.Event()
     never = asyncio.Event()
 
@@ -408,12 +479,12 @@ async def test_interrupt_running_child_terminalizes_journal(tmp_path) -> None:
         yield  # unreachable; keeps the factory an async generator
 
     model = ScriptedModel([hanging])
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         ),
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
 
     launched = await supervisor.launch(_request("hang"), _context(), background=True)
@@ -421,24 +492,24 @@ async def test_interrupt_running_child_terminalizes_journal(tmp_path) -> None:
     result = await supervisor.interrupt(launched.handle, wait_seconds=5)
 
     assert result is not None
-    assert result.status is ChildStatus.CANCELLED
-    child_records = await _read_child_records(tmp_path, result.child_run_id)
-    assert child_records[-1].type is JournalRecordType.RUN_INTERRUPTED
-    assert child_records[-1].payload["status"] == "aborted"
+    assert result.status is SubagentStatus.CANCELLED
+    subagent_records = await _read_subagent_records(tmp_path, result.subagent_run_id)
+    assert subagent_records[-1].type is JournalRecordType.RUN_INTERRUPTED
+    assert subagent_records[-1].payload["status"] == "aborted"
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_child_budget_exhaustion_maps_from_max_turns(tmp_path) -> None:
+async def test_subagent_budget_exhaustion_maps_from_max_turns(tmp_path) -> None:
     registry = ToolRegistry().register(_echo)
     model = ScriptedModel(
         [tool_events([tool_call_wire(f"c{i}", "echo", {"text": "x"})]) for i in range(4)]
     )
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
@@ -448,14 +519,62 @@ async def test_child_budget_exhaustion_maps_from_max_turns(tmp_path) -> None:
         background=False,
     )
 
-    assert result.status is ChildStatus.BUDGET_EXHAUSTED
+    assert result.status is SubagentStatus.BUDGET_EXHAUSTED
     assert result.steps == 1
     assert len(model.requests) == 1
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_parent_message_steers_active_child(tmp_path) -> None:
+async def test_subagent_reserves_last_step_for_plain_text_conclusion(tmp_path) -> None:
+    executions = 0
+
+    @tool(name="observe")
+    def _observe(text: str) -> str:
+        nonlocal executions
+        executions += 1
+        return f"observed:{text}"
+
+    registry = ToolRegistry().register(_observe)
+    model = ScriptedModel(
+        [
+            tool_events([tool_call_wire("c1", "observe", {"text": "evidence"})]),
+            tool_events(
+                [tool_call_wire("c2", "observe", {"text": "must-not-run"})],
+                text="conclusion from committed evidence",
+            ),
+        ]
+    )
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=model,
+            tool_registry=registry,
+            journal_directory=_subagents_root(tmp_path),
+        )
+    )
+
+    result = await supervisor.launch(
+        _request("inspect", budget=TaskBudget(max_steps=2)),
+        _context(parent_tool_authority=registry.freeze()),
+        background=False,
+    )
+
+    assert result.status is SubagentStatus.BUDGET_EXHAUSTED
+    assert result.conclusion.summary == "conclusion from committed evidence"
+    assert result.steps == 2
+    assert len(model.requests) == 2
+    assert executions == 1
+    final_users = [
+        message
+        for message in model.requests[1].message_dicts()
+        if message.get("role") == "user"
+    ]
+    assert final_users[-1]["content"] != final_users[0]["content"]
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_parent_message_steers_active_subagent(tmp_path) -> None:
     registry = ToolRegistry().register(_echo)
 
     async def first_response(_request):
@@ -468,13 +587,13 @@ async def test_parent_message_steers_active_child(tmp_path) -> None:
     model = ScriptedModel(
         [first_response, text_events("acknowledged")],
     )
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         ),
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
     launched = await supervisor.launch(
         _request("start"),
@@ -491,7 +610,7 @@ async def test_parent_message_steers_active_child(tmp_path) -> None:
     assert accepted is True
     assert current is not None and not current.ready
     final = await supervisor.wait(launched.handle, timeout_seconds=5)
-    assert final is not None and final.status is ChildStatus.COMPLETED
+    assert final is not None and final.status is SubagentStatus.COMPLETED
     second_request = model.requests[1]
     steered = [
         message
@@ -501,11 +620,11 @@ async def test_parent_message_steers_active_child(tmp_path) -> None:
         and "steer note" in str(message.get("content"))
     ]
     assert len(steered) == 1
-    child_records = await _read_child_records(tmp_path, final.child_run_id)
+    subagent_records = await _read_subagent_records(tmp_path, final.subagent_run_id)
     assert any(
         record.type is JournalRecordType.RUNTIME_INPUT_POSTED
         and record.payload["payload"]["content"] == "steer note"
-        for record in child_records
+        for record in subagent_records
     )
     await supervisor.aclose()
 
@@ -524,30 +643,30 @@ async def test_parent_message_rejects_pre_run_and_terminal_settlement_windows(
                 await release_terminal_append.wait()
             return await super().append(record_type, payload, record_id=record_id)
 
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=ScriptedModel([text_events("done")]),
-        journal_factory=lambda: BlockingTerminalJournal(_children_root(tmp_path)),
+        journal_factory=lambda: BlockingTerminalJournal(_subagents_root(tmp_path)),
     )
     event = RuntimeInput(
         event_id="parent-message",
         kind="agent.parent.message",
-        correlation_id="child",
+        correlation_id="subagent",
         source="qitos.parent",
         payload={"content": "too late"},
     )
 
-    assert await engine.apost_runtime_event(event, run_id="run_childrace") is False
+    assert await engine.apost_runtime_event(event, run_id="run_subagentrace") is False
     running = asyncio.create_task(
-        engine.arun("inspect", run_id="run_childrace")
+        engine.arun("inspect", run_id="run_subagentrace")
     )
     await asyncio.wait_for(terminal_append_started.wait(), timeout=1)
 
-    assert await engine.apost_runtime_event(event, run_id="run_childrace") is False
+    assert await engine.apost_runtime_event(event, run_id="run_subagentrace") is False
 
     release_terminal_append.set()
     await running
     await engine.aclose()
-    records = await _read_child_records(tmp_path, "run_childrace")
+    records = await _read_subagent_records(tmp_path, "run_subagentrace")
     assert JournalRecordType.RUNTIME_INPUT_POSTED not in {
         record.type for record in records
     }
@@ -576,7 +695,7 @@ async def test_parent_message_reserved_before_turn_end_settles_before_terminal(
                 await release_runtime_append.wait()
             return await super().append(record_type, payload, record_id=record_id)
 
-    class BoundaryObservedEngine(AgentChildEngine):
+    class BoundaryObservedEngine(AgentSubagentEngine):
         def _close_runtime_event_admission(self):
             turn_boundary_started.set()
             super()._close_runtime_event_admission()
@@ -586,22 +705,22 @@ async def test_parent_message_reserved_before_turn_end_settles_before_terminal(
     )
     engine = BoundaryObservedEngine(
         model=model,
-        journal_factory=lambda: BlockingRuntimeJournal(_children_root(tmp_path)),
+        journal_factory=lambda: BlockingRuntimeJournal(_subagents_root(tmp_path)),
     )
     event = RuntimeInput(
         event_id="parent-message-race",
         kind="agent.parent.message",
-        correlation_id="child",
+        correlation_id="subagent",
         source="qitos.parent",
         payload={"content": "reserved note"},
     )
 
     running = asyncio.create_task(
-        engine.arun("inspect", run_id="run_childreserved")
+        engine.arun("inspect", run_id="run_subagentreserved")
     )
     await asyncio.wait_for(model_started.wait(), timeout=1)
     posting = asyncio.create_task(
-        engine.apost_runtime_event(event, run_id="run_childreserved")
+        engine.apost_runtime_event(event, run_id="run_subagentreserved")
     )
     release_model.set()
     await asyncio.wait_for(turn_boundary_started.wait(), timeout=1)
@@ -618,7 +737,7 @@ async def test_parent_message_reserved_before_turn_end_settles_before_terminal(
     }
 
     await engine.aclose()
-    records = await _read_child_records(tmp_path, "run_childreserved")
+    records = await _read_subagent_records(tmp_path, "run_subagentreserved")
     record_types = [record.type for record in records]
     assert record_types.index(JournalRecordType.RUNTIME_INPUT_POSTED) < (
         record_types.index(JournalRecordType.RUN_COMPLETED)
@@ -641,15 +760,15 @@ async def test_accepted_parent_message_is_marked_consumed_after_its_turn_commits
     model = ScriptedModel(
         [first_response, text_events("acknowledged")],
     )
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=model,
         tool_registry=registry,
-        journal_factory=_child_journal_factory(tmp_path),
+        journal_factory=_subagent_journal_factory(tmp_path),
     )
     event = RuntimeInput(
         event_id="parent-message-consume",
         kind="agent.parent.message",
-        correlation_id="child",
+        correlation_id="subagent",
         source="qitos.parent",
         payload={"content": "reserved note"},
     )
@@ -657,15 +776,15 @@ async def test_accepted_parent_message_is_marked_consumed_after_its_turn_commits
     async def _post_when_started() -> None:
         while not engine._accepting_runtime_events:
             await asyncio.sleep(0)
-        assert await engine.apost_runtime_event(event, run_id="run_childconsume")
+        assert await engine.apost_runtime_event(event, run_id="run_subagentconsume")
 
     posting = asyncio.create_task(_post_when_started())
-    result = await engine.arun("inspect", run_id="run_childconsume")
+    result = await engine.arun("inspect", run_id="run_subagentconsume")
     await posting
     assert result.state.stop_reason == "completed"
     await engine.aclose()
 
-    records = await _read_child_records(tmp_path, "run_childconsume")
+    records = await _read_subagent_records(tmp_path, "run_subagentconsume")
     record_types = [record.type for record in records]
     posted = record_types.index(JournalRecordType.RUNTIME_INPUT_POSTED)
     consumed = record_types.index(JournalRecordType.RUNTIME_INPUT_CONSUMED)
@@ -693,19 +812,19 @@ async def test_pending_parent_message_withdrawal_leaves_no_reservation_or_record
         for event in text_events("done"):
             yield event
 
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=ScriptedModel([response]),
-        journal_factory=_child_journal_factory(tmp_path),
+        journal_factory=_subagent_journal_factory(tmp_path),
     )
     event = RuntimeInput(
         event_id=f"parent-message-{withdrawal}",
         kind="agent.parent.message",
-        correlation_id="child",
+        correlation_id="subagent",
         source="qitos.parent",
         payload={"content": "withdraw this note"},
     )
     running = asyncio.create_task(
-        engine.arun("inspect", run_id=f"run_child_{withdrawal}")
+        engine.arun("inspect", run_id=f"run_subagent_{withdrawal}")
     )
     await asyncio.wait_for(model_started.wait(), timeout=1)
 
@@ -714,7 +833,7 @@ async def test_pending_parent_message_withdrawal_leaves_no_reservation_or_record
             await asyncio.wait_for(
                 engine.apost_runtime_event(
                     event,
-                    run_id=f"run_child_{withdrawal}",
+                    run_id=f"run_subagent_{withdrawal}",
                 ),
                 timeout=0.01,
             )
@@ -722,7 +841,7 @@ async def test_pending_parent_message_withdrawal_leaves_no_reservation_or_record
         posting = asyncio.create_task(
             engine.apost_runtime_event(
                 event,
-                run_id=f"run_child_{withdrawal}",
+                run_id=f"run_subagent_{withdrawal}",
             )
         )
         while not engine._runtime_event_reservations:
@@ -736,7 +855,7 @@ async def test_pending_parent_message_withdrawal_leaves_no_reservation_or_record
     assert result.state.stop_reason == "completed"
     await engine.aclose()
 
-    records = await _read_child_records(tmp_path, f"run_child_{withdrawal}")
+    records = await _read_subagent_records(tmp_path, f"run_subagent_{withdrawal}")
     assert JournalRecordType.RUNTIME_INPUT_POSTED not in {
         record.type for record in records
     }
@@ -771,23 +890,23 @@ async def test_parent_message_append_commit_wins_caller_cancellation(tmp_path) -
             return await super().append(record_type, payload, record_id=record_id)
 
     model = ScriptedModel([first_response, text_events("continued")])
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=model,
-        journal_factory=lambda: BlockingRuntimeJournal(_children_root(tmp_path)),
+        journal_factory=lambda: BlockingRuntimeJournal(_subagents_root(tmp_path)),
     )
     event = RuntimeInput(
         event_id="parent-message-commit-wins",
         kind="agent.parent.message",
-        correlation_id="child",
+        correlation_id="subagent",
         source="qitos.parent",
         payload={"content": "committed note"},
     )
     running = asyncio.create_task(
-        engine.arun("inspect", run_id="run_child_commit_wins")
+        engine.arun("inspect", run_id="run_subagent_commit_wins")
     )
     await asyncio.wait_for(model_started.wait(), timeout=1)
     posting = asyncio.create_task(
-        engine.apost_runtime_event(event, run_id="run_child_commit_wins")
+        engine.apost_runtime_event(event, run_id="run_subagent_commit_wins")
     )
     release_model.set()
     await asyncio.wait_for(runtime_append_started.wait(), timeout=1)
@@ -803,7 +922,7 @@ async def test_parent_message_append_commit_wins_caller_cancellation(tmp_path) -
     }
     await engine.aclose()
 
-    records = await _read_child_records(tmp_path, "run_child_commit_wins")
+    records = await _read_subagent_records(tmp_path, "run_subagent_commit_wins")
     record_types = [record.type for record in records]
     assert record_types.index(JournalRecordType.RUNTIME_INPUT_POSTED) < (
         record_types.index(JournalRecordType.RUN_COMPLETED)
@@ -837,23 +956,23 @@ async def test_parent_message_accepts_committed_journal_error(tmp_path) -> None:
             return position
 
     model = ScriptedModel([first_response, text_events("continued")])
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=model,
-        journal_factory=lambda: CommittedErrorJournal(_children_root(tmp_path)),
+        journal_factory=lambda: CommittedErrorJournal(_subagents_root(tmp_path)),
     )
     event = RuntimeInput(
         event_id="parent-message-commit-error",
         kind="agent.parent.message",
-        correlation_id="child",
+        correlation_id="subagent",
         source="qitos.parent",
         payload={"content": "committed error note"},
     )
     running = asyncio.create_task(
-        engine.arun("inspect", run_id="run_child_commit_error")
+        engine.arun("inspect", run_id="run_subagent_commit_error")
     )
     await asyncio.wait_for(model_started.wait(), timeout=1)
     posting = asyncio.create_task(
-        engine.apost_runtime_event(event, run_id="run_child_commit_error")
+        engine.apost_runtime_event(event, run_id="run_subagent_commit_error")
     )
     release_model.set()
 
@@ -866,7 +985,7 @@ async def test_parent_message_accepts_committed_journal_error(tmp_path) -> None:
     }
     await engine.aclose()
 
-    records = await _read_child_records(tmp_path, "run_child_commit_error")
+    records = await _read_subagent_records(tmp_path, "run_subagent_commit_error")
     assert sum(
         record.type is JournalRecordType.RUNTIME_INPUT_POSTED for record in records
     ) == 1
@@ -896,25 +1015,25 @@ async def test_parent_message_append_rollback_preserves_caller_timeout(
                     raise JournalAppendCancelled(None) from cancellation
             return await super().append(record_type, payload, record_id=record_id)
 
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=ScriptedModel([response]),
         journal_factory=lambda: RollingBackRuntimeJournal(
-            _children_root(tmp_path)
+            _subagents_root(tmp_path)
         ),
     )
     event = RuntimeInput(
         event_id="parent-message-rollback",
         kind="agent.parent.message",
-        correlation_id="child",
+        correlation_id="subagent",
         source="qitos.parent",
         payload={"content": "rolled back note"},
     )
     running = asyncio.create_task(
-        engine.arun("inspect", run_id="run_child_rollback")
+        engine.arun("inspect", run_id="run_subagent_rollback")
     )
     await asyncio.wait_for(model_started.wait(), timeout=1)
     posting = asyncio.create_task(
-        engine.apost_runtime_event(event, run_id="run_child_rollback")
+        engine.apost_runtime_event(event, run_id="run_subagent_rollback")
     )
     release_model.set()
     await asyncio.wait_for(runtime_append_started.wait(), timeout=1)
@@ -925,7 +1044,7 @@ async def test_parent_message_append_rollback_preserves_caller_timeout(
     assert result.state.stop_reason == "completed"
     await engine.aclose()
 
-    records = await _read_child_records(tmp_path, "run_child_rollback")
+    records = await _read_subagent_records(tmp_path, "run_subagent_rollback")
     assert JournalRecordType.RUNTIME_INPUT_POSTED not in {
         record.type for record in records
     }
@@ -974,7 +1093,7 @@ async def test_reserved_parent_message_is_rejected_before_terminal_outcomes(
                 await release_runtime_append.wait()
             return await super().append(record_type, payload, record_id=record_id)
 
-    class BoundaryObservedEngine(AgentChildEngine):
+    class BoundaryObservedEngine(AgentSubagentEngine):
         def _close_runtime_event_admission(self):
             turn_boundary_started.set()
             super()._close_runtime_event_admission()
@@ -987,24 +1106,24 @@ async def test_reserved_parent_message_is_rejected_before_terminal_outcomes(
             if terminal_case == "budget"
             else TaskBudget()
         ),
-        journal_factory=lambda: BlockingRuntimeJournal(_children_root(tmp_path)),
+        journal_factory=lambda: BlockingRuntimeJournal(_subagents_root(tmp_path)),
     )
     event = RuntimeInput(
         event_id=f"parent-message-{terminal_case}",
         kind="agent.parent.message",
-        correlation_id="child",
+        correlation_id="subagent",
         source="qitos.parent",
         payload={"content": "terminal note"},
     )
 
     running = asyncio.create_task(
-        engine.arun("inspect", run_id=f"run_child_{terminal_case}")
+        engine.arun("inspect", run_id=f"run_subagent_{terminal_case}")
     )
     await asyncio.wait_for(model_started.wait(), timeout=1)
     posting = asyncio.create_task(
         engine.apost_runtime_event(
             event,
-            run_id=f"run_child_{terminal_case}",
+            run_id=f"run_subagent_{terminal_case}",
         )
     )
     if terminal_case == "cancel":
@@ -1018,38 +1137,38 @@ async def test_reserved_parent_message_is_rejected_before_terminal_outcomes(
     assert result.state.stop_reason == expected_reason
     await engine.aclose()
 
-    records = await _read_child_records(tmp_path, f"run_child_{terminal_case}")
+    records = await _read_subagent_records(tmp_path, f"run_subagent_{terminal_case}")
     record_types = [record.type for record in records]
     assert JournalRecordType.RUNTIME_INPUT_POSTED not in record_types
 
 
 @pytest.mark.asyncio
-async def test_recovery_rebuilds_completed_child_from_journal(tmp_path) -> None:
-    engine = AgentChildEngine(
+async def test_recovery_rebuilds_completed_subagent_from_journal(tmp_path) -> None:
+    engine = AgentSubagentEngine(
         model=ScriptedModel([text_events("recovered answer", usage={"total_tokens": 5})]),
-        journal_factory=_child_journal_factory(tmp_path),
+        journal_factory=_subagent_journal_factory(tmp_path),
     )
-    completed = await engine.arun("inspect", run_id="run_childcompleted")
+    completed = await engine.arun("inspect", run_id="run_subagentcompleted")
     await engine.aclose()
     assert completed.state.stop_reason == "completed"
 
     parent_journal = JsonlSessionJournal(tmp_path / "parent")
     await parent_journal.create("parent-run", {})
     request = _request("inspect")
-    handle = ChildHandle(child_id="child-done", parent_run_id="parent-run")
+    handle = SubagentHandle(subagent_id="subagent-done", parent_run_id="parent-run")
     await parent_journal.append(
-        JournalRecordType.CHILD_STARTED,
+        JournalRecordType.SUBAGENT_STARTED,
         {
             "handle": handle.to_dict(),
             "request": request.to_dict(),
-            "child_run_id": "run_childcompleted",
+            "subagent_run_id": "run_subagentcompleted",
         },
-        record_id="parent-run:child:child-done:started",
+        record_id="parent-run:subagent:subagent-done:started",
     )
 
-    supervisor = ChildSupervisor(
+    supervisor = SubagentSupervisor(
         invocation_factory=_unused_factory,
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
     recovered = await supervisor.recover(
         parent_run_id="parent-run",
@@ -1058,7 +1177,7 @@ async def test_recovery_rebuilds_completed_child_from_journal(tmp_path) -> None:
 
     assert len(recovered) == 1
     result = recovered[0]
-    assert result.status is ChildStatus.COMPLETED
+    assert result.status is SubagentStatus.COMPLETED
     assert result.conclusion.summary == "recovered answer"
     assert result.steps == 1
     assert result.total_tokens == 5
@@ -1066,10 +1185,10 @@ async def test_recovery_rebuilds_completed_child_from_journal(tmp_path) -> None:
     terminal_records = [
         record
         for record in await parent_journal.replay()
-        if record.type is JournalRecordType.CHILD_TERMINAL
+        if record.type is JournalRecordType.SUBAGENT_TERMINAL
     ]
     assert len(terminal_records) == 1
-    assert terminal_records[0].payload["status"] == ChildStatus.COMPLETED.value
+    assert terminal_records[0].payload["status"] == SubagentStatus.COMPLETED.value
     await supervisor.aclose()
     await parent_journal.close()
 
@@ -1078,18 +1197,18 @@ async def test_recovery_rebuilds_completed_child_from_journal(tmp_path) -> None:
 async def test_recovery_preserves_root_budget_stop_before_parent_terminal(
     tmp_path,
 ) -> None:
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=ScriptedModel([text_events("answer", usage={"total_tokens": 10})]),
-        journal_factory=_child_journal_factory(tmp_path),
+        journal_factory=_subagent_journal_factory(tmp_path),
     )
-    completed = await engine.arun("inspect", run_id="run_childbudget")
+    completed = await engine.arun("inspect", run_id="run_subagentbudget")
     await engine.aclose()
     assert completed.state.stop_reason == "completed"
 
     ledger = BudgetLedger(max_tokens=1)
     await ledger.commit(
-        origin_run_id="run_childbudget",
-        transaction_id="run_childbudget:turn:0:model",
+        origin_run_id="run_subagentbudget",
+        transaction_id="run_subagentbudget:turn:0:model",
         tokens=10,
         cost_usd=0.0,
         usage_complete=True,
@@ -1098,19 +1217,19 @@ async def test_recovery_preserves_root_budget_stop_before_parent_terminal(
     parent_journal = JsonlSessionJournal(tmp_path / "parent")
     await parent_journal.create("parent-run", {})
     request = _request("inspect")
-    handle = ChildHandle(child_id="child-budget", parent_run_id="parent-run")
+    handle = SubagentHandle(subagent_id="subagent-budget", parent_run_id="parent-run")
     await parent_journal.append(
-        JournalRecordType.CHILD_STARTED,
+        JournalRecordType.SUBAGENT_STARTED,
         {
             "handle": handle.to_dict(),
             "request": request.to_dict(),
-            "child_run_id": "run_childbudget",
+            "subagent_run_id": "run_subagentbudget",
         },
-        record_id="parent-run:child:child-budget:started",
+        record_id="parent-run:subagent:subagent-budget:started",
     )
-    supervisor = ChildSupervisor(
+    supervisor = SubagentSupervisor(
         invocation_factory=_unused_factory,
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
 
     recovered = await supervisor.recover(
@@ -1120,31 +1239,31 @@ async def test_recovery_preserves_root_budget_stop_before_parent_terminal(
     )
 
     assert len(recovered) == 1
-    assert recovered[0].status is ChildStatus.BUDGET_EXHAUSTED
+    assert recovered[0].status is SubagentStatus.BUDGET_EXHAUSTED
     await supervisor.aclose()
     await parent_journal.close()
 
 
 @pytest.mark.asyncio
-async def test_recovery_attributes_root_budget_to_crossing_child_only(
+async def test_recovery_attributes_root_budget_to_crossing_subagent_only(
     tmp_path,
 ) -> None:
     for run_id, answer, tokens in (
-        ("run_childa", "answer-a", 4),
-        ("run_childb", "answer-b", 7),
+        ("run_subagenta", "answer-a", 4),
+        ("run_subagentb", "answer-b", 7),
     ):
-        engine = AgentChildEngine(
+        engine = AgentSubagentEngine(
             model=ScriptedModel(
                 [text_events(answer, usage={"total_tokens": tokens})]
             ),
-            journal_factory=_child_journal_factory(tmp_path),
+            journal_factory=_subagent_journal_factory(tmp_path),
         )
         completed = await engine.arun("inspect", run_id=run_id)
         await engine.aclose()
         assert completed.state.stop_reason == "completed"
 
     ledger = BudgetLedger(max_tokens=10)
-    for run_id, tokens in (("run_childa", 4), ("run_childb", 7)):
+    for run_id, tokens in (("run_subagenta", 4), ("run_subagentb", 7)):
         await ledger.commit(
             origin_run_id=run_id,
             transaction_id=f"{run_id}:turn:0:model",
@@ -1157,22 +1276,22 @@ async def test_recovery_attributes_root_budget_to_crossing_child_only(
     await parent_journal.create("parent-run", {})
     for suffix in ("a", "b"):
         request = _request(f"inspect-{suffix}")
-        handle = ChildHandle(
-            child_id=f"child-{suffix}",
+        handle = SubagentHandle(
+            subagent_id=f"subagent-{suffix}",
             parent_run_id="parent-run",
         )
         await parent_journal.append(
-            JournalRecordType.CHILD_STARTED,
+            JournalRecordType.SUBAGENT_STARTED,
             {
                 "handle": handle.to_dict(),
                 "request": request.to_dict(),
-                "child_run_id": f"run_child{suffix}",
+                "subagent_run_id": f"run_subagent{suffix}",
             },
-            record_id=f"parent-run:child:child-{suffix}:started",
+            record_id=f"parent-run:subagent:subagent-{suffix}:started",
         )
-    supervisor = ChildSupervisor(
+    supervisor = SubagentSupervisor(
         invocation_factory=_unused_factory,
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
 
     recovered = await supervisor.recover(
@@ -1181,15 +1300,15 @@ async def test_recovery_attributes_root_budget_to_crossing_child_only(
         budget_ledger=ledger,
     )
 
-    by_child = {result.handle.child_id: result for result in recovered}
-    assert by_child["child-a"].status is ChildStatus.COMPLETED
-    assert by_child["child-b"].status is ChildStatus.BUDGET_EXHAUSTED
+    by_subagent = {result.handle.subagent_id: result for result in recovered}
+    assert by_subagent["subagent-a"].status is SubagentStatus.COMPLETED
+    assert by_subagent["subagent-b"].status is SubagentStatus.BUDGET_EXHAUSTED
     await supervisor.aclose()
     await parent_journal.close()
 
 
 @pytest.mark.asyncio
-async def test_recovery_rebuilds_interrupted_child_from_journal(tmp_path) -> None:
+async def test_recovery_rebuilds_interrupted_subagent_from_journal(tmp_path) -> None:
     started = asyncio.Event()
     never = asyncio.Event()
 
@@ -1198,11 +1317,11 @@ async def test_recovery_rebuilds_interrupted_child_from_journal(tmp_path) -> Non
         await never.wait()
         yield  # unreachable; keeps the factory an async generator
 
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=ScriptedModel([hanging]),
-        journal_factory=_child_journal_factory(tmp_path),
+        journal_factory=_subagent_journal_factory(tmp_path),
     )
-    run = asyncio.create_task(engine.arun("hang", run_id="run_childaborted"))
+    run = asyncio.create_task(engine.arun("hang", run_id="run_subagentaborted"))
     await asyncio.wait_for(started.wait(), timeout=5)
     engine.cancel("immediate")
     aborted = await run
@@ -1212,20 +1331,20 @@ async def test_recovery_rebuilds_interrupted_child_from_journal(tmp_path) -> Non
     parent_journal = JsonlSessionJournal(tmp_path / "parent")
     await parent_journal.create("parent-run", {})
     request = _request("hang")
-    handle = ChildHandle(child_id="child-aborted", parent_run_id="parent-run")
+    handle = SubagentHandle(subagent_id="subagent-aborted", parent_run_id="parent-run")
     await parent_journal.append(
-        JournalRecordType.CHILD_STARTED,
+        JournalRecordType.SUBAGENT_STARTED,
         {
             "handle": handle.to_dict(),
             "request": request.to_dict(),
-            "child_run_id": "run_childaborted",
+            "subagent_run_id": "run_subagentaborted",
         },
-        record_id="parent-run:child:child-aborted:started",
+        record_id="parent-run:subagent:subagent-aborted:started",
     )
 
-    supervisor = ChildSupervisor(
+    supervisor = SubagentSupervisor(
         invocation_factory=_unused_factory,
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
     recovered = await supervisor.recover(
         parent_run_id="parent-run",
@@ -1233,31 +1352,31 @@ async def test_recovery_rebuilds_interrupted_child_from_journal(tmp_path) -> Non
     )
 
     assert len(recovered) == 1
-    assert recovered[0].status is ChildStatus.CANCELLED
-    assert recovered[0].child_run_id == "run_childaborted"
+    assert recovered[0].status is SubagentStatus.CANCELLED
+    assert recovered[0].subagent_run_id == "run_subagentaborted"
     await supervisor.aclose()
     await parent_journal.close()
 
 
 @pytest.mark.asyncio
-async def test_recovery_without_child_journal_marks_interrupted(tmp_path) -> None:
+async def test_recovery_without_subagent_journal_marks_interrupted(tmp_path) -> None:
     parent_journal = JsonlSessionJournal(tmp_path / "parent")
     await parent_journal.create("parent-run", {})
     request = _request("lost")
-    handle = ChildHandle(child_id="child-lost", parent_run_id="parent-run")
+    handle = SubagentHandle(subagent_id="subagent-lost", parent_run_id="parent-run")
     await parent_journal.append(
-        JournalRecordType.CHILD_STARTED,
+        JournalRecordType.SUBAGENT_STARTED,
         {
             "handle": handle.to_dict(),
             "request": request.to_dict(),
-            "child_run_id": "run_missing",
+            "subagent_run_id": "run_missing",
         },
-        record_id="parent-run:child:child-lost:started",
+        record_id="parent-run:subagent:subagent-lost:started",
     )
 
-    supervisor = ChildSupervisor(
+    supervisor = SubagentSupervisor(
         invocation_factory=_unused_factory,
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
     recovered = await supervisor.recover(
         parent_run_id="parent-run",
@@ -1265,41 +1384,41 @@ async def test_recovery_without_child_journal_marks_interrupted(tmp_path) -> Non
     )
 
     assert len(recovered) == 1
-    assert recovered[0].status is ChildStatus.INTERRUPTED
+    assert recovered[0].status is SubagentStatus.INTERRUPTED
     await supervisor.aclose()
     await parent_journal.close()
 
 
 @pytest.mark.asyncio
 async def test_recovery_rejects_non_loop_terminal_payload(tmp_path) -> None:
-    child_journal = JsonlSessionJournal(_children_root(tmp_path))
-    await child_journal.create("run_legacy", {})
-    await child_journal.append(
+    subagent_journal = JsonlSessionJournal(_subagents_root(tmp_path))
+    await subagent_journal.create("run_legacy", {})
+    await subagent_journal.append(
         JournalRecordType.RUN_COMPLETED,
         {"status": "completed", "state": {"final_result": "legacy"}},
         record_id="run_legacy:run:terminal",
     )
-    await child_journal.close()
+    await subagent_journal.close()
 
     parent_journal = JsonlSessionJournal(tmp_path / "parent")
     await parent_journal.create("parent-run", {})
     request = _request("legacy")
-    handle = ChildHandle(child_id="child-legacy", parent_run_id="parent-run")
+    handle = SubagentHandle(subagent_id="subagent-legacy", parent_run_id="parent-run")
     await parent_journal.append(
-        JournalRecordType.CHILD_STARTED,
+        JournalRecordType.SUBAGENT_STARTED,
         {
             "handle": handle.to_dict(),
             "request": request.to_dict(),
-            "child_run_id": "run_legacy",
+            "subagent_run_id": "run_legacy",
         },
-        record_id="parent-run:child:child-legacy:started",
+        record_id="parent-run:subagent:subagent-legacy:started",
     )
 
-    supervisor = ChildSupervisor(
+    supervisor = SubagentSupervisor(
         invocation_factory=_unused_factory,
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
-    with pytest.raises(ChildPersistenceError):
+    with pytest.raises(SubagentPersistenceError):
         await supervisor.recover(
             parent_run_id="parent-run",
             journal=parent_journal,
@@ -1309,7 +1428,7 @@ async def test_recovery_rejects_non_loop_terminal_payload(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_child_tool_groups_narrow_exposure(tmp_path) -> None:
+async def test_subagent_tool_groups_narrow_exposure(tmp_path) -> None:
     registry = ToolRegistry().register(_echo)
 
     @tool(name="other", group="network")
@@ -1328,11 +1447,11 @@ async def test_child_tool_groups_narrow_exposure(tmp_path) -> None:
             return {"tools": list(payload)}
 
     model = RecordingModel([text_events("done")])
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
@@ -1342,14 +1461,14 @@ async def test_child_tool_groups_narrow_exposure(tmp_path) -> None:
         background=False,
     )
 
-    assert result.status is ChildStatus.COMPLETED
+    assert result.status is SubagentStatus.COMPLETED
     assert "echo" in model.seen_tool_names
     assert "other" not in model.seen_tool_names
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_child_tool_exposure_fails_closed_without_parent_authority(
+async def test_subagent_tool_exposure_fails_closed_without_parent_authority(
     tmp_path,
 ) -> None:
     registry = ToolRegistry().register(_echo)
@@ -1366,23 +1485,23 @@ async def test_child_tool_exposure_fails_closed_without_parent_authority(
             return {"tools": list(payload)}
 
     model = RecordingModel([text_events("done")])
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
     result = await supervisor.launch(_request("inspect"), _context(), background=False)
 
-    assert result.status is ChildStatus.COMPLETED
+    assert result.status is SubagentStatus.COMPLETED
     assert model.seen_tool_names == set()
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_child_tool_exposure_cannot_exceed_parent_frozen_authority(
+async def test_subagent_tool_exposure_cannot_exceed_parent_frozen_authority(
     tmp_path,
 ) -> None:
     registry = ToolRegistry().register(_echo)
@@ -1406,11 +1525,11 @@ async def test_child_tool_exposure_cannot_exceed_parent_frozen_authority(
             return {"tools": list(payload)}
 
     model = RecordingModel([text_events("done")])
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
@@ -1420,13 +1539,13 @@ async def test_child_tool_exposure_cannot_exceed_parent_frozen_authority(
         background=False,
     )
 
-    assert result.status is ChildStatus.COMPLETED
+    assert result.status is SubagentStatus.COMPLETED
     assert model.seen_tool_names == set()
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_agent_tool_preserves_parent_parameter_scope_denial(tmp_path) -> None:
+async def test_subagent_tool_preserves_parent_parameter_scope_denial(tmp_path) -> None:
     executions: list[str] = []
 
     @tool(
@@ -1456,15 +1575,15 @@ async def test_agent_tool_preserves_parent_parameter_scope_denial(tmp_path) -> N
             text_events("done"),
         ]
     )
-    agent_tool = AgentTool(
-        invocation_factory=build_agent_child_invocation_factory(
+    subagent_tool = SubagentTool(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
-    result = await agent_tool.execute(
+    result = await subagent_tool.execute(
         {
             "description": "inspect",
             "prompt": "inspect",
@@ -1477,9 +1596,12 @@ async def test_agent_tool_preserves_parent_parameter_scope_denial(tmp_path) -> N
         },
     )
 
-    assert result.output["child_status"] == ChildStatus.COMPLETED.value
+    assert result.output["subagent_status"] == SubagentStatus.COMPLETED.value
     assert executions == []
-    records = await _read_child_records(tmp_path, result.output["run_id"])
+    records = await _read_subagent_records(
+        tmp_path,
+        result.output["subagent_run_id"],
+    )
     denied = next(
         record
         for record in records
@@ -1488,11 +1610,11 @@ async def test_agent_tool_preserves_parent_parameter_scope_denial(tmp_path) -> N
     denied_result = _terminal_result_payload(records, denied)
     assert denied_result["status"] == "denied"
     assert denied_result["metadata"]["permission_scope"] == "/secret"
-    await agent_tool.aclose()
+    await subagent_tool.aclose()
 
 
 @pytest.mark.asyncio
-async def test_builtin_child_factory_rejects_different_env_permission_policy(
+async def test_builtin_subagent_factory_rejects_different_env_permission_policy(
     tmp_path,
 ) -> None:
     model_factory_calls = 0
@@ -1505,11 +1627,11 @@ async def test_builtin_child_factory_rejects_different_env_permission_policy(
     class WiderEnv:
         tool_permission_context = ToolPermissionContext(default_decision="allow")
 
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model_factory,
             env=WiderEnv(),
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
@@ -1523,7 +1645,7 @@ async def test_builtin_child_factory_rejects_different_env_permission_policy(
         background=False,
     )
 
-    assert result.status is ChildStatus.FAILED
+    assert result.status is SubagentStatus.FAILED
     assert "cannot prove" in result.error
     assert model_factory_calls == 0
     await supervisor.aclose()
@@ -1534,7 +1656,7 @@ async def test_builtin_child_factory_rejects_different_env_permission_policy(
     [("configured-safe", "parent-privileged"), ("configured-privileged", "parent-safe")],
 )
 @pytest.mark.asyncio
-async def test_child_tool_name_collision_exposes_and_executes_neither_definition(
+async def test_subagent_tool_name_collision_exposes_and_executes_neither_definition(
     tmp_path,
     base_result: str,
     parent_result: str,
@@ -1571,11 +1693,11 @@ async def test_child_tool_name_collision_exposes_and_executes_neither_definition
             text_events("done"),
         ]
     )
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=configured_registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
@@ -1585,7 +1707,7 @@ async def test_child_tool_name_collision_exposes_and_executes_neither_definition
         background=False,
     )
 
-    assert result.status is ChildStatus.COMPLETED
+    assert result.status is SubagentStatus.COMPLETED
     assert model.seen_tool_names == set()
     assert executions == []
     await supervisor.aclose()
@@ -1599,9 +1721,9 @@ async def test_child_tool_name_collision_exposes_and_executes_neither_definition
     ],
 )
 @pytest.mark.asyncio
-async def test_builtin_child_factory_rejects_unresolved_runtime_policy(
+async def test_builtin_subagent_factory_rejects_unresolved_runtime_policy(
     tmp_path,
-    launch_request: ChildLaunchRequest,
+    launch_request: SubagentLaunchRequest,
 ) -> None:
     model_factory_calls = 0
 
@@ -1610,22 +1732,22 @@ async def test_builtin_child_factory_rejects_unresolved_runtime_policy(
         model_factory_calls += 1
         return ScriptedModel([text_events("must not run")])
 
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model_factory,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
     result = await supervisor.launch(launch_request, _context(), background=False)
 
-    assert result.status is ChildStatus.FAILED
+    assert result.status is SubagentStatus.FAILED
     assert model_factory_calls == 0
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_child_model_usage_consumes_root_budget_and_closes_admission(
+async def test_subagent_model_usage_consumes_root_budget_and_closes_admission(
     tmp_path,
 ) -> None:
     ledger = BudgetLedger(max_tokens=1)
@@ -1641,9 +1763,9 @@ async def test_child_model_usage_consumes_root_budget_and_closes_admission(
             )
         ]
     )
-    base_factory = build_agent_child_invocation_factory(
+    base_factory = build_agent_subagent_invocation_factory(
         model=model,
-        journal_directory=_children_root(tmp_path),
+        journal_directory=_subagents_root(tmp_path),
     )
     factory_calls = 0
 
@@ -1652,14 +1774,14 @@ async def test_child_model_usage_consumes_root_budget_and_closes_admission(
         factory_calls += 1
         return await base_factory(request, context)
 
-    supervisor = ChildSupervisor(invocation_factory=counting_factory)
+    supervisor = SubagentSupervisor(invocation_factory=counting_factory)
     context = _context(budget_ledger=ledger)
 
     first = await supervisor.launch(_request("first"), context, background=False)
     second = await supervisor.launch(_request("second"), context, background=False)
 
-    assert first.status is ChildStatus.BUDGET_EXHAUSTED
-    assert second.status is ChildStatus.BUDGET_EXHAUSTED
+    assert first.status is SubagentStatus.BUDGET_EXHAUSTED
+    assert second.status is SubagentStatus.BUDGET_EXHAUSTED
     assert factory_calls == 1
     assert len(model.requests) == 1
     snapshot = ledger.snapshot()
@@ -1669,20 +1791,20 @@ async def test_child_model_usage_consumes_root_budget_and_closes_admission(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_children_share_one_lineage_step_budget() -> None:
+async def test_concurrent_subagents_share_one_lineage_step_budget() -> None:
     ledger = BudgetLedger(max_steps=1)
     models = [
         ScriptedModel([text_events(f"answer-{index}")])
         for index in range(2)
     ]
     engines = [
-        AgentChildEngine(model=model, budget_ledger=ledger)
+        AgentSubagentEngine(model=model, budget_ledger=ledger)
         for model in models
     ]
 
     results = await asyncio.gather(
         *(
-            engine.arun("inspect", run_id=f"child-{index}")
+            engine.arun("inspect", run_id=f"subagent-{index}")
             for index, engine in enumerate(engines)
         )
     )
@@ -1696,6 +1818,30 @@ async def test_concurrent_children_share_one_lineage_step_budget() -> None:
     snapshot = ledger.snapshot()
     assert snapshot.total_steps == 1
     assert snapshot.remaining_steps == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_step_lease_releases_conclusion_capacity() -> None:
+    class RejectingLeaseLedger(BudgetLedger):
+        async def lease_step(self, **kwargs):
+            _ = kwargs
+            raise RuntimeError("injected lease failure")
+
+    ledger = RejectingLeaseLedger(max_steps=1)
+    engine = AgentSubagentEngine(
+        model=ScriptedModel([text_events("unused")]),
+        budget_ledger=ledger,
+    )
+
+    with pytest.raises(RuntimeError, match="injected lease failure"):
+        await engine.arun("inspect", run_id="subagent-lease-failure")
+
+    await ledger.reserve_step(
+        origin_run_id="root",
+        transaction_id="root:turn:0:step",
+    )
+    assert ledger.snapshot().total_steps == 1
+    await engine.aclose()
 
 
 @pytest.mark.asyncio
@@ -1713,12 +1859,12 @@ async def test_immediate_interrupt_cannot_cancel_model_budget_commit(tmp_path) -
     model = ScriptedModel(
         [text_events("answer", usage={"total_tokens": 10})]
     )
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         ),
-        child_journal_factory=_child_journal_factory(tmp_path),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
     launched = await supervisor.launch(
         _request("interrupt"),
@@ -1732,16 +1878,16 @@ async def test_immediate_interrupt_cannot_cancel_model_budget_commit(tmp_path) -
     terminal = await supervisor.wait(launched.handle, timeout_seconds=1)
 
     assert terminal is not None
-    assert terminal.status is ChildStatus.CANCELLED
+    assert terminal.status is SubagentStatus.CANCELLED
     assert ledger.snapshot().total_tokens == 10
-    records = await _read_child_records(tmp_path, terminal.child_run_id)
+    records = await _read_subagent_records(tmp_path, terminal.subagent_run_id)
     assert JournalRecordType.MODEL_COMPLETED in {record.type for record in records}
     assert records[-1].type is JournalRecordType.RUN_INTERRUPTED
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_root_budget_is_durable_before_child_model_terminal(tmp_path) -> None:
+async def test_root_budget_is_durable_before_subagent_model_terminal(tmp_path) -> None:
     class FailingModelJournal(JsonlSessionJournal):
         async def append(self, record_type, payload, *, record_id):
             if record_type is JournalRecordType.MODEL_COMPLETED:
@@ -1752,16 +1898,16 @@ async def test_root_budget_is_durable_before_child_model_terminal(tmp_path) -> N
     await root_journal.create("root-run", {})
     ledger = BudgetLedger()
     ledger.attach(root_journal, root_run_id="root-run")
-    engine = AgentChildEngine(
+    engine = AgentSubagentEngine(
         model=ScriptedModel(
             [text_events("answer", usage={"total_tokens": 10})]
         ),
         budget_ledger=ledger,
-        journal_factory=lambda: FailingModelJournal(_children_root(tmp_path)),
+        journal_factory=lambda: FailingModelJournal(_subagents_root(tmp_path)),
     )
 
     with pytest.raises(JournalError, match="model terminal failed"):
-        await engine.arun("inspect", run_id="run_childcrash")
+        await engine.arun("inspect", run_id="run_subagentcrash")
     await engine.aclose()
 
     assert ledger.snapshot().total_tokens == 10
@@ -1769,15 +1915,15 @@ async def test_root_budget_is_durable_before_child_model_terminal(tmp_path) -> N
     assert JournalRecordType.BUDGET_COMMITTED in {
         record.type for record in root_records
     }
-    child_records = await _read_child_records(tmp_path, "run_childcrash")
+    subagent_records = await _read_subagent_records(tmp_path, "run_subagentcrash")
     assert JournalRecordType.MODEL_COMPLETED not in {
-        record.type for record in child_records
+        record.type for record in subagent_records
     }
     await root_journal.close()
 
 
 @pytest.mark.asyncio
-async def test_child_token_budget_blocks_tool_side_effects_in_exhausting_turn(
+async def test_subagent_token_budget_blocks_tool_side_effects_in_exhausting_turn(
     tmp_path,
 ) -> None:
     executions = 0
@@ -1795,17 +1941,19 @@ async def test_child_token_budget_blocks_tool_side_effects_in_exhausting_turn(
                 ModelStreamEvent(
                     type=ModelStreamEventType.COMPLETED,
                     finish_reason="tool_calls",
+                    text="attempting a mutation",
                     tool_calls=[tool_call_wire("c1", "mutate", {})],
                     usage={"total_tokens": 10},
                 )
-            ]
+            ],
+            text_events("budget-limited conclusion", usage={"total_tokens": 1}),
         ]
     )
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
@@ -1815,20 +1963,22 @@ async def test_child_token_budget_blocks_tool_side_effects_in_exhausting_turn(
         background=False,
     )
 
-    assert result.status is ChildStatus.BUDGET_EXHAUSTED
+    assert result.status is SubagentStatus.BUDGET_EXHAUSTED
+    assert result.conclusion.summary == "budget-limited conclusion"
+    assert len(model.requests) == 2
     assert executions == 0
-    child_records = await _read_child_records(tmp_path, result.child_run_id)
+    subagent_records = await _read_subagent_records(tmp_path, result.subagent_run_id)
     terminal = next(
         record
-        for record in child_records
+        for record in subagent_records
         if record.type is JournalRecordType.TOOL_TERMINAL
     )
-    assert _terminal_result_payload(child_records, terminal)["status"] == "denied"
+    assert _terminal_result_payload(subagent_records, terminal)["status"] == "denied"
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_child_cost_budget_uses_explicit_frozen_model_pricing(tmp_path) -> None:
+async def test_subagent_cost_budget_uses_explicit_frozen_model_pricing(tmp_path) -> None:
     pricing = ModelPricing(
         input_usd_per_million=1.0,
         output_usd_per_million=2.0,
@@ -1846,11 +1996,11 @@ async def test_child_cost_budget_uses_explicit_frozen_model_pricing(tmp_path) ->
             )
         ]
     )
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             model_pricing=pricing,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
@@ -1860,7 +2010,7 @@ async def test_child_cost_budget_uses_explicit_frozen_model_pricing(tmp_path) ->
         background=False,
     )
 
-    assert result.status is ChildStatus.BUDGET_EXHAUSTED
+    assert result.status is SubagentStatus.BUDGET_EXHAUSTED
     assert result.total_cost_usd == pytest.approx(0.000006)
     snapshot = ledger.snapshot()
     assert snapshot.total_cost_usd == pytest.approx(0.000006)
@@ -1870,7 +2020,7 @@ async def test_child_cost_budget_uses_explicit_frozen_model_pricing(tmp_path) ->
 
 
 @pytest.mark.asyncio
-async def test_child_cost_budget_without_pricing_fails_before_model_construction(
+async def test_subagent_cost_budget_without_pricing_fails_before_model_construction(
     tmp_path,
 ) -> None:
     model_factory_calls = 0
@@ -1880,10 +2030,10 @@ async def test_child_cost_budget_without_pricing_fails_before_model_construction
         model_factory_calls += 1
         return ScriptedModel([text_events("must not run")])
 
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model_factory,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
@@ -1893,20 +2043,20 @@ async def test_child_cost_budget_without_pricing_fails_before_model_construction
         background=False,
     )
 
-    assert result.status is ChildStatus.FAILED
+    assert result.status is SubagentStatus.FAILED
     assert model_factory_calls == 0
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_child_budget_narrows_nested_max_children_runtime_context(
+async def test_subagent_budget_narrows_nested_max_subagents_runtime_context(
     tmp_path,
 ) -> None:
     observed: list[int] = []
 
     @tool(name="capture_budget")
     def _capture_budget(runtime_context=None) -> str:
-        observed.append(runtime_context["max_children"])
+        observed.append(runtime_context["max_subagents"])
         return "captured"
 
     registry = ToolRegistry().register(_capture_budget)
@@ -1916,27 +2066,27 @@ async def test_child_budget_narrows_nested_max_children_runtime_context(
             text_events("done"),
         ]
     )
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
     result = await supervisor.launch(
-        _request("nested", budget=TaskBudget(max_children=2)),
-        _context(max_children=3, parent_tool_authority=registry.freeze()),
+        _request("nested", budget=TaskBudget(max_subagents=2)),
+        _context(max_subagents=3, parent_tool_authority=registry.freeze()),
         background=False,
     )
 
-    assert result.status is ChildStatus.COMPLETED
+    assert result.status is SubagentStatus.COMPLETED
     assert observed == [2]
     await supervisor.aclose()
 
 
 @pytest.mark.asyncio
-async def test_child_runtime_exposes_its_mailbox_for_descendant_completion(
+async def test_subagent_runtime_exposes_its_mailbox_for_descendant_completion(
     tmp_path,
 ) -> None:
     observed: list[bool] = []
@@ -1953,11 +2103,11 @@ async def test_child_runtime_exposes_its_mailbox_for_descendant_completion(
             text_events("done"),
         ]
     )
-    supervisor = ChildSupervisor(
-        invocation_factory=build_agent_child_invocation_factory(
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             tool_registry=registry,
-            journal_directory=_children_root(tmp_path),
+            journal_directory=_subagents_root(tmp_path),
         )
     )
 
@@ -1967,10 +2117,10 @@ async def test_child_runtime_exposes_its_mailbox_for_descendant_completion(
         background=False,
     )
 
-    assert result.status is ChildStatus.COMPLETED
+    assert result.status is SubagentStatus.COMPLETED
     assert observed == [True]
     await supervisor.aclose()
 
 
 async def _unused_factory(_request, _context):
-    raise AssertionError("recovery must not construct a child")
+    raise AssertionError("recovery must not construct a subagent")

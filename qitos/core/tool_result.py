@@ -70,7 +70,7 @@ class ToolResult:
     """Normalized, deeply immutable tool execution result.
 
     ``usage`` carries typed token/cost accounting for work the Tool itself
-    performed (for example a child Agent run); ``added_tool_names`` lists
+    performed (for example a Subagent run); ``added_tool_names`` lists
     the names of Tools this result activated, available from this transcript
     point onward. Both are durable facts and ride the canonical codec; they
     are not provider wire data and stay out of :meth:`to_model_dict`.

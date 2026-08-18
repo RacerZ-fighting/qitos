@@ -629,8 +629,8 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
             elif record_type in (
                 JournalRecordType.PROCESS_STARTED,
                 JournalRecordType.PROCESS_TERMINAL,
-                JournalRecordType.CHILD_STARTED,
-                JournalRecordType.CHILD_TERMINAL,
+                JournalRecordType.SUBAGENT_STARTED,
+                JournalRecordType.SUBAGENT_TERMINAL,
             ):
                 pass
             else:

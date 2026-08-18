@@ -19,10 +19,14 @@ How to update:
 
 ### Fixed
 
-- Root and recursively launched Child agents now reserve model steps from one
-  durable lineage budget before provider admission. Concurrent Children cannot
-  oversubscribe the remaining step allowance, and resume/fork replay preserves
-  the shared count while each Child's own step limit remains a narrower cap.
+- Root and recursively launched Subagents now reserve model steps from one durable
+  lineage budget before provider admission. Concurrent Subagents cannot oversubscribe
+  the remaining allowance, and each active Subagent holds one slot for a final
+  tool-free, same-context answer. A useful answer releases the unused hold; a step
+  boundary or settled token/cost crossing consumes it for the conclusion turn. The
+  model's final text remains canonical, and typed projections cannot replace it with
+  Tool, Plan, or Journal-derived prose. Resume/fork restores only durable usage, not
+  process-local holds for Agents interrupted by a crash.
 - Bundled Skills whose exact names are already visible may now be loaded directly;
   the model-facing Tool guidance reserves `list_skills` for catalog discovery or
   truncated summaries instead of requiring a redundant listing call.
@@ -84,21 +88,21 @@ How to update:
   (including Anthropic `tool_result.is_error`). The façade returns typed
   values for expected rejections only; listener/codec/persistence bugs are
   faults that propagate after the run is terminalized.
-- **Façade-driven child agents.** `qitos.kit.child.AgentChildEngine` implements
-  the `ChildEngine` contract over the new `Agent` façade, and
-  `qitos.kit.child.build_agent_child_invocation_factory` wires one child run
+- **Façade-driven subagents.** `qitos.kit.subagent.AgentSubagentEngine` implements
+  the `SubagentEngine` contract over the new `Agent` façade, and
+  `qitos.kit.subagent.build_agent_subagent_invocation_factory` wires one Subagent run
   per invocation with a narrowed Tool registry (filtered to the request's
   allowed groups) and a value snapshot of the parent's effective Tool
   permission/scope policy, budgets tightened to the tightest of factory defaults,
   request budget and the parent's remaining deadline, and a per-run
   `JournalTurnTransaction` journal (`journal_directory` or an explicit
-  SessionJournal factory). Parent messages enter the child run's steering
+  SessionJournal factory). Parent messages enter the Subagent run's steering
   queue with journaled acceptance (`runtime_input.posted`) only while the run
   can guarantee a following turn safe point; starting and terminal-settlement
-  windows reject instead of reporting false acceptance. Child control Tools
+  windows reject instead of reporting false acceptance. Subagent control Tools
   use the executor-owned Run identity, and every abort
-  still ends in a durable `run.interrupted` record. Child recovery now
-  rebuilds a started child's terminal `ChildResult` from its own loop journal
+  still ends in a durable `run.interrupted` record. Subagent recovery now
+  rebuilds a started Subagent's terminal `SubagentResult` from its own loop journal
   when that journal holds a run terminal record
   (`qitos.kit.journal.recover_run_outcome`), and closes it as `interrupted`
   only when no terminal record exists; journals written by the retired Engine
@@ -163,7 +167,7 @@ How to update:
   a `RecoveredRecorderState` seed (next turn, last journaled config, recorded
   message count) so a resumed run continues without rewriting history, and
   can commit `budget.committed` per model terminal through an attached
-  `BudgetLedger` with the same idempotency-key scheme the Child boundary
+  `BudgetLedger` with the same idempotency-key scheme the Subagent boundary
   uses. `runtime_input.consumed` records consumption of a posted runtime
   input; recovery folds own-run records only and never redelivers inherited
   fork facts.
@@ -184,7 +188,7 @@ How to update:
   `runtime_input.posted`, steers the message and appends
   `runtime_input.consumed` once the steered message is covered by a
   `step.committed`; unconsumed inputs are re-projected exactly once on
-  resume, and the Child engine now marks consumption the same way. Manual
+  resume, and the Subagent engine now marks consumption the same way. Manual
   `compact()` runs at idle only (typed `CompactRejected` for `busy` /
   `nothing_to_compact`); automatic compaction evaluates Pi's token
   threshold at idle boundaries against the model's `context_window`, and a
@@ -233,33 +237,33 @@ How to update:
   leg advances carry Task facts that would otherwise be truncated by the
   fork boundary. Prompting a task-bearing Session whose Root Task is
   terminal rejects with `AgentRunRejected("task_terminal")`; taskless
-  Sessions are unchanged. Child launch binds the narrowed Child Task
-  durably: `ChildLaunchRequest` carries `parent_task_id` / `plan_assignment`
-  fields, the façade Child engine commits the Child `task.created` before its
+  Sessions are unchanged. Subagent launch binds the narrowed Subagent Task
+  durably: `SubagentLaunchRequest` carries `parent_task_id` / `plan_assignment`
+  fields, the façade Subagent engine commits the Subagent `task.created` before its
   `input.accepted`, and the Agent Tool binds a new assignment explicitly
   instead of copying the parent's assignment.
 - **Dependency-aware durable Plan (S3b).** `qitos.core.plan` replaces the flat
   checklist with immutable `Plan` / `PlanNode` / `PlanStatus` contracts: stable
-  node ids, dependencies, optional typed `ChildHandle` owners, derived readiness,
+  node ids, dependencies, optional typed `SubagentHandle` owners, derived readiness,
   topological rendering, cycle/reference checks, legal whole-graph replacements,
   and at most one in-progress node per owner. Task-bound `plan.updated` records are
   the sole Plan truth and pure recovery folds each Task's graph through fork lineage,
   so a terminal follow-up starts without the previous Task's Plan. `UpdatePlanTool`
   commits accepted replacements through the current Session journal; models cannot
-  invent a Child owner. Agent Tool calls may name a ready `plan_assignment`; the
-  supervisor commits the generated handle before `child.started` and durably
-  releases it if admission fails. A Child launched for a parent Task with a durable
+  invent a Subagent owner. Agent Tool calls may name a ready `plan_assignment`; the
+  supervisor commits the generated handle before `subagent.started` and durably
+  releases it if admission fails. A Subagent launched for a parent Task with a durable
   Plan must name an explicit assignment, while no-Plan Tasks may still launch an
-  unassigned Child. Root and Child use this one optional contract,
-  while a dependency-free Child Plan renders as an ordinary TODO.
-- **Child product-binding and conclusion contracts.** `ChildLaunchRequest` now carries
+  unassigned Subagent. Root and Subagent use this one optional contract,
+  while a dependency-free Subagent Plan renders as an ordinary TODO.
+- **Subagent product-binding and conclusion contracts.** `SubagentLaunchRequest` now carries
   explicit success criteria, Task constraints/references and a frozen
-  `ToolPermissionContext`; all fields use the strict durable codec and the façade Child
-  engine commits them on the narrowed Child Task. `ChildInvocation` accepts a typed
+  `ToolPermissionContext`; all fields use the strict durable codec and the façade Subagent
+  engine commits them on the narrowed Subagent Task. `SubagentInvocation` accepts a typed
   async conclusion factory that settles before resource cleanup, and
   `AgentConclusion.resource_refs` carries stable reusable-resource references without
-  copying a Child transcript. Recursive Agent Tools can share one Root-owned
-  `ChildRunLimiter`, while independent concurrency-safe Agent calls remain ordered at
+  copying a Subagent transcript. Recursive Agent Tools can share one Root-owned
+  `SubagentRunLimiter`, while independent concurrency-safe Agent calls remain ordered at
   the parent ToolResult boundary.
 - **Committed Tool-transaction projection.**
   `qitos.kit.journal.committed_tool_transactions` returns only canonical Tool terminals
@@ -272,7 +276,7 @@ How to update:
 - **Flat WorkPlan replaced in place (S3b).** `WorkPlanState`, `WorkPlanItem`,
   `WorkPlanStatus`, `WorkPlanUpdate`, `UpdateWorkPlanTool` and their codecs/reducer
   are removed rather than aliased. Use `Plan`, `PlanNode`, `PlanStatus`,
-  `PlanUpdate`, `UpdatePlanTool` and the Plan codecs. `ChildLaunchRequest.from_dict`
+  `PlanUpdate`, `UpdatePlanTool` and the Plan codecs. `SubagentLaunchRequest.from_dict`
   now requires the canonical task/product-binding keys, including `success_criteria`,
   `constraints`, `references`, `permission_context` and explicit `null` values.
   The unused `qitos.kit.state` package is removed.
@@ -291,21 +295,29 @@ How to update:
 
 ### Changed
 
+- **Breaking:** The public Child-Agent vocabulary is now consistently `Subagent`:
+  `qitos.core.subagent`, `qitos.kit.subagent`, `qitos.kit.tool.subagent`,
+  `SubagentTool`, `SubagentSupervisor`, `SubagentHandle`, `SubagentResult`, and the
+  `subagent_*` control Tools replace the old names. New journals and runtime inputs use
+  `subagent.started` / `subagent.terminal` and `agent.subagent.*`. Strict decoders keep
+  one-way read migration for already-persisted `child.*` data; no old Python API alias
+  remains.
+
 - Trace DTO serialization now traverses dataclass fields and immutable mappings without
   `deepcopy`, so deeply frozen Tool arguments remain serializable without weakening the
   runtime snapshot boundary.
 - `CancelToken` / `CancelMode` moved from the retired Engine lifecycle to
   `qitos.core.cancellation`; the compatibility export is removed.
-- `AgentTool` (and the child completion/runtime projections in
-  `qitos.core.runtime_input.child_result_payload`) no longer report
-  `total_tokens` / `total_cost_usd` inside the untyped output payload. Child
+- `SubagentTool` (and the Subagent completion/runtime projections in
+  `qitos.core.runtime_input.subagent_result_payload`) no longer report
+  `total_tokens` / `total_cost_usd` inside the untyped output payload. Subagent
   token/cost accounting rides the typed `ToolResult.usage` carrier
-  (`cost_usd` as a lossless detail key) on terminal Child results; status,
+  (`cost_usd` as a lossless detail key) on terminal Subagent results; status,
   conclusion, completeness flags (`usage_complete` / `cost_complete`), steps
   and elapsed time stay in `output`. The Agent Tool now returns a typed
   `ToolResult` on the success path instead of a plain payload mapping. The
-  durable `child.terminal` journal record still carries the full typed
-  `ChildResult` facts.
+  durable `subagent.terminal` journal record still carries the full typed
+  `SubagentResult` facts.
 
 ### Removed
 
@@ -359,7 +371,7 @@ How to update:
 - **Breaking:** Removed the pattern method recipes
   (`qitos.recipes.{lats,magentic_one,moa,reflexion,self_refine}`): AgentModule
   Agent + Critic templates with no caller outside their own tests. The
-  surviving composition path is the Agent façade plus child agents; the
+  surviving composition path is the Agent façade plus subagents; the
   method-templates guide and glossary entries leave with them.
 - **Breaking:** Removed the `qitos_zoo` submodule (gitlink and `.gitmodules`).
   The fork carries no product showcase agents; the zoo's coder/cyber
@@ -381,8 +393,8 @@ How to update:
 - **Breaking:** Removed the Engine-coupled delegation tools
   `qitos.kit.tool.delegate` (`DelegateTool`) and `qitos.kit.tool.fanout`
   (`FanOutTool`) together with `AgentRegistry.get_delegate_tools()` /
-  `get_fanout_tool()` and their examples. Child agents now run through the
-  façade-driven `AgentChildEngine` (see Added); the retired delegate/fanout
+  `get_fanout_tool()` and their examples. Subagents now run through the
+  façade-driven `AgentSubagentEngine` (see Added); the retired delegate/fanout
   event names are removed with the Engine lifecycle.
 - **Breaking:** Removed the kit-side handoff tool chain:
   `qitos.kit.tool.handoff_tool` (`HandoffTool`),
@@ -396,7 +408,7 @@ How to update:
   `ExecutionConfig.has_shared_memory` projection, the `shared_memory` runtime
   context entry, `AgentSpec.shared_memory`, and the handoff namespace setup.
   The blackboard was consumed only by the retired delegation tools and the
-  Engine multi-agent path; parent/child collaboration uses typed Child
+  Engine multi-agent path; parent/Subagent collaboration uses typed Subagent
   results and messages instead.
 - **Breaking:** Removed the `qitos.kit.repl` package (`AgentREPL`). It drove
   the Engine stepping API interactively and had no consumer outside the zoo
@@ -415,7 +427,7 @@ How to update:
   Planner/Executor, Proposer/Verifier, Debate, MoA, and DAG workflow templates.
   They formed a synchronous parallel orchestration layer with no production caller
   inside QitOS. Applications should express coordination policy through the typed
-  `AgentTool` and `ChildControlToolSet` lifecycle or in application-owned recipes.
+  `SubagentTool` and `SubagentControlToolSet` lifecycle or in application-owned recipes.
 - **Breaking:** Removed the deprecated product-level `SecurityAuditAgent` template and
   redundant security-audit Tool/ToolSet forwarding packages. Security research remains
   available from the explicit `qitos.kit.tool.experimental.security_research` owner,
@@ -538,12 +550,12 @@ How to update:
   the managed file, foreground, background, PTY, stdin, and shutdown contracts.
 - Root Engines and every descendant can now share one journal-backed `BudgetLedger`.
   Completed model transactions atomically settle token and cost usage into the Root
-  JSONL, while `EngineResult` and `ChildResult` preserve local totals and usage
-  completeness for audit. Local Child ceilings further narrow, rather than duplicate,
+  JSONL, while `EngineResult` and `SubagentResult` preserve local totals and usage
+  completeness for audit. Local Subagent ceilings further narrow, rather than duplicate,
   the shared Run allowance.
 - Canonical `ToolResult` now carries the model ToolCall `call_id`, assigned by the
   Engine before application finalization and reconstructed for older Journal records.
-  Child invocation factories may complete async resource construction while existing
+  Subagent invocation factories may complete async resource construction while existing
   synchronous factories remain supported.
 - Engine-owned MCP catalogs now refresh atomically at pre-turn safe points after an
   explicit request or `notifications/tools/list_changed`. Discovery follows bounded
@@ -573,8 +585,8 @@ How to update:
   atomic replacement operation. Reads expose a complete-file SHA-256 revision;
   explicit and implicit compare-and-swap guards turn concurrent changes into a stable
   `file_revision_conflict` result instead of a lost update.
-- Child invocation factories now receive the already-journaled `ChildHandle` in their
-  runtime context, so product runtimes can correlate independent Child sessions and
+- Subagent invocation factories now receive the already-journaled `SubagentHandle` in their
+  runtime context, so product runtimes can correlate independent Subagent sessions and
   traces without deriving identity from mutable task data.
 
 ### Breaking
@@ -590,7 +602,7 @@ How to update:
   legacy synchronous hooks run in a worker thread by default.
 - Live MCP transports no longer belong to `AgentModule.mcp_servers`. Applications pass
   `Engine(mcp_server_factory=...)` a construction-only factory that returns fresh,
-  unconnected transports for each Run, preventing Root, Child, resumed, or repeated
+  unconnected transports for each Run, preventing Root, Subagent, resumed, or repeated
   Runs from sharing a process, HTTP client, or session.
 
 - `MCPServer.list_tools()` and `MCPServer.call_tool()` now use the official
@@ -598,18 +610,18 @@ How to update:
   `MCPToolInfo`, `MCPToolAnnotations`, and `MCPCallToolResult` mirrors were removed;
   callers should import protocol models from `mcp.types`. MCP bridges still project
   remote results into regular QitOS `ToolResult` values with stable classifications.
-- Child invocation factories are now async-only and must resolve to a
-  `ChildInvocation`. This makes cancellation and partial-construction cleanup part of
+- Subagent invocation factories are now async-only and must resolve to a
+  `SubagentInvocation`. This makes cancellation and partial-construction cleanup part of
   the same awaited ownership chain instead of a synchronous pre-run side effect.
 - Custom `FileSystemCapability` implementations must provide `write_text_atomic()`.
   The method owns same-path mutation ordering, optional SHA-256 preconditions, and the
   final replace boundary; `write_text()` remains the unconditional convenience path.
 - `AgentRequest`, `AgentInvocation`, and `AgentResult` have been replaced by the
-  immutable core `ChildLaunchRequest`, `ChildInvocation`, `ChildHandle`, `ChildResult`,
-  `ChildStatus`, and `AgentConclusion` contracts. `AgentTool` now accepts a complete
-  `TaskBudget`, returns parent-scoped handles, and exposes typed `child_result(handle)`
-  and `cancel_child(handle)` lifecycle operations. Tool execution status remains
-  separate from the child task's `child_status`.
+  immutable core `SubagentLaunchRequest`, `SubagentInvocation`, `SubagentHandle`, `SubagentResult`,
+  `SubagentStatus`, and `AgentConclusion` contracts. `SubagentTool` now accepts a complete
+  `TaskBudget`, returns parent-scoped handles, and exposes typed `subagent_result(handle)`
+  and `cancel_subagent(handle)` lifecycle operations. Tool execution status remains
+  separate from the Subagent task's `subagent_status`.
 - `CommandCapability.start()` has been replaced by the async typed
   `astart()`/`apoll()`/`aread()`/`awrite()`/`await_process()`/`aterminate()` lifecycle.
   Environment cleanup now awaits `Env.ateardown()` so managed subprocess readers and
@@ -645,10 +657,10 @@ How to update:
   invalid raw queue modes fail closed. Reaching `max_turns` no longer consumes steering
   or follow-up input that cannot be injected, and the façade restores any input drained
   immediately before a run rejection.
-- Child launch now intersects requested Tool groups with the parent's frozen exposure,
+- Subagent launch now intersects requested Tool groups with the parent's frozen exposure,
   carries a value snapshot of the parent's permission/scope authority, and applies one
   absolute deadline across limiter admission, factory construction, execution, and
-  cleanup. Child control Tools prefer the executor-owned parent Run identity, while
+  cleanup. Subagent control Tools prefer the executor-owned parent Run identity, while
   mailbox posting rejects startup, between-turn, and terminal-settlement windows where
   no later safe point can be guaranteed. Posts reserved during a live turn settle in
   FIFO order at Pi's existing prepare-next-turn boundary, before steering is drained;
@@ -666,22 +678,22 @@ How to update:
   async suite executes in CI instead of producing unknown-mark warnings and hundreds
   of unsupported-coroutine failures. Build and audit environments require a
   `setuptools` release containing the fix for `PYSEC-2026-3447`.
-- MCP startup, Child waits, and their behavior tests now use structured primitives
+- MCP startup, Subagent waits, and their behavior tests now use structured primitives
   available across the declared Python 3.10+ range. Python 3.10 cancellation tests
   verify the canonical Journal outcome when its runtime normalizes a cancelled Task's
   `CancelledError` subclass.
 - Manual contribution checks now import the canonical `ToolSpec`, and the Chinese
   documentation set includes the multi-agent tutorial required by the bilingual
   navigation validation.
-- Foreground Child supervision now distinguishes `ChildInvocationCancelled` from an
-  actual caller Task cancellation. Both outcomes persist one cancelled Child terminal,
+- Foreground Subagent supervision now distinguishes `SubagentInvocationCancelled` from an
+  actual caller Task cancellation. Both outcomes persist one cancelled Subagent terminal,
   but only `asyncio.CancelledError` from the caller aborts the parent.
 - Caller cancellation after Tool execution now reuses the executor's typed terminal
   `cancel_source` instead of inspecting Python-version-specific Task internals. The
   Engine still commits one terminal result per ToolCall before propagating cancellation.
-- Resume now derives idempotent background Child and process completion inputs from local
-  terminal facts. A crash between `child.terminal` / `process.terminal` and mailbox
-  acceptance no longer loses the notification; foreground Child results are not
+- Resume now derives idempotent background Subagent and process completion inputs from local
+  terminal facts. A crash between `subagent.terminal` / `process.terminal` and mailbox
+  acceptance no longer loses the notification; foreground Subagent results are not
   redelivered, consumed ids stay consumed, and forks do not receive inherited completions.
 - Cancelling MCP shutdown now waits for active requests and asks the task that entered
   the official SDK contexts to finish their transport cleanup before cancellation
@@ -706,8 +718,8 @@ How to update:
   time. Trace provenance preserves explicit structured Task IDs in an independent
   `task_hash` without mixing task data into `run_config_hash`; qita requires the task
   fingerprint for same-spec comparisons while keeping older manifests readable.
-- The `ChildRunResult.records` contract is now a read-only sequence view, so concrete
-  typed `EngineResult` values structurally satisfy the Child Engine protocol.
+- The `SubagentRunResult.records` contract is now a read-only sequence view, so concrete
+  typed `EngineResult` values structurally satisfy the Subagent Engine protocol.
 - Synchronous Engine hooks can now defer runtime input for durable async acceptance at
   the next turn safe point instead of calling the external sync mailbox bridge from
   the Engine event loop.
@@ -763,23 +775,23 @@ How to update:
   `JsonlRunCatalog` for inspect, deterministic listing, validated lineage, and direct
   children. Catalog reads use only an exact read-only SQLite projection or canonical
   JSONL prefix and never acquire ownership, repair, or rebuild storage.
-- `AgentTool` composition can now populate the Child profile, allowed Tool groups, and
-  working directory in each immutable launch request. `ChildInvocation.cleanup` gives
-  the supervisor explicit async ownership of per-Child model and trace resources across
+- `SubagentTool` composition can now populate the Subagent profile, allowed Tool groups, and
+  working directory in each immutable launch request. `SubagentInvocation.cleanup` gives
+  the supervisor explicit async ownership of per-Subagent model and trace resources across
   success, failure, and cancellation.
-- Added a reusable Run-owned `ChildSupervisor`. It admits fresh Engines under one async
+- Added a reusable Run-owned `SubagentSupervisor`. It admits fresh Engines under one async
   concurrency limit, supports non-destructive wait and bounded interrupt, stores
   terminal results before parent delivery, and continues to own delivery tasks until
-  shutdown drains them. `AgentTool` is now only the model-facing launch projection.
-- Child supervision now journals `child.started` before constructing an Engine and
-  `child.terminal` before parent delivery. Recovery marks a started child without a
+  shutdown drains them. `SubagentTool` is now only the model-facing launch projection.
+- Subagent supervision now journals `subagent.started` before constructing an Engine and
+  `subagent.terminal` before parent delivery. Recovery marks a started Subagent without a
   terminal as `interrupted` and never replays it; forked Runs do not acquire authority
   over inherited parent handles.
-- Added `child_status`, `child_wait`, `child_message`, and `child_interrupt` tools over
-  the shared supervisor. Message delivery uses the active Child's async durable mailbox;
+- Added `subagent_status`, `subagent_wait`, `subagent_message`, and `subagent_interrupt` tools over
+  the shared supervisor. Message delivery uses the active Subagent's async durable mailbox;
   wait timeout preserves execution, interrupt awaits cleanup, and unknown or foreign
   handles return stable state.
-- Added canonical Child Agent contracts that keep persisted launch intent, stable
+- Added canonical Subagent contracts that keep persisted launch intent, stable
   identity, lifecycle status, bounded conclusions, evidence references, and live Engine
   ownership separate. The contracts round-trip without serializing a runnable Agent.
 - Added durable run-scoped mailbox acceptance. Journal-backed events append
@@ -808,13 +820,13 @@ How to update:
 - Added one immutable `TurnSnapshot` for every model transaction. It freezes the model
   reference, protocol, transaction-complete History view, Tool definitions, runtime
   capabilities, absolute deadline, explicit pricing, and remaining step/token/cost,
-  Tool-concurrency, and Child budgets used by both model projection and dispatch.
+  Tool-concurrency, and Subagent budgets used by both model projection and dispatch.
 - Added typed completion assessment. Product agents can accept a proposed final answer,
   reject it with durable feedback for another turn, or classify it as blocked; new
   runs distinguish `completed`, `blocked`, step/time/token/cost budget exhaustion,
   cancellation, and failure.
 - Added explicit `ModelPricing` plus Run and Task limits for cost, Tool concurrency, and
-  Child count. Journal resume restores accumulated provider token usage and calculated
+  Subagent count. Journal resume restores accumulated provider token usage and calculated
   cost before another turn is admitted.
 
 - Added one process-safe writer lease per Run and a disposable SQLite Journal read
@@ -906,7 +918,7 @@ How to update:
   compatibility interpretation live in a composed decision runtime, and optional
   critic/handoff policies no longer occupy the outer loop.
 - The canonical action path is now async from Engine through Tool, Mailbox, MCP, and
-  Child execution. Blocking host and Docker commands use asyncio subprocesses with
+  Subagent execution. Blocking host and Docker commands use asyncio subprocesses with
   process-group cleanup; explicitly concurrency-safe calls remain parallel and commit
   terminal results in source order.
 - Cancellation now drains every started Tool handler before publishing its terminal
@@ -914,10 +926,10 @@ How to update:
   and runtime cleanup, while controlled Engine cancellation returns an auditable
   cancelled result without leaving event-loop tasks behind.
 - `ToolExposure` now freezes each Tool definition while retaining one live handler
-  owner, so stateful Tool lifecycle and Run-scoped Child accounting cannot be copied
+  owner, so stateful Tool lifecycle and Run-scoped Subagent accounting cannot be copied
   away between lookups or turns.
 - Runtime input is accepted through a thread-safe async inbox and projected only at the
-  next pre-turn safe point. MCP transports and background Child tasks stay on their
+  next pre-turn safe point. MCP transports and background Subagent tasks stay on their
   owning event loop; the temporary-loop MCP bridge and daemon action pool were removed.
 - Journal records now deep-copy nested payloads at construction and projection
   boundaries. Replay and committed-tool queries return isolated values.
@@ -971,10 +983,10 @@ How to update:
   one checkpoint row per id and enforce thread-scoped reads, listing, and deletion.
 - Memory and SQLite checkpoint stores now share one JSON boundary, return independent
   values, and reject cross-event-loop reuse.
-- **Breaking:** `AgentTool` now requires one explicit `invocation_factory` and uses only
+- **Breaking:** `SubagentTool` now requires one explicit `invocation_factory` and uses only
   the canonical `execution_mode`. Removed the class registry, generic model/workspace
   construction, hidden worktree argument, `allow_background` alias, and the separate
-  `CodingToolSet.agent_spawn` loop; applications own fresh child Engine construction.
+  `CodingToolSet.agent_spawn` loop; applications own fresh Subagent Engine construction.
 
 - Model calls now use one async-native Engine path and one Engine-scoped absolute
   request deadline. Provider connection, stream-idle, and retry waits are clamped to
@@ -1004,13 +1016,13 @@ How to update:
   synchronous `run()` and `step()` entry points only bridge at the process boundary and
   reject calls from an active event loop; the daemon-thread `AsyncEngine` bridge has
   been removed.
-- Background `AgentTool` runs now snapshot parent history at launch but defer model,
+- Background `SubagentTool` runs now snapshot parent history at launch but defer model,
   Engine, and trace construction until an execution slot opens. Event-loop-owned tasks,
   awaited close, canonical cancellation stops, and terminal-before-wakeup ordering keep
-  child teardown structured and observable. Terminal
-  children retain their queryable result while active task, request, Engine, and
+  Subagent teardown structured and observable. Terminal
+  Subagents retain their queryable result while active task, request, Engine, and
   cancellation records are reaped immediately.
-- Clarified the generic `AgentTool` model contract: independent multi-step tasks can be
+- Clarified the generic `SubagentTool` model contract: independent multi-step tasks can be
   delegated in one response for concurrent execution, while dependent steps and cheap
   mechanical variants remain in the parent. Explicit tool guidance is no longer replaced
   by the `execute()` implementation docstring during initialization.
@@ -1082,7 +1094,7 @@ How to update:
 - Fixed native response text extraction so OpenAI-compatible messages with null content no longer become repr-string final answers.
 - Fixed OpenAI-compatible forced tool-call requests so conflicting thinking options are disabled, and repaired JSON/tool-call parsing for bare control characters inside string values.
 - Fixed JSON-like object extraction so apostrophes in surrounding natural-language text no longer hide valid JSON payloads.
-- Fixed `DelegateTool` context delivery so the optional tool-call `context` object is passed into the child agent via `Engine.run(..., context=...)`.
+- Fixed `DelegateTool` context delivery so the optional tool-call `context` object is passed into the subagent via `Engine.run(..., context=...)`.
 - Fixed OpenAI-compatible tool schema generation for postponed or string annotations so CyberGym tools no longer emit invalid JSON Schema types.
 - Fixed CyberGym batch trace/result/render redaction so API keys and auth token markers are scrubbed before persisted artifacts are written.
 - Fixed CyberGym PoC generation runs so benchmark-local Bash commands can run without interactive command review while the default coding toolset review guard remains intact.

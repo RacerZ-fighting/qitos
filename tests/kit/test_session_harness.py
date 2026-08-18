@@ -151,7 +151,7 @@ async def _scripted_journal(
 def _runtime_input(event_id: str, content: str) -> RuntimeInput:
     return RuntimeInput(
         event_id=event_id,
-        kind="agent.child.completed",
+        kind="agent.subagent.completed",
         correlation_id="child-1",
         source="qitos.agent",
         payload={"content": content},
