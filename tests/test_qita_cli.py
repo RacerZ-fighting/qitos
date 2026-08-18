@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from datetime import datetime, timezone
 from http.client import HTTPConnection
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -233,6 +235,55 @@ def test_discover_runs_and_export(tmp_path: Path):
     content = out.read_text(encoding="utf-8")
     assert "QitOS Trace" in content
     assert "r1" in content
+
+
+def test_running_run_projects_committed_jsonl_progress(tmp_path: Path):
+    run = _make_run(tmp_path, "live-progress")
+    manifest_path = run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        {
+            "status": "running",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "step_count": 0,
+            "event_count": 0,
+        }
+    )
+    manifest["summary"]["steps"] = 0
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    live_update = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    for name in ("events.jsonl", "steps.jsonl"):
+        os.utime(run / name, (live_update.timestamp(), live_update.timestamp()))
+
+    discovered = _discover_runs(tmp_path)[0]
+    payload = _load_run_payload(run)
+
+    assert discovered["event_count"] == 2
+    assert discovered["step_count"] == 1
+    assert discovered["updated_at"] == live_update.isoformat()
+    assert payload["manifest"]["event_count"] == 2
+    assert payload["manifest"]["step_count"] == 1
+    assert payload["manifest"]["summary"]["steps"] == 1
+    assert payload["manifest"]["updated_at"] == live_update.isoformat()
+
+
+def test_completed_run_keeps_finalized_manifest_counts(tmp_path: Path):
+    run = _make_run(tmp_path, "finalized-counts")
+    manifest_path = run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["event_count"] = 20
+    manifest["step_count"] = 10
+    manifest["summary"]["steps"] = 10
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    discovered = _discover_runs(tmp_path)[0]
+    payload = _load_run_payload(run)
+
+    assert discovered["event_count"] == 20
+    assert discovered["step_count"] == 10
+    assert payload["manifest"]["event_count"] == 20
+    assert payload["manifest"]["step_count"] == 10
+    assert payload["manifest"]["summary"]["steps"] == 10
 
 
 def test_run_payload_includes_diagnostic_insights(tmp_path: Path):

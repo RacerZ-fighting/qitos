@@ -73,6 +73,7 @@ from ...core.tool_executor import (
 )
 from ...core.tool_registry import ToolExposure, ToolRegistry
 from ...core.tool_result import ToolResult
+from ...trace import AgentTraceProducer, TraceWriter, trace_producer_metadata
 from ..journal import JournalTurnTransaction, JsonlSessionJournal
 from ..journal.turn_recorder import (
     encode_runtime_input_consumed,
@@ -443,6 +444,7 @@ class AgentChildEngine:
         journal_factory: Optional[Callable[[], SessionJournal]] = None,
         journal_metadata: Optional[Mapping[str, Any]] = None,
         child_task: Optional[Task] = None,
+        trace_directory: Union[str, Path, None] = None,
     ) -> None:
         self._model = model
         self._tool_registry = tool_registry
@@ -486,9 +488,15 @@ class AgentChildEngine:
         self._run_finalizer = run_finalizer
         self._journal_factory = journal_factory
         self._journal_metadata = dict(journal_metadata or {})
+        self._trace_directory = (
+            Path(trace_directory).expanduser().resolve()
+            if trace_directory is not None
+            else None
+        )
 
         self._agent: Optional[Agent] = None
         self._journal: Optional[SessionJournal] = None
+        self._trace_producer: AgentTraceProducer | None = None
         self._run_id = ""
         self._cancel_requested = False
         self._runtime_started = asyncio.Event()
@@ -705,6 +713,7 @@ class AgentChildEngine:
             run_finalizer=self._run_finalizer,
         )
         self._agent = agent
+        self._trace_producer = self._attach_trace(agent, run_id)
 
         async def _observe_run(event: Any) -> None:
             if isinstance(event, TurnStart):
@@ -747,6 +756,9 @@ class AgentChildEngine:
                 f"a fresh child Agent rejected its only run: {outcome.reason}"
             )
         self._result = outcome
+        producer = self._trace_producer
+        if producer is not None:
+            producer.finalize(outcome)
         return AgentChildRunResult(
             run_id=run_id,
             result=outcome,
@@ -755,6 +767,34 @@ class AgentChildEngine:
                 transaction.budget_stop_reason or transaction.task_stop_reason
             ),
         )
+
+    def _attach_trace(
+        self,
+        agent: Agent,
+        run_id: str,
+    ) -> AgentTraceProducer | None:
+        directory = self._trace_directory
+        if directory is None:
+            return None
+        metadata = trace_producer_metadata(self._model)
+        metadata["agent_name"] = "qitos.child"
+        task = self._child_task
+        parent_run_id = (
+            task.created_by_run_id
+            if task is not None
+            else self._journal_metadata.get("parent_run_id")
+        )
+        if isinstance(parent_run_id, str) and parent_run_id:
+            metadata["parent_run_id"] = parent_run_id
+        if task is not None:
+            provenance = dict(metadata.get("provenance") or {})
+            provenance["task_id"] = task.task_id
+            metadata["provenance"] = provenance
+        producer = AgentTraceProducer(
+            TraceWriter(str(directory), run_id, metadata=metadata)
+        )
+        producer.attach(agent)
+        return producer
 
     async def _settle_child_task(
         self,
@@ -1133,8 +1173,22 @@ class AgentChildEngine:
             agent.abort()
             await self._reject_runtime_event_admissions()
             await agent.wait_for_idle()
-        if self._journal is not None:
-            await self._journal.close()
+        trace_error: BaseException | None = None
+        producer = self._trace_producer
+        if producer is not None and not producer.finalized:
+            try:
+                producer.finalize(self._result)
+            except BaseException as exc:
+                trace_error = exc
+        try:
+            if self._journal is not None:
+                await self._journal.close()
+        except BaseException as exc:
+            if trace_error is not None:
+                raise exc from trace_error
+            raise
+        if trace_error is not None:
+            raise trace_error
 
 
 def _narrow_tool_registry(
@@ -1181,6 +1235,7 @@ def build_agent_child_invocation_factory(
     extra_request_options: Optional[Mapping[str, Any]] = None,
     journal_directory: Union[str, Path, None] = None,
     journal_factory: Optional[Callable[[], SessionJournal]] = None,
+    trace_directory: Union[str, Path, None] = None,
     run_finalizer: RunFinalizer | None = None,
 ) -> Callable[[ChildLaunchRequest, ChildRuntimeContext], Awaitable[ChildInvocation]]:
     """Build a ``ChildInvocationFactory`` driving children through ``Agent``.
@@ -1190,7 +1245,9 @@ def build_agent_child_invocation_factory(
     request's allowed groups, and turn/runtime budgets are the tightest of the
     factory defaults, the request budget and the parent's remaining deadline.
     ``journal_directory`` (or an explicit ``journal_factory``) gives each
-    child run its own ``JournalTurnTransaction`` journal.
+    child run its own ``JournalTurnTransaction`` journal. ``trace_directory``
+    writes a separate trace directory for every Child Run and links it to the
+    immediate parent through manifest metadata.
     """
 
     if journal_directory is not None and journal_factory is not None:
@@ -1326,6 +1383,7 @@ def build_agent_child_invocation_factory(
             },
             journal_factory=journal_factory,
             child_task=child_task if journal_factory is not None else None,
+            trace_directory=trace_directory,
             journal_metadata={
                 "parent_run_id": runtime_context.parent_run_id,
                 "child_id": runtime_context.handle.child_id,

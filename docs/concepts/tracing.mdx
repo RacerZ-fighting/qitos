@@ -21,6 +21,10 @@ names and statuses — never credentials; the writer applies the established tra
 redaction. The `SessionHarness` attaches a producer to every journal run when it is
 constructed with `trace_directory=...`.
 
+While a Run is active, qita derives its displayed event count, step count, and latest
+update time from the committed JSONL files. Once the producer finalizes the Run, the
+validated manifest summary becomes authoritative.
+
 <Note>
 Trace artifacts are an observational projection. Nothing in Session recovery reads
 them, and they cannot create an executable resume or fork — the canonical Session
