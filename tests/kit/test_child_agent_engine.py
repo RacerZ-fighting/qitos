@@ -1669,6 +1669,36 @@ async def test_child_model_usage_consumes_root_budget_and_closes_admission(
 
 
 @pytest.mark.asyncio
+async def test_concurrent_children_share_one_lineage_step_budget() -> None:
+    ledger = BudgetLedger(max_steps=1)
+    models = [
+        ScriptedModel([text_events(f"answer-{index}")])
+        for index in range(2)
+    ]
+    engines = [
+        AgentChildEngine(model=model, budget_ledger=ledger)
+        for model in models
+    ]
+
+    results = await asyncio.gather(
+        *(
+            engine.arun("inspect", run_id=f"child-{index}")
+            for index, engine in enumerate(engines)
+        )
+    )
+    await asyncio.gather(*(engine.aclose() for engine in engines))
+
+    assert sorted(result.state.stop_reason for result in results) == [
+        "completed",
+        "max_steps",
+    ]
+    assert sum(len(model.requests) for model in models) == 1
+    snapshot = ledger.snapshot()
+    assert snapshot.total_steps == 1
+    assert snapshot.remaining_steps == 0
+
+
+@pytest.mark.asyncio
 async def test_immediate_interrupt_cannot_cancel_model_budget_commit(tmp_path) -> None:
     commit_started = asyncio.Event()
     release_commit = asyncio.Event()

@@ -19,6 +19,10 @@ How to update:
 
 ### Fixed
 
+- Root and recursively launched Child agents now reserve model steps from one
+  durable lineage budget before provider admission. Concurrent Children cannot
+  oversubscribe the remaining step allowance, and resume/fork replay preserves
+  the shared count while each Child's own step limit remains a narrower cap.
 - Bundled Skills whose exact names are already visible may now be loaded directly;
   the model-facing Tool guidance reserves `list_skills` for catalog discovery or
   truncated summaries instead of requiring a redundant listing call.

@@ -732,6 +732,11 @@ class JournalTurnTransaction(TurnTransactionBoundary):
                 )
             )
             self._last_tool_names = config.tool_names
+        if self._budget_ledger is not None:
+            await self._budget_ledger.reserve_step(
+                origin_run_id=run_id,
+                transaction_id=f"{run_id}:turn:{turn}:step",
+            )
         return tuple(positions)
 
     async def model_terminal(

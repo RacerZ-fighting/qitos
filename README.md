@@ -184,12 +184,16 @@ critic, checkpoint, and recipe are not current execution APIs.
 - **Product-owned completion and bounded Runs**: `AgentModule.assess_completion()` can
   accept a final answer, request another evidence-gathering turn, or classify a concrete
   blocker. Runtime and Task budgets now cover steps, time, tokens, cost, Tool
-  concurrency, and Child count, with token/cost usage restored on Journal resume.
-- **One Root/Child usage ledger**: product runtimes can pass one `BudgetLedger` to
-  descendant Engines. Every completed model transaction settles token and cost into
-  the Root JSONL exactly once; Child budgets only narrow the remaining Run allowance.
-  Results expose both shared and local totals plus completeness. Enforcement stops the
-  next turn after settlement; it does not reserve tokens for concurrent requests.
+  concurrency, and Child count, with shared step/token/cost usage restored on Journal
+  resume.
+- **One Root/Child budget ledger**: product runtimes can pass one `BudgetLedger` to
+  descendant Engines. Every model request first reserves one step in the Root JSONL;
+  every completed model transaction then settles token and cost exactly once. The
+  reservation is atomic across concurrent Children, so the lineage cannot issue more
+  provider requests than its shared step limit. Child budgets remain local caps inside
+  that allowance. Results expose both shared and local totals plus completeness. Token
+  and cost enforcement still settles after a response; it does not pre-reserve unknown
+  usage for concurrent requests.
 - **Single-owner Session journals**: each Run now has one process-safe JSONL writer
   lease and an explicit terminal lifecycle. Replay always validates canonical JSONL;
   the disposable SQLite read projection is retained only when it matches JSONL and

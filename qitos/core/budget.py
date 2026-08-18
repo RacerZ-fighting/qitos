@@ -1,4 +1,4 @@
-"""Shared Root/Child model-usage accounting."""
+"""Shared Root/Child model-step admission and usage accounting."""
 
 from __future__ import annotations
 
@@ -28,6 +28,14 @@ class BudgetSnapshot:
     total_cost_usd: float
     usage_complete: bool
     cost_complete: bool
+    max_steps: int | None = None
+    total_steps: int = 0
+
+    @property
+    def remaining_steps(self) -> int | None:
+        if self.max_steps is None:
+            return None
+        return max(0, self.max_steps - self.total_steps)
 
     @property
     def remaining_tokens(self) -> int | None:
@@ -44,6 +52,10 @@ class BudgetSnapshot:
     @property
     def tokens_exhausted(self) -> bool:
         return self.max_tokens is not None and self.total_tokens >= self.max_tokens
+
+    @property
+    def steps_exhausted(self) -> bool:
+        return self.max_steps is not None and self.total_steps >= self.max_steps
 
     @property
     def cost_exhausted(self) -> bool:
@@ -136,6 +148,55 @@ class _BudgetCommit:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _StepReservation:
+    origin_run_id: str
+    transaction_id: str
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.origin_run_id, self.transaction_id)
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "origin_run_id": self.origin_run_id,
+            "transaction_id": self.transaction_id,
+        }
+
+    @classmethod
+    def from_record(cls, record: JournalRecord) -> _StepReservation:
+        if set(record.payload) != {"origin_run_id", "transaction_id"}:
+            raise ValueError("budget.step_reserved fields are invalid")
+        return cls.create(
+            origin_run_id=record.payload["origin_run_id"],
+            transaction_id=record.payload["transaction_id"],
+        )
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        origin_run_id: object,
+        transaction_id: object,
+    ) -> _StepReservation:
+        if not isinstance(origin_run_id, str) or not origin_run_id.strip():
+            raise ValueError("origin_run_id must be a non-empty string")
+        if not isinstance(transaction_id, str) or not transaction_id.strip():
+            raise ValueError("transaction_id must be a non-empty string")
+        return cls(
+            origin_run_id=origin_run_id.strip(),
+            transaction_id=transaction_id.strip(),
+        )
+
+
+class StepBudgetExhaustedError(RuntimeError):
+    """Raised before a model request when its lineage has no step capacity."""
+
+    def __init__(self, max_steps: int) -> None:
+        self.max_steps = max_steps
+        super().__init__(f"lineage reached the max step budget ({max_steps})")
+
+
 class BudgetLedger:
     """One async-safe usage owner shared by a Root Run and its descendants.
 
@@ -147,9 +208,16 @@ class BudgetLedger:
     def __init__(
         self,
         *,
+        max_steps: int | None = None,
         max_tokens: int | None = None,
         max_cost_usd: float | None = None,
     ) -> None:
+        if max_steps is not None and (
+            isinstance(max_steps, bool)
+            or not isinstance(max_steps, int)
+            or max_steps <= 0
+        ):
+            raise ValueError("max_steps must be a positive integer or None")
         if max_tokens is not None and (
             isinstance(max_tokens, bool)
             or not isinstance(max_tokens, int)
@@ -163,11 +231,14 @@ class BudgetLedger:
             or float(max_cost_usd) <= 0
         ):
             raise ValueError("max_cost_usd must be a positive finite number or None")
+        self._max_steps = max_steps
         self._max_tokens = max_tokens
         self._max_cost_usd = (
             float(max_cost_usd) if max_cost_usd is not None else None
         )
         self._commits: dict[tuple[str, str], _BudgetCommit] = {}
+        self._step_reservations: set[tuple[str, str]] = set()
+        self._total_steps = 0
         self._total_tokens = 0
         self._total_cost_usd = 0.0
         self._usage_complete = True
@@ -199,9 +270,10 @@ class BudgetLedger:
         self._reset_projection()
         effective_records = tuple(resolve_inherited_record(item) for item in records)
         for record in effective_records:
-            if record.type is not JournalRecordType.BUDGET_COMMITTED:
-                continue
-            self._apply(_BudgetCommit.from_record(record))
+            if record.type is JournalRecordType.BUDGET_COMMITTED:
+                self._apply(_BudgetCommit.from_record(record))
+            elif record.type is JournalRecordType.BUDGET_STEP_RESERVED:
+                self._apply_step(_StepReservation.from_record(record))
         self._journal = journal
         self._root_run_id = normalized_run_id
 
@@ -217,22 +289,27 @@ class BudgetLedger:
         *,
         max_tokens: int | None,
         max_cost_usd: float | None,
+        max_steps: int | None = None,
     ) -> None:
         """Set Root limits before the first transaction is committed."""
 
-        if self._commits:
+        if self._commits or self._step_reservations:
             raise RuntimeError("BudgetLedger limits cannot change after usage")
         replacement = BudgetLedger(
+            max_steps=max_steps,
             max_tokens=max_tokens,
             max_cost_usd=max_cost_usd,
         )
+        self._max_steps = replacement._max_steps
         self._max_tokens = replacement._max_tokens
         self._max_cost_usd = replacement._max_cost_usd
 
     def snapshot(self) -> BudgetSnapshot:
         return BudgetSnapshot(
+            max_steps=self._max_steps,
             max_tokens=self._max_tokens,
             max_cost_usd=self._max_cost_usd,
+            total_steps=self._total_steps,
             total_tokens=self._total_tokens,
             total_cost_usd=self._total_cost_usd,
             usage_complete=self._usage_complete,
@@ -296,8 +373,53 @@ class BudgetLedger:
             self._apply(commit)
             return self.snapshot()
 
+    async def reserve_step(
+        self,
+        *,
+        origin_run_id: str,
+        transaction_id: str,
+    ) -> BudgetSnapshot:
+        """Atomically reserve one lineage step before its model side effect.
+
+        Reservations use deterministic transaction ids, so recovery may retry
+        the same turn admission without consuming a second step. Concurrent
+        Root and Child admissions serialize through the ledger lock; once the
+        shared limit is reached, no further provider request is admitted.
+        """
+
+        reservation = _StepReservation.create(
+            origin_run_id=origin_run_id,
+            transaction_id=transaction_id,
+        )
+        async with self._lock:
+            if reservation.key in self._step_reservations:
+                return self.snapshot()
+            if self._max_steps is not None and self._total_steps >= self._max_steps:
+                raise StepBudgetExhaustedError(self._max_steps)
+            if self._journal is not None:
+                digest = hashlib.sha256(
+                    (
+                        f"{reservation.origin_run_id}\0"
+                        f"{reservation.transaction_id}"
+                    ).encode("utf-8")
+                ).hexdigest()[:32]
+                try:
+                    await self._journal.append(
+                        JournalRecordType.BUDGET_STEP_RESERVED,
+                        reservation.to_payload(),
+                        record_id=f"{self._root_run_id}:budget-step:{digest}",
+                    )
+                except JournalAppendCancelled as cancellation:
+                    if cancellation.commit_state is JournalCommitState.COMMITTED:
+                        self._apply_step(reservation)
+                    raise
+            self._apply_step(reservation)
+            return self.snapshot()
+
     def _reset_projection(self) -> None:
         self._commits.clear()
+        self._step_reservations.clear()
+        self._total_steps = 0
         self._total_tokens = 0
         self._total_cost_usd = 0.0
         self._usage_complete = True
@@ -321,5 +443,20 @@ class BudgetLedger:
         else:
             self._ordered_attribution_complete = False
 
+    def _apply_step(
+        self,
+        reservation: _StepReservation,
+        *,
+        ordered: bool = True,
+    ) -> None:
+        if reservation.key in self._step_reservations:
+            return
+        self._step_reservations.add(reservation.key)
+        self._total_steps += 1
+        if ordered:
+            self._origin_snapshots[reservation.origin_run_id] = self.snapshot()
+        else:
+            self._ordered_attribution_complete = False
 
-__all__ = ["BudgetLedger", "BudgetSnapshot"]
+
+__all__ = ["BudgetLedger", "BudgetSnapshot", "StepBudgetExhaustedError"]

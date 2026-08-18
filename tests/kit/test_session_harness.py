@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from typing import Any
 
 import pytest
 
@@ -23,7 +24,7 @@ from qitos.core.model_request import ModelRequest
 from qitos.core.model_response import ModelUsage
 from qitos.core.run import RunStatus
 from qitos.core.runtime_input import RuntimeInput
-from qitos.core.tool import tool
+from qitos.core.tool import BaseTool, ToolSpec, tool
 from qitos.core.tool_registry import ToolRegistry
 from qitos.core.tool_result import ToolResult
 from qitos.kit.journal import (
@@ -1131,3 +1132,67 @@ async def test_budget_ledger_follows_the_lineage_across_legs() -> None:
     assert any(
         record.type is JournalRecordType.BUDGET_COMMITTED for record in records
     )
+
+
+@pytest.mark.asyncio
+async def test_lineage_step_budget_stops_before_an_extra_model_request() -> None:
+    store = InMemoryJournalStore()
+    ledger = BudgetLedger(max_steps=1)
+    model = ScriptedModel(
+        [tool_events([tool_call_wire("c1", "echo", {"text": "hi"})])]
+    )
+    session_run = await SessionHarness(store).start(
+        model=model,
+        tool_registry=_registry(),
+        budget_ledger=ledger,
+    )
+
+    result = await session_run.prompt("inspect")
+
+    assert result.status is AgentRunStatus.MAX_TURNS
+    assert len(model.requests) == 1
+    snapshot = session_run.budget_ledger.snapshot()
+    assert snapshot.total_steps == 1
+    assert snapshot.remaining_steps == 0
+    await session_run.close()
+
+
+@pytest.mark.asyncio
+async def test_session_exposes_its_budget_ledger_to_tool_descendants() -> None:
+    observed: list[BudgetLedger] = []
+
+    class CaptureLedgerTool(BaseTool):
+        def __init__(self) -> None:
+            super().__init__(ToolSpec(name="capture_ledger", description="capture"))
+
+        async def execute(
+            self,
+            args: dict[str, Any],
+            runtime_context: dict[str, Any] | None = None,
+        ) -> str:
+            _ = args
+            assert runtime_context is not None
+            ledger = runtime_context.get("budget_ledger")
+            assert isinstance(ledger, BudgetLedger)
+            observed.append(ledger)
+            return "captured"
+
+    ledger = BudgetLedger(max_steps=2)
+    registry = ToolRegistry().register(CaptureLedgerTool())
+    model = ScriptedModel(
+        [
+            tool_events([tool_call_wire("c1", "capture_ledger", {})]),
+            text_events("done"),
+        ]
+    )
+    session_run = await SessionHarness(InMemoryJournalStore()).start(
+        model=model,
+        tool_registry=registry,
+        budget_ledger=ledger,
+    )
+
+    result = await session_run.prompt("inspect")
+
+    assert result.status is AgentRunStatus.COMPLETED
+    assert observed == [session_run.budget_ledger]
+    await session_run.close()

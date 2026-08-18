@@ -7,7 +7,7 @@ QitOS public API surface.
 
 __version__ = "0.6.0"
 
-from .core.budget import BudgetLedger, BudgetSnapshot
+from .core.budget import BudgetLedger, BudgetSnapshot, StepBudgetExhaustedError
 from .core.env import Env, EnvSpec
 from .core.memory import Memory
 from .core.model_response import ModelResponse, ModelTiming
@@ -102,6 +102,7 @@ from .core.tool_executor import (
 __all__ = [
     "BudgetLedger",
     "BudgetSnapshot",
+    "StepBudgetExhaustedError",
     "RuntimeInput",
     "DEFAULT_CHILD_MAX_STEPS",
     "AgentConclusion",

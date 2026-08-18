@@ -91,6 +91,9 @@ Task/Goal truth.
 Root and Child use the same Agent implementation. A Child has an independent Task,
 Session, Plan and cancellation domain while authorization and budget only narrow. The
 parent stores a stable handle and bounded conclusion, not a live Agent or transcript.
+Every descendant reserves model steps from one Root-lineage ledger before provider
+admission; a Child's local step budget is a cap within that shared total, not an
+additional allowance.
 
 ## Repository invariants
 

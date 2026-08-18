@@ -1,6 +1,6 @@
 """Core modules for QitOS Framework."""
 
-from .budget import BudgetLedger, BudgetSnapshot
+from .budget import BudgetLedger, BudgetSnapshot, StepBudgetExhaustedError
 from .errors import (
     ModelContinuationRejected,
     ModelRequestCancelled,
@@ -206,6 +206,7 @@ from .tool_executor import (
 __all__ = [
     "BudgetLedger",
     "BudgetSnapshot",
+    "StepBudgetExhaustedError",
     "ModelContinuationRejected",
     "ModelTransportError",
     "ModelRequestCancelled",

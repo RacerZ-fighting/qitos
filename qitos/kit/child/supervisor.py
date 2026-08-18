@@ -1678,6 +1678,8 @@ class ChildSupervisor:
         if ledger is None:
             return None
         snapshot = ledger.snapshot()
+        if snapshot.steps_exhausted:
+            return "Root step budget is exhausted."
         if snapshot.max_tokens is not None:
             if not snapshot.usage_complete:
                 return "Root token usage is incomplete; Child admission is closed."
