@@ -19,6 +19,9 @@ How to update:
 
 ### Fixed
 
+- Bundled Skills whose exact names are already visible may now be loaded directly;
+  the model-facing Tool guidance reserves `list_skills` for catalog discovery or
+  truncated summaries instead of requiring a redundant listing call.
 - Parallel Tool handlers now settle independently but append their canonical
   ToolResult transcript/terminal records and end events strictly in ToolCall
   input order, eliminating concurrent transcript record-id reuse. A failed or

@@ -77,8 +77,9 @@ class SkillToolSet:
     ) -> dict[str, Any]:
         """List bundled Skills available for full loading.
 
-        Use this bounded catalog before loading a Skill. Descriptions explain when a
-        Skill applies; source identifies the configured read-only asset.
+        Use this bounded catalog when the exact Skill name is not already visible or
+        when the available summaries were truncated. Descriptions explain when a Skill
+        applies; source identifies the configured read-only asset.
 
         :param limit: Maximum number of stable, name-sorted entries to return.
         """
@@ -115,11 +116,11 @@ class SkillToolSet:
     def load_skill(self, name: str) -> dict[str, Any]:
         """Load one bundled Skill's complete validated `SKILL.md` snapshot.
 
-        Call `list_skills` first, then pass one exact returned name. The complete
-        content may describe workflows, tools, failure semantics, and relative
-        resources; loading it does not install software or grant permissions.
+        Pass an exact name from the visible Skill summaries or `list_skills`. The
+        complete content may describe workflows, tools, failure semantics, and
+        relative resources; loading it does not install software or grant permissions.
 
-        :param name: Exact bundled Skill name returned by `list_skills`.
+        :param name: Exact bundled Skill name from a visible summary or catalog.
         """
 
         try:
