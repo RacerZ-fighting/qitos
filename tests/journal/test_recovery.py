@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from qitos.core.agent_loop import AgentLoopResult, AgentRunStatus, TurnConfigSnapshot
+from qitos.core.agent_loop import (
+    AgentLoopResult,
+    AgentRunStatus,
+    RunFinalizationDiagnostic,
+    RunFinalizationDiagnosticCode,
+    TurnConfigSnapshot,
+)
 from qitos.core.journal import (
     JournalCorruptionError,
     JournalRecord,
@@ -174,11 +180,37 @@ async def test_clean_run_recovers_full_state() -> None:
     assert recovered.outcome is not None
     assert recovered.outcome.status is AgentRunStatus.COMPLETED
     assert recovered.outcome.messages == recovered.transcript
+    assert recovered.outcome.finalization_diagnostic is None
     assert recovered.recorder_state.next_turn == 2
     assert recovered.recorder_state.recorded_message_count == len(
         recovered.transcript
     )
     assert recovered.uncommitted_transcript_record_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_run_finalization_diagnostic_round_trips_through_recovery() -> None:
+    run = await _start_run()
+    await run.prompt()
+    await run.model(0, _assistant(text="done"))
+    await run.commit(0)
+    diagnostic = RunFinalizationDiagnostic(
+        code=RunFinalizationDiagnosticCode.RESOURCE_QUIESCE_FAILED,
+        message="one process did not settle",
+    )
+    await run.recorder.run_terminal(
+        AgentLoopResult(
+            status=AgentRunStatus.COMPLETED,
+            messages=(),
+            finalization_diagnostic=diagnostic,
+        )
+    )
+
+    recovered = await run.recover()
+
+    assert recovered.outcome is not None
+    assert recovered.outcome.status is AgentRunStatus.COMPLETED
+    assert recovered.outcome.finalization_diagnostic == diagnostic
 
 
 @pytest.mark.asyncio
@@ -212,6 +244,15 @@ async def test_crash_after_model_completed_leaves_unstarted_calls() -> None:
         if record.type is JournalRecordType.TOOL_TERMINAL
     ]
     assert len(terminals) == 2
+    starts = [
+        record
+        for record in records
+        if record.type is JournalRecordType.TOOL_STARTED
+    ]
+    assert [decode_tool_started(record.payload)[1].id for record in starts] == [
+        "c1",
+        "c2",
+    ]
     tool_entries = [
         record.payload["message"]
         for record in records
@@ -933,6 +974,30 @@ async def test_codec_fail_closed_matrix() -> None:
     with pytest.raises(ValueError):
         decode_run_terminal(
             JournalRecordType.RUN_INTERRUPTED, {"status": "completed", "error": None}
+        )
+    with pytest.raises(ValueError, match="diagnostic code"):
+        decode_run_terminal(
+            JournalRecordType.RUN_COMPLETED,
+            {
+                "status": "completed",
+                "error": None,
+                "finalization_diagnostic": {
+                    "code": "UNKNOWN_FINALIZER_FAILURE",
+                    "message": "failed",
+                },
+            },
+        )
+    with pytest.raises(ValueError, match="maximum length"):
+        decode_run_terminal(
+            JournalRecordType.RUN_COMPLETED,
+            {
+                "status": "completed",
+                "error": None,
+                "finalization_diagnostic": {
+                    "code": "RESOURCE_QUIESCE_FAILED",
+                    "message": "x" * 513,
+                },
+            },
         )
 
 

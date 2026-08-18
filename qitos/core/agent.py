@@ -49,6 +49,7 @@ from .agent_loop import (
     AgentLoopResult,
     AgentRunStatus,
     PrepareNextTurnHook,
+    RunFinalizer,
     ShouldStopAfterTurnHook,
     TransformContextHook,
     TurnTransactionBoundary,
@@ -209,6 +210,7 @@ class Agent:
         after_tool_call: Optional[AfterToolCallHook] = None,
         should_stop_after_turn: Optional[ShouldStopAfterTurnHook] = None,
         prepare_next_turn: Optional[PrepareNextTurnHook] = None,
+        run_finalizer: RunFinalizer | None = None,
         initial_messages: Sequence[Message] = (),
         turn_base: int = 0,
     ) -> None:
@@ -232,6 +234,7 @@ class Agent:
         self._after_tool_call = after_tool_call
         self._should_stop_after_turn = should_stop_after_turn
         self._prepare_next_turn = prepare_next_turn
+        self._run_finalizer = run_finalizer
         if (
             isinstance(turn_base, bool)
             or not isinstance(turn_base, int)
@@ -561,6 +564,7 @@ class Agent:
             get_steering_messages=_drain_steering,
             get_follow_up_messages=_drain_follow_up,
             continuation_floor=self._continuation_floor,
+            run_finalizer=self._run_finalizer,
         )
         context = AgentContext(
             system_prompt=self._system_prompt,

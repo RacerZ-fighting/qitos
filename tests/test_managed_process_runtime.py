@@ -167,6 +167,42 @@ async def test_managed_process_enforces_active_process_limit(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_quiesce_settles_one_run_and_keeps_runtime_reusable(
+    tmp_path: Path,
+) -> None:
+    runtime = ManagedHostProcessRuntime(str(tmp_path))
+    first = await runtime.start(
+        _python_command("import time; time.sleep(60)"),
+        owner_run_id="run-1",
+        cwd=str(tmp_path),
+    )
+    second = await runtime.start(
+        _python_command("import time; time.sleep(60)"),
+        owner_run_id="run-2",
+        cwd=str(tmp_path),
+    )
+
+    await runtime.quiesce(owner_run_id="run-1")
+
+    assert (await runtime.poll(first.handle)).terminal is True
+    assert (await runtime.poll(second.handle)).status is ProcessStatus.RUNNING
+
+    third = await runtime.start(
+        _python_command("print('still reusable', flush=True)"),
+        owner_run_id="run-3",
+        cwd=str(tmp_path),
+    )
+    third_terminal = await runtime.wait(
+        third.handle,
+        deadline_monotonic=asyncio.get_running_loop().time() + 2.0,
+    )
+    assert third_terminal.status is ProcessStatus.EXITED
+
+    await runtime.close()
+    assert (await runtime.poll(second.handle)).terminal is True
+
+
+@pytest.mark.asyncio
 async def test_concurrent_starts_share_one_atomic_process_limit(
     tmp_path: Path,
 ) -> None:
@@ -229,6 +265,41 @@ async def test_managed_process_journals_one_started_and_terminal_record(
     assert process_records[1].payload["handle"] == started.handle.to_dict()
 
     await runtime.close()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_owner_quiesce_persists_one_process_terminal_before_returning(
+    tmp_path: Path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal")
+    await journal.create("run-1", {})
+    runtime = ManagedHostProcessRuntime(str(tmp_path))
+    started = await runtime.start(
+        _python_command("import time; time.sleep(60)"),
+        owner_run_id="run-1",
+        cwd=str(tmp_path),
+        journal=journal,
+    )
+
+    await runtime.quiesce(owner_run_id="run-1")
+
+    assert (await runtime.poll(started.handle)).terminal is True
+    process_terminals = [
+        record
+        for record in await journal.replay()
+        if record.type is JournalRecordType.PROCESS_TERMINAL
+    ]
+    assert len(process_terminals) == 1
+
+    await runtime.quiesce(owner_run_id="run-1")
+    await runtime.close()
+    process_terminals_after_close = [
+        record
+        for record in await journal.replay()
+        if record.type is JournalRecordType.PROCESS_TERMINAL
+    ]
+    assert process_terminals_after_close == process_terminals
     await journal.close()
 
 

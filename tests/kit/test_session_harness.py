@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 
 import pytest
 
@@ -38,6 +39,7 @@ from qitos.kit.journal.turn_recorder import (
     encode_model_completed,
     encode_runtime_input_consumed,
 )
+from qitos.kit.env.host_env import HostCommandCapability, HostEnv
 from qitos.kit.session import (
     CompactRejected,
     CompactionSettings,
@@ -978,6 +980,76 @@ async def test_overflow_failure_compacts_and_continues_once() -> None:
     assert recovered.outcome.status is AgentRunStatus.COMPLETED
     # turn0 tool turn, turn1 overflow failure, summary request, retry.
     assert len(model.requests) == 4
+
+
+@pytest.mark.asyncio
+async def test_overflow_quiesces_each_leg_without_closing_reusable_env(
+    tmp_path,
+) -> None:
+    class TrackingCommands(HostCommandCapability):
+        def __init__(self) -> None:
+            super().__init__(str(tmp_path))
+            self.quiesced: list[str | None] = []
+            self.close_count = 0
+
+        async def aquiesce(self, *, owner_run_id: str | None = None) -> None:
+            self.quiesced.append(owner_run_id)
+            await super().aquiesce(owner_run_id=owner_run_id)
+
+        async def aclose(self) -> None:
+            self.close_count += 1
+            await super().aclose()
+
+    commands = TrackingCommands()
+    env = HostEnv(str(tmp_path), cmd=commands)
+    tool_runs: list[str] = []
+
+    @tool(name="use_env")
+    async def _use_env(text: str, env=None) -> str:
+        tool_runs.append(text)
+        result = await env.cmd.arun_argv(
+            [sys.executable, "-c", "print('ready')"]
+        )
+        assert result["returncode"] == 0
+        return "x" * 100_000 if text == "big" else "reused"
+
+    model = ScriptedModel(
+        [
+            tool_events([tool_call_wire("c1", "use_env", {"text": "big"})]),
+            failed_events("prompt is too long: 213462 tokens > 200000 maximum"),
+            text_events("compact prefix summary"),
+            tool_events([tool_call_wire("c2", "use_env", {"text": "again"})]),
+            text_events("recovered answer"),
+        ]
+    )
+    run_ids = iter(("overflow-first", "overflow-retry"))
+    harness = SessionHarness(
+        InMemoryJournalStore(),
+        compaction=CompactionSettings(),
+        run_id_factory=lambda: next(run_ids),
+    )
+
+    async def quiesce(run_id: str) -> None:
+        await commands.aquiesce(owner_run_id=run_id)
+
+    session_run = await harness.start(
+        model=model,
+        tool_registry=ToolRegistry().register(_use_env),
+        env=env,
+        run_finalizer=quiesce,
+    )
+    result = await session_run.prompt("handle the big result")
+
+    assert result.status is AgentRunStatus.COMPLETED
+    assert session_run.run_id == "overflow-retry"
+    assert tool_runs == ["big", "again"]
+    assert commands.quiesced == ["overflow-first", "overflow-retry"]
+    assert commands.close_count == 0
+
+    await session_run.close()
+    assert commands.close_count == 0
+    await env.ateardown()
+    assert commands.close_count == 1
 
 
 @pytest.mark.asyncio

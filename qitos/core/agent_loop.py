@@ -101,6 +101,36 @@ class AgentRunStatus(str, Enum):
     DEADLINE_EXCEEDED = "deadline_exceeded"
 
 
+class RunFinalizationDiagnosticCode(str, Enum):
+    """Stable failure code for the Run-owned resource quiescence barrier."""
+
+    RESOURCE_QUIESCE_FAILED = "RESOURCE_QUIESCE_FAILED"
+
+
+_MAX_FINALIZATION_DIAGNOSTIC_MESSAGE = 512
+
+
+@dataclass(frozen=True, slots=True)
+class RunFinalizationDiagnostic:
+    """Non-fatal failure observed while quiescing one Run's resources."""
+
+    code: RunFinalizationDiagnosticCode
+    message: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.code, RunFinalizationDiagnosticCode):
+            raise TypeError("finalization diagnostic code is invalid")
+        if not isinstance(self.message, str) or not self.message.strip():
+            raise ValueError("finalization diagnostic message must be non-empty text")
+        if len(self.message) > _MAX_FINALIZATION_DIAGNOSTIC_MESSAGE:
+            raise ValueError(
+                "finalization diagnostic message exceeds the maximum length"
+            )
+
+
+RunFinalizer = Callable[[str], Awaitable[None]]
+
+
 @dataclass(frozen=True, slots=True)
 class AgentLoopResult:
     """Terminal outcome of one run; ``messages`` are the run's new messages."""
@@ -108,6 +138,7 @@ class AgentLoopResult:
     status: AgentRunStatus
     messages: Tuple[Message, ...]
     error: Optional[str] = None
+    finalization_diagnostic: RunFinalizationDiagnostic | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +294,7 @@ class AgentLoopConfig:
     get_steering_messages: Optional[QueueDrainHook] = None
     get_follow_up_messages: Optional[QueueDrainHook] = None
     continuation_floor: int = 0
+    run_finalizer: RunFinalizer | None = None
 
     def __post_init__(self) -> None:
         if not getattr(self.model, "provider_name", None) or not getattr(
@@ -291,6 +323,8 @@ class AgentLoopConfig:
             or self.continuation_floor < 0
         ):
             raise ValueError("continuation_floor must be a non-negative integer")
+        if self.run_finalizer is not None and not callable(self.run_finalizer):
+            raise TypeError("run_finalizer must be an async callable or None")
 
 
 class _StreamAborted(Exception):
@@ -435,6 +469,76 @@ class _RunTerminalGuard:
     def __init__(self) -> None:
         self._written = False
         self._end_attempted = False
+        self._finalizer_task: asyncio.Task[None] | None = None
+        self._finalization_settled = False
+        self._finalization_diagnostic: RunFinalizationDiagnostic | None = None
+
+    async def _finalize_once(
+        self,
+        config: AgentLoopConfig,
+        *,
+        suppress_cancellation: bool,
+    ) -> RunFinalizationDiagnostic | None:
+        """Await the frozen Run finalizer once without letting cancellation orphan it."""
+
+        if self._finalization_settled:
+            return self._finalization_diagnostic
+        finalizer = config.run_finalizer
+        if finalizer is None:
+            self._finalization_settled = True
+            return None
+        if self._finalizer_task is None:
+            async def _invoke_finalizer() -> None:
+                await finalizer(config.run_id)
+
+            self._finalizer_task = asyncio.create_task(
+                _invoke_finalizer(), name=f"qitos-run-finalizer-{config.run_id[:8]}"
+            )
+
+        cancellation_seen = False
+        owner_task = asyncio.current_task()
+        task = self._finalizer_task
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                owner_cancelled = (
+                    owner_task is not None and owner_task.cancelling() > 0
+                )
+                if owner_cancelled:
+                    # Owner cancellation wins even when the finalizer also
+                    # self-cancels in the same loop tick. Keep shielding the
+                    # resource settlement, then terminalize ABORTED upstream.
+                    cancellation_seen = True
+                    continue
+                if task.done() and task.cancelled():
+                    # The finalizer cancelled itself; that is a cleanup
+                    # diagnostic, not cancellation of the owning Run.
+                    break
+                cancellation_seen = True
+                continue
+            except Exception:
+                # The task is done; inspect it below through one typed path.
+                break
+
+        if task.cancelled():
+            message = "run finalizer was cancelled before resources quiesced"
+            self._finalization_diagnostic = RunFinalizationDiagnostic(
+                code=RunFinalizationDiagnosticCode.RESOURCE_QUIESCE_FAILED,
+                message=message,
+            )
+        else:
+            fault = task.exception()
+            if fault is not None:
+                raw_message = str(fault).strip() or type(fault).__name__
+                self._finalization_diagnostic = RunFinalizationDiagnostic(
+                    code=RunFinalizationDiagnosticCode.RESOURCE_QUIESCE_FAILED,
+                    message=raw_message[:_MAX_FINALIZATION_DIAGNOSTIC_MESSAGE],
+                )
+        self._finalization_settled = True
+        if cancellation_seen and not suppress_cancellation:
+            raise asyncio.CancelledError()
+        return self._finalization_diagnostic
 
     async def _emit_end_once(
         self, emit: EventSink | None, new_messages: Sequence[Message]
@@ -452,8 +556,14 @@ class _RunTerminalGuard:
         emit: EventSink | None,
         error: Optional[str] = None,
     ) -> AgentLoopResult:
+        diagnostic = await self._finalize_once(
+            config, suppress_cancellation=False
+        )
         result = AgentLoopResult(
-            status=status, messages=tuple(new_messages), error=error
+            status=status,
+            messages=tuple(new_messages),
+            error=error,
+            finalization_diagnostic=diagnostic,
         )
         self._written = True
         if config.transaction is not None:
@@ -474,10 +584,16 @@ class _RunTerminalGuard:
         """Terminalize a run torn down by cancellation or a fault."""
 
         if not self._written:
+            diagnostic = await self._finalize_once(
+                config, suppress_cancellation=True
+            )
             self._written = True
             if config.transaction is not None:
                 result = AgentLoopResult(
-                    status=status, messages=tuple(new_messages), error=error
+                    status=status,
+                    messages=tuple(new_messages),
+                    error=error,
+                    finalization_diagnostic=diagnostic,
                 )
                 await config.transaction.run_terminal(result)
         await self._emit_end_once(emit, new_messages)
@@ -1603,6 +1719,9 @@ __all__ = [
     "AgentLoopResult",
     "AgentRunStatus",
     "NextTurnUpdate",
+    "RunFinalizationDiagnostic",
+    "RunFinalizationDiagnosticCode",
+    "RunFinalizer",
     "TurnConfigSnapshot",
     "TurnHookContext",
     "TurnTransactionBoundary",

@@ -20,7 +20,10 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import Sequence
 
-from ...core.agent_loop import AgentRunStatus
+from ...core.agent_loop import (
+    AgentRunStatus,
+    RunFinalizationDiagnostic,
+)
 from ...core.journal import (
     JournalCorruptionError,
     JournalRecord,
@@ -59,6 +62,7 @@ from .turn_recorder import (
     decode_tools_change,
     decode_transcript_message,
     encode_step_committed,
+    encode_tool_started,
     encode_tool_terminal,
     encode_transcript_message,
 )
@@ -75,6 +79,7 @@ class RecoveredRunOutcome:
     status: AgentRunStatus
     error: str | None
     messages: tuple[Message, ...]
+    finalization_diagnostic: RunFinalizationDiagnostic | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,6 +253,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
     segment_side_effects: set[str] = set()
     outcome_status: AgentRunStatus | None = None
     outcome_error: str | None = None
+    outcome_finalization_diagnostic: RunFinalizationDiagnostic | None = None
     input_accepted_seen = False
     last_turn = -1
     fork_seen = False
@@ -610,9 +616,11 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                         "inherited prefix contains a run terminal"
                     )
                 _commit_barrier("run terminal")
-                outcome_status, outcome_error = decode_run_terminal(
-                    record_type, payload
-                )
+                (
+                    outcome_status,
+                    outcome_error,
+                    outcome_finalization_diagnostic,
+                ) = decode_run_terminal(record_type, payload)
             elif record_type is JournalRecordType.BUDGET_COMMITTED:
                 pass
             elif record_type in (
@@ -809,6 +817,7 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                 for record_id, message in zip(transcript_ids, transcript)
                 if record_id in own_transcript_ids
             ),
+            finalization_diagnostic=outcome_finalization_diagnostic,
         )
     return RecoveredSession(
         run_id=run_id,
@@ -870,7 +879,10 @@ async def close_crashed_tool_calls(
 
     Admitted-but-unterminated calls and never-admitted calls each receive a
     ``tool.terminal`` plus its transcript entry (a torn durable entry is
-    linked, never replaced), followed by one closing ``step.committed``.
+    linked, never replaced). A never-admitted call first receives an explicit
+    recovery admission so no terminal exists without a matching
+    ``tool.started``; this permit is consumed only by the cancelled result and
+    never dispatches the handler. One closing ``step.committed`` follows.
     Nothing is re-executed and side effects are never guessed: every
     synthesized result is ``cancelled`` with an explicit unknown-outcome
     error that distinguishes the two categories. All record ids and payloads
@@ -897,6 +909,12 @@ async def close_crashed_tool_calls(
     closed: list[JournalRecordRef] = []
     for crashed_call in crashed:
         call = crashed_call.call
+        if crashed_call.started_record_id is None:
+            await journal.append(
+                JournalRecordType.TOOL_STARTED,
+                encode_tool_started(turn, call),
+                record_id=f"{run_id}:turn:{turn}:tool:{call.id}:started",
+            )
         transcript_record_id = crashed_call.transcript_record_id
         if transcript_record_id is None:
             if crashed_call.started_record_id is not None:

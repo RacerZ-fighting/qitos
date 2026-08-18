@@ -30,6 +30,7 @@ from ...core.agent_loop import (
     AgentRunStatus,
     NextTurnUpdate,
     PrepareNextTurnHook,
+    RunFinalizer,
     ShouldStopAfterTurnHook,
     TransformContextHook,
     TurnConfigSnapshot,
@@ -438,6 +439,7 @@ class AgentChildEngine:
         after_tool_call: Optional[AfterToolCallHook] = None,
         should_stop_after_turn: Optional[ShouldStopAfterTurnHook] = None,
         prepare_next_turn: Optional[PrepareNextTurnHook] = None,
+        run_finalizer: RunFinalizer | None = None,
         journal_factory: Optional[Callable[[], SessionJournal]] = None,
         journal_metadata: Optional[Mapping[str, Any]] = None,
         child_task: Optional[Task] = None,
@@ -479,6 +481,9 @@ class AgentChildEngine:
         self._after_tool_call = after_tool_call
         self._should_stop_after_turn = should_stop_after_turn
         self._prepare_next_turn = prepare_next_turn
+        if run_finalizer is not None and not callable(run_finalizer):
+            raise TypeError("run_finalizer must be an async callable or None")
+        self._run_finalizer = run_finalizer
         self._journal_factory = journal_factory
         self._journal_metadata = dict(journal_metadata or {})
 
@@ -697,6 +702,7 @@ class AgentChildEngine:
             after_tool_call=self._after_tool_call,
             should_stop_after_turn=_stop_after_budget,
             prepare_next_turn=_prepare_child_next_turn,
+            run_finalizer=self._run_finalizer,
         )
         self._agent = agent
 
@@ -1175,6 +1181,7 @@ def build_agent_child_invocation_factory(
     extra_request_options: Optional[Mapping[str, Any]] = None,
     journal_directory: Union[str, Path, None] = None,
     journal_factory: Optional[Callable[[], SessionJournal]] = None,
+    run_finalizer: RunFinalizer | None = None,
 ) -> Callable[[ChildLaunchRequest, ChildRuntimeContext], Awaitable[ChildInvocation]]:
     """Build a ``ChildInvocationFactory`` driving children through ``Agent``.
 
@@ -1297,6 +1304,7 @@ def build_agent_child_invocation_factory(
             budget_ledger=runtime_context.budget_ledger,
             model_pricing=model_pricing,
             extra_request_options=extra_request_options,
+            run_finalizer=run_finalizer,
             runtime_context={
                 "parent_run_id": runtime_context.child_run_id,
                 "delegate_depth": runtime_context.delegate_depth + 1,

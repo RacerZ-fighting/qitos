@@ -239,6 +239,35 @@ async def test_host_capability_exposes_recovery_contract(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_host_capability_quiesces_one_run_without_closing_itself(
+    tmp_path: Path,
+) -> None:
+    capability = HostCommandCapability(str(tmp_path))
+    first = await capability.astart(
+        _python_command("import time; time.sleep(60)"), owner_run_id="run-1"
+    )
+    second = await capability.astart(
+        _python_command("import time; time.sleep(60)"), owner_run_id="run-2"
+    )
+
+    await capability.aquiesce(owner_run_id="run-1")
+
+    assert (await capability.apoll(first.handle)).terminal is True
+    assert (await capability.apoll(second.handle)).status is ProcessStatus.RUNNING
+
+    third = await capability.astart(
+        _python_command("print('reused', flush=True)"), owner_run_id="run-3"
+    )
+    terminal = await capability.await_process(
+        third.handle,
+        deadline_monotonic=asyncio.get_running_loop().time() + 2.0,
+    )
+    assert terminal.status is ProcessStatus.EXITED
+
+    await capability.aclose()
+
+
+@pytest.mark.asyncio
 async def test_reused_shell_toolset_creates_a_fresh_supervisor_for_each_run(
     tmp_path: Path,
 ) -> None:

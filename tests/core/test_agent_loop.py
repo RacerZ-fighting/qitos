@@ -24,6 +24,7 @@ from qitos.core.agent_loop import (
     AgentLoopConfig,
     AgentRunStatus,
     NextTurnUpdate,
+    RunFinalizationDiagnosticCode,
     agent_loop,
     run_agent_loop,
     run_agent_loop_continue,
@@ -484,6 +485,96 @@ async def test_expired_deadline_blocks_model_admission() -> None:
 
     assert result.status is AgentRunStatus.DEADLINE_EXCEEDED
     assert model.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_finalizer_settles_before_terminal_commit() -> None:
+    order: List[str] = []
+
+    class TerminalTransaction(RecordingTransaction):
+        async def run_terminal(self, result) -> None:
+            order.append("run_terminal")
+            self.result = result
+            await super().run_terminal(result)
+
+    async def _finalize(run_id: str) -> None:
+        assert run_id == "run-finalizer-order"
+        order.append("finalizer")
+
+    transaction = TerminalTransaction()
+    config = AgentLoopConfig(
+        model=ScriptedModel([text_events("done")]),
+        run_id="run-finalizer-order",
+        transaction=transaction,
+        run_finalizer=_finalize,
+    )
+
+    result = await run_agent_loop(
+        [UserMessage(content="go")], AgentContext(messages=[]), config, None
+    )
+
+    assert result.status is AgentRunStatus.COMPLETED
+    assert result.finalization_diagnostic is None
+    assert order == ["finalizer", "run_terminal"]
+
+
+@pytest.mark.asyncio
+async def test_finalizer_failure_is_bounded_diagnostic_on_deadline_outcome() -> None:
+    class TerminalTransaction(RecordingTransaction):
+        async def run_terminal(self, result) -> None:
+            self.result = result
+            await super().run_terminal(result)
+
+    async def _broken_finalizer(_run_id: str) -> None:
+        raise RuntimeError("cleanup failed " + ("x" * 1000))
+
+    transaction = TerminalTransaction()
+    config = AgentLoopConfig(
+        model=ScriptedModel([text_events("never")]),
+        run_id="run-finalizer-deadline",
+        deadline_monotonic=time.monotonic() - 1,
+        transaction=transaction,
+        run_finalizer=_broken_finalizer,
+    )
+
+    result = await run_agent_loop(
+        [UserMessage(content="go")], AgentContext(messages=[]), config, None
+    )
+
+    assert result.status is AgentRunStatus.DEADLINE_EXCEEDED
+    assert result.error == "model request deadline expired before admission"
+    diagnostic = result.finalization_diagnostic
+    assert diagnostic is not None
+    assert (
+        diagnostic.code
+        is RunFinalizationDiagnosticCode.RESOURCE_QUIESCE_FAILED
+    )
+    assert diagnostic.message.startswith("cleanup failed")
+    assert len(diagnostic.message) == 512
+    assert transaction.result == result
+
+
+@pytest.mark.asyncio
+async def test_self_cancelled_finalizer_does_not_cancel_primary_outcome() -> None:
+    async def _self_cancel(_run_id: str) -> None:
+        raise asyncio.CancelledError()
+
+    config = AgentLoopConfig(
+        model=ScriptedModel([text_events("done")]),
+        run_id="run-self-cancelled-finalizer",
+        run_finalizer=_self_cancel,
+    )
+
+    result = await run_agent_loop(
+        [UserMessage(content="go")], AgentContext(messages=[]), config, None
+    )
+
+    assert result.status is AgentRunStatus.COMPLETED
+    assert result.finalization_diagnostic is not None
+    assert (
+        result.finalization_diagnostic.code
+        is RunFinalizationDiagnosticCode.RESOURCE_QUIESCE_FAILED
+    )
 
 
 @pytest.mark.asyncio
@@ -1051,6 +1142,137 @@ async def test_loop_task_cancellation_terminalizes_then_reraises() -> None:
     assistant = context.messages[-1]
     assert isinstance(assistant, AssistantMessage)
     assert assistant.failed and "cancelled" in str(assistant.error)
+
+
+@pytest.mark.asyncio
+async def test_task_cancellation_waits_for_run_finalizer_before_terminal() -> None:
+    model_gate = asyncio.Event()
+    finalizer_started = asyncio.Event()
+    release_finalizer = asyncio.Event()
+    finalizer_settled = asyncio.Event()
+
+    class TerminalTransaction(RecordingTransaction):
+        terminal_result = None
+
+        async def run_terminal(self, result) -> None:
+            self.terminal_result = result
+            await super().run_terminal(result)
+
+    async def _finalize(_run_id: str) -> None:
+        finalizer_started.set()
+        try:
+            await release_finalizer.wait()
+        finally:
+            finalizer_settled.set()
+
+    transaction = TerminalTransaction()
+    config = AgentLoopConfig(
+        model=ScriptedModel([make_hanging_model(model_gate, first_text="hi")]),
+        run_id="run-cancel-finalizer",
+        transaction=transaction,
+        run_finalizer=_finalize,
+    )
+    streaming = asyncio.Event()
+
+    def _sink(event) -> None:
+        if isinstance(event, MessageUpdate):
+            streaming.set()
+
+    task = asyncio.create_task(
+        run_agent_loop(
+            [UserMessage(content="go")], AgentContext(messages=[]), config, _sink
+        )
+    )
+    await streaming.wait()
+    task.cancel()
+    await finalizer_started.wait()
+
+    assert transaction.terminal_result is None
+    assert not task.done()
+
+    release_finalizer.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert finalizer_settled.is_set()
+    assert transaction.terminal_result is not None
+    assert transaction.terminal_result.status is AgentRunStatus.ABORTED
+
+
+@pytest.mark.asyncio
+async def test_owner_cancel_wins_when_finalizer_self_cancels_in_same_tick() -> None:
+    finalizer_started = asyncio.Event()
+    release_finalizer = asyncio.Event()
+
+    class TerminalTransaction(RecordingTransaction):
+        terminal_result = None
+
+        async def run_terminal(self, result) -> None:
+            self.terminal_result = result
+            await super().run_terminal(result)
+
+    async def _self_cancel(_run_id: str) -> None:
+        finalizer_started.set()
+        await release_finalizer.wait()
+        raise asyncio.CancelledError()
+
+    transaction = TerminalTransaction()
+    config = AgentLoopConfig(
+        model=ScriptedModel([text_events("done")]),
+        run_id="run-owner-and-finalizer-cancel",
+        transaction=transaction,
+        run_finalizer=_self_cancel,
+    )
+    task = asyncio.create_task(
+        run_agent_loop(
+            [UserMessage(content="go")], AgentContext(messages=[]), config, None
+        )
+    )
+    await finalizer_started.wait()
+
+    release_finalizer.set()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert transaction.terminal_result is not None
+    assert transaction.terminal_result.status is AgentRunStatus.ABORTED
+
+
+@pytest.mark.asyncio
+async def test_loop_fault_keeps_primary_error_when_finalizer_also_fails() -> None:
+    class FaultingTransaction(RecordingTransaction):
+        terminal_result = None
+
+        async def turn_frozen(self, turn, config) -> None:
+            raise RuntimeError("primary persistence fault")
+
+        async def run_terminal(self, result) -> None:
+            self.terminal_result = result
+            await super().run_terminal(result)
+
+    async def _broken_finalizer(_run_id: str) -> None:
+        raise RuntimeError("cleanup fault")
+
+    transaction = FaultingTransaction()
+    config = AgentLoopConfig(
+        model=ScriptedModel([text_events("never")]),
+        run_id="run-primary-fault-finalizer",
+        transaction=transaction,
+        run_finalizer=_broken_finalizer,
+    )
+
+    with pytest.raises(RuntimeError, match="primary persistence fault"):
+        await run_agent_loop(
+            [UserMessage(content="go")], AgentContext(messages=[]), config, None
+        )
+
+    terminal = transaction.terminal_result
+    assert terminal is not None
+    assert terminal.status is AgentRunStatus.FAILED
+    assert terminal.error == "primary persistence fault"
+    assert terminal.finalization_diagnostic is not None
+    assert terminal.finalization_diagnostic.message == "cleanup fault"
 
 
 @pytest.mark.asyncio

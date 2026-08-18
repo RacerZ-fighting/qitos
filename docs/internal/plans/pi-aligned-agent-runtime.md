@@ -49,13 +49,25 @@ Review-hardening dispositions recorded on the same branch:
 - `before_tool_call` keeps Pi's `block` / `reason` / `terminate` surface. Tool
   argument rewriting remains owned by the existing permission pipeline; the
   hook does not introduce a second mutation channel.
-- Cancellation closes the loop: external task cancellation and faults
-  terminalize started work plus the run record before re-raising;
+- Cancellation closes the loop: external task cancellation and ordinary faults
+  terminalize started work plus the run record before re-raising when canonical
+  appends settle; append failure or uncertainty stops before an open Tool boundary,
+  which close-and-replay recovery closes in input order without re-execution;
   `CancelToken` `after_step` stops at turn boundaries and never interrupts
   in-flight streams or Tool calls; duplicate Tool-call ids remain in the
   assistant transcript as protocol-failure evidence and the malformed batch
   is rejected before Tool admission; terminal `ToolResult`s are deeply immutable before they
   cross journal, event and Message boundaries.
+- Run terminalization now has one frozen, optional async resource-quiescence
+  finalizer. The Run owner awaits it exactly once on success, failure, deadline
+  and cancellation before appending the terminal record; cleanup faults are a
+  bounded typed diagnostic and never replace the primary status/error. It receives
+  only the current leg's stable Run id, quiesces that Run's resources, and cannot
+  close Env, Tool or MCP owners reused by later legs; the outer application owns
+  their exactly-once teardown. This is a narrow lifecycle barrier, not a Hook list
+  or extension bus. Parallel Tool
+  handlers still overlap, while every Tool terminal transaction and end event
+  commits deterministically in assistant-call input order.
 
 S1 closes the remaining parity items:
 

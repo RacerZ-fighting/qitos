@@ -97,10 +97,16 @@ async def test_foreground_child_completes_and_journals_turns(tmp_path) -> None:
     model = ScriptedModel(
         [text_events("child answer", usage={"total_tokens": 7})]
     )
+    finalized_run_ids: list[str] = []
+
+    async def _finalize(run_id: str) -> None:
+        finalized_run_ids.append(run_id)
+
     supervisor = ChildSupervisor(
         invocation_factory=build_agent_child_invocation_factory(
             model=model,
             journal_directory=_children_root(tmp_path),
+            run_finalizer=_finalize,
         ),
         child_journal_factory=_child_journal_factory(tmp_path),
     )
@@ -120,6 +126,7 @@ async def test_foreground_child_completes_and_journals_turns(tmp_path) -> None:
     assert result.usage_complete is True
     assert result.cost_complete is False
     assert result.child_run_id
+    assert finalized_run_ids == [result.child_run_id]
 
     parent_records = await parent_journal.replay()
     child_started = [

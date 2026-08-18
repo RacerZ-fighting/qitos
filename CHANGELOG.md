@@ -17,6 +17,21 @@ How to update:
 
 ## Unreleased
 
+### Fixed
+
+- Parallel Tool handlers now settle independently but append their canonical
+  ToolResult transcript/terminal records and end events strictly in ToolCall
+  input order, eliminating concurrent transcript record-id reuse. A failed or
+  uncertain terminal append stops the ordered prefix; recovery closes that
+  call and later candidates in input order without re-running handlers.
+- Runs may compose one frozen async resource finalizer. It is awaited exactly
+  once before `run.completed` / `run.interrupted` on normal, fault, deadline
+  and cancellation paths; cleanup failures are preserved as bounded typed
+  diagnostics without replacing the primary outcome. The finalizer receives
+  only the stable Run id and quiesces that Run's resources; reusable Env,
+  Tool and MCP owners remain open for later Session legs and are closed once
+  by the outer application.
+
 ### Added
 
 - **Minimal agent loop and Agent façade (Pi-aligned).** New
@@ -44,8 +59,11 @@ How to update:
   immutable snapshots; absolute downward-propagated deadlines; and
   cooperative `CancelToken` cancellation (now `qitos.core.cancellation`)
   where `immediate` interrupts in-flight work and `after_step` stops the run
-  after the current turn commits. External task cancellation and faults
-  terminalize started work and the run record before re-raising. Hook
+  after the current turn commits. External task cancellation and ordinary
+  faults terminalize started work and the run record before re-raising when
+  canonical appends settle. If an append fails or its outcome is unknown, the
+  writer stops before crossing an open Tool boundary; close, replay and
+  recovery establish the missing terminals without re-execution. Hook
   contracts mirror Pi: `before_tool_call` receives validated arguments and an
   immutable agent-context snapshot and may block the call;
   `after_tool_call` applies a field-level `AfterToolCallOverride`;

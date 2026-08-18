@@ -74,6 +74,21 @@ The Harness owns prompt, queue, abort, idle, compact, resume and fork operations
 Expected rejections use typed results; corruption and implementation faults use
 exceptions.
 
+One Run may carry one frozen async resource finalizer composed by the application.
+The Run owner awaits it exactly once after model/Tool work has settled and before
+the canonical Run terminal append, including fault, deadline and cancellation
+paths. A cleanup failure is retained as a bounded typed finalization diagnostic;
+it does not replace the primary Run status or error. The finalizer receives only
+the current leg's stable Run id and quiesces resources owned by that Run. It does
+not close reusable Env, Tool or MCP owners shared across Session legs; the outer
+application performs full teardown exactly once. This is not an extension Hook list.
+
+Ordinary faults and caller cancellation terminalize started work before the Run
+terminal when canonical appends settle. An append failure or unknown durable outcome
+stops the writer: it never guesses a Tool terminal or crosses an open Tool boundary
+with a Run terminal. The owner must close and replay the writer, then recovery closes
+the missing Tool terminals in input order without re-executing handlers.
+
 ### Canonical log
 
 One Run journal is one canonical append-only log; a Session is the lineage of
@@ -93,7 +108,8 @@ The log carries two typed record families in one sequence:
   transcript reference), `tool.started` / `tool.terminal` (call plus terminal
   transcript reference), `step.committed` (turn commit marker listing the
   turn's transcript and Tool-terminal references), `run.completed` /
-  `run.interrupted`, `model.change` / `thinking.change` / `tools.change`
+  `run.interrupted` (primary status/error plus an optional resource-finalization
+  diagnostic), `model.change` / `thinking.change` / `tools.change`
   (per-turn configuration freeze diffs), `budget.committed`, `process.*`,
   `child.*`, `runtime_input.posted` / `runtime_input.consumed`, `task.*`,
   `plan.updated`, `run.forked` and `journal.inherited`.
@@ -230,6 +246,8 @@ loader or arbitrary loop/Session hooks.
 - Admitted ToolCall and ToolResult remain paired across compact, resume, fork and
   interruption; ambiguous duplicate ids never reach Tool admission.
 - Provider continuation, SQLite index, trace and projections are never recovery truth.
-- Cancellation is re-raised only after started work reaches durable terminal records.
+- Cancellation is re-raised after started work reaches durable terminal records when
+  canonical appends settle; an append failure or unknown outcome instead requires
+  close-and-replay recovery and never permits a Run terminal across an open Tool call.
 - Runtime and Child concurrency are bounded and leave no detached tasks.
 - The outermost CLI/application is the only sync-to-async boundary.

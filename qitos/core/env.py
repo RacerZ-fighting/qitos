@@ -615,6 +615,17 @@ class CommandCapability(ABC):
         _ = owner_run_id, journal
         return ()
 
+    async def aquiesce(self, *, owner_run_id: str | None = None) -> None:
+        """Settle resources owned by one Run without closing the capability.
+
+        Command backends without managed background resources are already
+        quiescent, so the public contract defaults to a safe no-op. Backends
+        that do manage Run-owned resources must scope cleanup to
+        ``owner_run_id`` when provided and remain reusable afterwards.
+        """
+
+        _ = owner_run_id
+
     async def aclose(self) -> None:
         """Terminate owned live processes and await all runtime Tasks."""
 

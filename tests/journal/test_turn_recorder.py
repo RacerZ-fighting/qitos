@@ -13,7 +13,7 @@ from qitos.core.agent_loop import (
     run_agent_loop,
 )
 from qitos.core.cancellation import CancelToken
-from qitos.core.journal import JournalRecordRef, JournalRecordType
+from qitos.core.journal import JournalError, JournalRecordRef, JournalRecordType
 from qitos.core.message import (
     AssistantMessage,
     UserMessage,
@@ -25,10 +25,14 @@ from qitos.core.tool import tool
 from qitos.core.tool_registry import ToolRegistry
 from qitos.core.tool_result import ToolResult
 from qitos.kit.journal import (
+    InMemoryJournalStore,
+    InMemorySessionJournal,
     JsonlSessionJournal,
     JournalTurnTransaction,
     RecoveredRecorderState,
+    close_crashed_tool_calls,
     recover_run_outcome,
+    recover_session,
 )
 
 from tests.core.agent_fakes import ScriptedModel, text_events, tool_call_wire, tool_events
@@ -124,7 +128,11 @@ async def test_full_run_records_transcript_entries_and_operation_references(
                 "tool_terminal_record_ids",
             }
         if record.type is JournalRecordType.RUN_COMPLETED:
-            assert record.payload == {"status": "completed", "error": None}
+            assert record.payload == {
+                "status": "completed",
+                "error": None,
+                "finalization_diagnostic": None,
+            }
 
     # Deterministic per-turn transcript sequence ids.
     transcript_ids = [
@@ -247,6 +255,7 @@ async def test_aborted_run_records_run_interrupted_without_messages(tmp_path) ->
     assert records[-1].payload == {
         "status": "aborted",
         "error": "run aborted before model admission",
+        "finalization_diagnostic": None,
     }
 
     outcome = recover_run_outcome(records)
@@ -522,3 +531,96 @@ async def test_recorder_commits_budget_per_model_terminal(tmp_path) -> None:
     assert restored.snapshot().total_tokens == 7
     assert restored.snapshot_after_origin("run-budget") is not None
     await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_parallel_terminal_append_fault_keeps_a_recoverable_crash_run() -> None:
+    class FailFirstToolTerminal(InMemorySessionJournal):
+        def __init__(self, store: InMemoryJournalStore) -> None:
+            super().__init__(store)
+            self.failed = False
+
+        async def append(self, record_type, payload, *, record_id):
+            if record_type is JournalRecordType.TOOL_TERMINAL and not self.failed:
+                self.failed = True
+                raise JournalError("injected first terminal append failure")
+            return await super().append(record_type, payload, record_id=record_id)
+
+    executed: list[str] = []
+
+    @tool(name="first", concurrency_safe=True)
+    async def _first() -> str:
+        executed.append("first")
+        return "first"
+
+    @tool(name="second", concurrency_safe=True)
+    async def _second() -> str:
+        executed.append("second")
+        return "second"
+
+    store = InMemoryJournalStore()
+    journal = FailFirstToolTerminal(store)
+    transaction = await JournalTurnTransaction.create(
+        journal, "run-terminal-fault", {"purpose": "test"}
+    )
+    model = ScriptedModel(
+        [
+            tool_events(
+                [
+                    tool_call_wire("c1", "first", {}),
+                    tool_call_wire("c2", "second", {}),
+                ]
+            )
+        ]
+    )
+    context = AgentContext(
+        messages=[],
+        tools=ToolRegistry().include_toolset([_first, _second]).freeze(),
+    )
+    config = AgentLoopConfig(
+        model=model,
+        run_id="run-terminal-fault",
+        transaction=transaction,
+        tool_execution="parallel",
+    )
+
+    with pytest.raises(JournalError, match="unterminated"):
+        await run_agent_loop([UserMessage(content="go")], context, config, None)
+
+    assert set(executed) == {"first", "second"}
+    records = await journal.replay()
+    assert not any(
+        record.type
+        in (JournalRecordType.RUN_COMPLETED, JournalRecordType.RUN_INTERRUPTED)
+        for record in records
+    )
+    terminals = [
+        record
+        for record in records
+        if record.type is JournalRecordType.TOOL_TERMINAL
+    ]
+    assert terminals == []
+
+    recovered = recover_session(records)
+    assert recovered.outcome is None
+    assert [item.call.id for item in recovered.unterminated_calls] == ["c1", "c2"]
+    before_close = tuple(executed)
+    closed = await close_crashed_tool_calls(journal, recovered)
+    assert closed
+    assert tuple(executed) == before_close
+
+    settled_records = await journal.replay()
+    settled_terminals = [
+        record
+        for record in settled_records
+        if record.type is JournalRecordType.TOOL_TERMINAL
+    ]
+    assert [record.payload["call_id"] for record in settled_terminals] == [
+        "c1",
+        "c2",
+    ]
+    settled = recover_session(settled_records)
+    assert settled.unterminated_calls == ()
+    assert settled.unstarted_calls == ()
+    assert settled.outcome is None
+    await journal.close()

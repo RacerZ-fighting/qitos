@@ -18,9 +18,9 @@ executor, now expressed over typed ``ToolCall`` / ``ToolResult``:
 - ``CancelToken`` mode ``"immediate"`` interrupts at the next safe point;
   ``"after_step"`` never interrupts an in-flight call — it is honored by the
   agent loop at the turn boundary instead;
-- external task cancellation terminalizes every started or admitted call
-  (cancelled results, journal records and events) and only then re-raises
-  ``asyncio.CancelledError``;
+- external task cancellation terminalizes every started or admitted call before
+  re-raising ``asyncio.CancelledError`` when canonical appends settle; an append
+  failure or unknown outcome stops the writer for close-and-replay recovery;
 - a per-Tool ``RetryPolicy`` is the single retry owner;
 - ``before_tool_call`` receives the validated arguments and may block;
   ``after_tool_call`` applies a field-level partial override. Hook
@@ -56,6 +56,7 @@ from .agent_events import (
 from .cancellation import CancelSignalView, CancelToken
 from .env import Env
 from .journal import JournalAppendCancelled
+from .journal import JournalCommitState
 from .message import AssistantMessage, Message, ToolCall
 from .tool import BaseTool, ToolValidationResult
 from .tool_registry import ToolExposure
@@ -251,6 +252,9 @@ class ToolBatchExecutor:
         self._transaction = transaction
         self._results: List[Optional[ToolResult]] = []
         self._started: Set[int] = set()
+        self._committed: Set[int] = set()
+        self._defer_terminal_commits = False
+        self._journal_outcome_unknown = False
         self._handler_cancelled_error_seen = False
         self._events_failed = False
         #: Ordered terminal results of the last batch, including the results
@@ -271,6 +275,15 @@ class ToolBatchExecutor:
             )
         self._results = [None] * len(calls)
         self._started = set()
+        self._committed = set()
+        # Parallel handlers may finish in any order, but their canonical
+        # Tool terminal records and end events belong to the assistant
+        # message's input order. Defer every terminal candidate in a
+        # parallel batch until the ordered finalization pass.
+        self._defer_terminal_commits = (
+            self._config.mode == "parallel" and len(calls) > 1
+        )
+        self._journal_outcome_unknown = False
         self._handler_cancelled_error_seen = False
         self._events_failed = False
         try:
@@ -304,6 +317,12 @@ class ToolBatchExecutor:
             self.last_batch_results = await self._final_results(calls)
             raise fault.cause
         except asyncio.CancelledError:
+            if self._journal_outcome_unknown:
+                # The canonical writer must be closed and replayed before
+                # anyone can decide which Tool boundary exists. Do not append
+                # a guessed counterpart or a Run terminal on this instance.
+                self.last_batch_results = None
+                raise
             # External task cancellation: every admitted call reaches a
             # terminal state before the cancellation propagates.
             for index, call in enumerate(calls):
@@ -456,7 +475,7 @@ class ToolBatchExecutor:
                             item.index, item.call, abort_reason or "parent_cancelled"
                         )
                     except Exception as exc:  # pragma: no cover - defensive path
-                        self._results[item.index] = await self._commit_terminal(
+                        self._results[item.index] = await self._terminal_result(
                             item.index,
                             item.call,
                             self._missing_result(item.call, str(exc)),
@@ -530,10 +549,16 @@ class ToolBatchExecutor:
         if self._transaction is not None and journal:
             try:
                 await self._transaction.tool_started(self._config.turn, call)
+            except JournalAppendCancelled as exc:
+                if exc.commit_state is JournalCommitState.COMMITTED:
+                    self._started.add(index)
+                elif exc.commit_state is JournalCommitState.UNKNOWN:
+                    self._journal_outcome_unknown = True
+                raise
             except asyncio.CancelledError:
-                # Journal appends settle before surfacing cancellation, so
-                # the started record is durable even though we re-raise.
-                self._started.add(index)
+                # A plain cancellation provides no committed admission
+                # evidence. The cancellation drain may retry the admission as
+                # an explicit cancelled call, but the handler never runs.
                 raise
         self._started.add(index)
         await self._emit_event(
@@ -551,15 +576,23 @@ class ToolBatchExecutor:
         if self._transaction is not None and journal:
             try:
                 await self._transaction.tool_terminal(self._config.turn, call, final)
+            except JournalAppendCancelled as exc:
+                self._results[index] = final
+                if exc.commit_state is JournalCommitState.COMMITTED:
+                    self._committed.add(index)
+                elif exc.commit_state is JournalCommitState.UNKNOWN:
+                    self._journal_outcome_unknown = True
+                raise
             except asyncio.CancelledError:
-                # The append settled durably; mark the slot before the
-                # cancellation propagates so nobody records a second terminal.
+                # No durable outcome was provided. Preserve the already-run
+                # handler's candidate, but do not infer terminal persistence.
                 self._results[index] = final
                 raise
         # The canonical result wins before an observational listener runs.
         # If that listener fails, batch recovery sees this slot as terminal
         # and only cancels calls that have not started yet.
         self._results[index] = final
+        self._committed.add(index)
         await self._emit_event(
             ToolExecutionEnd(
                 tool_call_id=call.id,
@@ -568,6 +601,24 @@ class ToolBatchExecutor:
                 is_error=final.status != "success",
             )
         )
+        return final
+
+    async def _terminal_result(
+        self, index: int, call: ToolCall, result: ToolResult, *, journal: bool = True
+    ) -> ToolResult:
+        """Return one terminal candidate or commit it immediately.
+
+        Parallel batches keep handler execution concurrent while deferring the
+        canonical transaction and end event to ``_final_results``. Serial
+        batches retain their existing per-call durability boundary.
+        """
+
+        if not self._defer_terminal_commits:
+            return await self._commit_terminal(
+                index, call, result, journal=journal
+            )
+        final = dataclasses.replace(result, call_id=call.id).frozen()
+        self._results[index] = final
         return final
 
     async def _emit_event(self, event: Any) -> None:
@@ -596,10 +647,10 @@ class ToolBatchExecutor:
 
         stopped = self._stop_result(call, start, attempts=0, deadline=deadline)
         if stopped is not None:
-            return await self._commit_terminal(index, call, stopped)
+            return await self._terminal_result(index, call, stopped)
 
         if call.parse_error is not None:
-            return await self._commit_terminal(
+            return await self._terminal_result(
                 index,
                 call,
                 self._finish_result(
@@ -618,7 +669,7 @@ class ToolBatchExecutor:
 
         tool = self._exposure.get(call.name)
         if tool is None:
-            return await self._commit_terminal(
+            return await self._terminal_result(
                 index,
                 call,
                 self._finish_result(
@@ -645,11 +696,11 @@ class ToolBatchExecutor:
 
         stopped = self._stop_result(call, start, attempts=0, deadline=deadline)
         if stopped is not None:
-            return await self._commit_terminal(index, call, stopped)
+            return await self._terminal_result(index, call, stopped)
 
         permission = tool.check_permissions(dict(call.arguments), runtime_context)
         if permission.decision == "deny":
-            return await self._commit_terminal(
+            return await self._terminal_result(
                 index,
                 call,
                 self._finish_result(
@@ -667,7 +718,7 @@ class ToolBatchExecutor:
                 ),
             )
         if permission.decision == "ask":
-            return await self._commit_terminal(
+            return await self._terminal_result(
                 index,
                 call,
                 self._finish_result(
@@ -693,7 +744,7 @@ class ToolBatchExecutor:
         )
         validation = self._validate(tool, effective_args, runtime_context)
         if not validation.valid:
-            return await self._commit_terminal(
+            return await self._terminal_result(
                 index,
                 call,
                 self._finish_result(
@@ -712,14 +763,14 @@ class ToolBatchExecutor:
 
         stopped = self._stop_result(call, start, attempts=0, deadline=deadline)
         if stopped is not None:
-            return await self._commit_terminal(index, call, stopped)
+            return await self._terminal_result(index, call, stopped)
 
         if self._config.before_tool_call is not None:
             decision, hook_failure = await self._run_before_hook(
                 call, effective_args
             )
             if hook_failure is not None:
-                return await self._commit_terminal(index, call, hook_failure)
+                return await self._terminal_result(index, call, hook_failure)
             if decision is not None and decision.block:
                 extra: Dict[str, Any] = {
                     **ordering_meta,
@@ -728,7 +779,7 @@ class ToolBatchExecutor:
                 }
                 if decision.terminate:
                     extra["terminate"] = True
-                return await self._commit_terminal(
+                return await self._terminal_result(
                     index,
                     call,
                     self._finish_result(
@@ -742,7 +793,7 @@ class ToolBatchExecutor:
                 )
         stopped = self._stop_result(call, start, attempts=0, deadline=deadline)
         if stopped is not None:
-            return await self._commit_terminal(index, call, stopped)
+            return await self._terminal_result(index, call, stopped)
 
         return _PreparedCall(
             index=index,
@@ -775,7 +826,7 @@ class ToolBatchExecutor:
 
         if self._config.after_tool_call is not None:
             result = await self._run_after_hook(prepared, result)
-        return await self._commit_terminal(prepared.index, call, result)
+        return await self._terminal_result(prepared.index, call, result)
 
     async def _run_before_hook(
         self, call: ToolCall, effective_args: Dict[str, Any]
@@ -1499,7 +1550,7 @@ class ToolBatchExecutor:
 
         if index not in self._started:
             await self._start_call(index, call)
-        return await self._commit_terminal(
+        return await self._terminal_result(
             index, call, self._prevented_result(call, cancel_source)
         )
 
@@ -1539,14 +1590,36 @@ class ToolBatchExecutor:
         """Assemble ordered results, committing any defensively missing slot."""
 
         out: List[ToolResult] = []
+        first_fault: Exception | None = None
+        commit_blocked = False
         for index, call in enumerate(calls):
             result = self._results[index]
             if result is None:  # pragma: no cover - defensive path
-                result = await self._commit_terminal(
+                result = await self._terminal_result(
                     index, call, self._missing_result(call, "result_missing")
                 )
+            if index not in self._committed and not commit_blocked:
+                try:
+                    result = await self._commit_terminal(index, call, result)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # A handler may already have produced external side
+                    # effects. Preserve its candidate, but never commit a
+                    # later candidate across this missing canonical prefix
+                    # and never re-execute a handler to manufacture a result.
+                    if first_fault is None:
+                        first_fault = exc
+                    if index not in self._committed:
+                        # Canonical terminals are an ordered prefix. Once one
+                        # persistence boundary is missing, later candidates
+                        # stay uncommitted for crash recovery to close in the
+                        # same input order.
+                        commit_blocked = True
             out.append(result)
         self.last_batch_results = out
+        if first_fault is not None:
+            raise first_fault
         return out
 
     def _finish_result(

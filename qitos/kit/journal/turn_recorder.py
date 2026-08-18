@@ -23,11 +23,14 @@ from typing import Any
 from ...core.agent_loop import (
     AgentLoopResult,
     AgentRunStatus,
+    RunFinalizationDiagnostic,
+    RunFinalizationDiagnosticCode,
     TurnConfigSnapshot,
     TurnTransactionBoundary,
 )
 from ...core.budget import BudgetLedger
 from ...core.journal import (
+    JournalError,
     JournalPosition,
     JournalRecordType,
     SessionJournal,
@@ -194,19 +197,43 @@ def decode_step_committed(
     )
 
 
-def encode_run_terminal(status: AgentRunStatus, error: str | None) -> dict[str, Any]:
-    return {"status": status.value, "error": error}
+def encode_run_terminal(
+    status: AgentRunStatus,
+    error: str | None,
+    finalization_diagnostic: RunFinalizationDiagnostic | None = None,
+) -> dict[str, Any]:
+    diagnostic_payload = (
+        None
+        if finalization_diagnostic is None
+        else {
+            "code": finalization_diagnostic.code.value,
+            "message": finalization_diagnostic.message,
+        }
+    )
+    return {
+        "status": status.value,
+        "error": error,
+        "finalization_diagnostic": diagnostic_payload,
+    }
 
 
 def decode_run_terminal(
     record_type: JournalRecordType, payload: Mapping[str, Any]
-) -> tuple[AgentRunStatus, str | None]:
+) -> tuple[
+    AgentRunStatus,
+    str | None,
+    RunFinalizationDiagnostic | None,
+]:
     if record_type not in (
         JournalRecordType.RUN_COMPLETED,
         JournalRecordType.RUN_INTERRUPTED,
     ):
         raise ValueError("record type is not a run terminal")
-    if set(payload) != {"status", "error"}:
+    fields = set(payload)
+    if fields not in (
+        {"status", "error"},
+        {"status", "error", "finalization_diagnostic"},
+    ):
         raise ValueError("run terminal fields are invalid")
     try:
         status = AgentRunStatus(str(payload["status"]))
@@ -220,7 +247,26 @@ def decode_run_terminal(
     error = payload["error"]
     if error is not None and not isinstance(error, str):
         raise ValueError("run terminal error must be text or None")
-    return status, error
+    raw_diagnostic = payload.get("finalization_diagnostic")
+    diagnostic: RunFinalizationDiagnostic | None = None
+    if raw_diagnostic is not None:
+        if not isinstance(raw_diagnostic, Mapping) or set(raw_diagnostic) != {
+            "code",
+            "message",
+        }:
+            raise ValueError("run finalization diagnostic fields are invalid")
+        try:
+            code = RunFinalizationDiagnosticCode(str(raw_diagnostic["code"]))
+        except ValueError as exc:
+            raise ValueError("run finalization diagnostic code is invalid") from exc
+        try:
+            diagnostic = RunFinalizationDiagnostic(
+                code=code,
+                message=raw_diagnostic["message"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
+    return status, error, diagnostic
 
 
 def decode_input_accepted(payload: Mapping[str, Any]) -> tuple[str, ...]:
@@ -783,6 +829,32 @@ class JournalTurnTransaction(TurnTransactionBoundary):
         )
 
     async def run_terminal(self, result: AgentLoopResult) -> JournalPosition:
+        records = await self._journal.replay()
+        started: set[tuple[int, str]] = set()
+        terminal: set[tuple[int, str]] = set()
+        try:
+            for record in records:
+                if record.type is JournalRecordType.TOOL_STARTED:
+                    turn, call = decode_tool_started(record.payload)
+                    started.add((turn, call.id))
+                elif record.type is JournalRecordType.TOOL_TERMINAL:
+                    turn, call, _message_record_id = decode_tool_terminal(
+                        record.payload
+                    )
+                    terminal.add((turn, call.id))
+        except ValueError as exc:
+            raise JournalError(
+                "cannot append a Run terminal over invalid Tool records"
+            ) from exc
+        if not terminal.issubset(started):
+            raise JournalError(
+                "cannot append a Run terminal over a Tool terminal without admission"
+            )
+        open_calls = started - terminal
+        if open_calls:
+            raise JournalError(
+                "cannot append a Run terminal while Tool calls remain unterminated"
+            )
         record_type = (
             JournalRecordType.RUN_INTERRUPTED
             if result.status is AgentRunStatus.ABORTED
@@ -790,7 +862,11 @@ class JournalTurnTransaction(TurnTransactionBoundary):
         )
         return await self._journal.append(
             record_type,
-            encode_run_terminal(result.status, result.error),
+            encode_run_terminal(
+                result.status,
+                result.error,
+                result.finalization_diagnostic,
+            ),
             record_id=f"{self._journal.run_id}:run:terminal",
         )
 

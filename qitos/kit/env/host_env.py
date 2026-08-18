@@ -607,6 +607,13 @@ class HostCommandCapability(CommandCapability):
             journal=journal,
         )
 
+    async def aquiesce(self, *, owner_run_id: str | None = None) -> None:
+        """Settle Run-owned processes while keeping this capability reusable."""
+
+        runtime = self._managed
+        if runtime is not None:
+            await runtime.quiesce(owner_run_id=owner_run_id)
+
     async def aclose(self) -> None:
         runtime = self._managed
         self._managed = None

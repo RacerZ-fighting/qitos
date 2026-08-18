@@ -67,6 +67,25 @@ async def test_prompt_completes_and_updates_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_facade_freezes_and_awaits_the_run_finalizer() -> None:
+    finalized = asyncio.Event()
+
+    async def _finalize(run_id: str) -> None:
+        assert run_id
+        finalized.set()
+
+    agent = _agent(
+        ScriptedModel([text_events("answer")]), run_finalizer=_finalize
+    )
+
+    result = await agent.prompt("question")
+
+    assert isinstance(result, AgentLoopResult)
+    assert result.status is AgentRunStatus.COMPLETED
+    assert finalized.is_set()
+
+
+@pytest.mark.asyncio
 async def test_prompt_during_run_is_a_typed_rejection() -> None:
     gate = asyncio.Event()
     agent = _agent(ScriptedModel([make_hanging_model(gate, first_text="w")]))

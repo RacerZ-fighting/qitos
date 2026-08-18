@@ -15,6 +15,11 @@ from qitos.core.agent_events import (
     ToolExecutionUpdate,
 )
 from qitos.core.cancellation import CancelToken
+from qitos.core.journal import (
+    JournalAppendCancelled,
+    JournalCommitState,
+    JournalPosition,
+)
 from qitos.core.message import ToolCall
 from qitos.core.tool import RetryPolicy, tool
 from qitos.core.tool_executor import (
@@ -75,6 +80,92 @@ async def test_transaction_records_started_then_terminal() -> None:
     assert kinds == ["tool_started", "tool_terminal"]
     assert transaction.records[0][2] == "c9"
     assert transaction.records[1][2:] == ("c9", "success")
+
+
+@pytest.mark.parametrize("phase", ["tool_started", "tool_terminal"])
+@pytest.mark.parametrize(
+    "commit_state",
+    [
+        JournalCommitState.COMMITTED,
+        JournalCommitState.NOT_COMMITTED,
+        JournalCommitState.UNKNOWN,
+    ],
+)
+@pytest.mark.asyncio
+async def test_cancelled_journal_append_respects_commit_state_without_reexecution(
+    phase: str,
+    commit_state: JournalCommitState,
+) -> None:
+    class CancelOnceTransaction(RecordingTransaction):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started_attempts = 0
+            self.terminal_attempts = 0
+            self.cancelled = False
+
+        def _cancel(self, record_id: str) -> JournalAppendCancelled:
+            position = JournalPosition("r", 1, record_id)
+            return JournalAppendCancelled(
+                position if commit_state is JournalCommitState.COMMITTED else None,
+                commit_state=commit_state,
+                pending_position=position,
+            )
+
+        async def tool_started(self, turn: int, call: ToolCall) -> None:
+            self.started_attempts += 1
+            if phase == "tool_started" and not self.cancelled:
+                self.cancelled = True
+                raise self._cancel(f"{call.id}:started")
+            await super().tool_started(turn, call)
+
+        async def tool_terminal(
+            self, turn: int, call: ToolCall, result: ToolResult
+        ) -> None:
+            self.terminal_attempts += 1
+            if phase == "tool_terminal" and not self.cancelled:
+                self.cancelled = True
+                raise self._cancel(f"{call.id}:terminal")
+            await super().tool_terminal(turn, call, result)
+
+    executions = 0
+
+    @tool(name="side_effect")
+    def _side_effect() -> str:
+        nonlocal executions
+        executions += 1
+        return "done"
+
+    transaction = CancelOnceTransaction()
+    executor = ToolBatchExecutor(
+        _exposure(_side_effect),
+        ToolExecutionConfig(run_id="r"),
+        transaction=transaction,
+    )
+
+    with pytest.raises(JournalAppendCancelled) as cancelled:
+        await executor.execute_batch([_call("side_effect", {}, "c1")])
+
+    assert cancelled.value.commit_state is commit_state
+    assert executions == (0 if phase == "tool_started" else 1)
+    if phase == "tool_started":
+        assert transaction.started_attempts == (
+            2 if commit_state is JournalCommitState.NOT_COMMITTED else 1
+        )
+        assert transaction.terminal_attempts == (
+            0 if commit_state is JournalCommitState.UNKNOWN else 1
+        )
+    else:
+        assert transaction.started_attempts == 1
+        assert transaction.terminal_attempts == (
+            2 if commit_state is JournalCommitState.NOT_COMMITTED else 1
+        )
+    if commit_state is JournalCommitState.UNKNOWN:
+        assert executor.last_batch_results is None
+    else:
+        assert executor.last_batch_results is not None
+        assert executor.last_batch_results[0].status == (
+            "cancelled" if phase == "tool_started" else "success"
+        )
 
 
 @pytest.mark.asyncio
@@ -489,6 +580,55 @@ async def test_parallel_preflight_is_sequential_and_precedes_execution() -> None
     first_run = log.index(runs[0])
     assert all(log.index(entry) < first_run for entry in befores)
     assert len(runs) == 3
+
+
+@pytest.mark.asyncio
+async def test_parallel_handlers_commit_terminal_results_in_input_order() -> None:
+    first_started = asyncio.Event()
+    second_finished = asyncio.Event()
+    release_first = asyncio.Event()
+    completion_order: List[str] = []
+
+    @tool(name="first", concurrency_safe=True)
+    async def _first() -> str:
+        first_started.set()
+        await release_first.wait()
+        completion_order.append("first")
+        return "first"
+
+    @tool(name="second", concurrency_safe=True)
+    async def _second() -> str:
+        await first_started.wait()
+        completion_order.append("second")
+        second_finished.set()
+        return "second"
+
+    transaction = RecordingTransaction()
+    executor = ToolBatchExecutor(
+        _exposure(_first, _second),
+        ToolExecutionConfig(mode="parallel", max_concurrency=2),
+        transaction=transaction,
+    )
+    batch = asyncio.create_task(
+        executor.execute_batch(
+            [_call("first", {}, "c1"), _call("second", {}, "c2")]
+        )
+    )
+
+    await second_finished.wait()
+    assert completion_order == ["second"]
+    assert not any(record[0] == "tool_terminal" for record in transaction.records)
+
+    release_first.set()
+    results = await batch
+
+    assert [result.call_id for result in results] == ["c1", "c2"]
+    terminal_ids = [
+        record[2]
+        for record in transaction.records
+        if record[0] == "tool_terminal"
+    ]
+    assert terminal_ids == ["c1", "c2"]
 
 
 @pytest.mark.asyncio

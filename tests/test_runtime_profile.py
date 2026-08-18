@@ -59,6 +59,15 @@ class _ProbeCommands(CommandCapability):
         )
 
 
+@pytest.mark.asyncio
+async def test_command_capability_without_background_resources_is_quiescent() -> None:
+    backend = _ProbeCommands()
+
+    await backend.aquiesce(owner_run_id="run-1")
+
+    assert backend.argv == []
+
+
 def test_runtime_snapshot_round_trips_without_mutable_fields() -> None:
     snapshot = RuntimeCapabilitySnapshot(
         backend="local",

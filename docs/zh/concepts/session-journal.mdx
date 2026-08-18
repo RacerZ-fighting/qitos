@@ -19,8 +19,9 @@ writer lease；其他进程若尝试同时写入，会得到 `JournalOwnershipEr
 record id 引用 transcript 条目——消息内容只出现在恰好一条记录中。
 `model.completed` 保留精确的请求审计与 assistant transcript 引用；`tool.terminal`
 保留调用与终态 transcript 引用；`step.committed` 是纯提交标记，列出该 turn 的
-transcript 与 Tool 终态引用；`run.completed` / `run.interrupted` 只携带终态状态与
-错误。携带引用的记录通过 `journal.inherited` 包装 fail closed 解析。
+transcript 与 Tool 终态引用；`run.completed` / `run.interrupted` 携带终态状态、
+错误，以及可选的有界资源收敛诊断。携带引用的记录通过 `journal.inherited` 包装
+fail closed 解析。
 
 ## Loop 事务顺序
 
@@ -32,18 +33,25 @@ loop 的 `JournalTurnTransaction` 按以下顺序记录每次运行：
    （首个 turn 写完整三元组，之后只写差异）
 3. assistant 消息的 `transcript.message`，然后是 `model.completed`
 4. `tool.started`：一次已准入 ToolCall 的持久化执行许可
-5. 执行 Handler 并生成唯一 canonical `ToolResult`
-6. Tool 结果消息的 `transcript.message`，然后是 `tool.terminal`
+5. 执行 Handler（仅明确声明安全时并行），并生成唯一 canonical `ToolResult` 候选
+6. 严格按 ToolCall 输入顺序写入每个 Tool 结果消息的 `transcript.message`，然后是
+   对应的 `tool.terminal`
 7. `step.committed`：该 turn 的提交标记
 
 `tool.started` 是持久化执行许可；写入失败时不能执行 Handler。终态结果只持久化一次，
 并且与进入 transcript 的值是同一个深度不可变值。并行 Tool 批次按输入顺序提交结果，
-每个已准入调用（包括拒绝、超时、取消）都恰好得到一个终态结果。
+若前一个终态写入失败或结果未知，后续候选不得跨过缺口继续写入；关闭并重放后，恢复逻辑
+按输入顺序关闭这些调用，且不重新执行 Handler。每个已准入调用（包括拒绝、超时、取消）
+最终都恰好得到一个终态结果。
 
-一次运行恰好以一个终态记录结束：`run.completed` 携带终态状态（`completed`、`failed`、
+一次已收敛的运行恰好有一个终态记录：`run.completed` 携带终态状态（`completed`、`failed`、
 `max_turns`、`deadline_exceeded`）；被中止的运行改为写入
-`run.interrupted`。外部任务取消与故障会先终结已开始的工作和运行记录再重新抛出，
-因此一次运行永远不会缺少终态记录。
+`run.interrupted`。若配置了 Run 唯一的冻结资源 finalizer，它只接收当前 leg 的稳定
+Run id，并在任一终态记录前收敛属于该 Run 的资源。它不得关闭供后续 Session leg 复用的
+Env、Tool 或 MCP owner；完整 teardown 由最外层应用恰好执行一次。清理失败只写入类型化
+诊断，不覆盖原始状态或错误。外部任务取消与普通故障会在 canonical 写入成功收敛时，先
+终结已开始的工作和运行记录再重新抛出。若 append 自身失败或结果未知，writer 不得跨过
+未关闭的 Tool 边界猜写 Run 终态；必须先关闭并重放，再由恢复逻辑补齐 Tool 终态。
 
 ## 恢复
 

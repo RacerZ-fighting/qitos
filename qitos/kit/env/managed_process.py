@@ -536,12 +536,22 @@ class ManagedHostProcessRuntime:
                 self._recovered_runs.add(owner_run_id)
             return await self.list(owner_run_id=owner_run_id)
 
-    async def close(self) -> None:
+    async def quiesce(self, *, owner_run_id: str | None = None) -> None:
+        """Settle active processes without closing the reusable runtime."""
+
+        if owner_run_id is not None and (
+            not isinstance(owner_run_id, str) or not owner_run_id.strip()
+        ):
+            raise ValueError("owner_run_id must be a non-empty string or None")
         async with self._start_condition:
-            self._closed = True
             while self._starting:
                 await self._start_condition.wait()
-            entries = list(self._entries.values())
+            entries = [
+                entry
+                for entry in self._entries.values()
+                if owner_run_id is None
+                or entry.handle.owner_run_id == owner_run_id
+            ]
         active = [entry for entry in entries if entry.status is ProcessStatus.RUNNING]
         if active:
             await asyncio.gather(
@@ -560,6 +570,13 @@ class ManagedHostProcessRuntime:
             raise ProcessPersistenceError(
                 f"failed to persist {len(errors)} process terminal record(s)"
             ) from errors[0]
+
+    async def close(self) -> None:
+        async with self._start_condition:
+            self._closed = True
+            while self._starting:
+                await self._start_condition.wait()
+        await self.quiesce()
 
     async def _spawn(
         self,

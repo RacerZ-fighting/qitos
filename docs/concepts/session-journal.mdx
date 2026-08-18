@@ -24,7 +24,8 @@ record. `model.completed` keeps the exact request audit plus the assistant
 transcript reference; `tool.terminal` keeps the call plus the terminal
 transcript reference; `step.committed` is a pure commit marker listing the
 turn's transcript and Tool-terminal references; `run.completed` /
-`run.interrupted` carry only the terminal status and error. Records that
+`run.interrupted` carry the terminal status, error, and an optional bounded
+resource-finalization diagnostic. Records that
 carry references resolve them fail closed through `journal.inherited`
 wrappers.
 
@@ -38,21 +39,32 @@ The loop's `JournalTurnTransaction` records each run in this order:
    `tools.change` (the full trio on the first turn, diffs only afterwards)
 3. `transcript.message` for the assistant message, then `model.completed`
 4. `tool.started` — a durable execution permit for one admitted ToolCall
-5. execute the handler and finalize the canonical `ToolResult`
-6. `transcript.message` for the Tool-result message, then `tool.terminal`
+5. execute handlers (concurrently only when declared safe) and finalize their
+   canonical `ToolResult` candidates
+6. in ToolCall input order, append `transcript.message` for each Tool-result
+   message, then its `tool.terminal`
 7. `step.committed` — the turn commit marker
 
 `tool.started` is a durable execution permit. If it cannot be written, the handler is
 not invoked. The finalized terminal result is persisted once and is the same deeply
 immutable value delivered to the transcript. Parallel Tool batches commit results in
-input order, and every admitted call receives exactly one terminal result, including
-denied, timed-out, and cancelled calls.
+input order. If an earlier terminal append fails or has an unknown outcome, no later
+candidate is appended across that gap; close-and-replay recovery terminates the open
+calls in input order without re-running handlers. Every admitted call ultimately
+receives exactly one terminal result, including denied, timed-out, and cancelled calls.
 
-A run ends in exactly one terminal record: `run.completed` carries the terminal
+A settled run has exactly one terminal record: `run.completed` carries the terminal
 status (`completed`, `failed`, `max_turns`, `deadline_exceeded`); an aborted run
-appends `run.interrupted` instead. External task
-cancellation and faults terminalize started work and the run record before
-re-raising, so a run never ends without a terminal record.
+appends `run.interrupted` instead. When configured, the Run's single frozen
+resource finalizer receives only that leg's stable Run id and settles resources owned
+by that Run before either terminal append. It must not close reusable Env, Tool or MCP
+owners shared by later Session legs; the outer application performs their full teardown
+once. Cleanup failure is recorded as a typed diagnostic without replacing the primary
+status/error. External task cancellation and ordinary faults terminalize started work
+and the run record before re-raising when the canonical appends settle. If an append
+itself fails or has an unknown outcome, the writer does not guess or append a Run
+terminal across an open Tool boundary: it closes and replays, then recovery writes the
+missing Tool terminals before the Run can settle.
 
 ## Recovery
 
