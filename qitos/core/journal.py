@@ -61,6 +61,7 @@ class JournalRecordType(str, Enum):
     TOOLS_CHANGE = "tools.change"
     COMPACTION = "compaction"
     BUDGET_COMMITTED = "budget.committed"
+    BUDGET_STEP_RESERVED = "budget.step_reserved"
     TOOL_STARTED = "tool.started"
     TOOL_TERMINAL = "tool.terminal"
     PROCESS_STARTED = "process.started"

@@ -110,9 +110,10 @@ The log carries two typed record families in one sequence:
   turn's transcript and Tool-terminal references), `run.completed` /
   `run.interrupted` (primary status/error plus an optional resource-finalization
   diagnostic), `model.change` / `thinking.change` / `tools.change`
-  (per-turn configuration freeze diffs), `budget.committed`, `process.*`,
-  `child.*`, `runtime_input.posted` / `runtime_input.consumed`, `task.*`,
-  `plan.updated`, `run.forked` and `journal.inherited`.
+  (per-turn configuration freeze diffs), `budget.step_reserved` (atomic
+  Root-lineage model admission), `budget.committed` (settled token/cost usage),
+  `process.*`, `child.*`, `runtime_input.posted` / `runtime_input.consumed`,
+  `task.*`, `plan.updated`, `run.forked` and `journal.inherited`.
 
 Records that carry references resolve fail closed through `journal.inherited`
 wrappers. Message content appears in exactly one record (its transcript
@@ -214,6 +215,11 @@ never merged into the parent Plan.
 
 Root and Child use the same Agent implementation. A Child has its own Task, Session,
 optional Plan, context and cancellation domain; authorization and budgets only narrow.
+Root and every descendant reserve each model step through one durable, async-safe
+lineage ledger before the provider request. A Child's `max_steps` is only a local cap
+within the shared remaining total. Concurrent admission is serialized, and deterministic
+reservation ids make resume/fork replay idempotent without resetting or double-charging
+the lineage.
 Launch commits the accepted parent Plan assignment before Child lifecycle persistence
 and runtime construction. When the parent Task already has a durable Plan, launch
 requires an explicit ready assignment; a parent Task without a Plan may still launch
@@ -252,4 +258,6 @@ loader or arbitrary loop/Session hooks.
   canonical appends settle; an append failure or unknown outcome instead requires
   close-and-replay recovery and never permits a Run terminal across an open Tool call.
 - Runtime and Child concurrency are bounded and leave no detached tasks.
+- Concurrent Root/Child model requests cannot oversubscribe the durable lineage step
+  budget; token/cost totals settle exactly once after each model terminal.
 - The outermost CLI/application is the only sync-to-async boundary.

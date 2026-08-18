@@ -61,6 +61,7 @@ from .agent_events import (
     TurnStart,
     emit_to,
 )
+from .budget import StepBudgetExhaustedError
 from .cancellation import CancelToken
 from .env import Env
 from .errors import ModelRequestDeadlineExceeded, ModelTransportError
@@ -918,9 +919,12 @@ async def _run_loop(
             if config.transaction is not None:
                 # One immutable model/thinking/Tool snapshot per turn, durable
                 # before the model request it governs.
-                await config.transaction.turn_frozen(
-                    turn, _turn_config_snapshot(exposure, config)
-                )
+                try:
+                    await config.transaction.turn_frozen(
+                        turn, _turn_config_snapshot(exposure, config)
+                    )
+                except StepBudgetExhaustedError as exc:
+                    return await _finish(AgentRunStatus.MAX_TURNS, error=str(exc))
             message, status_override = await _stream_assistant(
                 turn, context, new_messages, exposure, config, emit, token
             )

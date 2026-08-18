@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from qitos.core.budget import BudgetLedger
+from qitos.core.budget import BudgetLedger, StepBudgetExhaustedError
 from qitos.core.journal import (
     JournalAppendCancelled,
     JournalCommitState,
@@ -48,6 +48,37 @@ async def test_budget_ledger_commits_concurrent_usage_once() -> None:
     assert snapshot.remaining_cost_usd == pytest.approx(5.0)
     assert snapshot.usage_complete is True
     assert snapshot.cost_complete is True
+
+
+@pytest.mark.asyncio
+async def test_budget_ledger_serializes_concurrent_step_reservations() -> None:
+    ledger = BudgetLedger(max_steps=3)
+
+    async def reserve(index: int) -> tuple[int, bool]:
+        try:
+            await ledger.reserve_step(
+                origin_run_id=f"run-{index}",
+                transaction_id=f"turn-{index}",
+            )
+        except StepBudgetExhaustedError:
+            return index, False
+        return index, True
+
+    outcomes = await asyncio.gather(*(reserve(index) for index in range(10)))
+    admitted = [index for index, accepted in outcomes if accepted]
+
+    assert len(admitted) == 3
+    snapshot = ledger.snapshot()
+    assert snapshot.total_steps == 3
+    assert snapshot.remaining_steps == 0
+    assert snapshot.steps_exhausted is True
+
+    admitted_index = admitted[0]
+    repeated = await ledger.reserve_step(
+        origin_run_id=f"run-{admitted_index}",
+        transaction_id=f"turn-{admitted_index}",
+    )
+    assert repeated.total_steps == 3
 
 
 @pytest.mark.asyncio
@@ -232,6 +263,48 @@ async def test_budget_ledger_restores_descendant_usage_from_root_jsonl(
     assert snapshot.total_cost_usd == pytest.approx(3.0)
     assert snapshot.usage_complete is False
     assert snapshot.cost_complete is True
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_budget_ledger_restores_step_reservations_without_reset(tmp_path) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    await journal.create("root-run", {"agent": "root"})
+    ledger = BudgetLedger(max_steps=2)
+    ledger.attach(journal, root_run_id="root-run", records=await journal.replay())
+
+    await ledger.reserve_step(
+        origin_run_id="root-run",
+        transaction_id="root-run:turn:0:step",
+    )
+    await ledger.reserve_step(
+        origin_run_id="child-run",
+        transaction_id="child-run:turn:0:step",
+    )
+    await journal.close()
+
+    reopened = JsonlSessionJournal(tmp_path)
+    await reopened.open("root-run")
+    restored = BudgetLedger(max_steps=2)
+    restored.attach(
+        reopened,
+        root_run_id="root-run",
+        records=await reopened.replay(),
+    )
+
+    snapshot = restored.snapshot()
+    assert snapshot.total_steps == 2
+    assert snapshot.remaining_steps == 0
+    repeated = await restored.reserve_step(
+        origin_run_id="child-run",
+        transaction_id="child-run:turn:0:step",
+    )
+    assert repeated.total_steps == 2
+    with pytest.raises(StepBudgetExhaustedError):
+        await restored.reserve_step(
+            origin_run_id="other-child",
+            transaction_id="other-child:turn:0:step",
+        )
     await reopened.close()
 
 

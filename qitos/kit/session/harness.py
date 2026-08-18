@@ -984,6 +984,10 @@ class SessionRun:
         }
         runtime_context = dict(self._agent_kwargs.get("runtime_context") or {})
         runtime_context.setdefault("journal", journal)
+        if self._budget_ledger is not None:
+            # The Session ledger is authoritative for Tool-launched descendants;
+            # a caller-provided runtime context cannot substitute another owner.
+            runtime_context["budget_ledger"] = self._budget_ledger
         if self._task_state is not None:
             # Publish the current Root Task identity for Tools that bind
             # their work to it (the Agent Tool reads these keys for its
@@ -1045,6 +1049,7 @@ class SessionRun:
             # same totals under identical limits.
             snapshot = source.snapshot()
             fresh = BudgetLedger(
+                max_steps=snapshot.max_steps,
                 max_tokens=snapshot.max_tokens,
                 max_cost_usd=snapshot.max_cost_usd,
             )

@@ -621,7 +621,10 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                     outcome_error,
                     outcome_finalization_diagnostic,
                 ) = decode_run_terminal(record_type, payload)
-            elif record_type is JournalRecordType.BUDGET_COMMITTED:
+            elif record_type in (
+                JournalRecordType.BUDGET_COMMITTED,
+                JournalRecordType.BUDGET_STEP_RESERVED,
+            ):
                 pass
             elif record_type in (
                 JournalRecordType.PROCESS_STARTED,
