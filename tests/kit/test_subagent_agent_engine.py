@@ -25,7 +25,7 @@ from qitos.core.journal import (
 )
 from qitos.core.model_response import ModelPricing
 from qitos.core.model_stream import ModelStreamEvent, ModelStreamEventType
-from qitos.core.message import UserMessage
+from qitos.core.message import ContextMessage, UserMessage
 from qitos.core.plan import Plan, PlanNode
 from qitos.core.task import Task, TaskBudget, TaskReference, TaskStatus
 from qitos.core.tool import ToolPermissionContext, ToolPermissionRule, tool
@@ -37,7 +37,12 @@ from qitos.kit.subagent import (
     SubagentSupervisor,
     build_agent_subagent_invocation_factory,
 )
-from qitos.kit.journal import JsonlSessionJournal, recover_session
+from qitos.kit.subagent.agent_engine import subagent_final_text
+from qitos.kit.journal import (
+    JsonlSessionJournal,
+    recover_run_outcome,
+    recover_session,
+)
 from qitos.kit.journal.turn_recorder import encode_plan_updated, encode_task_created
 from qitos.kit.tool.subagent import SubagentTool
 
@@ -206,7 +211,10 @@ async def test_empty_conclusion_retry_fails_without_fabricating_tool_output(
 ) -> None:
     model = ScriptedModel(
         [
-            tool_events([tool_call_wire("c1", "echo", {"text": "evidence"})]),
+            tool_events(
+                [tool_call_wire("c1", "echo", {"text": "evidence"})],
+                text="incidental progress text",
+            ),
             text_events(""),
             text_events(""),
         ]
@@ -362,9 +370,14 @@ async def test_subagent_engine_composes_product_turn_hooks(tmp_path) -> None:
         ]
     )
     observed: list[str] = []
+    prepared_context_turns: list[int] = []
 
     def transform(messages):
         return [*messages, UserMessage(content="projected subagent state")]
+
+    def prepare_context(context):
+        prepared_context_turns.append(context.turn)
+        return (ContextMessage(content=f"durable subagent state {context.turn}"),)
 
     def before(context):
         observed.append(f"before:{context.tool_call.name}")
@@ -387,6 +400,7 @@ async def test_subagent_engine_composes_product_turn_hooks(tmp_path) -> None:
         tool_registry=ToolRegistry().register(_echo),
         system_prompt="initial subagent instructions",
         transform_context=transform,
+        prepare_turn_context=prepare_context,
         before_tool_call=before,
         after_tool_call=after,
         prepare_next_turn=prepare,
@@ -400,6 +414,10 @@ async def test_subagent_engine_composes_product_turn_hooks(tmp_path) -> None:
     assert "projected subagent state" in {
         message.get("content") for message in model.requests[0].messages
     }
+    assert "durable subagent state 0" in {
+        message.get("content") for message in model.requests[0].messages
+    }
+    assert prepared_context_turns == [0, 1]
     assert model.requests[1].messages[0] == {
         "role": "system",
         "content": "updated subagent instructions",
@@ -539,10 +557,7 @@ async def test_subagent_reserves_last_step_for_plain_text_conclusion(tmp_path) -
     model = ScriptedModel(
         [
             tool_events([tool_call_wire("c1", "observe", {"text": "evidence"})]),
-            tool_events(
-                [tool_call_wire("c2", "observe", {"text": "must-not-run"})],
-                text="conclusion from committed evidence",
-            ),
+            text_events("conclusion from committed evidence"),
         ]
     )
     supervisor = SubagentSupervisor(
@@ -564,6 +579,7 @@ async def test_subagent_reserves_last_step_for_plain_text_conclusion(tmp_path) -
     assert result.steps == 2
     assert len(model.requests) == 2
     assert executions == 1
+    assert model.requests[1].option_dict().get("tools", []) == []
     final_users = [
         message
         for message in model.requests[1].message_dicts()
@@ -1883,6 +1899,56 @@ async def test_immediate_interrupt_cannot_cancel_model_budget_commit(tmp_path) -
     records = await _read_subagent_records(tmp_path, terminal.subagent_run_id)
     assert JournalRecordType.MODEL_COMPLETED in {record.type for record in records}
     assert records[-1].type is JournalRecordType.RUN_INTERRUPTED
+    recovered = recover_run_outcome(records)
+    assert recovered is not None
+    assert terminal.conclusion.summary == subagent_final_text(recovered.messages)
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_deadline_uses_committed_conclusion_without_retrying_model(tmp_path) -> None:
+    second_request_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def hang(_request):
+        second_request_started.set()
+        await never.wait()
+        yield
+
+    model = ScriptedModel(
+        [
+            tool_events(
+                [tool_call_wire("c1", "echo", {"text": "evidence"})],
+                text="progress before the deadline",
+            ),
+            hang,
+        ]
+    )
+    registry = ToolRegistry().register(_echo)
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=model,
+            tool_registry=registry,
+            journal_directory=_subagents_root(tmp_path),
+            run_timeout_s=0.1,
+        ),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
+    )
+
+    result = await supervisor.launch(
+        _request("inspect"),
+        _context(parent_tool_authority=registry.freeze()),
+        background=False,
+    )
+
+    assert second_request_started.is_set()
+    assert result.status is SubagentStatus.BUDGET_EXHAUSTED
+    assert result.conclusion.summary == ""
+    assert len(model.requests) == 2
+    records = await _read_subagent_records(tmp_path, result.subagent_run_id)
+    recovered = recover_run_outcome(records)
+    assert recovered is not None
+    assert result.conclusion.summary == subagent_final_text(recovered.messages)
     await supervisor.aclose()
 
 

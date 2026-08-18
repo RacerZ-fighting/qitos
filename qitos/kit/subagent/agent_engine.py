@@ -30,6 +30,7 @@ from ...core.agent_loop import (
     AgentRunStatus,
     NextTurnUpdate,
     PrepareNextTurnHook,
+    PrepareTurnContextHook,
     RunFinalizer,
     ShouldStopAfterTurnHook,
     TransformContextHook,
@@ -116,10 +117,19 @@ def subagent_stop_reason(status: AgentRunStatus, error: Optional[str]) -> str:
 
 
 def subagent_final_text(messages: Sequence[Message]) -> str:
-    """Return text from the last non-failed assistant message in one run."""
+    """Return the last terminal natural-language answer in one run.
+
+    Text attached to a Tool call is progress commentary, not a conclusion.
+    Both the live engine and journal recovery use this selector so interruption
+    and deadline races cannot change which model-authored text is canonical.
+    """
 
     for message in reversed(messages):
-        if isinstance(message, AssistantMessage) and not message.error:
+        if (
+            isinstance(message, AssistantMessage)
+            and not message.error
+            and not message.tool_calls
+        ):
             return message.text.strip()
     return ""
 
@@ -249,6 +259,7 @@ class _SubagentTurnTransaction(TurnTransactionBoundary):
         self._settle_runtime_events = settle_runtime_events
         self._before_run_terminal = before_run_terminal
         self._model_messages: dict[int, AssistantMessage] = {}
+        self._durable_model_messages: dict[int, AssistantMessage] = {}
         self._budget_stop_reason: str | None = None
         self._task_stop_reason: str | None = None
 
@@ -260,6 +271,15 @@ class _SubagentTurnTransaction(TurnTransactionBoundary):
     def task_stop_reason(self) -> str | None:
         return self._task_stop_reason
 
+    @property
+    def final_text(self) -> str:
+        return subagent_final_text(
+            tuple(
+                self._durable_model_messages[index]
+                for index in sorted(self._durable_model_messages)
+            )
+        )
+
     async def model_terminal(
         self,
         turn: int,
@@ -270,6 +290,10 @@ class _SubagentTurnTransaction(TurnTransactionBoundary):
         if previous is not None and previous != message:
             raise RuntimeError("Subagent model transaction conflicts with its turn")
         if previous is not None:
+            if turn not in self._durable_model_messages:
+                if self._delegate is not None:
+                    await self._delegate.model_terminal(turn, request, message)
+                self._durable_model_messages[turn] = message
             return
         root_budget: BudgetSnapshot | None = None
         usage = subagent_run_stats((message,), model_pricing=self._model_pricing)
@@ -295,6 +319,7 @@ class _SubagentTurnTransaction(TurnTransactionBoundary):
             self._budget_stop_reason = reason
         if self._delegate is not None:
             await self._delegate.model_terminal(turn, request, message)
+        self._durable_model_messages[turn] = message
 
     async def input_accepted(self, prompts: tuple[Message, ...]) -> None:
         if self._delegate is not None:
@@ -396,6 +421,7 @@ class AgentSubagentRunResult:
         result: AgentLoopResult,
         model_pricing: ModelPricing | None = None,
         stop_reason: str | None = None,
+        final_result: str | None = None,
     ) -> None:
         self.run_id = run_id
         self._result = result
@@ -410,7 +436,11 @@ class AgentSubagentRunResult:
         self.local_usage_complete = stats.usage_complete
         self.local_cost_complete = stats.cost_complete
         self._state = _AgentSubagentStateView(
-            final_result=subagent_final_text(result.messages),
+            final_result=(
+                subagent_final_text(result.messages)
+                if final_result is None
+                else final_result
+            ),
             stop_reason=stop_reason or subagent_stop_reason(result.status, result.error),
         )
 
@@ -456,6 +486,7 @@ class AgentSubagentEngine:
         extra_request_options: Optional[Mapping[str, Any]] = None,
         runtime_context: Optional[Mapping[str, Any]] = None,
         transform_context: Optional[TransformContextHook] = None,
+        prepare_turn_context: Optional[PrepareTurnContextHook] = None,
         before_tool_call: Optional[BeforeToolCallHook] = None,
         after_tool_call: Optional[AfterToolCallHook] = None,
         should_stop_after_turn: Optional[ShouldStopAfterTurnHook] = None,
@@ -498,6 +529,7 @@ class AgentSubagentEngine:
         self._extra_request_options = dict(extra_request_options or {})
         self._runtime_context = dict(runtime_context or {})
         self._transform_context = transform_context
+        self._prepare_turn_context = prepare_turn_context
         self._before_tool_call = before_tool_call
         self._after_tool_call = after_tool_call
         self._should_stop_after_turn = should_stop_after_turn
@@ -525,10 +557,18 @@ class AgentSubagentEngine:
         self._conclusion_budget_limited = False
         self._closed = False
         self._result: Optional[AgentLoopResult] = None
+        self._transaction: _SubagentTurnTransaction | None = None
 
     @property
     def active_run_id(self) -> str:
         return self._run_id
+
+    @property
+    def committed_final_text(self) -> str:
+        """Return model-authored text that crossed the journal terminal barrier."""
+
+        transaction = self._transaction
+        return "" if transaction is None else transaction.final_text
 
     @property
     def messages(self) -> Tuple[Message, ...]:
@@ -644,6 +684,7 @@ class AgentSubagentEngine:
                 self._settle_subagent_task if self._subagent_task is not None else None
             ),
         )
+        self._transaction = transaction
 
         leased_turns: set[int] = set()
         conclusion_claimed = False
@@ -891,6 +932,7 @@ class AgentSubagentEngine:
             transaction_factory=lambda _run_id: transaction,
             run_id_factory=lambda: run_id,
             transform_context=self._transform_context,
+            prepare_turn_context=self._prepare_turn_context,
             before_tool_call=_block_tools_after_budget,
             after_tool_call=self._after_tool_call,
             should_stop_after_turn=_stop_after_budget,
@@ -948,6 +990,7 @@ class AgentSubagentEngine:
             run_id=run_id,
             result=outcome,
             model_pricing=self._model_pricing,
+            final_result=transaction.final_text,
             stop_reason=(
                 transaction.budget_stop_reason
                 or self._conclusion_stop_reason

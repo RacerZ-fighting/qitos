@@ -1672,7 +1672,10 @@ class SubagentSupervisor:
             handle=owned.handle,
             request=owned.request,
             status=SubagentStatus.CANCELLED,
-            conclusion=AgentConclusion(failure_paths=(error,)),
+            conclusion=AgentConclusion(
+                summary=self._engine_committed_final_text(owned),
+                failure_paths=(error,),
+            ),
             subagent_run_id=self._subagent_run_id(owned),
             error=error,
             total_tokens=tokens,
@@ -1693,7 +1696,10 @@ class SubagentSupervisor:
             handle=owned.handle,
             request=owned.request,
             status=SubagentStatus.BUDGET_EXHAUSTED,
-            conclusion=AgentConclusion(unknowns=(error,)),
+            conclusion=AgentConclusion(
+                summary=self._engine_committed_final_text(owned),
+                unknowns=(error,),
+            ),
             subagent_run_id=self._subagent_run_id(owned),
             error=error,
             total_tokens=tokens,
@@ -1730,7 +1736,10 @@ class SubagentSupervisor:
             handle=owned.handle,
             request=owned.request,
             status=SubagentStatus.FAILED,
-            conclusion=AgentConclusion(failure_paths=(error,)),
+            conclusion=AgentConclusion(
+                summary=self._engine_committed_final_text(owned),
+                failure_paths=(error,),
+            ),
             subagent_run_id=self._subagent_run_id(owned),
             error=error,
             total_tokens=tokens,
@@ -1750,6 +1759,14 @@ class SubagentSupervisor:
             bool(getattr(engine, "usage_complete", False)),
             bool(getattr(engine, "cost_complete", False)),
         )
+
+    @staticmethod
+    def _engine_committed_final_text(owned: _OwnedSubagent) -> str:
+        engine = owned.engine
+        if engine is None:
+            return ""
+        value = getattr(engine, "committed_final_text", "")
+        return value.strip() if isinstance(value, str) else ""
 
     @staticmethod
     def _subagent_run_id(owned: _OwnedSubagent) -> str:

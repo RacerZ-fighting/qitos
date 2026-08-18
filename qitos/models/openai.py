@@ -48,6 +48,7 @@ from .base import (
 GLM_TOKENIZER_ENV_VARS = ("QITOS_GLM_TOKENIZER_PATH", "GLM_TOKENIZER_PATH")
 _MANAGED_WEB_SEARCH_FALLBACK_OPTION = "_qitos_managed_web_search_tools"
 _QWEN_PROVIDER_NAME = "qwen"
+_OPENAI_PROVIDER_NAME = "openai"
 _OFFICIAL_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
@@ -545,12 +546,23 @@ def _is_unsupported_prompt_cache_key_error(exc: Exception) -> bool:
     )
 
 
-def _to_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _to_openai_messages(
+    messages: List[Dict[str, Any]],
+    *,
+    developer_role: bool = False,
+) -> List[Dict[str, Any]]:
     normalized = normalize_messages(messages)
     out: List[Dict[str, Any]] = []
     for message in normalized:
         role = str(message.get("role") or "user").strip() or "user"
         content = message.get("content")
+        if role == "developer" and not developer_role:
+            role = "user"
+            content = (
+                "<runtime-context>\n"
+                f"{content_to_text(content)}\n"
+                "</runtime-context>"
+            )
         payload: Dict[str, Any] = {"role": role}
         for key, value in message.items():
             if key in {"role", "content", "native_items", "is_error"}:
@@ -584,7 +596,13 @@ def _count_openai_request_tokens(
     wire_messages = (
         _to_responses_input(messages)
         if api_mode == "responses"
-        else _to_openai_messages(messages)
+        else _to_openai_messages(
+            messages,
+            developer_role=(
+                str(getattr(adapter, "provider_name", "")).casefold()
+                == _OPENAI_PROVIDER_NAME
+            ),
+        )
     )
     message_payload: Any = (
         {"input": wire_messages} if api_mode == "responses" else wire_messages
@@ -826,7 +844,12 @@ class OpenAICompatibleModel(Model):
             "model": self.model,
             "messages": cast(
                 Any,
-                _to_openai_messages(model_request.message_dicts()),
+                _to_openai_messages(
+                    model_request.message_dicts(),
+                    developer_role=(
+                        self.provider_name.casefold() == _OPENAI_PROVIDER_NAME
+                    ),
+                ),
             ),
             "stream": True,
         }

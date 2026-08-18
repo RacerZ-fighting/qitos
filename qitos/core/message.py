@@ -193,9 +193,10 @@ class UserMessage:
 class ContextMessage:
     """Model-visible runtime context that is not a user instruction.
 
-    The canonical role stays provider-neutral. OpenAI-style protocols project
-    it as a developer message; protocols without a developer role preserve
-    the ordered content through their documented contextual-user fallback.
+    The canonical role stays provider-neutral. Official OpenAI protocols
+    project it as a developer message; compatible Chat protocols without that
+    role preserve the ordered content through a tagged contextual-user
+    fallback.
     Products remain responsible for the state and delta represented by the
     text -- this message is only its durable model-history projection.
     """
