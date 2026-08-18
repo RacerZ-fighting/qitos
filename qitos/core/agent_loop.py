@@ -67,6 +67,7 @@ from .env import Env
 from .errors import ModelRequestDeadlineExceeded, ModelTransportError
 from .message import (
     AssistantMessage,
+    ContextMessage,
     Message,
     ToolCall,
     ToolResultMessage,
@@ -186,6 +187,12 @@ class TurnTransactionBoundary(ToolTransactionBoundary, Protocol):
         """Record one turn's frozen configuration before its model request."""
         ...
 
+    async def turn_input_committed(
+        self, turn: int, messages: Tuple[Message, ...]
+    ) -> None:
+        """Commit new ordered model input before the request can run."""
+        ...
+
     async def model_terminal(
         self, turn: int, request: ModelRequest, message: AssistantMessage
     ) -> None:
@@ -232,6 +239,14 @@ class TurnHookContext:
 
 
 @dataclass(frozen=True, slots=True)
+class TurnPreparationContext:
+    """Frozen request view used to project durable dynamic context."""
+
+    turn: int
+    context: AgentContextSnapshot
+
+
+@dataclass(frozen=True, slots=True)
 class NextTurnUpdate:
     """Optional per-turn replacement of the loop's runtime state (Pi parity).
 
@@ -259,6 +274,14 @@ PrepareNextTurnHook = Callable[
     [TurnHookContext],
     Union[NextTurnUpdate, None, Awaitable[Optional[NextTurnUpdate]]],
 ]
+PrepareTurnContextHook = Callable[
+    [TurnPreparationContext],
+    Union[
+        Sequence[ContextMessage],
+        None,
+        Awaitable[Optional[Sequence[ContextMessage]]],
+    ],
+]
 QueueDrainHook = Callable[
     [], Union[Sequence[Message], Awaitable[Sequence[Message]], None]
 ]
@@ -270,10 +293,11 @@ class AgentLoopConfig:
 
     Hook contract: hooks must not throw. ``before_tool_call`` and
     ``after_tool_call`` exceptions are converted to Tool error results;
-    exceptions from ``transform_context``, ``should_stop_after_turn`` and
-    ``prepare_next_turn`` are implementation faults and propagate after the
-    run is terminalized. Every hook await is bounded by the run deadline and
-    the cancel token, so a hung hook cannot block abort or the deadline.
+    exceptions from ``transform_context``, ``prepare_turn_context``,
+    ``should_stop_after_turn`` and ``prepare_next_turn`` are implementation
+    faults and propagate after the run is terminalized. Every hook await is
+    bounded by the run deadline and the cancel token, so a hung hook cannot
+    block abort or the deadline.
     """
 
     model: "Model"
@@ -288,6 +312,7 @@ class AgentLoopConfig:
     transaction: Optional[TurnTransactionBoundary] = None
     turn_base: int = 0
     transform_context: Optional[TransformContextHook] = None
+    prepare_turn_context: Optional[PrepareTurnContextHook] = None
     before_tool_call: Optional[BeforeToolCallHook] = None
     after_tool_call: Optional[AfterToolCallHook] = None
     should_stop_after_turn: Optional[ShouldStopAfterTurnHook] = None
@@ -391,6 +416,7 @@ async def run_agent_loop(
             cancel_token,
             guard,
             turn=config.turn_base,
+            initial_turn_input=tuple(prompts),
         )
     except asyncio.CancelledError:
         await guard.terminalize_interrupted(
@@ -441,6 +467,7 @@ async def run_agent_loop_continue(
             cancel_token,
             guard,
             turn=config.turn_base,
+            initial_turn_input=(),
         )
     except asyncio.CancelledError:
         await guard.terminalize_interrupted(
@@ -858,6 +885,96 @@ def _turn_config_snapshot(
     )
 
 
+async def _prepare_model_context(
+    *,
+    turn: int,
+    turn_input: Sequence[Message],
+    context: AgentContext,
+    new_messages: List[Message],
+    exposure: ToolExposure,
+    config: AgentLoopConfig,
+    emit: EventSink | None,
+    token: CancelToken | None,
+) -> Optional[Tuple[AgentRunStatus, str]]:
+    """Project and durably commit new input immediately before sampling.
+
+    The application hook may only add typed ``ContextMessage`` values. The
+    immutable Tool exposure and request configuration have already been
+    frozen for this turn, so the resulting text describes the same view the
+    model and Tool executor will use. The transaction barrier covers ordinary
+    prompt/steering input and context in their actual conversation order.
+    """
+
+    projected: Tuple[ContextMessage, ...] = ()
+    hook = config.prepare_turn_context
+    if hook is not None:
+        preparation = TurnPreparationContext(
+            turn=turn,
+            context=AgentContextSnapshot(
+                system_prompt=context.system_prompt,
+                messages=tuple(context.messages),
+                tools=exposure,
+                env=context.env,
+            ),
+        )
+        try:
+            raw_projected = await _bounded_await(
+                hook(preparation), token, config.deadline_monotonic
+            )
+            if raw_projected is not None:
+                if isinstance(raw_projected, (str, bytes)) or not isinstance(
+                    raw_projected, Sequence
+                ):
+                    raise TypeError(
+                        "prepare_turn_context must return ContextMessage values"
+                    )
+                projected = tuple(raw_projected)
+                if not all(
+                    isinstance(message, ContextMessage) for message in projected
+                ):
+                    raise TypeError(
+                        "prepare_turn_context must return ContextMessage values"
+                    )
+        except _StreamAborted:
+            if config.transaction is not None and turn_input:
+                await config.transaction.turn_input_committed(
+                    turn, tuple(turn_input)
+                )
+            return AgentRunStatus.ABORTED, "run aborted while preparing context"
+        except _HookTimedOut:
+            if config.transaction is not None and turn_input:
+                await config.transaction.turn_input_committed(
+                    turn, tuple(turn_input)
+                )
+            return (
+                AgentRunStatus.DEADLINE_EXCEEDED,
+                "run deadline expired while preparing context",
+            )
+        except asyncio.CancelledError:
+            if config.transaction is not None and turn_input:
+                await config.transaction.turn_input_committed(
+                    turn, tuple(turn_input)
+                )
+            raise
+        except Exception:
+            if config.transaction is not None and turn_input:
+                await config.transaction.turn_input_committed(
+                    turn, tuple(turn_input)
+                )
+            raise
+
+    for message in projected:
+        context.messages.append(message)
+        new_messages.append(message)
+    committed_input = (*turn_input, *projected)
+    if config.transaction is not None and committed_input:
+        await config.transaction.turn_input_committed(turn, committed_input)
+    for message in projected:
+        await emit_to(emit, MessageStart(message=message))
+        await emit_to(emit, MessageEnd(message=message))
+    return None
+
+
 async def _run_loop(
     context: AgentContext,
     new_messages: List[Message],
@@ -867,8 +984,10 @@ async def _run_loop(
     guard: _RunTerminalGuard,
     *,
     turn: int,
+    initial_turn_input: Sequence[Message],
 ) -> AgentLoopResult:
     turn_message_base = 0
+    turn_input: List[Message] = list(initial_turn_input)
 
     async def _finish(
         status: AgentRunStatus, error: Optional[str] = None
@@ -907,10 +1026,12 @@ async def _run_loop(
                     token.reset_step_event()
                 await emit_to(emit, TurnStart(turn=turn))
                 turn_message_base = len(new_messages)
+                turn_input = []
 
             for message in pending:
                 context.messages.append(message)
                 new_messages.append(message)
+                turn_input.append(message)
                 await emit_to(emit, MessageStart(message=message))
                 await emit_to(emit, MessageEnd(message=message))
             pending = []
@@ -925,6 +1046,44 @@ async def _run_loop(
                     )
                 except StepBudgetExhaustedError as exc:
                     return await _finish(AgentRunStatus.MAX_TURNS, error=str(exc))
+            prepared_status = await _prepare_model_context(
+                turn=turn,
+                turn_input=turn_input,
+                context=context,
+                new_messages=new_messages,
+                exposure=exposure,
+                config=config,
+                emit=emit,
+                token=token,
+            )
+            if prepared_status is not None:
+                status, error = prepared_status
+                message = AssistantMessage(
+                    error=error,
+                    model_name=config.model.model,
+                    provider=config.model.provider_name,
+                )
+                await _finalize_model_message(
+                    message,
+                    context,
+                    new_messages,
+                    emit,
+                    config,
+                    turn,
+                    None,
+                )
+                if config.transaction is not None:
+                    await config.transaction.turn_committed(
+                        turn, tuple(new_messages[turn_message_base:])
+                    )
+                try:
+                    await emit_to(
+                        emit, TurnEnd(turn=turn, message=message, tool_results=())
+                    )
+                finally:
+                    if token is not None:
+                        token.mark_step_complete()
+                return await _finish(status, error=error)
             message, status_override = await _stream_assistant(
                 turn, context, new_messages, exposure, config, emit, token
             )
@@ -1723,11 +1882,13 @@ __all__ = [
     "AgentLoopResult",
     "AgentRunStatus",
     "NextTurnUpdate",
+    "PrepareTurnContextHook",
     "RunFinalizationDiagnostic",
     "RunFinalizationDiagnosticCode",
     "RunFinalizer",
     "TurnConfigSnapshot",
     "TurnHookContext",
+    "TurnPreparationContext",
     "TurnTransactionBoundary",
     "agent_loop",
     "agent_loop_continue",

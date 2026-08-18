@@ -32,6 +32,7 @@ from qitos.core.agent_loop import (
 from qitos.core.cancellation import CancelMode, CancelToken
 from qitos.core.message import (
     AssistantMessage,
+    ContextMessage,
     ToolResultMessage,
     UserMessage,
 )
@@ -321,6 +322,7 @@ async def test_duplicate_provider_call_ids_preserve_evidence_and_fail_closed() -
     assert [record[0] for record in transaction.records] == [
         "input_accepted",
         "turn_frozen",
+        "turn_input_committed",
         "model_terminal",
         "turn_committed",
         "run_terminal",
@@ -734,6 +736,86 @@ async def test_transform_context_rewrites_the_wire_messages() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prepare_turn_context_appends_durable_non_user_input() -> None:
+    model = ScriptedModel(
+        [
+            tool_events([tool_call_wire("c1", "echo", {"text": "x"})]),
+            text_events("done"),
+        ]
+    )
+    transaction = RecordingTransaction()
+    projected = iter(("full state", "state delta"))
+    hook_calls = []
+
+    def _prepare(preparation):
+        hook_calls.append(preparation)
+        return [ContextMessage(content=next(projected))]
+
+    context = AgentContext(messages=[], tools=_registry(_echo).freeze())
+    config = AgentLoopConfig(
+        model=model,
+        run_id="run-context",
+        transaction=transaction,
+        prepare_turn_context=_prepare,
+    )
+
+    result = await run_agent_loop(
+        [UserMessage(content="go")], context, config, None
+    )
+
+    assert result.status is AgentRunStatus.COMPLETED
+    assert len(hook_calls) == 2
+    assert [message["role"] for message in model.requests[0].messages] == [
+        "user",
+        "developer",
+    ]
+    assert model.requests[0].messages[-1]["content"] == "full state"
+    assert model.requests[1].messages[-1] == {
+        "role": "developer",
+        "content": "state delta",
+    }
+    assert [
+        message.content
+        for message in context.messages
+        if isinstance(message, ContextMessage)
+    ] == ["full state", "state delta"]
+    input_barriers = [
+        record for record in transaction.records if record[0] == "turn_input_committed"
+    ]
+    assert input_barriers == [
+        ("turn_input_committed", 0, 2),
+        ("turn_input_committed", 1, 1),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_turn_context_is_not_appended_after_final_answer() -> None:
+    model = ScriptedModel([text_events("done")])
+    context = AgentContext(messages=[])
+    calls = 0
+
+    def _prepare(_preparation):
+        nonlocal calls
+        calls += 1
+        return [ContextMessage(content="initial state")]
+
+    result = await run_agent_loop(
+        [UserMessage(content="go")],
+        context,
+        AgentLoopConfig(
+            model=model,
+            run_id="run-context-final",
+            prepare_turn_context=_prepare,
+        ),
+        None,
+    )
+
+    assert result.status is AgentRunStatus.COMPLETED
+    assert calls == 1
+    assert isinstance(context.messages[-1], AssistantMessage)
+
+
+@pytest.mark.asyncio
 async def test_transaction_barriers_wrap_model_and_tool_side_effects() -> None:
     model = ScriptedModel(
         [tool_events([tool_call_wire("c1", "echo", {"text": "x"})]), text_events("done")]
@@ -750,6 +832,7 @@ async def test_transaction_barriers_wrap_model_and_tool_side_effects() -> None:
     assert kinds == [
         "input_accepted",
         "turn_frozen",
+        "turn_input_committed",
         "model_terminal",
         "tool_started",
         "tool_terminal",
@@ -1040,6 +1123,7 @@ async def test_after_step_requested_before_admission_finishes_one_turn() -> None
     assert [record[0] for record in transaction.records] == [
         "input_accepted",
         "turn_frozen",
+        "turn_input_committed",
         "model_terminal",
         "turn_committed",
         "run_terminal",
@@ -1135,6 +1219,7 @@ async def test_loop_task_cancellation_terminalizes_then_reraises() -> None:
     assert kinds == [
         "input_accepted",
         "turn_frozen",
+        "turn_input_committed",
         "model_terminal",
         "run_terminal",
     ]

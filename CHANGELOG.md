@@ -43,12 +43,25 @@ How to update:
   Tool and MCP owners remain open for later Session legs and are closed once
   by the outer application.
 
+### Breaking
+
+- Custom `TurnTransactionBoundary` implementations must implement
+  `turn_input_committed(turn, messages)`. Exhaustive handlers for the closed
+  `Message` union must also handle `ContextMessage`.
+
 ### Added
 
+- Added provider-neutral `ContextMessage` and a `turn_input.committed` request
+  barrier. Applications can project dynamic state as durable model history
+  immediately before sampling without impersonating a user message or
+  rebuilding runtime state from the Journal every turn. OpenAI transports keep
+  the developer role; Anthropic and Gemini preserve it as explicitly tagged
+  contextual user content. Recovery, compaction, trace, fork and continuation
+  validation use the same canonical entries.
 - **Minimal agent loop and Agent façade (Pi-aligned).** New
   `qitos.core.agent_loop` (`agent_loop` / `run_agent_loop`), `qitos.core.agent`
-  (`Agent`), `qitos.core.message` (typed `UserMessage` / `AssistantMessage` /
-  `ToolResultMessage` / `ToolCall` with wire and durable codecs),
+  (`Agent`), `qitos.core.message` (typed `UserMessage` / `ContextMessage` /
+  `AssistantMessage` / `ToolResultMessage` / `ToolCall` with wire and durable codecs),
   `qitos.core.agent_events`, and `qitos.core.tool_executor`
   (`ToolBatchExecutor`) implement the `Message -> Model -> ToolCall ->
   ToolResult` mainline. The loop freezes one
@@ -88,6 +101,7 @@ How to update:
   (including Anthropic `tool_result.is_error`). The façade returns typed
   values for expected rejections only; listener/codec/persistence bugs are
   faults that propagate after the run is terminalized.
+
 - **Façade-driven subagents.** `qitos.kit.subagent.AgentSubagentEngine` implements
   the `SubagentEngine` contract over the new `Agent` façade, and
   `qitos.kit.subagent.build_agent_subagent_invocation_factory` wires one Subagent run

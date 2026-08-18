@@ -130,6 +130,9 @@ class RecordingTransaction(TurnTransactionBoundary):
     async def turn_frozen(self, turn: int, config: Any) -> None:
         self.records.append(("turn_frozen", turn, tuple(config.tool_names)))
 
+    async def turn_input_committed(self, turn: int, messages: tuple) -> None:
+        self.records.append(("turn_input_committed", turn, len(messages)))
+
     async def model_terminal(
         self, turn: int, request: ModelRequest, message: AssistantMessage
     ) -> None:

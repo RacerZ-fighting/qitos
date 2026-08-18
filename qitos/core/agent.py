@@ -49,6 +49,7 @@ from .agent_loop import (
     AgentLoopResult,
     AgentRunStatus,
     PrepareNextTurnHook,
+    PrepareTurnContextHook,
     RunFinalizer,
     ShouldStopAfterTurnHook,
     TransformContextHook,
@@ -58,7 +59,13 @@ from .agent_loop import (
 )
 from .cancellation import CancelSignalView, CancelToken
 from .env import Env
-from .message import AssistantMessage, Message, ToolResultMessage, UserMessage
+from .message import (
+    AssistantMessage,
+    ContextMessage,
+    Message,
+    ToolResultMessage,
+    UserMessage,
+)
 from .thinking import ThinkingLevel
 from .tool_executor import AfterToolCallHook, BeforeToolCallHook
 from .tool_registry import ToolRegistry
@@ -163,7 +170,9 @@ def normalize_prompt_messages(
 
     if isinstance(message, str):
         return [UserMessage(content=message)]
-    if isinstance(message, (UserMessage, AssistantMessage, ToolResultMessage)):
+    if isinstance(
+        message, (UserMessage, ContextMessage, AssistantMessage, ToolResultMessage)
+    ):
         return [message]
     if isinstance(message, Sequence) and not isinstance(message, (str, bytes)):
         messages: List[Message] = list(message)
@@ -206,6 +215,7 @@ class Agent:
         steering_mode: QueueMode = QueueMode.ONE_AT_A_TIME,
         follow_up_mode: QueueMode = QueueMode.ONE_AT_A_TIME,
         transform_context: Optional[TransformContextHook] = None,
+        prepare_turn_context: Optional[PrepareTurnContextHook] = None,
         before_tool_call: Optional[BeforeToolCallHook] = None,
         after_tool_call: Optional[AfterToolCallHook] = None,
         should_stop_after_turn: Optional[ShouldStopAfterTurnHook] = None,
@@ -230,6 +240,7 @@ class Agent:
         self._transaction_factory = transaction_factory
         self._run_id_factory = run_id_factory or (lambda: uuid.uuid4().hex)
         self._transform_context = transform_context
+        self._prepare_turn_context = prepare_turn_context
         self._before_tool_call = before_tool_call
         self._after_tool_call = after_tool_call
         self._should_stop_after_turn = should_stop_after_turn
@@ -459,11 +470,12 @@ class Agent:
         seeded = list(messages)
         for message in seeded:
             if not isinstance(
-                message, (UserMessage, AssistantMessage, ToolResultMessage)
+                message,
+                (UserMessage, ContextMessage, AssistantMessage, ToolResultMessage),
             ):
                 raise TypeError(
                     "transcript messages must be typed UserMessage, "
-                    "AssistantMessage or ToolResultMessage values"
+                    "ContextMessage, AssistantMessage or ToolResultMessage values"
                 )
         self._messages = seeded
 
@@ -557,6 +569,7 @@ class Agent:
             transaction=transaction,
             turn_base=self._turn_base,
             transform_context=self._transform_context,
+            prepare_turn_context=self._prepare_turn_context,
             before_tool_call=self._before_tool_call,
             after_tool_call=self._after_tool_call,
             should_stop_after_turn=self._should_stop_after_turn,

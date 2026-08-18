@@ -241,6 +241,17 @@ async def test_anthropic_preserves_block_order_thinking_tools_usage_and_replay(
     ]
 
 
+def test_anthropic_preserves_developer_context_as_tagged_user_content() -> None:
+    model = AnthropicModel(api_key="test-key", model="claude-test")
+
+    replay = model._anthropic_messages(
+        [{"role": "developer", "content": "Plan revision is 3."}]
+    )
+
+    assert replay[0]["role"] == "user"
+    assert "Plan revision is 3." in replay[0]["content"][0]["text"]
+
+
 @pytest.mark.asyncio
 async def test_anthropic_retries_without_affinity_when_endpoint_rejects_it(
     monkeypatch: pytest.MonkeyPatch,
@@ -1045,6 +1056,17 @@ async def test_gemini_uses_native_async_sdk_and_preserves_parts(
     assert len(terminal.native_items or []) == 3
     assert responses.closed is True
     assert captured["client_closed"] is True
+
+
+def test_gemini_preserves_developer_context_as_tagged_user_content() -> None:
+    model = GeminiModel(api_key="test-key", model="gemini-test")
+
+    replay = model._gemini_contents(
+        [{"role": "developer", "content": "Plan revision is 3."}]
+    )
+
+    assert replay[0]["role"] == "user"
+    assert "Plan revision is 3." in replay[0]["parts"][0]["text"]
 
 
 @pytest.mark.asyncio

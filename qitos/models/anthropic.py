@@ -620,6 +620,17 @@ class AnthropicModel(Model):
                 and str(item.get("type") or "") != "tool_result"
             ]
             blocks = native or self._content_blocks(message.get("content"))
+            if role == "developer" and not native:
+                blocks = [
+                    {
+                        "type": "text",
+                        "text": (
+                            "<runtime-context>\n"
+                            f"{content_to_text(message.get('content'))}\n"
+                            "</runtime-context>"
+                        ),
+                    }
+                ]
             if mapped_role == "assistant":
                 native_call_ids = {
                     str(item.get("id") or "")

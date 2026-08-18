@@ -9,6 +9,7 @@ import pytest
 from qitos.core._freeze import thaw_deep
 from qitos.core.message import (
     AssistantMessage,
+    ContextMessage,
     ImageContent,
     TextContent,
     ToolCall,
@@ -49,6 +50,29 @@ def test_user_message_block_content_round_trip() -> None:
     assert isinstance(decoded.content, tuple)
     assert decoded.content[0] == TextContent(text="look")
     assert isinstance(decoded.content[1], ImageContent)
+
+
+def test_context_message_has_distinct_wire_role_and_round_trip() -> None:
+    message = ContextMessage(content="Current Plan revision: 3", timestamp=7.5)
+
+    assert message_to_wire(message) == {
+        "role": "developer",
+        "content": "Current Plan revision: 3",
+    }
+    decoded = message_from_dict(message_to_dict(message))
+
+    assert isinstance(decoded, ContextMessage)
+    assert decoded.content == message.content
+    assert decoded.timestamp == message.timestamp
+
+
+def test_context_message_rejects_empty_or_noncanonical_payloads() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        ContextMessage(content="  ")
+    payload = message_to_dict(ContextMessage(content="state", timestamp=1.0))
+    payload["unexpected"] = True
+    with pytest.raises(ValueError, match="fields"):
+        message_from_dict(payload)
 
 
 def test_tool_call_wire_shape_matches_adapter_contract() -> None:

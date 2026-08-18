@@ -16,6 +16,7 @@ from qitos.core.cancellation import CancelToken
 from qitos.core.journal import JournalError, JournalRecordRef, JournalRecordType
 from qitos.core.message import (
     AssistantMessage,
+    ContextMessage,
     UserMessage,
     message_from_dict,
 )
@@ -95,6 +96,7 @@ async def test_full_run_records_transcript_entries_and_operation_references(
         JournalRecordType.MODEL_CHANGE,
         JournalRecordType.THINKING_CHANGE,
         JournalRecordType.TOOLS_CHANGE,
+        JournalRecordType.TURN_INPUT_COMMITTED,
         JournalRecordType.TRANSCRIPT_MESSAGE,
         JournalRecordType.MODEL_COMPLETED,
         JournalRecordType.TOOL_STARTED,
@@ -103,8 +105,9 @@ async def test_full_run_records_transcript_entries_and_operation_references(
         JournalRecordType.STEP_COMMITTED,
         JournalRecordType.MODEL_CHANGE,
         JournalRecordType.TRANSCRIPT_MESSAGE,
-        JournalRecordType.MODEL_COMPLETED,
+        JournalRecordType.TURN_INPUT_COMMITTED,
         JournalRecordType.TRANSCRIPT_MESSAGE,
+        JournalRecordType.MODEL_COMPLETED,
         JournalRecordType.STEP_COMMITTED,
         JournalRecordType.RUN_COMPLETED,
     ]
@@ -196,39 +199,95 @@ async def test_full_run_records_transcript_entries_and_operation_references(
 
     # The model record references the assistant transcript entry by id and
     # keeps the exact request audit.
-    model_record = records[7]
+    model_record = records[8]
     assert model_record.payload["message_record_id"] == transcript_ids[1]
     assert model_record.payload["request"]["run_id"] == "run-journal-1"
-    assistant = message_from_dict(records[6].payload["message"])
+    assistant = message_from_dict(records[7].payload["message"])
     assert isinstance(assistant, AssistantMessage)
     assert assistant.tool_calls[0].id == "c1"
 
-    # The terminal references the tool transcript entry; the steering user
-    # message is recorded by the turn commit that accepted it. The commit
-    # lists the turn's entries in conversation order (steering before the
-    # assistant reply), which need not match journal append order.
-    terminal = records[10]
+    # The terminal references the tool transcript entry. Turn input commits
+    # steering before model admission; the step commit then references only
+    # the assistant reply because the input already has a durable owner.
+    terminal = records[11]
     assert terminal.payload["message_record_id"] == transcript_ids[2]
     assert terminal.payload["call_id"] == "c1"
-    turn_one_commit = records[16]
+    turn_one_input = records[15]
+    assert turn_one_input.payload["transcript_record_ids"] == [
+        "run-journal-1:turn:1:transcript:0"
+    ]
+    turn_one_commit = records[18]
     assert turn_one_commit.payload["transcript_record_ids"] == [
         "run-journal-1:turn:1:transcript:1",
-        "run-journal-1:turn:1:transcript:0",
     ]
     assert turn_one_commit.payload["tool_terminal_record_ids"] == []
-    steering_message = message_from_dict(records[15].payload["message"])
+    steering_message = message_from_dict(records[14].payload["message"])
     assert isinstance(steering_message, UserMessage)
     assert steering_message.content == "steer"
 
-    turn_zero_commit = records[11]
+    turn_zero_input = records[6]
+    assert turn_zero_input.payload["transcript_record_ids"] == [
+        "run-journal-1:turn:0:transcript:0"
+    ]
+    turn_zero_commit = records[12]
     assert turn_zero_commit.payload["transcript_record_ids"] == [
-        "run-journal-1:turn:0:transcript:0",
         "run-journal-1:turn:0:transcript:1",
         "run-journal-1:turn:0:transcript:2",
     ]
     assert turn_zero_commit.payload["tool_terminal_record_ids"] == [
         "run-journal-1:turn:0:tool:c1:terminal"
     ]
+
+
+@pytest.mark.asyncio
+async def test_turn_context_is_committed_before_model_and_recovers_in_order(
+    tmp_path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path)
+    transaction = await JournalTurnTransaction.create(
+        journal, "run-context", {"purpose": "context"}
+    )
+    model = ScriptedModel([text_events("done")])
+    context = AgentContext(messages=[])
+
+    await run_agent_loop(
+        [UserMessage(content="go", timestamp=1.0)],
+        context,
+        AgentLoopConfig(
+            model=model,
+            run_id="run-context",
+            transaction=transaction,
+            prepare_turn_context=lambda _context: (
+                ContextMessage(content="current state", timestamp=2.0),
+            ),
+        ),
+        None,
+    )
+    records = await journal.replay()
+    recovered = recover_session(records)
+    await journal.close()
+
+    input_record = next(
+        record
+        for record in records
+        if record.type is JournalRecordType.TURN_INPUT_COMMITTED
+    )
+    model_record = next(
+        record
+        for record in records
+        if record.type is JournalRecordType.MODEL_COMPLETED
+    )
+    assert input_record.seq < model_record.seq
+    assert input_record.payload["transcript_record_ids"] == [
+        "run-context:turn:0:transcript:0",
+        "run-context:turn:0:transcript:1",
+    ]
+    assert [type(message) for message in recovered.transcript] == [
+        UserMessage,
+        ContextMessage,
+        AssistantMessage,
+    ]
+    assert recovered.transcript[1].content == "current state"
 
 
 @pytest.mark.asyncio

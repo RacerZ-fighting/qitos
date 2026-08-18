@@ -171,6 +171,16 @@ def test_responses_input_replays_native_items_without_mirror_duplicates() -> Non
     assert sum(item.get("call_id") == "call_1" for item in payload) == 2
 
 
+def test_responses_input_preserves_developer_context_role() -> None:
+    payload = _to_responses_input(
+        [{"role": "developer", "content": "Current state revision: 3"}]
+    )
+
+    assert payload == [
+        {"role": "developer", "content": "Current state revision: 3"}
+    ]
+
+
 def test_responses_tools_and_forced_choice_use_native_shape() -> None:
     tools = _to_responses_tools(
         [
