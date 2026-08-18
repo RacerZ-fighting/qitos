@@ -23,6 +23,7 @@ from .turn_recorder import (
     decode_input_accepted,
     decode_run_terminal,
     decode_step_committed,
+    decode_task_created,
 )
 
 _COMMITTED_BOUNDARIES = {
@@ -152,6 +153,7 @@ def _summarize_run(
     completed: JournalRecord | None = None
     interrupted: JournalRecord | None = None
     agent_name = _optional_text(start.payload, "agent")
+    task = ""
     for index, record in enumerate(records):
         effective = resolve_inherited_record(record)
         try:
@@ -165,6 +167,8 @@ def _summarize_run(
                 # The task text arrives with the goal-bearing Task (S3);
                 # input.accepted references prompt transcript entries only.
                 decode_input_accepted(effective.payload)
+            elif effective.type is JournalRecordType.TASK_CREATED:
+                task = decode_task_created(effective.payload).objective
             elif effective.type in (
                 JournalRecordType.RUN_COMPLETED,
                 JournalRecordType.RUN_INTERRUPTED,
@@ -197,7 +201,7 @@ def _summarize_run(
         forked_from=forked_from,
         record_count=len(records),
         agent_name=agent_name,
-        task="",
+        task=task,
         stop_reason=(
             str(completed.payload["status"]) if completed is not None else None
         ),

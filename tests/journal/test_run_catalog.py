@@ -16,8 +16,10 @@ from qitos.core import (
     RunHandle,
     RunNotFoundError,
     RunStatus,
+    Task,
 )
 from qitos.kit.journal import JsonlRunCatalog, JsonlSessionJournal
+from qitos.kit.journal.turn_recorder import encode_task_created
 
 
 def _commit_payload(turn: int = 0) -> dict[str, object]:
@@ -63,6 +65,11 @@ async def test_catalog_inspects_active_writer_without_taking_ownership(
     journal = JsonlSessionJournal(tmp_path)
     await journal.create("active", {"agent": "worker"})
     await journal.append(
+        JournalRecordType.TASK_CREATED,
+        encode_task_created(Task(task_id="task-active", objective="inspect target")),
+        record_id="active:task:task-active:created",
+    )
+    await journal.append(
         JournalRecordType.INPUT_ACCEPTED,
         {"transcript_record_ids": ["active:turn:0:transcript:0"]},
         record_id="active:input",
@@ -83,9 +90,7 @@ async def test_catalog_inspects_active_writer_without_taking_ownership(
     assert handle.committed_position == committed
     assert handle.continuation_position == committed
     assert handle.agent_name == "worker"
-    # The task text arrives with the goal-bearing Task (S3); until then the
-    # handle carries no task.
-    assert handle.task == ""
+    assert handle.task == "inspect target"
     await journal.append(
         JournalRecordType.RUN_INTERRUPTED,
         {"status": "aborted", "error": "cancelled"},

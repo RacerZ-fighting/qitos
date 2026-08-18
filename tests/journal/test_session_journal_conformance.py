@@ -24,6 +24,7 @@ from qitos.kit.journal import (
     InMemoryJournalStore,
     InMemorySessionJournal,
     JsonlSessionJournal,
+    committed_tool_transactions,
     recover_session,
 )
 from qitos.kit.journal.turn_recorder import (
@@ -260,6 +261,38 @@ async def test_tool_transaction_join_requires_commit_and_transcript(backend) -> 
             record_id="run-1:turn:0:tool:c9:terminal",
         )
     await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_committed_tool_transactions_preserve_commit_and_fork_order(
+    backend,
+) -> None:
+    parent = backend()
+    await parent.create("parent", {})
+    first, first_entry, first_terminal = await _tool_pair(
+        parent, "parent", call_id="first", turn=0
+    )
+    boundary = await parent.append(
+        JournalRecordType.STEP_COMMITTED,
+        encode_step_committed(0, [first_entry], [first_terminal]),
+        record_id="parent:turn:0:committed",
+    )
+    child = await parent.fork(boundary, "child")
+    second, second_entry, second_terminal = await _tool_pair(
+        child, "child", call_id="second", turn=1
+    )
+    await child.append(
+        JournalRecordType.STEP_COMMITTED,
+        encode_step_committed(1, [second_entry], [second_terminal]),
+        record_id="child:turn:1:committed",
+    )
+
+    projected = await committed_tool_transactions(child)
+
+    assert [item.action for item in projected] == [first, second]
+    assert [item.terminal.run_id for item in projected] == ["parent", "child"]
+    await child.close()
+    await parent.close()
 
 
 @pytest.mark.asyncio

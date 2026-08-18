@@ -880,6 +880,7 @@ class ChildSupervisor:
         if not isinstance(invocation, ChildInvocation):
             raise TypeError("invocation_factory must resolve to ChildInvocation")
         owned.engine = invocation.engine
+        conclusion: AgentConclusion | None = None
         try:
             if self._closed or owned.cancel_event.is_set():
                 invocation.engine.cancel("immediate")
@@ -896,6 +897,12 @@ class ChildSupervisor:
                 invocation.task,
                 **run_kwargs,
             )
+            if invocation.conclusion_factory is not None:
+                conclusion = await invocation.conclusion_factory(engine_result)
+                if not isinstance(conclusion, AgentConclusion):
+                    raise TypeError(
+                        "Child conclusion_factory must return AgentConclusion"
+                    )
         finally:
             await self._cleanup_invocation(invocation)
         state = engine_result.state
@@ -908,12 +915,20 @@ class ChildSupervisor:
             handle=owned.handle,
             request=owned.request,
             status=status,
-            conclusion=AgentConclusion(
-                summary=summary,
-                failure_paths=(status_detail,) if status is ChildStatus.FAILED else (),
-                unknowns=(
-                    (status_detail,) if status is ChildStatus.BUDGET_EXHAUSTED else ()
-                ),
+            conclusion=(
+                conclusion
+                if conclusion is not None
+                else AgentConclusion(
+                    summary=summary,
+                    failure_paths=(
+                        (status_detail,) if status is ChildStatus.FAILED else ()
+                    ),
+                    unknowns=(
+                        (status_detail,)
+                        if status is ChildStatus.BUDGET_EXHAUSTED
+                        else ()
+                    ),
+                )
             ),
             child_run_id=owned.child_run_id,
             steps=int(engine_result.step_count or 0),

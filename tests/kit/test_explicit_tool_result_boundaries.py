@@ -85,7 +85,11 @@ async def test_agent_expected_rejection_is_typed_error_and_error_event() -> None
 
     result, end = await _execute(
         agent,
-        {"description": "inspect target", "prompt": "  "},
+        {
+            "description": "inspect target",
+            "prompt": "  ",
+            "success_criteria": ["Report the result"],
+        },
     )
 
     assert result.status == "error"

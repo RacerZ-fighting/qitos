@@ -16,6 +16,7 @@ terminal journal record before the engine reports a result.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field as dataclass_field
@@ -27,6 +28,10 @@ from ...core.agent_events import AgentEnd, MessageEnd, TurnEnd, TurnStart
 from ...core.agent_loop import (
     AgentLoopResult,
     AgentRunStatus,
+    NextTurnUpdate,
+    PrepareNextTurnHook,
+    ShouldStopAfterTurnHook,
+    TransformContextHook,
     TurnConfigSnapshot,
     TurnHookContext,
     TurnTransactionBoundary,
@@ -50,13 +55,29 @@ from ...core.message import AssistantMessage, Message, ToolCall, UserMessage
 from ...core.model_request import ModelRequest
 from ...core.model_response import ModelPricing, ModelUsage
 from ...core.runtime_input import RuntimeInput
-from ...core.task import Task, TaskBudget
+from ...core.task import (
+    Task,
+    TaskBlocker,
+    TaskBudget,
+    TaskLifecycle,
+    TaskStatus,
+    validate_task_transition,
+)
 from ...core.tool import ToolPermissionContext
-from ...core.tool_executor import BeforeToolCallContext, BeforeToolCallDecision
+from ...core.tool_executor import (
+    AfterToolCallHook,
+    BeforeToolCallContext,
+    BeforeToolCallDecision,
+    BeforeToolCallHook,
+)
 from ...core.tool_registry import ToolExposure, ToolRegistry
 from ...core.tool_result import ToolResult
 from ..journal import JournalTurnTransaction, JsonlSessionJournal
-from ..journal.turn_recorder import encode_runtime_input_consumed, encode_task_created
+from ..journal.turn_recorder import (
+    encode_runtime_input_consumed,
+    encode_task_created,
+    encode_task_transition,
+)
 
 if TYPE_CHECKING:
     from ...models.base import Model
@@ -204,6 +225,10 @@ class _ChildTurnTransaction(TurnTransactionBoundary):
         budget_ledger: BudgetLedger | None,
         model_pricing: ModelPricing | None,
         settle_runtime_events: Callable[[], Awaitable[None]],
+        before_run_terminal: Callable[
+            [AgentLoopResult, str | None], Awaitable[str | None]
+        ]
+        | None = None,
     ) -> None:
         self._run_id = run_id
         self._delegate = delegate
@@ -211,12 +236,18 @@ class _ChildTurnTransaction(TurnTransactionBoundary):
         self._budget_ledger = budget_ledger
         self._model_pricing = model_pricing
         self._settle_runtime_events = settle_runtime_events
+        self._before_run_terminal = before_run_terminal
         self._model_messages: dict[int, AssistantMessage] = {}
         self._budget_stop_reason: str | None = None
+        self._task_stop_reason: str | None = None
 
     @property
     def budget_stop_reason(self) -> str | None:
         return self._budget_stop_reason
+
+    @property
+    def task_stop_reason(self) -> str | None:
+        return self._task_stop_reason
 
     async def model_terminal(
         self,
@@ -288,6 +319,11 @@ class _ChildTurnTransaction(TurnTransactionBoundary):
         # barrier still has to follow every parent message reserved during the
         # open turn.
         await self._settle_runtime_events()
+        if self._before_run_terminal is not None:
+            self._task_stop_reason = await self._before_run_terminal(
+                result,
+                self._budget_stop_reason,
+            )
         if self._delegate is not None:
             await self._delegate.run_terminal(result)
 
@@ -397,6 +433,11 @@ class AgentChildEngine:
         model_pricing: Optional[ModelPricing] = None,
         extra_request_options: Optional[Mapping[str, Any]] = None,
         runtime_context: Optional[Mapping[str, Any]] = None,
+        transform_context: Optional[TransformContextHook] = None,
+        before_tool_call: Optional[BeforeToolCallHook] = None,
+        after_tool_call: Optional[AfterToolCallHook] = None,
+        should_stop_after_turn: Optional[ShouldStopAfterTurnHook] = None,
+        prepare_next_turn: Optional[PrepareNextTurnHook] = None,
         journal_factory: Optional[Callable[[], SessionJournal]] = None,
         journal_metadata: Optional[Mapping[str, Any]] = None,
         child_task: Optional[Task] = None,
@@ -422,10 +463,22 @@ class AgentChildEngine:
             if journal_factory is None:
                 raise ValueError("a child_task requires a journal factory")
         self._child_task = child_task
+        self._task_lifecycle = (
+            TaskLifecycle(status=TaskStatus.ACTIVE)
+            if child_task is not None
+            else None
+        )
+        self._task_lock = asyncio.Lock()
+        self._task_transition_count = 0
         self._budget_ledger = budget_ledger
         self._model_pricing = model_pricing
         self._extra_request_options = dict(extra_request_options or {})
         self._runtime_context = dict(runtime_context or {})
+        self._transform_context = transform_context
+        self._before_tool_call = before_tool_call
+        self._after_tool_call = after_tool_call
+        self._should_stop_after_turn = should_stop_after_turn
+        self._prepare_next_turn = prepare_next_turn
         self._journal_factory = journal_factory
         self._journal_metadata = dict(journal_metadata or {})
 
@@ -475,6 +528,42 @@ class AgentChildEngine:
     def cost_complete(self) -> bool:
         return self._stats().cost_complete
 
+    @property
+    def task_lifecycle(self) -> TaskLifecycle | None:
+        """Return the in-process projection of the durable Child Task state."""
+
+        return self._task_lifecycle
+
+    def follow_up(self, message: Message) -> None:
+        """Queue product policy feedback without exposing the live Agent object."""
+
+        agent = self._agent
+        if agent is None or self._result is not None:
+            raise RuntimeError("child run is not accepting follow-up input")
+        agent.follow_up(message)
+
+    async def complete_task(self, reason: str) -> TaskLifecycle:
+        """Commit the Child Task's completed terminal transition."""
+
+        return await self._transition_task(TaskStatus.COMPLETED, reason=reason)
+
+    async def fail_task(self, reason: str) -> TaskLifecycle:
+        """Commit the Child Task's failed terminal transition."""
+
+        return await self._transition_task(TaskStatus.FAILED, reason=reason)
+
+    async def cancel_task(self, reason: str) -> TaskLifecycle:
+        """Commit the Child Task's cancelled terminal transition."""
+
+        return await self._transition_task(TaskStatus.CANCELLED, reason=reason)
+
+    async def block_task(self, blocker: TaskBlocker) -> TaskLifecycle:
+        """Commit a resumable blocker before the Child run settles."""
+
+        if not isinstance(blocker, TaskBlocker):
+            raise TypeError("blocker must be a TaskBlocker")
+        return await self._transition_task(TaskStatus.BLOCKED, blocker=blocker)
+
     def _stats(self) -> ChildRunStats:
         return child_run_stats(self.messages, model_pricing=self._model_pricing)
 
@@ -520,6 +609,9 @@ class AgentChildEngine:
             budget_ledger=self._budget_ledger,
             model_pricing=self._model_pricing,
             settle_runtime_events=self._reject_runtime_event_admissions,
+            before_run_terminal=(
+                self._settle_child_task if self._child_task is not None else None
+            ),
         )
 
         runtime_context = dict(self._runtime_context)
@@ -535,21 +627,44 @@ class AgentChildEngine:
         # the natural parent-run endpoint.
         runtime_context.setdefault("post_runtime_event", _post_descendant_event)
 
-        def _block_tools_after_budget(
-            _context: BeforeToolCallContext,
+        async def _block_tools_after_budget(
+            context: BeforeToolCallContext,
         ) -> BeforeToolCallDecision | None:
             if transaction.budget_stop_reason is None:
-                return None
+                hook = self._before_tool_call
+                if hook is None:
+                    return None
+                value = hook(context)
+                if inspect.isawaitable(value):
+                    value = await value
+                return value
             return BeforeToolCallDecision(
                 block=True,
                 reason="Child budget was exhausted by the model transaction.",
                 terminate=True,
             )
 
-        def _stop_after_budget(_context: TurnHookContext) -> bool:
-            return transaction.budget_stop_reason is not None
+        async def _stop_after_budget(context: TurnHookContext) -> bool:
+            if transaction.budget_stop_reason is not None:
+                return True
+            hook = self._should_stop_after_turn
+            if hook is None:
+                return False
+            value = hook(context)
+            if inspect.isawaitable(value):
+                value = await value
+            return bool(value)
 
-        async def _prepare_child_next_turn(context: TurnHookContext) -> None:
+        async def _prepare_child_next_turn(
+            context: TurnHookContext,
+        ) -> NextTurnUpdate | None:
+            update: NextTurnUpdate | None = None
+            hook = self._prepare_next_turn
+            if hook is not None:
+                value = hook(context)
+                if inspect.isawaitable(value):
+                    value = await value
+                update = value
             can_continue = (
                 not self._cancel_requested
                 and transaction.budget_stop_reason is None
@@ -562,6 +677,7 @@ class AgentChildEngine:
                 accept=can_continue,
                 agent=agent,
             )
+            return update
 
         agent = Agent(
             model=self._model,
@@ -576,7 +692,9 @@ class AgentChildEngine:
             runtime_context=runtime_context,
             transaction_factory=lambda _run_id: transaction,
             run_id_factory=lambda: run_id,
+            transform_context=self._transform_context,
             before_tool_call=_block_tools_after_budget,
+            after_tool_call=self._after_tool_call,
             should_stop_after_turn=_stop_after_budget,
             prepare_next_turn=_prepare_child_next_turn,
         )
@@ -627,8 +745,87 @@ class AgentChildEngine:
             run_id=run_id,
             result=outcome,
             model_pricing=self._model_pricing,
-            stop_reason=transaction.budget_stop_reason,
+            stop_reason=(
+                transaction.budget_stop_reason or transaction.task_stop_reason
+            ),
         )
+
+    async def _settle_child_task(
+        self,
+        result: AgentLoopResult,
+        budget_stop_reason: str | None,
+    ) -> str | None:
+        """Terminalize an active Child Task before the Run terminal record."""
+
+        lifecycle = self._task_lifecycle
+        if lifecycle is None:
+            return None
+        if lifecycle.status is not TaskStatus.ACTIVE:
+            return lifecycle.status.value
+        if result.status is AgentRunStatus.ABORTED:
+            target = TaskStatus.CANCELLED
+            reason = result.error or "Child run was cancelled"
+        elif budget_stop_reason is not None:
+            target = TaskStatus.FAILED
+            reason = f"Child budget ended the run: {budget_stop_reason}"
+        elif result.status is AgentRunStatus.COMPLETED:
+            target = TaskStatus.COMPLETED
+            reason = "Child run completed"
+        else:
+            target = TaskStatus.FAILED
+            reason = result.error or f"Child run ended with {result.status.value}"
+        await self._transition_task(target, reason=reason)
+        # Preserve the loop/budget stop vocabulary unless product policy had
+        # already committed a more specific Task outcome in a turn hook.
+        return None
+
+    async def _transition_task(
+        self,
+        to_status: TaskStatus,
+        *,
+        reason: str | None = None,
+        blocker: TaskBlocker | None = None,
+    ) -> TaskLifecycle:
+        task = self._child_task
+        journal = self._journal
+        if task is None or self._task_lifecycle is None:
+            raise RuntimeError("child engine has no goal-bearing Task")
+        if journal is None or not self._run_id:
+            raise RuntimeError("child Task cannot transition before its Run starts")
+        async with self._task_lock:
+            current = self._task_lifecycle
+            validate_task_transition(current.status, to_status)
+            stats = self._stats()
+            usage = ModelUsage.from_mapping(
+                {
+                    "total_tokens": stats.total_tokens,
+                    "cost_usd": stats.total_cost_usd,
+                }
+            )
+            lifecycle = TaskLifecycle(
+                status=to_status,
+                usage=usage,
+                blocker=blocker,
+                terminal_reason=reason,
+            )
+            sequence = self._task_transition_count
+            await journal.append(
+                JournalRecordType.TASK_TRANSITION,
+                encode_task_transition(
+                    task_id=task.task_id,
+                    from_status=current.status,
+                    to_status=to_status,
+                    reason=reason,
+                    blocker=blocker,
+                    usage=usage,
+                ),
+                record_id=(
+                    f"{self._run_id}:task:{task.task_id}:transition:{sequence}"
+                ),
+            )
+            self._task_transition_count += 1
+            self._task_lifecycle = lifecycle
+            return lifecycle
 
     def cancel(self, mode: str) -> None:
         """Cooperatively abort the active run; every mode maps to abort."""
@@ -1014,6 +1211,17 @@ def build_agent_child_invocation_factory(
                 "resolver"
             )
         parent_permission = runtime_context.parent_permission_context
+        requested_permission = request.permission_context
+        if (
+            requested_permission is not None
+            and parent_permission is not None
+            and requested_permission != parent_permission
+        ):
+            raise ValueError(
+                "Child permission policy differs from the frozen parent policy; "
+                "the built-in factory cannot prove that it only narrows authority"
+            )
+        effective_permission = requested_permission or parent_permission
         env_permission = getattr(env, "tool_permission_context", None)
         if isinstance(env_permission, Mapping):
             env_permission = ToolPermissionContext.from_dict(dict(env_permission))
@@ -1025,9 +1233,9 @@ def build_agent_child_invocation_factory(
                 "ToolPermissionContext, mapping, or None"
             )
         if (
-            parent_permission is not None
+            effective_permission is not None
             and env_permission is not None
-            and env_permission != parent_permission
+            and env_permission != effective_permission
         ):
             raise ValueError(
                 "Child Env permission policy differs from the frozen parent policy; "
@@ -1061,6 +1269,9 @@ def build_agent_child_invocation_factory(
             task_id=runtime_context.handle.child_id,
             parent_task_id=request.parent_task_id,
             objective=request.task,
+            success_criteria=request.success_criteria,
+            constraints=request.constraints,
+            references=request.references,
             budget=request.budget,
             created_by_run_id=runtime_context.parent_run_id,
             plan_assignment=request.plan_assignment,
@@ -1091,8 +1302,9 @@ def build_agent_child_invocation_factory(
                 "delegate_depth": runtime_context.delegate_depth + 1,
                 "deadline_monotonic": runtime_context.deadline_monotonic,
                 "budget_ledger": runtime_context.budget_ledger,
-                "permission_context": runtime_context.parent_permission_context,
+                "permission_context": effective_permission,
                 "task_id": runtime_context.handle.child_id,
+                "task": child_task,
                 **(
                     {"plan_assignment": request.plan_assignment}
                     if request.plan_assignment is not None

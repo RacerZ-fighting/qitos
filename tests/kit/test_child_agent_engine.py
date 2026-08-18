@@ -8,6 +8,7 @@ from collections.abc import Mapping
 import pytest
 
 from qitos.core.budget import BudgetLedger
+from qitos.core.agent_loop import NextTurnUpdate
 from qitos.core.child import (
     ChildHandle,
     ChildLaunchContext,
@@ -24,9 +25,11 @@ from qitos.core.journal import (
 )
 from qitos.core.model_response import ModelPricing
 from qitos.core.model_stream import ModelStreamEvent, ModelStreamEventType
+from qitos.core.message import UserMessage
 from qitos.core.plan import Plan, PlanNode
-from qitos.core.task import Task, TaskBudget
+from qitos.core.task import Task, TaskBudget, TaskReference, TaskStatus
 from qitos.core.tool import ToolPermissionContext, ToolPermissionRule, tool
+from qitos.core.tool_executor import AfterToolCallOverride
 from qitos.core.tool_registry import ToolRegistry
 from qitos.core.runtime_input import RuntimeInput
 from qitos.kit.child import (
@@ -34,7 +37,7 @@ from qitos.kit.child import (
     ChildSupervisor,
     build_agent_child_invocation_factory,
 )
-from qitos.kit.journal import JsonlSessionJournal
+from qitos.kit.journal import JsonlSessionJournal, recover_session
 from qitos.kit.journal.turn_recorder import encode_plan_updated, encode_task_created
 from qitos.kit.tool.agent import AgentTool
 
@@ -135,12 +138,23 @@ async def test_foreground_child_completes_and_journals_turns(tmp_path) -> None:
     child_records = await _read_child_records(tmp_path, result.child_run_id)
     child_types = [record.type for record in child_records]
     assert child_types[0] is JournalRecordType.RUN_STARTED
+    assert child_types.index(JournalRecordType.TASK_CREATED) < child_types.index(
+        JournalRecordType.INPUT_ACCEPTED
+    )
     assert JournalRecordType.MODEL_COMPLETED in child_types
     assert JournalRecordType.STEP_COMMITTED in child_types
+    assert child_types.index(JournalRecordType.TASK_TRANSITION) < child_types.index(
+        JournalRecordType.RUN_COMPLETED
+    )
     assert child_types[-1] is JournalRecordType.RUN_COMPLETED
     terminal = child_records[-1]
     assert terminal.record_id == f"{result.child_run_id}:run:terminal"
     assert terminal.payload["status"] == "completed"
+    recovered = recover_session(child_records)
+    task = next(iter(recovered.tasks.values()))
+    assert task.lifecycle.status is TaskStatus.COMPLETED
+    assert task.lifecycle.usage is not None
+    assert task.lifecycle.usage.total_tokens == result.total_tokens
     await supervisor.aclose()
     await parent_journal.close()
 
@@ -149,9 +163,17 @@ async def test_foreground_child_completes_and_journals_turns(tmp_path) -> None:
 async def test_agent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
     parent_journal = JsonlSessionJournal(tmp_path / "parent-plan")
     await parent_journal.create("parent-run", {})
+    parent_task = Task(
+        task_id="parent-task",
+        objective="Parent work",
+        constraints={"scope": "primary"},
+        references=(
+            TaskReference(kind="artifact", uri="scope://engagement/primary"),
+        ),
+    )
     await parent_journal.append(
         JournalRecordType.TASK_CREATED,
-        encode_task_created(Task(task_id="parent-task", objective="Parent work")),
+        encode_task_created(parent_task),
         record_id="parent-run:task:parent-task:created",
     )
     await parent_journal.append(
@@ -168,16 +190,25 @@ async def test_agent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
             journal_directory=_children_root(tmp_path),
         )
     )
+    permission = ToolPermissionContext(
+        default_decision="deny",
+        allow_rules=(
+            ToolPermissionRule(effect="allow", tool_family="filesystem.read"),
+        ),
+    )
 
     result = await agent_tool.execute(
         {
             "description": "inspect",
             "prompt": "inspect",
+            "success_criteria": ["Return the inspection result"],
             "plan_assignment": "delegate",
         },
         runtime_context={
             "run_id": "parent-run",
             "task_id": "parent-task",
+            "task": parent_task,
+            "permission_context": permission,
             "journal": parent_journal,
         },
     )
@@ -190,6 +221,12 @@ async def test_agent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
     assert result.output["child_status"] == ChildStatus.COMPLETED.value
     assert started.payload["request"]["parent_task_id"] == "parent-task"
     assert started.payload["request"]["plan_assignment"] == "delegate"
+    child_records = await _read_child_records(tmp_path, result.output["run_id"])
+    child_task = next(iter(recover_session(child_records).tasks.values())).definition
+    assert child_task.success_criteria == ("Return the inspection result",)
+    assert child_task.constraints == parent_task.constraints
+    assert child_task.references == parent_task.references
+    assert started.payload["request"]["permission_context"] == permission.to_dict()
     await agent_tool.aclose()
     await parent_journal.close()
 
@@ -236,6 +273,121 @@ async def test_child_tool_evidence_commits_in_order(tmp_path) -> None:
         "echo:ping"
     )
     await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_child_engine_composes_product_turn_hooks(tmp_path) -> None:
+    model = ScriptedModel(
+        [
+            tool_events([tool_call_wire("c1", "echo", {"text": "ping"})]),
+            text_events("done"),
+        ]
+    )
+    observed: list[str] = []
+
+    def transform(messages):
+        return [*messages, UserMessage(content="projected child state")]
+
+    def before(context):
+        observed.append(f"before:{context.tool_call.name}")
+        return None
+
+    def after(context):
+        observed.append(f"after:{context.tool_call.name}")
+        return AfterToolCallOverride(output="rewritten child result")
+
+    def prepare(context):
+        observed.append(f"prepare:{context.turn}")
+        return NextTurnUpdate(system_prompt="updated child instructions")
+
+    def should_stop(context):
+        observed.append(f"stop:{context.turn}")
+        return context.turn == 1
+
+    engine = AgentChildEngine(
+        model=model,
+        tool_registry=ToolRegistry().register(_echo),
+        system_prompt="initial child instructions",
+        transform_context=transform,
+        before_tool_call=before,
+        after_tool_call=after,
+        prepare_next_turn=prepare,
+        should_stop_after_turn=should_stop,
+        journal_factory=_child_journal_factory(tmp_path),
+    )
+
+    result = await engine.arun("inspect", run_id="run_child_hooks")
+
+    assert result.state.stop_reason == "completed"
+    assert "projected child state" in {
+        message.get("content") for message in model.requests[0].messages
+    }
+    assert model.requests[1].messages[0] == {
+        "role": "system",
+        "content": "updated child instructions",
+    }
+    assert any(
+        message.get("role") == "tool"
+        and "rewritten child result" in str(message.get("content"))
+        for message in model.requests[1].messages
+    )
+    assert observed == [
+        "before:echo",
+        "after:echo",
+        "prepare:0",
+        "stop:0",
+        "prepare:1",
+        "stop:1",
+    ]
+    await engine.aclose()
+
+
+@pytest.mark.asyncio
+async def test_child_policy_can_follow_up_and_terminalize_its_task(tmp_path) -> None:
+    model = ScriptedModel(
+        [text_events("premature answer"), text_events("finished answer")]
+    )
+    engine: AgentChildEngine
+
+    def prepare(context):
+        if context.turn == 0:
+            engine.follow_up(UserMessage(content="finish the committed work"))
+
+    async def should_stop(context):
+        if context.turn != 1:
+            return False
+        await engine.complete_task("child completion policy passed")
+        return True
+
+    engine = AgentChildEngine(
+        model=model,
+        prepare_next_turn=prepare,
+        should_stop_after_turn=should_stop,
+        journal_factory=_child_journal_factory(tmp_path),
+        child_task=Task(
+            task_id="child-policy",
+            parent_task_id="parent-task",
+            objective="finish committed work",
+        ),
+    )
+
+    result = await engine.arun("inspect", run_id="run_child_policy")
+
+    assert result.step_count == 2
+    assert any(
+        message.get("role") == "user"
+        and "finish the committed work" in str(message.get("content"))
+        for message in model.requests[1].messages
+    )
+    await engine.aclose()
+    records = await _read_child_records(tmp_path, "run_child_policy")
+    types = [record.type for record in records]
+    assert types.count(JournalRecordType.TASK_TRANSITION) == 1
+    assert types.index(JournalRecordType.TASK_TRANSITION) < types.index(
+        JournalRecordType.RUN_COMPLETED
+    )
+    recovered = recover_session(records)
+    assert recovered.tasks["child-policy"].lifecycle.status is TaskStatus.COMPLETED
 
 
 @pytest.mark.asyncio
@@ -1306,7 +1458,11 @@ async def test_agent_tool_preserves_parent_parameter_scope_denial(tmp_path) -> N
     )
 
     result = await agent_tool.execute(
-        {"description": "inspect", "prompt": "inspect"},
+        {
+            "description": "inspect",
+            "prompt": "inspect",
+            "success_criteria": ["Report whether the Tool was admitted"],
+        },
         runtime_context={
             "run_id": "parent-run",
             "tool_registry": registry.freeze(),

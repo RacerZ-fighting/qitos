@@ -225,6 +225,20 @@ How to update:
   supervisor commits the generated handle before `child.started` and durably
   releases it if admission fails. Root and Child use this one optional contract,
   while a dependency-free Child Plan renders as an ordinary TODO.
+- **Child product-binding and conclusion contracts.** `ChildLaunchRequest` now carries
+  explicit success criteria, Task constraints/references and a frozen
+  `ToolPermissionContext`; all fields use the strict durable codec and the façade Child
+  engine commits them on the narrowed Child Task. `ChildInvocation` accepts a typed
+  async conclusion factory that settles before resource cleanup, and
+  `AgentConclusion.resource_refs` carries stable reusable-resource references without
+  copying a Child transcript. Recursive Agent Tools can share one Root-owned
+  `ChildRunLimiter`, while independent concurrency-safe Agent calls remain ordered at
+  the parent ToolResult boundary.
+- **Committed Tool-transaction projection.**
+  `qitos.kit.journal.committed_tool_transactions` returns only canonical Tool terminals
+  referenced by `step.committed`, follows inherited record origins and fails closed on
+  missing or duplicate references so application state can be rebuilt without replaying
+  handlers.
 
 ### Breaking
 
@@ -232,7 +246,8 @@ How to update:
   `WorkPlanStatus`, `WorkPlanUpdate`, `UpdateWorkPlanTool` and their codecs/reducer
   are removed rather than aliased. Use `Plan`, `PlanNode`, `PlanStatus`,
   `PlanUpdate`, `UpdatePlanTool` and the Plan codecs. `ChildLaunchRequest.from_dict`
-  now requires the canonical task-binding keys, including explicit `null` values.
+  now requires the canonical task/product-binding keys, including `success_criteria`,
+  `constraints`, `references`, `permission_context` and explicit `null` values.
   The unused `qitos.kit.state` package is removed.
 
 - **`Task` schema replaced in place (S3a).** `Task` loses `id` (renamed
@@ -249,6 +264,9 @@ How to update:
 
 ### Changed
 
+- Trace DTO serialization now traverses dataclass fields and immutable mappings without
+  `deepcopy`, so deeply frozen Tool arguments remain serializable without weakening the
+  runtime snapshot boundary.
 - `CancelToken` / `CancelMode` moved from the retired Engine lifecycle to
   `qitos.core.cancellation`; the compatibility export is removed.
 - `AgentTool` (and the child completion/runtime projections in

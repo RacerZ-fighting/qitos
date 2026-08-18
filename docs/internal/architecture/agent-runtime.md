@@ -2,9 +2,10 @@
 
 ## Status
 
-Accepted target architecture on 2026-08-16. The minimal loop, the `Agent`
-façade, the authoritative Session/Harness, the goal-bearing Task and the
-dependency-aware Plan are the shipped execution and recovery path.
+Accepted target architecture on 2026-08-16. On the migration branch, the minimal loop,
+the `Agent` façade, the authoritative Session/Harness, the goal-bearing Task and the
+dependency-aware Plan are the only execution and recovery path. Final integration gates
+and merge remain separate release steps.
 
 This document owns the final QitOS runtime boundaries. The
 [migration plan](../plans/pi-aligned-agent-runtime.md) owns the remaining sequencing.
@@ -198,7 +199,13 @@ never merged into the parent Plan.
 Root and Child use the same Agent implementation. A Child has its own Task, Session,
 optional Plan, context and cancellation domain; authorization and budgets only narrow.
 Launch commits the accepted parent Plan assignment before Child lifecycle persistence
-and runtime construction. Parent control uses stable handles and bounded conclusions,
+and runtime construction. `ChildLaunchRequest` carries explicit success criteria,
+inherited Task constraints/references and the frozen parent Permission context; the
+built-in factory rejects conflicting Permission values. Independent Agent Tool calls
+may execute concurrently through the bounded, concurrency-safe Tool path while results
+remain in input order. A typed conclusion factory runs before Child cleanup and can
+project committed application facts into evidence/resource refs, failure paths,
+unknowns and next steps. Parent control uses stable handles and bounded conclusions,
 never live Agents or Child transcripts.
 
 ## 7. Tool, Runtime and extension boundary

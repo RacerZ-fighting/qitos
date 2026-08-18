@@ -7,13 +7,17 @@ Accepted migration plan on 2026-08-16. The target contracts are defined by the
 façade, retired-runtime deletion slices, S1 parity items, the authoritative
 Session/Harness (S2), goal-bearing Task (S3a), and dependency-aware Plan (S3b) are
 implemented on the migration branch. The branch has passed its independent pytest,
-flake8 and mypy gates and now awaits architecture review before merge.
+flake8 and mypy gates for S1-S3. Cross-repository integration hardening has since added
+Child product hooks, authorization/task binding, committed transaction queries and a
+trace serialization fix; the branch has passed a fresh full pytest, flake8 and mypy gate
+and now awaits review and merge.
 
 ## 1. Current gaps
 
-- QitOS runtime migration S1-S3 is complete on the feature branch. PentestAgent
-  application composition, gitlink movement, and product-domain migration remain
-  separate cross-repository work and are not part of this branch gate.
+- QitOS runtime migration S1-S3 and the QitOS side of GeneralAgent integration
+  hardening are complete on the feature branch. PentestAgent's product composition is
+  implemented and independently verified on its own feature branch; QitOS mainline merge
+  and gitlink movement remain separate cross-repository steps.
 
 Proven Tool transaction, cancellation, absolute deadline, result ordering, trace and
 recovery behavior is the conformance baseline. Legacy type names and package layout are
@@ -177,15 +181,26 @@ S3b (Plan), done on `feat/pi-aligned-agent-loop`:
 Done when Task, Session, Run, Plan and Child identities stay distinct across
 recovery, and no TaskV2/Goal mirror or compatibility Plan remains.
 
-### 2.5 Migrate application composition
+### 2.5 Harden application composition boundary
 
-- Let PentestAgent compose the new façade directly.
-- Preserve product-owned Engagement, Scope, domain state, plugin system and completion
-  policy outside QitOS.
-- Keep Root and Child on the same Agent implementation with narrowing-only authority.
+Done on the two feature branches, pending final gates and cross-repository landing:
 
-Done when QitOS contains no PentestAgent concepts and PentestAgent contains no QitOS
-runtime wrapper.
+- PentestAgent composes the façade directly and keeps Engagement, Scope, investigation
+  state, plugin system and completion policy outside QitOS.
+- Root and Child use the same Agent implementation and product hooks. Child launch
+  carries explicit success criteria, inherited Task constraints/references and frozen
+  Permission; the built-in factory persists them on the Child Task before model work.
+- A typed conclusion factory runs before invocation cleanup, allowing the application to
+  project committed evidence, resource, failure, unknown and next-step facts without
+  copying a transcript.
+- Independent Agent Tool calls use the executor's bounded concurrency-safe path, while a
+  single Root-owned limiter remains shared by recursive descendants.
+- `committed_tool_transactions` exposes a read-only, fail-closed application fold over
+  terminals referenced by `step.committed`; trace serialization handles deeply frozen
+  runtime mappings without mutating them.
+
+This slice now has no PentestAgent concepts in QitOS, no QitOS runtime wrapper in
+PentestAgent, and both independent gates pass.
 
 ### 2.6 Remove historical surface
 

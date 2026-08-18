@@ -29,6 +29,7 @@ from qitos.core.journal import (
     JournalCommitState,
     JournalError,
     JournalPosition,
+    JournalRecordRef,
     JournalRecordType,
     SessionJournal,
 )
@@ -1308,6 +1309,53 @@ async def test_committed_terminal_error_preserves_terminal_result(tmp_path) -> N
 
     assert result.status is ChildStatus.COMPLETED
     assert result.conclusion.summary == "done:inspect"
+    await supervisor.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_invocation_projects_typed_conclusion_before_cleanup(tmp_path) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+    projected = AgentConclusion(
+        summary="committed product conclusion",
+        evidence=(JournalRecordRef("child-run", "child-run:tool:terminal"),),
+        next_steps=("Reuse the recorded foothold",),
+    )
+    cleaned = False
+
+    async def build(request, _context):
+        async def conclusion_factory(result):
+            assert result.state.final_result == "done:inspect"
+            assert cleaned is False
+            return projected
+
+        async def cleanup() -> None:
+            nonlocal cleaned
+            cleaned = True
+
+        return ChildInvocation(
+            engine=_CompletingEngine(),
+            task=request.task,
+            cleanup=cleanup,
+            conclusion_factory=conclusion_factory,
+        )
+
+    supervisor = ChildSupervisor(invocation_factory=build)
+    result = await supervisor.launch(
+        _request(),
+        _context(journal=journal),
+        background=False,
+    )
+
+    assert cleaned is True
+    assert result.conclusion == projected
+    terminal = next(
+        record
+        for record in await journal.replay()
+        if record.type is JournalRecordType.CHILD_TERMINAL
+    )
+    assert ChildResult.from_dict(terminal.payload).conclusion == projected
     await supervisor.aclose()
     await journal.close()
 

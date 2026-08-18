@@ -51,6 +51,19 @@ class _ClosableEngine:
         return None
 
 
+def _agent_args(
+    description: str,
+    prompt: str,
+    **extra: Any,
+) -> dict[str, Any]:
+    return {
+        "description": description,
+        "prompt": prompt,
+        "success_criteria": [f"Complete {description}"],
+        **extra,
+    }
+
+
 # ── File detection helpers ────────────────────────────────────────────────────
 
 
@@ -322,7 +335,7 @@ class TestAgentTool:
             child_working_directory="workspace",
         )
         first = await tool.execute(
-            {"description": "first task", "prompt": "one"},
+            _agent_args("first task", "one"),
             runtime_context={
                 "budget_ledger": budget_ledger,
                 "delegate_depth": 0,
@@ -330,7 +343,7 @@ class TestAgentTool:
             },
         )
         second = await tool.execute(
-            {"description": "second task", "prompt": "two"},
+            _agent_args("second task", "two"),
             runtime_context={
                 "budget_ledger": budget_ledger,
                 "delegate_depth": 0,
@@ -389,7 +402,7 @@ class TestAgentTool:
             execution_mode="foreground",
         )
         result = await tool.execute(
-            {"description": "scoped task", "prompt": "one"},
+            _agent_args("scoped task", "one"),
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
@@ -443,7 +456,7 @@ class TestAgentTool:
             execution_mode="background",
         )
         result = await tool.execute(
-            {"description": "long route", "prompt": "wait"},
+            _agent_args("long route", "wait"),
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
@@ -465,7 +478,7 @@ class TestAgentTool:
             execution_mode="foreground",
         )
         result = await tool.execute(
-            {"description": "nested task", "prompt": "recurse"},
+            _agent_args("nested task", "recurse"),
             runtime_context={"delegate_depth": 1, "parent_run_id": "parent-run"},
         )
 
@@ -507,11 +520,11 @@ class TestAgentTool:
         }
 
         first = await tool.execute(
-            {"description": "first", "prompt": "one"},
+            _agent_args("first", "one"),
             runtime_context=context,
         )
         second = await tool.execute(
-            {"description": "second", "prompt": "two"},
+            _agent_args("second", "two"),
             runtime_context=context,
         )
 
@@ -586,11 +599,11 @@ class TestAgentTool:
         }
 
         first = await tool.execute(
-            {"description": "route one", "prompt": "one"},
+            _agent_args("route one", "one"),
             runtime_context=runtime_context,
         )
         second = await tool.execute(
-            {"description": "route two", "prompt": "two"},
+            _agent_args("route two", "two"),
             runtime_context=runtime_context,
         )
 
@@ -666,11 +679,7 @@ class TestAgentTool:
             execution_mode="background",
         )
         launched = await tool.execute(
-            {
-                "description": "queued route",
-                "prompt": "inspect",
-                "subagent_type": "fork",
-            },
+            _agent_args("queued route", "inspect", subagent_type="fork"),
             runtime_context={
                 "delegate_depth": 0,
                 "parent_run_id": "parent-run",
@@ -734,7 +743,7 @@ class TestAgentTool:
             execution_mode="background",
         )
         launched = await tool.execute(
-            {"description": "fast route", "prompt": "inspect"},
+            _agent_args("fast route", "inspect"),
             runtime_context={
                 "delegate_depth": 0,
                 "parent_run_id": "parent-run",
@@ -801,7 +810,7 @@ class TestAgentTool:
             return True
 
         launched = await tool.execute(
-            {"description": "validate route", "prompt": "validate"},
+            _agent_args("validate route", "validate"),
             runtime_context={
                 "delegate_depth": 0,
                 "parent_run_id": "parent-run",
@@ -876,11 +885,11 @@ class TestAgentTool:
             execution_mode="background",
         )
         launched = await tool.execute(
-            {
-                "description": "validate extension bypass",
-                "name": "extension-bypass",
-                "prompt": "validate",
-            },
+            _agent_args(
+                "validate extension bypass",
+                "validate",
+                name="extension-bypass",
+            ),
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
@@ -934,7 +943,7 @@ class TestAgentTool:
             execution_mode="background",
         )
         launched = await tool.execute(
-            {"description": "done", "prompt": "done"},
+            _agent_args("done", "done"),
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
@@ -983,7 +992,7 @@ class TestAgentTool:
             execution_mode="background",
         )
         result = await tool.execute(
-            {"description": "long route", "prompt": "wait"},
+            _agent_args("long route", "wait"),
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
@@ -1028,7 +1037,7 @@ class TestAgentTool:
             execution_mode="background",
         )
         result = await tool.execute(
-            {"description": "long route", "prompt": "wait"},
+            _agent_args("long route", "wait"),
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
@@ -1076,7 +1085,7 @@ class TestAgentTool:
             execution_mode="background",
         )
         result = await tool.execute(
-            {"description": "queued route", "prompt": "wait"},
+            _agent_args("queued route", "wait"),
             runtime_context={"delegate_depth": 0, "parent_run_id": "parent-run"},
         )
 
@@ -1114,7 +1123,7 @@ class TestAgentTool:
             execution_mode="background",
         )
         launched = await tool.execute(
-            {"description": "queued route", "prompt": "wait"},
+            _agent_args("queued route", "wait"),
             runtime_context={
                 "deadline_monotonic": time.monotonic() + 0.02,
                 "delegate_depth": 0,

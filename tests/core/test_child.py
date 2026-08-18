@@ -14,7 +14,8 @@ from qitos.core.child import (
     ChildStatus,
 )
 from qitos.core.journal import JournalRecordRef
-from qitos.core.task import TaskBudget
+from qitos.core.task import TaskBudget, TaskReference
+from qitos.core.tool import ToolPermissionContext, ToolPermissionRule
 
 
 def _request() -> ChildLaunchRequest:
@@ -23,6 +24,15 @@ def _request() -> ChildLaunchRequest:
         description="service inspection",
         name="inspector",
         context="The parent already identified port 443.",
+        success_criteria=("Return target-side evidence",),
+        constraints={"scope": "engagement-primary"},
+        references=(
+            TaskReference(kind="artifact", uri="scope://engagement/primary"),
+        ),
+        permission_context=ToolPermissionContext(
+            default_decision="deny",
+            allow_rules=(ToolPermissionRule(effect="allow", tool_family="network"),),
+        ),
         profile="restricted",
         allowed_tool_groups=("network", "files", "network"),
         working_directory="workspace",
@@ -41,6 +51,10 @@ def test_child_launch_request_is_immutable_and_round_trips() -> None:
     request = _request()
 
     assert request.allowed_tool_groups == ("network", "files")
+    assert request.success_criteria == ("Return target-side evidence",)
+    assert request.constraints == {"scope": "engagement-primary"}
+    assert request.references[0].uri == "scope://engagement/primary"
+    assert request.permission_context is not None
     assert ChildLaunchRequest.from_dict(request.to_dict()) == request
     with pytest.raises(FrozenInstanceError):
         request.task = "changed"  # type: ignore[misc]
@@ -80,6 +94,7 @@ def test_child_result_preserves_scoped_handle_and_evidence() -> None:
             evidence=(
                 JournalRecordRef(run_id="child-run", record_id="record-7"),
             ),
+            resource_refs=("child-run:resource:session-1",),
             failure_paths=("Anonymous access was rejected.",),
             unknowns=("No test credential was supplied.",),
             next_steps=("Provide a scoped test account.",),
@@ -99,6 +114,9 @@ def test_child_result_preserves_scoped_handle_and_evidence() -> None:
     assert restored.ready is True
     assert restored.succeeded is False
     assert restored.handle.parent_run_id == "parent-1"
+    assert restored.conclusion.resource_refs == (
+        "child-run:resource:session-1",
+    )
     assert restored.total_cost_usd == pytest.approx(0.75)
     assert restored.usage_complete is False
     assert restored.cost_complete is True

@@ -31,6 +31,11 @@ def _echo(text: str) -> str:
     return f"echo:{text}"
 
 
+@tool(name="record_nested")
+def _record_nested(operations: list[dict[str, object]]) -> int:
+    return len(operations)
+
+
 def _read_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -98,6 +103,50 @@ async def test_run_produces_discoverable_valid_trace(tmp_path) -> None:
     discovered = _discover_runs(trace_dir)
     assert [run["id"] for run in discovered] == [run_id]
     assert discovered[0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_trace_serializes_deeply_frozen_tool_arguments(tmp_path) -> None:
+    trace_dir = tmp_path / "trace"
+    harness = SessionHarness(
+        InMemoryJournalStore(),
+        trace_directory=trace_dir,
+    )
+    model = ScriptedModel(
+        [
+            tool_events(
+                [
+                    tool_call_wire(
+                        "nested-call",
+                        "record_nested",
+                        {
+                            "operations": [
+                                {
+                                    "type": "completion",
+                                    "evidence_ids": ["evidence:0:0123456789abcdef"],
+                                }
+                            ]
+                        },
+                    )
+                ]
+            ),
+            text_events("done"),
+        ]
+    )
+    session_run = await harness.start(
+        model=model,
+        tool_registry=ToolRegistry().register(_record_nested),
+    )
+
+    result = await session_run.prompt("record nested input")
+    run_id = session_run.run_id
+    await session_run.close()
+
+    assert result.status is AgentRunStatus.COMPLETED
+    manifest, events, steps = _artifacts(trace_dir, run_id)
+    TraceSchemaValidator().validate_manifest(manifest)
+    TraceSchemaValidator().validate_events(events)
+    TraceSchemaValidator().validate_steps(steps)
 
 
 @pytest.mark.asyncio

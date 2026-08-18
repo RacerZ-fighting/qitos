@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -18,7 +19,7 @@ class TraceEvent:
     ts: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return _plain_dataclass(self)
 
 
 @dataclass
@@ -68,4 +69,23 @@ class TraceStep:
     observation_modalities: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return _plain_dataclass(self)
+
+
+def _plain_dataclass(value: Any) -> Dict[str, Any]:
+    """Serialize a trace DTO without deepcopying immutable runtime mappings."""
+
+    return {
+        item.name: _plain_value(getattr(value, item.name))
+        for item in fields(value)
+    }
+
+
+def _plain_value(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _plain_dataclass(value)
+    if isinstance(value, Mapping):
+        return {key: _plain_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_value(item) for item in value]
+    return value

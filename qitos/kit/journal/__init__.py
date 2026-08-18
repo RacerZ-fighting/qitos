@@ -3,6 +3,7 @@
 from .catalog import JsonlRunCatalog
 from .jsonl import JsonlSessionJournal
 from .memory import InMemoryJournalStore, InMemorySessionJournal
+from .query import committed_tool_transactions
 from .recovery import (
     CrashedToolCall,
     RecoveredRunOutcome,
@@ -26,6 +27,7 @@ __all__ = [
     "RecoveredSession",
     "RecoveredTask",
     "close_crashed_tool_calls",
+    "committed_tool_transactions",
     "recover_run_outcome",
     "recover_session",
 ]

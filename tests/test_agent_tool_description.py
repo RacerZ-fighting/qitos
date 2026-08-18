@@ -16,3 +16,8 @@ def test_description_explains_parallel_delegation_boundary() -> None:
     assert "do not repeat" in description
     assert "dependent steps" in description
     assert "mechanical variants" in description
+
+    assert "success_criteria" in tool.spec.required
+    criteria = tool.spec.parameters["success_criteria"]
+    assert criteria["type"] == "array"
+    assert criteria["minItems"] == 1

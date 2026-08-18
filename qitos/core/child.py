@@ -12,7 +12,7 @@ from typing import Any, Protocol
 from .budget import BudgetLedger
 from .journal import JournalRecordRef, SessionJournal
 from .runtime_input import RuntimeInput
-from .task import TaskBudget
+from .task import TaskBudget, TaskReference
 from .tool import ToolPermissionContext
 from .tool_registry import ToolExposure
 
@@ -99,6 +99,10 @@ class ChildLaunchRequest:
     name: str = ""
     agent_type: str = "general-purpose"
     context: str = ""
+    success_criteria: tuple[str, ...] = ()
+    constraints: Mapping[str, str] = field(default_factory=dict)
+    references: tuple[TaskReference, ...] = ()
+    permission_context: ToolPermissionContext | None = None
     profile: str = "default"
     allowed_tool_groups: tuple[str, ...] = ()
     working_directory: str | None = None
@@ -118,6 +122,43 @@ class ChildLaunchRequest:
         for name in ("name", "context"):
             if not isinstance(getattr(self, name), str):
                 raise TypeError(f"ChildLaunchRequest.{name} must be a string")
+        if not isinstance(self.success_criteria, tuple) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in self.success_criteria
+        ):
+            raise TypeError(
+                "ChildLaunchRequest.success_criteria must contain non-empty strings"
+            )
+        if not isinstance(self.constraints, Mapping) or any(
+            not isinstance(key, str)
+            or not isinstance(item, str)
+            for key, item in self.constraints.items()
+        ):
+            raise TypeError(
+                "ChildLaunchRequest.constraints must map strings to strings"
+            )
+        object.__setattr__(
+            self,
+            "constraints",
+            MappingProxyType(dict(self.constraints)),
+        )
+        if not isinstance(self.references, tuple) or any(
+            not isinstance(item, TaskReference) for item in self.references
+        ):
+            raise TypeError(
+                "ChildLaunchRequest.references must contain TaskReference values"
+            )
+        if self.permission_context is not None:
+            if not isinstance(self.permission_context, ToolPermissionContext):
+                raise TypeError(
+                    "ChildLaunchRequest.permission_context must be a "
+                    "ToolPermissionContext or None"
+                )
+            object.__setattr__(
+                self,
+                "permission_context",
+                ToolPermissionContext.from_dict(self.permission_context.to_dict()),
+            )
         for name in ("parent_task_id", "plan_assignment"):
             value = getattr(self, name)
             if value is not None and (
@@ -154,6 +195,14 @@ class ChildLaunchRequest:
             "name": self.name,
             "agent_type": self.agent_type,
             "context": self.context,
+            "success_criteria": list(self.success_criteria),
+            "constraints": dict(self.constraints),
+            "references": [item.to_dict() for item in self.references],
+            "permission_context": (
+                None
+                if self.permission_context is None
+                else self.permission_context.to_dict()
+            ),
             "profile": self.profile,
             "allowed_tool_groups": list(self.allowed_tool_groups),
             "working_directory": self.working_directory,
@@ -170,6 +219,10 @@ class ChildLaunchRequest:
             "name",
             "agent_type",
             "context",
+            "success_criteria",
+            "constraints",
+            "references",
+            "permission_context",
             "profile",
             "allowed_tool_groups",
             "working_directory",
@@ -181,16 +234,40 @@ class ChildLaunchRequest:
             raise ValueError("ChildLaunchRequest fields are invalid")
         raw_groups = value["allowed_tool_groups"]
         raw_budget = value["budget"]
+        raw_criteria = value["success_criteria"]
+        raw_constraints = value["constraints"]
+        raw_references = value["references"]
+        raw_permission = value["permission_context"]
         if not isinstance(raw_groups, list):
             raise TypeError("allowed_tool_groups must be an array")
         if not isinstance(raw_budget, Mapping):
             raise TypeError("budget must be an object")
+        if not isinstance(raw_criteria, list):
+            raise TypeError("success_criteria must be an array")
+        if not isinstance(raw_constraints, Mapping):
+            raise TypeError("constraints must be an object")
+        if not isinstance(raw_references, list) or any(
+            not isinstance(item, Mapping) for item in raw_references
+        ):
+            raise TypeError("references must be an array of objects")
+        if raw_permission is not None and not isinstance(raw_permission, Mapping):
+            raise TypeError("permission_context must be an object or null")
         return cls(
             task=value["task"],
             description=value["description"],
             name=value["name"],
             agent_type=value["agent_type"],
             context=value["context"],
+            success_criteria=tuple(raw_criteria),
+            constraints=dict(raw_constraints),
+            references=tuple(
+                TaskReference.from_dict(item) for item in raw_references
+            ),
+            permission_context=(
+                None
+                if raw_permission is None
+                else ToolPermissionContext.from_dict(dict(raw_permission))
+            ),
             profile=value["profile"],
             allowed_tool_groups=tuple(raw_groups),
             working_directory=value["working_directory"],
@@ -393,6 +470,9 @@ class ChildInvocation:
     task: str
     run_kwargs: Mapping[str, Any] = field(default_factory=dict)
     cleanup: ChildInvocationCleanup | None = None
+    conclusion_factory: (
+        Callable[[ChildRunResult], Awaitable["AgentConclusion"]] | None
+    ) = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.task, str) or not self.task.strip():
@@ -401,6 +481,12 @@ class ChildInvocation:
             raise TypeError("ChildInvocation.run_kwargs must be a mapping")
         if self.cleanup is not None and not callable(self.cleanup):
             raise TypeError("ChildInvocation.cleanup must be async callable or None")
+        if self.conclusion_factory is not None and not callable(
+            self.conclusion_factory
+        ):
+            raise TypeError(
+                "ChildInvocation.conclusion_factory must be async callable or None"
+            )
         object.__setattr__(
             self,
             "run_kwargs",
@@ -414,6 +500,7 @@ class AgentConclusion:
 
     summary: str = ""
     evidence: tuple[JournalRecordRef, ...] = ()
+    resource_refs: tuple[str, ...] = ()
     failure_paths: tuple[str, ...] = ()
     unknowns: tuple[str, ...] = ()
     next_steps: tuple[str, ...] = ()
@@ -427,7 +514,7 @@ class AgentConclusion:
             raise TypeError(
                 "AgentConclusion.evidence must contain JournalRecordRef values"
             )
-        for name in ("failure_paths", "unknowns", "next_steps"):
+        for name in ("resource_refs", "failure_paths", "unknowns", "next_steps"):
             values = getattr(self, name)
             if not isinstance(values, tuple) or any(
                 not isinstance(item, str) or not item.strip() for item in values
@@ -440,6 +527,7 @@ class AgentConclusion:
         return {
             "summary": self.summary,
             "evidence": [item.to_dict() for item in self.evidence],
+            "resource_refs": list(self.resource_refs),
             "failure_paths": list(self.failure_paths),
             "unknowns": list(self.unknowns),
             "next_steps": list(self.next_steps),
@@ -450,6 +538,7 @@ class AgentConclusion:
         expected = {
             "summary",
             "evidence",
+            "resource_refs",
             "failure_paths",
             "unknowns",
             "next_steps",
@@ -464,6 +553,7 @@ class AgentConclusion:
         return cls(
             summary=value["summary"],
             evidence=tuple(JournalRecordRef.from_dict(item) for item in raw_evidence),
+            resource_refs=_string_tuple(value["resource_refs"], "resource_refs"),
             failure_paths=_string_tuple(value["failure_paths"], "failure_paths"),
             unknowns=_string_tuple(value["unknowns"], "unknowns"),
             next_steps=_string_tuple(value["next_steps"], "next_steps"),

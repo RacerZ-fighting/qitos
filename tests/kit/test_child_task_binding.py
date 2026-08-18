@@ -11,7 +11,7 @@ from qitos.core.child import (
 )
 from qitos.core.journal import JournalRecordType
 from qitos.core.plan import Plan, PlanNode
-from qitos.core.task import Task, TaskBudget
+from qitos.core.task import Task, TaskBudget, TaskReference
 from qitos.kit.child import (
     ChildSupervisor,
     build_agent_child_invocation_factory,
@@ -70,6 +70,11 @@ async def test_child_journal_commits_narrowed_task_before_input(tmp_path) -> Non
     request = ChildLaunchRequest(
         task="enumerate the target",
         description="enumeration child",
+        success_criteria=("Return verified service evidence",),
+        constraints={"scope": "primary"},
+        references=(
+            TaskReference(kind="artifact", uri="scope://engagement/primary"),
+        ),
         budget=TaskBudget(max_steps=11),
         parent_task_id="root-task",
         plan_assignment="plan-node-1",
@@ -105,6 +110,11 @@ async def test_child_journal_commits_narrowed_task_before_input(tmp_path) -> Non
     assert definition.task_id == result.handle.child_id
     assert definition.parent_task_id == "root-task"
     assert definition.objective == "enumerate the target"
+    assert definition.success_criteria == ("Return verified service evidence",)
+    assert definition.constraints == {"scope": "primary"}
+    assert definition.references == (
+        TaskReference(kind="artifact", uri="scope://engagement/primary"),
+    )
     assert definition.budget == TaskBudget(max_steps=11)
     assert definition.created_by_run_id == "parent-run"
     assert definition.plan_assignment == "plan-node-1"
@@ -112,7 +122,7 @@ async def test_child_journal_commits_narrowed_task_before_input(tmp_path) -> Non
     recovered = recover_session(records)
     projected = recovered.tasks[result.handle.child_id]
     assert projected.definition == definition
-    assert projected.lifecycle.status.value == "active"
+    assert projected.lifecycle.status.value == "completed"
     # A Child Task is not a Root Task of its own lineage.
     assert recovered.unfinished_root is None
 

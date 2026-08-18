@@ -15,7 +15,7 @@ from ....core.child import (
 )
 from ....core.model_response import ModelUsage
 from ....core.runtime_input import RuntimeInput
-from ....core.task import TaskBudget
+from ....core.task import Task, TaskBudget
 from ....core.tool import (
     BaseTool,
     ToolPermission,
@@ -67,6 +67,7 @@ class AgentTool(BaseTool):
         execution_mode: AgentExecutionMode = "foreground",
         max_background_workers: int = 4,
         run_limiter: ChildRunLimiter | None = None,
+        owns_run_limiter: bool = True,
         child_journal_factory: ChildJournalFactory | None = None,
         max_delegate_depth: int = 1,
         child_budget: TaskBudget | None = None,
@@ -77,6 +78,8 @@ class AgentTool(BaseTool):
     ) -> None:
         if max_delegate_depth <= 0:
             raise ValueError("max_delegate_depth must be positive")
+        if not isinstance(owns_run_limiter, bool):
+            raise TypeError("owns_run_limiter must be a boolean")
         resolved_budget = child_budget or TaskBudget(max_steps=DEFAULT_CHILD_MAX_STEPS)
         if not isinstance(resolved_budget, TaskBudget):
             raise TypeError("child_budget must be a TaskBudget")
@@ -123,6 +126,7 @@ class AgentTool(BaseTool):
                 child_journal_factory=child_journal_factory,
             )
         self._supervisor = supervisor
+        self._owns_run_limiter = owns_run_limiter
         self._execution_mode = execution_mode
         self._max_delegate_depth = max_delegate_depth
         self._child_budget = resolved_budget
@@ -144,6 +148,15 @@ class AgentTool(BaseTool):
             "prompt": {
                 "type": "string",
                 "description": "The task for the child agent to perform.",
+            },
+            "success_criteria": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": (
+                    "Concrete conditions the child must satisfy before it can "
+                    "report completion."
+                ),
             },
             "name": {
                 "type": "string",
@@ -195,7 +208,7 @@ class AgentTool(BaseTool):
                 name="Agent",
                 description=description,
                 parameters=parameters,
-                required=["description", "prompt"],
+                required=["description", "prompt", "success_criteria"],
                 permissions=ToolPermission(),
                 concurrency_safe=True,
                 supports_background=execution_mode != "foreground",
@@ -222,6 +235,21 @@ class AgentTool(BaseTool):
                 {"status": "error", "error": "description is required"},
                 status="error",
             )
+        raw_criteria = args.get("success_criteria")
+        if not isinstance(raw_criteria, list) or not raw_criteria or any(
+            not isinstance(item, str) or not item.strip() for item in raw_criteria
+        ):
+            return tool_result(
+                {
+                    "status": "error",
+                    "error": (
+                        "success_criteria must be a non-empty array of "
+                        "non-empty strings"
+                    ),
+                },
+                status="error",
+            )
+        success_criteria = tuple(item.strip() for item in raw_criteria)
         agent_type = (
             str(args.get("subagent_type", "general-purpose")).strip()
             or "general-purpose"
@@ -270,6 +298,27 @@ class AgentTool(BaseTool):
                 },
                 status="error",
             )
+        parent_task = context_values.get("task")
+        if parent_task is not None and not isinstance(parent_task, Task):
+            return tool_result(
+                {
+                    "status": "error",
+                    "error": "runtime context task must be a Task or None",
+                },
+                status="error",
+            )
+        if (
+            isinstance(parent_task, Task)
+            and parent_task_id is not None
+            and parent_task.task_id != parent_task_id
+        ):
+            return tool_result(
+                {
+                    "status": "error",
+                    "error": "runtime context task does not match task_id",
+                },
+                status="error",
+            )
         raw_assignment = args.get("plan_assignment")
         if raw_assignment is not None and (
             not isinstance(raw_assignment, str) or not raw_assignment.strip()
@@ -286,6 +335,10 @@ class AgentTool(BaseTool):
             description=description,
             name=str(args.get("name", "")).strip(),
             agent_type=agent_type,
+            success_criteria=success_criteria,
+            constraints=(parent_task.constraints if parent_task is not None else {}),
+            references=(parent_task.references if parent_task is not None else ()),
+            permission_context=context.parent_permission_context,
             profile=self._child_profile,
             allowed_tool_groups=self._child_allowed_tool_groups,
             working_directory=self._child_working_directory,
@@ -368,7 +421,7 @@ class AgentTool(BaseTool):
 
     def setup(self, context: dict[str, Any] | None = None) -> None:
         _ = context
-        self._supervisor.setup(reset_run_limiter=True)
+        self._supervisor.setup(reset_run_limiter=self._owns_run_limiter)
 
     async def asetup(self, context: dict[str, Any] | None = None) -> None:
         self.setup(context)

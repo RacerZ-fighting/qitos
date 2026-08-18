@@ -171,14 +171,22 @@ async def test_agent_tool_setup_starts_fresh_root_run_limit_generation() -> None
 
     tool = AgentTool(invocation_factory=build, run_limiter=limiter)
     first = await tool.execute(
-        {"description": "first", "prompt": "one"},
+        {
+            "description": "first",
+            "prompt": "one",
+            "success_criteria": ["Complete one"],
+        },
         runtime_context={"run_id": "root-one"},
     )
     await tool.aclose()
 
     tool.setup()
     second = await tool.execute(
-        {"description": "second", "prompt": "two"},
+        {
+            "description": "second",
+            "prompt": "two",
+            "success_criteria": ["Complete two"],
+        },
         runtime_context={"run_id": "root-two"},
     )
 
@@ -186,6 +194,30 @@ async def test_agent_tool_setup_starts_fresh_root_run_limit_generation() -> None
     assert second.output["child_status"] == ChildStatus.COMPLETED.value
     assert limiter.children_started == 1
     await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_nested_agent_tool_setup_preserves_active_shared_run_limit() -> None:
+    limiter = ChildRunLimiter(max_active_children=2, max_children=2)
+    lease = await limiter.reserve()
+
+    async def build(
+        request: ChildLaunchRequest,
+        _context: ChildRuntimeContext,
+    ) -> ChildInvocation:
+        return ChildInvocation(engine=_Engine(), task=request.task)
+
+    nested = AgentTool(
+        invocation_factory=build,
+        run_limiter=limiter,
+        owns_run_limiter=False,
+    )
+    nested.setup()
+
+    assert limiter.active_children == 1
+    assert limiter.children_started == 1
+    await lease.rollback()
+    await nested.aclose()
 
 
 @pytest.mark.asyncio
