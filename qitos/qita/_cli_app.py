@@ -6,6 +6,7 @@ import argparse
 import html
 import json
 import sys
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import mimetypes
 from pathlib import Path
@@ -615,6 +616,7 @@ def _discover_runs(logdir: Path) -> List[Dict[str, Any]]:
         manifest = _load_json(manifest_path)
         events = _load_jsonl(p / "events.jsonl")
         steps = _load_jsonl(p / "steps.jsonl")
+        manifest = _project_live_trace_manifest(p, manifest, events, steps)
         grouped_events = _group_events_by_step(events)
         step_interactions = _build_step_interactions(steps, grouped_events)
         step_summaries = _build_step_summaries(steps, grouped_events)
@@ -695,6 +697,7 @@ def _load_run_payload(run_dir: Path) -> Dict[str, Any]:
     manifest = _load_json(run_dir / "manifest.json")
     events = _load_jsonl(run_dir / "events.jsonl")
     steps = _load_jsonl(run_dir / "steps.jsonl")
+    manifest = _project_live_trace_manifest(run_dir, manifest, events, steps)
     grouped_events = _group_events_by_step(events)
     step_interactions = _build_step_interactions(steps, grouped_events)
     step_summaries = _build_step_summaries(steps, grouped_events)
@@ -998,6 +1001,37 @@ def _load_jsonl(path: Path) -> List[Dict[str, Any]]:
             except json.JSONDecodeError:
                 out.append({"raw": line, "error": "invalid_json"})
     return out
+
+
+def _project_live_trace_manifest(
+    run_dir: Path,
+    manifest: Dict[str, Any],
+    events: List[Dict[str, Any]],
+    steps: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Overlay committed JSONL progress on a running manifest for display."""
+
+    if str(manifest.get("status") or "").lower() != "running":
+        return manifest
+    projected = dict(manifest)
+    projected["event_count"] = len(events)
+    projected["step_count"] = len(steps)
+    summary = manifest.get("summary")
+    if isinstance(summary, dict):
+        projected_summary = dict(summary)
+        projected_summary["steps"] = len(steps)
+        projected["summary"] = projected_summary
+    mtimes: List[float] = []
+    for name in ("events.jsonl", "steps.jsonl"):
+        try:
+            mtimes.append((run_dir / name).stat().st_mtime)
+        except OSError:
+            continue
+    if mtimes:
+        projected["updated_at"] = datetime.fromtimestamp(
+            max(mtimes), tz=timezone.utc
+        ).isoformat()
+    return projected
 
 
 def _shorten_for_summary(value: Any, limit: int = 140) -> str:

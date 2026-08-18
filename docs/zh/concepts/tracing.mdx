@@ -20,6 +20,9 @@ id、名称和状态——绝不携带凭据；writer 会应用既有的 trace �
 `trace_directory=...` 构造 `SessionHarness` 时，每个 journal run 都会连接一个
 producer。
 
+Run 仍在运行时，qita 从已提交的 JSONL 文件推导展示用的事件数、step 数和最近
+更新时间。producer 完成 Run 的 finalize 后，经过校验的 manifest 摘要成为权威值。
+
 <Note>
 Trace artifact 是观察性投影。Session 恢复的任何路径都不读取它们，它们也不能
 创建可执行的 resume 或 fork——canonical Session Journal 是唯一的恢复真源。

@@ -19,6 +19,9 @@ How to update:
 
 ### Fixed
 
+- qita now derives live event and step counts plus the latest update time from
+  committed trace JSONL files while a Run is still active. Finalized Runs keep
+  using their validated manifest summary.
 - Bundled Skills whose exact names are already visible may now be loaded directly;
   the model-facing Tool guidance reserves `list_skills` for catalog discovery or
   truncated summaries instead of requiring a redundant listing call.
