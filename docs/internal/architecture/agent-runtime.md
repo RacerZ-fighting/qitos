@@ -245,7 +245,10 @@ same-context follow-up turn with an empty Tool exposure. If it already returned 
 final text, its unused claim is released immediately. The model's final assistant text
 is the canonical conclusion: a typed conclusion projector may attach stable evidence,
 resource, failure, unknown and next-step references, but cannot author or replace the
-summary. An empty final turn remains an explicit missing conclusion; the Supervisor
+summary. Text attached to a Tool call is progress commentary, not a terminal answer.
+Only text that crossed the durable model-terminal barrier can survive deadline or
+cancellation settlement, so live results and recovery choose the same conclusion.
+An empty final turn remains an explicit missing conclusion; the Supervisor
 does not synthesize prose from Tool results, Plan state or Journal records. Claims are
 not persisted because a crash interrupts the live Agent; only provider admissions and
 settled usage remain durable. Explicit cancellation and an expired absolute deadline

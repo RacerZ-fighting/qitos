@@ -30,6 +30,16 @@ How to update:
   model's final text remains canonical, and typed projections cannot replace it with
   Tool, Plan, or Journal-derived prose. Resume/fork restores only durable usage, not
   process-local holds for Agents interrupted by a crash.
+- Subagent runs now receive the same typed pre-sampling context hook as Root runs.
+  Deadline, cancellation, and transaction-barrier races preserve only a terminal
+  natural-language answer that crossed the durable model boundary; text attached to
+  Tool calls remains progress commentary. Live results and Journal recovery therefore
+  select the same conclusion without retrying the model past a hard boundary.
+- OpenAI-compatible Chat Completions transports that do not claim the official OpenAI
+  provider contract now project typed runtime context as tagged user-role content.
+  Kimi and similar endpoints therefore keep the canonical non-user `ContextMessage`
+  without receiving the unsupported `developer` wire role; official OpenAI Chat and
+  Responses continue to use `developer`.
 - Bundled Skills whose exact names are already visible may now be loaded directly;
   the model-facing Tool guidance reserves `list_skills` for catalog discovery or
   truncated summaries instead of requiring a redundant listing call.
@@ -57,9 +67,9 @@ How to update:
 - Added provider-neutral `ContextMessage` and a `turn_input.committed` request
   barrier. Applications can project dynamic state as durable model history
   immediately before sampling without impersonating a user message or
-  rebuilding runtime state from the Journal every turn. OpenAI transports keep
-  the developer role; Anthropic and Gemini preserve it as explicitly tagged
-  contextual user content. Recovery, compaction, trace, fork and continuation
+  rebuilding runtime state from the Journal every turn. OpenAI Responses and official
+  OpenAI Chat keep the developer role; compatibility Chat, Anthropic and Gemini
+  preserve it as explicitly tagged contextual user content. Recovery, compaction, trace, fork and continuation
   validation use the same canonical entries.
 - **Minimal agent loop and Agent façade (Pi-aligned).** New
   `qitos.core.agent_loop` (`agent_loop` / `run_agent_loop`), `qitos.core.agent`

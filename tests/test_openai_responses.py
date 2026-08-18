@@ -25,6 +25,7 @@ from qitos.models.openai import (
     ChatStreamAccumulator,
     OpenAICompatibleModel,
     OpenAIModel,
+    _to_openai_messages,
 )
 
 
@@ -174,6 +175,27 @@ def test_responses_input_replays_native_items_without_mirror_duplicates() -> Non
 def test_responses_input_preserves_developer_context_role() -> None:
     payload = _to_responses_input(
         [{"role": "developer", "content": "Current state revision: 3"}]
+    )
+
+    assert payload == [
+        {"role": "developer", "content": "Current state revision: 3"}
+    ]
+
+
+def test_compatibility_chat_tags_developer_context_as_user_content() -> None:
+    payload = _to_openai_messages(
+        [{"role": "developer", "content": "Current state revision: 3"}]
+    )
+
+    assert payload[0]["role"] == "user"
+    assert "<runtime-context>" in payload[0]["content"]
+    assert "Current state revision: 3" in payload[0]["content"]
+
+
+def test_official_openai_chat_preserves_developer_context_role() -> None:
+    payload = _to_openai_messages(
+        [{"role": "developer", "content": "Current state revision: 3"}],
+        developer_role=True,
     )
 
     assert payload == [
