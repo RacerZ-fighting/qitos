@@ -61,11 +61,18 @@ The loop owns only:
 It does not discover resources, construct environments, load products, evaluate
 benchmarks, own Session storage or reduce application domain state.
 
-The loop receives a transaction boundary that can record model terminal, Tool admission,
-Tool terminal and turn commit around side effects. Every uniquely identified call that
-reaches Tool admission, including a per-call rejection, receives exactly one terminal
-ToolResult. Duplicate raw call ids remain assistant protocol-failure evidence and the
-ambiguous batch is rejected before Tool admission or side effects.
+The loop freezes one request view, then optionally asks the application for typed
+`ContextMessage` values. It appends those values to live history and commits the
+turn's new prompt, steering and context input before model admission. This is a narrow
+request boundary, not a state reducer or extension bus. Request-only
+`transform_context` remains a provider-view transformation and must not be used as a
+durable application-state owner.
+
+The transaction boundary records accepted input, per-turn input, model terminal, Tool
+admission, Tool terminal and turn commit around side effects. Every uniquely identified
+call that reaches Tool admission, including a per-call rejection, receives exactly one
+terminal ToolResult. Duplicate raw call ids remain assistant protocol-failure evidence
+and the ambiguous batch is rejected before Tool admission or side effects.
 
 ## 4. Agent façade and Session Harness
 
@@ -100,14 +107,17 @@ writer and one unfinished Run.
 
 The log carries two typed record families in one sequence:
 
-- Transcript entries own message content: `transcript.message` (user,
-  assistant and Tool-result messages) and `compaction` (summary plus the first
-  kept transcript reference).
+- Transcript entries own message content: `transcript.message` (user, runtime
+  context, assistant and Tool-result messages) and `compaction` (summary plus
+  the first kept transcript reference). `ContextMessage` is model-visible
+  history, not a user instruction or an application-state truth source.
 - Operation records own lifecycle and side-effect boundaries: `run.started`,
-  `input.accepted`, `model.completed` (exact request audit plus the assistant
-  transcript reference), `tool.started` / `tool.terminal` (call plus terminal
-  transcript reference), `step.committed` (turn commit marker listing the
-  turn's transcript and Tool-terminal references), `run.completed` /
+  `input.accepted`, `turn_input.committed` (ordered prompt, steering and
+  context references durable before sampling), `model.completed` (exact
+  request audit plus the assistant transcript reference), `tool.started` /
+  `tool.terminal` (call plus terminal transcript reference), `step.committed`
+  (turn commit marker listing the remaining transcript and Tool-terminal
+  references), `run.completed` /
   `run.interrupted` (primary status/error plus an optional resource-finalization
   diagnostic), `model.change` / `thinking.change` / `tools.change`
   (per-turn configuration freeze diffs), `budget.step_reserved` (atomic
@@ -130,6 +140,12 @@ Tools and never guesses side effects. Runtime inputs posted by the current Run
 and never consumed are re-projected exactly once; inherited fork facts and
 foreground results are never redelivered. Queued steering/follow-up messages
 are memory-only and are not recovery truth.
+
+Full replay occurs when a Session starts, resumes or forks. During a live Run,
+the Agent owns its in-memory transcript and per-turn snapshots; successful
+appends update that live state incrementally. The JSONL recovery contract does
+not imply reconstructing runtime state from the entire journal before every
+model request.
 
 Memory and JSONL journal implementations share one conformance suite; a
 SQLite index remains a disposable projection. Authoritative snapshots come

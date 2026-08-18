@@ -309,6 +309,12 @@ class _SubagentTurnTransaction(TurnTransactionBoundary):
                 transaction_id=f"{self._run_id}:turn:{turn}:step",
             )
 
+    async def turn_input_committed(
+        self, turn: int, messages: tuple[Message, ...]
+    ) -> None:
+        if self._delegate is not None:
+            await self._delegate.turn_input_committed(turn, messages)
+
     async def tool_started(self, turn: int, call: ToolCall) -> None:
         if self._delegate is not None:
             await self._delegate.tool_started(turn, call)

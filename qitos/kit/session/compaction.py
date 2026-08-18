@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Literal, Union
 from ...core.agent_loop import model_protocol_identity
 from ...core.message import (
     AssistantMessage,
+    ContextMessage,
     ImageContent,
     Message,
     TextContent,
@@ -90,6 +91,8 @@ def estimate_tokens(message: Message) -> int:
     chars = 0
     if isinstance(message, UserMessage):
         chars = _content_chars(message.content)
+    elif isinstance(message, ContextMessage):
+        chars = len(message.content)
     elif isinstance(message, AssistantMessage):
         chars = len(message.text)
         if message.reasoning_content:
@@ -440,6 +443,8 @@ def serialize_conversation(messages: Sequence[Message]) -> str:
             content = _user_text(message)
             if content:
                 parts.append(f"[User]: {content}")
+        elif isinstance(message, ContextMessage):
+            parts.append(f"[Runtime context]: {message.content}")
         elif isinstance(message, AssistantMessage):
             if message.reasoning_content:
                 parts.append(f"[Assistant thinking]: {message.reasoning_content}")

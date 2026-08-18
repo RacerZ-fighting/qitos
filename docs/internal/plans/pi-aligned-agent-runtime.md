@@ -41,11 +41,13 @@ Review-hardening dispositions recorded on the same branch:
 - `ToolExecutionUpdate` is implemented, wired to the Tool `emit_progress`
   runtime callback (Pi parity); earlier notes claiming "no data source" were
   wrong.
-- Pi's custom `AgentMessage` + `convertToLlm` extension point is explicitly
-  excluded at the QitOS canonical transcript boundary: the transcript stays a
-  closed typed set (`UserMessage`/`AssistantMessage`/`ToolResultMessage`)
-  with a fail-closed codec; application-specific projections belong in
-  journal records, events and metadata, not in LLM-bound messages.
+- Pi's open-ended custom `AgentMessage` + `convertToLlm` extension point is
+  excluded at the QitOS canonical transcript boundary. The transcript stays a
+  closed typed set (`UserMessage`/`ContextMessage`/`AssistantMessage`/
+  `ToolResultMessage`) with a fail-closed codec. The narrow `ContextMessage`
+  addition follows Codex's durable developer-context behavior: products own
+  their state and delta, while QitOS only preserves the model-visible history
+  projection before sampling.
 - `before_tool_call` keeps Pi's `block` / `reason` / `terminate` surface. Tool
   argument rewriting remains owned by the existing permission pipeline; the
   hook does not introduce a second mutation channel.
@@ -107,6 +109,10 @@ concretely:
   references; `run.completed`/`run.interrupted` no longer embed messages.
 - (done in S2a) `input.accepted` gains a writer and commits, with the initial
   prompt transcript entries, before the first model side effect.
+- A later hardening slice adds `turn_input.committed`: prompt, steering and
+  typed runtime-context entries are durable in their model-visible order before
+  each sampling request. Normal live turns use the in-memory Agent context;
+  full Journal replay remains a start/resume/fork operation.
 - (done in S2a) Pure recovery (`qitos.kit.journal.recovery.recover_session`)
   replays the log into transcript, configuration lineage, open Tool
   operations, unconsumed runtime inputs and terminal outcome; crash-torn Tool

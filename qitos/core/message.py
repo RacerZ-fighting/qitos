@@ -1,9 +1,10 @@
 """Typed provider-neutral messages for the minimal agent loop.
 
-Messages are the canonical transcript contract: user input, assistant output
-(including Tool calls) and Tool results. Provider adapters keep consuming the
-existing wire mappings, so each message owns a one-way ``to_wire`` projection
-plus a strict ``to_dict``/``from_dict`` round trip used by persistence.
+Messages are the canonical transcript contract: user input, durable runtime
+context, assistant output (including Tool calls) and Tool results. Provider
+adapters keep consuming the existing wire mappings, so each message owns a
+one-way ``to_wire`` projection plus a strict ``to_dict``/``from_dict`` round
+trip used by persistence.
 
 Invariants:
 - Every uniquely identified call that reaches Tool admission is paired with
@@ -189,6 +190,27 @@ class UserMessage:
 
 
 @dataclass(frozen=True, slots=True)
+class ContextMessage:
+    """Model-visible runtime context that is not a user instruction.
+
+    The canonical role stays provider-neutral. OpenAI-style protocols project
+    it as a developer message; protocols without a developer role preserve
+    the ordered content through their documented contextual-user fallback.
+    Products remain responsible for the state and delta represented by the
+    text -- this message is only its durable model-history projection.
+    """
+
+    content: str
+    timestamp: float = field(default_factory=time.time)
+    role: str = field(default="context", init=False)
+
+    def __post_init__(self) -> None:
+        _validate_message_timestamp(self.timestamp)
+        if not isinstance(self.content, str) or not self.content.strip():
+            raise ValueError("context content must be non-empty text")
+
+
+@dataclass(frozen=True, slots=True)
 class AssistantMessage:
     """One terminal assistant transaction in the canonical transcript."""
 
@@ -309,7 +331,7 @@ class ToolResultMessage:
         return self.result.status != "success"
 
 
-Message = Union[UserMessage, AssistantMessage, ToolResultMessage]
+Message = Union[UserMessage, ContextMessage, AssistantMessage, ToolResultMessage]
 
 
 def _freeze_json(value: Any) -> Any:
@@ -408,6 +430,8 @@ def message_to_wire(message: Message) -> Dict[str, Any]:
                 for block in message.content
             ]
         return {"role": "user", "content": content}
+    if isinstance(message, ContextMessage):
+        return {"role": "developer", "content": message.content}
     if isinstance(message, AssistantMessage):
         payload: Dict[str, Any] = {
             "role": "assistant",
@@ -462,6 +486,12 @@ def message_to_dict(message: Message) -> Dict[str, Any]:
         return {
             "role": "user",
             "content": content,
+            "timestamp": message.timestamp,
+        }
+    if isinstance(message, ContextMessage):
+        return {
+            "role": "context",
+            "content": message.content,
             "timestamp": message.timestamp,
         }
     if isinstance(message, AssistantMessage):
@@ -543,6 +573,17 @@ def message_from_dict(value: Mapping[str, Any]) -> Message:
             raise ValueError("user message content is invalid")
         return UserMessage(
             content=content,
+            timestamp=_message_timestamp(value),
+        )
+    if role == "context":
+        required = {"role", "content", "timestamp"}
+        if set(value) != required:
+            raise ValueError("context message fields are invalid")
+        raw_content = value["content"]
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            raise ValueError("context message content must be non-empty text")
+        return ContextMessage(
+            content=raw_content,
             timestamp=_message_timestamp(value),
         )
     if role == "assistant":
@@ -686,6 +727,7 @@ def _continuation_from_dict(value: Mapping[str, Any]) -> ModelContinuation:
 
 __all__ = [
     "AssistantMessage",
+    "ContextMessage",
     "ImageContent",
     "Message",
     "TextContent",

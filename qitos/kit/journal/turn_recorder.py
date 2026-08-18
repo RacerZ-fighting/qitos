@@ -277,6 +277,28 @@ def decode_input_accepted(payload: Mapping[str, Any]) -> tuple[str, ...]:
     )
 
 
+def encode_turn_input_committed(
+    turn: int, transcript_record_ids: Sequence[str]
+) -> dict[str, Any]:
+    return {
+        "turn": turn,
+        "transcript_record_ids": list(transcript_record_ids),
+    }
+
+
+def decode_turn_input_committed(
+    payload: Mapping[str, Any],
+) -> tuple[int, tuple[str, ...]]:
+    if set(payload) != {"turn", "transcript_record_ids"}:
+        raise ValueError("turn_input.committed fields are invalid")
+    record_ids = _decode_record_id_list(
+        payload["transcript_record_ids"], "transcript_record_ids"
+    )
+    if not record_ids:
+        raise ValueError("turn_input.committed requires transcript entries")
+    return _decode_turn(payload["turn"]), record_ids
+
+
 def encode_model_change(identity: tuple[str, str, str]) -> dict[str, Any]:
     provider, model, api = identity
     return {"provider": provider, "model": model, "api": api}
@@ -608,6 +630,8 @@ class JournalTurnTransaction(TurnTransactionBoundary):
         # identity lookup can never hit a reused object address.
         self._recorded_messages: list[Message] = []
         self._message_record_ids: dict[int, str] = {}
+        self._turn_input_record_ids: set[str] = set()
+        self._turn_inputs_committed: set[int] = set()
         self._tool_message_record_ids: dict[tuple[int, str], str] = {}
         self._tool_terminal_record_ids: dict[tuple[int, str], str] = {}
         self._budget_ledger = budget_ledger
@@ -739,6 +763,31 @@ class JournalTurnTransaction(TurnTransactionBoundary):
             )
         return tuple(positions)
 
+    async def turn_input_committed(
+        self, turn: int, messages: tuple[Message, ...]
+    ) -> JournalPosition:
+        """Commit the ordered new input batch before model admission."""
+
+        self._require_turn(turn)
+        if not messages:
+            raise ValueError("turn_input_committed requires at least one message")
+        if turn in self._turn_inputs_committed:
+            raise ValueError("turn input may be committed only once")
+        record_ids: list[str] = []
+        for message in messages:
+            record_id = self._message_record_ids.get(id(message))
+            if record_id is None:
+                record_id = await self._append_transcript(message)
+            record_ids.append(record_id)
+        position = await self._journal.append(
+            JournalRecordType.TURN_INPUT_COMMITTED,
+            encode_turn_input_committed(turn, record_ids),
+            record_id=f"{self._journal.run_id}:turn:{turn}:input",
+        )
+        self._turn_input_record_ids.update(record_ids)
+        self._turn_inputs_committed.add(turn)
+        return position
+
     async def model_terminal(
         self, turn: int, request: ModelRequest, message: AssistantMessage
     ) -> JournalPosition:
@@ -824,7 +873,8 @@ class JournalTurnTransaction(TurnTransactionBoundary):
                 record_id = self._message_record_ids.get(id(message))
             if record_id is None:
                 record_id = await self._append_transcript(message)
-            transcript_record_ids.append(record_id)
+            if record_id not in self._turn_input_record_ids:
+                transcript_record_ids.append(record_id)
         return await self._journal.append(
             JournalRecordType.STEP_COMMITTED,
             encode_step_committed(
@@ -950,6 +1000,7 @@ __all__ = [
     "decode_step_committed",
     "decode_task_created",
     "decode_task_transition",
+    "decode_turn_input_committed",
     "decode_thinking_change",
     "decode_tool_started",
     "decode_tool_terminal",
@@ -964,6 +1015,7 @@ __all__ = [
     "encode_step_committed",
     "encode_task_created",
     "encode_task_transition",
+    "encode_turn_input_committed",
     "encode_thinking_change",
     "encode_tool_started",
     "encode_tool_terminal",

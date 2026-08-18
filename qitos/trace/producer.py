@@ -32,6 +32,7 @@ from ..core.agent_events import (
 from ..core.agent_loop import AgentLoopResult, AgentRunStatus
 from ..core.message import (
     AssistantMessage,
+    ContextMessage,
     TextContent,
     ToolResultMessage,
     UserMessage,
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
 #: not return; this small set is what the minimal loop can observe).
 PHASE_AGENT = "agent"
 PHASE_INPUT = "input"
+PHASE_CONTEXT = "context"
 PHASE_MODEL = "model"
 PHASE_TOOL = "tool"
 PHASE_TURN = "turn"
@@ -185,6 +187,8 @@ class AgentTraceProducer:
         message = event.message
         if isinstance(message, UserMessage):
             self._stage(PHASE_INPUT, {"content": _user_text(message)})
+        elif isinstance(message, ContextMessage):
+            self._stage(PHASE_CONTEXT, {"content": message.content})
         elif isinstance(message, AssistantMessage):
             if message.usage is not None and message.usage.total_tokens:
                 self._total_tokens += message.usage.total_tokens
@@ -272,6 +276,7 @@ def _final_text(result: AgentLoopResult) -> Optional[str]:
 __all__ = [
     "AgentTraceProducer",
     "PHASE_AGENT",
+    "PHASE_CONTEXT",
     "PHASE_INPUT",
     "PHASE_MODEL",
     "PHASE_TOOL",

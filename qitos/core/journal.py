@@ -54,6 +54,7 @@ class JournalCommitState(str, Enum):
 class JournalRecordType(str, Enum):
     RUN_STARTED = "run.started"
     INPUT_ACCEPTED = "input.accepted"
+    TURN_INPUT_COMMITTED = "turn_input.committed"
     TRANSCRIPT_MESSAGE = "transcript.message"
     MODEL_COMPLETED = "model.completed"
     MODEL_CHANGE = "model.change"

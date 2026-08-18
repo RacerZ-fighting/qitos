@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from qitos.core.agent_loop import AgentRunStatus
+from qitos.core.message import ContextMessage
 from qitos.core.tool import tool
 from qitos.core.tool_registry import ToolRegistry
 from qitos.kit.journal import InMemoryJournalStore
@@ -68,7 +69,11 @@ async def test_run_produces_discoverable_valid_trace(tmp_path) -> None:
         ]
     )
     session_run = await harness.start(
-        model=model, tool_registry=ToolRegistry().register(_echo)
+        model=model,
+        tool_registry=ToolRegistry().register(_echo),
+        prepare_turn_context=lambda _context: (
+            ContextMessage(content="current state"),
+        ),
     )
     result = await session_run.prompt("hello")
     assert result.status is AgentRunStatus.COMPLETED
@@ -85,7 +90,7 @@ async def test_run_produces_discoverable_valid_trace(tmp_path) -> None:
     # vocabulary, and tool events carry call id, name and status.
     assert [step["step_id"] for step in steps] == [0, 1]
     phases = {event["phase"] for event in events}
-    assert {"agent", "input", "model", "tool", "turn"} <= phases
+    assert {"agent", "context", "input", "model", "tool", "turn"} <= phases
     tool_events_ = [event for event in events if event["phase"] == "tool"]
     assert any(
         event["payload"].get("call_id") == "c1"

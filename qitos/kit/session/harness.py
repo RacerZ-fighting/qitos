@@ -518,7 +518,10 @@ def _latest_committed_boundary(
     records: Sequence[JournalRecord],
 ) -> JournalPosition | None:
     for record in reversed(records):
-        if resolve_inherited_record(record).type is JournalRecordType.STEP_COMMITTED:
+        if resolve_inherited_record(record).type in {
+            JournalRecordType.STEP_COMMITTED,
+            JournalRecordType.TURN_INPUT_COMMITTED,
+        }:
             return record.position
     return None
 

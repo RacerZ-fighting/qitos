@@ -6,6 +6,7 @@ import pytest
 
 from qitos.core.message import (
     AssistantMessage,
+    ContextMessage,
     ImageContent,
     TextContent,
     ToolCall,
@@ -55,6 +56,7 @@ def test_estimate_tokens_uses_chars_per_four_with_ceiling() -> None:
     # Assistant text and reasoning both count.
     message = AssistantMessage(text="a" * 8, reasoning_content="r" * 4)
     assert estimate_tokens(message) == 3
+    assert estimate_tokens(ContextMessage(content="c" * 9)) == 3
     # Images follow Pi's fixed char estimate.
     image_message = UserMessage(
         content=(TextContent(text="ab"), ImageContent(source={"data": "x"}))

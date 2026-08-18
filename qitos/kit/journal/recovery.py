@@ -57,6 +57,7 @@ from .turn_recorder import (
     decode_task_created,
     decode_task_transition,
     decode_thinking_change,
+    decode_turn_input_committed,
     decode_tool_started,
     decode_tool_terminal,
     decode_tools_change,
@@ -309,7 +310,10 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
         # A forked run restarts its own turn numbering after the inherited
         # prefix, and the prefix itself is always one committed boundary.
         nonlocal prefix_closed
-        if last_inherited_type is not JournalRecordType.STEP_COMMITTED:
+        if last_inherited_type not in {
+            JournalRecordType.STEP_COMMITTED,
+            JournalRecordType.TURN_INPUT_COMMITTED,
+        }:
             raise JournalCorruptionError(
                 "inherited prefix does not end at a committed boundary"
             )
@@ -333,7 +337,10 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                     raise JournalCorruptionError(
                         "inherited segment does not start with run.started"
                     )
-            elif previous_effective_type is JournalRecordType.STEP_COMMITTED:
+            elif previous_effective_type in {
+                JournalRecordType.STEP_COMMITTED,
+                JournalRecordType.TURN_INPUT_COMMITTED,
+            }:
                 _close_segment("inherited prefix")
             else:
                 raise JournalCorruptionError(
@@ -502,6 +509,31 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                         raise JournalCorruptionError(
                             "input.accepted references an unknown transcript entry"
                         )
+            elif record_type is JournalRecordType.TURN_INPUT_COMMITTED:
+                turn, input_record_ids = decode_turn_input_committed(payload)
+                segment_side_effects.add(effective.run_id)
+                _turn_barrier(turn)
+                _commit_barrier("turn_input.committed")
+                for record_id in input_record_ids:
+                    if record_id not in transcript_index:
+                        raise JournalCorruptionError(
+                            "turn_input.committed references an unknown "
+                            "transcript entry"
+                        )
+                    if transcript_turns[record_id] != turn:
+                        raise JournalCorruptionError(
+                            "turn_input.committed references another turn"
+                        )
+                    if record_id in covered_entry_ids:
+                        raise JournalCorruptionError(
+                            "transcript entry was committed twice"
+                        )
+                if len(set(input_record_ids)) != len(input_record_ids):
+                    raise JournalCorruptionError(
+                        "turn_input.committed repeats a transcript entry"
+                    )
+                covered_entry_ids.update(input_record_ids)
+                commit_entry_ids.extend(input_record_ids)
             elif record_type is JournalRecordType.COMPACTION:
                 if len(covered_entry_ids) != len(transcript_index):
                     raise JournalCorruptionError(

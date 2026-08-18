@@ -295,6 +295,7 @@ async def test_transaction_factory_receives_run_id_and_records() -> None:
     assert kinds == [
         "input_accepted",
         "turn_frozen",
+        "turn_input_committed",
         "model_terminal",
         "turn_committed",
         "run_terminal",
@@ -375,6 +376,7 @@ async def test_listener_fault_propagates_and_run_is_terminalized() -> None:
     assert kinds == [
         "input_accepted",
         "turn_frozen",
+        "turn_input_committed",
         "model_terminal",
         "turn_committed",
         "run_terminal",
@@ -424,6 +426,7 @@ async def test_message_listener_fault_follows_model_terminal_record() -> None:
     assert [record[0] for record in transaction.records] == [
         "input_accepted",
         "turn_frozen",
+        "turn_input_committed",
         "model_terminal",
         "run_terminal",
     ]
@@ -458,6 +461,7 @@ async def test_tool_listener_fault_preserves_call_result_pair() -> None:
     assert [record[0] for record in transaction.records] == [
         "input_accepted",
         "turn_frozen",
+        "turn_input_committed",
         "model_terminal",
         "tool_started",
         "tool_terminal",
@@ -661,6 +665,7 @@ async def test_abort_interrupts_hanging_tool_and_preserves_terminal_result() -> 
     assert [record[0] for record in transaction.records] == [
         "input_accepted",
         "turn_frozen",
+        "turn_input_committed",
         "model_terminal",
         "tool_started",
         "tool_terminal",

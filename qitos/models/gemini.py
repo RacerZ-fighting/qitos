@@ -431,6 +431,16 @@ class GeminiModel(Model):
                 and "type" not in item
             ]
             parts = native_parts or [{"text": content_to_text(message.get("content"))}]
+            if role == "developer" and not native_parts:
+                parts = [
+                    {
+                        "text": (
+                            "<runtime-context>\n"
+                            f"{content_to_text(message.get('content'))}\n"
+                            "</runtime-context>"
+                        )
+                    }
+                ]
             if mapped_role == "model":
                 native_names = {
                     str(
