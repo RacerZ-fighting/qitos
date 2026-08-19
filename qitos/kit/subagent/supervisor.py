@@ -96,6 +96,7 @@ class _OwnedSubagent:
     engine: SubagentEngine | None = None
     result: SubagentResult | None = None
     run_lease: _SubagentRunLease | None = None
+    started_monotonic: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -718,6 +719,7 @@ class SubagentSupervisor:
             raise RuntimeError("Subagent launch context was released before execution")
         deadline = launch_context.deadline_monotonic
         started = time.monotonic()
+        owned.started_monotonic = started
         if deadline is not None and started >= deadline:
             return self._budget_exhausted_result(
                 owned,
@@ -1583,10 +1585,12 @@ class SubagentSupervisor:
             ),
             subagent_run_id=self._subagent_run_id(owned),
             error=error,
+            steps=self._engine_steps(owned),
             total_tokens=tokens,
             total_cost_usd=cost,
             usage_complete=usage_complete,
             cost_complete=cost_complete,
+            elapsed_seconds=self._owned_elapsed_seconds(owned),
         )
 
     def _budget_exhausted_result(
@@ -1607,6 +1611,7 @@ class SubagentSupervisor:
             ),
             subagent_run_id=self._subagent_run_id(owned),
             error=error,
+            steps=self._engine_steps(owned),
             total_tokens=tokens,
             total_cost_usd=cost,
             usage_complete=usage_complete,
@@ -1647,11 +1652,26 @@ class SubagentSupervisor:
             ),
             subagent_run_id=self._subagent_run_id(owned),
             error=error,
+            steps=self._engine_steps(owned),
             total_tokens=tokens,
             total_cost_usd=cost,
             usage_complete=usage_complete,
             cost_complete=cost_complete,
+            elapsed_seconds=self._owned_elapsed_seconds(owned),
         )
+
+    @staticmethod
+    def _engine_steps(owned: _OwnedSubagent) -> int:
+        engine = owned.engine
+        if engine is None:
+            return 0
+        return int(getattr(engine, "step_count", 0) or 0)
+
+    @staticmethod
+    def _owned_elapsed_seconds(owned: _OwnedSubagent) -> float:
+        if owned.started_monotonic <= 0.0:
+            return 0.0
+        return max(0.0, time.monotonic() - owned.started_monotonic)
 
     @staticmethod
     def _engine_usage(owned: _OwnedSubagent) -> tuple[int, float, bool, bool]:

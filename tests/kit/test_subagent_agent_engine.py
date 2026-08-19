@@ -634,6 +634,46 @@ async def test_interrupt_running_subagent_terminalizes_journal(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_interrupted_subagent_terminal_keeps_committed_usage(
+    tmp_path,
+) -> None:
+    registry = ToolRegistry().register(_echo)
+    second_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def hanging(_request):
+        second_started.set()
+        await never.wait()
+        yield  # unreachable; keeps the factory an async generator
+
+    model = ScriptedModel(
+        [tool_events([tool_call_wire("c1", "echo", {"text": "x"})]), hanging]
+    )
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=model,
+            tool_registry=registry,
+            journal_directory=_subagents_root(tmp_path),
+        ),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
+    )
+
+    launched = await supervisor.launch(
+        _request("hang after one turn"),
+        _context(parent_tool_authority=registry.freeze()),
+        background=True,
+    )
+    await asyncio.wait_for(second_started.wait(), timeout=5)
+    result = await supervisor.interrupt(launched.handle, wait_seconds=5)
+
+    assert result is not None
+    assert result.status is SubagentStatus.CANCELLED
+    assert result.steps >= 1
+    assert result.elapsed_seconds > 0
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_subagent_budget_exhaustion_maps_from_max_turns(tmp_path) -> None:
     registry = ToolRegistry().register(_echo)
     model = ScriptedModel(

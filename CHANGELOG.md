@@ -29,6 +29,10 @@ How to update:
   are rejected at the terminal boundary without a `runtime_input.posted`
   record, so acceptance means queued, not guaranteed delivery.
 
+- Cancelled, failed and budget-exhausted Subagent terminal results now keep
+  the run's committed step count and elapsed time instead of reporting zeros,
+  matching the token usage those paths already reported.
+
 - qita now derives live event and step counts plus the latest update time from
   committed trace JSONL files while a Run is still active. Finalized Runs keep
   using their validated manifest summary.
