@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 
 import pytest
@@ -47,6 +48,7 @@ from qitos.kit.tool.subagent import SubagentTool
 
 from tests.core.agent_fakes import (
     ScriptedModel,
+    failed_events,
     text_events,
     tool_call_wire,
     tool_events,
@@ -110,6 +112,7 @@ async def test_foreground_subagent_completes_and_journals_turns(tmp_path) -> Non
         invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             journal_directory=_subagents_root(tmp_path),
+            trace_directory=tmp_path / "traces",
             run_finalizer=_finalize,
         ),
         subagent_journal_factory=_subagent_journal_factory(tmp_path),
@@ -166,8 +169,111 @@ async def test_foreground_subagent_completes_and_journals_turns(tmp_path) -> Non
     assert task.lifecycle.status is TaskStatus.COMPLETED
     assert task.lifecycle.usage is not None
     assert task.lifecycle.usage.total_tokens == result.total_tokens
+    manifest = json.loads(
+        (tmp_path / "traces" / result.subagent_run_id / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "completed"
+    assert manifest["parent_run_id"] == "parent-run"
+    assert manifest["step_count"] == result.steps
     await supervisor.aclose()
     await parent_journal.close()
+
+
+@pytest.mark.asyncio
+async def test_subagent_traces_preserve_recursive_run_lineage(tmp_path) -> None:
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=ScriptedModel(
+                [text_events("first subagent"), text_events("grandchild")]
+            ),
+            journal_directory=_subagents_root(tmp_path),
+            trace_directory=tmp_path / "traces",
+        ),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
+    )
+
+    child = await supervisor.launch(
+        _request("first"),
+        _context(),
+        background=False,
+    )
+    grandchild = await supervisor.launch(
+        _request("nested"),
+        SubagentLaunchContext(parent_run_id=child.subagent_run_id),
+        background=False,
+    )
+
+    child_manifest = json.loads(
+        (tmp_path / "traces" / child.subagent_run_id / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    grandchild_manifest = json.loads(
+        (
+            tmp_path
+            / "traces"
+            / grandchild.subagent_run_id
+            / "manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert child_manifest["parent_run_id"] == "parent-run"
+    assert grandchild_manifest["parent_run_id"] == child.subagent_run_id
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_trace_lineage_does_not_require_a_run_journal(tmp_path) -> None:
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=ScriptedModel([text_events("subagent result")]),
+            trace_directory=tmp_path / "traces",
+        ),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
+    )
+
+    result = await supervisor.launch(
+        _request("trace only"),
+        _context(),
+        background=False,
+    )
+
+    manifest = json.loads(
+        (tmp_path / "traces" / result.subagent_run_id / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["parent_run_id"] == "parent-run"
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_subagent_finalizes_its_own_trace(tmp_path) -> None:
+    supervisor = SubagentSupervisor(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=ScriptedModel([failed_events("provider failed")]),
+            journal_directory=_subagents_root(tmp_path),
+            trace_directory=tmp_path / "traces",
+        ),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
+    )
+
+    result = await supervisor.launch(
+        _request("fail"),
+        _context(),
+        background=False,
+    )
+
+    manifest = json.loads(
+        (tmp_path / "traces" / result.subagent_run_id / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert result.status is SubagentStatus.FAILED
+    assert manifest["status"] == "failed"
+    assert manifest["parent_run_id"] == "parent-run"
+    await supervisor.aclose()
 
 
 @pytest.mark.asyncio
@@ -491,6 +597,7 @@ async def test_interrupt_running_subagent_terminalizes_journal(tmp_path) -> None
         invocation_factory=build_agent_subagent_invocation_factory(
             model=model,
             journal_directory=_subagents_root(tmp_path),
+            trace_directory=tmp_path / "traces",
         ),
         subagent_journal_factory=_subagent_journal_factory(tmp_path),
     )
@@ -504,6 +611,13 @@ async def test_interrupt_running_subagent_terminalizes_journal(tmp_path) -> None
     subagent_records = await _read_subagent_records(tmp_path, result.subagent_run_id)
     assert subagent_records[-1].type is JournalRecordType.RUN_INTERRUPTED
     assert subagent_records[-1].payload["status"] == "aborted"
+    manifest = json.loads(
+        (tmp_path / "traces" / result.subagent_run_id / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "stopped"
+    assert manifest["parent_run_id"] == "parent-run"
     await supervisor.aclose()
 
 

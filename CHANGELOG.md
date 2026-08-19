@@ -22,6 +22,9 @@ How to update:
 - qita now derives live event and step counts plus the latest update time from
   committed trace JSONL files while a Run is still active. Finalized Runs keep
   using their validated manifest summary.
+- Subagent runs attach their own trace producer when a trace directory is
+  configured: every Subagent Run writes its events, steps and manifest linked to
+  the immediate parent Run id, finalized on completion, failure and interrupt.
 - Root and recursively launched Subagents now reserve model steps from one durable
   lineage budget before provider admission. Concurrent Subagents cannot oversubscribe
   the remaining allowance, and each active Subagent holds one slot for a final
