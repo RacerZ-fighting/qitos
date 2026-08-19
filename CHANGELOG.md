@@ -19,6 +19,16 @@ How to update:
 
 ### Fixed
 
+- Subagent mailboxes now queue parent messages instead of awaiting turn
+  admission. `AgentSubagentEngine.apost_runtime_event` accepts a message for
+  any active Run — including while a model request or Tool call is in flight
+  and between turns — and returns once the message is queued; journal
+  persistence and steering-queue delivery still settle at the next
+  turn-boundary safe point. Steering a busy Subagent therefore no longer
+  times out behind long turns. Messages still queued when a Run terminalizes
+  are rejected at the terminal boundary without a `runtime_input.posted`
+  record, so acceptance means queued, not guaranteed delivery.
+
 - qita now derives live event and step counts plus the latest update time from
   committed trace JSONL files while a Run is still active. Finalized Runs keep
   using their validated manifest summary.

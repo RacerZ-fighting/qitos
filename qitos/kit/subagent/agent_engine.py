@@ -19,7 +19,7 @@ import asyncio
 import inspect
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, field as dataclass_field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple, Union
 
@@ -54,7 +54,6 @@ from ...core.journal import (
     JournalAppendCancelled,
     JournalCommitError,
     JournalCommitState,
-    JournalError,
     JournalRecordType,
     SessionJournal,
 )
@@ -378,22 +377,17 @@ class _SubagentTurnTransaction(TurnTransactionBoundary):
 
 @dataclass(slots=True)
 class _RuntimeEventReservation:
-    """One ordered parent message awaiting its turn-boundary decision."""
+    """One queued parent message awaiting its turn-boundary decision."""
 
     event: RuntimeInput
     message: UserMessage
-    result: asyncio.Future[bool]
     phase: Literal[
         "pending",
         "appending",
         "committed",
         "rejected",
         "unknown",
-        "withdrawn",
     ] = "pending"
-    withdrawal_requested: asyncio.Event = dataclass_field(
-        default_factory=asyncio.Event
-    )
 
 
 class _AgentSubagentStateView:
@@ -553,7 +547,6 @@ class AgentSubagentEngine:
         self._run_id = ""
         self._cancel_requested = False
         self._runtime_started = asyncio.Event()
-        self._accepting_runtime_events = False
         self._runtime_event_reservations: list[_RuntimeEventReservation] = []
         self._runtime_input_messages: dict[int, str] = {}
         self._runtime_input_injected: list[str] = []
@@ -952,7 +945,6 @@ class AgentSubagentEngine:
 
         async def _observe_run(event: Any) -> None:
             if isinstance(event, TurnStart):
-                self._accepting_runtime_events = True
                 self._runtime_started.set()
             elif isinstance(event, MessageEnd):
                 event_id = self._runtime_input_messages.pop(
@@ -964,12 +956,6 @@ class AgentSubagentEngine:
                 ):
                     self._runtime_input_injected.append(event_id)
             elif isinstance(event, TurnEnd):
-                # Close admission before observing the reservations. No await
-                # separates a post's open-state check from its reservation, so
-                # later posts fail. The existing prepare-next-turn hook then
-                # decides and settles reservations immediately before the
-                # loop's stop checks and steering drain.
-                self._close_runtime_event_admission()
                 # TurnEnd follows the turn's durable commit: every steered
                 # input the turn injected is now covered by a step.committed,
                 # so its consumption becomes durable exactly once.
@@ -986,10 +972,12 @@ class AgentSubagentEngine:
                 initial_task = f"{task}\n\n{_CONCLUSION_FOLLOW_UP}"
             outcome = await agent.prompt(initial_task)
         finally:
-            await self._reject_runtime_event_admissions()
             self._runtime_started.set()
             unsubscribe_observer()
             await _release_budget_holds()
+            # Backstop the AgentEnd observer last so a post queued while the
+            # run was settling still reaches a rejected terminal phase.
+            await self._reject_runtime_event_admissions()
         if isinstance(outcome, AgentRunRejected):
             raise RuntimeError(
                 f"a fresh Subagent rejected its only run: {outcome.reason}"
@@ -1108,19 +1096,22 @@ class AgentSubagentEngine:
         *,
         run_id: Optional[str] = None,
     ) -> bool:
-        """Accept one parent message into the subagent run's steering queue.
+        """Queue one parent message in the subagent run's ordered mailbox.
 
-        Acceptance is durable when the engine keeps a journal and means the
-        message was queued for the next turn safe point. Starting, between-turn
-        and terminal-settlement windows reject. A post made during an open turn
-        first reserves ordered admission; the existing prepare-next-turn hook
-        accepts it only when the one-shot Subagent can continue, and settles the
-        journal plus steering queue before the loop drains that queue. Terminal
-        turns reject without writing a runtime-input record. Once the steered
-        message enters the committed transcript (its ``MessageEnd`` followed by
-        the turn's commit), the engine appends the idempotent
-        ``runtime_input.consumed`` record; a run that ends without injecting
-        the message consumes nothing.
+        ``True`` means the message was accepted into the mailbox, not that it
+        was delivered: persistence (the journal ``runtime_input.posted``
+        record) and steering-queue insertion happen at the next turn-boundary
+        safe point, where the prepare-next-turn hook admits the queue only
+        when the one-shot Subagent can continue. Active runs accept messages
+        at any time, including while a model request or Tool call is in
+        flight and between turns; posts made before the Run id is assigned,
+        after close, or after the run produced a result return ``False``.
+        A message that is still queued when the run terminalizes is rejected
+        at the terminal boundary without a posted record, so acceptance does
+        not guarantee delivery. Once a delivered message enters the committed
+        transcript (its ``MessageEnd`` followed by the turn's commit), the
+        engine appends the idempotent ``runtime_input.consumed`` record; a
+        run that ends without injecting the message consumes nothing.
         """
 
         if not isinstance(event, RuntimeInput):
@@ -1134,49 +1125,20 @@ class AgentSubagentEngine:
             return False
         await self._runtime_started.wait()
         agent = self._agent
-        if agent is None or not self._accepting_runtime_events:
+        if agent is None or self._closed or self._result is not None:
             return False
-        outcome: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        reservation = _RuntimeEventReservation(
-            event=event,
-            message=UserMessage(content=text),
-            result=outcome,
+        # No await separates this terminal-state check from the reservation,
+        # so the boundary settle pass cannot drain the queue in between.
+        self._runtime_event_reservations.append(
+            _RuntimeEventReservation(
+                event=event,
+                message=UserMessage(content=text),
+            )
         )
-        self._runtime_event_reservations.append(reservation)
-        try:
-            return await asyncio.shield(outcome)
-        except asyncio.CancelledError as cancellation:
-            # Pending withdrawal wins without I/O. Once TurnEnd atomically
-            # moves the reservation to appending, durable settlement wins the
-            # race: wait_for observes True if the record committed, while a
-            # rolled-back append preserves the caller's cancellation.
-            if reservation.phase == "pending":
-                reservation.phase = "withdrawn"
-                try:
-                    self._runtime_event_reservations.remove(reservation)
-                except ValueError:
-                    pass
-                if not outcome.done():
-                    outcome.set_result(False)
-                raise
-            reservation.withdrawal_requested.set()
-            while not outcome.done():
-                try:
-                    await asyncio.shield(outcome)
-                except asyncio.CancelledError:
-                    continue
-            accepted = outcome.result()
-            if accepted:
-                return True
-            raise cancellation
-
-    def _close_runtime_event_admission(self) -> None:
-        """Prevent reservations after the current TurnEnd boundary."""
-
-        self._accepting_runtime_events = False
+        return True
 
     async def _reject_runtime_event_admissions(self) -> None:
-        """Reject every reservation when no next-turn safe point exists."""
+        """Reject every queued message when no next-turn safe point exists."""
 
         await self._settle_runtime_event_admissions(accept=False)
 
@@ -1186,28 +1148,21 @@ class AgentSubagentEngine:
         accept: bool,
         agent: Agent | None = None,
     ) -> None:
-        """Settle this turn's ordered reservations at its next-turn hook."""
+        """Settle the queued mailbox at one turn-boundary safe point."""
 
-        self._accepting_runtime_events = False
         while self._runtime_event_reservations:
             reservation = self._runtime_event_reservations.pop(0)
-            if reservation.phase == "withdrawn":
-                continue
             if not accept:
                 self._reject_runtime_event(reservation)
                 continue
             if agent is None:
                 raise RuntimeError("runtime event admission requires an Agent")
-            # This phase transition is the cancellation linearization point;
-            # it occurs before journal append can suspend.
             reservation.phase = "appending"
             await self._accept_runtime_event(reservation, agent)
 
     @staticmethod
     def _reject_runtime_event(reservation: _RuntimeEventReservation) -> None:
         reservation.phase = "rejected"
-        if not reservation.result.done():
-            reservation.result.set_result(False)
 
     def _commit_runtime_event(
         self,
@@ -1219,8 +1174,6 @@ class AgentSubagentEngine:
             reservation.event.event_id
         )
         agent.steer(reservation.message)
-        if not reservation.result.done():
-            reservation.result.set_result(True)
 
     async def _consume_injected_runtime_inputs(self) -> None:
         """Mark each committed steered input consumed once (idempotent)."""
@@ -1270,55 +1223,20 @@ class AgentSubagentEngine:
             _append_settled(),
             name=f"qitos-{self._run_id}-runtime-input-append",
         )
-        withdrawal = asyncio.create_task(
-            reservation.withdrawal_requested.wait(),
-            name=f"qitos-{self._run_id}-runtime-input-withdrawal",
-        )
-        cancelled_for_withdrawal = False
         try:
-            done, _pending = await asyncio.wait(
-                (append, withdrawal),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if withdrawal in done and not append.done():
-                cancelled_for_withdrawal = True
-                append.cancel()
-            try:
-                append_error = await asyncio.shield(append)
-            except asyncio.CancelledError:
-                if cancelled_for_withdrawal:
-                    self._reject_runtime_event(reservation)
-                    return
-                raise
-            except JournalCommitError as exc:
-                self._settle_runtime_event_commit_error(
-                    reservation,
-                    agent,
-                    exc,
-                )
-                return
-            except Exception as exc:
-                reservation.phase = "rejected"
-                if not reservation.result.done():
-                    reservation.result.set_exception(exc)
-                return
-            if append_error is not None:
-                self._settle_runtime_event_append_error(
-                    reservation,
-                    agent,
-                    append_error,
-                )
-                return
+            append_error = await asyncio.shield(append)
         except asyncio.CancelledError:
+            # Run teardown cancels the boundary settle, never the in-flight
+            # journal append: cancel it explicitly and settle from its
+            # durable outcome before re-raising.
             append.cancel()
             try:
                 append_error = await append
             except asyncio.CancelledError:
                 self._reject_runtime_event(reservation)
-            except Exception as exc:
-                reservation.phase = "rejected"
-                if not reservation.result.done():
-                    reservation.result.set_exception(exc)
+            except Exception:
+                # A non-journal fault leaves the durable outcome unknown.
+                reservation.phase = "unknown"
             else:
                 if append_error is None:
                     self._commit_runtime_event(reservation, agent)
@@ -1329,9 +1247,13 @@ class AgentSubagentEngine:
                         append_error,
                     )
             raise
-        finally:
-            withdrawal.cancel()
-            await asyncio.gather(withdrawal, return_exceptions=True)
+        if append_error is not None:
+            self._settle_runtime_event_append_error(
+                reservation,
+                agent,
+                append_error,
+            )
+            return
         self._commit_runtime_event(reservation, agent)
 
     def _settle_runtime_event_append_error(
@@ -1346,25 +1268,15 @@ class AgentSubagentEngine:
             elif error.commit_state is JournalCommitState.NOT_COMMITTED:
                 AgentSubagentEngine._reject_runtime_event(reservation)
             else:
-                AgentSubagentEngine._fail_runtime_event_unknown(reservation, error)
+                # The append's durable outcome is unknown; replay/recovery
+                # decides from the journal whether the input was posted.
+                reservation.phase = "unknown"
             return
         self._settle_runtime_event_commit_error(
             reservation,
             agent,
             error,
         )
-
-    @staticmethod
-    def _fail_runtime_event_unknown(
-        reservation: _RuntimeEventReservation,
-        error: JournalAppendCancelled,
-    ) -> None:
-        reservation.phase = "unknown"
-        if not reservation.result.done():
-            reservation.result.set_exception(
-                error.commit_error
-                or JournalError("runtime input append has unknown durable outcome")
-            )
 
     def _settle_runtime_event_commit_error(
         self,
@@ -1378,8 +1290,6 @@ class AgentSubagentEngine:
             AgentSubagentEngine._reject_runtime_event(reservation)
         else:
             reservation.phase = "unknown"
-            if not reservation.result.done():
-                reservation.result.set_exception(error)
 
     def _attach_trace(
         self,
@@ -1415,7 +1325,6 @@ class AgentSubagentEngine:
         if self._closed:
             return
         self._closed = True
-        self._accepting_runtime_events = False
         self._runtime_started.set()
         agent = self._agent
         if agent is not None:

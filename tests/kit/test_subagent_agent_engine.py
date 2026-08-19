@@ -98,6 +98,18 @@ async def _read_subagent_records(tmp_path, run_id: str):
         await journal.close()
 
 
+def _model_requests_contain_note(model, note: str) -> bool:
+    """Whether any request after the first carries the note as user input."""
+
+    return any(
+        isinstance(message, Mapping)
+        and message.get("role") == "user"
+        and note in str(message.get("content"))
+        for request in model.requests[1:]
+        for message in request.messages
+    )
+
+
 @pytest.mark.asyncio
 async def test_foreground_subagent_completes_and_journals_turns(tmp_path) -> None:
     model = ScriptedModel(
@@ -781,7 +793,10 @@ async def test_parent_message_rejects_pre_run_and_terminal_settlement_windows(
     )
     await asyncio.wait_for(terminal_append_started.wait(), timeout=1)
 
-    assert await engine.apost_runtime_event(event, run_id="run_subagentrace") is False
+    # Acceptance means queued: a post racing terminal settlement still enters
+    # the mailbox, but no turn safe point remains, so the terminal boundary
+    # rejects it without a posted record and without delivery.
+    assert await engine.apost_runtime_event(event, run_id="run_subagentrace") is True
 
     release_terminal_append.set()
     await running
@@ -816,9 +831,12 @@ async def test_parent_message_reserved_before_turn_end_settles_before_terminal(
             return await super().append(record_type, payload, record_id=record_id)
 
     class BoundaryObservedEngine(AgentSubagentEngine):
-        def _close_runtime_event_admission(self):
+        async def _settle_runtime_event_admissions(self, *, accept, agent=None):
             turn_boundary_started.set()
-            super()._close_runtime_event_admission()
+            await super()._settle_runtime_event_admissions(
+                accept=accept,
+                agent=agent,
+            )
 
     model = ScriptedModel(
         [first_response, text_events("answer after parent message")]
@@ -869,8 +887,10 @@ async def test_accepted_parent_message_is_marked_consumed_after_its_turn_commits
     tmp_path,
 ) -> None:
     registry = ToolRegistry().register(_echo)
+    model_started = asyncio.Event()
 
     async def first_response(_request):
+        model_started.set()
         yield ModelStreamEvent(
             type=ModelStreamEventType.COMPLETED,
             finish_reason="tool_calls",
@@ -893,14 +913,12 @@ async def test_accepted_parent_message_is_marked_consumed_after_its_turn_commits
         payload={"content": "reserved note"},
     )
 
-    async def _post_when_started() -> None:
-        while not engine._accepting_runtime_events:
-            await asyncio.sleep(0)
-        assert await engine.apost_runtime_event(event, run_id="run_subagentconsume")
-
-    posting = asyncio.create_task(_post_when_started())
-    result = await engine.arun("inspect", run_id="run_subagentconsume")
-    await posting
+    running = asyncio.create_task(
+        engine.arun("inspect", run_id="run_subagentconsume")
+    )
+    await asyncio.wait_for(model_started.wait(), timeout=1)
+    assert await engine.apost_runtime_event(event, run_id="run_subagentconsume")
+    result = await asyncio.wait_for(running, timeout=1)
     assert result.state.stop_reason == "completed"
     await engine.aclose()
 
@@ -918,74 +936,11 @@ async def test_accepted_parent_message_is_marked_consumed_after_its_turn_commits
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("withdrawal", ["cancel", "timeout"])
-async def test_pending_parent_message_withdrawal_leaves_no_reservation_or_record(
+async def test_parent_message_queues_while_model_turn_is_in_flight(
     tmp_path,
-    withdrawal,
 ) -> None:
     model_started = asyncio.Event()
     release_model = asyncio.Event()
-
-    async def response(_request):
-        model_started.set()
-        await release_model.wait()
-        for event in text_events("done"):
-            yield event
-
-    engine = AgentSubagentEngine(
-        model=ScriptedModel([response]),
-        journal_factory=_subagent_journal_factory(tmp_path),
-    )
-    event = RuntimeInput(
-        event_id=f"parent-message-{withdrawal}",
-        kind="agent.parent.message",
-        correlation_id="subagent",
-        source="qitos.parent",
-        payload={"content": "withdraw this note"},
-    )
-    running = asyncio.create_task(
-        engine.arun("inspect", run_id=f"run_subagent_{withdrawal}")
-    )
-    await asyncio.wait_for(model_started.wait(), timeout=1)
-
-    if withdrawal == "timeout":
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(
-                engine.apost_runtime_event(
-                    event,
-                    run_id=f"run_subagent_{withdrawal}",
-                ),
-                timeout=0.01,
-            )
-    else:
-        posting = asyncio.create_task(
-            engine.apost_runtime_event(
-                event,
-                run_id=f"run_subagent_{withdrawal}",
-            )
-        )
-        while not engine._runtime_event_reservations:
-            await asyncio.sleep(0)
-        posting.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await posting
-
-    release_model.set()
-    result = await asyncio.wait_for(running, timeout=1)
-    assert result.state.stop_reason == "completed"
-    await engine.aclose()
-
-    records = await _read_subagent_records(tmp_path, f"run_subagent_{withdrawal}")
-    assert JournalRecordType.RUNTIME_INPUT_POSTED not in {
-        record.type for record in records
-    }
-
-
-@pytest.mark.asyncio
-async def test_parent_message_append_commit_wins_caller_cancellation(tmp_path) -> None:
-    model_started = asyncio.Event()
-    release_model = asyncio.Event()
-    runtime_append_started = asyncio.Event()
 
     async def first_response(_request):
         model_started.set()
@@ -993,26 +948,133 @@ async def test_parent_message_append_commit_wins_caller_cancellation(tmp_path) -
         for event in text_events("first answer"):
             yield event
 
-    class BlockingRuntimeJournal(JsonlSessionJournal):
+    model = ScriptedModel([first_response, text_events("acknowledged")])
+    engine = AgentSubagentEngine(
+        model=model,
+        journal_factory=_subagent_journal_factory(tmp_path),
+    )
+    event = RuntimeInput(
+        event_id="parent-message-busy",
+        kind="agent.parent.message",
+        correlation_id="subagent",
+        source="qitos.parent",
+        payload={"content": "busy note"},
+    )
+    running = asyncio.create_task(
+        engine.arun("inspect", run_id="run_subagent_busy")
+    )
+    await asyncio.wait_for(model_started.wait(), timeout=1)
+
+    # The model turn is still in flight; mailbox acceptance must not wait
+    # for the turn boundary.
+    accepted = await asyncio.wait_for(
+        engine.apost_runtime_event(event, run_id="run_subagent_busy"),
+        timeout=1,
+    )
+    assert accepted is True
+    assert running.done() is False
+
+    release_model.set()
+    result = await asyncio.wait_for(running, timeout=1)
+    assert result.state.stop_reason == "completed"
+    assert _model_requests_contain_note(model, "busy note")
+    await engine.aclose()
+
+    records = await _read_subagent_records(tmp_path, "run_subagent_busy")
+    assert any(
+        record.type is JournalRecordType.RUNTIME_INPUT_POSTED
+        and record.payload["payload"]["content"] == "busy note"
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_parent_message_posted_between_turns_is_queued_and_delivered(
+    tmp_path,
+) -> None:
+    registry = ToolRegistry().register(_echo)
+    posted_between_turns = asyncio.Event()
+    engine: AgentSubagentEngine
+
+    async def first_response(_request):
+        yield ModelStreamEvent(
+            type=ModelStreamEventType.COMPLETED,
+            finish_reason="tool_calls",
+            tool_calls=[tool_call_wire("c1", "echo", {"text": "wait"})],
+        )
+
+    async def _post_after_first_turn(context) -> None:
+        if context.turn != 0 or posted_between_turns.is_set():
+            return None
+        # Turn 0 has ended and its admission window is closed; the mailbox
+        # still queues the message for the next turn safe point.
+        accepted = await engine.apost_runtime_event(
+            event,
+            run_id="run_subagent_between",
+        )
+        assert accepted is True
+        posted_between_turns.set()
+        return None
+
+    event = RuntimeInput(
+        event_id="parent-message-between",
+        kind="agent.parent.message",
+        correlation_id="subagent",
+        source="qitos.parent",
+        payload={"content": "between turns note"},
+    )
+    model = ScriptedModel([first_response, text_events("acknowledged")])
+    engine = AgentSubagentEngine(
+        model=model,
+        tool_registry=registry,
+        journal_factory=_subagent_journal_factory(tmp_path),
+        prepare_next_turn=_post_after_first_turn,
+    )
+
+    result = await engine.arun("inspect", run_id="run_subagent_between")
+    assert posted_between_turns.is_set()
+    assert result.state.stop_reason == "completed"
+    assert _model_requests_contain_note(model, "between turns note")
+    await engine.aclose()
+
+    records = await _read_subagent_records(tmp_path, "run_subagent_between")
+    assert any(
+        record.type is JournalRecordType.RUNTIME_INPUT_POSTED
+        and record.payload["payload"]["content"] == "between turns note"
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_parent_message_append_commit_wins_journal_cancellation(
+    tmp_path,
+) -> None:
+    model_started = asyncio.Event()
+    release_model = asyncio.Event()
+
+    async def first_response(_request):
+        model_started.set()
+        await release_model.wait()
+        for event in text_events("first answer"):
+            yield event
+
+    class CommitCancelledJournal(JsonlSessionJournal):
         async def append(self, record_type, payload, *, record_id):
+            position = await super().append(
+                record_type,
+                payload,
+                record_id=record_id,
+            )
             if record_type is JournalRecordType.RUNTIME_INPUT_POSTED:
-                position = await super().append(
-                    record_type,
-                    payload,
-                    record_id=record_id,
-                )
-                runtime_append_started.set()
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError as cancellation:
-                    raise JournalAppendCancelled(position) from cancellation
-                return position
-            return await super().append(record_type, payload, record_id=record_id)
+                # The record committed before the append observed its
+                # cancellation; the durable outcome wins the settlement.
+                raise JournalAppendCancelled(position)
+            return position
 
     model = ScriptedModel([first_response, text_events("continued")])
     engine = AgentSubagentEngine(
         model=model,
-        journal_factory=lambda: BlockingRuntimeJournal(_subagents_root(tmp_path)),
+        journal_factory=lambda: CommitCancelledJournal(_subagents_root(tmp_path)),
     )
     event = RuntimeInput(
         event_id="parent-message-commit-wins",
@@ -1025,15 +1087,12 @@ async def test_parent_message_append_commit_wins_caller_cancellation(tmp_path) -
         engine.arun("inspect", run_id="run_subagent_commit_wins")
     )
     await asyncio.wait_for(model_started.wait(), timeout=1)
-    posting = asyncio.create_task(
-        engine.apost_runtime_event(event, run_id="run_subagent_commit_wins")
+    assert (
+        await engine.apost_runtime_event(event, run_id="run_subagent_commit_wins")
+        is True
     )
     release_model.set()
-    await asyncio.wait_for(runtime_append_started.wait(), timeout=1)
 
-    posting.cancel()
-    assert posting.done() is False
-    assert await asyncio.wait_for(posting, timeout=1) is True
     result = await asyncio.wait_for(running, timeout=1)
     assert result.state.stop_reason == "completed"
     assert model.requests[1].messages[-1] == {
@@ -1044,6 +1103,7 @@ async def test_parent_message_append_commit_wins_caller_cancellation(tmp_path) -
 
     records = await _read_subagent_records(tmp_path, "run_subagent_commit_wins")
     record_types = [record.type for record in records]
+    assert record_types.count(JournalRecordType.RUNTIME_INPUT_POSTED) == 1
     assert record_types.index(JournalRecordType.RUNTIME_INPUT_POSTED) < (
         record_types.index(JournalRecordType.RUN_COMPLETED)
     )
@@ -1112,31 +1172,27 @@ async def test_parent_message_accepts_committed_journal_error(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_parent_message_append_rollback_preserves_caller_timeout(
-    tmp_path,
-) -> None:
+async def test_parent_message_append_rollback_is_not_delivered(tmp_path) -> None:
     model_started = asyncio.Event()
     release_model = asyncio.Event()
-    runtime_append_started = asyncio.Event()
 
-    async def response(_request):
+    async def first_response(_request):
         model_started.set()
         await release_model.wait()
-        for event in text_events("done"):
+        for event in text_events("first answer"):
             yield event
 
     class RollingBackRuntimeJournal(JsonlSessionJournal):
         async def append(self, record_type, payload, *, record_id):
             if record_type is JournalRecordType.RUNTIME_INPUT_POSTED:
-                runtime_append_started.set()
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError as cancellation:
-                    raise JournalAppendCancelled(None) from cancellation
+                # The append observed cancellation before anything committed;
+                # the rolled-back message must not be delivered.
+                raise JournalAppendCancelled(None)
             return await super().append(record_type, payload, record_id=record_id)
 
+    model = ScriptedModel([first_response, text_events("continued")])
     engine = AgentSubagentEngine(
-        model=ScriptedModel([response]),
+        model=model,
         journal_factory=lambda: RollingBackRuntimeJournal(
             _subagents_root(tmp_path)
         ),
@@ -1152,16 +1208,15 @@ async def test_parent_message_append_rollback_preserves_caller_timeout(
         engine.arun("inspect", run_id="run_subagent_rollback")
     )
     await asyncio.wait_for(model_started.wait(), timeout=1)
-    posting = asyncio.create_task(
-        engine.apost_runtime_event(event, run_id="run_subagent_rollback")
+    assert (
+        await engine.apost_runtime_event(event, run_id="run_subagent_rollback")
+        is True
     )
     release_model.set()
-    await asyncio.wait_for(runtime_append_started.wait(), timeout=1)
 
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(posting, timeout=0.01)
     result = await asyncio.wait_for(running, timeout=1)
     assert result.state.stop_reason == "completed"
+    assert not _model_requests_contain_note(model, "rolled back note")
     await engine.aclose()
 
     records = await _read_subagent_records(tmp_path, "run_subagent_rollback")
@@ -1187,9 +1242,7 @@ async def test_reserved_parent_message_is_rejected_before_terminal_outcomes(
 ) -> None:
     model_started = asyncio.Event()
     release_model = asyncio.Event()
-    runtime_append_started = asyncio.Event()
-    release_runtime_append = asyncio.Event()
-    turn_boundary_started = asyncio.Event()
+    runtime_append_attempted = asyncio.Event()
 
     async def first_response(_request):
         model_started.set()
@@ -1209,16 +1262,10 @@ async def test_reserved_parent_message_is_rejected_before_terminal_outcomes(
     class BlockingRuntimeJournal(JsonlSessionJournal):
         async def append(self, record_type, payload, *, record_id):
             if record_type is JournalRecordType.RUNTIME_INPUT_POSTED:
-                runtime_append_started.set()
-                await release_runtime_append.wait()
+                runtime_append_attempted.set()
             return await super().append(record_type, payload, record_id=record_id)
 
-    class BoundaryObservedEngine(AgentSubagentEngine):
-        def _close_runtime_event_admission(self):
-            turn_boundary_started.set()
-            super()._close_runtime_event_admission()
-
-    engine = BoundaryObservedEngine(
+    engine = AgentSubagentEngine(
         model=ScriptedModel([first_response]),
         max_turns=1 if terminal_case == "max_turns" else None,
         budget=(
@@ -1240,21 +1287,21 @@ async def test_reserved_parent_message_is_rejected_before_terminal_outcomes(
         engine.arun("inspect", run_id=f"run_subagent_{terminal_case}")
     )
     await asyncio.wait_for(model_started.wait(), timeout=1)
-    posting = asyncio.create_task(
-        engine.apost_runtime_event(
-            event,
-            run_id=f"run_subagent_{terminal_case}",
-        )
+    # Queue semantics: the active run accepts the message into its mailbox;
+    # a run that terminalizes before the next turn safe point rejects the
+    # reservation at the terminal boundary without a posted record.
+    accepted = await engine.apost_runtime_event(
+        event,
+        run_id=f"run_subagent_{terminal_case}",
     )
+    assert accepted is True
     if terminal_case == "cancel":
         engine.cancel("immediate")
     release_model.set()
-    await asyncio.wait_for(turn_boundary_started.wait(), timeout=1)
 
-    assert await asyncio.wait_for(posting, timeout=1) is False
-    assert runtime_append_started.is_set() is False
     result = await asyncio.wait_for(running, timeout=1)
     assert result.state.stop_reason == expected_reason
+    assert runtime_append_attempted.is_set() is False
     await engine.aclose()
 
     records = await _read_subagent_records(tmp_path, f"run_subagent_{terminal_case}")

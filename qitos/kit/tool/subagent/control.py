@@ -180,8 +180,9 @@ class SubagentMessageTool(_SubagentControlTool):
             supervisor=supervisor,
             name="subagent_message",
             description=(
-                "Send context or follow-up instructions to an active Subagent. The Subagent "
-                "accepts the message at its next turn safe point."
+                "Send context or follow-up instructions to an active Subagent. The message "
+                "is queued to the Subagent's mailbox and delivered at its next turn "
+                "safe point."
             ),
             parameters={
                 "content": {
