@@ -126,6 +126,32 @@ async def test_wait_timeout_preserves_running_subagent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_status_reports_live_subagent_progress() -> None:
+    class _ProgressEngine(_MailboxEngine):
+        step_count = 7
+        token_usage = 1234
+        cost_usage_usd = 0.0
+        usage_complete = True
+        cost_complete = True
+
+    engine = _ProgressEngine()
+    supervisor = _supervisor(engine)
+    launched = await _launch(supervisor)
+    await asyncio.wait_for(engine.started.wait(), timeout=1)
+
+    result = await SubagentStatusTool(supervisor).execute(
+        {"subagent_id": launched.handle.subagent_id},
+        runtime_context={"parent_run_id": "parent-run"},
+    )
+
+    assert result["status"] == "success"
+    assert result["subagent_status"] == "running"
+    assert result["steps"] == 7
+    assert result["elapsed_seconds"] >= 0
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_interrupt_reports_subagent_terminal_without_cancelling_tool() -> None:
     engine = _MailboxEngine()
     supervisor = _supervisor(engine)

@@ -29,6 +29,11 @@ How to update:
   are rejected at the terminal boundary without a `runtime_input.posted`
   record, so acceptance means queued, not guaranteed delivery.
 
+- Live Subagent status projections now carry the run's committed steps, token
+  usage and elapsed time: `SubagentSupervisor._current_result` previously left
+  them at zero for running Subagents, so a parent's `subagent_status` poll saw
+  no observable progress and could mistake healthy work for a stall.
+
 - The `subagent` launch Tool accepts an optional `max_steps` argument so the
   model can size each Subagent's step budget to its front; the effective budget
   always narrows to the smaller of the requested value and the configured

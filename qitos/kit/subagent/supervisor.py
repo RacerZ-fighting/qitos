@@ -1162,6 +1162,7 @@ class SubagentSupervisor:
     def _current_result(self, owned: _OwnedSubagent) -> SubagentResult:
         if owned.result is not None:
             return owned.result
+        tokens, cost, usage_complete, cost_complete = self._engine_usage(owned)
         return SubagentResult(
             handle=owned.handle,
             request=owned.request,
@@ -1175,6 +1176,12 @@ class SubagentSupervisor:
                 )
             ),
             subagent_run_id=owned.subagent_run_id,
+            steps=self._engine_steps(owned),
+            total_tokens=tokens,
+            total_cost_usd=cost,
+            usage_complete=usage_complete,
+            cost_complete=cost_complete,
+            elapsed_seconds=self._owned_elapsed_seconds(owned),
         )
 
     @staticmethod
