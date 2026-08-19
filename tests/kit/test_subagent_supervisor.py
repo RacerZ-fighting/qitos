@@ -34,7 +34,7 @@ from qitos.core.journal import (
     JournalRecordType,
     SessionJournal,
 )
-from qitos.core.plan import Plan, PlanContractError, PlanNode, PlanStatus
+from qitos.core.plan import Plan, PlanItem
 from qitos.core.task import Task
 from qitos.kit.subagent import SubagentRunLimiter, SubagentSupervisor
 from qitos.kit.journal import JsonlSessionJournal, recover_session
@@ -82,7 +82,7 @@ async def _seed_parent_plan(
             "parent-task",
             Plan(
                 tuple(
-                    PlanNode(node_id, f"Delegate {node_id}")
+                    PlanItem(f"Delegate {node_id}")
                     for node_id in node_ids
                 )
             )
@@ -993,16 +993,12 @@ async def test_invocation_factory_receives_persisted_subagent_handle(tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_plan_assignment_commits_before_subagent_started(tmp_path) -> None:
-    journal = JsonlSessionJournal(tmp_path / "journal-assignment")
+async def test_subagent_launch_does_not_bind_or_rewrite_the_parent_plan(
+    tmp_path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal-plan-independent")
     await journal.create("parent-run", {})
     await _seed_parent_plan(journal)
-    request = SubagentLaunchRequest(
-        task="inspect",
-        description="inspect task",
-        parent_task_id="parent-task",
-        plan_assignment="delegate",
-    )
     supervisor = SubagentSupervisor(
         invocation_factory=lambda request, _context: _ready_invocation(
             engine=_CompletingEngine(), task=request.task
@@ -1010,212 +1006,22 @@ async def test_plan_assignment_commits_before_subagent_started(tmp_path) -> None
     )
 
     result = await supervisor.launch(
-        request,
+        SubagentLaunchRequest(
+            task="inspect",
+            description="inspect task",
+            parent_task_id="parent-task",
+        ),
         _context(journal=journal),
         background=False,
     )
     records = await journal.replay()
-    assignment_index = next(
-        index
-        for index, record in enumerate(records)
-        if record.type is JournalRecordType.PLAN_UPDATED
-        and record.record_id.endswith(result.handle.subagent_id)
-    )
-    started_index = next(
-        index
-        for index, record in enumerate(records)
-        if record.type is JournalRecordType.SUBAGENT_STARTED
-    )
     recovered = recover_session(records)
 
-    assert assignment_index < started_index
-    assert recovered.plan is not None
-    assigned = recovered.plan.node("delegate")
-    assert assigned.status is PlanStatus.IN_PROGRESS
-    assert assigned.owner == result.handle
-    await supervisor.aclose()
-    await journal.close()
-
-
-@pytest.mark.asyncio
-async def test_parent_plan_requires_explicit_subagent_assignment(tmp_path) -> None:
-    journal = JsonlSessionJournal(tmp_path / "journal-missing-assignment")
-    await journal.create("parent-run", {})
-    await _seed_parent_plan(journal)
-    factory_called = False
-
-    def invocation_factory(request, _context):
-        nonlocal factory_called
-        factory_called = True
-        return _ready_invocation(engine=_CompletingEngine(), task=request.task)
-
-    supervisor = SubagentSupervisor(invocation_factory=invocation_factory)
-    with pytest.raises(PlanContractError, match="requires an explicit"):
-        await supervisor.launch(
-            SubagentLaunchRequest(
-                task="inspect",
-                description="inspect task",
-                parent_task_id="parent-task",
-            ),
-            _context(journal=journal),
-            background=False,
-        )
-
-    assert factory_called is False
-    assert all(
-        record.type is not JournalRecordType.SUBAGENT_STARTED
-        for record in await journal.replay()
-    )
-
-    result = await supervisor.launch(
-        SubagentLaunchRequest(
-            task="inspect",
-            description="inspect task",
-            parent_task_id="parent-task",
-            plan_assignment="delegate",
-        ),
-        _context(journal=journal),
-        background=False,
-    )
     assert result.status is SubagentStatus.COMPLETED
-    await supervisor.aclose()
-    await journal.close()
-
-
-@pytest.mark.asyncio
-async def test_parent_task_without_plan_allows_unassigned_subagent(tmp_path) -> None:
-    journal = JsonlSessionJournal(tmp_path / "journal-no-parent-plan")
-    await journal.create("parent-run", {})
-    await journal.append(
-        JournalRecordType.TASK_CREATED,
-        encode_task_created(Task(task_id="parent-task", objective="Parent work")),
-        record_id="parent-run:task:parent-task:created",
-    )
-    supervisor = SubagentSupervisor(
-        invocation_factory=lambda request, _context: _ready_invocation(
-            engine=_CompletingEngine(), task=request.task
-        )
-    )
-
-    result = await supervisor.launch(
-        SubagentLaunchRequest(
-            task="inspect",
-            description="inspect task",
-            parent_task_id="parent-task",
-        ),
-        _context(journal=journal),
-        background=False,
-    )
-
-    assert result.status is SubagentStatus.COMPLETED
-    await supervisor.aclose()
-    await journal.close()
-
-
-@pytest.mark.asyncio
-async def test_concurrent_subagent_assignments_preserve_independent_owners(
-    tmp_path,
-) -> None:
-    journal = JsonlSessionJournal(tmp_path / "journal-concurrent-assignment")
-    await journal.create("parent-run", {})
-    await _seed_parent_plan(journal, ("first", "second"))
-    supervisor = SubagentSupervisor(
-        invocation_factory=lambda request, _context: _ready_invocation(
-            engine=_CompletingEngine(), task=request.task
-        )
-    )
-
-    results = await asyncio.gather(
-        *(
-            supervisor.launch(
-                SubagentLaunchRequest(
-                    task=node_id,
-                    description=f"{node_id} task",
-                    parent_task_id="parent-task",
-                    plan_assignment=node_id,
-                ),
-                _context(journal=journal),
-                background=True,
-            )
-            for node_id in ("first", "second")
-        )
-    )
-    recovered = recover_session(await journal.replay())
-
-    assert recovered.plan is not None
-    assert {
-        recovered.plan.node(node_id).owner for node_id in ("first", "second")
-    } == {result.handle for result in results}
-    await asyncio.gather(*(supervisor.wait(result.handle) for result in results))
-    await supervisor.aclose()
-    await journal.close()
-
-
-@pytest.mark.asyncio
-async def test_unknown_plan_assignment_never_constructs_subagent(tmp_path) -> None:
-    journal = JsonlSessionJournal(tmp_path / "journal-invalid-assignment")
-    await journal.create("parent-run", {})
-    await _seed_parent_plan(journal)
-    factory_called = False
-
-    def invocation_factory(request, _context):
-        nonlocal factory_called
-        factory_called = True
-        return _ready_invocation(engine=_CompletingEngine(), task=request.task)
-
-    supervisor = SubagentSupervisor(invocation_factory=invocation_factory)
-    with pytest.raises(ValueError, match="Unknown Plan node"):
-        await supervisor.launch(
-            SubagentLaunchRequest(
-                task="inspect",
-                description="inspect task",
-                parent_task_id="parent-task",
-                plan_assignment="missing",
-            ),
-            _context(journal=journal),
-            background=False,
-        )
-
-    assert factory_called is False
-    assert all(
-        record.type is not JournalRecordType.SUBAGENT_STARTED
-        for record in await journal.replay()
-    )
-    await supervisor.aclose()
-    await journal.close()
-
-
-@pytest.mark.asyncio
-async def test_subagent_started_failure_releases_plan_assignment(tmp_path) -> None:
-    journal = _FailingSubagentJournal(
-        tmp_path / "journal-release-assignment",
-        fail_type=JournalRecordType.SUBAGENT_STARTED,
-    )
-    await journal.create("parent-run", {})
-    await _seed_parent_plan(journal)
-    supervisor = SubagentSupervisor(
-        invocation_factory=lambda request, _context: _ready_invocation(
-            engine=_CompletingEngine(), task=request.task
-        )
-    )
-
-    with pytest.raises(SubagentPersistenceError, match="was not executed"):
-        await supervisor.launch(
-            SubagentLaunchRequest(
-                task="inspect",
-                description="inspect task",
-                parent_task_id="parent-task",
-                plan_assignment="delegate",
-            ),
-            _context(journal=journal),
-            background=False,
-        )
-    recovered = recover_session(await journal.replay())
-
-    assert recovered.plan is not None
-    released = recovered.plan.node("delegate")
-    assert released.status is PlanStatus.PENDING
-    assert released.owner is None
+    assert recovered.plan == Plan((PlanItem("Delegate delegate"),))
+    assert sum(
+        record.type is JournalRecordType.PLAN_UPDATED for record in records
+    ) == 1
     await supervisor.aclose()
     await journal.close()
 
@@ -1645,7 +1451,7 @@ async def test_recovery_rejects_terminal_run_id_that_conflicts_with_start(
 
 
 @pytest.mark.asyncio
-async def test_recovery_decodes_legacy_child_lifecycle_records(tmp_path) -> None:
+async def test_recovery_decodes_legacy_subagent_wire_records(tmp_path) -> None:
     journal = JsonlSessionJournal(tmp_path / "journal")
     await journal.create("parent-run", {})
     request = _request()

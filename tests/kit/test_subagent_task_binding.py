@@ -10,7 +10,6 @@ from qitos.core.subagent import (
     SubagentStatus,
 )
 from qitos.core.journal import JournalRecordType
-from qitos.core.plan import Plan, PlanNode
 from qitos.core.task import Task, TaskBudget, TaskReference
 from qitos.kit.subagent import (
     SubagentSupervisor,
@@ -19,7 +18,6 @@ from qitos.kit.subagent import (
 from qitos.kit.journal import JsonlSessionJournal, recover_session
 from qitos.kit.journal.turn_recorder import (
     decode_task_created,
-    encode_plan_updated,
     encode_task_created,
 )
 
@@ -58,15 +56,6 @@ async def test_subagent_journal_commits_narrowed_task_before_input(tmp_path) -> 
         encode_task_created(Task(task_id="root-task", objective="Root work")),
         record_id="parent-run:task:root-task:created",
     )
-    await parent_journal.append(
-        JournalRecordType.PLAN_UPDATED,
-        encode_plan_updated(
-            "root-task",
-            Plan((PlanNode("plan-node-1", "Enumerate the target"),))
-        ),
-        record_id="parent-run:plan:initial",
-    )
-
     request = SubagentLaunchRequest(
         task="enumerate the target",
         description="enumeration subagent",
@@ -77,7 +66,6 @@ async def test_subagent_journal_commits_narrowed_task_before_input(tmp_path) -> 
         ),
         budget=TaskBudget(max_steps=11),
         parent_task_id="root-task",
-        plan_assignment="plan-node-1",
     )
     result = await supervisor.launch(
         request,
@@ -94,7 +82,7 @@ async def test_subagent_journal_commits_narrowed_task_before_input(tmp_path) -> 
     assert len(started) == 1
     embedded = started[0].payload["request"]
     assert embedded["parent_task_id"] == "root-task"
-    assert embedded["plan_assignment"] == "plan-node-1"
+    assert "plan_assignment" not in embedded
 
     records = await _read_records(_subagents_root(tmp_path), result.subagent_run_id)
     ordering = [record.type for record in records]
@@ -117,7 +105,6 @@ async def test_subagent_journal_commits_narrowed_task_before_input(tmp_path) -> 
     )
     assert definition.budget == TaskBudget(max_steps=11)
     assert definition.created_by_run_id == "parent-run"
-    assert definition.plan_assignment == "plan-node-1"
 
     recovered = recover_session(records)
     projected = recovered.tasks[result.handle.subagent_id]
@@ -131,7 +118,7 @@ async def test_subagent_journal_commits_narrowed_task_before_input(tmp_path) -> 
 
 
 @pytest.mark.asyncio
-async def test_subagent_launch_defaults_keep_task_binding_empty(tmp_path) -> None:
+async def test_subagent_launch_allows_no_parent_task_binding(tmp_path) -> None:
     model = ScriptedModel([text_events("subagent answer")])
     supervisor = SubagentSupervisor(
         invocation_factory=build_agent_subagent_invocation_factory(
@@ -154,5 +141,4 @@ async def test_subagent_launch_defaults_keep_task_binding_empty(tmp_path) -> Non
     definition = decode_task_created(created.payload)
     assert definition.task_id == result.handle.subagent_id
     assert definition.parent_task_id is None
-    assert definition.plan_assignment is None
     await supervisor.aclose()

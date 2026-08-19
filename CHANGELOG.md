@@ -55,6 +55,12 @@ How to update:
 
 ### Breaking
 
+- `Plan` is now a replaceable progress checklist of `PlanItem(step, status)` values,
+  matching the model-facing `update_plan` shape. Dependency nodes, readiness, owners,
+  transition rules and `plan_assignment` are removed from the current API; Plan no
+  longer schedules Subagents or gates Task completion. Existing graph snapshots and
+  Task/Subagent payloads with `plan_assignment` have one-way read migration into the
+  new projection and are never emitted again.
 - Custom `TurnTransactionBoundary` implementations must implement
   `turn_input_committed(turn, messages)`. Exhaustive handlers for the closed
   `Message` union must also handle `ContextMessage`.
@@ -240,7 +246,7 @@ How to update:
   definition (`task_id`, optional `parent_task_id`, `objective`,
   `success_criteria`, string `constraints`, stable typed `references`
   (`TaskReference`, no filesystem probing), `budget`, `created_at` UTC
-  provenance, `created_by_run_id`, optional `plan_assignment`) plus
+  provenance and `created_by_run_id`) plus
   `TaskStatus` / `TaskBlocker` / `TaskLifecycle` lifecycle values with
   invariant validation (blocker exactly while blocked, terminal reason
   exactly at a terminal status) and exact fail-closed codecs throughout.
@@ -261,25 +267,15 @@ How to update:
   leg advances carry Task facts that would otherwise be truncated by the
   fork boundary. Prompting a task-bearing Session whose Root Task is
   terminal rejects with `AgentRunRejected("task_terminal")`; taskless
-  Sessions are unchanged. Subagent launch binds the narrowed Subagent Task
-  durably: `SubagentLaunchRequest` carries `parent_task_id` / `plan_assignment`
-  fields, the façade Subagent engine commits the Subagent `task.created` before its
-  `input.accepted`, and the Agent Tool binds a new assignment explicitly
-  instead of copying the parent's assignment.
-- **Dependency-aware durable Plan (S3b).** `qitos.core.plan` replaces the flat
-  checklist with immutable `Plan` / `PlanNode` / `PlanStatus` contracts: stable
-  node ids, dependencies, optional typed `SubagentHandle` owners, derived readiness,
-  topological rendering, cycle/reference checks, legal whole-graph replacements,
-  and at most one in-progress node per owner. Task-bound `plan.updated` records are
-  the sole Plan truth and pure recovery folds each Task's graph through fork lineage,
-  so a terminal follow-up starts without the previous Task's Plan. `UpdatePlanTool`
-  commits accepted replacements through the current Session journal; models cannot
-  invent a Subagent owner. Agent Tool calls may name a ready `plan_assignment`; the
-  supervisor commits the generated handle before `subagent.started` and durably
-  releases it if admission fails. A Subagent launched for a parent Task with a durable
-  Plan must name an explicit assignment, while no-Plan Tasks may still launch an
-  unassigned Subagent. Root and Subagent use this one optional contract,
-  while a dependency-free Subagent Plan renders as an ordinary TODO.
+  Sessions are unchanged. Subagent launch durably commits the narrowed Subagent Task,
+  whose `SubagentLaunchRequest` carries `parent_task_id`, before `input.accepted`.
+- **Durable progress-checklist Plan (S3b).** `qitos.core.plan` provides immutable
+  `Plan` / `PlanItem` / `PlanStatus` contracts matching `update_plan`: each item has a
+  concise step description and display status, with at most one item in progress.
+  Task-bound `plan.updated` records are the sole Plan truth and pure recovery folds each
+  Task's latest replacement through fork lineage, so a terminal follow-up starts without
+  the previous Task's Plan. Root and Subagent use this one optional contract; Plan does
+  not express dependencies, ownership, assignment, scheduling or completion truth.
 - **Subagent product-binding and conclusion contracts.** `SubagentLaunchRequest` now carries
   explicit success criteria, Task constraints/references and a frozen
   `ToolPermissionContext`; all fields use the strict durable codec and the façade Subagent
@@ -289,6 +285,10 @@ How to update:
   copying a Subagent transcript. Recursive Agent Tools can share one Root-owned
   `SubagentRunLimiter`, while independent concurrency-safe Agent calls remain ordered at
   the parent ToolResult boundary.
+- **Independent active and cumulative Subagent limits.** `SubagentRunLimiter` accepts
+  `max_subagents=None` as an unbounded cumulative launch budget while continuing to
+  enforce `max_active_subagents`. Terminal Subagents immediately return active capacity;
+  an explicit cumulative limit still includes restored launch history.
 - **Committed Tool-transaction projection.**
   `qitos.kit.journal.committed_tool_transactions` returns only canonical Tool terminals
   referenced by `step.committed`, follows inherited record origins and fails closed on
@@ -299,7 +299,7 @@ How to update:
 
 - **Flat WorkPlan replaced in place (S3b).** `WorkPlanState`, `WorkPlanItem`,
   `WorkPlanStatus`, `WorkPlanUpdate`, `UpdateWorkPlanTool` and their codecs/reducer
-  are removed rather than aliased. Use `Plan`, `PlanNode`, `PlanStatus`,
+  are removed rather than aliased. Use `Plan`, `PlanItem`, `PlanStatus`,
   `PlanUpdate`, `UpdatePlanTool` and the Plan codecs. `SubagentLaunchRequest.from_dict`
   now requires the canonical task/product-binding keys, including `success_criteria`,
   `constraints`, `references`, `permission_context` and explicit `null` values.
@@ -319,7 +319,7 @@ How to update:
 
 ### Changed
 
-- **Breaking:** The public Child-Agent vocabulary is now consistently `Subagent`:
+- **Breaking:** The public Agent-delegation vocabulary is now consistently `Subagent`:
   `qitos.core.subagent`, `qitos.kit.subagent`, `qitos.kit.tool.subagent`,
   `SubagentTool`, `SubagentSupervisor`, `SubagentHandle`, `SubagentResult`, and the
   `subagent_*` control Tools replace the old names. New journals and runtime inputs use

@@ -37,7 +37,6 @@ def test_task_round_trip_full_definition() -> None:
         budget=TaskBudget(max_steps=20, max_tokens=5000),
         created_at="2026-08-17T10:00:00+00:00",
         created_by_run_id="run-9",
-        plan_assignment="plan-node-3",
     )
     payload = task.to_dict()
     restored = Task.from_dict(payload)
@@ -51,7 +50,6 @@ def test_task_round_trip_defaults() -> None:
     assert Task.from_dict(task.to_dict()) == task
     payload = task.to_dict()
     assert payload["parent_task_id"] is None
-    assert payload["plan_assignment"] is None
     assert payload["success_criteria"] == []
     assert payload["constraints"] == {}
     assert payload["references"] == []
@@ -70,7 +68,6 @@ def test_task_created_at_default_is_utc_iso() -> None:
         ("objective", "  "),
         ("parent_task_id", ""),
         ("created_by_run_id", ""),
-        ("plan_assignment", ""),
     ],
 )
 def test_task_rejects_empty_identity_text(field: str, value: str) -> None:
@@ -112,6 +109,15 @@ def test_task_from_dict_fail_closed_on_key_sets() -> None:
         Task.from_dict({**payload, "metadata": {}})
     with pytest.raises(ValueError):
         Task.from_dict({**payload, "resources": []})
+
+
+def test_task_from_dict_discards_retired_plan_assignment() -> None:
+    task = _task()
+
+    restored = Task.from_dict({**task.to_dict(), "plan_assignment": "legacy-node"})
+
+    assert restored == task
+    assert "plan_assignment" not in restored.to_dict()
 
 
 def test_task_from_dict_fail_closed_on_value_types() -> None:

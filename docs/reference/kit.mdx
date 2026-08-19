@@ -61,15 +61,14 @@ Use this page as a capability map for QitOS authoring.
 
 ### Planning
 
-- `UpdatePlanTool` / `update_plan` commits a complete dependency-aware Plan to the
-  current Session journal. Nodes have stable ids, dependencies, explicit durable
-  states, and optional Subagent owners. Readiness is derived from completed dependencies.
-  An empty Plan has no TODO projection; a Plan without dependencies or owners renders
-  as a plain TODO list.
+- `UpdatePlanTool` / `update_plan` commits a complete progress checklist to the current
+  Session journal. Each item has a concise `step` description and
+  `pending | in_progress | completed` display status; an update may add, remove, rewrite,
+  or reorder items and may include one update-level explanation. At most one item may be
+  in progress. An empty Plan has no TODO projection.
 
-Subagent ownership is not model-authored. Pass a ready node id as the `subagent` Tool's
-`plan_assignment`; the Subagent supervisor commits the generated handle to the Plan before
-it writes `subagent.started`.
+Plan is not a dependency graph, Subagent scheduler, or completion gate. Subagent launch
+and lifecycle are recorded independently of the current Plan.
 
 ---
 
@@ -499,7 +498,7 @@ registry.register_toolset(SubagentControlToolSet(tool.supervisor), namespace="")
 ```
 
 The model-facing arguments are `description`, `prompt`, `success_criteria`, optional
-`name`, optional `subagent_type`, and optional `plan_assignment`. The supervisor awaits
+`name`, and optional `subagent_type`. The supervisor awaits
 the invocation factory, so construction can
 acquire run-scoped resources without blocking the event loop. Each factory call must
 resolve to an independent Agent; sharing a mutable history or model client between
@@ -560,6 +559,13 @@ inputs is owned by `qitos.kit.session.SessionHarness`: it re-projects them exact
 once from the recovered journal's own records while inherited fork facts are never
 redelivered. Foreground results are
 returned only through the original Agent ToolResult.
+
+A shared `SubagentRunLimiter` always enforces `max_active_subagents` across the recursive
+Run tree. Its optional `max_subagents` value separately limits cumulative launches;
+`None` leaves cumulative launches unbounded. Terminal Subagents therefore free active
+capacity for later launches while their durable handles and conclusions remain
+queryable. Recovery restores launch history for an explicit cumulative budget without
+restoring terminal Subagents as active.
 
 `active_background_count`, `subagent_result(handle)`, `wait_subagent(handle)`,
 `interrupt_subagent(handle)`, `cancel_subagent(handle)`,

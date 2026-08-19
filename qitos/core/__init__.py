@@ -124,14 +124,13 @@ from .tool_schema import function_schema, type_to_json_schema, parse_docstring
 from .function_tool_decorator import function_tool
 from .tool_registry import ToolExposure, ToolRegistry
 from .plan import (
-    MAX_PLAN_DESCRIPTION_CHARS,
     MAX_PLAN_EXPLANATION_CHARS,
-    MAX_PLAN_NODE_ID_CHARS,
-    MAX_PLAN_NODES,
+    MAX_PLAN_ITEMS,
+    MAX_PLAN_STEP_CHARS,
     UPDATE_PLAN_TOOL_NAME,
     Plan,
     PlanContractError,
-    PlanNode,
+    PlanItem,
     PlanStatus,
     PlanUpdate,
     parse_plan_update,
@@ -139,7 +138,6 @@ from .plan import (
     plan_to_dict,
     reduce_plan,
     render_plan_markdown,
-    validate_plan_transition,
 )
 from .cancellation import CancelMode, CancelSignalView, CancelToken
 from .message import (
@@ -333,14 +331,13 @@ __all__ = [
     "function_tool",
     "ToolRegistry",
     "ToolExposure",
-    "MAX_PLAN_DESCRIPTION_CHARS",
     "MAX_PLAN_EXPLANATION_CHARS",
-    "MAX_PLAN_NODE_ID_CHARS",
-    "MAX_PLAN_NODES",
+    "MAX_PLAN_ITEMS",
+    "MAX_PLAN_STEP_CHARS",
     "UPDATE_PLAN_TOOL_NAME",
     "Plan",
     "PlanContractError",
-    "PlanNode",
+    "PlanItem",
     "PlanStatus",
     "PlanUpdate",
     "parse_plan_update",
@@ -348,7 +345,6 @@ __all__ = [
     "plan_to_dict",
     "reduce_plan",
     "render_plan_markdown",
-    "validate_plan_transition",
     "CancelMode",
     "CancelSignalView",
     "CancelToken",

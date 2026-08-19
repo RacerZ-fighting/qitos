@@ -39,7 +39,7 @@ from ...core.message import (
     ToolResultMessage,
     UserMessage,
 )
-from ...core.plan import Plan, validate_plan_transition
+from ...core.plan import Plan
 from ...core.runtime_input import RuntimeInput
 from ...core.task import Task, TaskLifecycle, TaskStatus
 from ...core.thinking import ThinkingLevel
@@ -637,7 +637,6 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                     raise JournalCorruptionError(
                         "plan.updated references an unknown task"
                     )
-                validate_plan_transition(plans.get(task_id), proposed)
                 plans[task_id] = proposed
             elif record_type in (
                 JournalRecordType.RUN_COMPLETED,

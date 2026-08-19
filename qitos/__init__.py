@@ -48,7 +48,7 @@ from .core.artifact import ArtifactRef, ArtifactStore, ArtifactStoreError
 from .core.plan import (
     Plan,
     PlanContractError,
-    PlanNode,
+    PlanItem,
     PlanStatus,
     PlanUpdate,
     parse_plan_update,
@@ -56,7 +56,6 @@ from .core.plan import (
     plan_to_dict,
     reduce_plan,
     render_plan_markdown,
-    validate_plan_transition,
 )
 from .core.spec import BenchmarkRunResult, ExperimentSpec, RunSpec
 from .core.task import (
@@ -140,7 +139,7 @@ __all__ = [
     "TaskStatus",
     "Plan",
     "PlanContractError",
-    "PlanNode",
+    "PlanItem",
     "PlanStatus",
     "PlanUpdate",
     "parse_plan_update",
@@ -148,7 +147,6 @@ __all__ = [
     "plan_to_dict",
     "reduce_plan",
     "render_plan_markdown",
-    "validate_plan_transition",
     "Memory",
     "ModelResponse",
     "ModelContinuation",

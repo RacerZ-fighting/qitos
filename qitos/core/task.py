@@ -268,7 +268,6 @@ class Task:
     budget: TaskBudget = field(default_factory=TaskBudget)
     created_at: str = field(default_factory=_utc_now_iso)
     created_by_run_id: str | None = None
-    plan_assignment: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.task_id, str) or not self.task_id.strip():
@@ -277,7 +276,6 @@ class Task:
             raise ValueError("Task.objective must be a non-empty string")
         _optional_text(self.parent_task_id, "Task.parent_task_id")
         _optional_text(self.created_by_run_id, "Task.created_by_run_id")
-        _optional_text(self.plan_assignment, "Task.plan_assignment")
         if not isinstance(self.success_criteria, tuple) or any(
             not isinstance(item, str) or not item.strip()
             for item in self.success_criteria
@@ -323,7 +321,6 @@ class Task:
             "budget": self.budget.to_dict(),
             "created_at": self.created_at,
             "created_by_run_id": self.created_by_run_id,
-            "plan_assignment": self.plan_assignment,
         }
 
     @classmethod
@@ -338,9 +335,8 @@ class Task:
             "budget",
             "created_at",
             "created_by_run_id",
-            "plan_assignment",
         }
-        if set(value) != expected:
+        if set(value) not in (expected, expected | {"plan_assignment"}):
             raise ValueError("Task fields are invalid")
         raw_criteria = value["success_criteria"]
         raw_constraints = value["constraints"]
@@ -368,7 +364,6 @@ class Task:
             budget=TaskBudget.from_dict(raw_budget),
             created_at=value["created_at"],
             created_by_run_id=value["created_by_run_id"],
-            plan_assignment=value["plan_assignment"],
         )
 
 

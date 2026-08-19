@@ -5,7 +5,7 @@
 Accepted migration plan on 2026-08-16. The target contracts are defined by the
 [QitOS Agent runtime architecture](../architecture/agent-runtime.md). The minimal loop,
 façade, retired-runtime deletion slices, S1 parity items, the authoritative
-Session/Harness (S2), goal-bearing Task (S3a), and dependency-aware Plan (S3b) are
+Session/Harness (S2), goal-bearing Task (S3a), and progress-checklist Plan (S3b) are
 implemented on the migration branch. The branch has passed its independent pytest,
 flake8 and mypy gates for S1-S3. Cross-repository integration hardening has since added
 Subagent product hooks, authorization/task binding, committed transaction queries and a
@@ -162,7 +162,7 @@ S3a (Task), done on `feat/pi-aligned-agent-loop`:
 - (done) Replaced `core/task.py` in place with the goal-bearing Task of
   architecture §5: immutable definition (task id, optional parent task id,
   objective, success criteria, string constraints, stable typed references,
-  budget, creation provenance, optional parent Plan assignment reference)
+  budget and creation provenance)
   plus durable lifecycle (`active|blocked|completed|failed|cancelled`,
   usage, typed blocker/terminal reason) committed as `task.created` /
   `task.transition`.
@@ -177,24 +177,21 @@ S3a (Task), done on `feat/pi-aligned-agent-loop`:
   (`unblock_task` is the only blocked → active path; run termination never
   auto-transitions the Task; `start_follow_up` starts a new Task explicitly
   on a terminal-task lineage); Subagent launch commits the narrowed Subagent Task
-  into the Subagent journal before its `input.accepted`. Remainder for S3b:
-  binding `plan_assignment` to a real parent Plan node and parent-side
-  narrowing enforcement of the Subagent Task.
+  into the Subagent journal before its `input.accepted`.
 
 S3b (Plan), done on `feat/pi-aligned-agent-loop`:
 
-- (done) Replaced `core/work_plan.py` in place with the dependency-aware graph:
-  stable node ids, dependencies, owners, explicit state, derived readiness,
-  per-owner in-progress limits, cycle/reference/transition validation.
-- (done) Kept one optional Plan contract for Root and Subagent: Root normally uses the full
-  dependency/owner graph; a simple Subagent may have no Plan or a flat graph whose
-  deterministic projection is a TODO. Parent and Subagent Plans never merge.
+- (done) Replaced `core/work_plan.py` in place with a small replaceable checklist:
+  each item has a concise `step` description and `pending | in_progress | completed`
+  status, with at most one item in progress.
+- (done) Kept one optional Plan contract for Root and Subagent. A Subagent may have no
+  Plan; Parent and Subagent Plans never merge.
 - (done) Every accepted update commits one Task-bound `plan.updated` record; recovery
   replays each Task's latest committed update through the lineage, so terminal
-  follow-up starts without the previous Task's Plan; TODO Markdown is the deterministic
-  topological projection.
-- (done) Reworked the `update_plan` tool onto the graph contract and bound Subagent launch
-  to a parent Plan assignment.
+  follow-up starts without the previous Task's Plan; TODO Markdown is its deterministic
+  projection.
+- (done) Reworked `update_plan` as whole-checklist replacement. Plan no longer expresses
+  dependency, readiness, Subagent owner/assignment or Task-completion state.
 
 Done when Task, Session, Run, Plan and Subagent identities stay distinct across
 recovery, and no TaskV2/Goal mirror or compatibility Plan remains.

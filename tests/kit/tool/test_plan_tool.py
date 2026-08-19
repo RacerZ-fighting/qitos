@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from qitos.core import SubagentHandle, PlanContractError, PlanStatus
+from qitos.core import Plan, PlanContractError, PlanStatus
 from qitos.core.journal import JournalRecordType
 from qitos.core.task import Task
 from qitos.core.tool_registry import ToolRegistry
@@ -12,8 +12,8 @@ from qitos.kit.journal import (
     recover_session,
 )
 from qitos.kit.journal.turn_recorder import encode_task_created
-from qitos.kit.tool.planning import UpdatePlanTool
 from qitos.kit.session import SessionHarness
+from qitos.kit.tool.planning import UpdatePlanTool
 
 from tests.core.agent_fakes import (
     ScriptedModel,
@@ -34,29 +34,17 @@ async def _journal() -> InMemorySessionJournal:
     return journal
 
 
-def _node(
-    node_id: str,
-    *,
-    status: str = "pending",
-    dependencies: list[str] | None = None,
-    owner: dict[str, str] | None = None,
-) -> dict[str, object]:
-    return {
-        "node_id": node_id,
-        "description": f"Work on {node_id}",
-        "status": status,
-        "dependencies": dependencies or [],
-        "owner": owner,
-    }
+def _item(step: str, *, status: str = "pending") -> dict[str, str]:
+    return {"step": step, "status": status}
 
 
 @pytest.mark.asyncio
-async def test_update_plan_tool_commits_whole_graph_to_the_journal() -> None:
+async def test_update_plan_tool_commits_whole_checklist_to_the_journal() -> None:
     journal = await _journal()
     arguments = {
         "plan": [
-            _node("collect", status="completed"),
-            _node("verify", dependencies=["collect"]),
+            _item("Collect evidence", status="completed"),
+            _item("Verify result"),
         ],
         "explanation": "Evidence collected",
     }
@@ -73,7 +61,10 @@ async def test_update_plan_tool_commits_whole_graph_to_the_journal() -> None:
 
     assert result["plan"] == arguments["plan"]
     assert recovered.plan is not None
-    assert recovered.plan.ready_node_ids == ("verify",)
+    assert tuple(item.step for item in recovered.plan.items) == (
+        "Collect evidence",
+        "Verify result",
+    )
     assert any(
         record.type is JournalRecordType.PLAN_UPDATED
         for record in await journal.replay()
@@ -84,12 +75,10 @@ async def test_update_plan_tool_commits_whole_graph_to_the_journal() -> None:
 async def test_update_plan_tool_commits_inside_the_agent_tool_transaction(
     tmp_path,
 ) -> None:
-    arguments = {"plan": [_node("inspect")]}
+    arguments = {"plan": [_item("Inspect target")]}
     model = ScriptedModel(
         [
-            tool_events(
-                [tool_call_wire("plan-call", "update_plan", arguments)]
-            ),
+            tool_events([tool_call_wire("plan-call", "update_plan", arguments)]),
             text_events("done"),
         ]
     )
@@ -104,7 +93,7 @@ async def test_update_plan_tool_commits_inside_the_agent_tool_transaction(
     ordering = [record.type for record in records]
 
     assert session_run.plan is not None
-    assert session_run.plan.node("inspect").status is PlanStatus.PENDING
+    assert session_run.plan.items[0].status is PlanStatus.PENDING
     assert ordering.index(JournalRecordType.TOOL_STARTED) < ordering.index(
         JournalRecordType.PLAN_UPDATED
     )
@@ -118,12 +107,10 @@ async def test_update_plan_tool_commits_inside_the_agent_tool_transaction(
 async def test_terminal_follow_up_starts_without_the_previous_tasks_plan(
     tmp_path,
 ) -> None:
-    arguments = {"plan": [_node("inspect")]}
+    arguments = {"plan": [_item("Inspect target")]}
     model = ScriptedModel(
         [
-            tool_events(
-                [tool_call_wire("plan-call", "update_plan", arguments)]
-            ),
+            tool_events([tool_call_wire("plan-call", "update_plan", arguments)]),
             text_events("first done"),
             text_events("follow-up done"),
         ]
@@ -146,17 +133,17 @@ async def test_terminal_follow_up_starts_without_the_previous_tasks_plan(
     assert session_run.task is not None
     assert session_run.task.task_id == "task-second"
     assert session_run.plan is None
-    assert recovered.plans["task-first"].node("inspect").status is PlanStatus.PENDING
+    assert recovered.plans["task-first"].items[0].status is PlanStatus.PENDING
     assert "task-second" not in recovered.plans
     await session_run.close()
 
 
 @pytest.mark.asyncio
-async def test_update_plan_tool_rejects_history_rewrite() -> None:
+async def test_update_plan_tool_allows_rewriting_or_clearing_current_steps() -> None:
     journal = await _journal()
     tool = UpdatePlanTool()
     await tool.execute(
-        {"plan": [_node("keep")]},
+        {"plan": [_item("Initial approach", status="in_progress")]},
         runtime_context={
             "journal": journal,
             "tool_call_id": "first",
@@ -164,52 +151,30 @@ async def test_update_plan_tool_rejects_history_rewrite() -> None:
         },
     )
 
-    with pytest.raises(PlanContractError):
-        await tool.execute(
-            {"plan": []},
-            runtime_context={
-                "journal": journal,
-                "tool_call_id": "second",
-                "task_id": "task-plan",
-            },
-        )
+    result = await tool.execute(
+        {"plan": []},
+        runtime_context={
+            "journal": journal,
+            "tool_call_id": "second",
+            "task_id": "task-plan",
+        },
+    )
 
-
-@pytest.mark.asyncio
-async def test_update_plan_tool_cannot_invent_a_subagent_owner() -> None:
-    journal = await _journal()
-    owner = SubagentHandle("child-a", "run-plan-tool")
-
-    with pytest.raises(PlanContractError):
-        await UpdatePlanTool().execute(
-            {
-                "plan": [
-                    _node(
-                        "delegated",
-                        status=PlanStatus.IN_PROGRESS.value,
-                        owner=owner.to_dict(),
-                    )
-                ]
-            },
-            runtime_context={
-                "journal": journal,
-                "tool_call_id": "forged",
-                "task_id": "task-plan",
-            },
-        )
+    assert result["plan"] == []
+    assert recover_session(await journal.replay()).plan == Plan()
 
 
 @pytest.mark.asyncio
 async def test_update_plan_tool_requires_a_durable_session_boundary() -> None:
     with pytest.raises(PlanContractError):
-        await UpdatePlanTool().execute({"plan": [_node("a")]})
+        await UpdatePlanTool().execute({"plan": [_item("A")]})
 
 
-def test_update_plan_tool_exposes_strict_graph_schema() -> None:
+def test_update_plan_tool_exposes_strict_checklist_schema() -> None:
     schema = UpdatePlanTool().spec.input_schema
-    node_schema = schema["properties"]["plan"]["items"]
+    item_schema = schema["properties"]["plan"]["items"]
 
     assert schema["additionalProperties"] is False
-    assert node_schema["additionalProperties"] is False
-    assert "dependencies" in node_schema["required"]
-    assert "owner" in node_schema["properties"]
+    assert item_schema["additionalProperties"] is False
+    assert set(item_schema["required"]) == {"step", "status"}
+    assert set(item_schema["properties"]) == {"step", "status"}

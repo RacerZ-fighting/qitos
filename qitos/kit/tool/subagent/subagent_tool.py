@@ -175,13 +175,6 @@ class SubagentTool(BaseTool):
                     "general-purpose subagent."
                 ),
             },
-            "plan_assignment": {
-                "type": "string",
-                "description": (
-                    "Optional ready parent Plan node id assigned to this subagent. "
-                    "The runtime durably reserves it before the subagent starts."
-                ),
-            },
         }
         if execution_mode == "optional_background":
             parameters["run_in_background"] = {
@@ -326,17 +319,6 @@ class SubagentTool(BaseTool):
                 },
                 status="error",
             )
-        raw_assignment = args.get("plan_assignment")
-        if raw_assignment is not None and (
-            not isinstance(raw_assignment, str) or not raw_assignment.strip()
-        ):
-            return tool_result(
-                {
-                    "status": "error",
-                    "error": "plan_assignment must be a non-empty string or omitted",
-                },
-                status="error",
-            )
         request = SubagentLaunchRequest(
             task=prompt,
             description=description,
@@ -351,11 +333,6 @@ class SubagentTool(BaseTool):
             working_directory=self._subagent_working_directory,
             budget=self._subagent_budget,
             parent_task_id=parent_task_id,
-            plan_assignment=(
-                raw_assignment.strip()
-                if isinstance(raw_assignment, str)
-                else None
-            ),
         )
         try:
             result = await self._supervisor.launch(

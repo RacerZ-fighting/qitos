@@ -64,17 +64,15 @@ def test_subagent_launch_request_is_immutable_and_round_trips() -> None:
 def test_subagent_launch_request_rejects_payload_without_task_binding_fields() -> None:
     payload = _request().to_dict()
     del payload["parent_task_id"]
-    del payload["plan_assignment"]
     with pytest.raises(ValueError):
         SubagentLaunchRequest.from_dict(payload)
 
 
-def test_subagent_launch_request_round_trips_task_binding() -> None:
+def test_subagent_launch_request_round_trips_parent_task_binding() -> None:
     request = SubagentLaunchRequest(
         task="Enumerate the service",
         description="enumeration subagent",
         parent_task_id="root-task",
-        plan_assignment="plan-node-1",
     )
     assert SubagentLaunchRequest.from_dict(request.to_dict()) == request
     with pytest.raises(ValueError):
@@ -83,6 +81,17 @@ def test_subagent_launch_request_round_trips_task_binding() -> None:
             description="y",
             parent_task_id=" ",
         )
+
+
+def test_subagent_launch_request_discards_retired_plan_assignment() -> None:
+    request = _request()
+
+    restored = SubagentLaunchRequest.from_dict(
+        {**request.to_dict(), "plan_assignment": "legacy-node"}
+    )
+
+    assert restored == request
+    assert "plan_assignment" not in restored.to_dict()
 
 
 def test_subagent_result_preserves_scoped_handle_and_evidence() -> None:
@@ -143,7 +152,7 @@ def test_legacy_subagent_result_marks_usage_incomplete() -> None:
     assert restored.cost_complete is False
 
 
-def test_legacy_child_result_decodes_to_subagent_contract() -> None:
+def test_legacy_subagent_result_wire_format_decodes_to_current_contract() -> None:
     result = SubagentResult(
         handle=SubagentHandle(subagent_id="subagent-1", parent_run_id="parent-1"),
         request=_request(),
@@ -166,7 +175,7 @@ def test_legacy_child_result_decodes_to_subagent_contract() -> None:
     assert "max_subagents" in restored.request.to_dict()["budget"]
 
 
-def test_legacy_child_runtime_input_decodes_to_subagent_event() -> None:
+def test_legacy_subagent_runtime_input_decodes_to_current_event() -> None:
     event = RuntimeInput.from_dict(
         {
             "event_id": "child-1:terminal",
@@ -195,7 +204,7 @@ def test_legacy_child_runtime_input_decodes_to_subagent_event() -> None:
     }
 
 
-def test_legacy_child_runtime_input_rejects_conflicting_new_fields() -> None:
+def test_legacy_subagent_runtime_input_rejects_conflicting_current_fields() -> None:
     with pytest.raises(ValueError, match="conflicts"):
         RuntimeInput.from_dict(
             {
@@ -218,7 +227,7 @@ def test_legacy_child_runtime_input_rejects_conflicting_new_fields() -> None:
         ("child.terminal", JournalRecordType.SUBAGENT_TERMINAL),
     ],
 )
-def test_legacy_child_journal_type_decodes_one_way(
+def test_legacy_subagent_journal_type_decodes_one_way(
     legacy_type: str,
     canonical_type: JournalRecordType,
 ) -> None:

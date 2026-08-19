@@ -115,7 +115,6 @@ class SubagentLaunchRequest:
         default_factory=lambda: TaskBudget(max_steps=DEFAULT_SUBAGENT_MAX_STEPS)
     )
     parent_task_id: str | None = None
-    plan_assignment: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("task", "description", "agent_type", "profile"):
@@ -164,14 +163,13 @@ class SubagentLaunchRequest:
                 "permission_context",
                 ToolPermissionContext.from_dict(self.permission_context.to_dict()),
             )
-        for name in ("parent_task_id", "plan_assignment"):
-            value = getattr(self, name)
-            if value is not None and (
-                not isinstance(value, str) or not value.strip()
-            ):
-                raise ValueError(
-                    f"SubagentLaunchRequest.{name} must be a non-empty string or None"
-                )
+        if self.parent_task_id is not None and (
+            not isinstance(self.parent_task_id, str)
+            or not self.parent_task_id.strip()
+        ):
+            raise ValueError(
+                "SubagentLaunchRequest.parent_task_id must be a non-empty string or None"
+            )
         if not isinstance(self.allowed_tool_groups, tuple) or any(
             not isinstance(group, str) or not group.strip()
             for group in self.allowed_tool_groups
@@ -213,7 +211,6 @@ class SubagentLaunchRequest:
             "working_directory": self.working_directory,
             "budget": _budget_to_dict(self.budget),
             "parent_task_id": self.parent_task_id,
-            "plan_assignment": self.plan_assignment,
         }
 
     @classmethod
@@ -233,9 +230,8 @@ class SubagentLaunchRequest:
             "working_directory",
             "budget",
             "parent_task_id",
-            "plan_assignment",
         }
-        if set(value) != expected:
+        if set(value) not in (expected, expected | {"plan_assignment"}):
             raise ValueError("SubagentLaunchRequest fields are invalid")
         raw_groups = value["allowed_tool_groups"]
         raw_budget = value["budget"]
@@ -278,7 +274,6 @@ class SubagentLaunchRequest:
             working_directory=value["working_directory"],
             budget=_budget_from_dict(raw_budget),
             parent_task_id=value["parent_task_id"],
-            plan_assignment=value["plan_assignment"],
         )
 
 

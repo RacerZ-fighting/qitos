@@ -41,7 +41,7 @@ async def _types(session_run: SessionRun) -> list[JournalRecordType]:
 
 @pytest.mark.asyncio
 async def test_start_commits_task_before_input() -> None:
-    task = _task("root-1", plan_assignment="node-1")
+    task = _task("root-1")
     session_run = await _started_run("done", task=task)
     records = await session_run.journal.replay()
     created = [

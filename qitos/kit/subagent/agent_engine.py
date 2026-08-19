@@ -1530,7 +1530,6 @@ def build_agent_subagent_invocation_factory(
             references=request.references,
             budget=request.budget,
             created_by_run_id=runtime_context.parent_run_id,
-            plan_assignment=request.plan_assignment,
         )
         engine = AgentSubagentEngine(
             model=resolved_model,
@@ -1562,11 +1561,6 @@ def build_agent_subagent_invocation_factory(
                 "permission_context": effective_permission,
                 "task_id": runtime_context.handle.subagent_id,
                 "task": subagent_task,
-                **(
-                    {"plan_assignment": request.plan_assignment}
-                    if request.plan_assignment is not None
-                    else {}
-                ),
                 "max_subagents": _tightest_int(
                     runtime_context.launch.max_subagents or None,
                     budget.max_subagents,
