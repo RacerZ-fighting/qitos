@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Literal, cast
 
 from ....core.budget import BudgetLedger
@@ -175,6 +176,15 @@ class SubagentTool(BaseTool):
                     "general-purpose subagent."
                 ),
             },
+            "max_steps": {
+                "type": "integer",
+                "minimum": 1,
+                "description": (
+                    "Optional step budget for this Subagent. The effective budget "
+                    "narrows to the smaller of this value and the configured "
+                    "Subagent budget."
+                ),
+            },
         }
         if execution_mode == "optional_background":
             parameters["run_in_background"] = {
@@ -250,6 +260,28 @@ class SubagentTool(BaseTool):
                 status="error",
             )
         success_criteria = tuple(item.strip() for item in raw_criteria)
+        raw_max_steps = args.get("max_steps")
+        budget = self._subagent_budget
+        if raw_max_steps is not None:
+            if isinstance(raw_max_steps, bool) or not isinstance(raw_max_steps, int):
+                return tool_result(
+                    {"status": "error", "error": "max_steps must be an integer"},
+                    status="error",
+                )
+            if raw_max_steps < 1:
+                return tool_result(
+                    {"status": "error", "error": "max_steps must be positive"},
+                    status="error",
+                )
+            configured_steps = budget.max_steps
+            budget = replace(
+                budget,
+                max_steps=(
+                    raw_max_steps
+                    if configured_steps is None
+                    else min(raw_max_steps, configured_steps)
+                ),
+            )
         agent_type = (
             str(args.get("subagent_type", "general-purpose")).strip()
             or "general-purpose"
@@ -331,7 +363,7 @@ class SubagentTool(BaseTool):
             profile=self._subagent_profile,
             allowed_tool_groups=self._subagent_allowed_tool_groups,
             working_directory=self._subagent_working_directory,
-            budget=self._subagent_budget,
+            budget=budget,
             parent_task_id=parent_task_id,
         )
         try:

@@ -29,6 +29,11 @@ How to update:
   are rejected at the terminal boundary without a `runtime_input.posted`
   record, so acceptance means queued, not guaranteed delivery.
 
+- The `subagent` launch Tool accepts an optional `max_steps` argument so the
+  model can size each Subagent's step budget to its front; the effective budget
+  always narrows to the smaller of the requested value and the configured
+  Subagent budget.
+
 - Cancelled, failed and budget-exhausted Subagent terminal results now keep
   the run's committed step count and elapsed time instead of reporting zeros,
   matching the token usage those paths already reported.

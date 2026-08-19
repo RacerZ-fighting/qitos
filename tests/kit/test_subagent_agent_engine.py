@@ -700,6 +700,88 @@ async def test_subagent_budget_exhaustion_maps_from_max_turns(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_subagent_tool_narrows_budget_from_max_steps_argument(tmp_path) -> None:
+    registry = ToolRegistry().register(_echo)
+    model = ScriptedModel(
+        [tool_events([tool_call_wire(f"c{i}", "echo", {"text": "x"})]) for i in range(4)]
+    )
+    tool = SubagentTool(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=model,
+            tool_registry=registry,
+            journal_directory=_subagents_root(tmp_path),
+        ),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
+    )
+
+    result = await tool.execute(
+        {
+            "description": "loop until capped",
+            "prompt": "loop until capped",
+            "success_criteria": ["This never completes"],
+            "max_steps": 1,
+        },
+        runtime_context={
+            "run_id": "parent-run",
+            "parent_tool_authority": registry.freeze(),
+        },
+    )
+
+    assert result.output["subagent_status"] == SubagentStatus.BUDGET_EXHAUSTED.value
+    assert result.output["steps"] == 1
+    assert len(model.requests) == 1
+
+    invalid = await tool.execute(
+        {
+            "description": "bad budget",
+            "prompt": "bad budget",
+            "success_criteria": ["x"],
+            "max_steps": 0,
+        },
+        runtime_context={"run_id": "parent-run"},
+    )
+    assert invalid.status == "error"
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_subagent_tool_max_steps_never_widens_the_configured_budget(
+    tmp_path,
+) -> None:
+    registry = ToolRegistry().register(_echo)
+    model = ScriptedModel(
+        [tool_events([tool_call_wire(f"c{i}", "echo", {"text": "x"})]) for i in range(6)]
+    )
+    tool = SubagentTool(
+        invocation_factory=build_agent_subagent_invocation_factory(
+            model=model,
+            tool_registry=registry,
+            journal_directory=_subagents_root(tmp_path),
+        ),
+        subagent_budget=TaskBudget(max_steps=2),
+        subagent_journal_factory=_subagent_journal_factory(tmp_path),
+    )
+
+    result = await tool.execute(
+        {
+            "description": "loop until capped",
+            "prompt": "loop until capped",
+            "success_criteria": ["This never completes"],
+            "max_steps": 5,
+        },
+        runtime_context={
+            "run_id": "parent-run",
+            "parent_tool_authority": registry.freeze(),
+        },
+    )
+
+    assert result.output["subagent_status"] == SubagentStatus.BUDGET_EXHAUSTED.value
+    assert result.output["steps"] == 2
+    assert len(model.requests) == 2
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_subagent_reserves_last_step_for_plain_text_conclusion(tmp_path) -> None:
     executions = 0
 
