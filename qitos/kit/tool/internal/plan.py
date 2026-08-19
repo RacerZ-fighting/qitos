@@ -6,10 +6,9 @@ from typing import Any, Dict, Optional
 
 from qitos.core.journal import SessionJournal
 from qitos.core.plan import (
-    MAX_PLAN_DESCRIPTION_CHARS,
     MAX_PLAN_EXPLANATION_CHARS,
-    MAX_PLAN_NODE_ID_CHARS,
-    MAX_PLAN_NODES,
+    MAX_PLAN_ITEMS,
+    MAX_PLAN_STEP_CHARS,
     UPDATE_PLAN_TOOL_NAME,
     PlanContractError,
     parse_plan_update,
@@ -20,43 +19,29 @@ from qitos.kit.plan import commit_model_plan_update
 
 
 class UpdatePlanTool(BaseTool):
-    """Validate and durably commit a complete dependency-graph replacement."""
+    """Validate and durably commit a complete progress checklist replacement."""
 
     def __init__(self) -> None:
-        owner_schema = {
-            "type": "object",
-            "properties": {
-                "subagent_id": {"type": "string"},
-                "parent_run_id": {"type": "string"},
-            },
-            "required": ["subagent_id", "parent_run_id"],
-            "additionalProperties": False,
-        }
         super().__init__(
             ToolSpec(
                 name=UPDATE_PLAN_TOOL_NAME,
                 description=(
-                    "Replace the current dependency-aware execution Plan. Keep "
-                    "existing nodes when revising work; readiness is derived from "
-                    "completed dependencies. Subagent owners are assigned by the Agent "
-                    "launch boundary, not invented here."
+                    "Replace the current task progress checklist. Steps may be added, "
+                    "removed, rewritten, or reordered as the approach changes. Keep at "
+                    "most one step in progress."
                 ),
                 input_schema={
                     "type": "object",
                     "properties": {
                         "plan": {
                             "type": "array",
-                            "maxItems": MAX_PLAN_NODES,
+                            "maxItems": MAX_PLAN_ITEMS,
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "node_id": {
+                                    "step": {
                                         "type": "string",
-                                        "maxLength": MAX_PLAN_NODE_ID_CHARS,
-                                    },
-                                    "description": {
-                                        "type": "string",
-                                        "maxLength": MAX_PLAN_DESCRIPTION_CHARS,
+                                        "maxLength": MAX_PLAN_STEP_CHARS,
                                     },
                                     "status": {
                                         "type": "string",
@@ -64,29 +49,10 @@ class UpdatePlanTool(BaseTool):
                                             "pending",
                                             "in_progress",
                                             "completed",
-                                            "failed",
-                                            "blocked",
-                                            "cancelled",
                                         ],
                                     },
-                                    "dependencies": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "string",
-                                            "maxLength": MAX_PLAN_NODE_ID_CHARS,
-                                        },
-                                        "uniqueItems": True,
-                                    },
-                                    "owner": {
-                                        "anyOf": [owner_schema, {"type": "null"}]
-                                    },
                                 },
-                                "required": [
-                                    "node_id",
-                                    "description",
-                                    "status",
-                                    "dependencies",
-                                ],
+                                "required": ["step", "status"],
                                 "additionalProperties": False,
                             },
                         },
@@ -127,7 +93,7 @@ class UpdatePlanTool(BaseTool):
             record_id=f"{journal.run_id}:plan:tool:{call_id}",
         )
         return {
-            "plan": plan_to_dict(committed)["nodes"],
+            "plan": plan_to_dict(committed)["items"],
             "explanation": update.explanation,
         }
 

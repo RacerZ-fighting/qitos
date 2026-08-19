@@ -34,22 +34,30 @@ class _SubagentRunLease:
 
 
 class SubagentRunLimiter:
-    """Bound active and cumulative Subagent launches across one recursive Run tree.
+    """Bound active and optional cumulative launches across one recursive Run tree.
 
     Each nested :class:`SubagentSupervisor` receives the same instance. Admission is
     immediate rather than queued so a foreground Subagent cannot deadlock while it
     waits for a descendant to acquire the last active slot.
     """
 
-    def __init__(self, *, max_active_subagents: int, max_subagents: int) -> None:
-        for name, value in (
-            ("max_active_subagents", max_active_subagents),
-            ("max_subagents", max_subagents),
+    def __init__(
+        self,
+        *,
+        max_active_subagents: int,
+        max_subagents: int | None = None,
+    ) -> None:
+        if not isinstance(max_active_subagents, int) or isinstance(
+            max_active_subagents, bool
         ):
-            if not isinstance(value, int) or isinstance(value, bool):
-                raise TypeError(f"{name} must be an integer")
-            if value <= 0:
-                raise ValueError(f"{name} must be positive")
+            raise TypeError("max_active_subagents must be an integer")
+        if max_active_subagents <= 0:
+            raise ValueError("max_active_subagents must be positive")
+        if max_subagents is not None:
+            if not isinstance(max_subagents, int) or isinstance(max_subagents, bool):
+                raise TypeError("max_subagents must be an integer or None")
+            if max_subagents <= 0:
+                raise ValueError("max_subagents must be positive when configured")
         self._max_active_subagents = max_active_subagents
         self._max_subagents = max_subagents
         self._active_subagents = 0
@@ -62,7 +70,7 @@ class SubagentRunLimiter:
         return self._max_active_subagents
 
     @property
-    def max_subagents(self) -> int:
+    def max_subagents(self) -> int | None:
         return self._max_subagents
 
     @property
@@ -77,7 +85,10 @@ class SubagentRunLimiter:
         """Reserve one active slot and one provisional cumulative launch."""
 
         async with self._lock:
-            if self._subagents_started >= self._max_subagents:
+            if (
+                self._max_subagents is not None
+                and self._subagents_started >= self._max_subagents
+            ):
                 raise SubagentRunLimitError(
                     "Run Subagent budget exhausted: "
                     f"max_subagents={self._max_subagents}."
@@ -106,7 +117,10 @@ class SubagentRunLimiter:
         async with self._lock:
             unseen = normalized_launches.difference(self._restored_launches)
             restored_total = self._subagents_started + len(unseen)
-            if restored_total > self._max_subagents:
+            if (
+                self._max_subagents is not None
+                and restored_total > self._max_subagents
+            ):
                 raise SubagentRunLimitError(
                     "Restored Subagent launch history exceeds the Run budget: "
                     f"max_subagents={self._max_subagents}, "

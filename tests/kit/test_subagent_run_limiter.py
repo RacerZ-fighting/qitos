@@ -134,6 +134,141 @@ async def test_recursive_supervisors_share_cumulative_subagent_budget() -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_subagents_release_default_active_slots_for_later_launches() -> (
+    None
+):
+    started = [asyncio.Event() for _ in range(4)]
+    releases = [asyncio.Event() for _ in range(4)]
+    engine_index = 0
+
+    def engine_factory() -> _Engine:
+        nonlocal engine_index
+        index = engine_index
+        engine_index += 1
+        if index < len(started):
+            return _Engine(started=started[index], release=releases[index])
+        return _Engine()
+
+    limiter = SubagentRunLimiter(max_active_subagents=4)
+    supervisor = _supervisor(limiter, engine_factory)
+    running = [
+        await supervisor.launch(
+            _request(f"blocking-{index}"),
+            _context("root-run"),
+            background=True,
+        )
+        for index in range(4)
+    ]
+    await asyncio.gather(
+        *(asyncio.wait_for(event.wait(), timeout=1) for event in started)
+    )
+
+    with pytest.raises(SubagentRunLimitError, match="max_active_subagents=4"):
+        await supervisor.launch(
+            _request("fifth while full"),
+            _context("root-run"),
+            background=False,
+        )
+
+    releases[0].set()
+    first = await supervisor.wait(running[0].handle, timeout_seconds=1)
+    assert first is not None and first.status is SubagentStatus.COMPLETED
+    fifth = await supervisor.launch(
+        _request("fifth after terminal"),
+        _context("root-run"),
+        background=False,
+    )
+
+    assert fifth.status is SubagentStatus.COMPLETED
+    assert limiter.max_subagents is None
+    assert limiter.subagents_started == 5
+    assert limiter.active_subagents == 3
+
+    for release in releases[1:]:
+        release.set()
+    await asyncio.gather(
+        *(
+            supervisor.wait(result.handle, timeout_seconds=1)
+            for result in running[1:]
+        )
+    )
+    assert limiter.active_subagents == 0
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_failed_subagent_releases_unlimited_active_slot() -> None:
+    attempts = 0
+
+    async def build(
+        request: SubagentLaunchRequest,
+        _context: SubagentRuntimeContext,
+    ) -> SubagentInvocation:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("fixture construction failed")
+        return SubagentInvocation(engine=_Engine(), task=request.task)
+
+    limiter = SubagentRunLimiter(max_active_subagents=1)
+    supervisor = SubagentSupervisor(invocation_factory=build, run_limiter=limiter)
+
+    failed = await supervisor.launch(
+        _request("failed"),
+        _context("root-run"),
+        background=False,
+    )
+    replacement = await supervisor.launch(
+        _request("replacement"),
+        _context("root-run"),
+        background=False,
+    )
+
+    assert failed.status is SubagentStatus.FAILED
+    assert replacement.status is SubagentStatus.COMPLETED
+    assert limiter.subagents_started == 2
+    assert limiter.active_subagents == 0
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_subagent_releases_unlimited_active_slot() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    attempts = 0
+
+    def engine_factory() -> _Engine:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return _Engine(started=started, release=release)
+        return _Engine()
+
+    limiter = SubagentRunLimiter(max_active_subagents=1)
+    supervisor = _supervisor(limiter, engine_factory)
+    running = await supervisor.launch(
+        _request("interrupt"),
+        _context("root-run"),
+        background=True,
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    interrupted = await supervisor.interrupt(running.handle, wait_seconds=1)
+    replacement = await supervisor.launch(
+        _request("replacement"),
+        _context("root-run"),
+        background=False,
+    )
+
+    assert interrupted is not None
+    assert interrupted.status is SubagentStatus.CANCELLED
+    assert replacement.status is SubagentStatus.COMPLETED
+    assert limiter.subagents_started == 2
+    assert limiter.active_subagents == 0
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
 async def test_nested_supervisor_setup_does_not_reset_shared_run_budget() -> None:
     limiter = SubagentRunLimiter(max_active_subagents=1, max_subagents=1)
     root = _supervisor(limiter, _Engine)
@@ -354,6 +489,48 @@ async def test_recovery_restores_durable_launches_into_shared_budget(
             _context("root-run", journal=journal),
             background=False,
         )
+
+    await recovered.aclose()
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_retains_unlimited_terminal_launch_history_without_active_slots(
+    tmp_path: Path,
+) -> None:
+    journal = JsonlSessionJournal(tmp_path / "journal")
+    await journal.create("root-run", {})
+    original = SubagentSupervisor(
+        invocation_factory=(
+            lambda request, _context: _ready_invocation(
+                engine=_Engine(),
+                task=request.task,
+            )
+        )
+    )
+    for index in range(5):
+        result = await original.launch(
+            _request(f"persisted-{index}"),
+            _context("root-run", journal=journal),
+            background=False,
+        )
+        assert result.status is SubagentStatus.COMPLETED
+    await original.aclose()
+
+    limiter = SubagentRunLimiter(max_active_subagents=4)
+    recovered = _supervisor(limiter, _Engine)
+    results = await recovered.recover(parent_run_id="root-run", journal=journal)
+
+    assert len(results) == 5
+    assert limiter.subagents_started == 5
+    assert limiter.active_subagents == 0
+    later = await recovered.launch(
+        _request("later"),
+        _context("root-run", journal=journal),
+        background=False,
+    )
+    assert later.status is SubagentStatus.COMPLETED
+    assert limiter.subagents_started == 6
 
     await recovered.aclose()
     await journal.close()

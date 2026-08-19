@@ -660,11 +660,11 @@ async def test_unconsumed_input_is_resteered_exactly_once_on_resume() -> None:
     await script.model_turn(0, assistant)
     results = await script.tool_results(0, assistant, "echo:x")
     await script.commit(0, [user, assistant, *results])
-    posted = _runtime_input("child-7:terminal", "late child result")
+    posted = _runtime_input("subagent-7:terminal", "late Subagent result")
     await journal.append(
         JournalRecordType.RUNTIME_INPUT_POSTED,
         posted.to_dict(),
-        record_id="run-input-crash:runtime:child-7:terminal",
+        record_id="run-input-crash:runtime:subagent-7:terminal",
     )
     # The process died before the steered message was injected.
     await journal.close()
@@ -685,7 +685,7 @@ async def test_unconsumed_input_is_resteered_exactly_once_on_resume() -> None:
         for message in model.requests[0].messages
         if message.get("role") == "user"
     ]
-    assert sum("late child result" in content for content in contents) == 1
+    assert sum("late Subagent result" in content for content in contents) == 1
     records = await _replay(store, "run-input-crash")
     posted_records = [
         record

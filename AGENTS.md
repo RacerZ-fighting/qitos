@@ -91,8 +91,8 @@ Task rules:
   Task identity; terminal follow-up creates a new Task explicitly.
 - Blocked is resumable only after explicit caller input or observed external-state
   change. Completed, failed and cancelled are terminal once.
-- Subagent launch creates a narrowed Task linked to parent Task and Plan assignment before
-  runtime construction.
+- Subagent launch creates a narrowed Task linked to its parent Task before runtime
+  construction. Plan is a progress checklist, not a Subagent assignment surface.
 - Benchmark resources, environment probing, metrics and free-form metadata do not enter
   canonical Task.
 

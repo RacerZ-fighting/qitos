@@ -36,14 +36,12 @@ from ...core.journal import (
 )
 from ...core.message import AssistantMessage, ToolResultMessage
 from ...core.model_response import ModelPricing
-from ...core.plan import PlanContractError
 from ...core.runtime_input import (
     RuntimeInput,
     subagent_result_payload,
     subagent_terminal_runtime_input,
 )
 from ..journal import recover_run_outcome, recover_session
-from ..plan import assign_plan_node, release_plan_node
 from .agent_engine import (
     subagent_budget_stop_reason,
     subagent_final_text,
@@ -197,38 +195,10 @@ class SubagentSupervisor:
                 raise
 
             try:
-                await self._persist_plan_assignment(owned)
-            except JournalAppendCancelled as cancellation:
-                await self._discard_unstarted(
-                    owned,
-                    release_assignment=(
-                        cancellation.commit_state is JournalCommitState.COMMITTED
-                    ),
-                )
-                raise
-            except JournalCommitError as commit_error:
-                await self._discard_unstarted(
-                    owned,
-                    release_assignment=(
-                        commit_error.commit_state is JournalCommitState.COMMITTED
-                    ),
-                )
-                raise SubagentPersistenceError(
-                    "failed to persist the parent Plan assignment; "
-                    "subagent was not admitted"
-                ) from commit_error
-            except BaseException:
-                await self._discard_unstarted(owned, release_assignment=False)
-                raise
-
-            try:
                 await self._persist_started(owned)
             except JournalAppendCancelled as cancellation:
                 if cancellation.commit_state is JournalCommitState.NOT_COMMITTED:
-                    await self._discard_unstarted(
-                        owned,
-                        release_assignment=True,
-                    )
+                    await self._discard_unstarted(owned)
                     raise
 
                 if cancellation.commit_state is JournalCommitState.COMMITTED:
@@ -256,10 +226,7 @@ class SubagentSupervisor:
                 raise
             except JournalCommitError as commit_error:
                 if commit_error.commit_state is JournalCommitState.NOT_COMMITTED:
-                    await self._discard_unstarted(
-                        owned,
-                        release_assignment=True,
-                    )
+                    await self._discard_unstarted(owned)
                 else:
                     await self._retain_failed_admission(
                         owned,
@@ -269,10 +236,7 @@ class SubagentSupervisor:
                     "failed to persist subagent.started; subagent was not executed"
                 ) from commit_error
             except BaseException:
-                await self._discard_unstarted(
-                    owned,
-                    release_assignment=True,
-                )
+                await self._discard_unstarted(owned)
                 raise
             if run_lease is not None:
                 run_lease.commit()
@@ -1037,73 +1001,14 @@ class SubagentSupervisor:
                 "failed to persist subagent.started; subagent was not executed"
             ) from exc
 
-    async def _persist_plan_assignment(self, owned: _OwnedSubagent) -> None:
-        node_id = owned.request.plan_assignment
-        if owned.journal is None:
-            if node_id is None:
-                return
-            raise SubagentPersistenceError(
-                "a Subagent Plan assignment requires the parent Session Journal"
-            )
-        if node_id is None:
-            parent_task_id = owned.request.parent_task_id
-            if parent_task_id is None:
-                return
-            recovered = recover_session(await owned.journal.replay())
-            if recovered.plans.get(parent_task_id) is not None:
-                raise PlanContractError(
-                    "a Subagent launched for a Task with a Plan requires an explicit "
-                    "Plan assignment"
-                )
-            return
-        await assign_plan_node(
-            owned.journal,
-            node_id,
-            owned.handle,
-            parent_task_id=owned.request.parent_task_id,
-            record_id=(
-                f"{owned.handle.parent_run_id}:plan:assign:"
-                f"{owned.handle.subagent_id}"
-            ),
-        )
+    async def _discard_unstarted(self, owned: _OwnedSubagent) -> None:
+        """Release local admission after a launch failed before persistence."""
 
-    async def _discard_unstarted(
-        self,
-        owned: _OwnedSubagent,
-        *,
-        release_assignment: bool,
-    ) -> None:
-        """Release a durable assignment and local admission after launch failure."""
-
-        release_error: BaseException | None = None
-        try:
-            if (
-                release_assignment
-                and owned.request.plan_assignment is not None
-                and owned.journal is not None
-            ):
-                await release_plan_node(
-                    owned.journal,
-                    owned.request.parent_task_id or "",
-                    owned.request.plan_assignment,
-                    owned.handle,
-                    record_id=(
-                        f"{owned.handle.parent_run_id}:plan:release:"
-                        f"{owned.handle.subagent_id}"
-                    ),
-                )
-        except BaseException as exc:
-            release_error = exc
-        finally:
-            async with self._admission_lock:
-                self._subagents.pop(owned.handle, None)
-                self._subagents_started -= 1
-            if owned.run_lease is not None:
-                await owned.run_lease.rollback()
-        if release_error is not None:
-            raise SubagentPersistenceError(
-                "failed to release a Plan assignment after subagent admission failed"
-            ) from release_error
+        async with self._admission_lock:
+            self._subagents.pop(owned.handle, None)
+            self._subagents_started -= 1
+        if owned.run_lease is not None:
+            await owned.run_lease.rollback()
 
     async def _store_terminal(
         self,

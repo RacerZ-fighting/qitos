@@ -26,7 +26,6 @@ from qitos.core.journal import (
 from qitos.core.model_response import ModelPricing
 from qitos.core.model_stream import ModelStreamEvent, ModelStreamEventType
 from qitos.core.message import ContextMessage, UserMessage
-from qitos.core.plan import Plan, PlanNode
 from qitos.core.task import Task, TaskBudget, TaskReference, TaskStatus
 from qitos.core.tool import ToolPermissionContext, ToolPermissionRule, tool
 from qitos.core.tool_executor import AfterToolCallOverride
@@ -43,7 +42,7 @@ from qitos.kit.journal import (
     recover_run_outcome,
     recover_session,
 )
-from qitos.kit.journal.turn_recorder import encode_plan_updated, encode_task_created
+from qitos.kit.journal.turn_recorder import encode_task_created
 from qitos.kit.tool.subagent import SubagentTool
 
 from tests.core.agent_fakes import (
@@ -243,7 +242,7 @@ async def test_empty_conclusion_retry_fails_without_fabricating_tool_output(
 
 
 @pytest.mark.asyncio
-async def test_subagent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
+async def test_subagent_tool_threads_parent_task_domain_constraints(tmp_path) -> None:
     parent_journal = JsonlSessionJournal(tmp_path / "parent-plan")
     await parent_journal.create("parent-run", {})
     parent_task = Task(
@@ -258,14 +257,6 @@ async def test_subagent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
         JournalRecordType.TASK_CREATED,
         encode_task_created(parent_task),
         record_id="parent-run:task:parent-task:created",
-    )
-    await parent_journal.append(
-        JournalRecordType.PLAN_UPDATED,
-        encode_plan_updated(
-            "parent-task",
-            Plan((PlanNode("delegate", "Delegate work"),)),
-        ),
-        record_id="parent-run:plan:initial",
     )
     subagent_tool = SubagentTool(
         invocation_factory=build_agent_subagent_invocation_factory(
@@ -285,7 +276,6 @@ async def test_subagent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
             "description": "inspect",
             "prompt": "inspect",
             "success_criteria": ["Return the inspection result"],
-            "plan_assignment": "delegate",
         },
         runtime_context={
             "run_id": "parent-run",
@@ -303,7 +293,7 @@ async def test_subagent_tool_threads_explicit_plan_assignment(tmp_path) -> None:
 
     assert result.output["subagent_status"] == SubagentStatus.COMPLETED.value
     assert started.payload["request"]["parent_task_id"] == "parent-task"
-    assert started.payload["request"]["plan_assignment"] == "delegate"
+    assert "plan_assignment" not in started.payload["request"]
     subagent_records = await _read_subagent_records(
         tmp_path,
         result.output["subagent_run_id"],

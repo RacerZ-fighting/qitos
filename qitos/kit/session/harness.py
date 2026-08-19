@@ -992,14 +992,8 @@ class SessionRun:
             # a caller-provided runtime context cannot substitute another owner.
             runtime_context["budget_ledger"] = self._budget_ledger
         if self._task_state is not None:
-            # Publish the current Root Task identity for Tools that bind
-            # their work to it (the Agent Tool reads these keys for its
-            # Subagent launch request).
+            # Publish the current Root Task identity for Subagent launch requests.
             runtime_context["task_id"] = self._task_state.definition.task_id
-            if self._task_state.definition.plan_assignment is not None:
-                runtime_context["plan_assignment"] = (
-                    self._task_state.definition.plan_assignment
-                )
         runtime_context["post_runtime_event"] = (
             self._post_runtime_event or self.post_runtime_event
         )

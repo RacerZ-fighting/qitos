@@ -4,7 +4,7 @@
 
 Accepted target architecture on 2026-08-16. On the migration branch, the minimal loop,
 the `Agent` façade, the authoritative Session/Harness, the goal-bearing Task and the
-dependency-aware Plan are the only execution and recovery path. Final integration gates
+progress-checklist Plan are the only execution and recovery path. Final integration gates
 and merge remain separate release steps.
 
 This document owns the final QitOS runtime boundaries. The
@@ -186,8 +186,7 @@ Task
 │   ├── task id / optional parent task id
 │   ├── objective + success criteria
 │   ├── constraints + stable resource/context references
-│   ├── budget + creation provenance
-│   └── optional parent Plan assignment reference
+│   └── budget + creation provenance
 └── durable lifecycle
     ├── active | blocked | completed | failed | cancelled
     ├── usage
@@ -212,22 +211,18 @@ compatibility mirror.
 
 ## 6. Plan and Subagent
 
-Plan is a dependency-aware graph with stable node identity, owner and explicit state.
-`ready` is a derived view of a pending node whose dependencies are completed, not a
-persisted state. One owner may hold at most one node in progress; independent owners
-may work concurrently. QitOS validates graph, transition, reservation and concurrency;
-applications or models choose the schedule. Every accepted update
-commits as one `plan.updated` record with its owning Task id in the Run journal. Plans
-are replayed per Task through the fork lineage, so an explicit terminal follow-up Task
-does not inherit the previous Task's strategy. TODO
-Markdown is a deterministic projection of the committed Plan, never an editable
+Plan is an optional progress checklist. Each `PlanItem` carries one concise `step`
+description and a `pending | in_progress | completed` display status. A model may add,
+remove, rewrite or reorder items; QitOS validates the bounded shape and at most one item
+in progress. Every accepted replacement commits as one `plan.updated` record with its
+owning Task id in the Run journal. Plans are replayed per Task through the fork lineage,
+so an explicit terminal follow-up Task does not inherit the previous Task's strategy.
+TODO Markdown is a deterministic projection of the committed Plan, never an editable
 second truth.
 
-Plan is optional and uses one contract for Root and Subagent. Root normally uses a graph
-with dependencies and Subagent owners. A simple Subagent may have no Plan, or use the same
-graph with no dependencies or owners as a linear TODO. Parent and Subagent Plans remain
-independent; a Subagent conclusion drives the parent assignment node but the Subagent Plan is
-never merged into the parent Plan.
+Plan does not express dependencies, readiness, Subagent ownership or assignment. It is
+not a scheduler or Task completion gate. Root and Subagent use the same optional
+contract, while Parent and Subagent Plans remain independent and are never merged.
 
 Root and Subagent use the same Agent implementation. A Subagent has its own Task, Session,
 optional Plan, context and cancellation domain; authorization and budgets only narrow.
@@ -253,10 +248,7 @@ does not synthesize prose from Tool results, Plan state or Journal records. Clai
 not persisted because a crash interrupts the live Agent; only provider admissions and
 settled usage remain durable. Explicit cancellation and an expired absolute deadline
 remain hard boundaries.
-Launch commits the accepted parent Plan assignment before Subagent lifecycle persistence
-and runtime construction. When the parent Task already has a durable Plan, launch
-requires an explicit ready assignment; a parent Task without a Plan may still launch
-an unassigned Subagent. `SubagentLaunchRequest` carries explicit success criteria,
+Subagent launch is independent of Plan state. `SubagentLaunchRequest` carries explicit success criteria,
 inherited Task constraints/references and the frozen parent Permission context; the
 built-in factory rejects conflicting Permission values. Independent Agent Tool calls
 may execute concurrently through the bounded, concurrency-safe Tool path while results
