@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from qitos.core.budget import BudgetLedger
 from qitos.core.subagent import (
     AgentConclusion,
     SubagentHandle,
@@ -35,7 +36,7 @@ from qitos.core.journal import (
     SessionJournal,
 )
 from qitos.core.plan import Plan, PlanItem
-from qitos.core.task import Task
+from qitos.core.task import Task, TaskBudget
 from qitos.kit.subagent import SubagentRunLimiter, SubagentSupervisor
 from qitos.kit.journal import JsonlSessionJournal, recover_session
 from qitos.kit.journal.turn_recorder import encode_plan_updated, encode_task_created
@@ -50,13 +51,25 @@ def _context(
     journal: SessionJournal | None = None,
     post_runtime_event: SubagentPostRuntimeEvent | None = None,
     deadline_monotonic: float | None = None,
+    budget_ledger: BudgetLedger | None = None,
 ) -> SubagentLaunchContext:
     return SubagentLaunchContext(
         parent_run_id="parent-run",
         journal=journal,
         post_runtime_event=post_runtime_event,
         deadline_monotonic=deadline_monotonic,
+        budget_ledger=budget_ledger,
     )
+
+
+async def _ledger_with_steps(*, max_steps: int, used: int) -> BudgetLedger:
+    ledger = BudgetLedger(max_steps=max_steps)
+    for index in range(used):
+        await ledger.reserve_step(
+            origin_run_id="parent-run",
+            transaction_id=f"step-{index}",
+        )
+    return ledger
 
 
 async def _set_event(event: asyncio.Event) -> None:
@@ -113,6 +126,34 @@ class _CompletingEngine(_ClosableEngine):
 
     def cancel(self, mode: str) -> None:
         _ = mode
+
+
+class _GatedEngine(_ClosableEngine):
+    """Engine whose run blocks until its release event is set."""
+
+    def __init__(self, started: asyncio.Event, release: asyncio.Event) -> None:
+        self.active_run_id = ""
+        self._started = started
+        self._release = release
+
+    async def arun(self, task: str, **kwargs: object) -> object:
+        run_id = kwargs.pop("run_id")
+        assert isinstance(run_id, str)
+        assert kwargs == {}
+        self.active_run_id = run_id
+        self._started.set()
+        await self._release.wait()
+        return SimpleNamespace(
+            state=SimpleNamespace(final_result=f"done:{task}", stop_reason="completed"),
+            records=[],
+            step_count=1,
+            total_tokens=0,
+            run_id=run_id,
+        )
+
+    def cancel(self, mode: str) -> None:
+        assert mode == "immediate"
+        self._release.set()
 
 
 class _FailingSubagentJournal(JsonlSessionJournal):
@@ -518,6 +559,266 @@ async def test_wait_timeout_does_not_cancel_subagent() -> None:
     assert terminal is not None
     assert terminal.status is SubagentStatus.COMPLETED
     assert await supervisor.aclose(wait_seconds=1) == 0
+
+
+def _completing_supervisor(**kwargs: Any) -> SubagentSupervisor:
+    return SubagentSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task=request.task,
+        ),
+        **kwargs,
+    )
+
+
+def _gated_factory(
+    started: dict[str, asyncio.Event],
+    released: dict[str, asyncio.Event],
+):
+    async def factory(
+        request: SubagentLaunchRequest,
+        _context: SubagentRuntimeContext,
+    ) -> SubagentInvocation:
+        return SubagentInvocation(
+            engine=_GatedEngine(started[request.task], released[request.task]),
+            task=request.task,
+        )
+
+    return factory
+
+
+def test_supervisor_rejects_invalid_min_remaining_step_reserve() -> None:
+    with pytest.raises(ValueError, match="min_remaining_step_reserve"):
+        _completing_supervisor(min_remaining_step_reserve=True)
+    with pytest.raises(ValueError, match="min_remaining_step_reserve"):
+        _completing_supervisor(min_remaining_step_reserve=-1)
+    with pytest.raises(ValueError, match="min_remaining_step_reserve"):
+        _completing_supervisor(min_remaining_step_reserve=1.5)
+
+
+@pytest.mark.asyncio
+async def test_launch_rejects_when_lineage_remaining_hits_reserve() -> None:
+    ledger = await _ledger_with_steps(max_steps=5, used=4)
+    supervisor = _completing_supervisor(min_remaining_step_reserve=1)
+
+    with pytest.raises(RuntimeError, match=r"remaining=1, reserve=1"):
+        await supervisor.launch(
+            _request(),
+            _context(budget_ledger=ledger),
+            background=False,
+        )
+
+    assert supervisor.active_count == 0
+    assert await supervisor.aclose() == 0
+
+
+@pytest.mark.asyncio
+async def test_launch_rejects_zero_remaining_with_zero_reserve() -> None:
+    ledger = await _ledger_with_steps(max_steps=2, used=2)
+    supervisor = _completing_supervisor()
+
+    with pytest.raises(RuntimeError, match=r"remaining=0, reserve=0"):
+        await supervisor.launch(
+            _request(),
+            _context(budget_ledger=ledger),
+            background=False,
+        )
+
+    assert supervisor.active_count == 0
+    assert await supervisor.aclose() == 0
+
+
+@pytest.mark.asyncio
+async def test_launch_clamps_requested_max_steps_to_lineage_remaining() -> None:
+    ledger = await _ledger_with_steps(max_steps=10, used=3)
+    supervisor = _completing_supervisor()
+
+    result = await supervisor.launch(
+        SubagentLaunchRequest(
+            task="inspect",
+            description="inspect task",
+            budget=TaskBudget(max_steps=20, max_tokens=5000),
+        ),
+        _context(budget_ledger=ledger),
+        background=False,
+    )
+
+    assert result.status is SubagentStatus.COMPLETED
+    assert result.request.budget.max_steps == 7
+    assert result.request.budget.max_tokens == 5000
+    assert await supervisor.aclose() == 0
+
+
+@pytest.mark.asyncio
+async def test_launch_clamps_unbounded_request_max_steps() -> None:
+    ledger = await _ledger_with_steps(max_steps=10, used=3)
+    supervisor = _completing_supervisor()
+
+    result = await supervisor.launch(
+        SubagentLaunchRequest(
+            task="inspect",
+            description="inspect task",
+            budget=TaskBudget(),
+        ),
+        _context(budget_ledger=ledger),
+        background=False,
+    )
+
+    assert result.status is SubagentStatus.COMPLETED
+    assert result.request.budget.max_steps == 7
+    assert await supervisor.aclose() == 0
+
+
+@pytest.mark.asyncio
+async def test_launch_keeps_smaller_requested_max_steps() -> None:
+    ledger = await _ledger_with_steps(max_steps=10, used=3)
+    supervisor = _completing_supervisor()
+
+    result = await supervisor.launch(
+        SubagentLaunchRequest(
+            task="inspect",
+            description="inspect task",
+            budget=TaskBudget(max_steps=3),
+        ),
+        _context(budget_ledger=ledger),
+        background=False,
+    )
+
+    assert result.status is SubagentStatus.COMPLETED
+    assert result.request.budget.max_steps == 3
+    assert await supervisor.aclose() == 0
+
+
+@pytest.mark.asyncio
+async def test_launch_budget_unchanged_without_ledger_or_step_limit() -> None:
+    supervisor = _completing_supervisor(min_remaining_step_reserve=2)
+    request = SubagentLaunchRequest(
+        task="inspect",
+        description="inspect task",
+        budget=TaskBudget(max_steps=20),
+    )
+
+    no_ledger = await supervisor.launch(request, _context(), background=False)
+    no_step_limit = await supervisor.launch(
+        request,
+        _context(budget_ledger=BudgetLedger(max_tokens=1000)),
+        background=False,
+    )
+
+    assert no_ledger.request.budget.max_steps == 20
+    assert no_step_limit.request.budget.max_steps == 20
+    assert await supervisor.aclose() == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_any_returns_none_without_owned_subagents() -> None:
+    supervisor = _completing_supervisor()
+
+    assert await supervisor.wait_any(timeout_seconds=0) is None
+    assert await supervisor.wait_any() is None
+
+
+@pytest.mark.asyncio
+async def test_wait_any_rejects_negative_timeout() -> None:
+    supervisor = _completing_supervisor()
+
+    with pytest.raises(ValueError, match="timeout_seconds"):
+        await supervisor.wait_any(timeout_seconds=-0.1)
+
+
+@pytest.mark.asyncio
+async def test_wait_any_returns_existing_terminal_without_waiting() -> None:
+    supervisor = _completing_supervisor()
+    completed = await supervisor.launch(_request(), _context(), background=False)
+
+    result = await asyncio.wait_for(supervisor.wait_any(), timeout=1)
+
+    assert result == completed
+    assert await supervisor.aclose() == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_any_returns_first_terminal_result() -> None:
+    started = {"one": asyncio.Event(), "two": asyncio.Event()}
+    released = {"one": asyncio.Event(), "two": asyncio.Event()}
+    supervisor = SubagentSupervisor(
+        invocation_factory=_gated_factory(started, released)
+    )
+    first = await supervisor.launch(_request("one"), _context(), background=True)
+    second = await supervisor.launch(_request("two"), _context(), background=True)
+    await asyncio.wait_for(started["one"].wait(), timeout=1)
+    await asyncio.wait_for(started["two"].wait(), timeout=1)
+
+    released["two"].set()
+    result = await supervisor.wait_any(timeout_seconds=1)
+
+    assert result is not None
+    assert result.handle == second.handle
+    assert result.status is SubagentStatus.COMPLETED
+    assert supervisor.active_count == 1
+
+    released["one"].set()
+    terminal = await supervisor.wait(first.handle, timeout_seconds=1)
+    assert terminal is not None
+    assert terminal.status is SubagentStatus.COMPLETED
+    assert await supervisor.aclose() == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_any_timeout_leaves_subagents_running() -> None:
+    started = {"one": asyncio.Event()}
+    released = {"one": asyncio.Event()}
+    supervisor = SubagentSupervisor(
+        invocation_factory=_gated_factory(started, released)
+    )
+    launched = await supervisor.launch(_request("one"), _context(), background=True)
+    await asyncio.wait_for(started["one"].wait(), timeout=1)
+
+    result = await supervisor.wait_any(timeout_seconds=0.01)
+
+    assert result is None
+    assert supervisor.active_count == 1
+
+    released["one"].set()
+    terminal = await supervisor.wait(launched.handle, timeout_seconds=1)
+    assert terminal is not None
+    assert terminal.status is SubagentStatus.COMPLETED
+    assert await supervisor.aclose() == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_any_cancellation_cancels_waiters_and_propagates() -> None:
+    started = {"one": asyncio.Event()}
+    released = {"one": asyncio.Event()}
+    supervisor = SubagentSupervisor(
+        invocation_factory=_gated_factory(started, released)
+    )
+    launched = await supervisor.launch(_request("one"), _context(), background=True)
+    await asyncio.wait_for(started["one"].wait(), timeout=1)
+
+    waiter = asyncio.create_task(supervisor.wait_any())
+    await asyncio.sleep(0)
+    assert any(
+        task.get_name().endswith("-wait-any") and not task.done()
+        for task in asyncio.all_tasks()
+    )
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert not {
+        task.get_name()
+        for task in asyncio.all_tasks()
+        if not task.done() and task.get_name().endswith("-wait-any")
+    }
+    assert supervisor.active_count == 1
+
+    released["one"].set()
+    terminal = await supervisor.wait(launched.handle, timeout_seconds=1)
+    assert terminal is not None
+    assert terminal.status is SubagentStatus.COMPLETED
+    assert await supervisor.aclose() == 0
 
 
 @pytest.mark.asyncio

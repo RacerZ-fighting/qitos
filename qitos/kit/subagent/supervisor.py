@@ -117,9 +117,17 @@ class SubagentSupervisor:
         max_concurrency: int = 4,
         run_limiter: SubagentRunLimiter | None = None,
         subagent_journal_factory: SubagentJournalFactory | None = None,
+        min_remaining_step_reserve: int = 0,
     ) -> None:
         if max_concurrency <= 0:
             raise ValueError("max_concurrency must be positive")
+        if (
+            isinstance(min_remaining_step_reserve, bool)
+            or not isinstance(min_remaining_step_reserve, int)
+            or min_remaining_step_reserve < 0
+        ):
+            raise ValueError("min_remaining_step_reserve must be a non-negative integer")
+        self._min_remaining_step_reserve = min_remaining_step_reserve
         self._invocation_factory = invocation_factory
         self._execution_scope = execution_scope
         self._max_concurrency = max_concurrency
@@ -171,6 +179,7 @@ class SubagentSupervisor:
                             "Run Subagent budget exhausted: "
                             f"max_subagents={context.max_subagents}."
                         )
+                    request = self._admit_lineage_step_budget(request, context)
                     self._subagents_started += 1
                     handle = SubagentHandle(
                         subagent_id=f"subagent-{uuid.uuid4().hex[:12]}",
@@ -312,6 +321,58 @@ class SubagentSupervisor:
         except asyncio.TimeoutError:
             return self._current_result(owned)
         return self._current_result(owned)
+
+    async def wait_any(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> SubagentResult | None:
+        """Wait for the next owned subagent terminal state without cancelling it.
+
+        Returns the most recent terminal result immediately when one already
+        exists, ``None`` when no subagent is owned or when the bounded wait
+        expires. A timeout never cancels a running subagent.
+        """
+
+        if timeout_seconds is not None and timeout_seconds < 0:
+            raise ValueError("timeout_seconds must be non-negative or None")
+        terminal = self._latest_terminal_result()
+        if terminal is not None:
+            return terminal
+        owned_list = list(self._subagents.values())
+        if not owned_list:
+            return None
+        waiters = [
+            asyncio.create_task(
+                owned.terminal_event.wait(),
+                name=f"qitos-{owned.handle.subagent_id}-wait-any",
+            )
+            for owned in owned_list
+        ]
+        try:
+            completed, _ = await asyncio.wait(
+                waiters,
+                timeout=timeout_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not completed:
+                return None
+            return self._latest_terminal_result()
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+
+    def _latest_terminal_result(self) -> SubagentResult | None:
+        terminal = [
+            owned
+            for owned in self._subagents.values()
+            if owned.terminal_event.is_set()
+        ]
+        if not terminal:
+            return None
+        return self._current_result(terminal[-1])
 
     async def recover(
         self,
@@ -581,6 +642,15 @@ class SubagentSupervisor:
 
         return sum(
             1
+            for owned in self._subagents.values()
+            if not self._current_result(owned).ready
+        )
+
+    def active_results(self) -> tuple[SubagentResult, ...]:
+        """Return current projections for subagents that have not terminalized."""
+
+        return tuple(
+            self._current_result(owned)
             for owned in self._subagents.values()
             if not self._current_result(owned).ready
         )
@@ -1625,6 +1695,40 @@ class SubagentSupervisor:
             cost_complete=cost_complete,
             elapsed_seconds=elapsed_seconds,
         )
+
+    def _admit_lineage_step_budget(
+        self,
+        request: SubagentLaunchRequest,
+        context: SubagentLaunchContext,
+    ) -> SubagentLaunchRequest:
+        """Narrow one launch to the shared lineage step budget.
+
+        An oversized or unbounded ``max_steps`` is clamped to the remaining
+        lineage steps so one Subagent cannot oversubscribe the Root budget.
+        A launch at or below the configured reserve is rejected so the parent
+        keeps capacity for its own turns.
+        """
+
+        ledger = context.budget_ledger
+        if ledger is None:
+            return request
+        remaining = ledger.snapshot().remaining_steps
+        if remaining is None:
+            return request
+        reserve = self._min_remaining_step_reserve
+        if remaining <= reserve:
+            raise RuntimeError(
+                "lineage step budget reserve reached: "
+                f"remaining={remaining}, reserve={reserve}; "
+                "no new Subagent launches"
+            )
+        max_steps = request.budget.max_steps
+        if max_steps is None or max_steps > remaining:
+            return replace(
+                request,
+                budget=replace(request.budget, max_steps=remaining),
+            )
+        return request
 
     @staticmethod
     def _budget_admission_error(context: SubagentLaunchContext) -> str | None:

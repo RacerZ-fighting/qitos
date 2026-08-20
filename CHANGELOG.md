@@ -19,6 +19,18 @@ How to update:
 
 ### Fixed
 
+- Subagent launch admission now narrows each requested `max_steps` to the
+  shared lineage budget's remaining steps instead of oversubscribing it, and a
+  new `SubagentSupervisor` `min_remaining_step_reserve` option rejects launches
+  once the remaining lineage steps fall to the configured reserve, keeping
+  capacity for the parent's own turns.
+
+- `subagent_wait` may now omit `subagent_id` to wait for the next Subagent
+  terminal state in the Run through the new event-driven
+  `SubagentSupervisor.wait_any`, and its `timeout_seconds` ceiling is raised
+  from 60 to 600 seconds, so a parent can take one long wait instead of
+  polling in a tight loop.
+
 - Subagent mailboxes now queue parent messages instead of awaiting turn
   admission. `AgentSubagentEngine.apost_runtime_event` accepts a message for
   any active Run — including while a model request or Tool call is in flight

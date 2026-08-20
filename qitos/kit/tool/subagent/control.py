@@ -21,10 +21,16 @@ class _SubagentControlTool(BaseTool):
         description: str,
         parameters: dict[str, dict[str, Any]],
         required: list[str],
+        subagent_id_required: bool = True,
     ) -> None:
         if not isinstance(supervisor, SubagentSupervisor):
             raise TypeError("supervisor must be a SubagentSupervisor")
         self._supervisor = supervisor
+        subagent_id_description = "The subagent id returned by `subagent`."
+        if not subagent_id_required:
+            subagent_id_description += (
+                " Omit it to apply this call to all Subagents of the current Run."
+            )
         super().__init__(
             ToolSpec(
                 name=name,
@@ -32,11 +38,15 @@ class _SubagentControlTool(BaseTool):
                 parameters={
                     "subagent_id": {
                         "type": "string",
-                        "description": "The subagent id returned by `subagent`.",
+                        "description": subagent_id_description,
                     },
                     **parameters,
                 },
-                required=["subagent_id", *required],
+                required=(
+                    ["subagent_id", *required]
+                    if subagent_id_required
+                    else list(required)
+                ),
                 permissions=ToolPermission(),
                 concurrency_safe=True,
                 group="subagent",
@@ -129,25 +139,28 @@ class SubagentStatusTool(_SubagentControlTool):
 
 
 class SubagentWaitTool(_SubagentControlTool):
-    """Wait a bounded time for one Subagent without cancelling it on timeout."""
+    """Wait a bounded time for Subagent terminal state without cancelling it."""
 
     def __init__(self, supervisor: SubagentSupervisor) -> None:
         super().__init__(
             supervisor=supervisor,
             name="subagent_wait",
             description=(
-                "Wait for one Subagent to reach terminal state. A wait timeout leaves the "
-                "Subagent running and returns its current status."
+                "Wait for one Subagent to reach terminal state, or for the next "
+                "Subagent terminal state in this Run when subagent_id is omitted. "
+                "A wait timeout leaves every Subagent running and returns its "
+                "current status. Prefer one long wait over repeated short polling."
             ),
             parameters={
                 "timeout_seconds": {
                     "type": "number",
-                    "description": "Maximum wait, from 0 to 60 seconds.",
+                    "description": "Maximum wait, from 0 to 600 seconds.",
                     "minimum": 0,
-                    "maximum": 60,
+                    "maximum": 600,
                 }
             },
             required=[],
+            subagent_id_required=False,
         )
 
     async def execute(
@@ -155,21 +168,48 @@ class SubagentWaitTool(_SubagentControlTool):
         args: dict[str, Any],
         runtime_context: dict[str, Any] | None = None,
     ) -> dict[str, Any] | ToolResult:
+        subagent_id = str(args.get("subagent_id") or "").strip()
         try:
-            handle = self._handle(args, runtime_context)
             timeout = min(
-                60.0,
+                600.0,
                 self._timeout(args, runtime_context, default=30.0),
             )
-            result = await self._supervisor.wait(
-                handle,
-                timeout_seconds=timeout,
-            )
+            if subagent_id:
+                handle = self._handle(args, runtime_context)
+                result = await self._supervisor.wait(
+                    handle,
+                    timeout_seconds=timeout,
+                )
+            else:
+                result = await self._supervisor.wait_any(timeout_seconds=timeout)
         except (TypeError, ValueError) as exc:
             return tool_result(
                 {"status": "error", "error": str(exc)}, status="error"
             )
-        return self._unknown(handle) if result is None else self._projection(result)
+        if subagent_id:
+            return self._unknown(handle) if result is None else self._projection(result)
+        if result is not None:
+            return self._projection(result)
+        return self._wait_any_pending(timeout)
+
+    def _wait_any_pending(self, timeout: float) -> dict[str, Any]:
+        running = [
+            result.handle.subagent_id
+            for result in self._supervisor.active_results()
+        ]
+        if not running:
+            output = "No Subagent belongs to the current Run."
+        else:
+            output = (
+                f"No Subagent reached terminal state within {timeout:g} seconds; "
+                f"still running: {', '.join(running)}."
+            )
+        return {
+            "status": "success",
+            "ready": False,
+            "output": output,
+            "subagent_ids": running,
+        }
 
 
 class SubagentMessageTool(_SubagentControlTool):
