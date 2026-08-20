@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from .capability import WebFetchCapability
+from .direct import DirectWebFetchCapability
 from .kimi import KimiWebFetchCapability
 
 CapabilityBuilder = Callable[[str, str | None, float], WebFetchCapability | None]
@@ -24,7 +25,16 @@ def _build_kimi(
     )
 
 
-_BUILDERS: dict[str, CapabilityBuilder] = {"kimi": _build_kimi}
+def _build_direct(
+    api_key: str,
+    fetch_url: str | None,
+    timeout_seconds: float,
+) -> WebFetchCapability | None:
+    _ = api_key, fetch_url
+    return DirectWebFetchCapability(timeout_seconds=timeout_seconds)
+
+
+_BUILDERS: dict[str, CapabilityBuilder] = {"kimi": _build_kimi, "direct": _build_direct}
 
 
 def build_web_fetch_capability(
