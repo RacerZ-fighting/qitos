@@ -109,6 +109,10 @@ How to update:
 
 ### Added
 
+- Added a credential-free `direct` web fetch provider with optional proxy
+  routing and SSRF guards, so applications can retrieve public pages without
+  provisioning a managed search or fetch credential.
+
 - Added provider-neutral `ContextMessage` and a `turn_input.committed` request
   barrier. Applications can project dynamic state as durable model history
   immediately before sampling without impersonating a user message or
