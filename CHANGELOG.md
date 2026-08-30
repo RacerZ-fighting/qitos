@@ -19,6 +19,19 @@ How to update:
 
 ### Fixed
 
+- Managed process cleanup no longer stalls forever when a command backgrounds
+  a descendant that outlives the spawned leader. Such a descendant keeps the
+  inherited output descriptor open, which leaves both the output reader and
+  `Process.wait()` pending long after the leader was reaped, so the process
+  stayed `running`, never received a terminal record, and `terminate`,
+  `quiesce` and `close` waited on it without a deadline. Group signals are no
+  longer gated on the leader's return code, so the survivor is now reaped with
+  the group, and cleanup escalates SIGTERM, SIGKILL and finally output
+  abandonment on a bounded grace period. A descendant that left the group
+  through `setsid` or a double fork stays out of reach, but its process now
+  reaches a terminal record carrying the abandonment reason instead of holding
+  the owning Session open.
+
 - Subagent launch admission now narrows each requested `max_steps` to the
   shared lineage budget's remaining steps instead of oversubscribing it, and a
   new `SubagentSupervisor` `min_remaining_step_reserve` option rejects launches
