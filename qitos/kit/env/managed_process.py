@@ -180,6 +180,7 @@ class _ProcessEntry:
     started_record_ready: asyncio.Event = field(default_factory=asyncio.Event)
     suppress_terminal_record: bool = False
     journal_error: BaseException | None = None
+    abandoned: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class ManagedHostProcessRuntime:
@@ -701,12 +702,10 @@ class ManagedHostProcessRuntime:
                 await self._record_output(entry, final)
                 return
             entry.error = f"process output reader failed: {exc}"
-            if entry.process.returncode is None:
-                self._signal_process_group(entry.process, signal.SIGKILL)
+            self._signal_process_group(entry.process, signal.SIGKILL)
         except Exception as exc:
             entry.error = f"process output reader failed: {exc}"
-            if entry.process.returncode is None:
-                self._signal_process_group(entry.process, signal.SIGKILL)
+            self._signal_process_group(entry.process, signal.SIGKILL)
 
     async def _record_output(self, entry: _ProcessEntry, content: bytes) -> None:
         if not content:
@@ -718,11 +717,15 @@ class ManagedHostProcessRuntime:
 
     async def _watch_terminal(self, entry: _ProcessEntry) -> None:
         try:
-            exit_code = await entry.process.wait()
+            exit_code = await self._await_leader_exit(entry)
             if entry.reader_task is not None:
-                await entry.reader_task
+                try:
+                    await entry.reader_task
+                except asyncio.CancelledError:
+                    if not entry.abandoned.is_set():
+                        raise
             async with entry.condition:
-                entry.exit_code = int(exit_code)
+                entry.exit_code = None if exit_code is None else int(exit_code)
                 entry.ended_at = _utc_now()
                 if entry.error:
                     entry.status = ProcessStatus.FAILED
@@ -770,14 +773,45 @@ class ManagedHostProcessRuntime:
                 entry.read_transport.close()
                 entry.read_transport = None
 
+    async def _await_leader_exit(self, entry: _ProcessEntry) -> int | None:
+        """Return the leader's exit code, or ``None`` once its output is abandoned.
+
+        ``Process.wait()`` settles only after every subprocess pipe disconnects,
+        so a descendant that outlived the leader and kept the inherited output
+        descriptor holds that wait open long after the leader was reaped.
+        Abandonment releases it and falls back to the recorded return code,
+        which is already set for a leader the runtime reaped.
+        """
+
+        waiting = asyncio.ensure_future(entry.process.wait())
+        abandoned = asyncio.ensure_future(entry.abandoned.wait())
+        try:
+            await asyncio.wait(
+                (waiting, abandoned),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            abandoned.cancel()
+        if waiting.done():
+            return await waiting
+        waiting.cancel()
+        return entry.process.returncode
+
     async def _terminate_entry(self, entry: _ProcessEntry) -> None:
+        """Drive one entry to its terminal record within a bounded deadline.
+
+        A command may background a descendant that outlives the spawned leader
+        while still holding the inherited output descriptor, which keeps both
+        the output reader and the leader's own wait pending. Each stage below
+        escalates only after the previous one failed to settle within one
+        grace period.
+        """
+
         async with entry.condition:
-            if entry.status is not ProcessStatus.RUNNING:
-                watcher = entry.watcher_task
-            else:
+            if entry.status is ProcessStatus.RUNNING:
                 entry.termination_requested = True
                 self._signal_process_group(entry.process, signal.SIGTERM)
-                watcher = entry.watcher_task
+            watcher = entry.watcher_task
         if entry.process.returncode is None:
             try:
                 await asyncio.wait_for(
@@ -786,8 +820,39 @@ class ManagedHostProcessRuntime:
                 )
             except asyncio.TimeoutError:
                 self._signal_process_group(entry.process, signal.SIGKILL)
-        if watcher is not None:
-            await asyncio.shield(watcher)
+        if watcher is None:
+            return
+        if await self._watcher_settles(watcher):
+            return
+        # A watcher still pending after the leader was signalled is itself the
+        # evidence that a descendant survives in the group, so this signal
+        # reaches that survivor rather than a group that was already recycled.
+        self._signal_process_group(entry.process, signal.SIGKILL)
+        if await self._watcher_settles(watcher):
+            return
+        # The survivor left the group entirely, through setsid or a double
+        # fork, and is out of reach. Abandon its output rather than stall
+        # every caller waiting for this runtime to close.
+        entry.error = (
+            "process output abandoned: a descendant left the process group "
+            "and still holds the output descriptor"
+        )
+        entry.abandoned.set()
+        if entry.reader_task is not None:
+            entry.reader_task.cancel()
+        await asyncio.shield(watcher)
+
+    async def _watcher_settles(self, watcher: asyncio.Task[None]) -> bool:
+        """Wait one grace period; ``False`` means the watcher is still pending."""
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(watcher),
+                timeout=self._terminate_grace_seconds,
+            )
+        except asyncio.TimeoutError:
+            return False
+        return True
 
     async def _terminate_raw(self, process: _ManagedProcess) -> None:
         if process.returncode is not None:
@@ -807,10 +872,19 @@ class ManagedHostProcessRuntime:
         process: _ManagedProcess,
         sig: signal.Signals,
     ) -> None:
-        if process.returncode is not None:
-            return
+        """Signal the process group the spawned leader owns.
+
+        ``start_new_session`` makes the leader its own group leader, so a
+        descendant it backgrounded stays in that group and can outlive it.
+        Gating on the leader's return code would skip exactly those survivors,
+        and they are the ones holding an output descriptor open. An empty group
+        raises ``ProcessLookupError``, which is the ordinary case.
+        """
+
         try:
             if os.name == "nt":
+                if process.returncode is not None:
+                    return
                 if sig is signal.SIGKILL:
                     process.kill()
                 else:

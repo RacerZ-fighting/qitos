@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import signal
 import sys
 import threading
 from pathlib import Path
@@ -10,7 +11,11 @@ from pathlib import Path
 import pytest
 
 from qitos.core.journal import JournalError, JournalRecordType
-from qitos.core.process import ProcessPersistenceError, ProcessStatus
+from qitos.core.process import (
+    ProcessHandle,
+    ProcessPersistenceError,
+    ProcessStatus,
+)
 from qitos.kit.env.managed_process import ManagedHostProcessRuntime
 from qitos.kit.journal import JsonlSessionJournal
 
@@ -485,3 +490,99 @@ async def test_cancelled_pty_spawn_reaps_process_before_propagating(
     assert reaped.is_set()
     assert await runtime.list() == ()
     await runtime.close()
+
+
+async def _await_process_exit(pid: int, *, timeout: float) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+async def _read_until(
+    runtime: ManagedHostProcessRuntime,
+    handle: ProcessHandle,
+    needle: str,
+    *,
+    timeout: float,
+) -> str:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    content = ""
+    cursor = 0
+    while needle not in content:
+        if loop.time() >= deadline:
+            raise AssertionError(f"{needle!r} never appeared in {content!r}")
+        observed = await runtime.read(handle, cursor=cursor, wait_seconds=0.5)
+        content += observed.output.content
+        cursor = observed.output.next_cursor
+    return content
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_descendant_outliving_the_leader_is_reaped_with_the_group(
+    tmp_path: Path,
+) -> None:
+    runtime = ManagedHostProcessRuntime(
+        str(tmp_path),
+        terminate_grace_seconds=0.05,
+    )
+    survivor = _python_command("import time; print('ready', flush=True); time.sleep(120)")
+    started = await runtime.start(
+        f"{survivor} & echo survivor=$! ; exit 0",
+        owner_run_id="run-1",
+        cwd=str(tmp_path),
+    )
+    content = await _read_until(runtime, started.handle, "ready", timeout=15.0)
+    survivor_pid = int(content.split("survivor=")[1].split()[0])
+    assert (await runtime.poll(started.handle)).status is ProcessStatus.RUNNING
+
+    await asyncio.wait_for(runtime.close(), timeout=15.0)
+
+    assert await _await_process_exit(survivor_pid, timeout=5.0)
+    (terminal,) = await runtime.list(owner_run_id="run-1")
+    assert terminal.terminal is True
+    assert terminal.error is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+@pytest.mark.asyncio
+async def test_descendant_escaping_the_group_terminalizes_without_stalling(
+    tmp_path: Path,
+) -> None:
+    runtime = ManagedHostProcessRuntime(
+        str(tmp_path),
+        terminate_grace_seconds=0.05,
+    )
+    escapee = _python_command(
+        "import os, time; "
+        "os.setsid(); "
+        "print('escaped', flush=True); "
+        "time.sleep(120)"
+    )
+    started = await runtime.start(
+        f"{escapee} & echo escapee=$! ; exit 0",
+        owner_run_id="run-1",
+        cwd=str(tmp_path),
+    )
+    content = await _read_until(runtime, started.handle, "escaped", timeout=15.0)
+    escapee_pid = int(content.split("escapee=")[1].split()[0])
+
+    try:
+        await asyncio.wait_for(runtime.close(), timeout=15.0)
+
+        (terminal,) = await runtime.list(owner_run_id="run-1")
+        assert terminal.terminal is True
+        assert terminal.error is not None
+        assert not await _await_process_exit(escapee_pid, timeout=0.1)
+    finally:
+        try:
+            os.kill(escapee_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
