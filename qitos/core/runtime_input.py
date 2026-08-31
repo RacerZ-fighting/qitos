@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from .process import ProcessSnapshot
 
 
-_PROCESS_TERMINAL_EVENT_MAX_CHARS = 8_000
+_TERMINAL_EVENT_MAX_CHARS = 8_000
 
 
 def _bounded_head_tail(content: str, max_chars: int) -> str:
@@ -164,13 +164,48 @@ def subagent_result_payload(result: SubagentResult) -> dict[str, Any]:
     }
 
 
+def _terminal_notification(headline: str, body: str) -> str:
+    """Compose one bounded notification, keeping the headline intact."""
+
+    detail = body.strip()
+    if not detail:
+        return headline
+    return _bounded_head_tail(f"{headline}\n{detail}", _TERMINAL_EVENT_MAX_CHARS)
+
+
+def _subagent_terminal_content(result: SubagentResult) -> str:
+    """Render the parent-facing notification text for one Subagent terminal."""
+
+    from .subagent import SubagentResult
+
+    if not isinstance(result, SubagentResult):
+        raise TypeError("result must be a SubagentResult")
+    request = result.request
+    name = request.name or request.agent_type
+    headline = (
+        f"Subagent {result.handle.subagent_id} ({name}) reached "
+        f"{result.status.value} after {result.steps} steps."
+    )
+    return _terminal_notification(
+        headline,
+        result.conclusion.summary or result.error or "",
+    )
+
+
 def subagent_terminal_runtime_input(result: SubagentResult) -> RuntimeInput:
-    """Derive the idempotent parent input for one canonical Subagent terminal."""
+    """Derive the idempotent parent input for one canonical Subagent terminal.
+
+    ``content`` carries the text every delivery endpoint steers into the parent
+    transcript; the remaining keys stay the structured terminal projection an
+    endpoint records. An input without it is dropped before any durable record,
+    so the notification and its evidence must travel in the same payload.
+    """
 
     payload = subagent_result_payload(result)
     if not result.ready:
         raise ValueError("Subagent result must be terminal")
     subagent_id = result.handle.subagent_id
+    payload["content"] = _subagent_terminal_content(result)
     return RuntimeInput(
         event_id=f"{subagent_id}:terminal",
         kind="agent.subagent.completed",
@@ -190,11 +225,11 @@ def process_terminal_payload(snapshot: ProcessSnapshot) -> dict[str, Any]:
     if not snapshot.terminal:
         raise ValueError("process snapshot must be terminal")
     content = snapshot.output.content
-    notification_truncated = len(content) > _PROCESS_TERMINAL_EVENT_MAX_CHARS
+    notification_truncated = len(content) > _TERMINAL_EVENT_MAX_CHARS
     if notification_truncated:
         content = _bounded_head_tail(
             content,
-            _PROCESS_TERMINAL_EVENT_MAX_CHARS,
+            _TERMINAL_EVENT_MAX_CHARS,
         )
     return {
         "handle": snapshot.handle.to_dict(),
@@ -216,11 +251,33 @@ def process_terminal_payload(snapshot: ProcessSnapshot) -> dict[str, Any]:
     }
 
 
+def _process_terminal_content(snapshot: ProcessSnapshot, output: str) -> str:
+    """Render the owner-facing notification text for one bounded process terminal."""
+
+    exit_code = "unknown" if snapshot.exit_code is None else snapshot.exit_code
+    headline = (
+        f"Process {snapshot.handle.process_id} reached {snapshot.status.value} "
+        f"with exit code {exit_code}: {snapshot.command}"
+    )
+    return _terminal_notification(headline, output or snapshot.error or "")
+
+
 def process_terminal_runtime_input(snapshot: ProcessSnapshot) -> RuntimeInput:
-    """Derive the idempotent Run input for one canonical process terminal."""
+    """Derive the idempotent Run input for one canonical process terminal.
+
+    ``content`` carries the text every delivery endpoint steers into the owner's
+    transcript; the remaining keys stay the structured terminal projection an
+    endpoint records. An input without it is dropped before any durable record,
+    so the notification and its evidence must travel in the same payload.
+    """
 
     payload = process_terminal_payload(snapshot)
     process_id = snapshot.handle.process_id
+    raw_output = payload["output"]
+    payload["content"] = _process_terminal_content(
+        snapshot,
+        str(raw_output["content"]) if isinstance(raw_output, dict) else "",
+    )
     return RuntimeInput(
         event_id=f"{process_id}:terminal",
         kind="process.completed",

@@ -17,6 +17,20 @@ How to update:
 
 ## Unreleased
 
+### Fixed
+
+- Subagent and process terminal notifications now reach the run that owns them.
+  `subagent_terminal_runtime_input` and `process_terminal_runtime_input` derived
+  a payload with no top-level `content`, while every delivery endpoint
+  (`SessionRuntimeInputs.post`, `AgentSubagentEngine.apost_runtime_event`)
+  steers `payload["content"]` and drops an input whose text is empty — before
+  any `runtime_input.posted` record. A background Subagent could finish and a
+  long process could exit without the owning run ever being told. Both
+  derivations now carry a bounded notification beside the structured
+  projection, and `tests/core/test_runtime_input.py` covers the module for the
+  first time; the existing harness tests had hand-built payloads, so they
+  exercised delivery without ever exercising the derivations.
+
 ### Changed
 
 - A rejected `update_plan` replacement now tells the caller to resend the
