@@ -211,3 +211,35 @@ async def test_update_plan_tool_commits_a_checklist_without_a_rationale() -> Non
     assert result["explanation"] is None
     assert "explanation" not in committed[0].payload
     assert decode_plan_updated(committed[0].payload)[1].explanation is None
+
+
+@pytest.mark.asyncio
+async def test_update_plan_tool_keeps_the_diagnosis_when_it_asks_for_a_retry() -> None:
+    journal = await _journal()
+    rejected = {
+        "plan": [
+            _item("Work front A", status="in_progress"),
+            _item("Work front B", status="in_progress"),
+        ],
+        "explanation": "Both fronts opened after the fingerprint pass.",
+    }
+
+    with pytest.raises(PlanContractError) as raised:
+        await UpdatePlanTool().execute(
+            rejected,
+            runtime_context={
+                "journal": journal,
+                "tool_call_id": "call-plan",
+                "task_id": "task-plan",
+            },
+        )
+
+    cause = raised.value.__cause__
+    assert isinstance(cause, PlanContractError)
+    assert str(raised.value).startswith(str(cause))
+    assert len(str(raised.value)) > len(str(cause))
+    assert not [
+        record
+        for record in await journal.replay()
+        if record.type is JournalRecordType.PLAN_UPDATED
+    ]

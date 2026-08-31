@@ -81,7 +81,18 @@ class UpdatePlanTool(BaseTool):
         args: Dict[str, Any],
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, object]:
-        update = parse_plan_update(args)
+        try:
+            update = parse_plan_update(args)
+        except PlanContractError as exc:
+            # A rejected replacement is retried, and the retry carries whatever
+            # explanation the model writes next. Left to itself the model
+            # explains the correction it just made, so the reason the checklist
+            # actually changed never reaches a record.
+            raise PlanContractError(
+                f"{exc}; resend the corrected checklist with the same "
+                "explanation, which still states what changed the plan rather "
+                "than how it was reshaped to satisfy this rule"
+            ) from exc
         context = runtime_context or {}
         journal = context.get("journal")
         if not isinstance(journal, SessionJournal):

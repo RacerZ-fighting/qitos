@@ -19,6 +19,13 @@ How to update:
 
 ### Changed
 
+- A rejected `update_plan` replacement now tells the caller to resend the
+  corrected checklist with the same explanation. The contract error stated only
+  the violated invariant, so a model repaired the checklist and then explained
+  the repair; the reason the plan actually changed stayed in the rejected call
+  and never reached a record. The core `Plan` invariant message is unchanged —
+  the guidance lives at the tool boundary, where the caller is a model.
+
 - `plan.updated` now carries the optional `explanation` the `update_plan` tool
   already accepted. The tool returned the model's rationale to the caller and
   the journal then dropped it, so a replayed journal showed what a checklist
