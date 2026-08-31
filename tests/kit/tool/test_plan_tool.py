@@ -11,7 +11,10 @@ from qitos.kit.journal import (
     InMemorySessionJournal,
     recover_session,
 )
-from qitos.kit.journal.turn_recorder import encode_task_created
+from qitos.kit.journal.turn_recorder import (
+    decode_plan_updated,
+    encode_task_created,
+)
 from qitos.kit.session import SessionHarness
 from qitos.kit.tool.planning import UpdatePlanTool
 
@@ -65,10 +68,17 @@ async def test_update_plan_tool_commits_whole_checklist_to_the_journal() -> None
         "Collect evidence",
         "Verify result",
     )
-    assert any(
-        record.type is JournalRecordType.PLAN_UPDATED
+    committed = [
+        record
         for record in await journal.replay()
+        if record.type is JournalRecordType.PLAN_UPDATED
+    ]
+    assert len(committed) == 1
+    assert (
+        decode_plan_updated(committed[0].payload)[1].explanation
+        == arguments["explanation"]
     )
+    assert result["explanation"] == arguments["explanation"]
 
 
 @pytest.mark.asyncio
@@ -178,3 +188,26 @@ def test_update_plan_tool_exposes_strict_checklist_schema() -> None:
     assert item_schema["additionalProperties"] is False
     assert set(item_schema["required"]) == {"step", "status"}
     assert set(item_schema["properties"]) == {"step", "status"}
+
+
+@pytest.mark.asyncio
+async def test_update_plan_tool_commits_a_checklist_without_a_rationale() -> None:
+    journal = await _journal()
+
+    result = await UpdatePlanTool().execute(
+        {"plan": [_item("Collect evidence")]},
+        runtime_context={
+            "journal": journal,
+            "tool_call_id": "call-plan",
+            "task_id": "task-plan",
+        },
+    )
+
+    committed = [
+        record
+        for record in await journal.replay()
+        if record.type is JournalRecordType.PLAN_UPDATED
+    ]
+    assert result["explanation"] is None
+    assert "explanation" not in committed[0].payload
+    assert decode_plan_updated(committed[0].payload)[1].explanation is None

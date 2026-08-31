@@ -632,12 +632,12 @@ def recover_session(records: Sequence[JournalRecord]) -> RecoveredSession:
                     ),
                 )
             elif record_type is JournalRecordType.PLAN_UPDATED:
-                task_id, proposed = decode_plan_updated(payload)
+                task_id, update = decode_plan_updated(payload)
                 if task_id not in tasks:
                     raise JournalCorruptionError(
                         "plan.updated references an unknown task"
                     )
-                plans[task_id] = proposed
+                plans[task_id] = update.plan
             elif record_type in (
                 JournalRecordType.RUN_COMPLETED,
                 JournalRecordType.RUN_INTERRUPTED,

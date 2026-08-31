@@ -45,7 +45,7 @@ from ...core.message import (
 )
 from ...core.model_request import ModelRequest
 from ...core.model_response import ModelPricing, ModelUsage
-from ...core.plan import Plan, plan_from_dict, plan_to_dict
+from ...core.plan import PlanUpdate, plan_from_dict, plan_to_dict
 from ...core.task import Task, TaskBlocker, TaskStatus, validate_task_transition
 from ...core.thinking import ThinkingLevel
 from ...core.tool_result import ToolResult
@@ -404,25 +404,42 @@ def decode_runtime_input_consumed(payload: Mapping[str, Any]) -> str:
     return _decode_record_id(payload["event_id"], "event_id")
 
 
-def encode_plan_updated(task_id: str, plan: Plan) -> dict[str, Any]:
-    """Payload of one whole-graph ``plan.updated`` replacement."""
+def encode_plan_updated(task_id: str, update: PlanUpdate) -> dict[str, Any]:
+    """Payload of one whole-checklist ``plan.updated`` replacement.
 
-    payload = {"task_id": task_id, "plan": plan_to_dict(plan)}
+    The model-authored rationale rides with the replacement it explains: a
+    replacement states what the checklist became, and only the explanation
+    says why it changed. It is absent from the payload when the update
+    carries none, so an older record without it stays decodable.
+    """
+
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "plan": plan_to_dict(update.plan),
+    }
+    if update.explanation is not None:
+        payload["explanation"] = update.explanation
+    # Validate before writing: the codec round trip is the fail-closed gate.
     decode_plan_updated(payload)
     return payload
 
 
-def decode_plan_updated(payload: Mapping[str, Any]) -> tuple[str, Plan]:
+def decode_plan_updated(payload: Mapping[str, Any]) -> tuple[str, PlanUpdate]:
     """Decode one exact Plan replacement, failing closed on shape."""
 
-    if set(payload) != {"task_id", "plan"}:
+    if not {"task_id", "plan"}.issubset(payload) or not set(payload).issubset(
+        {"task_id", "plan", "explanation"}
+    ):
         raise ValueError("plan.updated fields are invalid")
     task_id = _decode_record_id(payload["task_id"], "task_id")
     raw_plan = payload["plan"]
     if not isinstance(raw_plan, Mapping):
         raise ValueError("plan.updated plan must be a mapping")
+    explanation = payload.get("explanation")
+    if explanation is not None and not isinstance(explanation, str):
+        raise ValueError("plan.updated explanation must be text")
     try:
-        return task_id, plan_from_dict(raw_plan)
+        return task_id, PlanUpdate(plan_from_dict(raw_plan), explanation)
     except (TypeError, ValueError) as exc:
         raise ValueError("plan.updated is not decodable") from exc
 

@@ -17,6 +17,19 @@ How to update:
 
 ## Unreleased
 
+### Changed
+
+- `plan.updated` now carries the optional `explanation` the `update_plan` tool
+  already accepted. The tool returned the model's rationale to the caller and
+  the journal then dropped it, so a replayed journal showed what a checklist
+  became but never why it changed. `encode_plan_updated` takes a `PlanUpdate`,
+  `decode_plan_updated` returns one, and `commit_model_plan_update` accepts one
+  and still returns the committed `Plan`. The key is written only when the
+  update carries a rationale, so a record written before this change decodes
+  unchanged. The tool description and the `explanation` schema property now ask
+  the model for what changed since the previous checklist and why; without that
+  guidance the field went unused in practice.
+
 ### Fixed
 
 - Managed process cleanup no longer stalls forever when a command backgrounds

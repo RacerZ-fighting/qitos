@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ..core.journal import JournalRecordType, SessionJournal
-from ..core.plan import Plan, PlanContractError
+from ..core.plan import Plan, PlanContractError, PlanUpdate
 from .journal.recovery import recover_session
 from .journal.turn_recorder import encode_plan_updated
 
@@ -27,14 +27,14 @@ async def load_plan(journal: SessionJournal, task_id: str) -> Plan | None:
 async def commit_model_plan_update(
     journal: SessionJournal,
     task_id: str,
-    proposed: Plan,
+    proposed: PlanUpdate,
     *,
     record_id: str,
 ) -> Plan:
-    """Commit one model-authored whole-checklist replacement."""
+    """Commit one model-authored whole-checklist replacement and its rationale."""
 
-    if not isinstance(proposed, Plan):
-        raise TypeError("proposed must be a Plan")
+    if not isinstance(proposed, PlanUpdate):
+        raise TypeError("proposed must be a PlanUpdate")
     if not isinstance(record_id, str) or not record_id.strip():
         raise ValueError("record_id must be non-empty text")
     await load_plan(journal, task_id)
@@ -43,7 +43,7 @@ async def commit_model_plan_update(
         encode_plan_updated(task_id, proposed),
         record_id=record_id,
     )
-    return proposed
+    return proposed.plan
 
 
 __all__ = ["commit_model_plan_update", "load_plan"]

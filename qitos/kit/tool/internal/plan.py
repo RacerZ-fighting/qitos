@@ -27,8 +27,9 @@ class UpdatePlanTool(BaseTool):
                 name=UPDATE_PLAN_TOOL_NAME,
                 description=(
                     "Replace the current task progress checklist. Steps may be added, "
-                    "removed, rewritten, or reordered as the approach changes. Keep at "
-                    "most one step in progress."
+                    "removed, rewritten, or reordered as the approach changes. Provide "
+                    "an explanation of what changed since the previous checklist and "
+                    "why. Keep at most one step in progress."
                 ),
                 input_schema={
                     "type": "object",
@@ -59,6 +60,11 @@ class UpdatePlanTool(BaseTool):
                         "explanation": {
                             "type": "string",
                             "maxLength": MAX_PLAN_EXPLANATION_CHARS,
+                            "description": (
+                                "Why this checklist differs from the previous "
+                                "one: which evidence added, removed, or "
+                                "re-scoped which step."
+                            ),
                         },
                     },
                     "required": ["plan"],
@@ -89,7 +95,7 @@ class UpdatePlanTool(BaseTool):
         committed = await commit_model_plan_update(
             journal,
             task_id,
-            update.plan,
+            update,
             record_id=f"{journal.run_id}:plan:tool:{call_id}",
         )
         return {

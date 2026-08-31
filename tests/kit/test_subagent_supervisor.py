@@ -35,7 +35,7 @@ from qitos.core.journal import (
     JournalRecordType,
     SessionJournal,
 )
-from qitos.core.plan import Plan, PlanItem
+from qitos.core.plan import Plan, PlanItem, PlanUpdate
 from qitos.core.task import Task, TaskBudget
 from qitos.kit.subagent import SubagentRunLimiter, SubagentSupervisor
 from qitos.kit.journal import JsonlSessionJournal, recover_session
@@ -93,12 +93,14 @@ async def _seed_parent_plan(
         JournalRecordType.PLAN_UPDATED,
         encode_plan_updated(
             "parent-task",
-            Plan(
-                tuple(
-                    PlanItem(f"Delegate {node_id}")
-                    for node_id in node_ids
+            PlanUpdate(
+                Plan(
+                    tuple(
+                        PlanItem(f"Delegate {node_id}")
+                        for node_id in node_ids
+                    )
                 )
-            )
+            ),
         ),
         record_id="parent-run:plan:initial",
     )

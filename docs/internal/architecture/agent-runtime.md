@@ -215,8 +215,10 @@ Plan is an optional progress checklist. Each `PlanItem` carries one concise `ste
 description and a `pending | in_progress | completed` display status. A model may add,
 remove, rewrite or reorder items; QitOS validates the bounded shape and at most one item
 in progress. Every accepted replacement commits as one `plan.updated` record with its
-owning Task id in the Run journal. Plans are replayed per Task through the fork lineage,
-so an explicit terminal follow-up Task does not inherit the previous Task's strategy.
+owning Task id and the update's optional explanation in the Run journal, so a replay
+recovers both what the checklist became and why it changed. Plans are replayed per Task
+through the fork lineage, so an explicit terminal follow-up Task does not inherit the
+previous Task's strategy.
 TODO Markdown is a deterministic projection of the committed Plan, never an editable
 second truth.
 
