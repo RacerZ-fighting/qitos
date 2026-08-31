@@ -31,6 +31,14 @@ How to update:
   first time; the existing harness tests had hand-built payloads, so they
   exercised delivery without ever exercising the derivations.
 
+### Removed
+
+- `plan_from_dict` no longer decodes the retired dependency-graph snapshot. The
+  fold dropped `dependencies` and `owner` and demoted every `in_progress` node
+  after the first, so it could only ever produce a display-only checklist from a
+  shape nothing writes any more. Unrecognised payloads now raise
+  `PlanContractError` instead of migrating.
+
 ### Changed
 
 - A rejected `update_plan` replacement now tells the caller to resend the
