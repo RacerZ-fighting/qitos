@@ -98,37 +98,15 @@ def test_plan_markdown_preserves_checklist_order() -> None:
     assert render_plan_markdown(Plan()) is None
 
 
-def test_legacy_graph_snapshot_migrates_without_retired_workflow_state() -> None:
-    restored = plan_from_dict(
-        {
-            "nodes": [
-                {
-                    "node_id": "first",
-                    "description": "First",
-                    "status": "cancelled",
-                    "dependencies": [],
-                    "owner": None,
-                },
-                {
-                    "node_id": "second",
-                    "description": "Second",
-                    "status": "blocked",
-                    "dependencies": ["first"],
-                    "owner": None,
-                },
-            ]
-        }
-    )
+def test_plan_snapshot_decoding_rejects_an_unrecognised_shape() -> None:
+    """Only the current durable shape decodes; anything else fails closed.
 
-    assert restored == Plan(
-        (
-            PlanItem("First", PlanStatus.COMPLETED),
-            PlanItem("Second", PlanStatus.PENDING),
-        )
-    )
-    assert plan_to_dict(restored) == {
-        "items": [
-            {"step": "First", "status": "completed"},
-            {"step": "Second", "status": "pending"},
-        ]
-    }
+    A payload the decoder does not recognise must raise rather than yield an
+    empty Plan, so a snapshot written by another shape cannot silently erase a
+    recovered checklist.
+    """
+
+    with pytest.raises(PlanContractError):
+        plan_from_dict({"nodes": [{"description": "First", "status": "pending"}]})
+    with pytest.raises(PlanContractError):
+        plan_from_dict({"items": [], "extra": []})

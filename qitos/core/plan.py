@@ -147,49 +147,9 @@ def plan_to_dict(plan: Plan) -> dict[str, object]:
     }
 
 
-def _legacy_status(value: object) -> PlanStatus:
-    if value in {"completed", "cancelled"}:
-        return PlanStatus.COMPLETED
-    if value == "in_progress":
-        return PlanStatus.IN_PROGRESS
-    if value in {"pending", "failed", "blocked"}:
-        return PlanStatus.PENDING
-    raise PlanContractError(f"Invalid legacy Plan status: {value}")
-
-
-def _legacy_plan_from_dict(payload: Mapping[str, object]) -> Plan:
-    """Fold the retired graph snapshot into a display-only checklist."""
-
-    raw_nodes = payload.get("nodes")
-    durable_fields = {
-        "node_id",
-        "description",
-        "status",
-        "dependencies",
-        "owner",
-    }
-    if not isinstance(raw_nodes, list) or any(
-        not isinstance(node, Mapping) or set(node) != durable_fields
-        for node in raw_nodes
-    ):
-        raise PlanContractError("Legacy durable Plan nodes have invalid fields")
-    items: list[PlanItem] = []
-    active_seen = False
-    for raw_node in raw_nodes:
-        status = _legacy_status(raw_node["status"])
-        if status is PlanStatus.IN_PROGRESS:
-            if active_seen:
-                status = PlanStatus.PENDING
-            active_seen = True
-        items.append(PlanItem(step=raw_node["description"], status=status))
-    return Plan(tuple(items))
-
-
 def plan_from_dict(payload: Mapping[str, object]) -> Plan:
-    """Decode the current shape or one retired dependency-graph snapshot."""
+    """Decode one durable Plan snapshot."""
 
-    if set(payload) == {"nodes"}:
-        return _legacy_plan_from_dict(payload)
     if set(payload) != {"items"}:
         raise PlanContractError("Plan state requires only items")
     raw_items = payload["items"]
