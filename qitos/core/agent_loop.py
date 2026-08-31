@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -107,9 +108,15 @@ class RunFinalizationDiagnosticCode(str, Enum):
     """Stable failure code for the Run-owned resource quiescence barrier."""
 
     RESOURCE_QUIESCE_FAILED = "RESOURCE_QUIESCE_FAILED"
+    RESOURCE_QUIESCE_TIMEOUT = "RESOURCE_QUIESCE_TIMEOUT"
 
 
 _MAX_FINALIZATION_DIAGNOSTIC_MESSAGE = 512
+
+#: Bounded window a Run finalizer gets to quiesce Run-owned resources. A
+#: finalizer that ignores it loses the run terminal to a typed timeout
+#: diagnostic instead of holding the run open forever.
+DEFAULT_RUN_FINALIZER_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,6 +328,7 @@ class AgentLoopConfig:
     get_follow_up_messages: Optional[QueueDrainHook] = None
     continuation_floor: int = 0
     run_finalizer: RunFinalizer | None = None
+    run_finalizer_timeout_seconds: float = DEFAULT_RUN_FINALIZER_TIMEOUT_SECONDS
 
     def __post_init__(self) -> None:
         if not getattr(self.model, "provider_name", None) or not getattr(
@@ -351,6 +359,15 @@ class AgentLoopConfig:
             raise ValueError("continuation_floor must be a non-negative integer")
         if self.run_finalizer is not None and not callable(self.run_finalizer):
             raise TypeError("run_finalizer must be an async callable or None")
+        if (
+            isinstance(self.run_finalizer_timeout_seconds, bool)
+            or not isinstance(self.run_finalizer_timeout_seconds, (int, float))
+            or not math.isfinite(self.run_finalizer_timeout_seconds)
+            or self.run_finalizer_timeout_seconds <= 0
+        ):
+            raise ValueError(
+                "run_finalizer_timeout_seconds must be a positive finite number"
+            )
 
 
 class _StreamAborted(Exception):
@@ -491,6 +508,17 @@ async def run_agent_loop_continue(
         raise
 
 
+def _discard_abandoned_finalizer(task: "asyncio.Task[None]") -> None:
+    """Retrieve an abandoned finalizer's outcome so it cannot surface as a warning.
+
+    The run already committed a timeout diagnostic for this Task, so whatever it
+    reports afterwards changes nothing the caller can still observe.
+    """
+
+    if not task.cancelled():
+        task.exception()
+
+
 class _RunTerminalGuard:
     """Write the run terminal record exactly once, on any exit path."""
 
@@ -507,7 +535,18 @@ class _RunTerminalGuard:
         *,
         suppress_cancellation: bool,
     ) -> RunFinalizationDiagnostic | None:
-        """Await the frozen Run finalizer once without letting cancellation orphan it."""
+        """Await the frozen Run finalizer once, bounded, without orphaning it.
+
+        Cancellation must not detach a finalizer that is still releasing
+        Run-owned resources, so caller cancellation is remembered and re-raised
+        after settlement rather than propagated immediately. A finalizer that
+        never settles is a different failure: it would hold the run open past
+        every deadline and leave it without a durable terminal. After
+        ``run_finalizer_timeout_seconds`` the wait is abandoned with a typed
+        timeout diagnostic so the caller can still commit the run terminal. The
+        abandoned Task stays referenced and cancelled; its resources are
+        reported as not quiesced rather than silently assumed released.
+        """
 
         if self._finalization_settled:
             return self._finalization_diagnostic
@@ -526,16 +565,24 @@ class _RunTerminalGuard:
         cancellation_seen = False
         owner_task = asyncio.current_task()
         task = self._finalizer_task
+        deadline = time.monotonic() + config.run_finalizer_timeout_seconds
+        timed_out = False
         while not task.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
             try:
-                await asyncio.shield(task)
+                # asyncio.wait observes the Task without cancelling it, so a
+                # timeout here abandons the wait and never the settlement.
+                await asyncio.wait((task,), timeout=remaining)
             except asyncio.CancelledError:
                 owner_cancelled = (
                     owner_task is not None and owner_task.cancelling() > 0
                 )
                 if owner_cancelled:
                     # Owner cancellation wins even when the finalizer also
-                    # self-cancels in the same loop tick. Keep shielding the
+                    # self-cancels in the same loop tick. Keep waiting on the
                     # resource settlement, then terminalize ABORTED upstream.
                     cancellation_seen = True
                     continue
@@ -545,11 +592,19 @@ class _RunTerminalGuard:
                     break
                 cancellation_seen = True
                 continue
-            except Exception:
-                # The task is done; inspect it below through one typed path.
-                break
 
-        if task.cancelled():
+        if timed_out:
+            task.cancel()
+            task.add_done_callback(_discard_abandoned_finalizer)
+            self._finalization_diagnostic = RunFinalizationDiagnostic(
+                code=RunFinalizationDiagnosticCode.RESOURCE_QUIESCE_TIMEOUT,
+                message=(
+                    "run finalizer did not settle within "
+                    f"{config.run_finalizer_timeout_seconds:g}s; "
+                    "Run-owned resources may still be active"
+                ),
+            )
+        elif task.cancelled():
             message = "run finalizer was cancelled before resources quiesced"
             self._finalization_diagnostic = RunFinalizationDiagnostic(
                 code=RunFinalizationDiagnosticCode.RESOURCE_QUIESCE_FAILED,

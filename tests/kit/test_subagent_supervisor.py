@@ -158,6 +158,42 @@ class _GatedEngine(_ClosableEngine):
         self._release.set()
 
 
+class _WedgedEngine(_ClosableEngine):
+    """Engine whose run swallows cancellation until its release event is set.
+
+    Models the observed failure: a subagent stuck below a wait that never
+    reaches a cancellation safe point, so no amount of interrupting moves it.
+    """
+
+    def __init__(self, started: asyncio.Event, release: asyncio.Event) -> None:
+        self.active_run_id = ""
+        self.cancels = 0
+        self._started = started
+        self._release = release
+
+    async def arun(self, task: str, **kwargs: object) -> object:
+        run_id = kwargs.pop("run_id")
+        assert isinstance(run_id, str)
+        assert kwargs == {}
+        self.active_run_id = run_id
+        self._started.set()
+        while not self._release.is_set():
+            try:
+                await self._release.wait()
+            except asyncio.CancelledError:
+                continue
+        return SimpleNamespace(
+            state=SimpleNamespace(final_result=f"late:{task}", stop_reason="completed"),
+            records=[],
+            step_count=1,
+            total_tokens=0,
+            run_id=run_id,
+        )
+
+    def cancel(self, mode: str) -> None:
+        self.cancels += 1
+
+
 class _FailingSubagentJournal(JsonlSessionJournal):
     def __init__(self, *args: object, fail_type: JournalRecordType) -> None:
         super().__init__(*args)
@@ -1114,6 +1150,150 @@ async def test_invocation_returned_after_interrupt_is_cleaned_without_starting()
     assert cleanup_called.is_set()
     assert supervisor.active_count == 0
     assert await supervisor.aclose(wait_seconds=0) == 0
+
+
+def _wedged_supervisor(
+    started: asyncio.Event,
+    release: asyncio.Event,
+    engines: list[_WedgedEngine],
+) -> SubagentSupervisor:
+    async def factory(
+        request: SubagentLaunchRequest,
+        _context: SubagentRuntimeContext,
+    ) -> SubagentInvocation:
+        engine = _WedgedEngine(started, release)
+        engines.append(engine)
+        return SubagentInvocation(engine=engine, task=request.task)
+
+    return SubagentSupervisor(invocation_factory=factory)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_forces_a_typed_terminal_for_a_wedged_subagent() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    engines: list[_WedgedEngine] = []
+    supervisor = _wedged_supervisor(started, release, engines)
+    launched = await supervisor.launch(_request(), _context(), background=True)
+    await started.wait()
+
+    forced = await supervisor.interrupt(launched.handle, wait_seconds=0.05)
+
+    assert forced is not None
+    assert forced.ready
+    assert forced.status is SubagentStatus.INTERRUPTED
+    assert forced.conclusion.failure_paths
+    assert not forced.usage_complete
+    assert supervisor.active_count == 0
+    assert engines[0].cancels >= 1
+
+    release.set()
+    await supervisor.aclose()
+    settled = supervisor.result(launched.handle)
+    assert settled is not None
+    assert settled.status is SubagentStatus.INTERRUPTED
+
+
+@pytest.mark.asyncio
+async def test_forced_terminal_is_durable_and_survives_the_late_result(
+    tmp_path,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    engines: list[_WedgedEngine] = []
+    journal = JsonlSessionJournal(tmp_path / "journal")
+    await journal.create("parent-run", {})
+    supervisor = _wedged_supervisor(started, release, engines)
+    launched = await supervisor.launch(
+        _request(), _context(journal=journal), background=True
+    )
+    await started.wait()
+
+    forced = await supervisor.interrupt(launched.handle, wait_seconds=0.05)
+    assert forced is not None
+    assert forced.status is SubagentStatus.INTERRUPTED
+
+    release.set()
+    await supervisor.aclose()
+
+    assert supervisor.result(launched.handle) == forced
+    records = await journal.replay()
+    terminals = [
+        record
+        for record in records
+        if record.type is JournalRecordType.SUBAGENT_TERMINAL
+    ]
+    assert len(terminals) == 1
+    assert (
+        terminals[0].payload["status"] == SubagentStatus.INTERRUPTED.value
+    )
+    await journal.close()
+
+
+@pytest.mark.asyncio
+async def test_forced_terminal_reaches_the_parent_mailbox() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    engines: list[_WedgedEngine] = []
+    delivered: list[Any] = []
+
+    async def _post(event: Any) -> None:
+        delivered.append(event)
+
+    supervisor = _wedged_supervisor(started, release, engines)
+    launched = await supervisor.launch(
+        _request(), _context(post_runtime_event=_post), background=True
+    )
+    await started.wait()
+
+    forced = await supervisor.interrupt(launched.handle, wait_seconds=0.05)
+    assert forced is not None
+    assert forced.status is SubagentStatus.INTERRUPTED
+    assert len(delivered) == 1
+
+    release.set()
+    await supervisor.aclose()
+    assert len(delivered) == 1
+
+
+@pytest.mark.asyncio
+async def test_close_forces_terminals_for_subagents_that_ignore_cancellation() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    engines: list[_WedgedEngine] = []
+    supervisor = _wedged_supervisor(started, release, engines)
+    launched = await supervisor.launch(_request(), _context(), background=True)
+    await started.wait()
+
+    pending = await supervisor.aclose(wait_seconds=0.05)
+
+    assert pending == 1
+    terminal = supervisor.result(launched.handle)
+    assert terminal is not None
+    assert terminal.status is SubagentStatus.INTERRUPTED
+    assert supervisor.active_count == 0
+
+    release.set()
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_without_a_wait_never_forces_a_running_subagent() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    engines: list[_WedgedEngine] = []
+    supervisor = _wedged_supervisor(started, release, engines)
+    launched = await supervisor.launch(_request(), _context(), background=True)
+    await started.wait()
+
+    signalled = await supervisor.interrupt(launched.handle, wait_seconds=0)
+
+    assert signalled is not None
+    assert not signalled.ready
+    assert signalled.status is SubagentStatus.CANCEL_REQUESTED
+
+    release.set()
+    await supervisor.aclose()
 
 
 @pytest.mark.asyncio

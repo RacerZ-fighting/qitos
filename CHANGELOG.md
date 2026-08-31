@@ -19,6 +19,26 @@ How to update:
 
 ### Fixed
 
+- A run now always reaches a durable terminal, even when its resources refuse to
+  quiesce. `_finalize_once` awaited the Run finalizer in an unbounded loop, and
+  the run terminal record is written only after that await returns, so a
+  finalizer stuck on a process that never exits left the run with no typed
+  outcome and no way for its launcher to exit. The wait is now bounded by
+  `AgentLoopConfig.run_finalizer_timeout_seconds` (default 30s); on expiry the
+  loop cancels the finalizer, commits the run terminal, and reports the new
+  `RunFinalizationDiagnosticCode.RESOURCE_QUIESCE_TIMEOUT` so unreleased
+  resources stay visible instead of being assumed released.
+- `SubagentSupervisor` can now force a terminal for a Subagent that ignores
+  cancellation. `_terminalize_cancelled_task` began with `if not task.done():
+  return`, so it could only annotate a Task that had already settled; a Subagent
+  wedged below a cancellation safe point stayed in `CANCEL_REQUESTED` forever
+  and every `interrupt` returned success without changing anything. After a
+  bounded wait the supervisor now commits an `INTERRUPTED` terminal naming the
+  incomplete reap, delivers it to a background Subagent's parent mailbox, and
+  releases its run lease. The Task stays registered so a later close can drain
+  it, and a result it produces afterwards is dropped rather than replacing a
+  terminal the parent has already observed. `interrupt`/`aclose` called with
+  `wait_seconds=0` keep signalling only.
 - Subagent and process terminal notifications now reach the run that owns them.
   `subagent_terminal_runtime_input` and `process_terminal_runtime_input` derived
   a payload with no top-level `content`, while every delivery endpoint

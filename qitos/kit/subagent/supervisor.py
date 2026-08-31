@@ -97,6 +97,7 @@ class _OwnedSubagent:
     result: SubagentResult | None = None
     run_lease: _SubagentRunLease | None = None
     started_monotonic: float = 0.0
+    reap_incomplete: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -548,7 +549,9 @@ class SubagentSupervisor:
                 # settle. Such a Task never enters the supervisor coroutine
                 # and therefore cannot terminalize itself.
                 await asyncio.sleep(0)
-            await self._terminalize_cancelled_task(owned, task)
+            await self._terminalize_cancelled_task(
+                owned, task, force=wait_seconds > 0
+            )
         return self._current_result(owned)
 
     async def message(
@@ -752,7 +755,9 @@ class SubagentSupervisor:
         for owned in owned_tasks:
             task = owned.task
             if task is not None:
-                await self._terminalize_cancelled_task(owned, task)
+                await self._terminalize_cancelled_task(
+                    owned, task, force=wait_seconds > 0
+                )
         return sum(1 for task in tasks if not task.done())
 
     async def _supervise_background(self, owned: _OwnedSubagent) -> SubagentResult:
@@ -763,6 +768,11 @@ class SubagentSupervisor:
         except Exception as exc:  # pragma: no cover - defensive boundary
             result = self._failed_result(owned, exc)
         try:
+            if owned.reap_incomplete:
+                # A forced terminal already reached the parent. Replacing it
+                # here would break terminal-once for a result nobody is
+                # waiting for any more.
+                return self._current_result(owned)
             persisted = await self._store_terminal(owned, result)
             result = self._current_result(owned)
             # A durable terminal result no longer consumes execution capacity.
@@ -1171,16 +1181,43 @@ class SubagentSupervisor:
         self,
         owned: _OwnedSubagent,
         task: asyncio.Task[SubagentResult],
+        *,
+        force: bool = False,
     ) -> None:
-        """Persist cancellation for a Task that never entered its supervisor."""
+        """Persist a terminal for a Task that cannot report one itself.
 
-        if not task.done() or owned.terminal_event.is_set():
+        A Task cancelled before its first step never enters the supervisor
+        coroutine and therefore cannot terminalize itself. ``force`` covers the
+        other case: a Task that outlived the bounded wait its caller granted.
+        The supervisor stops waiting and commits an ``INTERRUPTED`` terminal
+        naming the incomplete reap, so the parent always observes a typed
+        outcome instead of a handle stuck in ``CANCEL_REQUESTED``.
+
+        A forced terminal keeps the Task registered so a later close can still
+        drain it, and it stays authoritative: a result the Task produces
+        afterwards is dropped rather than replacing a terminal the parent has
+        already seen. Its run lease is released either way, so an unreaped
+        Subagent cannot hold execution capacity for the rest of the Run.
+        """
+
+        if owned.terminal_event.is_set():
             return
-        await self._store_terminal(owned, self._cancelled_result(owned))
+        if task.done():
+            await self._store_terminal(owned, self._cancelled_result(owned))
+            await self._release_run_lease(owned)
+            owned.task = None
+            owned.engine = None
+            owned.launch_context = None
+            return
+        if not force:
+            return
+        owned.reap_incomplete = True
+        persisted = await self._store_terminal(
+            owned, self._forced_reap_result(owned)
+        )
+        if persisted and owned.background:
+            await self._post_completion_event(owned, self._current_result(owned))
         await self._release_run_lease(owned)
-        owned.task = None
-        owned.engine = None
-        owned.launch_context = None
 
     @staticmethod
     async def _cleanup_invocation(invocation: SubagentInvocation) -> None:
@@ -1643,6 +1680,41 @@ class SubagentSupervisor:
     def _cancel_engine(owned: _OwnedSubagent) -> None:
         if owned.engine is not None:
             owned.engine.cancel("immediate")
+
+    def _forced_reap_result(self, owned: _OwnedSubagent) -> SubagentResult:
+        """Build the terminal for a Subagent that outlived its bounded reap.
+
+        ``INTERRUPTED`` already means "terminal, but this Subagent's side
+        effects were never confirmed", which is exactly what an unreaped run
+        leaves behind. The failure path says so explicitly so the parent does
+        not read the missing conclusion as a clean cancellation.
+        """
+
+        error = (
+            "Subagent did not reach a safe point within its interrupt window; "
+            "the supervisor stopped waiting. Its run may still be executing and "
+            "its side effects are unconfirmed."
+        )
+        # An unreaped Subagent's accounting is unfinished by definition, so the
+        # engine's completeness flags are deliberately not carried over.
+        tokens, cost, _, _ = self._engine_usage(owned)
+        return SubagentResult(
+            handle=owned.handle,
+            request=owned.request,
+            status=SubagentStatus.INTERRUPTED,
+            conclusion=AgentConclusion(
+                summary=self._engine_committed_final_text(owned),
+                failure_paths=(error,),
+            ),
+            subagent_run_id=self._subagent_run_id(owned),
+            error=error,
+            steps=self._engine_steps(owned),
+            total_tokens=tokens,
+            total_cost_usd=cost,
+            usage_complete=False,
+            cost_complete=False,
+            elapsed_seconds=self._owned_elapsed_seconds(owned),
+        )
 
     def _cancelled_result(
         self,

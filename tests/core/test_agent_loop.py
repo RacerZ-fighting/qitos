@@ -557,6 +557,112 @@ async def test_finalizer_failure_is_bounded_diagnostic_on_deadline_outcome() -> 
 
 
 @pytest.mark.asyncio
+async def test_wedged_finalizer_still_commits_a_typed_run_terminal() -> None:
+    finalizer_started = asyncio.Event()
+    abandoned = asyncio.Event()
+
+    class TerminalTransaction(RecordingTransaction):
+        terminal_result = None
+
+        async def run_terminal(self, result) -> None:
+            self.terminal_result = result
+            await super().run_terminal(result)
+
+    async def _never_settles(_run_id: str) -> None:
+        finalizer_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            abandoned.set()
+            raise
+
+    transaction = TerminalTransaction()
+    config = AgentLoopConfig(
+        model=ScriptedModel([text_events("done")]),
+        run_id="run-wedged-finalizer",
+        transaction=transaction,
+        run_finalizer=_never_settles,
+        run_finalizer_timeout_seconds=0.05,
+    )
+
+    result = await run_agent_loop(
+        [UserMessage(content="go")], AgentContext(messages=[]), config, None
+    )
+
+    assert finalizer_started.is_set()
+    assert result.status is AgentRunStatus.COMPLETED
+    diagnostic = result.finalization_diagnostic
+    assert diagnostic is not None
+    assert (
+        diagnostic.code
+        is RunFinalizationDiagnosticCode.RESOURCE_QUIESCE_TIMEOUT
+    )
+    assert transaction.terminal_result is result
+    await abandoned.wait()
+
+
+@pytest.mark.asyncio
+async def test_wedged_finalizer_does_not_swallow_caller_cancellation() -> None:
+    finalizer_started = asyncio.Event()
+
+    class TerminalTransaction(RecordingTransaction):
+        terminal_result = None
+
+        async def run_terminal(self, result) -> None:
+            self.terminal_result = result
+            await super().run_terminal(result)
+
+    async def _never_settles(_run_id: str) -> None:
+        finalizer_started.set()
+        await asyncio.Event().wait()
+
+    transaction = TerminalTransaction()
+    streaming = asyncio.Event()
+    model_gate = asyncio.Event()
+    config = AgentLoopConfig(
+        model=ScriptedModel([make_hanging_model(model_gate, first_text="hi")]),
+        run_id="run-wedged-finalizer-cancel",
+        transaction=transaction,
+        run_finalizer=_never_settles,
+        run_finalizer_timeout_seconds=0.05,
+    )
+
+    def _sink(event) -> None:
+        if isinstance(event, MessageUpdate):
+            streaming.set()
+
+    task = asyncio.create_task(
+        run_agent_loop(
+            [UserMessage(content="go")], AgentContext(messages=[]), config, _sink
+        )
+    )
+    await streaming.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert finalizer_started.is_set()
+    assert transaction.terminal_result is not None
+    assert transaction.terminal_result.status is AgentRunStatus.ABORTED
+    diagnostic = transaction.terminal_result.finalization_diagnostic
+    assert diagnostic is not None
+    assert (
+        diagnostic.code
+        is RunFinalizationDiagnosticCode.RESOURCE_QUIESCE_TIMEOUT
+    )
+
+
+@pytest.mark.parametrize("timeout", [0, -1.0, float("nan"), float("inf"), True])
+def test_run_finalizer_timeout_must_be_positive_and_finite(timeout) -> None:
+    with pytest.raises(ValueError):
+        AgentLoopConfig(
+            model=ScriptedModel([text_events("done")]),
+            run_id="run-finalizer-timeout-validation",
+            run_finalizer_timeout_seconds=timeout,
+        )
+
+
+@pytest.mark.asyncio
 async def test_self_cancelled_finalizer_does_not_cancel_primary_outcome() -> None:
     async def _self_cancel(_run_id: str) -> None:
         raise asyncio.CancelledError()
