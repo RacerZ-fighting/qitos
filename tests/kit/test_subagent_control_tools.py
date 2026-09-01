@@ -382,3 +382,37 @@ async def test_wait_any_timeout_is_bounded_by_remaining_seconds(monkeypatch) -> 
     assert capped["ready"] is False
     assert uncapped["subagent_ids"] == [launched.handle.subagent_id]
     await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_control_results_report_admission_capacity() -> None:
+    engine = _MailboxEngine()
+    supervisor = _supervisor(engine)
+    launched = await _launch(supervisor)
+    await asyncio.wait_for(engine.started.wait(), timeout=1)
+
+    status = await SubagentStatusTool(supervisor).execute(
+        {"subagent_id": launched.handle.subagent_id},
+        runtime_context={"parent_run_id": "parent-run"},
+    )
+
+    assert status["capacity"]["active"] == 1
+    running_slots = status["capacity"]["slots_remaining"]
+    assert running_slots >= 0
+
+    interrupted = await SubagentInterruptTool(supervisor).execute(
+        {"subagent_id": launched.handle.subagent_id, "timeout_seconds": 1},
+        runtime_context={"parent_run_id": "parent-run"},
+    )
+
+    # The parent reclaims a slot exactly where it decided to reclaim it.
+    assert interrupted["capacity"]["active"] == 0
+    assert interrupted["capacity"]["slots_remaining"] == running_slots + 1
+
+    unknown = await SubagentStatusTool(supervisor).execute(
+        {"subagent_id": "missing"},
+        runtime_context={"parent_run_id": "parent-run"},
+    )
+
+    assert unknown["capacity"]["active"] == 0
+    await supervisor.aclose()

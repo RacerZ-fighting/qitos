@@ -93,14 +93,34 @@ class _SubagentControlTool(BaseTool):
                 timeout = min(timeout, max(0.0, float(available)))
         return timeout
 
-    @staticmethod
-    def _projection(result: SubagentResult) -> dict[str, Any]:
+    def _capacity(
+        self,
+        runtime_context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Project admission capacity from the ledger this turn exposes."""
+
+        return self._supervisor.capacity_payload(
+            (runtime_context or {}).get("budget_ledger")
+        )
+
+    def _projection(
+        self,
+        result: SubagentResult,
+        runtime_context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         payload = SubagentSupervisor.result_payload(result)
         payload["status"] = "success"
+        # The parent sizes its next front from whatever this call just changed,
+        # so admission capacity travels with the answer instead of waiting for
+        # a separate projection to be re-rendered into the prompt.
+        payload["capacity"] = self._capacity(runtime_context)
         return payload
 
-    @staticmethod
-    def _unknown(handle: SubagentHandle) -> dict[str, Any]:
+    def _unknown(
+        self,
+        handle: SubagentHandle,
+        runtime_context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         return {
             "status": "success",
             "subagent_status": SubagentStatus.UNKNOWN.value,
@@ -108,6 +128,7 @@ class _SubagentControlTool(BaseTool):
             "handle": handle.to_dict(),
             "subagent_id": handle.subagent_id,
             "output": "No subagent with this handle belongs to the current Run.",
+            "capacity": self._capacity(runtime_context),
         }
 
 
@@ -135,7 +156,11 @@ class SubagentStatusTool(_SubagentControlTool):
                 {"status": "error", "error": str(exc)}, status="error"
             )
         result = self._supervisor.result(handle)
-        return self._unknown(handle) if result is None else self._projection(result)
+        return (
+            self._unknown(handle, runtime_context)
+            if result is None
+            else self._projection(result, runtime_context)
+        )
 
 
 class SubagentWaitTool(_SubagentControlTool):
@@ -187,12 +212,20 @@ class SubagentWaitTool(_SubagentControlTool):
                 {"status": "error", "error": str(exc)}, status="error"
             )
         if subagent_id:
-            return self._unknown(handle) if result is None else self._projection(result)
+            return (
+            self._unknown(handle, runtime_context)
+            if result is None
+            else self._projection(result, runtime_context)
+        )
         if result is not None:
-            return self._projection(result)
-        return self._wait_any_pending(timeout)
+            return self._projection(result, runtime_context)
+        return self._wait_any_pending(timeout, runtime_context)
 
-    def _wait_any_pending(self, timeout: float) -> dict[str, Any]:
+    def _wait_any_pending(
+        self,
+        timeout: float,
+        runtime_context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         running = [
             result.handle.subagent_id
             for result in self._supervisor.active_results()
@@ -209,6 +242,7 @@ class SubagentWaitTool(_SubagentControlTool):
             "ready": False,
             "output": output,
             "subagent_ids": running,
+            "capacity": self._capacity(runtime_context),
         }
 
 
@@ -260,9 +294,9 @@ class SubagentMessageTool(_SubagentControlTool):
                 {"status": "error", "error": str(exc)}, status="error"
             )
         if result is None:
-            payload = self._unknown(handle)
+            payload = self._unknown(handle, runtime_context)
         else:
-            payload = self._projection(result)
+            payload = self._projection(result, runtime_context)
         payload["accepted"] = accepted
         if not accepted and result is not None and result.ready:
             payload["message"] = (
@@ -313,7 +347,11 @@ class SubagentInterruptTool(_SubagentControlTool):
             return tool_result(
                 {"status": "error", "error": str(exc)}, status="error"
             )
-        return self._unknown(handle) if result is None else self._projection(result)
+        return (
+            self._unknown(handle, runtime_context)
+            if result is None
+            else self._projection(result, runtime_context)
+        )
 
 
 class SubagentControlToolSet:

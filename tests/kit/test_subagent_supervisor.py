@@ -2181,3 +2181,63 @@ async def test_fork_does_not_inherit_authority_over_parent_subagent(tmp_path) ->
     await supervisor.aclose()
     await subagent_journal.close()
     await parent.close()
+
+
+@pytest.mark.asyncio
+async def test_capacity_payload_tracks_run_wide_admission() -> None:
+    started = {"one": asyncio.Event(), "two": asyncio.Event()}
+    released = {"one": asyncio.Event(), "two": asyncio.Event()}
+    limiter = SubagentRunLimiter(max_active_subagents=2, max_subagents=3)
+    supervisor = SubagentSupervisor(
+        invocation_factory=_gated_factory(started, released),
+        run_limiter=limiter,
+    )
+
+    idle = supervisor.capacity_payload()
+    assert idle["active"] == 0
+    assert idle["slots_remaining"] == 2
+    assert idle["launches_remaining"] == 3
+    # Without a ledger the step budget is unknown rather than guessed.
+    assert idle["remaining_steps"] is None
+
+    await supervisor.launch(_request("one"), _context(), background=True)
+    second = await supervisor.launch(_request("two"), _context(), background=True)
+    await asyncio.wait_for(started["one"].wait(), timeout=1)
+    await asyncio.wait_for(started["two"].wait(), timeout=1)
+
+    saturated = supervisor.capacity_payload()
+    assert saturated["active"] == 2
+    assert saturated["run_active"] == 2
+    assert saturated["slots_remaining"] == 0
+    assert saturated["launches_remaining"] == 1
+
+    released["two"].set()
+    terminal = await supervisor.wait(second.handle, timeout_seconds=1)
+    assert terminal is not None
+
+    reclaimed = supervisor.capacity_payload()
+    assert reclaimed["slots_remaining"] == 1
+    # A finished launch never returns to the cumulative allowance.
+    assert reclaimed["launches_remaining"] == 1
+
+    released["one"].set()
+    assert await supervisor.aclose(wait_seconds=1) == 0
+
+
+@pytest.mark.asyncio
+async def test_capacity_payload_reports_the_shared_step_budget() -> None:
+    ledger = await _ledger_with_steps(max_steps=100, used=30)
+    supervisor = SubagentSupervisor(
+        invocation_factory=lambda request, _context: _ready_invocation(
+            engine=_CompletingEngine(),
+            task=request.task,
+        ),
+        min_remaining_step_reserve=20,
+    )
+
+    capacity = supervisor.capacity_payload(ledger)
+
+    # Sizing a front needs the budget it draws from, not only a free-slot count.
+    assert capacity["remaining_steps"] == 70
+    assert capacity["parent_step_reserve"] == 20
+    assert await supervisor.aclose() == 0

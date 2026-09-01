@@ -574,7 +574,15 @@ application. `SubagentResult` uses one stable status vocabulary for running, com
 blocking, budget exhaustion, failure, cancellation, interruption, and unknown handles.
 Tool payloads keep that value in `subagent_status`; their top-level `status` remains the
 canonical Tool execution status (`success`, `partial`, `running`, `error`, or
-`cancelled`).
+`cancelled`). Launch and control payloads also carry `capacity` from
+`SubagentSupervisor.capacity_payload(budget_ledger)`: the admission counts (`active`,
+`run_active`, `slots_remaining`, `launches_remaining`) plus the shared step budget the
+fronts draw from (`remaining_steps`, `parent_step_reserve`, both `None`/`0` when the
+caller has no ledger). A parent therefore decides how many fronts to open and how big to
+make each one from the same answer that just changed those numbers. Admission narrows a
+launch against the configured Subagent budget and again against the remaining lineage
+steps; the payload reports the granted `max_steps` from the admitted request and adds
+`max_steps_requested` whenever either narrowing applied.
 A snapshot projects only the active Subagents' bounded, completed tool
 results into `agent.subagent.snapshot` runtime events; it does not expose model responses or
 reasoning. This lets an owner preserve evidence immediately before a forced conclusion.

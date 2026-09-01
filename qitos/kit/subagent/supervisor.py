@@ -649,6 +649,51 @@ class SubagentSupervisor:
             if not self._current_result(owned).ready
         )
 
+    def capacity_payload(
+        self,
+        budget_ledger: BudgetLedger | None = None,
+    ) -> dict[str, Any]:
+        """Project what a launch may still ask for, from the live limits.
+
+        The parent decides how many fronts to open and how big to make each one
+        at the moment it launches or checks a Subagent, so both the admission
+        counts and the shared step budget they draw from belong in those Tool
+        results rather than in a projection the parent must be re-rendered to
+        see. ``budget_ledger`` is the parent's lineage ledger when the caller
+        has one; without it the step fields stay unknown.
+        """
+
+        limiter = self._run_limiter
+        active = self.active_count
+        if limiter is None:
+            run_active = active
+            slots_remaining = max(0, self._max_concurrency - active)
+            launches_remaining: int | None = None
+        else:
+            # The limiter spans the whole recursive Run tree, so headroom comes
+            # from its count rather than this parent's own Subagents.
+            run_active = limiter.active_subagents
+            slots_remaining = max(0, limiter.max_active_subagents - run_active)
+            launches_remaining = (
+                None
+                if limiter.max_subagents is None
+                else max(0, limiter.max_subagents - limiter.subagents_started)
+            )
+        remaining_steps: int | None = None
+        if isinstance(budget_ledger, BudgetLedger):
+            remaining_steps = budget_ledger.snapshot().remaining_steps
+        return {
+            "active": active,
+            "run_active": run_active,
+            "slots_remaining": slots_remaining,
+            "launches_remaining": launches_remaining,
+            # The lineage step budget every front draws from, and the floor
+            # below which admission refuses a launch so the parent keeps turns
+            # of its own. Sizing a front against anything else is a guess.
+            "remaining_steps": remaining_steps,
+            "parent_step_reserve": self._min_remaining_step_reserve,
+        }
+
     def active_results(self) -> tuple[SubagentResult, ...]:
         """Return current projections for subagents that have not terminalized."""
 

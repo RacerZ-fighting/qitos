@@ -21,7 +21,9 @@ from qitos.core.subagent import (
     SubagentRuntimeContext,
     SubagentStatus,
 )
+from qitos.core.budget import BudgetLedger
 from qitos.core.journal import JournalRecordType, SessionJournal
+from qitos.core.task import TaskBudget
 from qitos.kit.subagent import SubagentRunLimiter, SubagentSupervisor
 from qitos.kit.journal import JsonlSessionJournal
 from qitos.kit.tool.subagent import SubagentTool
@@ -737,3 +739,79 @@ async def test_recovery_rejects_history_over_configured_subagent_limit(
     assert supervisor.active_count == 0
     await supervisor.aclose()
     await root_journal.close()
+
+
+@pytest.mark.asyncio
+async def test_launch_result_reports_remaining_run_admission() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    limiter = SubagentRunLimiter(max_active_subagents=2, max_subagents=2)
+
+    def build(
+        request: SubagentLaunchRequest,
+        _context: SubagentRuntimeContext,
+    ) -> Any:
+        return _ready_invocation(
+            engine=_Engine(started=started, release=release),
+            task=request.task,
+        )
+
+    tool = SubagentTool(
+        invocation_factory=build,
+        run_limiter=limiter,
+        execution_mode="optional_background",
+    )
+    result = await tool.execute(
+        {
+            "description": "front",
+            "prompt": "sweep the range",
+            "success_criteria": ["Report the sweep"],
+            "run_in_background": True,
+        },
+        runtime_context={"run_id": "root-run"},
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    capacity = result.output["capacity"]
+    assert capacity["active"] == 1
+    assert capacity["run_active"] == 1
+    assert capacity["slots_remaining"] == 1
+    assert capacity["launches_remaining"] == 1
+    # Nothing was narrowed, so the launch answer carries no clamp.
+    assert "max_steps_requested" not in result.output
+
+    release.set()
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
+async def test_launch_result_reports_the_lineage_step_budget() -> None:
+    ledger = BudgetLedger(max_steps=60)
+    await ledger.reserve_step(origin_run_id="root-run", transaction_id="step-0")
+
+    def build(
+        request: SubagentLaunchRequest,
+        _context: SubagentRuntimeContext,
+    ) -> Any:
+        return _ready_invocation(engine=_Engine(), task=request.task)
+
+    tool = SubagentTool(
+        invocation_factory=build,
+        subagent_budget=TaskBudget(max_steps=200),
+    )
+    result = await tool.execute(
+        {
+            "description": "front",
+            "prompt": "sweep the range",
+            "success_criteria": ["Report the sweep"],
+            "max_steps": 150,
+        },
+        runtime_context={"run_id": "root-run", "budget_ledger": ledger},
+    )
+
+    # The front the parent asked for does not fit the shared lineage budget, so
+    # admission narrows it; the answer names the budget and what it granted.
+    assert result.output["capacity"]["remaining_steps"] is not None
+    assert result.output["max_steps_requested"] == 150
+    assert result.output["max_steps"] < 150
+    await tool.aclose()
