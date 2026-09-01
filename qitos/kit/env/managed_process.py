@@ -171,6 +171,10 @@ class _ProcessEntry:
     interaction_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     reader_task: asyncio.Task[None] | None = None
     watcher_task: asyncio.Task[None] | None = None
+    deadline_task: asyncio.Task[None] | None = None
+    timeout_seconds: float | None = None
+    deadline_monotonic: float | None = None
+    deadline_expired: bool = False
     status: ProcessStatus = ProcessStatus.RUNNING
     ended_at: str | None = None
     exit_code: int | None = None
@@ -225,6 +229,7 @@ class ManagedHostProcessRuntime:
         owner_run_id: str,
         cwd: str,
         tty: bool = False,
+        timeout: float | None = None,
         journal: SessionJournal | None = None,
         terminal_notifier: ProcessTerminalNotifier | None = None,
     ) -> ProcessSnapshot:
@@ -245,6 +250,7 @@ class ManagedHostProcessRuntime:
                 owner_run_id=owner_run_id,
                 cwd=cwd,
                 tty=tty,
+                timeout=timeout,
                 journal=journal,
                 terminal_notifier=terminal_notifier,
             )
@@ -260,12 +266,18 @@ class ManagedHostProcessRuntime:
         owner_run_id: str,
         cwd: str,
         tty: bool,
+        timeout: float | None,
         journal: SessionJournal | None,
         terminal_notifier: ProcessTerminalNotifier | None,
     ) -> ProcessSnapshot:
         text = str(command or "").strip()
         if not text:
             raise ValueError("command must be non-empty")
+        lifetime: float | None = None
+        if timeout is not None:
+            lifetime = float(timeout)
+            if lifetime <= 0:
+                raise ValueError("timeout must be positive")
         handle = ProcessHandle(
             process_id=f"proc_{uuid4().hex[:16]}",
             owner_run_id=owner_run_id,
@@ -297,6 +309,10 @@ class ManagedHostProcessRuntime:
                 relative_log_path=relative_log,
                 started_at=_utc_now(),
                 started_monotonic=loop.time(),
+                timeout_seconds=lifetime,
+                deadline_monotonic=(
+                    None if lifetime is None else loop.time() + lifetime
+                ),
                 journal=journal,
                 terminal_notifier=terminal_notifier,
                 writer_fd=writer_fd,
@@ -314,6 +330,11 @@ class ManagedHostProcessRuntime:
                     self._watch_terminal(entry),
                     name=f"qitos-process-watcher-{handle.process_id}",
                 )
+                if entry.deadline_monotonic is not None:
+                    entry.deadline_task = asyncio.create_task(
+                        self._watch_deadline(entry),
+                        name=f"qitos-process-deadline-{handle.process_id}",
+                    )
             if journal is not None:
                 try:
                     await journal.append(
@@ -569,6 +590,15 @@ class ManagedHostProcessRuntime:
         ]
         if watchers:
             await asyncio.gather(*watchers, return_exceptions=False)
+        # A deadline settles as soon as its watcher does, so awaiting them here
+        # keeps a quiesced runtime from leaving a pending task behind.
+        deadlines = [
+            entry.deadline_task
+            for entry in entries
+            if entry.deadline_task is not None and not entry.deadline_task.done()
+        ]
+        if deadlines:
+            await asyncio.gather(*deadlines, return_exceptions=False)
         errors = [entry.journal_error for entry in entries if entry.journal_error]
         if errors:
             raise ProcessPersistenceError(
@@ -728,6 +758,38 @@ class ManagedHostProcessRuntime:
             entry.output.append(content)
             entry.condition.notify_all()
 
+    async def _watch_deadline(self, entry: _ProcessEntry) -> None:
+        """Terminate one entry once the lifetime its caller granted elapses.
+
+        A caller that expects a command to finish grants it a lifetime. Without
+        one, a command that never exits stays RUNNING for the rest of the Run
+        and every observation of it reports no progress rather than a failure,
+        so the caller learns nothing from waiting and has to notice the stall
+        itself. Terminating here turns that silence into one terminal fact.
+        """
+
+        deadline = entry.deadline_monotonic
+        watcher = entry.watcher_task
+        if deadline is None or watcher is None:
+            return
+        remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+        try:
+            # The watcher settles on a normal exit, which retires this deadline
+            # without a second cancellation path having to reach for the task.
+            await asyncio.wait_for(asyncio.shield(watcher), timeout=remaining)
+            return
+        except asyncio.TimeoutError:
+            pass
+        async with entry.condition:
+            if entry.status is not ProcessStatus.RUNNING:
+                return
+            entry.deadline_expired = True
+            entry.error = (
+                f"command reached its {entry.timeout_seconds:g}s limit "
+                "before it exited and was terminated"
+            )
+        await self._terminate_entry(entry)
+
     async def _watch_terminal(self, entry: _ProcessEntry) -> None:
         try:
             exit_code = await self._await_leader_exit(entry)
@@ -740,7 +802,13 @@ class ManagedHostProcessRuntime:
             async with entry.condition:
                 entry.exit_code = None if exit_code is None else int(exit_code)
                 entry.ended_at = _utc_now()
-                if entry.error:
+                if entry.abandoned.is_set():
+                    # Output the runtime can no longer account for outranks the
+                    # reason the process was signalled in the first place.
+                    entry.status = ProcessStatus.FAILED
+                elif entry.deadline_expired:
+                    entry.status = ProcessStatus.TIMED_OUT
+                elif entry.error:
                     entry.status = ProcessStatus.FAILED
                 elif entry.termination_requested:
                     entry.status = ProcessStatus.TERMINATED

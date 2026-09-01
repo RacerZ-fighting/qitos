@@ -245,6 +245,18 @@ also expose `process_list`, `process_read`, `process_write`, `process_wait`, and
 the active Run, preserve full logs outside the bounded model view, and respect the
 current absolute Tool deadline.
 
+A command runs under a lifetime unless it asked to outlive its call. `run_command`
+grants `shell_timeout`, capped by what the turn has left, to every command started
+without `run_in_background`; the process group is terminated when that elapses and the
+snapshot reports `timed_out` with the limit it reached. A background command is granted
+no lifetime, because a listener or a tunnel is asked for precisely so that it outlives
+the call that started it, and it ends when it exits or a later call terminates it.
+
+The two ways to observe a live process answer different questions. `process_wait`
+returns when the process ends, so a process that is working and a process that is stuck
+look alike until its timeout elapses; `process_read` with `wait_seconds` returns as soon
+as output passes the cursor, which is what tells the two apart.
+
 `process_env` optionally supplies one complete application-owned environment snapshot
 for local shell, fixed-argv, and background subprocesses. Leave it unset to preserve
 normal inherited-environment behavior.

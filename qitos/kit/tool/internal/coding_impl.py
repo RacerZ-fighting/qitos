@@ -130,6 +130,8 @@ def _tool_status_for_process(snapshot: ProcessSnapshot) -> str:
         return "success" if snapshot.exit_code == 0 else "partial"
     if snapshot.status is ProcessStatus.TERMINATED:
         return "success"
+    if snapshot.status is ProcessStatus.TIMED_OUT:
+        return "timed_out"
     return "error"
 
 
@@ -179,6 +181,8 @@ def _process_tool_output(snapshot: ProcessSnapshot) -> Dict[str, Any] | ToolResu
     status = _tool_status_for_process(snapshot)
     if status == "partial":
         return tool_result(payload, status="partial")
+    if status == "timed_out":
+        return tool_result(payload, status="timed_out")
     if status == "error":
         return tool_result(payload, status="error")
     # A running background process is domain state; starting it completed the
@@ -975,6 +979,10 @@ class CodingToolSet:
 
         :param command: Shell command string to execute.
         :param run_in_background: Detach the command and return its task handle.
+            Use it for a process meant to outlive this call, such as a listener
+            or a tunnel: it runs until it exits or a later call terminates it.
+            Leave it false for work expected to finish, which is terminated once
+            the shell limit elapses and reports that limit as its outcome.
         :param tty: Allocate a pseudo-terminal for a managed background command.
         :param yield_time_ms: Initial wait before a live command returns its handle.
         :param runtime_context: Optional runtime context injected by the executor.
@@ -1015,10 +1023,29 @@ class CodingToolSet:
                     "process.pty",
                 )
             process_ops, run_id = await self._managed_process_ops(runtime_context)
+            # A command the caller expects to finish inherits the shell limit as
+            # its lifetime, bounded by whatever the turn has left. Asking for a
+            # background command is asking for a process that outlives the call
+            # -- a listener or a tunnel -- so that one is granted no lifetime and
+            # ends when it exits or a later call terminates it.
+            lifetime: float | None = None
+            if not run_in_background:
+                lifetime = float(self.shell_timeout)
+                remaining = self._remaining_seconds(runtime_context)
+                if remaining is not None:
+                    lifetime = min(lifetime, remaining)
+                if lifetime <= 0:
+                    payload = {
+                        "status": "error",
+                        "message": "command deadline expired before execution",
+                        "command": text,
+                    }
+                    return tool_result(payload, status="error")
             snapshot = await process_ops.astart(
                 text,
                 owner_run_id=run_id,
                 tty=bool(tty),
+                timeout=lifetime,
                 journal=context.get("journal"),
                 terminal_notifier=self._process_terminal_notifier(context),
             )
@@ -1083,7 +1110,14 @@ class CodingToolSet:
         wait_seconds: float = 0.0,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any] | ToolResult:
-        """Read incremental output from one active-Run process."""
+        """Read incremental output from one active-Run process.
+
+        :param process_id: Handle returned when the process started.
+        :param cursor: Byte offset to read from; 0 replays the retained output.
+        :param wait_seconds: Wake as soon as output passes the cursor, or after
+            this many seconds. Use this to learn whether a process is still
+            producing anything; 0 answers from what has already arrived.
+        """
 
         try:
             process_ops, run_id = await self._managed_process_ops(runtime_context)
@@ -1150,7 +1184,17 @@ class CodingToolSet:
         timeout_seconds: Optional[float] = None,
         runtime_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any] | ToolResult:
-        """Wait for one process without exceeding the current absolute deadline."""
+        """Wait for one process to end, bounded by the current absolute deadline.
+
+        Ending is the only thing this waits for: output arriving partway through
+        does not return it early, so a process that is working normally and a
+        process that is stuck both look the same until the timeout elapses. Use
+        ``process_read`` with ``wait_seconds`` to ask about progress instead.
+
+        :param process_id: Handle returned when the process started.
+        :param timeout_seconds: Give up waiting after this long and report the
+            process as it stands. The turn deadline still applies.
+        """
 
         try:
             process_ops, run_id = await self._managed_process_ops(runtime_context)
