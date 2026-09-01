@@ -586,3 +586,88 @@ async def test_descendant_escaping_the_group_terminalizes_without_stalling(
             os.kill(escapee_pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+@pytest.mark.asyncio
+async def test_command_granted_a_lifetime_terminalizes_when_it_elapses(
+    tmp_path: Path,
+) -> None:
+    runtime = ManagedHostProcessRuntime(str(tmp_path))
+    started = await runtime.start(
+        _python_command("print('holding', flush=True); import time; time.sleep(60)"),
+        owner_run_id="run-1",
+        cwd=str(tmp_path),
+        timeout=0.5,
+    )
+    observed = await runtime.read(started.handle, cursor=0, wait_seconds=2.0)
+    assert "holding" in observed.output.content
+
+    settled = await runtime.wait(started.handle, deadline_monotonic=None)
+
+    assert settled.status is not ProcessStatus.RUNNING
+    assert settled.error is not None
+    assert settled.ended_at is not None
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_command_without_a_lifetime_outlives_one_that_has_it(
+    tmp_path: Path,
+) -> None:
+    runtime = ManagedHostProcessRuntime(str(tmp_path))
+    source = "print('up', flush=True); import time; time.sleep(60)"
+    bounded = await runtime.start(
+        _python_command(source),
+        owner_run_id="run-1",
+        cwd=str(tmp_path),
+        timeout=0.5,
+    )
+    unbounded = await runtime.start(
+        _python_command(source),
+        owner_run_id="run-1",
+        cwd=str(tmp_path),
+    )
+
+    await runtime.wait(bounded.handle, deadline_monotonic=None)
+    still_running = await runtime.poll(unbounded.handle)
+
+    assert still_running.status is ProcessStatus.RUNNING
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_lifetime_that_outlasts_the_command_leaves_the_exit_intact(
+    tmp_path: Path,
+) -> None:
+    runtime = ManagedHostProcessRuntime(str(tmp_path))
+    started = await runtime.start(
+        _python_command("print('done', flush=True)"),
+        owner_run_id="run-1",
+        cwd=str(tmp_path),
+        timeout=30.0,
+    )
+
+    settled = await runtime.wait(started.handle, deadline_monotonic=None)
+
+    assert settled.status is ProcessStatus.EXITED
+    assert settled.exit_code == 0
+    assert settled.error is None
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_non_positive_lifetime_is_rejected_before_spawning(
+    tmp_path: Path,
+) -> None:
+    runtime = ManagedHostProcessRuntime(str(tmp_path))
+
+    with pytest.raises(ValueError):
+        await runtime.start(
+            _python_command("pass"),
+            owner_run_id="run-1",
+            cwd=str(tmp_path),
+            timeout=0.0,
+        )
+
+    assert await runtime.list(owner_run_id="run-1") == ()
+    await runtime.close()

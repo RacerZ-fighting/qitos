@@ -28,6 +28,7 @@ class ProcessStatus(str, Enum):
     EXITED = "exited"
     FAILED = "failed"
     TERMINATED = "terminated"
+    TIMED_OUT = "timed_out"
     LOST = "lost"
 
 

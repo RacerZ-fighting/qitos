@@ -559,6 +559,7 @@ class HostCommandCapability(CommandCapability):
         owner_run_id: str,
         cwd: str | None = None,
         tty: bool = False,
+        timeout: float | None = None,
         journal: SessionJournal | None = None,
         terminal_notifier: ProcessTerminalNotifier | None = None,
     ) -> ProcessSnapshot:
@@ -568,6 +569,7 @@ class HostCommandCapability(CommandCapability):
             owner_run_id=owner_run_id,
             cwd=effective_cwd,
             tty=tty,
+            timeout=timeout,
             journal=journal,
             terminal_notifier=terminal_notifier,
         )

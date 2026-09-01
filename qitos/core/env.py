@@ -537,16 +537,23 @@ class CommandCapability(ABC):
         owner_run_id: str,
         cwd: str | None = None,
         tty: bool = False,
+        timeout: float | None = None,
         journal: SessionJournal | None = None,
         terminal_notifier: ProcessTerminalNotifier | None = None,
     ) -> ProcessSnapshot:
         """Start one Run-owned background command when supported.
 
+        ``timeout`` is the lifetime a caller grants a command it expects to
+        finish: the process group is terminated once it elapses and the
+        terminal snapshot says the limit was reached. Without one the command
+        runs until it exits or a caller terminates it, which is what a listener
+        or a tunnel needs and what a batch command must not have.
+
         A terminal notifier runs only after the process terminal fact is durable.
         It may enqueue a safe-point input, but it does not own Agent state.
         """
 
-        _ = command, owner_run_id, cwd, tty, journal, terminal_notifier
+        _ = command, owner_run_id, cwd, tty, timeout, journal, terminal_notifier
         raise NotImplementedError("managed background commands are not supported")
 
     async def apoll(self, handle: ProcessHandle) -> ProcessSnapshot:

@@ -29,6 +29,21 @@ How to update:
 
 ### Fixed
 
+- A managed command started through `run_command` without `run_in_background` now
+  runs under a lifetime instead of no bound at all. Inside a Run every command
+  becomes a managed process, and `astart` accepted no timeout, so `shell_timeout`
+  reached only the unmanaged path and a command that never exited stayed `running`
+  for the rest of the Run: each observation of it reported no progress rather than
+  a failure, and the caller had to notice the stall itself. `Env.astart` now takes
+  a `timeout`, `run_command` passes `shell_timeout` bounded by the remaining turn
+  budget for a non-background command, and the expiry terminates the process group
+  and reports the new `ProcessStatus.TIMED_OUT` as the `timed_out` Tool status. A
+  background command is still granted no lifetime, so listeners and tunnels are
+  unchanged.
+- `process_read` and `process_wait` now document which event wakes each of them.
+  Neither carried `:param` descriptions, so the model schema named `wait_seconds`
+  and `timeout_seconds` without saying that `process_wait` returns only when the
+  process ends while `process_read` returns as soon as output passes the cursor.
 - A run now always reaches a durable terminal, even when its resources refuse to
   quiesce. `_finalize_once` awaited the Run finalizer in an unbounded loop, and
   the run terminal record is written only after that await returns, so a

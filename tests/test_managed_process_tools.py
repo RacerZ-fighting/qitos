@@ -433,3 +433,103 @@ async def test_process_output_is_fully_written_to_log_with_a_bounded_summary(
     assert len(result["model_summary"]) <= 8_000
     assert "omitted" in result["model_summary"]
     await tools.ateardown({})
+
+
+@pytest.mark.asyncio
+async def test_a_foreground_command_that_never_exits_ends_at_the_shell_limit(
+    tmp_path: Path,
+) -> None:
+    tools = CodingToolSet(
+        workspace_root=str(tmp_path),
+        profile="shell",
+        shell_timeout=1,
+    )
+    context = _runtime_context("run-bounded", timeout=30.0)
+
+    started = await tools.run_command.execute(
+        {
+            "command": _python_command(
+                "import time; print('ready', flush=True); time.sleep(60)"
+            ),
+            "yield_time_ms": 20,
+        },
+        runtime_context=context,
+    )
+    assert started["process_status"] == ProcessStatus.RUNNING.value
+
+    settled = await tools.process_wait.execute(
+        {"process_id": started["process_id"], "timeout_seconds": 10},
+        runtime_context=context,
+    )
+
+    assert isinstance(settled, ToolResult)
+    assert settled.status == "timed_out"
+    assert settled.output["process_status"] == ProcessStatus.TIMED_OUT.value
+    assert settled.output["terminal"] is True
+    await tools.ateardown({})
+
+
+@pytest.mark.asyncio
+async def test_a_background_command_outlives_the_shell_limit(
+    tmp_path: Path,
+) -> None:
+    tools = CodingToolSet(
+        workspace_root=str(tmp_path),
+        profile="shell",
+        shell_timeout=1,
+    )
+    context = _runtime_context("run-unbounded", timeout=30.0)
+
+    started = await tools.run_command.execute(
+        {
+            "command": _python_command(
+                "import time; print('listening', flush=True); time.sleep(60)"
+            ),
+            "run_in_background": True,
+        },
+        runtime_context=context,
+    )
+
+    await asyncio.sleep(2.0)
+    observed = await tools.process_read.execute(
+        {"process_id": started["process_id"]},
+        runtime_context=context,
+    )
+
+    assert observed["process_status"] == ProcessStatus.RUNNING.value
+    await tools.process_terminate.execute(
+        {"process_id": started["process_id"]},
+        runtime_context=context,
+    )
+    await tools.ateardown({})
+
+
+@pytest.mark.asyncio
+async def test_a_foreground_lifetime_never_outlasts_the_turn_deadline(
+    tmp_path: Path,
+) -> None:
+    tools = CodingToolSet(
+        workspace_root=str(tmp_path),
+        profile="shell",
+        shell_timeout=600,
+    )
+    context = _runtime_context("run-turn-bound", timeout=1.0)
+
+    started = await tools.run_command.execute(
+        {
+            "command": _python_command(
+                "import time; print('ready', flush=True); time.sleep(60)"
+            ),
+            "yield_time_ms": 20,
+        },
+        runtime_context=context,
+    )
+
+    await asyncio.sleep(3.0)
+    listed = await tools.process_list.execute({}, runtime_context=context)
+
+    settled = {
+        entry["handle"]["process_id"]: entry for entry in listed["processes"]
+    }[started["process_id"]]
+    assert settled["status"] == ProcessStatus.TIMED_OUT.value
+    await tools.ateardown({})
