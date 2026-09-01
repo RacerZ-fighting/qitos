@@ -377,6 +377,21 @@ class SubagentTool(BaseTool):
                 {"status": "error", "error": str(exc)}, status="error"
             )
         payload = self._supervisor.result_payload(result)
+        # Sizing the next front is a launch-time decision, so what this Run may
+        # still spend on Subagents rides the launch answer rather than a
+        # separate projection the parent has to be re-rendered to see.
+        payload["capacity"] = self._supervisor.capacity_payload(
+            (runtime_context or {}).get("budget_ledger")
+        )
+        # Admission narrows a launch twice, against the configured Subagent
+        # budget and against the remaining lineage steps. The granted value
+        # comes from the admitted request so one number covers both.
+        granted_steps = result.request.budget.max_steps
+        payload["max_steps"] = granted_steps
+        if raw_max_steps is not None and raw_max_steps != granted_steps:
+            # A silently clamped request looks like a Subagent that gave up
+            # early; name the granted budget where the parent reads the launch.
+            payload["max_steps_requested"] = raw_max_steps
         usage = _subagent_result_usage(result)
         lifecycle = str(payload.get("status") or "success")
         if lifecycle in {"error", "cancelled", "partial"}:

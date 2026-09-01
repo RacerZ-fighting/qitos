@@ -778,6 +778,10 @@ async def test_subagent_tool_max_steps_never_widens_the_configured_budget(
     assert result.output["subagent_status"] == SubagentStatus.BUDGET_EXHAUSTED.value
     assert result.output["steps"] == 2
     assert len(model.requests) == 2
+    # A narrowed budget looks like a Subagent that gave up early unless the
+    # launch answer names what it was actually granted.
+    assert result.output["max_steps"] == 2
+    assert result.output["max_steps_requested"] == 5
     await tool.aclose()
 
 
