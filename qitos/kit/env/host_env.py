@@ -41,6 +41,11 @@ from qitos.kit.env._file_mutation import (
 from qitos.kit.env.managed_process import ManagedHostProcessRuntime
 
 
+# Requested mode for a newly created file. The kernel applies the process
+# umask to it, so a Tool write lands on the same mode a shell redirect would.
+_NEW_FILE_MODE = 0o666
+
+
 class HostFSCapability(FileSystemCapability):
     def __init__(self, root: str):
         self.root = Path(root).resolve()
@@ -296,7 +301,14 @@ class HostFSCapability(FileSystemCapability):
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
-            temp_fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+            # Replacing an existing file stages its content privately and
+            # restores the target's own mode below, so a file that was already
+            # readable only by its owner never widens mid-write. A new file
+            # instead gets what an ordinary create would produce under the
+            # current umask, because a Tool-written file that no other account
+            # in this environment can read is a file the environment cannot use.
+            create_mode = 0o600 if previous_mode is not None else _NEW_FILE_MODE
+            temp_fd = os.open(temp_name, flags, create_mode, dir_fd=parent_fd)
             view = memoryview(content)
             while view:
                 written = os.write(temp_fd, view)

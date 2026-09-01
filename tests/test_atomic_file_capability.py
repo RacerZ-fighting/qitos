@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import PurePosixPath
 from typing import Any, Sequence
 
@@ -8,6 +9,7 @@ import pytest
 
 from qitos.core.env import FileRevisionConflictError
 from qitos.kit.env.docker_env import DockerFSCapability
+from qitos.kit.env.host_env import HostFSCapability
 
 
 class _DockerAtomicCommand:
@@ -78,3 +80,51 @@ def test_docker_atomic_write_uses_argv_stdin_and_revision_guard() -> None:
             expected_sha256=expected,
         )
     assert command.content == b"second\n"
+
+
+@pytest.fixture
+def umask_0002():
+    previous = os.umask(0o002)
+    try:
+        yield 0o002
+    finally:
+        os.umask(previous)
+
+
+def test_new_host_file_is_created_under_the_process_umask(tmp_path, umask_0002) -> None:
+    """A Tool-written file must be usable by the accounts the umask admits.
+
+    The runtime may run model-issued commands under a second account that shares
+    the Agent's group, so a new file staged privately and never widened is a
+    file that account cannot read.
+    """
+
+    fs = HostFSCapability(str(tmp_path))
+
+    fs.write_text("payload.py", "print('hi')\n")
+
+    mode = (tmp_path / "payload.py").stat().st_mode & 0o777
+    assert mode == 0o666 & ~umask_0002
+
+
+def test_replacing_a_host_file_keeps_its_own_mode(tmp_path, umask_0002) -> None:
+    private = tmp_path / "secret.txt"
+    private.write_text("first", encoding="utf-8")
+    private.chmod(0o600)
+    fs = HostFSCapability(str(tmp_path))
+
+    fs.write_text("secret.txt", "second")
+
+    assert private.stat().st_mode & 0o777 == 0o600
+    assert private.read_text(encoding="utf-8") == "second"
+
+
+def test_new_host_file_narrows_with_a_restrictive_umask(tmp_path) -> None:
+    previous = os.umask(0o077)
+    try:
+        fs = HostFSCapability(str(tmp_path))
+        fs.write_text("owned.txt", "body")
+    finally:
+        os.umask(previous)
+
+    assert (tmp_path / "owned.txt").stat().st_mode & 0o777 == 0o600
