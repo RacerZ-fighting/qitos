@@ -389,10 +389,15 @@ if [ -n "$expected" ] && [ "$current" != "$expected" ]; then
   exit 73
 fi
 temporary=$(mktemp "$parent/.qitos-write.XXXXXX")
-trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+probe="$temporary.mode"
+trap 'rm -f -- "$temporary" "$probe"' EXIT HUP INT TERM
 cat > "$temporary"
 if [ -e "$target" ]; then
   chmod --reference="$target" "$temporary" 2>/dev/null || true
+else
+  : > "$probe"
+  chmod --reference="$probe" "$temporary" 2>/dev/null || true
+  rm -f -- "$probe"
 fi
 mv -f -- "$temporary" "$target"
 trap - EXIT HUP INT TERM
