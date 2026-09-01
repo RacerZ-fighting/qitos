@@ -17,6 +17,16 @@ How to update:
 
 ## Unreleased
 
+### Added
+
+- `HostEnv` accepts a `CommandLauncher`, an argv prefix every command it spawns
+  passes through: foreground shell commands, argv commands, and managed
+  background and PTY processes. A composition uses it to run commands under
+  credentials of its own choosing instead of the ones the Agent process holds,
+  so a command cannot signal or read the process running the Agent. Without a
+  launcher nothing wraps commands and spawning is unchanged. POSIX only: a
+  launcher makes the implicit `/bin/sh -c` of a shell spawn explicit.
+
 ### Fixed
 
 - A run now always reaches a durable terminal, even when its resources refuse to

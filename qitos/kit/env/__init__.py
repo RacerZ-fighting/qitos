@@ -1,5 +1,6 @@
 """Concrete environment implementations for QitOS."""
 
+from ._async_process import CommandLauncher
 from .capability_env import CapabilityEnv
 from .desktop import ContainerDesktopProvider, DesktopEnv, MockDesktopProvider
 from .docker_env import DockerEnv, DockerEnvScheduler
@@ -20,6 +21,7 @@ from .web import MockBrowserProvider, PlaywrightBrowserProvider, WebBrowserEnv
 
 __all__ = [
     "CapabilityEnv",
+    "CommandLauncher",
     "HostEnv",
     "ManagedHostProcessRuntime",
     "DesktopEnv",

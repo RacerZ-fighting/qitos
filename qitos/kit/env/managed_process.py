@@ -18,6 +18,7 @@ from uuid import uuid4
 if os.name != "nt":
     from ptyprocess import PtyProcess
 
+from qitos.kit.env._async_process import POSIX_SHELL, CommandLauncher
 from qitos.core.journal import JournalRecordType, SessionJournal
 from qitos.core.process import (
     ProcessHandle,
@@ -191,6 +192,7 @@ class ManagedHostProcessRuntime:
         workspace_root: str,
         *,
         env: Mapping[str, str] | None = None,
+        launcher: CommandLauncher | None = None,
         max_processes: int = 16,
         max_tracked: int = 64,
         max_output_bytes: int = 64 * 1024,
@@ -202,6 +204,7 @@ class ManagedHostProcessRuntime:
             raise ValueError("terminate_grace_seconds must be non-negative")
         self.workspace_root = Path(workspace_root).resolve()
         self._env = dict(env) if env is not None else None
+        self._launcher = launcher
         self._max_processes = int(max_processes)
         self._max_tracked = int(max_tracked)
         self._max_output_bytes = int(max_output_bytes)
@@ -600,12 +603,19 @@ class ManagedHostProcessRuntime:
         else:
             process_kwargs["start_new_session"] = True
         if not tty:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                **process_kwargs,
+            pipes: dict[str, Any] = {
+                "stdin": asyncio.subprocess.PIPE,
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.STDOUT,
+            }
+            process = (
+                await asyncio.create_subprocess_shell(
+                    command, **pipes, **process_kwargs
+                )
+                if self._launcher is None
+                else await asyncio.create_subprocess_exec(
+                    *self._launcher.wrap_shell(command), **pipes, **process_kwargs
+                )
             )
             if process.stdout is None:
                 await self._terminate_raw(process)
@@ -614,11 +624,14 @@ class ManagedHostProcessRuntime:
         if os.name == "nt":
             raise NotImplementedError("PTY processes are not supported on Windows")
 
-        shell = os.environ.get("SHELL") or "/bin/sh"
+        shell = os.environ.get("SHELL") or POSIX_SHELL
+        pty_argv = [shell, "-lc", command]
+        if self._launcher is not None:
+            pty_argv = list(self._launcher.wrap(pty_argv))
         spawn_task = asyncio.create_task(
             asyncio.to_thread(
                 PtyProcess.spawn,
-                [shell, "-lc", command],
+                pty_argv,
                 cwd=cwd,
                 env=None if self._env is None else dict(self._env),
             ),

@@ -33,7 +33,7 @@ from qitos.core.process import (
     ProcessSnapshot,
     ProcessTerminalNotifier,
 )
-from qitos.kit.env._async_process import run_process
+from qitos.kit.env._async_process import CommandLauncher, run_process
 from qitos.kit.env._file_mutation import (
     FileMutationQueue,
     normalize_expected_sha256,
@@ -383,15 +383,21 @@ class HostCommandCapability(CommandCapability):
         cwd: str,
         *,
         env: Mapping[str, str] | None = None,
+        launcher: CommandLauncher | None = None,
     ):
         self.cwd = str(Path(cwd).resolve())
         self._env = dict(env) if env is not None else None
+        self._launcher = launcher
         self._managed: ManagedHostProcessRuntime | None = None
 
     def _managed_runtime(self) -> ManagedHostProcessRuntime:
         runtime = self._managed
         if runtime is None:
-            runtime = ManagedHostProcessRuntime(self.cwd, env=self._env)
+            runtime = ManagedHostProcessRuntime(
+                self.cwd,
+                env=self._env,
+                launcher=self._launcher,
+            )
             self._managed = runtime
         return runtime
 
@@ -404,6 +410,7 @@ class HostCommandCapability(CommandCapability):
                 cwd=self.cwd,
                 env=self._env,
                 timeout=float(timeout),
+                launcher=self._launcher,
             )
             return {
                 "status": "success" if result.returncode == 0 else "partial",
@@ -448,6 +455,7 @@ class HostCommandCapability(CommandCapability):
             env=self._env,
             stdin=stdin,
             timeout=float(timeout),
+            launcher=self._launcher,
         )
         return {
             "status": "success" if result.returncode == 0 else "partial",
@@ -645,6 +653,7 @@ class HostEnv(Env):
         *,
         backend: str = "local",
         command_environment: Mapping[str, str] | None = None,
+        command_launcher: CommandLauncher | None = None,
         commands: Sequence[RuntimeCommand] = (),
         limitations: Sequence[RuntimeLimitation] = (),
     ):
@@ -652,14 +661,18 @@ class HostEnv(Env):
             raise ValueError("backend must be a non-empty string")
         if cmd is not None and command_environment is not None:
             raise ValueError("cmd and command_environment are mutually exclusive")
+        if cmd is not None and command_launcher is not None:
+            raise ValueError("cmd and command_launcher are mutually exclusive")
         self.workspace_root = str(Path(workspace_root).resolve())
         self.fs = fs or HostFSCapability(self.workspace_root)
         self._command_environment = (
             dict(command_environment) if command_environment is not None else None
         )
+        self._command_launcher = command_launcher
         self.cmd = cmd or HostCommandCapability(
             self.workspace_root,
             env=self._command_environment,
+            launcher=self._command_launcher,
         )
         self.backend = backend.strip()
         self.commands = tuple(commands)
@@ -675,6 +688,7 @@ class HostEnv(Env):
             self.cmd = HostCommandCapability(
                 self.workspace_root,
                 env=self._command_environment,
+                launcher=self._command_launcher,
             )
         Path(self.workspace_root).mkdir(parents=True, exist_ok=True)
 
@@ -687,6 +701,7 @@ class HostEnv(Env):
             self.cmd = HostCommandCapability(
                 self.workspace_root,
                 env=self._command_environment,
+                launcher=self._command_launcher,
             )
         Path(self.workspace_root).mkdir(parents=True, exist_ok=True)
         self._last_error = None
