@@ -219,7 +219,7 @@ async def test_update_plan_tool_keeps_the_diagnosis_when_it_asks_for_a_retry() -
     rejected = {
         "plan": [
             _item("Work front A", status="in_progress"),
-            _item("Work front B", status="in_progress"),
+            _item("   ", status="pending"),
         ],
         "explanation": "Both fronts opened after the fingerprint pass.",
     }
