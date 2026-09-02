@@ -66,7 +66,16 @@ class PlanItem:
 
 @dataclass(frozen=True, slots=True)
 class Plan:
-    """Current progress checklist; history remains in the append-only Journal."""
+    """Current progress checklist; history remains in the append-only Journal.
+
+    How many items may be in progress at once is the author's to decide, not
+    this type's. The count was once bounded to one per owning Subagent; the
+    owner is gone and a single global cursor is what that rule decayed into,
+    which a checklist authored by an Agent driving several concurrent
+    Subagents cannot state honestly. Bounds that protect a reader -- item
+    count, step length -- stay; a claim about how work is sequenced belongs
+    to whoever writes the checklist.
+    """
 
     items: tuple[PlanItem, ...] = ()
 
@@ -79,11 +88,6 @@ class Plan:
             )
         if any(not isinstance(item, PlanItem) for item in self.items):
             raise PlanContractError("Plan contains an invalid item")
-        in_progress = sum(
-            item.status is PlanStatus.IN_PROGRESS for item in self.items
-        )
-        if in_progress > 1:
-            raise PlanContractError("Plan allows at most one in-progress item")
 
 
 @dataclass(frozen=True, slots=True)

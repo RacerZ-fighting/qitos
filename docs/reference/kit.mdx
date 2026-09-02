@@ -64,8 +64,9 @@ Use this page as a capability map for QitOS authoring.
 - `UpdatePlanTool` / `update_plan` commits a complete progress checklist to the current
   Session journal. Each item has a concise `step` description and
   `pending | in_progress | completed` display status; an update may add, remove, rewrite,
-  or reorder items and may include one update-level explanation. At most one item may be
-  in progress. An empty Plan has no TODO projection.
+  or reorder items and may include one update-level explanation. Any number of items may
+  be in progress, so an Agent driving several concurrent Subagents can show a step for
+  each. An empty Plan has no TODO projection.
 
 Plan is not a dependency graph, Subagent scheduler, or completion gate. Subagent launch
 and lifecycle are recorded independently of the current Plan.

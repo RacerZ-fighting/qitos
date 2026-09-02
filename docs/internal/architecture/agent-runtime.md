@@ -213,8 +213,9 @@ compatibility mirror.
 
 Plan is an optional progress checklist. Each `PlanItem` carries one concise `step`
 description and a `pending | in_progress | completed` display status. A model may add,
-remove, rewrite or reorder items; QitOS validates the bounded shape and at most one item
-in progress. Every accepted replacement commits as one `plan.updated` record with its
+remove, rewrite or reorder items; QitOS validates the bounded shape and leaves the
+number of items in progress to the author, so a checklist can carry one step per
+concurrently running Subagent. Every accepted replacement commits as one `plan.updated` record with its
 owning Task id and the update's optional explanation in the Run journal, so a replay
 recovers both what the checklist became and why it changed. Plans are replayed per Task
 through the fork lineage, so an explicit terminal follow-up Task does not inherit the

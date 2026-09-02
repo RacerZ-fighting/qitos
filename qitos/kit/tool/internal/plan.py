@@ -29,7 +29,9 @@ class UpdatePlanTool(BaseTool):
                     "Replace the current task progress checklist. Steps may be added, "
                     "removed, rewritten, or reordered as the approach changes. Provide "
                     "an explanation of what changed since the previous checklist and "
-                    "why. Keep at most one step in progress."
+                    "why. Keep one step in progress for each line of work "
+                    "actually underway: one while working alone, one per "
+                    "running Subagent while several fronts are open."
                 ),
                 input_schema={
                     "type": "object",

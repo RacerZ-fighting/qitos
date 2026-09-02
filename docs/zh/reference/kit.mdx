@@ -50,7 +50,8 @@ from qitos.harness import build_harness_policy, build_model_for_preset
 
 - `UpdatePlanTool` / `update_plan`：把完整的进度 checklist 提交到当前 Session journal。每项只有
   一句简短的 `step` 描述与 `pending | in_progress | completed` 展示状态；一次更新可增删、改写、
-  重排项目并附带整体 explanation，最多一项为 `in_progress`。空 Plan 不产生 TODO 投影。
+  重排项目并附带整体 explanation。`in_progress` 的数量不受限制，因此同时驱动多个 Subagent 的
+  Agent 可以为每条在跑的工作各留一项。空 Plan 不产生 TODO 投影。
 
 Plan 不表达依赖图、Subagent 调度或完成判定；Subagent launch 和 lifecycle 独立记录。每个活跃
 Subagent 会从共享 step 预算中保留一次无 Tool 的结论交互；模型

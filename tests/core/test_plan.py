@@ -35,14 +35,30 @@ def test_plan_round_trips_as_an_ordered_checklist() -> None:
     )
 
 
-def test_plan_allows_at_most_one_in_progress_item() -> None:
-    with pytest.raises(PlanContractError, match="at most one"):
-        Plan(
-            (
-                PlanItem("First", PlanStatus.IN_PROGRESS),
-                PlanItem("Second", PlanStatus.IN_PROGRESS),
-            )
-        )
+def test_a_checklist_may_carry_a_step_per_concurrent_line_of_work() -> None:
+    # An Agent driving several Subagents at once has that many steps underway,
+    # and a checklist that can show only one of them describes a run that is
+    # not happening.
+    statuses = (
+        PlanStatus.IN_PROGRESS,
+        PlanStatus.IN_PROGRESS,
+        PlanStatus.COMPLETED,
+        PlanStatus.IN_PROGRESS,
+    )
+    update = parse_plan_update(
+        {
+            "plan": [
+                {"step": f"Front {index}", "status": status.value}
+                for index, status in enumerate(statuses)
+            ]
+        }
+    )
+
+    assert tuple(item.status for item in update.plan.items) == statuses
+    assert plan_from_dict(plan_to_dict(update.plan)) == update.plan
+    rendered = render_plan_markdown(update.plan)
+    assert rendered is not None
+    assert rendered.count("[~]") == 3
 
 
 def test_model_plan_shape_rejects_retired_graph_fields() -> None:

@@ -17,6 +17,18 @@ How to update:
 
 ## Unreleased
 
+### Changed
+
+- A `Plan` may now carry more than one item in progress. The bound was once one
+  in-progress node per owning Subagent, and when owners were removed from the
+  checklist a single global cursor is what that rule decayed into -- so an Agent
+  running three Subagents could mark only one of the three steps underway, and
+  the TODO projection it reads back described a run that was not happening. Item
+  count and step length still bound the shape, because those protect whoever
+  reads the projection; how many lines of work are open is the author's fact to
+  state. `update_plan` now asks for one in-progress step per line of work
+  actually underway rather than at most one overall.
+
 ### Added
 
 - `HostEnv` accepts a `CommandLauncher`, an argv prefix every command it spawns
