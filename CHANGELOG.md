@@ -218,9 +218,9 @@ How to update:
 - `Plan` is now a replaceable progress checklist of `PlanItem(step, status)` values,
   matching the model-facing `update_plan` shape. Dependency nodes, readiness, owners,
   transition rules and `plan_assignment` are removed from the current API; Plan no
-  longer schedules Subagents or gates Task completion. Existing graph snapshots and
-  Task/Subagent payloads with `plan_assignment` have one-way read migration into the
-  new projection and are never emitted again.
+  longer schedules Subagents or gates Task completion. Retired graph snapshots and
+  Task/Subagent payloads containing `plan_assignment` now fail closed and are never
+  emitted.
 - Custom `TurnTransactionBoundary` implementations must implement
   `turn_input_committed(turn, messages)`. Exhaustive handlers for the closed
   `Message` union must also handle `ContextMessage`.

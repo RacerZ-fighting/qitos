@@ -83,15 +83,11 @@ def test_subagent_launch_request_round_trips_parent_task_binding() -> None:
         )
 
 
-def test_subagent_launch_request_discards_retired_plan_assignment() -> None:
-    request = _request()
-
-    restored = SubagentLaunchRequest.from_dict(
-        {**request.to_dict(), "plan_assignment": "legacy-node"}
-    )
-
-    assert restored == request
-    assert "plan_assignment" not in restored.to_dict()
+def test_subagent_launch_request_rejects_retired_plan_assignment() -> None:
+    with pytest.raises(ValueError):
+        SubagentLaunchRequest.from_dict(
+            {**_request().to_dict(), "plan_assignment": "legacy-node"}
+        )
 
 
 def test_subagent_result_preserves_scoped_handle_and_evidence() -> None:
