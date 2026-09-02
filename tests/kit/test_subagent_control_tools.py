@@ -104,8 +104,74 @@ async def test_message_enters_active_subagent_mailbox() -> None:
     assert result["accepted"] is True
     assert len(engine.messages) == 1
     assert engine.messages[0].kind == "agent.parent.message"
-    assert engine.messages[0].payload == {"content": "Check TLS too."}
+    assert engine.messages[0].payload == {
+        "content": "Check TLS too.",
+        "resource_refs": [],
+    }
     await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_message_schema_and_mailbox_preserve_resource_refs() -> None:
+    engine = _MailboxEngine()
+    supervisor = _supervisor(engine)
+    launched = await _launch(supervisor)
+    await asyncio.wait_for(engine.started.wait(), timeout=1)
+    tool = SubagentMessageTool(supervisor)
+
+    resource_refs = tool.spec.parameters["resource_refs"]
+    assert resource_refs["type"] == "array"
+    assert resource_refs["uniqueItems"] is True
+    assert "resource_refs" not in tool.spec.required
+
+    result = await tool.execute(
+        {
+            "subagent_id": launched.handle.subagent_id,
+            "content": "Use the newly available access.",
+            "resource_refs": ["run-parent:resource:credential-admin"],
+        },
+        runtime_context={"parent_run_id": "parent-run"},
+    )
+
+    assert result["accepted"] is True
+    assert engine.messages[0].payload == {
+        "content": "Use the newly available access.",
+        "resource_refs": ["run-parent:resource:credential-admin"],
+    }
+    await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource_refs",
+    ["credential", [""], ["credential", " credential "], [1]],
+)
+async def test_invalid_message_resource_refs_fail_before_supervisor_call(
+    resource_refs: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _supervisor(_MailboxEngine())
+    called = False
+
+    async def fail_if_called(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called = True
+        raise AssertionError("supervisor.message must not run")
+
+    monkeypatch.setattr(supervisor, "message", fail_if_called)
+
+    result = await SubagentMessageTool(supervisor).execute(
+        {
+            "subagent_id": "subagent-one",
+            "content": "Use the selected access.",
+            "resource_refs": resource_refs,
+        },
+        runtime_context={"parent_run_id": "parent-run"},
+    )
+
+    assert result.status == "error"
+    assert "resource_refs" in (result.error or "")
+    assert called is False
 
 
 @pytest.mark.asyncio

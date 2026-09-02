@@ -38,6 +38,11 @@ How to update:
 
 ### Added
 
+- `subagent_message` now accepts optional stable `resource_refs`. QitOS validates
+  and journals the references with the ordinary parent message, while leaving
+  product resource lookup and safe-point projection to the composing runtime.
+  The new immutable `SubagentMessageRequest` contract requires the canonical
+  message shape when decoding durable mailbox records.
 - `SubagentTool` now exposes the existing optional
   `SubagentLaunchRequest.context` field and a new immutable `resource_refs`
   tuple to the model and preserves both through launch persistence. Products
