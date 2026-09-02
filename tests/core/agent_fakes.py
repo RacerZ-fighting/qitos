@@ -75,6 +75,12 @@ def tool_events(
     return events
 
 
+def truncated_events(text: str = "partial") -> List[ModelStreamEvent]:
+    """Deltas with no terminal event, the shape a dropped connection leaves."""
+
+    return [ModelStreamEvent(type=ModelStreamEventType.TEXT_DELTA, text=text)]
+
+
 def failed_events(error: str) -> List[ModelStreamEvent]:
     return [ModelStreamEvent(type=ModelStreamEventType.FAILED, error=error)]
 

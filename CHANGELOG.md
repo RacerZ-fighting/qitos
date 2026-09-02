@@ -29,6 +29,24 @@ How to update:
 
 ### Fixed
 
+- A model stream that drops mid-response no longer ends the run. The transport
+  publishes deltas as they arrive and stops considering a retry once it has
+  published one, because replaying the attempt would duplicate visible output
+  and tool-call deltas; a provider that closed a connection without its
+  terminal chunk therefore terminalized the whole run, discarding every Tool
+  result the run had already earned. The loop now treats that failure as a turn
+  that produced nothing: the failed attempt is committed and its `turn_end` is
+  emitted exactly as a terminal failure would be, then a fresh turn re-runs the
+  transaction. Nothing is replayed -- a stream that never reached its terminal
+  event admitted no Tool, and a failed assistant message is already excluded
+  from the wire, so the re-run sends the request the dropped attempt sent.
+  `AgentLoopConfig.max_consecutive_model_transport_failures` (default 3) bounds
+  it: any turn that gets through resets the count, so a provider that is
+  actually down still ends the run in seconds rather than spinning, and the
+  re-run opens a turn like any other and so cannot outrun `max_turns`. Only a
+  transport error the adapter itself classified retryable qualifies; a failure
+  the provider reported, a deadline and an abort are terminal as before.
+
 - A managed command started through `run_command` without `run_in_background` now
   runs under a lifetime instead of no bound at all. Inside a Run every command
   becomes a managed process, and `astart` accepted no timeout, so `shell_timeout`

@@ -51,6 +51,7 @@ from .agent_fakes import (
     text_events,
     tool_call_wire,
     tool_events,
+    truncated_events,
 )
 
 
@@ -1799,3 +1800,120 @@ async def test_tool_result_usage_and_added_names_reach_the_committed_message() -
     assert tool_message.added_tool_names == ("loaded_skill_tool",)
     assert tool_message.result.usage is tool_message.usage
     assert tool_message.result.added_tool_names == ("loaded_skill_tool",)
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_model_stream_reruns_the_turn_from_the_same_wire() -> None:
+    model = ScriptedModel([truncated_events(), text_events("done")])
+    context = AgentContext(system_prompt="sys", messages=[])
+    transaction = RecordingTransaction()
+    events: List[object] = []
+    config = AgentLoopConfig(
+        model=model, run_id="run-drop-rerun", transaction=transaction
+    )
+    result = await run_agent_loop(
+        [UserMessage(content="go")], context, config, events.append
+    )
+
+    assert result.status is AgentRunStatus.COMPLETED
+    final = context.messages[-1]
+    assert isinstance(final, AssistantMessage)
+    assert final.text == "done"
+    # A stream that never reached its terminal event admitted no Tool, so the
+    # re-run asks the provider for exactly what the dropped attempt asked for.
+    assert len(model.requests) == 2
+    assert model.requests[1].messages == model.requests[0].messages
+    turn_starts = [event for event in events if event.type == "turn_start"]
+    assert len(turn_starts) == 2
+    # The attempt and its reason stay in the record even though the run went on.
+    model_terminals = [
+        record for record in transaction.records if record[0] == "model_terminal"
+    ]
+    assert model_terminals[0][2] is not None
+    assert model_terminals[1][2] is None
+    assert ("turn_committed", turn_starts[0].turn, 2) in transaction.records
+
+
+@pytest.mark.asyncio
+async def test_consecutive_dropped_streams_end_the_run_once_the_budget_is_spent() -> (
+    None
+):
+    model = ScriptedModel([truncated_events(), truncated_events()])
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(
+        model=model,
+        run_id="run-drop-budget",
+        max_consecutive_model_transport_failures=2,
+    )
+    result = await run_agent_loop([UserMessage(content="go")], context, config, None)
+
+    assert result.status is AgentRunStatus.FAILED
+    assert result.error is not None
+    # The budget is spent by the second failure; a third request never happens.
+    assert len(model.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_dropped_stream_budget_counts_consecutive_failures() -> None:
+    model = ScriptedModel(
+        [
+            truncated_events(),
+            tool_events([tool_call_wire("c1", "echo", {"text": "one"})]),
+            truncated_events(),
+            text_events("done"),
+        ]
+    )
+    context = AgentContext(messages=[], tools=_registry(_echo).freeze())
+    config = AgentLoopConfig(
+        model=model,
+        run_id="run-drop-reset",
+        max_consecutive_model_transport_failures=2,
+    )
+    result = await run_agent_loop([UserMessage(content="go")], context, config, None)
+
+    # Two drops separated by a turn that got through are not two in a row, so
+    # a provider that hiccups occasionally never accumulates its way to a
+    # terminal run.
+    assert result.status is AgentRunStatus.COMPLETED
+    assert len(model.requests) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_reported_model_failure_is_not_rerun() -> None:
+    model = ScriptedModel([failed_events("provider refused the request")])
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(model=model, run_id="run-model-failure")
+    result = await run_agent_loop([UserMessage(content="go")], context, config, None)
+
+    # The provider answered; the answer was a failure. Re-running would only
+    # ask the same question again.
+    assert result.status is AgentRunStatus.FAILED
+    assert len(model.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_rerunning_a_dropped_turn_still_respects_the_turn_budget() -> None:
+    model = ScriptedModel([truncated_events(), truncated_events()])
+    context = AgentContext(messages=[])
+    config = AgentLoopConfig(
+        model=model,
+        run_id="run-drop-turns",
+        max_turns=1,
+        max_consecutive_model_transport_failures=5,
+    )
+    result = await run_agent_loop([UserMessage(content="go")], context, config, None)
+
+    # A re-run opens a turn like any other, so it cannot outrun the turn budget.
+    assert result.status is AgentRunStatus.MAX_TURNS
+    assert len(model.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_dropped_stream_budget_must_be_a_positive_integer() -> None:
+    model = ScriptedModel([text_events("x")])
+    with pytest.raises(ValueError):
+        AgentLoopConfig(
+            model=model,
+            run_id="run-drop-invalid",
+            max_consecutive_model_transport_failures=0,
+        )

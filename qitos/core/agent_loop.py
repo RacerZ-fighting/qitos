@@ -118,6 +118,12 @@ _MAX_FINALIZATION_DIAGNOSTIC_MESSAGE = 512
 #: diagnostic instead of holding the run open forever.
 DEFAULT_RUN_FINALIZER_TIMEOUT_SECONDS = 30.0
 
+# How many model transactions may fail in transport back to back before the run
+# gives up. A provider that drops one stream mid-response has produced no Tool
+# side effect, so the turn can be re-run; a provider that is actually down fails
+# this many times in seconds and ends the run rather than spinning.
+DEFAULT_MAX_CONSECUTIVE_MODEL_TRANSPORT_FAILURES = 3
+
 
 @dataclass(frozen=True, slots=True)
 class RunFinalizationDiagnostic:
@@ -329,6 +335,9 @@ class AgentLoopConfig:
     continuation_floor: int = 0
     run_finalizer: RunFinalizer | None = None
     run_finalizer_timeout_seconds: float = DEFAULT_RUN_FINALIZER_TIMEOUT_SECONDS
+    max_consecutive_model_transport_failures: int = (
+        DEFAULT_MAX_CONSECUTIVE_MODEL_TRANSPORT_FAILURES
+    )
 
     def __post_init__(self) -> None:
         if not getattr(self.model, "provider_name", None) or not getattr(
@@ -359,6 +368,14 @@ class AgentLoopConfig:
             raise ValueError("continuation_floor must be a non-negative integer")
         if self.run_finalizer is not None and not callable(self.run_finalizer):
             raise TypeError("run_finalizer must be an async callable or None")
+        if (
+            isinstance(self.max_consecutive_model_transport_failures, bool)
+            or not isinstance(self.max_consecutive_model_transport_failures, int)
+            or self.max_consecutive_model_transport_failures < 1
+        ):
+            raise ValueError(
+                "max_consecutive_model_transport_failures must be a positive integer"
+            )
         if (
             isinstance(self.run_finalizer_timeout_seconds, bool)
             or not isinstance(self.run_finalizer_timeout_seconds, (int, float))
@@ -1043,6 +1060,7 @@ async def _run_loop(
 ) -> AgentLoopResult:
     turn_message_base = 0
     turn_input: List[Message] = list(initial_turn_input)
+    consecutive_transport_failures = 0
 
     async def _finish(
         status: AgentRunStatus, error: Optional[str] = None
@@ -1139,11 +1157,21 @@ async def _run_loop(
                     if token is not None:
                         token.mark_step_complete()
                 return await _finish(status, error=error)
-            message, status_override = await _stream_assistant(
+            message, status_override, retryable = await _stream_assistant(
                 turn, context, new_messages, exposure, config, emit, token
             )
 
             if status_override is not None or message.failed:
+                if retryable:
+                    consecutive_transport_failures += 1
+                # A dropped stream is a turn that produced nothing, not a run
+                # that cannot continue. Commit it and end it exactly as a
+                # terminal failure would, so the transcript keeps the attempt
+                # and its reason, then let the inner loop open a fresh turn.
+                retry_turn = retryable and (
+                    consecutive_transport_failures
+                    < config.max_consecutive_model_transport_failures
+                )
                 if config.transaction is not None:
                     await config.transaction.turn_committed(
                         turn, tuple(new_messages[turn_message_base:])
@@ -1155,10 +1183,14 @@ async def _run_loop(
                 finally:
                     if token is not None:
                         token.mark_step_complete()
+                if retry_turn:
+                    has_more_tool_calls = True
+                    continue
                 if status_override is not None:
                     return await _finish(status_override, error=message.error)
                 return await _finish(AgentRunStatus.FAILED, error=message.error)
 
+            consecutive_transport_failures = 0
             calls = list(message.tool_calls)
             tool_results: List[ToolResultMessage] = []
             has_more_tool_calls = False
@@ -1519,7 +1551,7 @@ async def _stream_assistant(
     config: AgentLoopConfig,
     emit: EventSink | None,
     token: CancelToken | None,
-) -> Tuple[AssistantMessage, Optional[AgentRunStatus]]:
+) -> Tuple[AssistantMessage, Optional[AgentRunStatus], bool]:
     """Run one model transaction and return its terminal assistant message.
 
     The terminal message is appended to both the context and the run's new
@@ -1527,6 +1559,11 @@ async def _stream_assistant(
     and caller cancellation. The second tuple element overrides the run
     status for abort and deadline terminals; ``None`` means normal turn
     processing continues.
+
+    The third element marks a transport failure the caller may re-run as a
+    fresh turn. It is true only for a transport error the adapter classified
+    retryable, and only from the streaming path, which ends before any Tool
+    is admitted -- so nothing this turn attempted has an external effect.
     """
 
     model = config.model
@@ -1547,7 +1584,7 @@ async def _stream_assistant(
             await _finalize_model_message(
                 message, context, new_messages, emit, config, turn, None
             )
-            return message, AgentRunStatus.ABORTED
+            return message, AgentRunStatus.ABORTED, False
         except _HookTimedOut:
             message = AssistantMessage(
                 error="model request deadline expired before admission",
@@ -1557,7 +1594,7 @@ async def _stream_assistant(
             await _finalize_model_message(
                 message, context, new_messages, emit, config, turn, None
             )
-            return message, AgentRunStatus.DEADLINE_EXCEEDED
+            return message, AgentRunStatus.DEADLINE_EXCEEDED, False
         messages = list(transformed)
 
     wire = [
@@ -1602,7 +1639,7 @@ async def _stream_assistant(
         await _finalize_model_message(
             message, context, new_messages, emit, config, turn, request
         )
-        return message, AgentRunStatus.ABORTED
+        return message, AgentRunStatus.ABORTED, False
 
     if config.deadline_monotonic is not None and (
         time.monotonic() >= config.deadline_monotonic
@@ -1615,7 +1652,7 @@ async def _stream_assistant(
         await _finalize_model_message(
             message, context, new_messages, emit, config, turn, request
         )
-        return message, AgentRunStatus.DEADLINE_EXCEEDED
+        return message, AgentRunStatus.DEADLINE_EXCEEDED, False
 
     accumulated_text: List[str] = []
     accumulated_reasoning: List[str] = []
@@ -1793,15 +1830,21 @@ async def _stream_assistant(
             partial,
             error=str(exc) or "model stream failed",
         )
+        retryable = False
         if isinstance(exc, ModelRequestDeadlineExceeded):
             status: Optional[AgentRunStatus] = AgentRunStatus.DEADLINE_EXCEEDED
         else:
             status = AgentRunStatus.FAILED
+            # The transport already spent its own retry budget and classified
+            # what it gave up on. A stream that dropped mid-response leaves no
+            # Tool admitted and no external effect behind, so re-running the
+            # transaction from the same context is the whole recovery.
+            retryable = isinstance(exc, ModelTransportError) and exc.retryable
         await _finalize_model_message(
             message, context, new_messages, emit, config, turn, request,
             started=started,
         )
-        return message, status
+        return message, status, retryable
     finally:
         close = getattr(stream_iter, "aclose", None)
         if callable(close):
@@ -1817,8 +1860,8 @@ async def _stream_assistant(
         started=started,
     )
     if aborted:
-        return message, AgentRunStatus.ABORTED
-    return message, None
+        return message, AgentRunStatus.ABORTED, False
+    return message, None, False
 
 
 async def _finalize_model_message(
