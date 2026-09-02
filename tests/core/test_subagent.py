@@ -10,6 +10,7 @@ from qitos.core.subagent import (
     AgentConclusion,
     SubagentHandle,
     SubagentLaunchRequest,
+    SubagentMessageRequest,
     SubagentResult,
     SubagentStatus,
 )
@@ -120,6 +121,42 @@ def test_subagent_launch_request_rejects_invalid_resource_refs() -> None:
             task="Inspect",
             description="inspection",
             resource_refs=("resource-1", " resource-1 "),
+        )
+
+
+def test_subagent_message_request_round_trips_resource_refs() -> None:
+    request = SubagentMessageRequest(
+        content="Use the newly available access.",
+        resource_refs=(
+            "run-parent:resource:credential-admin",
+            "run-sibling:resource:pivot-one",
+        ),
+    )
+
+    assert SubagentMessageRequest.from_dict(request.to_dict()) == request
+
+
+def test_subagent_message_request_requires_canonical_fields() -> None:
+    with pytest.raises(ValueError, match="fields are invalid"):
+        SubagentMessageRequest.from_dict({"content": "Use the selected access."})
+
+
+@pytest.mark.parametrize(
+    "resource_refs, error",
+    [
+        ((" ",), ValueError),
+        (("credential", " credential "), ValueError),
+        (("credential", 1), TypeError),
+    ],
+)
+def test_subagent_message_request_rejects_invalid_resource_refs(
+    resource_refs: tuple[object, ...],
+    error: type[Exception],
+) -> None:
+    with pytest.raises(error):
+        SubagentMessageRequest(
+            content="Use the selected access.",
+            resource_refs=resource_refs,  # type: ignore[arg-type]
         )
 
 

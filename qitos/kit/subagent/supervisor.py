@@ -20,6 +20,7 @@ from ...core.subagent import (
     SubagentInvocationCancelled,
     SubagentLaunchContext,
     SubagentLaunchRequest,
+    SubagentMessageRequest,
     SubagentPersistenceError,
     SubagentResult,
     SubagentRunLimitError,
@@ -41,7 +42,7 @@ from ...core.runtime_input import (
     subagent_result_payload,
     subagent_terminal_runtime_input,
 )
-from ..journal import recover_run_outcome, recover_session
+from ..journal import recover_run_outcome
 from .agent_engine import (
     subagent_budget_stop_reason,
     subagent_final_text,
@@ -559,13 +560,15 @@ class SubagentSupervisor:
         handle: SubagentHandle,
         content: str,
         *,
+        resource_refs: tuple[str, ...] = (),
         timeout_seconds: float | None = None,
     ) -> tuple[bool, SubagentResult | None]:
         """Post one parent message to an active Subagent's durable mailbox."""
 
-        text = str(content or "").strip()
-        if not text:
-            raise ValueError("content must be a non-empty string")
+        request = SubagentMessageRequest(
+            content=content,
+            resource_refs=resource_refs,
+        )
         if timeout_seconds is not None and timeout_seconds < 0:
             raise ValueError("timeout_seconds must be non-negative or None")
         deadline = (
@@ -604,7 +607,7 @@ class SubagentSupervisor:
             kind="agent.parent.message",
             correlation_id=owned.handle.subagent_id,
             source="qitos.parent",
-            payload={"content": text},
+            payload=request.to_dict(),
         )
         post = post_runtime_event(event, run_id=subagent_run_id)
         try:

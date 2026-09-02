@@ -96,6 +96,54 @@ class SubagentHandle:
 
 
 @dataclass(frozen=True, slots=True)
+class SubagentMessageRequest:
+    """One durable parent message plus optional stable resource references."""
+
+    content: str
+    resource_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.content, str) or not self.content.strip():
+            raise ValueError("SubagentMessageRequest.content must be non-empty text")
+        object.__setattr__(self, "content", self.content.strip())
+        if not isinstance(self.resource_refs, tuple) or any(
+            not isinstance(item, str) for item in self.resource_refs
+        ):
+            raise TypeError(
+                "SubagentMessageRequest.resource_refs must contain strings"
+            )
+        normalized = tuple(item.strip() for item in self.resource_refs)
+        if any(not item for item in normalized):
+            raise ValueError(
+                "SubagentMessageRequest.resource_refs must contain non-empty strings"
+            )
+        if len(normalized) != len(set(normalized)):
+            raise ValueError(
+                "SubagentMessageRequest.resource_refs must contain unique values"
+            )
+        object.__setattr__(self, "resource_refs", normalized)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "content": self.content,
+            "resource_refs": list(self.resource_refs),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "SubagentMessageRequest":
+        raw_value = dict(value)
+        if set(raw_value) != {"content", "resource_refs"}:
+            raise ValueError("SubagentMessageRequest fields are invalid")
+        raw_resource_refs = raw_value["resource_refs"]
+        if not isinstance(raw_resource_refs, list):
+            raise TypeError("resource_refs must be an array")
+        return cls(
+            content=raw_value["content"],
+            resource_refs=tuple(raw_resource_refs),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SubagentLaunchRequest:
     """One bounded subagent assignment without a live Agent object."""
 

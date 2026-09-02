@@ -616,9 +616,13 @@ Subagent that has not entered its Agent yet.
 
 `SubagentControlToolSet` exposes exact `subagent_status`, `subagent_wait`, `subagent_message`, and
 `subagent_interrupt` tools over that same supervisor. Wait timeout never cancels the Subagent.
-Message acceptance is journaled when the Subagent keeps a journal, and the message enters
-the Subagent run's steering queue, becoming visible at a
-turn safe point. Unknown or foreign handles return stable `unknown` state. A terminal
+`subagent_message` accepts ordinary `content` plus optional stable `resource_refs`.
+QitOS validates and journals the immutable `SubagentMessageRequest`, but does not
+resolve a product's resource namespace. The product can resolve those references from
+its canonical store and project the selected state at the same turn safe point without
+copying access material into the message. Message acceptance is journaled when the
+Subagent keeps a journal, and the ordinary content enters the Subagent run's steering
+queue. Unknown or foreign handles return stable `unknown` state. A terminal
 Subagent rejects messages explicitly; continuing a terminal Session requires a product
 resume factory rather than silently creating a different Subagent.
 

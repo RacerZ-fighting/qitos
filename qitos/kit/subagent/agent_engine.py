@@ -47,6 +47,7 @@ from ...core.budget import (
 from ...core.subagent import (
     SubagentInvocation,
     SubagentLaunchRequest,
+    SubagentMessageRequest,
     SubagentRuntimeContext,
 )
 from ...core.env import Env
@@ -1120,9 +1121,12 @@ class AgentSubagentEngine:
             return False
         if not self._run_id or self._closed or self._result is not None:
             return False
-        text = str(event.payload.get("content") or "").strip()
-        if not text:
-            return False
+        if event.kind == "agent.parent.message":
+            text = SubagentMessageRequest.from_dict(event.payload).content
+        else:
+            text = str(event.payload.get("content") or "").strip()
+            if not text:
+                return False
         await self._runtime_started.wait()
         agent = self._agent
         if agent is None or self._closed or self._result is not None:

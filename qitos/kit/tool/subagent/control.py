@@ -5,7 +5,12 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from ....core.subagent import SubagentHandle, SubagentResult, SubagentStatus
+from ....core.subagent import (
+    SubagentHandle,
+    SubagentMessageRequest,
+    SubagentResult,
+    SubagentStatus,
+)
 from ....core.tool import BaseTool, ToolPermission, ToolSpec
 from ....core.tool_result import ToolResult
 from ...subagent import SubagentSupervisor
@@ -299,6 +304,15 @@ class SubagentMessageTool(_SubagentControlTool):
                     "type": "string",
                     "description": "The new context or instruction for the Subagent.",
                 },
+                "resource_refs": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "uniqueItems": True,
+                    "description": (
+                        "Stable references to resources the Subagent should receive "
+                        "with this message."
+                    ),
+                },
                 "timeout_seconds": {
                     "type": "number",
                     "description": "Maximum time to wait for mailbox acceptance.",
@@ -316,13 +330,21 @@ class SubagentMessageTool(_SubagentControlTool):
     ) -> dict[str, Any] | ToolResult:
         try:
             handle = self._handle(args, runtime_context)
+            raw_resource_refs = args.get("resource_refs", [])
+            if not isinstance(raw_resource_refs, list):
+                raise TypeError("resource_refs must be an array")
+            request = SubagentMessageRequest(
+                content=args.get("content"),
+                resource_refs=tuple(raw_resource_refs),
+            )
             timeout = min(
                 30.0,
                 self._timeout(args, runtime_context, default=5.0),
             )
             accepted, result = await self._supervisor.message(
                 handle,
-                str(args.get("content") or ""),
+                request.content,
+                resource_refs=request.resource_refs,
                 timeout_seconds=timeout,
             )
         except (TypeError, ValueError, RuntimeError) as exc:

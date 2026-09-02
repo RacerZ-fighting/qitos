@@ -866,6 +866,7 @@ async def test_parent_message_steers_active_subagent(tmp_path) -> None:
     accepted, current = await supervisor.message(
         launched.handle,
         "steer note",
+        resource_refs=("run-parent:resource:credential-admin",),
         timeout_seconds=5,
     )
 
@@ -885,7 +886,11 @@ async def test_parent_message_steers_active_subagent(tmp_path) -> None:
     subagent_records = await _read_subagent_records(tmp_path, final.subagent_run_id)
     assert any(
         record.type is JournalRecordType.RUNTIME_INPUT_POSTED
-        and record.payload["payload"]["content"] == "steer note"
+        and record.payload["payload"]
+        == {
+            "content": "steer note",
+            "resource_refs": ["run-parent:resource:credential-admin"],
+        }
         for record in subagent_records
     )
     await supervisor.aclose()
@@ -914,7 +919,7 @@ async def test_parent_message_rejects_pre_run_and_terminal_settlement_windows(
         kind="agent.parent.message",
         correlation_id="subagent",
         source="qitos.parent",
-        payload={"content": "too late"},
+        payload={"content": "too late", "resource_refs": []},
     )
 
     assert await engine.apost_runtime_event(event, run_id="run_subagentrace") is False
@@ -980,7 +985,7 @@ async def test_parent_message_reserved_before_turn_end_settles_before_terminal(
         kind="agent.parent.message",
         correlation_id="subagent",
         source="qitos.parent",
-        payload={"content": "reserved note"},
+        payload={"content": "reserved note", "resource_refs": []},
     )
 
     running = asyncio.create_task(
@@ -1040,7 +1045,7 @@ async def test_accepted_parent_message_is_marked_consumed_after_its_turn_commits
         kind="agent.parent.message",
         correlation_id="subagent",
         source="qitos.parent",
-        payload={"content": "reserved note"},
+        payload={"content": "reserved note", "resource_refs": []},
     )
 
     running = asyncio.create_task(
@@ -1088,7 +1093,7 @@ async def test_parent_message_queues_while_model_turn_is_in_flight(
         kind="agent.parent.message",
         correlation_id="subagent",
         source="qitos.parent",
-        payload={"content": "busy note"},
+        payload={"content": "busy note", "resource_refs": []},
     )
     running = asyncio.create_task(
         engine.arun("inspect", run_id="run_subagent_busy")
@@ -1151,7 +1156,7 @@ async def test_parent_message_posted_between_turns_is_queued_and_delivered(
         kind="agent.parent.message",
         correlation_id="subagent",
         source="qitos.parent",
-        payload={"content": "between turns note"},
+        payload={"content": "between turns note", "resource_refs": []},
     )
     model = ScriptedModel([first_response, text_events("acknowledged")])
     engine = AgentSubagentEngine(
@@ -1211,7 +1216,7 @@ async def test_parent_message_append_commit_wins_journal_cancellation(
         kind="agent.parent.message",
         correlation_id="subagent",
         source="qitos.parent",
-        payload={"content": "committed note"},
+        payload={"content": "committed note", "resource_refs": []},
     )
     running = asyncio.create_task(
         engine.arun("inspect", run_id="run_subagent_commit_wins")
@@ -1275,7 +1280,7 @@ async def test_parent_message_accepts_committed_journal_error(tmp_path) -> None:
         kind="agent.parent.message",
         correlation_id="subagent",
         source="qitos.parent",
-        payload={"content": "committed error note"},
+        payload={"content": "committed error note", "resource_refs": []},
     )
     running = asyncio.create_task(
         engine.arun("inspect", run_id="run_subagent_commit_error")
@@ -1332,7 +1337,7 @@ async def test_parent_message_append_rollback_is_not_delivered(tmp_path) -> None
         kind="agent.parent.message",
         correlation_id="subagent",
         source="qitos.parent",
-        payload={"content": "rolled back note"},
+        payload={"content": "rolled back note", "resource_refs": []},
     )
     running = asyncio.create_task(
         engine.arun("inspect", run_id="run_subagent_rollback")
@@ -1410,7 +1415,7 @@ async def test_reserved_parent_message_is_rejected_before_terminal_outcomes(
         kind="agent.parent.message",
         correlation_id="subagent",
         source="qitos.parent",
-        payload={"content": "terminal note"},
+        payload={"content": "terminal note", "resource_refs": []},
     )
 
     running = asyncio.create_task(
