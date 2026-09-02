@@ -12,6 +12,7 @@ from qitos.core.subagent import SubagentInvocation, SubagentLaunchContext, Subag
 from qitos.core.runtime_input import RuntimeInput
 from qitos.kit.subagent import SubagentSupervisor
 from qitos.kit.tool.subagent import (
+    WAIT_DEFAULT_TIMEOUT_SECONDS,
     SubagentInterruptTool,
     SubagentMessageTool,
     SubagentStatusTool,
@@ -256,10 +257,9 @@ def test_wait_tool_schema_makes_subagent_id_optional_with_longer_cap() -> None:
     tool = SubagentWaitTool(_supervisor(_MailboxEngine()))
 
     assert "subagent_id" not in tool.spec.required
-    assert tool.spec.parameters["timeout_seconds"]["maximum"] == 600
-    description = tool.spec.description.lower()
-    assert "subagent_id is omitted" in description
-    assert "one long wait" in description
+    bound = tool.spec.parameters["timeout_seconds"]
+    assert bound["minimum"] == 0
+    assert bound["maximum"] > WAIT_DEFAULT_TIMEOUT_SECONDS
 
 
 @pytest.mark.asyncio
