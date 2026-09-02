@@ -785,6 +785,38 @@ async def test_launch_result_reports_remaining_run_admission() -> None:
 
 
 @pytest.mark.asyncio
+async def test_subagent_tool_preserves_explicit_launch_context() -> None:
+    captured: list[SubagentLaunchRequest] = []
+
+    def build(
+        request: SubagentLaunchRequest,
+        _context: SubagentRuntimeContext,
+    ) -> Any:
+        captured.append(request)
+        return _ready_invocation(engine=_Engine(), task=request.task)
+
+    tool = SubagentTool(invocation_factory=build)
+    result = await tool.execute(
+        {
+            "description": "front",
+            "prompt": "inspect the delegated service",
+            "context": "Reuse the verified parent access before probing again.",
+            "success_criteria": ["Report verified access"],
+        },
+        runtime_context={"run_id": "root-run"},
+    )
+
+    assert result.output["subagent_status"] == "completed"
+    assert "context" in tool.spec.parameters
+    assert "context" not in tool.spec.required
+    assert len(captured) == 1
+    assert captured[0].context == (
+        "Reuse the verified parent access before probing again."
+    )
+    await tool.aclose()
+
+
+@pytest.mark.asyncio
 async def test_launch_result_reports_the_lineage_step_budget() -> None:
     ledger = BudgetLedger(max_steps=60)
     await ledger.reserve_step(origin_run_id="root-run", transaction_id="step-0")

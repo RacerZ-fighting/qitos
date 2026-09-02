@@ -38,6 +38,14 @@ How to update:
 
 ### Added
 
+- `SubagentTool` now exposes the existing optional
+  `SubagentLaunchRequest.context` field to the model and preserves it through
+  launch persistence, so applications can pass selected prerequisite context
+  to a Subagent without folding it into the task objective.
+- `SubagentWaitTool` and `SubagentControlToolSet` now accept a composition-owned
+  maximum wait timeout. Their existing 600-second default remains compatible,
+  while products with event-driven Subagent completion can enforce a shorter
+  ceiling in both the model schema and execution.
 - `HostEnv` accepts a `CommandLauncher`, an argv prefix every command it spawns
   passes through: foreground shell commands, argv commands, and managed
   background and PTY processes. A composition uses it to run commands under

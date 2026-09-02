@@ -156,6 +156,13 @@ class SubagentTool(BaseTool):
                 "type": "string",
                 "description": "The task for the Subagent to perform.",
             },
+            "context": {
+                "type": "string",
+                "description": (
+                    "Optional prerequisite context the Subagent needs on its first "
+                    "turn. Keep it limited to facts relevant to this assignment."
+                ),
+            },
             "success_criteria": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -356,6 +363,7 @@ class SubagentTool(BaseTool):
             description=description,
             name=str(args.get("name", "")).strip(),
             agent_type=agent_type,
+            context=str(args.get("context", "")).strip(),
             success_criteria=success_criteria,
             constraints=(parent_task.constraints if parent_task is not None else {}),
             references=(parent_task.references if parent_task is not None else ()),
