@@ -156,6 +156,25 @@ class SubagentTool(BaseTool):
                 "type": "string",
                 "description": "The task for the Subagent to perform.",
             },
+            "context": {
+                "type": "string",
+                "description": (
+                    "Optional non-sensitive prerequisite context the Subagent needs "
+                    "on its first turn. Keep it limited to facts relevant to this "
+                    "assignment."
+                ),
+            },
+            "resource_refs": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "uniqueItems": True,
+                "description": (
+                    "Optional stable resource references already visible in the "
+                    "parent context. Pass exact references instead of copying "
+                    "credentials, access material, or reconnect instructions into "
+                    "prompt or context. The application validates and resolves them."
+                ),
+            },
             "success_criteria": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -260,6 +279,29 @@ class SubagentTool(BaseTool):
                 status="error",
             )
         success_criteria = tuple(item.strip() for item in raw_criteria)
+        raw_resource_refs = args.get("resource_refs", [])
+        if not isinstance(raw_resource_refs, list) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in raw_resource_refs
+        ):
+            return tool_result(
+                {
+                    "status": "error",
+                    "error": (
+                        "resource_refs must be an array of non-empty strings"
+                    ),
+                },
+                status="error",
+            )
+        resource_refs = tuple(item.strip() for item in raw_resource_refs)
+        if len(resource_refs) != len(set(resource_refs)):
+            return tool_result(
+                {
+                    "status": "error",
+                    "error": "resource_refs must contain unique values",
+                },
+                status="error",
+            )
         raw_max_steps = args.get("max_steps")
         budget = self._subagent_budget
         if raw_max_steps is not None:
@@ -356,6 +398,8 @@ class SubagentTool(BaseTool):
             description=description,
             name=str(args.get("name", "")).strip(),
             agent_type=agent_type,
+            context=str(args.get("context", "")).strip(),
+            resource_refs=resource_refs,
             success_criteria=success_criteria,
             constraints=(parent_task.constraints if parent_task is not None else {}),
             references=(parent_task.references if parent_task is not None else ()),

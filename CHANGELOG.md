@@ -38,6 +38,16 @@ How to update:
 
 ### Added
 
+- `SubagentTool` now exposes the existing optional
+  `SubagentLaunchRequest.context` field and a new immutable `resource_refs`
+  tuple to the model and preserves both through launch persistence. Products
+  can resolve those stable references from their canonical resource store while
+  keeping credentials and reconnect instructions out of model-authored launch
+  text. Older launch records decode both fields to their empty defaults.
+- `SubagentWaitTool` and `SubagentControlToolSet` now accept a composition-owned
+  maximum wait timeout. Their existing 600-second default remains compatible,
+  while products with event-driven Subagent completion can enforce a shorter
+  ceiling in both the model schema and execution.
 - `HostEnv` accepts a `CommandLauncher`, an argv prefix every command it spawns
   passes through: foreground shell commands, argv commands, and managed
   background and PTY processes. A composition uses it to run commands under

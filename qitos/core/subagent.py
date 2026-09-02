@@ -104,6 +104,7 @@ class SubagentLaunchRequest:
     name: str = ""
     agent_type: str = "general-purpose"
     context: str = ""
+    resource_refs: tuple[str, ...] = ()
     success_criteria: tuple[str, ...] = ()
     constraints: Mapping[str, str] = field(default_factory=dict)
     references: tuple[TaskReference, ...] = ()
@@ -126,6 +127,22 @@ class SubagentLaunchRequest:
         for name in ("name", "context"):
             if not isinstance(getattr(self, name), str):
                 raise TypeError(f"SubagentLaunchRequest.{name} must be a string")
+        if not isinstance(self.resource_refs, tuple) or any(
+            not isinstance(item, str) for item in self.resource_refs
+        ):
+            raise TypeError(
+                "SubagentLaunchRequest.resource_refs must contain strings"
+            )
+        normalized_resource_refs = tuple(item.strip() for item in self.resource_refs)
+        if any(not item for item in normalized_resource_refs):
+            raise ValueError(
+                "SubagentLaunchRequest.resource_refs must contain non-empty strings"
+            )
+        if len(normalized_resource_refs) != len(set(normalized_resource_refs)):
+            raise ValueError(
+                "SubagentLaunchRequest.resource_refs must contain unique values"
+            )
+        object.__setattr__(self, "resource_refs", normalized_resource_refs)
         if not isinstance(self.success_criteria, tuple) or any(
             not isinstance(item, str) or not item.strip()
             for item in self.success_criteria
@@ -198,6 +215,7 @@ class SubagentLaunchRequest:
             "name": self.name,
             "agent_type": self.agent_type,
             "context": self.context,
+            "resource_refs": list(self.resource_refs),
             "success_criteria": list(self.success_criteria),
             "constraints": dict(self.constraints),
             "references": [item.to_dict() for item in self.references],
@@ -215,12 +233,19 @@ class SubagentLaunchRequest:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "SubagentLaunchRequest":
+        raw_value = dict(value)
+        # ``context`` and ``resource_refs`` were added after the original
+        # durable launch shape. Missing values in older Journal records are
+        # their empty defaults, while unknown fields still fail closed.
+        raw_value.setdefault("context", "")
+        raw_value.setdefault("resource_refs", [])
         expected = {
             "task",
             "description",
             "name",
             "agent_type",
             "context",
+            "resource_refs",
             "success_criteria",
             "constraints",
             "references",
@@ -231,20 +256,23 @@ class SubagentLaunchRequest:
             "budget",
             "parent_task_id",
         }
-        if set(value) != expected:
+        if set(raw_value) != expected:
             raise ValueError("SubagentLaunchRequest fields are invalid")
-        raw_groups = value["allowed_tool_groups"]
-        raw_budget = value["budget"]
-        raw_criteria = value["success_criteria"]
-        raw_constraints = value["constraints"]
-        raw_references = value["references"]
-        raw_permission = value["permission_context"]
+        raw_groups = raw_value["allowed_tool_groups"]
+        raw_budget = raw_value["budget"]
+        raw_criteria = raw_value["success_criteria"]
+        raw_resource_refs = raw_value["resource_refs"]
+        raw_constraints = raw_value["constraints"]
+        raw_references = raw_value["references"]
+        raw_permission = raw_value["permission_context"]
         if not isinstance(raw_groups, list):
             raise TypeError("allowed_tool_groups must be an array")
         if not isinstance(raw_budget, Mapping):
             raise TypeError("budget must be an object")
         if not isinstance(raw_criteria, list):
             raise TypeError("success_criteria must be an array")
+        if not isinstance(raw_resource_refs, list):
+            raise TypeError("resource_refs must be an array")
         if not isinstance(raw_constraints, Mapping):
             raise TypeError("constraints must be an object")
         if not isinstance(raw_references, list) or any(
@@ -254,11 +282,12 @@ class SubagentLaunchRequest:
         if raw_permission is not None and not isinstance(raw_permission, Mapping):
             raise TypeError("permission_context must be an object or null")
         return cls(
-            task=value["task"],
-            description=value["description"],
-            name=value["name"],
-            agent_type=value["agent_type"],
-            context=value["context"],
+            task=raw_value["task"],
+            description=raw_value["description"],
+            name=raw_value["name"],
+            agent_type=raw_value["agent_type"],
+            context=raw_value["context"],
+            resource_refs=tuple(raw_resource_refs),
             success_criteria=tuple(raw_criteria),
             constraints=dict(raw_constraints),
             references=tuple(
@@ -269,11 +298,11 @@ class SubagentLaunchRequest:
                 if raw_permission is None
                 else ToolPermissionContext.from_dict(dict(raw_permission))
             ),
-            profile=value["profile"],
+            profile=raw_value["profile"],
             allowed_tool_groups=tuple(raw_groups),
-            working_directory=value["working_directory"],
+            working_directory=raw_value["working_directory"],
             budget=_budget_from_dict(raw_budget),
-            parent_task_id=value["parent_task_id"],
+            parent_task_id=raw_value["parent_task_id"],
         )
 
 

@@ -511,7 +511,12 @@ registry.register_toolset(SubagentControlToolSet(tool.supervisor), namespace="")
 ```
 
 The model-facing arguments are `description`, `prompt`, `success_criteria`, optional
-`name`, and optional `subagent_type`. The supervisor awaits
+`name`, optional `subagent_type`, optional non-sensitive `context`, and optional
+`resource_refs`. Resource references are stable identifiers already visible to the
+parent; a product invocation factory validates and resolves them from its canonical
+store instead of asking the model to copy credentials, access material, or reconnect
+instructions into launch text. QitOS preserves the immutable references but does not
+interpret product resource namespaces. The supervisor awaits
 the invocation factory, so construction can
 acquire run-scoped resources without blocking the event loop. Each factory call must
 resolve to an independent Agent; sharing a mutable history or model client between

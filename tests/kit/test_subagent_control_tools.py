@@ -13,6 +13,7 @@ from qitos.core.runtime_input import RuntimeInput
 from qitos.kit.subagent import SubagentSupervisor
 from qitos.kit.tool.subagent import (
     WAIT_DEFAULT_TIMEOUT_SECONDS,
+    SubagentControlToolSet,
     SubagentInterruptTool,
     SubagentMessageTool,
     SubagentStatusTool,
@@ -349,6 +350,45 @@ async def test_wait_timeout_cap_is_600_seconds(monkeypatch) -> None:
 
     assert observed == [120.0, 600.0]
     await supervisor.aclose()
+
+
+@pytest.mark.asyncio
+async def test_wait_timeout_cap_can_be_narrowed_by_the_composition(monkeypatch) -> None:
+    engine = _MailboxEngine()
+    supervisor = _supervisor(engine)
+    launched = await _launch(supervisor)
+    await asyncio.wait_for(engine.started.wait(), timeout=1)
+    observed: list[float | None] = []
+
+    async def fake_wait(handle, *, timeout_seconds=None):
+        observed.append(timeout_seconds)
+        return supervisor.result(handle)
+
+    monkeypatch.setattr(supervisor, "wait", fake_wait)
+    toolset = SubagentControlToolSet(
+        supervisor,
+        wait_max_timeout_seconds=7.5,
+    )
+    tool = next(item for item in toolset.tools() if item.spec.name == "subagent_wait")
+
+    await tool.execute(
+        {"subagent_id": launched.handle.subagent_id, "timeout_seconds": 120},
+        runtime_context={"parent_run_id": "parent-run"},
+    )
+    await tool.execute(
+        {"subagent_id": launched.handle.subagent_id},
+        runtime_context={"parent_run_id": "parent-run"},
+    )
+
+    assert tool.spec.parameters["timeout_seconds"]["maximum"] == 7.5
+    assert observed == [7.5, 7.5]
+    await supervisor.aclose()
+
+
+@pytest.mark.parametrize("value", [True, 0, -1, float("inf")])
+def test_wait_timeout_cap_rejects_invalid_values(value) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        SubagentWaitTool(_supervisor(_MailboxEngine()), max_timeout_seconds=value)
 
 
 @pytest.mark.asyncio

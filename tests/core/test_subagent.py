@@ -25,6 +25,10 @@ def _request() -> SubagentLaunchRequest:
         description="service inspection",
         name="inspector",
         context="The parent already identified port 443.",
+        resource_refs=(
+            "run-parent:resource:credential-admin",
+            "run-parent:resource:pivot-internal",
+        ),
         success_criteria=("Return target-side evidence",),
         constraints={"scope": "engagement-primary"},
         references=(
@@ -53,6 +57,10 @@ def test_subagent_launch_request_is_immutable_and_round_trips() -> None:
 
     assert request.allowed_tool_groups == ("network", "files")
     assert request.success_criteria == ("Return target-side evidence",)
+    assert request.resource_refs == (
+        "run-parent:resource:credential-admin",
+        "run-parent:resource:pivot-internal",
+    )
     assert request.constraints == {"scope": "engagement-primary"}
     assert request.references[0].uri == "scope://engagement/primary"
     assert request.permission_context is not None
@@ -80,6 +88,38 @@ def test_subagent_launch_request_round_trips_parent_task_binding() -> None:
             task="x",
             description="y",
             parent_task_id=" ",
+        )
+
+
+def test_subagent_launch_request_decodes_pre_handoff_payload() -> None:
+    payload = _request().to_dict()
+    del payload["context"]
+    del payload["resource_refs"]
+
+    restored = SubagentLaunchRequest.from_dict(payload)
+
+    assert restored.context == ""
+    assert restored.resource_refs == ()
+
+
+def test_subagent_launch_request_rejects_invalid_resource_refs() -> None:
+    with pytest.raises(TypeError):
+        SubagentLaunchRequest(
+            task="Inspect",
+            description="inspection",
+            resource_refs=("run-parent:resource:credential", 1),  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError):
+        SubagentLaunchRequest(
+            task="Inspect",
+            description="inspection",
+            resource_refs=(" ",),
+        )
+    with pytest.raises(ValueError):
+        SubagentLaunchRequest(
+            task="Inspect",
+            description="inspection",
+            resource_refs=("resource-1", " resource-1 "),
         )
 
 

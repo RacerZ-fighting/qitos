@@ -21,3 +21,7 @@ def test_description_explains_parallel_delegation_boundary() -> None:
     criteria = tool.spec.parameters["success_criteria"]
     assert criteria["type"] == "array"
     assert criteria["minItems"] == 1
+    resource_refs = tool.spec.parameters["resource_refs"]
+    assert resource_refs["type"] == "array"
+    assert resource_refs["uniqueItems"] is True
+    assert "resource_refs" not in tool.spec.required

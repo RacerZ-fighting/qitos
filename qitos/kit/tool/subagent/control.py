@@ -173,7 +173,24 @@ class SubagentStatusTool(_SubagentControlTool):
 class SubagentWaitTool(_SubagentControlTool):
     """Wait a bounded time for Subagent terminal state without cancelling it."""
 
-    def __init__(self, supervisor: SubagentSupervisor) -> None:
+    def __init__(
+        self,
+        supervisor: SubagentSupervisor,
+        *,
+        max_timeout_seconds: float = WAIT_MAX_TIMEOUT_SECONDS,
+    ) -> None:
+        if isinstance(max_timeout_seconds, bool) or not isinstance(
+            max_timeout_seconds, (int, float)
+        ):
+            raise TypeError("max_timeout_seconds must be a number")
+        resolved_max_timeout = float(max_timeout_seconds)
+        if not math.isfinite(resolved_max_timeout) or resolved_max_timeout <= 0:
+            raise ValueError("max_timeout_seconds must be finite and positive")
+        self._max_timeout_seconds = resolved_max_timeout
+        self._default_timeout_seconds = min(
+            WAIT_DEFAULT_TIMEOUT_SECONDS,
+            resolved_max_timeout,
+        )
         super().__init__(
             supervisor=supervisor,
             name="subagent_wait",
@@ -192,11 +209,11 @@ class SubagentWaitTool(_SubagentControlTool):
                     "type": "number",
                     "description": (
                         "Maximum wait, from 0 to "
-                        f"{int(WAIT_MAX_TIMEOUT_SECONDS)} seconds; "
-                        f"{int(WAIT_DEFAULT_TIMEOUT_SECONDS)} when omitted."
+                        f"{resolved_max_timeout:g} seconds; "
+                        f"{self._default_timeout_seconds:g} when omitted."
                     ),
                     "minimum": 0,
-                    "maximum": WAIT_MAX_TIMEOUT_SECONDS,
+                    "maximum": resolved_max_timeout,
                 }
             },
             required=[],
@@ -211,11 +228,11 @@ class SubagentWaitTool(_SubagentControlTool):
         subagent_id = str(args.get("subagent_id") or "").strip()
         try:
             timeout = min(
-                WAIT_MAX_TIMEOUT_SECONDS,
+                self._max_timeout_seconds,
                 self._timeout(
                     args,
                     runtime_context,
-                    default=WAIT_DEFAULT_TIMEOUT_SECONDS,
+                    default=self._default_timeout_seconds,
                 ),
             )
             if subagent_id:
@@ -232,10 +249,10 @@ class SubagentWaitTool(_SubagentControlTool):
             )
         if subagent_id:
             return (
-            self._unknown(handle, runtime_context)
-            if result is None
-            else self._projection(result, runtime_context)
-        )
+                self._unknown(handle, runtime_context)
+                if result is None
+                else self._projection(result, runtime_context)
+            )
         if result is not None:
             return self._projection(result, runtime_context)
         return self._wait_any_pending(timeout, runtime_context)
@@ -379,10 +396,18 @@ class SubagentControlToolSet:
     name = "subagent"
     version = "1"
 
-    def __init__(self, supervisor: SubagentSupervisor) -> None:
+    def __init__(
+        self,
+        supervisor: SubagentSupervisor,
+        *,
+        wait_max_timeout_seconds: float = WAIT_MAX_TIMEOUT_SECONDS,
+    ) -> None:
         self._tools = [
             SubagentStatusTool(supervisor),
-            SubagentWaitTool(supervisor),
+            SubagentWaitTool(
+                supervisor,
+                max_timeout_seconds=wait_max_timeout_seconds,
+            ),
             SubagentMessageTool(supervisor),
             SubagentInterruptTool(supervisor),
         ]

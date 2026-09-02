@@ -393,6 +393,7 @@ async def test_subagent_tool_threads_parent_task_domain_constraints(tmp_path) ->
         {
             "description": "inspect",
             "prompt": "inspect",
+            "resource_refs": ["run-parent:resource:credential-admin"],
             "success_criteria": ["Return the inspection result"],
         },
         runtime_context={
@@ -411,6 +412,9 @@ async def test_subagent_tool_threads_parent_task_domain_constraints(tmp_path) ->
 
     assert result.output["subagent_status"] == SubagentStatus.COMPLETED.value
     assert started.payload["request"]["parent_task_id"] == "parent-task"
+    assert started.payload["request"]["resource_refs"] == [
+        "run-parent:resource:credential-admin"
+    ]
     assert "plan_assignment" not in started.payload["request"]
     subagent_records = await _read_subagent_records(
         tmp_path,
