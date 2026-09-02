@@ -111,13 +111,9 @@ def test_task_from_dict_fail_closed_on_key_sets() -> None:
         Task.from_dict({**payload, "resources": []})
 
 
-def test_task_from_dict_discards_retired_plan_assignment() -> None:
-    task = _task()
-
-    restored = Task.from_dict({**task.to_dict(), "plan_assignment": "legacy-node"})
-
-    assert restored == task
-    assert "plan_assignment" not in restored.to_dict()
+def test_task_from_dict_rejects_retired_plan_assignment() -> None:
+    with pytest.raises(ValueError):
+        Task.from_dict({**_task().to_dict(), "plan_assignment": "legacy-node"})
 
 
 def test_task_from_dict_fail_closed_on_value_types() -> None:

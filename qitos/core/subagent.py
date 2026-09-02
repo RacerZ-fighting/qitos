@@ -231,7 +231,7 @@ class SubagentLaunchRequest:
             "budget",
             "parent_task_id",
         }
-        if set(value) not in (expected, expected | {"plan_assignment"}):
+        if set(value) != expected:
             raise ValueError("SubagentLaunchRequest fields are invalid")
         raw_groups = value["allowed_tool_groups"]
         raw_budget = value["budget"]

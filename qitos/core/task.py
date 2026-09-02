@@ -336,7 +336,7 @@ class Task:
             "created_at",
             "created_by_run_id",
         }
-        if set(value) not in (expected, expected | {"plan_assignment"}):
+        if set(value) != expected:
             raise ValueError("Task fields are invalid")
         raw_criteria = value["success_criteria"]
         raw_constraints = value["constraints"]
