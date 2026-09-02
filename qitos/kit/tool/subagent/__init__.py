@@ -6,6 +6,8 @@ from .subagent_tool import (
     SubagentTool,
 )
 from .control import (
+    WAIT_DEFAULT_TIMEOUT_SECONDS,
+    WAIT_MAX_TIMEOUT_SECONDS,
     SubagentControlToolSet,
     SubagentInterruptTool,
     SubagentMessageTool,
@@ -14,6 +16,8 @@ from .control import (
 )
 
 __all__ = [
+    "WAIT_DEFAULT_TIMEOUT_SECONDS",
+    "WAIT_MAX_TIMEOUT_SECONDS",
     "SubagentExecutionMode",
     "SubagentInvocationFactory",
     "SubagentTool",

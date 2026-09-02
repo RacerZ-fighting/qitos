@@ -11,6 +11,13 @@ from ....core.tool_result import ToolResult
 from ...subagent import SubagentSupervisor
 from ..internal.results import tool_result
 
+# A wait a caller did not size for itself: long enough to catch a Subagent that
+# is about to finish, short enough that the caller keeps its own turn.
+WAIT_DEFAULT_TIMEOUT_SECONDS = 30.0
+# The ceiling a caller may ask for. Waiting is always a caller's own cost, so
+# the cap only stops one call from eating a Run.
+WAIT_MAX_TIMEOUT_SECONDS = 600.0
+
 
 class _SubagentControlTool(BaseTool):
     def __init__(
@@ -174,14 +181,22 @@ class SubagentWaitTool(_SubagentControlTool):
                 "Wait for one Subagent to reach terminal state, or for the next "
                 "Subagent terminal state in this Run when subagent_id is omitted. "
                 "A wait timeout leaves every Subagent running and returns its "
-                "current status. Prefer one long wait over repeated short polling."
+                "current status. A background Subagent delivers its own terminal "
+                "as a message, so a wait never causes a result to arrive; it only "
+                "trades the caller's own turns for hearing about it sooner. Wait "
+                "when the next thing you would do depends on that result, and for "
+                "no longer than it takes to have something else worth doing."
             ),
             parameters={
                 "timeout_seconds": {
                     "type": "number",
-                    "description": "Maximum wait, from 0 to 600 seconds.",
+                    "description": (
+                        "Maximum wait, from 0 to "
+                        f"{int(WAIT_MAX_TIMEOUT_SECONDS)} seconds; "
+                        f"{int(WAIT_DEFAULT_TIMEOUT_SECONDS)} when omitted."
+                    ),
                     "minimum": 0,
-                    "maximum": 600,
+                    "maximum": WAIT_MAX_TIMEOUT_SECONDS,
                 }
             },
             required=[],
@@ -196,8 +211,12 @@ class SubagentWaitTool(_SubagentControlTool):
         subagent_id = str(args.get("subagent_id") or "").strip()
         try:
             timeout = min(
-                600.0,
-                self._timeout(args, runtime_context, default=30.0),
+                WAIT_MAX_TIMEOUT_SECONDS,
+                self._timeout(
+                    args,
+                    runtime_context,
+                    default=WAIT_DEFAULT_TIMEOUT_SECONDS,
+                ),
             )
             if subagent_id:
                 handle = self._handle(args, runtime_context)

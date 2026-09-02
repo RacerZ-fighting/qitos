@@ -19,6 +19,13 @@ How to update:
 
 ### Changed
 
+- `subagent_wait` no longer tells callers to prefer one long wait over short
+  polling. A background Subagent already delivers its own terminal as a message,
+  so a wait never causes a result to arrive -- it only trades the caller's own
+  turns for hearing about it sooner, and a parent that spends those turns waiting
+  stops driving anything itself. The tool now says that, and the wait bounds are
+  named as `WAIT_DEFAULT_TIMEOUT_SECONDS` / `WAIT_MAX_TIMEOUT_SECONDS` instead of
+  repeated literals. Behavior, schema range and default are unchanged.
 - A `Plan` may now carry more than one item in progress. The bound was once one
   in-progress node per owning Subagent, and when owners were removed from the
   checklist a single global cursor is what that rule decayed into -- so an Agent
