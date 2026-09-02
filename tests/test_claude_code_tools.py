@@ -272,6 +272,54 @@ class TestSubagentTool:
         assert result.output == {"status": "error", "error": "prompt is required"}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("resource_refs", "expected_error"),
+        [
+            ("run-parent:resource:credential", "must be an array"),
+            ([" "], "must be an array of non-empty strings"),
+            (
+                [
+                    "run-parent:resource:credential",
+                    "run-parent:resource:credential",
+                ],
+                "must contain unique values",
+            ),
+        ],
+    )
+    async def test_invalid_resource_refs_fail_before_invocation_factory(
+        self,
+        resource_refs: object,
+        expected_error: str,
+    ) -> None:
+        from qitos.kit.tool.subagent import SubagentTool
+
+        factory_called = False
+
+        def invocation_factory(
+            request: SubagentLaunchRequest,
+            runtime_context: SubagentRuntimeContext,
+        ) -> None:
+            nonlocal factory_called
+            _ = request, runtime_context
+            factory_called = True
+
+        tool = SubagentTool(invocation_factory=invocation_factory)
+
+        result = await tool.execute(
+            _agent_args(
+                "invalid handoff",
+                "inspect",
+                resource_refs=resource_refs,
+            )
+        )
+
+        assert isinstance(result, ToolResult)
+        assert result.status == "error"
+        assert result.error is not None
+        assert expected_error in result.error
+        assert factory_called is False
+
+    @pytest.mark.asyncio
     async def test_run_scoped_factory_creates_fresh_invocation_per_call(self):
         from contextlib import contextmanager
         from types import SimpleNamespace
