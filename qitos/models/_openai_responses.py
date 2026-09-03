@@ -14,7 +14,11 @@ from ..core.model_request import (
 )
 from ..core.model_stream import ModelStreamEventType
 from ..core.model_response import ModelResponse
-from .transport import close_async_resource
+from .transport import (
+    close_async_resource,
+    is_retryable_provider_error,
+    provider_error_details,
+)
 from .base import Model, ModelStreamEvent
 
 _logger = logging.getLogger(__name__)
@@ -528,18 +532,9 @@ def _provider_error_detail(event: Any) -> str | None:
     """Extract a bounded provider error from an untagged Responses payload."""
 
     try:
-        value = _native_value(event)
+        code, message = provider_error_details(_native_value(event))
     except TypeError:
         return None
-    if not isinstance(value, dict):
-        return None
-    nested = value.get("error")
-    if isinstance(nested, dict):
-        code = nested.get("code") or nested.get("type")
-        message = nested.get("message") or nested.get("detail")
-    else:
-        code = value.get("code") or value.get("error_code")
-        message = value.get("message") or value.get("error")
     if not isinstance(code, (str, int, float)) and not isinstance(
         message, (str, int, float)
     ):
@@ -547,6 +542,18 @@ def _provider_error_detail(event: Any) -> str | None:
     code_text = str(code).strip()[:128] if code is not None else "provider_error"
     message_text = str(message).strip()[:1000] if message is not None else ""
     return f"{code_text}: {message_text}" if message_text else code_text
+
+
+def _raise_retryable_provider_error(event: Any, detail: str) -> None:
+    """Raise a safe-to-retry provider error before any model output is visible."""
+
+    code, message = provider_error_details(event)
+    if is_retryable_provider_error(code, message):
+        raise ModelTransportError(
+            f"model stream failed: {detail}",
+            attempts=1,
+            retryable=True,
+        )
 
 
 def _function_event_key(event: Any, item: Dict[str, Any] | None = None) -> str:
@@ -684,6 +691,7 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamEvent]):
                 if provider_error is not None:
                     if self._continuation_applied and _continuation_rejected(event):
                         raise ModelContinuationRejected(provider_error)
+                    _raise_retryable_provider_error(event, provider_error)
                     self._finished = True
                     return ModelStreamEvent(
                         type=ModelStreamEventType.FAILED,
@@ -893,6 +901,10 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamEvent]):
                     error = _provider_error_detail(event)
                 if self._continuation_applied and _continuation_rejected(error):
                     raise ModelContinuationRejected(str(error)[:1000])
+                _raise_retryable_provider_error(
+                    event,
+                    f"{str(error)[:1000]}",
+                )
                 self._finished = True
                 return ModelStreamEvent(
                     type=ModelStreamEventType.FAILED,

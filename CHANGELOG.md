@@ -63,6 +63,11 @@ How to update:
 
 ### Fixed
 
+- OpenAI-compatible model streams now classify provider quota failures before
+  terminalizing a turn. Token-rate limits such as `AllocationQuota`/TPM are
+  retried with the existing bounded backoff, while account/API-key quota and
+  billing failures remain non-retryable.
+
 - OpenAI-compatible Responses streams now tolerate empty SSE keepalive frames and
   normalize untagged gateway error frames (including DashScope's
   `previous_response_id` rejection) into typed failures. Unknown non-empty malformed

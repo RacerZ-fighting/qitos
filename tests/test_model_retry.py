@@ -12,6 +12,7 @@ import pytest
 from qitos.core.errors import ModelRequestDeadlineExceeded, ModelTransportError
 from qitos.models.transport import (
     ModelRetryPolicy,
+    is_retryable_provider_error,
     transactional_stream_with_retry,
 )
 from qitos.models.base import ModelStreamEvent
@@ -258,6 +259,122 @@ async def test_nonretryable_status_fails_after_one_attempt() -> None:
     assert attempts == 1
     assert exc_info.value.status_code == 403
     assert exc_info.value.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_allocation_quota_status_retries_before_terminal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    class AllocationQuotaError(Exception):
+        status_code = 429
+        body = {
+            "error": {
+                "code": "rate_limit_exceeded",
+                "message": "Allocated quota exceeded, please increase your quota limit.",
+            }
+        }
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("qitos.models.transport.asyncio.sleep", no_sleep)
+
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        return _AttemptStream([], failure=AllocationQuotaError("throttled"))
+
+    with pytest.raises(ModelTransportError) as exc_info:
+        await _collect(create_stream, policy=ModelRetryPolicy(max_attempts=2))
+
+    assert attempts == 2
+    assert exc_info.value.retryable is True
+    assert exc_info.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_account_quota_status_does_not_retry() -> None:
+    attempts = 0
+
+    class AccountQuotaError(Exception):
+        status_code = 429
+        body = {
+            "error": {
+                "code": "insufficient_quota",
+                "message": "You exceeded your current quota, please check your plan and billing details.",
+            }
+        }
+
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        return _AttemptStream([], failure=AccountQuotaError("account quota"))
+
+    with pytest.raises(ModelTransportError) as exc_info:
+        await _collect(create_stream, policy=ModelRetryPolicy(max_attempts=3))
+
+    assert attempts == 1
+    assert exc_info.value.retryable is False
+    assert exc_info.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_account_quota_status_does_not_retry_even_with_retry_header() -> None:
+    attempts = 0
+
+    class AccountQuotaError(Exception):
+        status_code = 429
+        headers = {"x-should-retry": "true"}
+        body = {
+            "error": {
+                "code": "insufficient_quota",
+                "message": "You exceeded your current quota, please check your plan and billing details.",
+            }
+        }
+
+    async def create_stream() -> AsyncIterator[ModelStreamEvent]:
+        nonlocal attempts
+        attempts += 1
+        return _AttemptStream([], failure=AccountQuotaError("account quota"))
+
+    with pytest.raises(ModelTransportError) as exc_info:
+        await _collect(create_stream, policy=ModelRetryPolicy(max_attempts=3))
+
+    assert attempts == 1
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "expected"),
+    [
+        ("Throttling.BurstRate", "Request rate increased too quickly.", True),
+        ("Throttling.Concurrency", "Too many concurrent requests.", True),
+        (
+            "insufficient_quota",
+            "Allocated quota exceeded, please increase your quota limit.",
+            True,
+        ),
+        (
+            "insufficient_quota",
+            "You exceeded your current quota, please check your plan and billing details.",
+            False,
+        ),
+        (
+            "Throttling.AllocationQuota",
+            "Free allocated quota exceeded.",
+            False,
+        ),
+        ("unknown", "See https://example.test/status for details.", False),
+    ],
+)
+def test_provider_error_quota_classification(
+    code: str,
+    message: str,
+    expected: bool,
+) -> None:
+    assert is_retryable_provider_error(code, message) is expected
 
 
 @pytest.mark.asyncio

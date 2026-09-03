@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import random
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -19,6 +21,168 @@ from ..core.errors import (
 _logger = logging.getLogger(__name__)
 EventT = TypeVar("EventT")
 ResultT = TypeVar("ResultT")
+
+_RETRYABLE_PROVIDER_ERROR_CODES = frozenset(
+    {
+        "allocationquota",
+        "burst_rate",
+        "concurrency",
+        "limitrequests",
+        "rate_limit_exceeded",
+        "requests_rate_limit_exceeded",
+        "resourceexhausted",
+        "throttling_allocationquota",
+        "throttling_burstrate",
+        "throttling_concurrency",
+        "throttling_ratequota",
+        "too_many_requests",
+    }
+)
+_NON_RETRYABLE_PROVIDER_ERROR_CODES = frozenset(
+    {
+        "account_quota_exceeded",
+        "arrearage",
+        "billing_hard_limit_reached",
+        "free_allocated_quota_exceeded",
+        "insufficient_quota",
+        "quota_exceeded",
+    }
+)
+
+
+def provider_error_details(value: Any) -> tuple[str | None, str | None]:
+    """Extract a provider error code and message from an SDK value or body."""
+
+    candidates: list[Any] = [value]
+    seen: set[int] = set()
+    fallback_message: str | None = None
+    index = 0
+    while index < len(candidates):
+        candidate = candidates[index]
+        index += 1
+        identity = id(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(candidate, dict):
+            nested = candidate.get("error")
+            source = nested if isinstance(nested, dict) else candidate
+            code = source.get("code") or source.get("error_code")
+            source_type = source.get("type")
+            if code is None and (
+                source is not candidate
+                or not any(
+                    key in candidate
+                    for key in ("body", "error", "response", "data", "details")
+                )
+            ):
+                code = source_type
+            message = (
+                source.get("message")
+                or source.get("detail")
+                or source.get("error")
+            )
+            for key in ("body", "error", "response", "data", "details"):
+                nested_value = candidate.get(key)
+                if nested_value is not None:
+                    candidates.append(nested_value)
+        elif isinstance(candidate, (bytes, str)):
+            message = (
+                candidate.decode(errors="replace")
+                if isinstance(candidate, bytes)
+                else candidate
+            )
+            try:
+                decoded = json.loads(message)
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, (dict, list)):
+                candidates.append(decoded)
+            code = None
+        else:
+            code = (
+                getattr(candidate, "code", None)
+                or getattr(candidate, "error_code", None)
+            )
+            source_type = getattr(candidate, "type", None)
+            if code is None and (
+                not any(
+                    getattr(candidate, attribute, None) is not None
+                    for attribute in ("body", "error", "response")
+                )
+            ):
+                code = source_type
+            message = getattr(candidate, "message", None) or getattr(
+                candidate, "detail", None
+            )
+            for attribute in ("body", "error", "response"):
+                nested = getattr(candidate, attribute, None)
+                if nested is not None:
+                    candidates.append(nested)
+        if code is not None:
+            return (
+                str(code).strip(),
+                str(message).strip() if message is not None else None,
+            )
+        if message is not None and fallback_message is None:
+            fallback_message = str(message).strip()
+    return None, fallback_message
+
+
+def is_retryable_provider_error(
+    code: str | None,
+    message: str | None,
+    *,
+    default: bool = False,
+) -> bool:
+    """Classify transient rate limits separately from account quota failures."""
+
+    normalized_code = "".join(
+        character.lower() if character.isalnum() else "_"
+        for character in str(code or "")
+    ).strip("_")
+    normalized_message = str(message or "").casefold()
+
+    if any(
+        marker in normalized_message
+        for marker in (
+            "free allocated quota exceeded",
+            "free tier",
+            "hour allocated quota exceeded",
+            "month allocated quota exceeded",
+            "week allocated quota exceeded",
+            "billing hard limit",
+            "account quota",
+            "arrearage",
+            "you exceeded your current quota",
+            "insufficient balance",
+        )
+    ):
+        return False
+    explicit_token_limit = (
+        "allocated quota exceeded" in normalized_message
+        or "token-limit" in normalized_message
+        or "token limit" in normalized_message
+        or re.search(r"\b(?:tpm|tps)\b", normalized_message) is not None
+    )
+    if explicit_token_limit:
+        return True
+    if normalized_code in _NON_RETRYABLE_PROVIDER_ERROR_CODES:
+        return False
+    if normalized_code in _RETRYABLE_PROVIDER_ERROR_CODES:
+        return True
+    if any(
+        marker in normalized_message
+        for marker in (
+            "too many requests",
+            "being throttled",
+            "rate limit",
+            "request rate",
+            "resource exhausted",
+        )
+    ):
+        return True
+    return default
 
 
 def remaining_request_seconds(deadline_monotonic: float | None) -> float | None:
@@ -166,13 +330,23 @@ def _is_retryable(exc: Exception) -> bool:
         return False
     if isinstance(exc, ModelTransportError):
         return exc.retryable
+    status = _status_code(exc)
+    if status == 429:
+        code, message = provider_error_details(exc)
+        should_retry = _header(exc, "x-should-retry")
+        return is_retryable_provider_error(
+            code,
+            message,
+            default=should_retry.casefold() != "false"
+            if should_retry is not None
+            else True,
+        )
     should_retry = _header(exc, "x-should-retry")
     if should_retry:
         if should_retry.casefold() == "false":
             return False
         if should_retry.casefold() == "true":
             return True
-    status = _status_code(exc)
     if status is not None:
         return status in {408, 409, 429} or status >= 500
     if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
@@ -410,6 +584,8 @@ __all__ = [
     "close_async_resource",
     "effective_request_timeout",
     "ensure_request_active",
+    "is_retryable_provider_error",
+    "provider_error_details",
     "remaining_request_seconds",
     "sleep_before_retry",
     "transactional_stream_with_retry",

@@ -530,6 +530,155 @@ async def test_responses_normalizes_dashscope_error_without_type() -> None:
 
 
 @pytest.mark.asyncio
+async def test_responses_retries_allocation_quota_error_before_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    streams = [
+        _AsyncListStream(
+            [
+                {
+                    "code": "rate_limit_exceeded",
+                    "message": "Allocated quota exceeded, please increase your quota limit.",
+                }
+            ]
+        ),
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "response-after-allocation-quota",
+                        "status": "completed",
+                        "model": "gpt-test",
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [
+                                    {"type": "output_text", "text": "recovered"}
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ]
+        ),
+    ]
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("qitos.models.transport.asyncio.sleep", no_sleep)
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            return streams.pop(0)
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=2)
+    chunks = await _collect(model, [{"role": "user", "content": "question"}])
+
+    assert len(requests) == 2
+    assert chunks[-1].text == "recovered"
+    assert chunks[-1].done is True
+
+
+@pytest.mark.asyncio
+async def test_responses_does_not_retry_account_quota_error() -> None:
+    stream = _ResponsesEventStream(
+        _AsyncListStream(
+            [
+                {
+                    "code": "insufficient_quota",
+                    "message": "You exceeded your current quota, please check your plan and billing details.",
+                }
+            ]
+        ),
+        provider="openai",
+    )
+
+    terminal = await stream.__anext__()
+
+    assert terminal.type is ModelStreamEventType.FAILED
+    assert terminal.error == (
+        "model stream failed: insufficient_quota: You exceeded your current quota, "
+        "please check your plan and billing details."
+    )
+
+
+@pytest.mark.asyncio
+async def test_responses_failed_event_retries_nested_allocation_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    streams = [
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "Throttling.AllocationQuota",
+                            "message": "Allocated quota exceeded, please increase your quota limit.",
+                        },
+                    },
+                }
+            ]
+        ),
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "response-after-nested-allocation-quota",
+                        "status": "completed",
+                        "model": "gpt-test",
+                        "output": [],
+                    },
+                }
+            ]
+        ),
+    ]
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("qitos.models.transport.asyncio.sleep", no_sleep)
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            return streams.pop(0)
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=2)
+    chunks = await _collect(model, [{"role": "user", "content": "question"}])
+
+    assert len(requests) == 2
+    assert chunks[-1].done is True
+
+
+@pytest.mark.asyncio
 async def test_responses_dashscope_continuation_error_falls_back_to_transcript() -> None:
     stream = _ResponsesEventStream(
         _AsyncListStream(
