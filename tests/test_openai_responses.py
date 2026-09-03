@@ -725,6 +725,16 @@ async def test_responses_failed_event_is_a_terminal_error() -> None:
     with pytest.raises(StopAsyncIteration):
         await stream.__anext__()
 
+    typed_error = _ResponsesEventStream(
+        _AsyncListStream(
+            [{"type": "error", "code": "InvalidParameter", "message": marker}]
+        ),
+        provider="qwen",
+    )
+    typed_terminal = await typed_error.__anext__()
+    assert typed_terminal.type is ModelStreamEventType.FAILED
+    assert marker in str(typed_terminal.error)
+
 
 @pytest.mark.asyncio
 async def test_openai_defaults_to_responses_and_streams_one_complete_transaction(

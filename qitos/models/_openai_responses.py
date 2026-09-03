@@ -889,6 +889,8 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamEvent]):
                 )
             if event_type in {"response.failed", "error"}:
                 error = _field(event, "error") or _field(event, "response")
+                if error is None:
+                    error = _provider_error_detail(event)
                 if self._continuation_applied and _continuation_rejected(error):
                     raise ModelContinuationRejected(str(error)[:1000])
                 self._finished = True
