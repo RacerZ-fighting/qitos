@@ -63,6 +63,11 @@ How to update:
 
 ### Fixed
 
+- OpenAI-compatible Responses streams now accept the completed function-call
+  arguments when a gateway's final value differs byte-for-byte from the streamed
+  argument deltas. The completed event remains authoritative, and the mismatch is
+  logged without exposing argument contents or discarding the model turn.
+
 - OpenAI-compatible model streams now classify provider quota failures before
   terminalizing a turn. Token-rate limits such as `AllocationQuota`/TPM are
   retried with the existing bounded backoff, while account/API-key quota and

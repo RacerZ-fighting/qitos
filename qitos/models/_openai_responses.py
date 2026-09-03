@@ -753,10 +753,19 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamEvent]):
                     completed_arguments = str(arguments)
                     streamed_arguments = self._function_arguments.get(key, "")
                     if streamed_arguments and completed_arguments != streamed_arguments:
-                        raise ModelTransportError(
-                            "completed function arguments do not match streamed deltas",
-                            attempts=1,
-                            retryable=False,
+                        # The completed event is the provider's authoritative
+                        # function-call payload. Some OpenAI-compatible gateways
+                        # emit deltas that are not byte-for-byte identical to this
+                        # final value (for example, escaped or coalesced chunks).
+                        # Keep the safe terminal value instead of discarding the
+                        # whole model turn; never log the argument contents.
+                        _logger.warning(
+                            "Responses function arguments differ from streamed "
+                            "deltas; using completed value item=%s streamed_chars=%d "
+                            "completed_chars=%d",
+                            key,
+                            len(streamed_arguments),
+                            len(completed_arguments),
                         )
                     self._function_arguments[key] = completed_arguments
                 metadata["arguments_chars"] = len(self._function_arguments.get(key, ""))

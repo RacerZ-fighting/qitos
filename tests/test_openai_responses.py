@@ -788,6 +788,71 @@ async def test_responses_interleaved_function_deltas_keep_separate_state() -> No
 
 
 @pytest.mark.asyncio
+async def test_responses_accepts_authoritative_done_arguments_when_delta_differs() -> None:
+    completed = {
+        "type": "function_call",
+        "id": "item-a",
+        "call_id": "call-a",
+        "name": "lookup",
+        "arguments": '{"query":"current information"}',
+        "status": "completed",
+    }
+    stream = _ResponsesEventStream(
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call",
+                        "id": "item-a",
+                        "call_id": "call-a",
+                        "name": "lookup",
+                        "arguments": "",
+                    },
+                },
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "item-a",
+                    "delta": '{"query":',
+                },
+                {
+                    "type": "response.function_call_arguments.done",
+                    "item_id": "item-a",
+                    "arguments": completed["arguments"],
+                },
+                {"type": "response.output_item.done", "item": completed},
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "response-tools",
+                        "status": "completed",
+                        "model": "gpt-test",
+                        "output": [],
+                    },
+                },
+            ]
+        ),
+        provider="qwen",
+    )
+
+    chunks = [chunk async for chunk in stream]
+
+    terminal = chunks[-1]
+    assert terminal.done is True
+    assert terminal.tool_calls == [
+        {
+            "id": "call-a",
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "arguments": completed["arguments"],
+            },
+            "metadata": {"response_item_id": "item-a", "status": "completed"},
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_responses_incomplete_does_not_publish_tool_calls() -> None:
     partial_item = {
         "type": "function_call",
