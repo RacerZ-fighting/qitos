@@ -64,9 +64,9 @@ How to update:
 ### Fixed
 
 - OpenAI-compatible Responses streams now tolerate empty SSE keepalive frames and
-  retry non-empty malformed frames that arrive before any model output. The adapter
-  still reports the malformed fields for diagnosis and never replays a request after
-  visible content has been published.
+  normalize untagged gateway error frames (including DashScope's
+  `previous_response_id` rejection) into typed failures. Unknown non-empty malformed
+  frames remain retryable before output, while visible content is never replayed.
 
 - A model stream that drops mid-response no longer ends the run. The transport
   publishes deltas as they arrive and stops considering a retry once it has

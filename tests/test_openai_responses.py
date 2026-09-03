@@ -12,7 +12,12 @@ from typing import Any
 
 import pytest
 
-from qitos.core import ModelRequest, ModelStreamEventType, ModelTransportError
+from qitos.core import (
+    ModelContinuationRejected,
+    ModelRequest,
+    ModelStreamEventType,
+    ModelTransportError,
+)
 from qitos.core.model_response import ModelResponse
 from qitos.models._openai_responses import (
     _ResponsesEventStream,
@@ -430,7 +435,7 @@ async def test_responses_ignores_empty_provider_events() -> None:
 async def test_responses_reports_nonempty_event_without_type_as_retryable() -> None:
     stream = _ResponsesEventStream(
         _AsyncListStream(
-            [{"code": "upstream_protocol_error", "message": "temporary failure"}]
+            [{"payload": "unexpected provider payload"}]
         ),
         provider="qwen",
     )
@@ -439,7 +444,7 @@ async def test_responses_reports_nonempty_event_without_type_as_retryable() -> N
         await stream.__anext__()
 
     assert exc_info.value.retryable is True
-    assert "code" in str(exc_info.value)
+    assert "payload" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
@@ -449,7 +454,7 @@ async def test_responses_retries_nonempty_event_without_type_before_output(
     requests: list[dict[str, Any]] = []
     streams = [
         _AsyncListStream(
-            [{"code": "temporary_gateway_error", "message": "retry this"}]
+            [{"payload": "temporary gateway payload"}]
         ),
         _AsyncListStream(
             [
@@ -499,6 +504,53 @@ async def test_responses_retries_nonempty_event_without_type_before_output(
     assert len(requests) == 2
     assert chunks[-1].text == "recovered"
     assert chunks[-1].done is True
+
+
+@pytest.mark.asyncio
+async def test_responses_normalizes_dashscope_error_without_type() -> None:
+    stream = _ResponsesEventStream(
+        _AsyncListStream(
+            [
+                {
+                    "code": "InvalidParameter",
+                    "message": "request rejected",
+                    "request_id": "request-1",
+                }
+            ]
+        ),
+        provider="qwen",
+    )
+
+    terminal = await stream.__anext__()
+
+    assert terminal.type is ModelStreamEventType.FAILED
+    assert terminal.event_type == "error"
+    assert terminal.error == "model stream failed: InvalidParameter: request rejected"
+    assert terminal.is_final is True
+
+
+@pytest.mark.asyncio
+async def test_responses_dashscope_continuation_error_falls_back_to_transcript() -> None:
+    stream = _ResponsesEventStream(
+        _AsyncListStream(
+            [
+                {
+                    "code": "InvalidParameter",
+                    "message": "Not found previous_response_id: resp_1.",
+                    "request_id": "request-1",
+                }
+            ]
+        ),
+        provider="qwen",
+        request=_request_for(
+            OpenAIModel(api_key="key", model="gpt-test"),
+            [{"role": "user", "content": "question"}],
+        ),
+        continuation_applied=True,
+    )
+
+    with pytest.raises(ModelContinuationRejected, match="previous_response_id"):
+        await stream.__anext__()
 
 
 @pytest.mark.asyncio

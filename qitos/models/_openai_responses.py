@@ -524,6 +524,31 @@ def _missing_event_type_detail(event: Any) -> str:
     return f"value_type={type(value).__name__}"
 
 
+def _provider_error_detail(event: Any) -> str | None:
+    """Extract a bounded provider error from an untagged Responses payload."""
+
+    try:
+        value = _native_value(event)
+    except TypeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    nested = value.get("error")
+    if isinstance(nested, dict):
+        code = nested.get("code") or nested.get("type")
+        message = nested.get("message") or nested.get("detail")
+    else:
+        code = value.get("code") or value.get("error_code")
+        message = value.get("message") or value.get("error")
+    if not isinstance(code, (str, int, float)) and not isinstance(
+        message, (str, int, float)
+    ):
+        return None
+    code_text = str(code).strip()[:128] if code is not None else "provider_error"
+    message_text = str(message).strip()[:1000] if message is not None else ""
+    return f"{code_text}: {message_text}" if message_text else code_text
+
+
 def _function_event_key(event: Any, item: Dict[str, Any] | None = None) -> str:
     values = item or {}
     item_id = str(values.get("id") or _field(event, "item_id") or "").strip()
@@ -655,6 +680,17 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamEvent]):
                 if _is_empty_provider_event(event):
                     _logger.debug("ignoring empty Responses provider event")
                     continue
+                provider_error = _provider_error_detail(event)
+                if provider_error is not None:
+                    if self._continuation_applied and _continuation_rejected(event):
+                        raise ModelContinuationRejected(provider_error)
+                    self._finished = True
+                    return ModelStreamEvent(
+                        type=ModelStreamEventType.FAILED,
+                        event_type="error",
+                        event_metadata=_event_metadata(event),
+                        error=f"model stream failed: {provider_error}",
+                    )
                 raise ModelTransportError(
                     "model stream emitted a non-empty event without a type "
                     f"({_missing_event_type_detail(event)})",
