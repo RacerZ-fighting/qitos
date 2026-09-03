@@ -63,6 +63,11 @@ How to update:
 
 ### Fixed
 
+- OpenAI-compatible Responses streams now tolerate empty SSE keepalive frames and
+  retry non-empty malformed frames that arrive before any model output. The adapter
+  still reports the malformed fields for diagnosis and never replays a request after
+  visible content has been published.
+
 - A model stream that drops mid-response no longer ends the run. The transport
   publishes deltas as they arrive and stops considering a retry once it has
   published one, because replaying the attempt would duplicate visible output

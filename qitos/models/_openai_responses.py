@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, is_dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, cast
 
@@ -16,6 +17,7 @@ from ..core.model_response import ModelResponse
 from .transport import close_async_resource
 from .base import Model, ModelStreamEvent
 
+_logger = logging.getLogger(__name__)
 OPENAI_API_MODES = {"chat_completions", "responses"}
 _RESPONSES_REQUIREMENT = (
     "api_mode='responses' requires an OpenAI client and endpoint that "
@@ -480,6 +482,48 @@ def _event_response_metadata(event: Any) -> Dict[str, Any]:
     return metadata
 
 
+def _is_empty_provider_event(event: Any) -> bool:
+    """Return whether a provider event carries no semantic payload.
+
+    Some OpenAI-compatible gateways emit an empty SSE data frame as a keepalive.
+    The OpenAI SDK turns that frame into an event object whose ``type`` is empty.
+    It is safe to ignore only when no other payload is present; non-empty malformed
+    events must remain visible as transport failures for diagnosis and retry.
+    """
+
+    if event is None:
+        return True
+    try:
+        value = _native_value(event)
+    except TypeError:
+        return False
+    if not isinstance(value, dict):
+        return False
+    return not any(
+        key != "type" or str(item or "").strip()
+        for key, item in value.items()
+    )
+
+
+def _missing_event_type_detail(event: Any) -> str:
+    """Build a bounded, non-secret diagnostic for a malformed provider event."""
+
+    try:
+        value = _native_value(event)
+    except TypeError:
+        return f"value_type={type(event).__name__}"
+    if isinstance(value, dict):
+        keys = sorted(str(key) for key in value)[:16]
+        code = value.get("code") or value.get("error_code")
+        code_detail = (
+            f", code={str(code)[:128]}"
+            if isinstance(code, (str, int, float))
+            else ""
+        )
+        return f"fields={','.join(keys) or '<none>'}{code_detail}"
+    return f"value_type={type(value).__name__}"
+
+
 def _function_event_key(event: Any, item: Dict[str, Any] | None = None) -> str:
     values = item or {}
     item_id = str(values.get("id") or _field(event, "item_id") or "").strip()
@@ -608,10 +652,14 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamEvent]):
                 ) from exc
             event_type = str(_field(event, "type", "") or "")[:128]
             if not event_type:
+                if _is_empty_provider_event(event):
+                    _logger.debug("ignoring empty Responses provider event")
+                    continue
                 raise ModelTransportError(
-                    "model stream emitted an event without a type",
+                    "model stream emitted a non-empty event without a type "
+                    f"({_missing_event_type_detail(event)})",
                     attempts=1,
-                    retryable=False,
+                    retryable=True,
                 )
             metadata = _event_metadata(event)
             if event_type == "response.output_text.delta":

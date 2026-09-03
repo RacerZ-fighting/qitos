@@ -401,6 +401,107 @@ async def test_responses_lifecycle_backfills_terminal_only_content() -> None:
 
 
 @pytest.mark.asyncio
+async def test_responses_ignores_empty_provider_events() -> None:
+    events = _AsyncListStream(
+        [
+            None,
+            {},
+            SimpleNamespace(),
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "response-after-heartbeats",
+                    "status": "completed",
+                    "model": "gpt-test",
+                    "output": [],
+                },
+            },
+        ]
+    )
+
+    chunks = [chunk async for chunk in _ResponsesEventStream(events, provider="qwen")]
+
+    assert len(chunks) == 1
+    assert chunks[0].done is True
+    assert chunks[0].event_type == "response.completed"
+
+
+@pytest.mark.asyncio
+async def test_responses_reports_nonempty_event_without_type_as_retryable() -> None:
+    stream = _ResponsesEventStream(
+        _AsyncListStream(
+            [{"code": "upstream_protocol_error", "message": "temporary failure"}]
+        ),
+        provider="qwen",
+    )
+
+    with pytest.raises(ModelTransportError, match="without a type") as exc_info:
+        await stream.__anext__()
+
+    assert exc_info.value.retryable is True
+    assert "code" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_responses_retries_nonempty_event_without_type_before_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    streams = [
+        _AsyncListStream(
+            [{"code": "temporary_gateway_error", "message": "retry this"}]
+        ),
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "response-recovered",
+                        "status": "completed",
+                        "model": "gpt-test",
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [
+                                    {"type": "output_text", "text": "recovered"}
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ]
+        ),
+    ]
+
+    async def no_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("qitos.models.transport.asyncio.sleep", no_sleep)
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            return streams.pop(0)
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAIModel(api_key="key", model="gpt-test", max_attempts=2)
+    chunks = await _collect(model, [{"role": "user", "content": "question"}])
+
+    assert len(requests) == 2
+    assert chunks[-1].text == "recovered"
+    assert chunks[-1].done is True
+
+
+@pytest.mark.asyncio
 async def test_responses_interleaved_function_deltas_keep_separate_state() -> None:
     call_specs = [
         ("item-a", "call-a", '{"a":', "1}"),
