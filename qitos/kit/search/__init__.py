@@ -1,6 +1,7 @@
 """Provider-managed public Web search capabilities."""
 
 from .capability import (
+    RetryableWebSearchError,
     WebSearchCapability,
     WebSearchError,
     WebSearchResponse,
@@ -17,6 +18,7 @@ from .tool import ManagedWebSearchTool
 
 __all__ = [
     "WebSearchCapability",
+    "RetryableWebSearchError",
     "WebSearchError",
     "WebSearchResponse",
     "WebSource",

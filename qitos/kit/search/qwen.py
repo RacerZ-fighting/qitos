@@ -7,7 +7,12 @@ from collections.abc import Mapping
 
 import httpx
 
-from .capability import WebSearchError, WebSearchResponse, WebSource
+from .capability import (
+    RetryableWebSearchError,
+    WebSearchError,
+    WebSearchResponse,
+    WebSource,
+)
 
 DEFAULT_QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_QWEN_MODEL = "qwen-plus"
@@ -77,9 +82,13 @@ class QwenWebSearchCapability:
                 timeout=self._timeout_seconds,
             )
         except httpx.TimeoutException as exc:
-            raise WebSearchError("timeout", "Qwen web search timed out") from exc
+            raise RetryableWebSearchError(
+                "timeout", "Qwen web search timed out"
+            ) from exc
         except httpx.RequestError as exc:
-            raise WebSearchError("network", "Qwen web search request failed") from exc
+            raise RetryableWebSearchError(
+                "network", "Qwen web search request failed"
+            ) from exc
 
         if response.status_code in {401, 403}:
             raise WebSearchError(

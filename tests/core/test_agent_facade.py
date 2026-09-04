@@ -13,7 +13,13 @@ from qitos.core.agent import (
     AgentRunRejected,
     QueueMode,
 )
-from qitos.core.agent_events import AgentEnd, AgentStart, MessageEnd, ToolExecutionEnd
+from qitos.core.agent_events import (
+    AgentEnd,
+    AgentStart,
+    MessageEnd,
+    ToolExecutionEnd,
+    TurnEnd,
+)
 from qitos.core.agent_loop import AgentLoopResult, AgentRunStatus
 from qitos.core.cancellation import CancelSignalView
 from qitos.core.message import AssistantMessage, UserMessage
@@ -621,6 +627,32 @@ async def test_run_deadline_bounds_a_hanging_listener() -> None:
     assert listener_started.is_set()
     assert listener_settled.is_set()
     await agent.wait_for_idle()
+
+
+@pytest.mark.asyncio
+async def test_turn_end_listener_can_finish_after_run_deadline() -> None:
+    settled = asyncio.Event()
+
+    async def _delayed_response(_request):
+        await asyncio.sleep(0.02)
+        for event in text_events("answer"):
+            yield event
+
+    agent = _agent(
+        ScriptedModel([_delayed_response]),
+        run_timeout_s=0.01,
+    )
+
+    async def _listener(event) -> None:
+        if isinstance(event, TurnEnd):
+            await asyncio.sleep(0.02)
+            settled.set()
+
+    agent.subscribe(_listener)
+    result = await agent.prompt("go")
+
+    assert result.status is AgentRunStatus.DEADLINE_EXCEEDED
+    assert settled.is_set()
 
 
 @pytest.mark.asyncio

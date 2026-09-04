@@ -14,6 +14,10 @@ class WebSearchError(RuntimeError):
         self.kind = kind
 
 
+class RetryableWebSearchError(WebSearchError):
+    """A transient managed-search failure safe for Tool-level retry."""
+
+
 @dataclass(frozen=True)
 class WebSource:
     """One bounded public source returned by web search."""
@@ -66,6 +70,7 @@ class WebSearchCapability(Protocol):
 
 
 __all__ = [
+    "RetryableWebSearchError",
     "WebSearchCapability",
     "WebSearchError",
     "WebSearchResponse",

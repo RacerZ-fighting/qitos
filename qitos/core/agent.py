@@ -89,6 +89,12 @@ class AgentListenerTimeoutError(RuntimeError):
     """A listener exceeded the active run's absolute deadline."""
 
 
+# Terminal lifecycle events are part of run settlement. They must remain
+# observable after the model/tool deadline has elapsed, but cannot allow a
+# broken persistence observer to hold the run open indefinitely.
+_LISTENER_SETTLEMENT_TIMEOUT_SECONDS = 2.0
+
+
 @dataclass(frozen=True, slots=True)
 class AgentRunRejected:
     """Typed expected rejection for run-entry operations.
@@ -354,7 +360,9 @@ class Agent:
 
         Listeners are awaited in subscription order and are part of the run's
         settlement: the run is not idle until every ``agent_end`` listener has
-        finished. A raising listener is an implementation fault — it
+        finished. ``turn_end`` and ``agent_end`` listeners share a bounded
+        settlement window after the run deadline. A raising listener is an
+        implementation fault — it
         terminalizes the run's durable records and then propagates, since
         persistence listeners must not silently lose records. Pi-style
         two-argument listeners receive the run's read-only
@@ -698,6 +706,11 @@ class Agent:
         if active is None:
             raise RuntimeError("Agent listener invoked outside an active run")
         signal: CancelSignalView = active.token.signal
+        settlement_deadline = (
+            time.monotonic() + _LISTENER_SETTLEMENT_TIMEOUT_SECONDS
+            if isinstance(event, (TurnEnd, AgentEnd))
+            else None
+        )
         for listener, accepts_signal in list(self._listeners):
             if accepts_signal:
                 signal_listener = cast(
@@ -715,24 +728,37 @@ class Agent:
                 )
                 outcome = event_listener(event)
             if inspect.isawaitable(outcome):
-                await self._bounded_listener(listener, outcome)
+                await self._bounded_listener(
+                    listener,
+                    outcome,
+                    settlement_deadline=settlement_deadline,
+                )
 
     async def _bounded_listener(
-        self, listener: AgentEventListener, outcome: Awaitable[None]
+        self,
+        listener: AgentEventListener,
+        outcome: Awaitable[None],
+        *,
+        settlement_deadline: Optional[float] = None,
     ) -> None:
-        """Await one listener bounded by the run's cancellation and deadline.
+        """Await one listener bounded by its run or settlement deadline.
 
         Listener exceptions propagate as faults (persistence listeners must
         not silently lose records). Cancellation is exposed through the
         listener's read-only signal but does not cancel the listener task: Pi
         listeners settle in subscription order even for an aborted run. The
-        absolute run deadline remains the bounded escape hatch. A task that is
-        cancelled by its caller is still awaited during cleanup, so no callback
-        work is detached from the run.
+        absolute run deadline remains the bounded escape hatch for ordinary
+        events. Terminal lifecycle events use the shared settlement deadline
+        supplied by :meth:`_process_event`, allowing durable observers to
+        finish after the model deadline without detaching callback work.
         """
 
         active = self._active
-        deadline = active.deadline_monotonic if active is not None else None
+        deadline = (
+            settlement_deadline
+            if settlement_deadline is not None
+            else active.deadline_monotonic if active is not None else None
+        )
         if deadline is None:
             await outcome
             return
@@ -760,8 +786,13 @@ class Agent:
             listener_outcome, asyncio.CancelledError
         ):
             raise listener_outcome
+        deadline_kind = (
+            "settlement deadline"
+            if settlement_deadline is not None
+            else "run deadline"
+        )
         raise AgentListenerTimeoutError(
-            "agent listener exceeded the run deadline: "
+            f"agent listener exceeded the {deadline_kind}: "
             f"{getattr(listener, '__name__', repr(listener))}"
         )
 

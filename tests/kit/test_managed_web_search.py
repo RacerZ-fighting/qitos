@@ -9,12 +9,17 @@ from typing import Any
 
 import httpx
 import pytest
+from qitos.core.message import ToolCall
+from qitos.core.tool_executor import ToolBatchExecutor, ToolExecutionConfig
+from qitos.core.tool_registry import ToolRegistry
 from qitos.kit.search import (
     KimiBuiltinWebSearchCapability,
     KimiWebSearchCapability,
     ManagedWebSearchTool,
     QwenWebSearchCapability,
+    RetryableWebSearchError,
     WebSearchError,
+    WebSearchResponse,
     build_web_search_capability,
 )
 
@@ -211,6 +216,89 @@ async def test_qwen_managed_search_uses_native_enable_search_contract() -> None:
     assert payload["model"] == "qwen3.7-max"
     assert payload["enable_search"] is True
     assert payload["search_options"] == {"forced_search": True}
+
+
+@pytest.mark.asyncio
+async def test_qwen_web_search_timeout_retries_at_tool_boundary(monkeypatch) -> None:
+    class _FlakyCapability:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def search(self, query: str, *, max_results: int = 8):
+            assert query == "current vendor advisory"
+            assert max_results == 8
+            self.attempts += 1
+            if self.attempts < 3:
+                raise RetryableWebSearchError(
+                    "timeout", "Qwen web search timed out"
+                )
+            return WebSearchResponse(text="answer", sources=())
+
+        async def aclose(self) -> None:
+            return None
+
+    delays: list[float] = []
+
+    async def _wait_for_retry(
+        self, delay: float, *, deadline_monotonic: float | None
+    ) -> str | None:
+        delays.append(delay)
+        return None
+
+    monkeypatch.setattr(ToolBatchExecutor, "_wait_for_retry", _wait_for_retry)
+    capability = _FlakyCapability()
+    tool = ManagedWebSearchTool(capability)
+    exposure = ToolRegistry().register(tool).freeze()
+    executor = ToolBatchExecutor(exposure, ToolExecutionConfig())
+
+    result = (
+        await executor.execute_batch(
+            [
+                ToolCall(
+                    id="search-1",
+                    name="web_search",
+                    arguments={"query": "current vendor advisory"},
+                )
+            ]
+        )
+    )[0]
+
+    assert result.status == "success"
+    assert result.output["text"] == "answer"
+    assert result.output["sources"] == ()
+    assert capability.attempts == 3
+    assert result.metadata["attempts"] == 3
+    assert len(delays) == 2
+    assert 0.25 <= delays[0] <= 0.75
+    assert 0.5 <= delays[1] <= 1.5
+
+
+@pytest.mark.asyncio
+async def test_qwen_web_search_authentication_error_is_not_retried() -> None:
+    class _AuthFailureCapability:
+        attempts = 0
+
+        async def search(self, query: str, *, max_results: int = 8):
+            self.attempts += 1
+            raise WebSearchError("authentication", "invalid credentials")
+
+        async def aclose(self) -> None:
+            return None
+
+    capability = _AuthFailureCapability()
+    tool = ManagedWebSearchTool(capability)
+    executor = ToolBatchExecutor(
+        ToolRegistry().register(tool).freeze(), ToolExecutionConfig()
+    )
+
+    result = (
+        await executor.execute_batch(
+            [ToolCall(id="search-1", name="web_search", arguments={"query": "x"})]
+        )
+    )[0]
+
+    assert result.status == "error"
+    assert capability.attempts == 1
 
 
 @pytest.mark.parametrize(

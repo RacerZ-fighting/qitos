@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from qitos.core.tool import BaseTool, ToolPermission, ToolSpec
+from qitos.core.tool import BaseTool, RetryPolicy, ToolPermission, ToolSpec
 
-from .capability import WebSearchCapability
+from .capability import RetryableWebSearchError, WebSearchCapability
+
+
+_WEB_SEARCH_RETRY_POLICY = RetryPolicy(
+    max_attempts=3,
+    backoff_factor=0.5,
+    max_backoff=2.0,
+    retryable_exceptions=(RetryableWebSearchError,),
+)
 
 
 class ManagedWebSearchTool(BaseTool):
@@ -38,6 +46,7 @@ class ManagedWebSearchTool(BaseTool):
                 permissions=ToolPermission(network=True),
                 read_only=True,
                 concurrency_safe=True,
+                retry_policy=_WEB_SEARCH_RETRY_POLICY,
             )
         )
 

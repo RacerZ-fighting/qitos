@@ -63,6 +63,15 @@ How to update:
 
 ### Fixed
 
+- Terminal ``turn_end`` and ``agent_end`` observers now share a bounded
+  two-second settlement window, so durable lifecycle records can finish after
+  a model/tool deadline without allowing a stuck observer to wedge the run.
+
+- Managed Qwen web search now retries transient timeout and network failures at
+  the Tool boundary (up to three attempts with bounded exponential backoff).
+  Authentication, provider, protocol, and rate-limit failures remain visible
+  as non-retryable search errors.
+
 - OpenAI-compatible Responses streams now accept the completed function-call
   arguments when a gateway's final value differs byte-for-byte from the streamed
   argument deltas. The completed event remains authoritative, and the mismatch is
