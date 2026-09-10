@@ -180,6 +180,80 @@ def test_responses_input_replays_native_items_without_mirror_duplicates() -> Non
     assert sum(item.get("call_id") == "call_1" for item in payload) == 2
 
 
+def test_responses_replay_skips_function_call_without_recorded_tool_call() -> None:
+    messages = [
+        {"role": "user", "content": "question"},
+        {
+            "role": "assistant",
+            "content": "writing the exploit script",
+            "tool_calls": [],
+            "native_items": [
+                {
+                    "type": "function_call",
+                    "id": "fc_truncated",
+                    "call_id": "call_truncated",
+                    "name": "write_file",
+                    "arguments": '{"path": "wp/rce.py", "content": "#!/usr/bin/env',
+                }
+            ],
+        },
+    ]
+
+    payload = _to_responses_input(messages)
+
+    assert all(item.get("type") != "function_call" for item in payload)
+    assert payload == [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "writing the exploit script"},
+    ]
+
+
+def test_responses_incomplete_turn_drops_undispatched_function_call() -> None:
+    response = {
+        "id": "resp_truncated",
+        "status": "incomplete",
+        "model": "deepseek-v4.1-flash-expires-on-0910",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output": [
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Let me write the exploit script.",
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "fc_truncated",
+                "call_id": "call_truncated",
+                "name": "write_file",
+                "arguments": '{"path": "wp/rce.py", "content": "#!/usr/bin/env',
+                "status": "incomplete",
+            },
+        ],
+    }
+
+    normalized = _model_response_from_responses(response, provider="deepseek")
+    replayed = _to_responses_input(
+        [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": normalized.text,
+                "native_items": normalized.native_items,
+            },
+        ]
+    )
+
+    assert normalized.tool_calls is None
+    assert [item["type"] for item in normalized.native_items or []] == ["message"]
+    assert all(item.get("type") != "function_call" for item in replayed)
+
+
 def test_responses_input_preserves_developer_context_role() -> None:
     payload = _to_responses_input(
         [{"role": "developer", "content": "Current state revision: 3"}]
@@ -887,7 +961,10 @@ async def test_responses_incomplete_does_not_publish_tool_calls() -> None:
     assert terminal.done is True
     assert terminal.finish_reason == "max_output_tokens"
     assert terminal.tool_calls is None
-    assert terminal.native_items == [partial_item]
+    # The partial call was never dispatched, so it can never receive a
+    # ToolResult: keeping it as a replay item would put an unpaired
+    # function_call on the next request and the provider rejects that.
+    assert terminal.native_items is None
 
 
 @pytest.mark.asyncio

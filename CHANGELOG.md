@@ -63,6 +63,15 @@ How to update:
 
 ### Fixed
 
+- A truncated Responses turn no longer replays an undispatched ``function_call``.
+  When a turn ends at ``max_output_tokens`` the adapter keeps the provider's
+  incomplete call out of ``tool_calls`` because it was never executed, but the
+  item stayed in the replayed transcript; the next request then carried a
+  ``function_call`` whose output could not exist and the provider rejected the
+  whole request (``No tool output found for tool call``), failing the run. Native
+  ``function_call`` items are now limited to calls the transcript recorded, and
+  the projection drops any replay item that has no recorded ToolCall.
+
 - A Responses provider that keeps no response state no longer receives
   ``previous_response_id`` continuations. The official DeepSeek endpoint documents
   ``previous_response_id`` and ``conversation`` as unsupported and silently ignores

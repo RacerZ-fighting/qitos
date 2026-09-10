@@ -91,6 +91,11 @@ def _to_responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         native_output_ids: set[str] = set()
         has_native_message = False
         seen_transactions: set[tuple[str, str]] = set()
+        declared_call_ids = {
+            str(tool_call.get("id") or "").strip()
+            for tool_call in raw_message.get("tool_calls") or []
+            if isinstance(tool_call, dict) and str(tool_call.get("id") or "").strip()
+        }
         for raw_item in raw_message.get("native_items") or []:
             native_item = _native_value(raw_item)
             if not isinstance(native_item, dict):
@@ -99,6 +104,12 @@ def _to_responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if item_type not in _RESPONSES_ITEM_TYPES:
                 continue
             call_id = str(native_item.get("call_id") or "").strip()
+            if item_type == "function_call" and call_id not in declared_call_ids:
+                # A call this transcript never recorded as a ToolCall was never
+                # dispatched, so no ToolResult exists for it. Replaying it would
+                # put an unpaired function_call on the wire and the provider
+                # rejects the whole request.
+                continue
             if item_type in {"function_call", "function_call_output"} and call_id:
                 transaction = (item_type, call_id)
                 if transaction in seen_transactions:
@@ -304,6 +315,7 @@ def _model_response_from_responses(
     status = _field(response, "status")
     terminal_status = str(status or "").strip().casefold()
     tool_calls: List[Dict[str, Any]] = []
+    promoted_call_ids: set[str] = set()
     for item in native_items:
         if item.get("type") != "function_call":
             continue
@@ -328,6 +340,17 @@ def _model_response_from_responses(
                 },
             }
         )
+        promoted_call_ids.add(call_id)
+    # ``native_items`` are the provider's replay form. A ``function_call`` this
+    # adapter did not promote into ``tool_calls`` was never dispatched, so it can
+    # never receive a ToolResult; replaying it would put a function_call without
+    # its output on the wire, which providers reject outright.
+    replay_items = [
+        item
+        for item in native_items
+        if item.get("type") != "function_call"
+        or str(item.get("call_id") or "").strip() in promoted_call_ids
+    ]
     incomplete_details = _native_value(_field(response, "incomplete_details"))
     incomplete_reason = (
         str(incomplete_details.get("reason"))
@@ -360,7 +383,7 @@ def _model_response_from_responses(
         provider=provider,
         metadata=metadata,
         reasoning_content=_response_reasoning_text(native_items) or None,
-        native_items=native_items or None,
+        native_items=replay_items or None,
     )
 
 

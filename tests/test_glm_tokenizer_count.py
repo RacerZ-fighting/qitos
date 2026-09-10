@@ -76,6 +76,16 @@ def test_glm_responses_count_serializes_native_transaction_fields(monkeypatch):
             {
                 "role": "assistant",
                 "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_native",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": '{"key":"target"}',
+                        },
+                    }
+                ],
                 "native_items": [
                     {
                         "type": "reasoning",

@@ -49,7 +49,10 @@ fork or switch Provider. Retry is allowed only before observable output or exter
 side effects make replay unsafe. A transport only offers a Provider-side handle when
 its Responses implementation keeps response state; the family preset declares that
 with ``responses_stateful``, and a stateless endpoint always receives the canonical
-transcript.
+transcript. Provider items are replayed only for calls the transcript recorded: an
+item the adapter could not dispatch, such as a function call truncated at
+``max_output_tokens``, never reaches the wire, because an unpaired ``function_call``
+is rejected by Providers.
 
 ## 3. Minimal Agent loop
 
