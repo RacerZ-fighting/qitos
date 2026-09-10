@@ -70,6 +70,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
         retry_window_seconds = _coerce_float(kwargs.get("retry_window_seconds"), 300.0)
         if not isinstance(preset, FamilyPreset):
             raise TypeError("preset must be a FamilyPreset")
+        responses_stateful = bool(preset.responses_stateful)
         if not isinstance(model_name, str):
             raise TypeError("model_name must be a string")
         if not isinstance(context_policy, ContextPolicy):
@@ -101,6 +102,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
             stream_idle_timeout=stream_idle_timeout,
             retry_window_seconds=retry_window_seconds,
             provider_name=preset.id,
+            responses_stateful=responses_stateful,
         )
         setattr(
             llm,
@@ -110,6 +112,7 @@ class OpenAICompatibleAdapter(ModelAdapter):
                 "context_policy": context_policy.to_dict(),
                 "adapter_kind": self.kind,
                 "api_mode": llm.api_mode,
+                "responses_stateful": llm.responses_stateful,
             },
         )
         return llm

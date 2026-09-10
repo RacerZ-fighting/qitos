@@ -63,6 +63,16 @@ How to update:
 
 ### Fixed
 
+- A Responses provider that keeps no response state no longer receives
+  ``previous_response_id`` continuations. The official DeepSeek endpoint documents
+  ``previous_response_id`` and ``conversation`` as unsupported and silently ignores
+  both, so a delta-only follow-up carried a ``function_call_output`` whose matching
+  ``function_call`` sat in the omitted prefix and the provider rejected the turn
+  with ``No tool call found for tool output``. The DeepSeek family preset now
+  declares ``responses_stateful=False``, which also lowers
+  ``ModelCapabilities.continuation`` for that transport; other Responses providers
+  keep the handle.
+
 - Terminal ``turn_end`` and ``agent_end`` observers now share a bounded
   two-second settlement window, so durable lifecycle records can finish after
   a model/tool deadline without allowing a stuck observer to wedge the run.

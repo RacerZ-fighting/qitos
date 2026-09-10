@@ -727,6 +727,7 @@ class OpenAICompatibleModel(Model):
         max_attempts: int = 2,
         stream_idle_timeout: float = 60.0,
         retry_window_seconds: float = 300.0,
+        responses_stateful: bool = True,
         provider_name: str | None = None,
     ) -> None:
         super().__init__(
@@ -750,6 +751,9 @@ class OpenAICompatibleModel(Model):
         self.stream_idle_timeout = float(stream_idle_timeout)
         self.default_request_kwargs = dict(default_request_kwargs or {})
         self.api_mode = _normalize_api_mode(api_mode)
+        if not isinstance(responses_stateful, bool):
+            raise TypeError("responses_stateful must be a boolean")
+        self.responses_stateful = responses_stateful
         self.retry_policy = ModelRetryPolicy(
             max_attempts=max_attempts,
             retry_window_seconds=retry_window_seconds,
@@ -772,7 +776,7 @@ class OpenAICompatibleModel(Model):
                 ),
                 thinking_levels=THINKING_LEVEL_ORDER,
                 opaque_replay=True,
-                continuation=True,
+                continuation=self.responses_stateful,
                 usage=True,
                 prompt_cache_usage=True,
                 multimodal_input=True,

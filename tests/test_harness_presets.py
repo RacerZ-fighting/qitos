@@ -5,6 +5,7 @@ from qitos.harness import (
     build_model_for_preset,
     resolve_family_preset,
 )
+from qitos.models import ModelAPI
 from qitos.models.profile_registry import infer_default_protocol, infer_model_profile
 
 
@@ -90,3 +91,43 @@ def test_build_model_for_glm_preset_attaches_native_tool_call_metadata() -> None
     assert metadata["native_tool_call_preferred"] is True
     assert metadata["decision_lane_preference"] == "native_tool_calls"
     assert metadata["effective_tool_delivery"] == "api_parameter"
+
+
+def test_deepseek_preset_declares_a_stateless_responses_endpoint() -> None:
+    preset = resolve_family_preset("deepseek-v4-pro")
+
+    assert preset.id == "deepseek"
+    assert preset.responses_stateful is False
+    assert preset.to_dict()["responses_stateful"] is False
+
+    stateless = build_model_for_preset(
+        family_id="deepseek",
+        model_name="deepseek-v4-pro",
+        api_key="test-key",
+        base_url="https://api.deepseek.com",
+        api_mode="responses",
+    )
+    assert stateless.capabilities.api is ModelAPI.RESPONSES
+    assert stateless.capabilities.continuation is False
+    assert stateless.responses_stateful is False
+    metadata = dict(getattr(stateless, "qitos_harness_metadata", {}) or {})
+    assert metadata["responses_stateful"] is False
+
+    stateful = build_model_for_preset(
+        family_id="qwen",
+        model_name="qwen3.7-max",
+        api_key="test-key",
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_mode="responses",
+    )
+    assert stateful.capabilities.api is ModelAPI.RESPONSES
+    assert stateful.capabilities.continuation is True
+
+    chat_only = build_model_for_preset(
+        family_id="deepseek",
+        model_name="deepseek-v4-pro",
+        api_key="test-key",
+        base_url="https://api.deepseek.com",
+        api_mode="chat_completions",
+    )
+    assert chat_only.capabilities.continuation is False

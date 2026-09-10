@@ -19,9 +19,12 @@ from qitos.core import (
     ModelTransportError,
 )
 from qitos.core.model_response import ModelResponse
+from qitos.core.model_request import ModelContinuation, model_json_digest
 from qitos.models._openai_responses import (
     _ResponsesEventStream,
+    _continuation_settings,
     _model_response_from_responses,
+    _request_payload,
     _to_responses_input,
     _to_responses_tool_choice,
     _to_responses_tools,
@@ -1656,6 +1659,147 @@ async def test_responses_continuation_sends_only_verified_canonical_delta(
     assert second[-1].event_metadata["continuation_applied"] is True
     assert second[-1].continuation is not None
     assert second[-1].continuation.response_id == "resp_2"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("responses_stateful", [True, False])
+async def test_responses_statefulness_decides_delta_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+    responses_stateful: bool,
+) -> None:
+    requests: list[dict[str, Any]] = []
+    streams = [
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "model": "deepseek-v4-pro",
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "id": "fc_1",
+                                "call_id": "call_1",
+                                "name": "run_command",
+                                "arguments": '{"command": "id"}',
+                                "status": "completed",
+                            }
+                        ],
+                    },
+                }
+            ]
+        ),
+        _AsyncListStream(
+            [
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_2",
+                        "status": "completed",
+                        "model": "deepseek-v4-pro",
+                        "output": [
+                            {
+                                "type": "message",
+                                "id": "msg_2",
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "output_text", "text": "done"}
+                                ],
+                            }
+                        ],
+                    },
+                }
+            ]
+        ),
+    ]
+
+    class Client:
+        def __init__(self, **_: Any) -> None:
+            self.responses = SimpleNamespace(create=self.create)
+
+        async def create(self, **kwargs: Any) -> Any:
+            requests.append(kwargs)
+            return streams.pop(0)
+
+        async def aclose(self) -> None:
+            return None
+
+    fake = ModuleType("openai")
+    fake.AsyncOpenAI = Client
+    monkeypatch.setitem(sys.modules, "openai", fake)
+
+    model = OpenAICompatibleModel(
+        api_key="key",
+        model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com",
+        api_mode="responses",
+        max_attempts=1,
+        provider_name="deepseek",
+        responses_stateful=responses_stateful,
+    )
+    first_messages = [{"role": "user", "content": "Probe the entry point."}]
+    first = [
+        chunk async for chunk in model.stream(_request_for(model, first_messages))
+    ]
+
+    assert [call["id"] for call in first[-1].tool_calls or []] == ["call_1"]
+    assert "previous_response_id" not in requests[0]
+    if responses_stateful:
+        assert first[-1].continuation is not None
+        assert first[-1].event_metadata["continuation_reason"] == "absent"
+    else:
+        assert first[-1].continuation is None
+        assert first[-1].event_metadata["continuation_reason"] == "unsupported"
+
+    second_messages = [
+        *first_messages,
+        {"role": "assistant", "content": "", "native_items": first[-1].native_items},
+        {"role": "tool", "tool_call_id": "call_1", "content": "uid=0(root)"},
+    ]
+    probe = _request_for(model, second_messages)
+    probe_payload = _request_payload(
+        model,
+        probe,
+        {**probe.option_dict(), "prompt_cache_key": probe.cache_affinity},
+        provider="deepseek",
+    )
+    assert probe_payload["input"][-1]["type"] == "function_call_output"
+
+    # A handle whose canonical prefix stops right before the tool output is the
+    # delta a stateful endpoint accepts. A stateless endpoint keeps no response
+    # state, so the same handle must not become a delta-only request.
+    stale_prefix = len(probe_payload["input"]) - 1
+    stale = ModelContinuation(
+        run_id=probe.run_id,
+        provider=probe.provider,
+        model=probe.model,
+        protocol=probe.protocol,
+        response_id="resp_1",
+        prefix_items=stale_prefix,
+        prefix_digest=model_json_digest(probe_payload["input"][:stale_prefix]),
+        settings_digest=model_json_digest(_continuation_settings(probe_payload)),
+    )
+    second = [
+        chunk
+        async for chunk in model.stream(
+            _request_for(model, second_messages, continuation=stale)
+        )
+    ]
+
+    if responses_stateful:
+        assert requests[1]["previous_response_id"] == "resp_1"
+        assert requests[1]["input"] == probe_payload["input"][stale_prefix:]
+        assert second[-1].event_metadata["continuation_applied"] is True
+        assert second[-1].continuation is not None
+    else:
+        assert "previous_response_id" not in requests[1]
+        assert requests[1]["input"] == _to_responses_input(second_messages)
+        assert second[-1].event_metadata["continuation_applied"] is False
+        assert second[-1].event_metadata["continuation_reason"] == "unsupported"
+        assert second[-1].continuation is None
+    assert second[-1].text == "done"
 
 
 @pytest.mark.parametrize(

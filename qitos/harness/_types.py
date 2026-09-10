@@ -54,6 +54,7 @@ class FamilyPreset:
     fallback_protocols: tuple[str, ...] = field(default_factory=tuple)
     tool_policy: ToolPolicy = field(default_factory=ToolPolicy)
     context_policy: ContextPolicy = field(default_factory=ContextPolicy)
+    responses_stateful: bool = True
     notes: str = ""
     recommended_models: tuple[str, ...] = field(default_factory=tuple)
     recommended_max_steps: Optional[int] = None
@@ -83,6 +84,7 @@ class FamilyPreset:
             "fallback_protocols": list(self.fallback_protocols),
             "tool_policy": self.tool_policy.to_dict(),
             "context_policy": self.context_policy.to_dict(),
+            "responses_stateful": self.responses_stateful,
             "notes": self.notes,
             "recommended_models": list(self.recommended_models),
             "recommended_max_steps": self.recommended_max_steps,

@@ -247,7 +247,12 @@ _PRESETS: tuple[FamilyPreset, ...] = (
             notes="DeepSeek V4 supports native OpenAI-compatible tool calls.",
         ),
         context_policy=ContextPolicy(context_window_hint=128_000),
-        notes="DeepSeek models work best with JSON decision protocol, falling back to tool_use_xml for models that emit XML.",
+        # The official DeepSeek Responses API is stateless: it documents
+        # ``previous_response_id`` and ``conversation`` as unsupported and
+        # silently ignores both, so a delta-only request would carry a
+        # ``function_call_output`` with no matching ``function_call``.
+        responses_stateful=False,
+        notes="DeepSeek models work best with JSON decision protocol, falling back to tool_use_xml for models that emit XML. The official Responses endpoint is stateless, so transcripts are always replayed in full.",
         recommended_models=("ds-v4-pro", "ds-v4-flash", "deepseek-chat"),
     ),
 )

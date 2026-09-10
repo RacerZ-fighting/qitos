@@ -46,7 +46,10 @@ Provider SDK objects stop at the adapter edge.
 
 Continuation is an optimization. Canonical local transcript is sufficient to resume,
 fork or switch Provider. Retry is allowed only before observable output or external
-side effects make replay unsafe.
+side effects make replay unsafe. A transport only offers a Provider-side handle when
+its Responses implementation keeps response state; the family preset declares that
+with ``responses_stateful``, and a stateless endpoint always receives the canonical
+transcript.
 
 ## 3. Minimal Agent loop
 

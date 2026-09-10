@@ -652,6 +652,7 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamEvent]):
         settings_digest: str = "",
         continuation_applied: bool = False,
         continuation_reason: str = "absent",
+        continuation_supported: bool = True,
     ) -> None:
         self._events = events
         self._iterator = events.__aiter__()
@@ -666,6 +667,7 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamEvent]):
         self._settings_digest = settings_digest
         self._continuation_applied = continuation_applied
         self._continuation_reason = continuation_reason
+        self._continuation_supported = continuation_supported
 
     def __aiter__(self) -> _ResponsesEventStream:
         return self
@@ -873,7 +875,11 @@ class _ResponsesEventStream(AsyncIterator[ModelStreamEvent]):
                 self._finished = True
                 continuation = None
                 response_id = str(normalized.metadata.get("id") or "").strip()
-                if self._request is not None and response_id:
+                if (
+                    self._request is not None
+                    and response_id
+                    and self._continuation_supported
+                ):
                     prefix = self._full_input + list(normalized.native_items or [])
                     continuation = ModelContinuation(
                         run_id=self._request.run_id,
@@ -972,11 +978,25 @@ async def _open_responses_stream(
         if isinstance(raw_input, list)
         else []
     )
-    settings_digest = model_json_digest(_continuation_settings(full_payload))
-    payload, continuation_applied, continuation_reason = _apply_continuation(
-        request,
-        full_payload,
-    )
+    continuation_supported = bool(adapter.capabilities.continuation)
+    if continuation_supported:
+        settings_digest = model_json_digest(_continuation_settings(full_payload))
+        payload, continuation_applied, continuation_reason = _apply_continuation(
+            request,
+            full_payload,
+        )
+    else:
+        # A Responses endpoint that keeps no response state (for example the
+        # official DeepSeek API, which documents ``previous_response_id`` and
+        # ``conversation`` as unsupported and silently ignores both) must
+        # always receive the canonical transcript: a delta-only request would
+        # carry tool outputs whose matching function calls were omitted.
+        settings_digest = ""
+        payload, continuation_applied, continuation_reason = (
+            full_payload,
+            False,
+            "unsupported",
+        )
     try:
         events = await _responses_create(client)(**payload)
     except Exception as exc:
@@ -991,6 +1011,7 @@ async def _open_responses_stream(
         settings_digest=settings_digest,
         continuation_applied=continuation_applied,
         continuation_reason=continuation_reason,
+        continuation_supported=continuation_supported,
     )
 
 
